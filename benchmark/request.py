@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -1026,6 +1027,76 @@ class VLLMOmni(InferenceSystem):
         payload["modalities"] = [output_mod]
         return payload
 
+    def _speech_fields(self) -> dict:
+        # vllm-omni streams raw PCM only with stream_format=audio (benchmark/tts_speech_bench.py).
+        return {"stream_format": "audio"}
+
+    async def _send_request_audio_speech(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: "RequestInput",
+        base_url: str,
+        model: Model,
+        metrics: "RequestMetrics",
+        additional_model_kwargs: dict,
+    ) -> "RequestMetrics":
+        """TTS via OpenAI ``/v1/audio/speech`` (streaming PCM16).
+
+        ``response_format="pcm"`` asks for bare 16-bit PCM frames so every
+        server's bytes count the same audio. A server that answers with a WAV
+        anyway (M* before ``pcm`` streaming landed, Kokoro-FastAPI's muxer)
+        starts with ``RIFF``; that 44-byte header is stripped once, then each
+        read is recorded as a PCM16 audio chunk so timing/throughput match the
+        native path.
+        """
+        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
+        payload: dict = {
+            "model": model.get_served_model_name(),
+            "input": req_input.prompt,
+            "response_format": "pcm",
+            "stream": True,
+            **self._speech_fields(),
+            **kwargs,
+        }
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/audio/speech",
+                json=payload,
+                headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                header_skipped = False
+                pending = b""
+                async for raw in resp.content.iter_any():
+                    if not raw:
+                        continue
+                    if not header_skipped:
+                        pending += raw
+                        if len(pending) < 44:
+                            continue
+                        # drop a 44-byte streaming WAV header if the server sent one
+                        raw = pending[44:] if pending[:4] == b"RIFF" else pending
+                        pending = b""
+                        header_skipped = True
+                        if not raw:
+                            continue
+                    metrics.record_output_chunk(
+                        modality="audio",
+                        data_b64=base64.b64encode(raw),
+                        arrival_time=time.monotonic(),
+                        n_tokens=1,
+                    )
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
     async def send_request(
         self,
         session: aiohttp.ClientSession,
@@ -1047,6 +1118,16 @@ class VLLMOmni(InferenceSystem):
 
         if isinstance(model, Bagel) and output_mod == "image":
             return await self._send_request_bagel_images(
+                session=session,
+                req_input=req_input,
+                base_url=base_url,
+                model=model,
+                metrics=metrics,
+                additional_model_kwargs=additional_model_kwargs,
+            )
+        if output_mod == "audio" and isinstance(model, Qwen3TTS):
+            # A TTS checkpoint has no chat route on vllm-omni; it serves /v1/audio/speech.
+            return await self._send_request_audio_speech(
                 session=session,
                 req_input=req_input,
                 base_url=base_url,
@@ -1482,6 +1563,106 @@ class OpenAIText(VLLMOmni):
         return payload
 
 
+class OrpheusVLLM(InferenceSystem):
+    """Orpheus served the way the ``orpheus-speech`` package serves it: a plain vLLM server streams
+    the LM's audio tokens over ``/v1/completions`` and this client turns them into 24 kHz audio with
+    the ``snac`` package, decoding a 4-frame window each time a frame completes and keeping its
+    middle 2048 samples (``orpheus_tts.decoder``; mstar's SNAC node uses the same window). SNAC runs
+    on this process's GPU, one decode at a time, like the package's decoder thread.
+    """
+
+    PROMPT_START = [128259]
+    PROMPT_END = [128009, 128260, 128261, 128257]
+    STOP_TOKEN = 128258
+    FIRST_CODE = 128266  # <custom_token_10>
+    # Orpheus's sampling defaults, the same as mstar/model/orpheus/config.py
+    SAMPLING = {"temperature": 0.6, "top_p": 0.8, "repetition_penalty": 1.3, "max_tokens": 4096}
+
+    def __init__(self, device: str = "cuda"):
+        self._device = device
+        self._tok = None
+        self._snac = None
+        self._pool = None
+
+    def _load(self):
+        if self._snac is not None:
+            return
+        import concurrent.futures
+
+        import torch
+        from transformers import AutoTokenizer
+
+        try:
+            from snac import SNAC
+        except ImportError as e:
+            raise RuntimeError("the orpheus_vllm client needs the snac package (pip install snac)") from e
+        self._tok = AutoTokenizer.from_pretrained("canopylabs/orpheus-3b-0.1-pretrained")
+        self._snac = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().to(self._device)
+        self._torch = torch
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _decode(self, codes: list[int]) -> bytes | None:
+        """28 codes (4 frames) -> the middle 2048 samples as int16 PCM, or None for an invalid window."""
+        torch = self._torch
+        if any(c < 0 or c > 4096 for c in codes):
+            return None
+        f = torch.tensor(codes, dtype=torch.int32).view(4, 7)
+        levels = [f[:, [0]].reshape(1, -1), f[:, [1, 4]].reshape(1, -1), f[:, [2, 3, 5, 6]].reshape(1, -1)]
+        with torch.inference_mode():
+            audio = self._snac.decode([lv.to(self._device) for lv in levels])
+        pcm = (audio[:, :, 2048:4096].float().cpu().numpy() * 32767).astype("<i2")
+        return pcm.tobytes()
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type, expected_output_modalities=["audio"])
+        try:
+            self._load()
+            kwargs = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
+            voice = kwargs.get("voice", "tara")
+            ids = self.PROMPT_START + self._tok(f"{voice}: {req_input.prompt}").input_ids + self.PROMPT_END
+            payload = {"model": model.get_hf_url(), "prompt": ids, **self.SAMPLING, "stop_token_ids": [self.STOP_TOKEN],
+                       "skip_special_tokens": False, "stream": True, "logprobs": 0, "return_tokens_as_token_ids": True,
+                       "seed": request_id}
+            loop = asyncio.get_running_loop()
+            codes: list[int] = []
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/completions", json=payload, read_bufsize=2**24,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=120)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                async for raw in resp.content:
+                    chunk = _parse_sse_chunk(raw)
+                    if not chunk or chunk.get("_done"):
+                        continue
+                    for choice in chunk.get("choices", []):
+                        tokens = (choice.get("logprobs") or {}).get("tokens") or []
+                        for t in tokens:
+                            if not t.startswith("token_id:"):
+                                continue
+                            code = int(t[9:]) - self.FIRST_CODE - (len(codes) % 7) * 4096
+                            if code <= 0:
+                                continue
+                            codes.append(code)
+                            if len(codes) % 7 == 0 and len(codes) > 27:
+                                pcm = await loop.run_in_executor(self._pool, self._decode, codes[-28:])
+                                if pcm:
+                                    metrics.record_output_chunk("audio", base64.b64encode(pcm),
+                                                                arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
 class OursOpenAI(VLLMOmni):
     """Benchmark adapter for M*'s own OpenAI-compatible ``/v1`` surface.
 
@@ -1496,6 +1677,9 @@ class OursOpenAI(VLLMOmni):
     def _extra_fields(self) -> dict:
         # M* takes chat template switches such as enable_thinking as top-level fields.
         return dict(self.chat_template_kwargs or {})
+
+    def _speech_fields(self) -> dict:
+        return {}
 
     async def send_request(
         self,
@@ -1636,71 +1820,6 @@ class OursOpenAI(VLLMOmni):
                 metrics.output_text_tokens = ct
             if (pt := usage.get("prompt_tokens")) is not None:
                 metrics.input_tokens = pt
-        except Exception as e:
-            metrics.record_error(str(e))
-        else:
-            metrics.record_completion()
-        return metrics
-
-    async def _send_request_audio_speech(
-        self,
-        session: aiohttp.ClientSession,
-        req_input: "RequestInput",
-        base_url: str,
-        model: Model,
-        metrics: "RequestMetrics",
-        additional_model_kwargs: dict,
-    ) -> "RequestMetrics":
-        """TTS via OpenAI ``/v1/audio/speech`` (streaming PCM16).
-
-        ``response_format="pcm"`` asks for bare 16-bit PCM frames so every
-        server's bytes count the same audio. A server that answers with a WAV
-        anyway (M* before ``pcm`` streaming landed, Kokoro-FastAPI's muxer)
-        starts with ``RIFF``; that 44-byte header is stripped once, then each
-        read is recorded as a PCM16 audio chunk so timing/throughput match the
-        native path.
-        """
-        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
-        payload: dict = {
-            "model": model.get_served_model_name(),
-            "input": req_input.prompt,
-            "response_format": "pcm",
-            "stream": True,
-            **kwargs,
-        }
-        try:
-            metrics.start_time = time.monotonic()
-            async with session.post(
-                f"{base_url}/v1/audio/speech",
-                json=payload,
-                headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
-                read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
-
-                header_skipped = False
-                pending = b""
-                async for raw in resp.content.iter_any():
-                    if not raw:
-                        continue
-                    if not header_skipped:
-                        pending += raw
-                        if len(pending) < 44:
-                            continue
-                        # drop a 44-byte streaming WAV header if the server sent one
-                        raw = pending[44:] if pending[:4] == b"RIFF" else pending
-                        pending = b""
-                        header_skipped = True
-                        if not raw:
-                            continue
-                    metrics.record_output_chunk(
-                        modality="audio",
-                        data_b64=base64.b64encode(raw),
-                        arrival_time=time.monotonic(),
-                        n_tokens=1,
-                    )
         except Exception as e:
             metrics.record_error(str(e))
         else:

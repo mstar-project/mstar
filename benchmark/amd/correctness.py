@@ -3,8 +3,8 @@
 Text arms get their own greedy pass on the set right after the server starts. mstar receives the
 correctness runner's own /generate requests; vLLM and SGLang get the same prompts as chat
 completions with per-token logprobs, which turn back into one chunk per token, the form the
-text metrics compare. TTS arms are scored on the audio of their first timed run at concurrency 1
-(the same sentences, one pass over the set). Every pass is saved in the correctness runner's
+text metrics compare. TTS and ASR arms are scored on the outputs of their first timed run at
+concurrency 1 (the same set, one pass over it). Every pass is saved in the correctness runner's
 layout (r1/outputs, r1/responses.jsonl) and scored with its family code.
 
     python -m benchmark.amd.correctness score RUN_DIR      # what the sweep runs at the end
@@ -164,10 +164,12 @@ def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
     return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
 
 
-# --- TTS from a timed run ---------------------------------------------------------------------
+# --- TTS and ASR from a timed run --------------------------------------------------------------
 
-def tts_pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Path, out_dir: Path) -> dict:
-    """The correctness pass of a TTS arm: the first timed run at concurrency 1, one request per item."""
+def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Path, out_dir: Path,
+                   ext: str) -> dict:
+    """The correctness pass of a TTS (wav) or ASR (txt) arm: its first timed run at concurrency 1,
+    which sends every item of the set once, in order."""
     fam, cfg = _family(C, worktree, row_name)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     run = cell_dir / "a1r1"
@@ -176,11 +178,10 @@ def tts_pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir
     responses = []
     for i, it in enumerate(sset.items):
         r = C.client.Response(it.id)
-        wav = run / f"req_{i}.wav"
-        if i in ok_ids and wav.is_file():
+        if i in ok_ids and (run / f"req_{i}.{ext}").is_file():
             r.ok = True
         else:
-            r.error = "no audio in the timed run"
+            r.error = "no output in the timed run"
         responses.append(r)
     out_dir.mkdir(parents=True, exist_ok=True)
     run_out = out_dir / "r1"
@@ -189,7 +190,7 @@ def tts_pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir
     (run_out / "outputs").mkdir(parents=True)
     for i, (it, r) in enumerate(zip(sset.items, responses, strict=True)):
         if r.ok:
-            shutil.copyfile(run / f"req_{i}.wav", run_out / "outputs" / f"{it.id}.wav")
+            shutil.copyfile(run / f"req_{i}.{ext}", run_out / "outputs" / f"{it.id}.{ext}")
     with open(run_out / "responses.jsonl", "w") as f:
         for r in responses:
             f.write(json.dumps(r.summary(), default=str) + "\n")
@@ -252,9 +253,11 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
         info = json.loads(arm_json.read_text())
         corr = arm_dir / "correctness"
         if not (corr / "pass.json").is_file():
-            cell = arm_dir / "cells" / "tts-seed" / "c1"
-            if (cell / "a1r1" / "results.json").is_file():
-                tts_pass_from_cell(C, worktree, info["row"], info["arm"], cell, corr)
+            for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt")):
+                cell = arm_dir / "cells" / wl / "c1"
+                if (cell / "a1r1" / "results.json").is_file():
+                    pass_from_cell(C, worktree, info["row"], info["arm"], cell, corr, ext)
+                    break
         if (corr / "pass.json").is_file():
             results[f"{info['row']}/{info['arm']}"] = score_dir(C, worktree, corr, device)
     (run_dir / "correctness.json").write_text(json.dumps(results, indent=1, default=str))
