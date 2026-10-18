@@ -36,7 +36,7 @@ class _RecordingSampler:
         self.synced = 0
         self.sampled_with: list[bool] = []
 
-    def sync_seen_token_masks(self, seen_masks):
+    def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
     def sample(self, request_ids, logits, apply_penalty=False):
@@ -46,6 +46,8 @@ class _RecordingSampler:
 
 class _RecordingBuffers:
     """Stands in for SamplerBuffers, recording just what the gate controls."""
+
+    ingraph_scatter = False
 
     def __init__(self):
         self.sampler = _RecordingSampler()
@@ -67,7 +69,10 @@ class _RecordingBuffers:
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0):
+    def keep_mask(self, keep):
+        return keep
+
+    def scatter_offset(self, cg_slot=0, keep=None):
         self.offset_scatters += 1
 
     def register_request(self, rid, sampling_config):
@@ -110,7 +115,7 @@ def _drive(res, rids, *, apply_penalty=True, prefill_tokens=None):
     ctx = _ctx(rids)
     res.admit(step, ctx)
     res.plan(step, ctx)
-    res.sample(list(rids), torch.zeros(len(rids), VOCAB))
+    res.sample(torch.zeros(len(rids), VOCAB))
     res.commit(step, ctx)
 
 
