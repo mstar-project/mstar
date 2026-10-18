@@ -678,8 +678,13 @@ to N-1, using its own vocabulary size and no repetition penalty:
 
 The forward looks up each sampler by key and calls ``.sample()`` on it::
 
-   layer0 = engine_inputs.resources[TALKER_SAMPLER].sample(request_ids, logits)
-   code   = engine_inputs.resources[CODE_PRED_SAMPLER].sample(request_ids, logits)
+   layer0 = engine_inputs.resources[TALKER_SAMPLER].sample(logits)
+   code   = engine_inputs.resources[CODE_PRED_SAMPLER].sample(logits)
+
+``sample`` takes one row of logits per row of the step, and no request ids. The resource
+samples the rows it was planned with, padding rows included under capture. A forward that
+handed the ids over would make dynamo guard on their count, so an uncaptured step would
+recompile for every new batch size.
 
 Each resource owns its own buffers. The two parameter sets are therefore independent,
 per-request, and safe under CUDA graphs.
@@ -1132,7 +1137,7 @@ Two places need access to resources, and each has its own mechanism.
        hidden = self.language_model(self.embed_tokens(text_inputs), label="main")
        if graph_walk == "prefill":
            hidden = attn.select_last_hidden(hidden)
-       return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
+       return sampler.sample(self.lm_head(hidden))
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 
