@@ -174,8 +174,9 @@ On NVIDIA GPUs the model families depend on the libraries below. AMD GPUs use ot
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
-- **flash-attn** — used by Qwen3-Omni. **Not installed by any extra**; install it separately
-  (see `flash-attn (Qwen3-Omni)`_).
+- **flash-attn** — used by Qwen3-Omni's encoders. **Not installed by any extra**; install it
+  separately (see `flash-attn (Qwen3-Omni)`_). On ROCm, which has no flash-attn wheel, the
+  encoders run AITER's varlen kernel instead (``mstar/model/components/hf_attention.py``).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
@@ -185,6 +186,12 @@ On NVIDIA GPUs the model families depend on the libraries below. AMD GPUs use ot
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
 that for you (next section).
+
+Media decoding (``Model.load_audio`` / ``load_video``) uses **torchcodec** if it works. It
+needs FFmpeg's shared libraries, and its PyPI wheels are CUDA builds. Where it doesn't work
+(ROCm, or no system FFmpeg) decoding falls back to **PyAV** (``av``, which bundles FFmpeg)
+and ``soundfile``, so install both there. The choice is logged once per process
+(``mstar/model/components/media_io.py``).
 
 omnivoice (OmniVoice)
 ---------------------
@@ -454,13 +461,14 @@ way instead of ``-e``. The never-true marker drops a package from the resolution
      - SHM or TCP tensor transport, on one node (:doc:`serving`)
    * - ``torchcodec``
      - The PyPI wheels link the CUDA runtime, and there is no ROCm build
-     - Nothing yet, see :ref:`models:Running on AMD GPUs` for what this affects
+     - PyAV (``av``) and ``soundfile``, through ``mstar/model/components/media_io.py``
    * - ``vllm-xpu-kernels``
      - Intel GPUs only
      -
 
 ``flash-attn`` and ``flash-attn-4`` aren't installed by any extra and have no ROCm build
-that M* uses. Without ``flash-attn-4``, Waypoint's flex attention runs its Triton kernel
+that M* uses. Qwen3-Omni's and BAGEL's encoders run AITER's varlen kernel instead, and
+without ``flash-attn-4`` Waypoint's flex attention runs its Triton kernel
 (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 
 **3. AITER.** Install the release wheel, not a source or editable build. The wheel ships
