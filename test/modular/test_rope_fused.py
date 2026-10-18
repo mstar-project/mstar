@@ -51,3 +51,36 @@ def test_fused_matches_flashinfer(compiled):
     torch.testing.assert_close(got_k, want_k, rtol=1.6e-2, atol=1.6e-2)
     # and they round the same way almost everywhere
     assert (got_q != want_q).float().mean() < 0.05
+
+
+def test_fused_refuses_a_rope_dtype_it_does_not_compute_in():
+    with pytest.raises(NotImplementedError):
+        _manager(True, "cpu", rope_dtype=torch.bfloat16)
+
+
+@cuda
+def test_fused_refuses_overrides_its_table_ignores():
+    """The table is the config's: a call may repeat its parameters, not change them."""
+    fused = _manager(True, "cuda", rope_theta=10000.0)
+    fused._current_pos_ids["main"] = torch.zeros(2, dtype=torch.int32, device="cuda")
+    q, k = torch.randn(2, 2, 64, device="cuda"), torch.randn(2, 2, 64, device="cuda")
+    fused.apply_qk(q, k, label="main", rope_theta=10000.0, rope_scale=1.0, low_freq_factor=None)
+    with pytest.raises(ValueError, match="rope_theta"):
+        fused.apply_qk(q, k, label="main", rope_theta=1e6)
+    with pytest.raises(ValueError, match="rotary_dim"):
+        fused.apply_qk(q, k, label="main", rotary_dim=32)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_fused_admit_refuses_positions_past_its_table(fused):
+    """The fused path indexes its table unchecked, so admit refuses a step that would
+    run past it; FlashInfer computes any position."""
+    from mstar.engine.resources.position.config import PositionStep
+    from mstar.engine.resources.step import Segment, StepContext
+
+    m = _manager(fused, "cpu")
+    m._counters["r"] = {"main": 4090}
+    ctx = StepContext(request_ids=("r",), graph_walk="w", slot=0, capture=False)
+    assert m.admit(PositionStep(segments=(Segment("r", "main", 6),)), ctx).ok
+    outcome = m.admit(PositionStep(segments=(Segment("r", "main", 7),)), ctx)
+    assert outcome.ok != fused
