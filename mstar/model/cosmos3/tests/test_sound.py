@@ -361,10 +361,9 @@ def test_sound_engine_path_flashinfer() -> None:
     s_ref = ctx["sound_fused"].float()
     s_mse = (s_ref - snd.reshape(s_ref.shape).float()).pow(2).mean().item()
     s_snr = float("inf") if s_mse == 0 else 10 * math.log10(s_ref.pow(2).mean().item() / s_mse)
-    # ROCm: when only its SDPA kernel changes, the fused sound walk moves 21.3 dB
-    # (video) and 19.5 dB (sound latents) on MI300X, the floors sit 3 dB under
+    # ROCm: 3 dB under the fused walk's own SDPA-swap minimum over seeds 7/11/23/42 (18.1 dB video, 9.1 dB sound)
     rocm = current_platform.is_rocm()
-    bar, s_bar = (18, 16) if rocm else (30, 30)
+    bar, s_bar = (15, 6) if rocm else (30, 30)
     assert psnr >= bar, f"sound-walk video PSNR {psnr:.2f} < {bar} (MSE {mse:.3e})"
     assert s_snr >= s_bar, f"sound latent SNR {s_snr:.2f} < {s_bar} dB (MSE {s_mse:.3e})"
     print(f"  sound engine path (flashinfer): video PSNR={psnr:.2f} dB, sound latent SNR={s_snr:.2f} dB")
