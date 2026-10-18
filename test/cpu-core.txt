@@ -149,3 +149,4 @@ test/modular/test_rendezvous_store.py
 test/modular/test_mooncake_requirement.py
 test/modular/test_correctness_metrics.py
 test/modular/test_correctness_runner.py
+test/modular/test_media_decode.py

@@ -145,8 +145,8 @@ def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
     """Decode an audio file to a float32 mono waveform at ``sample_rate``.
 
     libsndfile (``soundfile``) first — it needs no FFmpeg and covers WAV,
-    FLAC, OGG and MP3 — then torchcodec for anything else (M4A, WebM, ...).
-    Resampling goes through torchaudio.
+    FLAC, OGG and MP3 — then ``media_io``'s FFmpeg-backed decoders for anything
+    else (M4A, WebM, ...). Resampling goes through torchaudio.
     """
     try:
         import soundfile as sf
@@ -154,10 +154,9 @@ def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
         audio, sr = sf.read(path, dtype="float32", always_2d=True)
         waveform = torch.from_numpy(audio).mean(dim=1)
     except Exception:  # noqa: BLE001 — not a libsndfile container; try FFmpeg
-        from torchcodec.decoders import AudioDecoder
+        from mstar.model.components.media_io import decode_audio
 
-        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
-        return frames.data[0].to(torch.float32)
+        return decode_audio(path, sample_rate=sample_rate, num_channels=1).data[0].to(torch.float32)
     if sr != sample_rate:
         import torchaudio
 

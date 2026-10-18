@@ -1,7 +1,6 @@
 import itertools
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
-from fractions import Fraction
+from dataclasses import dataclass, field
 from typing import NamedTuple, Type
 
 import torch
@@ -76,11 +75,6 @@ class Span(NamedTuple):
     advance: int
     source: str | tuple[str, int]
     params: tuple = ()
-
-
-def video_metadata_dict(metadata_obj) -> dict:
-    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
-    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
 
 
 _wg_id_counter = itertools.count(1 << 20)
@@ -758,18 +752,16 @@ class Model(ABC):
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        from mstar.model.components.media_io import decode_audio
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = decode_audio(filepath, sample_rate=16000, num_channels=1).data[0]
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
-        from torchcodec.decoders import VideoDecoder
+        from mstar.model.components.media_io import decode_video
 
-        decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
+        frames = decode_video(filepath, device=device)
+        return TensorAndMetadata(data=frames.data.float() / 255.0, metadata=frames.metadata)
 
     @abstractmethod
     def postprocess(
