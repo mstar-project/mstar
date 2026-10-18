@@ -413,7 +413,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
 
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = sampler.loopback_tokens()
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
         hidden = self.model(input_embeds=input_embeds, label="main")
@@ -423,7 +423,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             hidden = attn.select_last_hidden(hidden)
 
         logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,

@@ -248,7 +248,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         hidden = self.model(input_embeds, label="main")
         if graph_walk != DECODE_WALK:
             hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        return sampler.sample(self.model.logits(hidden))
 
     def forward(
         self,
