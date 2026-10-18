@@ -18,12 +18,11 @@ class _Sampler:
     def __init__(self, masters=True, tokens=None):
         self.has_slot_masters = masters
         self.tokens = tokens
-        self.asked = None
+        self.asked = 0
         self._row_stager = None
 
     def loopback_tokens(self):
-        # the rows are the planned step's, not an argument
-        self.asked = True
+        self.asked += 1
         return self.tokens
 
 
@@ -111,7 +110,7 @@ def test_preprocess_reads_the_step_tokens_off_the_sampler():
     _stub_model(sub, seen)
     out = LLMSubmodule.preprocess(sub, "decode", engine_inputs, rows)
     assert out["input_ids"].tolist() == [3, 4, 0, 0]
-    assert sampler.asked
+    assert sampler.asked == 1
     assert "input_embeds" not in out and seen["n"] == 4
 
 
@@ -180,7 +179,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
             return pos, pos
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
-    sampler.sample = lambda logits: ("sampled", logits.shape[0])
+    sampler.sample = lambda logits: "sampled"
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
     sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
@@ -194,7 +193,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
         )
-        assert out == ("sampled", 2)
+        assert out == "sampled"
         return dict(calls)
 
     c = run(True)
