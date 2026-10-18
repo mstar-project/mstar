@@ -101,6 +101,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
                 norm_topk_prob=tc.norm_topk_prob,
                 comm_group=comm_group,
                 moe_parallel=moe_parallel,
+                moe_backend=tc.moe_backend,
             )
         else:
             self.mlp = ParallelGatedMLP(
