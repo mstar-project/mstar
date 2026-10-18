@@ -1,0 +1,453 @@
+"""Run one benchmark table on a held node: every (row, arm, workload, concurrency) cell.
+
+    python -m benchmark.amd.sweep --table qwen35-dense --node-type mi325x --gpus 0,1,2,3,4,5,6,7 \\
+        --worktree $WORK/amd/worktrees/amd-native
+
+Per table: a node health check (a FAIL aborts), then each row's arms back to back on the same
+GPUs. Per arm: start the server (ready time and first request are recorded as cold start), a
+correctness pass on WS-K's sample set, then the timed cells with health snapshots around them and
+a 1 Hz monitor during them. A cell is warmup + ``repeats`` timed runs of benchmark.runner; a cell
+whose spread exceeds the table's limit is re-run once and flagged. Everything lands under
+<run-root>/<table>/<run-id>/ and table.py turns it into table.md and table.json.
+
+Timings only count from an exclusive full node (mi3258x / mi3008x) with a passing check; --dry
+runs the same path anywhere and labels the table as a functional run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import json
+import os
+import shlex
+import socket
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from benchmark.amd import catalog, health, tables
+from benchmark.amd.catalog import Arm, Row
+from benchmark.amd.launch import REPO, Launch, gpu_list, host_record
+
+WORK = Path("/work1/stephaniewang/atindra")
+DEFAULT_RUN_ROOT = WORK / "amd/results/bench"
+SETS_ROOT = WORK / "amd/results/correctness/data"
+BENCH_PARTITIONS = {"mi3258x": "mi325x", "mi3008x": "mi300x"}
+NODE_TYPES = {"mi325x": "MI325X", "mi300x": "MI300X"}
+
+
+def client_for(arm: Arm, row: Row) -> str:
+    # mstar's Whisper has no chat route; its native /generate is the one to time.
+    if arm.engine == "mstar" and row.family == "asr":
+        return "ours"
+    return arm.client
+
+
+def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, out_dir: Path, warmup: int,
+                   sets_root: Path = SETS_ROOT) -> list[str]:
+    cmd = [sys.executable, "-m", "benchmark.runner", "--url", f"http://127.0.0.1:{port}",
+           "--model", row.runner_model, "--inference-system", client_for(arm, row),
+           "--request-type", wl.request_type, "--profiling-type", "closed_loop", "--max-concurrency", str(c),
+           "--num-requests", str(wl.num_requests(c)), "--num-warmup", str(warmup), "--output-dir", str(out_dir),
+           "--local-cache", str(out_dir.parent / ".runner-cache")]
+    if row.runner_model_id:
+        cmd += ["--model-id", row.hf_id]
+    if wl.prompts.startswith("set:"):
+        cmd += ["--dataset", "sample_set", "--sample-set-dir", str(sets_root / "sets" / wl.prompts[4:])]
+    else:
+        cmd += ["--dataset", "text", "--request-txt-file", str(REPO / wl.prompts)]
+    if wl.output_len:
+        cmd += ["--ignore-eos", "--output-len-min", str(wl.output_len), "--output-len-max", str(wl.output_len)]
+    if wl.unique_prompts:
+        cmd += ["--unique-prompts"]
+    if row.family == "text":
+        cmd += ["--chat-template-kwargs", json.dumps({"enable_thinking": False})]
+    return cmd
+
+
+# --- cell statistics ------------------------------------------------------------------------
+
+def _p(stats: dict | None, key: str):
+    return (stats or {}).get(key)
+
+
+def repeat_stats(results: dict, family: str, input_seconds: list[float] | None = None,
+                 output_len: int | None = None) -> dict:
+    """The numbers one runner invocation contributes to a cell. With a fixed output length, tok/s
+    counts at most that many tokens per request (mstar sends one token past max_tokens)."""
+    agg = results.get("aggregate") or {}
+    out = {"completed": results.get("completed"), "failed": results.get("failed"),
+           "wall_s": results.get("wall_time_s"), "req_s": results.get("request_throughput"),
+           "e2e_p50_s": _p(agg.get("e2e_latency_s"), "p50"), "e2e_p95_s": _p(agg.get("e2e_latency_s"), "p95")}
+    per = results.get("per_request") or []
+    if family == "text":
+        ttft = (agg.get("ttft_s") or {}).get("text")
+        itl = (agg.get("itl_s") or {}).get("text")
+        tpots = []
+        for r in per:
+            n, t0 = r.get("output_text_tokens") or 0, (r.get("ttft_s") or {}).get("text")
+            if n > 1 and t0 is not None:
+                tpots.append((r["jct_ms"] / 1000.0 - t0) / (n - 1))
+        tok_s = agg.get("text_token_throughput")
+        wall = results.get("wall_time_s")
+        if output_len and per and wall:
+            tok_s = sum(min(r.get("output_text_tokens") or 0, output_len) for r in per) / wall
+        out.update(ttft_p50_s=_p(ttft, "p50"), ttft_p95_s=_p(ttft, "p95"), itl_p50_s=_p(itl, "p50"),
+                   itl_p95_s=_p(itl, "p95"), tpot_p50_s=statistics.median(tpots) if tpots else None,
+                   tok_s=tok_s, tok_s_raw=agg.get("text_token_throughput"), out_tokens=agg.get("total_text_tokens"),
+                   out_tokens_per_req=(agg.get("total_text_tokens") or 0) / max(len(per), 1),
+                   in_tokens_per_req=(agg.get("total_input_tokens") or 0) / max(len(per), 1))
+    elif family == "tts":
+        ttfa = (agg.get("ttft_s") or {}).get("audio")
+        out.update(ttfa_p50_s=_p(ttfa, "p50"), ttfa_p95_s=_p(ttfa, "p95"), rtf_p50=_p(agg.get("rtf"), "p50"),
+                   audio_s_per_s=agg.get("audio_seconds_throughput"),
+                   audio_s_per_req=agg.get("audio_duration_mean_s"))
+    elif family == "asr":
+        if input_seconds and per and results.get("wall_time_s"):
+            secs = sum(input_seconds[r["request_id"] % len(input_seconds)] for r in per)
+            out["rtfx"] = secs / results["wall_time_s"]
+    return out
+
+
+def summarize_repeats(repeats: list[dict]) -> dict:
+    """Median and min/max of every numeric field over the repeats."""
+    keys = sorted({k for r in repeats for k, v in r.items() if isinstance(v, (int, float)) and v is not None})
+    out = {}
+    for k in keys:
+        vals = [r[k] for r in repeats if isinstance(r.get(k), (int, float))]
+        if vals:
+            out[k] = {"median": statistics.median(vals), "min": min(vals), "max": max(vals), "n": len(vals)}
+    return out
+
+
+def spread(summary: dict, key: str) -> float | None:
+    s = summary.get(key)
+    if not s or not s["median"]:
+        return None
+    return (s["max"] - s["min"]) / abs(s["median"])
+
+
+def cotenants(job: str | None) -> dict:
+    """Who else is on this node: workstream markers for the job and our python/apptainer processes."""
+    users_dir = WORK / "amd/jobs/active" / f"{job}.users"
+    markers = sorted(p.name for p in users_dir.iterdir()) if job and users_dir.is_dir() else []
+    p = subprocess.run(["pgrep", "-u", os.environ.get("USER", ""), "-af", "python|apptainer"], capture_output=True,
+                       text=True, check=False)
+    procs = [ln for ln in p.stdout.splitlines() if "pgrep" not in ln]
+    return {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "markers": markers, "loadavg": os.getloadavg(),
+            "processes": procs}
+
+
+# --- the driver ----------------------------------------------------------------------------
+
+@dataclass
+class Plan:
+    table: tables.Table
+    rows: list[Row]
+    arms: list[str]
+    workloads: list[tables.Workload]
+    gpus: list[int]
+    run_dir: Path
+    worktree: Path
+    port_base: int
+    repeats: int
+    lanes: int = 1
+    dry: bool = False
+    correctness: bool = True
+    correctness_src: Path | None = None
+    numa: bool = False
+    resume: bool = False
+    expect_gpus: int | None = None
+    log_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def log(self, msg: str) -> None:
+        line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+        with self.log_lock:
+            print(line, flush=True)
+            with open(self.run_dir / "sweep.log", "a") as f:
+                f.write(line + "\n")
+
+
+def _numa_of(gpu: int) -> int | None:
+    try:
+        out = subprocess.run(["amd-smi", "static", "--numa", "-g", str(gpu), "--json"], capture_output=True,
+                             text=True, timeout=120, check=False).stdout
+        doc = json.loads(out[out.find("["):]) if "[" in out else json.loads(out)
+        entry = doc[0] if isinstance(doc, list) else doc
+        node = (entry.get("numa") or {}).get("node")
+        return int(node) if node is not None else None
+    except (ValueError, KeyError, IndexError, TypeError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path) -> dict:
+    cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
+    done = cell_dir / "cell.json"
+    if plan.resume and done.is_file() and json.loads(done.read_text()).get("status") != "error":
+        return json.loads(done.read_text())
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    input_seconds = None
+    if row.family == "asr" and wl.prompts.startswith("set:"):
+        man = json.loads((SETS_ROOT / "sets" / wl.prompts[4:] / "manifest.json").read_text())
+        input_seconds = [float(it["params"]["duration_s"]) for it in man["items"]]
+    attempts = []
+    for attempt in (1, 2):
+        reps = []
+        for k in range(1, plan.repeats + 1):
+            rdir = cell_dir / f"a{attempt}r{k}"
+            rdir.mkdir(parents=True, exist_ok=True)
+            warm = wl.warmup_waves_first if k == 1 else wl.warmup_waves_next
+            cmd = runner_command(arm, row, wl, c, port, rdir, warm)
+            (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
+            (rdir / "command.txt").write_text(shlex.join(cmd) + "\n")
+            env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]),
+                   "HF_HUB_OFFLINE": "1"}
+            t0 = time.monotonic()
+            with open(rdir / "bench.log", "w") as log:
+                p = subprocess.run(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
+            res_path = rdir / "results.json"
+            if p.returncode != 0 or not res_path.is_file():
+                reps.append({"error": f"runner rc {p.returncode}", "dir": str(rdir)})
+                continue
+            st = repeat_stats(json.loads(res_path.read_text()), row.family, input_seconds, wl.output_len)
+            st.update(dir=str(rdir), client_wall_s=round(time.monotonic() - t0, 1))
+            if st.get("failed"):
+                st["error"] = f"{st['failed']} failed requests"
+            reps.append(st)
+        good = [r for r in reps if "error" not in r]
+        summary = summarize_repeats(good)
+        sp = spread(summary, wl.primary[0])
+        attempts.append({"attempt": attempt, "repeats": reps, "summary": summary, "spread": sp})
+        if len(good) == len(reps) and (sp is None or sp <= plan.table.spread_limit or plan.repeats < 2):
+            break
+        if len(good) < len(reps):
+            break  # failures are not noise; a re-run would not fix them
+        plan.log(f"  {arm.name} {row.name} {wl.name} c={c}: spread {sp:.1%} > {plan.table.spread_limit:.0%}, re-run")
+    last = attempts[-1]
+    flags = []
+    if len(attempts) > 1:
+        flags.append("rerun")
+        if last["spread"] is not None and last["spread"] > plan.table.spread_limit:
+            flags.append("noisy")
+    errors = [r["error"] for r in last["repeats"] if "error" in r]
+    cell = {"status": "error" if errors else "done", "arm": arm.name, "row": row.name, "workload": wl.name,
+            "concurrency": c, "num_requests": wl.num_requests(c), "summary": last["summary"],
+            "spread": last["spread"], "primary": wl.primary[0], "flags": flags, "errors": errors,
+            "attempts": attempts}
+    done.write_text(json.dumps(cell, indent=1))
+    return cell
+
+
+def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: str) -> dict:
+    arm_dir = plan.run_dir / row.name / arm.name
+    summary_path = arm_dir / "arm.json"
+    if plan.resume and summary_path.is_file() and json.loads(summary_path.read_text()).get("status") == "done":
+        plan.log(f"{row.name}/{arm.name}: done earlier, skipped")
+        return json.loads(summary_path.read_text())
+    arm_dir.mkdir(parents=True, exist_ok=True)
+    info: dict = {"arm": arm.name, "row": row.name, "gpus": gpus, "port": port, "lane": lane, "status": "running",
+                  "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cells": []}
+    numa = _numa_of(gpus[0]) if plan.numa else None
+    server = None
+    hlth = health.ArmHealth(arm_dir / "health", gpus)
+    try:
+        if arm.engine != "reference":
+            server = Launch(arm=arm, row=row, gpus=gpus, port=port, run_dir=arm_dir / "server", worktree=plan.worktree,
+                            numa_node=numa, lane=lane)
+            plan.log(f"{row.name}/{arm.name}: starting on GPUs {gpus} port {port}")
+            info["startup"] = server.start()
+            plan.log(f"{row.name}/{arm.name}: ready in {info['startup']['ready_s']} s, first request "
+                     f"{info['startup']['first_request_s']} s")
+            if plan.correctness and row.family == "text":
+                from benchmark.amd import correctness
+                try:
+                    info["correctness_pass"] = correctness.text_pass(plan, row, arm, port, arm_dir / "correctness")
+                except Exception:
+                    info["correctness_pass"] = {"error": traceback.format_exc()[-3000:]}
+                    plan.log(f"{row.name}/{arm.name}: correctness pass failed, see arm.json")
+        hlth.begin()
+        if arm.engine == "reference":
+            from benchmark.amd import reference
+            info["reference"] = reference.run_arm(plan, row, arm, gpus, arm_dir)
+        else:
+            for wl in plan.workloads:
+                if wl.family != row.family:
+                    continue
+                for c in wl.concurrency:
+                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir)
+                    s = cell["summary"].get(wl.primary[0], {})
+                    plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
+                             f"{s.get('median', float('nan')):.4g} spread "
+                             f"{cell['spread'] if cell['spread'] is not None else float('nan'):.1%} "
+                             f"{' '.join(cell['flags'])} {'; '.join(cell['errors'])[:200]}")
+                    info["cells"].append({k: cell[k] for k in ("workload", "concurrency", "status", "flags")})
+        info["health"] = hlth.end()
+        hlth = None
+        info["status"] = "done"
+    except Exception:
+        info["status"] = "error"
+        info["error"] = traceback.format_exc()[-5000:]
+        plan.log(f"{row.name}/{arm.name}: ERROR {info['error'].strip().splitlines()[-1][:300]}")
+        if hlth and hlth.monitor:
+            info["health"] = hlth.end()
+    finally:
+        if server is not None:
+            info["stop"] = server.stop()
+            if info["stop"].get("leftover_pids"):
+                plan.log(f"{row.name}/{arm.name}: leftover processes after stop: {info['stop']['leftover_pids']}")
+        info["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        summary_path.write_text(json.dumps(info, indent=1, default=str))
+    return info
+
+
+def run_lane(plan: Plan, lane: str, gpus: list[int], rows: list[Row], port: int) -> None:
+    for i, row in enumerate(rows):
+        arms = catalog.arms_for(row, plan.arms)
+        # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
+        k = i % len(arms) if arms else 0
+        for arm in arms[k:] + arms[:k]:
+            run_arm(plan, row, arm, gpus[: row.gpus], port, lane)
+
+
+def assign_lanes(rows: list[Row], gpus: list[int], lanes: int) -> list[tuple[list[int], list[Row]]]:
+    """Split the GPUs into ``lanes`` equal groups and give each row to the lane with the least work."""
+    size = len(gpus) // lanes
+    if size < max(r.gpus for r in rows):
+        raise ValueError(f"{lanes} lanes on {len(gpus)} GPUs leaves {size} per lane, a row needs "
+                         f"{max(r.gpus for r in rows)}")
+    groups = [(gpus[i * size:(i + 1) * size], []) for i in range(lanes)]
+    load = [0] * lanes
+    for row in sorted(rows, key=lambda r: -r.gpus):
+        j = min(range(lanes), key=lambda x: load[x])
+        groups[j][1].append(row)
+        load[j] += 1
+    return groups
+
+
+def check_node(plan: Plan, node_type: str) -> dict:
+    part = os.environ.get("SLURM_JOB_PARTITION", "")
+    rec = host_record(plan.gpus)
+    names = {g: (v or {}).get("market_name") for g, v in rec.get("gpus", {}).items()}
+    info = {"partition": part, "host": socket.gethostname(), "gpu_names": names, "node_type": node_type}
+    want = NODE_TYPES.get(node_type, node_type)
+    wrong = {g: n for g, n in names.items() if not n or want.upper() not in str(n).upper()}
+    if not plan.dry:
+        if BENCH_PARTITIONS.get(part) != node_type:
+            raise SystemExit(f"partition {part!r} is not a {node_type} benchmark partition; use --dry for functional "
+                             "runs")
+        if wrong or len(names) < len(plan.gpus):
+            raise SystemExit(f"GPUs are not all {want}: {names}")
+    elif wrong:
+        info["warning"] = f"GPUs not reported as {want}: {wrong}"
+    return info
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--table", required=True, choices=sorted(tables.TABLES))
+    ap.add_argument("--node-type", required=True, choices=sorted(NODE_TYPES))
+    ap.add_argument("--gpus", required=True, help="GPUs this run owns, e.g. 0,1,2,3")
+    ap.add_argument("--worktree", default=str(REPO), help="mstar checkout the mstar arm serves")
+    ap.add_argument("--arms", default=None, help="comma list (default: the table's)")
+    ap.add_argument("--rows", default=None, help="comma list (default: the table's)")
+    ap.add_argument("--workloads", default=None, help="comma list (default: the table's)")
+    ap.add_argument("--repeats", type=int, default=None)
+    ap.add_argument("--concurrency", default=None, help="comma list replacing every workload's (dry runs)")
+    ap.add_argument("--lanes", type=int, default=1, help="rows run in parallel on disjoint GPU groups")
+    ap.add_argument("--numa", action="store_true", help="bind each server to its GPU's NUMA node")
+    ap.add_argument("--port-base", type=int, default=8400)
+    ap.add_argument("--expect-gpus", type=int, default=None, help="node GPU count for the health check")
+    ap.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT))
+    ap.add_argument("--run-id", default=None)
+    ap.add_argument("--resume", action="store_true", help="keep finished arms and cells of an existing run-id")
+    ap.add_argument("--dry", action="store_true", help="functional run on any node; the table says so")
+    ap.add_argument("--no-correctness", action="store_true")
+    ap.add_argument("--correctness-src", default=None,
+                    help="checkout with benchmark/correctness (default: this tree, else a pinned export of "
+                         "users/atindra/ws-k-correctness)")
+    ap.add_argument("--skip-health", action="store_true", help="dry runs only")
+    args = ap.parse_args(argv)
+
+    table = tables.TABLES[args.table]
+    rows = [catalog.ROWS[r] for r in (args.rows.split(",") if args.rows else table.rows)]
+    arms = args.arms.split(",") if args.arms else list(table.arms)
+    wls = [tables.WORKLOADS[w] for w in (args.workloads.split(",") if args.workloads else table.workloads)]
+    if args.concurrency:
+        conc = tuple(int(x) for x in args.concurrency.split(","))
+        wls = [dataclasses.replace(w, concurrency=conc) for w in wls]
+    gpus = gpu_list(args.gpus)
+    if args.skip_health and not args.dry:
+        raise SystemExit("--skip-health is for --dry runs only")
+    job = os.environ.get("SLURM_JOB_ID", "nojob")
+    run_id = args.run_id or f"{datetime.datetime.now():%Y%m%dT%H%M%S}-{socket.gethostname().split('.')[0]}-{job}"
+    run_dir = Path(args.run_root) / table.name / run_id
+    if run_dir.exists() and not args.resume:
+        raise SystemExit(f"{run_dir} exists; pass --resume to continue it")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    plan = Plan(table=table, rows=rows, arms=arms, workloads=wls, gpus=gpus, run_dir=run_dir,
+                worktree=Path(args.worktree).resolve(), port_base=args.port_base,
+                repeats=args.repeats or table.repeats, lanes=args.lanes, dry=args.dry,
+                correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
+                expect_gpus=args.expect_gpus)
+    node = check_node(plan, args.node_type)
+    if plan.correctness:
+        from benchmark.amd import correctness
+        plan.correctness_src = correctness.prepare_source(run_dir, args.correctness_src)
+    meta = {"table": table.name, "note": table.note, "run_id": run_id, "dry": args.dry, "node": node,
+            "job": job, "gpus": gpus, "rows": [r.name for r in rows], "arms": arms, "workloads": [w.name for w in wls],
+            "concurrency": {w.name: list(w.concurrency) for w in wls},
+            "repeats": plan.repeats, "spread_limit": table.spread_limit, "lanes": args.lanes, "numa": args.numa,
+            "worktree": str(plan.worktree), "driver": str(REPO), "argv": sys.argv,
+            "correctness_src": str(plan.correctness_src) if plan.correctness_src else None,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    (run_dir / "sweep.json").write_text(json.dumps(meta, indent=1, default=str))
+    plan.log(f"table {table.name} -> {run_dir}")
+
+    if not args.skip_health:
+        res = health.check(run_dir / "health", args.expect_gpus, gpus, name="check_before")
+        plan.log(f"node health: {res['verdict']['status']} {'; '.join(res['verdict']['reasons'])[:400]}")
+        if res["verdict"]["status"] == "FAIL":
+            if not args.dry:
+                (run_dir / "ABORTED").write_text("node health check failed:\n" + "\n".join(res["verdict"]["reasons"]))
+                plan.log("aborted: node health FAIL")
+                return 1
+            plan.log("dry run: continuing past the health FAIL")
+        health.snapshot(run_dir / "health" / "snapshot_table_before.txt")
+
+    lanes = assign_lanes(rows, gpus, args.lanes)
+    threads = []
+    for i, (lane_gpus, lane_rows) in enumerate(lanes):
+        if not lane_rows:
+            continue
+        port = args.port_base + 10 * i
+        name = f"lane{i}" if args.lanes > 1 else ""
+        t = threading.Thread(target=run_lane, args=(plan, name, lane_gpus, lane_rows, port), name=name or "lane0")
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    if not args.skip_health:
+        health.snapshot(run_dir / "health" / "snapshot_table_after.txt")
+        health.check(run_dir / "health", args.expect_gpus, gpus, name="check_after")
+    meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    (run_dir / "sweep.json").write_text(json.dumps(meta, indent=1, default=str))
+    if plan.correctness:
+        from benchmark.amd import correctness
+        plan.log("scoring correctness")
+        correctness.score_run(run_dir, gpu=gpus[0], log=plan.log)
+    from benchmark.amd import table as table_writer
+    table_writer.write(run_dir)
+    plan.log(f"wrote {run_dir / 'table.md'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
