@@ -173,6 +173,7 @@ class VideoFamily(MathSdpaReference, Family):
             sc.metrics["reference_vs_math_sdpa_reference_psnr_db"] = M.distribution(spread)
             sc.notes.append("The reference against itself with math SDPA, per-video median frame PSNR: median "
                             f"{sc.metrics['reference_vs_math_sdpa_reference_psnr_db'].get('median')} dB.")
+            self.calibrated_verdict(sc, spread, statistics.median(medians) if medians else None)
         if medians:
             med = statistics.median(medians)
             sc.metrics["per_video_median_frame_psnr_db"] = M.distribution(medians)
