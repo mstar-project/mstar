@@ -573,8 +573,24 @@ Platform defaults
 Before it spawns workers, the conductor sets the platform's process
 environment defaults (``Platform.process_env_defaults``, applied by
 ``mstar.platforms.apply_process_env_defaults``) with
-``os.environ.setdefault``, so anything you export wins. No platform sets any
-yet, ROCm included. A default goes in only with a measured win.
+``os.environ.setdefault``, so anything you export wins. A default goes in
+only with a measured win.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Variable
+     - Platform
+     - Default
+     - Why
+   * - ``MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC``
+     - ROCm
+     - ``0``
+     - Turns off MIOpen's split-K implicit-GEMM conv solver, which is not
+       deterministic, so same-seed outputs repeat (Waypoint's TAEHV decoder,
+       the Wan VAE's tiled decode). Costs about 1% on MI300X: a Wan
+       480x832x33 decode 1.030 to 1.039 s, the TAEHV conv it changes 72 to
+       76 us. Set by ``RocmPlatform.process_env_defaults``.
 
 The ROCm libraries read their own variables (``AITER_JIT_DIR``,
 ``AITER_ROOT_DIR``, ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLASHINFER_WORKSPACE_BASE``,
