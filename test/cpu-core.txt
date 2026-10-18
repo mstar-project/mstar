@@ -63,6 +63,7 @@ test/modular/test_streams.py
 test/modular/test_platforms.py
 test/modular/test_platform_dispatch.py
 test/modular/test_rocm_op_dispatch.py
+test/modular/test_fused_moe_backend.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
 test/modular/test_model_registration.py
