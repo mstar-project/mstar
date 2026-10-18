@@ -378,6 +378,55 @@ def test_plan_windows_cuts_only_bounded_models(tmp_path):
     assert len(short) == 1
 
 
+def test_plan_windows_drops_a_tail_too_short_to_hold_speech(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    import numpy as np
+
+    path = tmp_path / "long.wav"
+    # silence cuts at the boundary, leaving 10 ms that a model would refuse
+    sf.write(path, np.zeros(16_000 * 60 + 160, dtype="float32"), 16_000)
+    windows = serving_transcriptions.plan_windows(str(path), 30.0, tmp_path)
+    assert [round(w.duration, 3) for w in windows] == [30.0, 30.0]
+    planner = serving_transcriptions.WindowPlanner(str(path), 30.0, tmp_path)
+    assert planner.done(60.0) and not planner.done(59.9)
+
+
+@pytest.mark.parametrize("adapter", [adapters.HiggsAudioAdapter(), adapters.WhisperAdapter()], ids=["higgs", "whisper"])
+def test_windows_without_timestamps_are_one_segment_each(adapter):
+    """A window that decoded no timestamps (Higgs never emits them, and M*
+    Whisper decodes with ``<|notimestamps|>``) is one segment spanning it, so
+    the captions are timed to the windows."""
+    req = TranscriptionRequest(model="higgs_audio", response_format="srt")
+    windows = [
+        serving_transcriptions.Window(path="", offset=0.0, duration=30.0, raw_text="one"),
+        serving_transcriptions.Window(path="", offset=30.0, duration=15.0, raw_text="two"),
+    ]
+    t = serving_transcriptions.merge_windows(windows, adapter, req)
+    assert t.text == "one two"
+    assert [(s["start"], s["end"], s["text"]) for s in t.segments] == [(0.0, 30.0, "one"), (30.0, 45.0, "two")]
+
+
+def test_cleanup_while_a_thread_cuts_leaves_no_files(tmp_path, monkeypatch):
+    sf = pytest.importorskip("soundfile")
+    import numpy as np
+
+    path = tmp_path / "long.wav"
+    sf.write(path, np.zeros(16_000 * 75, dtype="float32"), 16_000)
+    planner = serving_transcriptions.WindowPlanner(str(path), 30.0, tmp_path)
+    write = serving_transcriptions.media_io.write_wav
+
+    def disconnect_after_a_window(*args, **kwargs):
+        # a client disconnect runs the request's cleanup while the thread cuts on
+        out = write(*args, **kwargs)
+        planner.cleanup()
+        return out
+
+    monkeypatch.setattr(serving_transcriptions.media_io, "write_wav", disconnect_after_a_window)
+    with pytest.raises(RuntimeError):
+        planner.fixed()
+    assert not list(tmp_path.iterdir())
+
+
 @requires_audio_duration
 def test_sequential_long_form_carries_language_and_text(client_and_stub):
     client, stub = client_and_stub
@@ -672,6 +721,31 @@ def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
     assert json.loads(lines[0][len("data: "):])["type"] == "error"
     # the failed window is released too: its iterator was left mid-stream
     assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
+
+
+@requires_audio_duration
+def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
+    client, stub = client_and_stub
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("Error opening 'long.wav': Format not recognised.")
+
+    class _Decoder:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("decode_av_frame: /src/torchcodec/_core/SingleStreamDecoder.cpp")
+
+    # the header reads fine, the payload does not: libsndfile and FFmpeg both refuse it
+    monkeypatch.setattr(serving_transcriptions.media_io, "read_soundfile_capped", refuse)
+    decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
+    monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    data = {"model": "whisper_large", "long_form": "parallel"}
+    r = _post(client, data, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 400 and "could not decode" in r.text and "torchcodec" not in r.text
+    # a stream is refused the same way, before it commits to a 200
+    r = _post(client, {**data, "stream": "true"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 400 and "torchcodec" not in r.text
+    assert not stub.submits and not list(stub.upload_dir.iterdir())
 
 
 @requires_audio_duration
