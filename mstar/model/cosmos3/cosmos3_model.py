@@ -114,7 +114,6 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VAEEncoderSubmodule,
     Cosmos3VisionEncoderSubmodule,
 )
-from mstar.model.media_limits import VideoBudget
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -129,36 +128,6 @@ VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
-
-
-def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str = "ultrafast") -> bytes:
-    """H.264 mp4 bytes from uint8 frames ``[T, H, W, 3]`` through PyAV (its
-    wheel bundles FFmpeg + libx264), matching the torchcodec encoder's
-    CRF / preset / threading settings. Odd frame sizes are edge-padded to
-    even dimensions for yuv420p."""
-    import io
-    from fractions import Fraction
-
-    import av
-
-    _, h, w, _ = frames.shape
-    arr = frames.numpy()
-    if (w % 2) or (h % 2):
-        import numpy as np
-
-        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
-    buf = io.BytesIO()
-    with av.open(buf, mode="w", format="mp4") as container:
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
-        stream.width, stream.height = arr.shape[2], arr.shape[1]
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
-        for frame in arr:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return buf.getvalue()
 
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
@@ -971,42 +940,6 @@ class Cosmos3Model(Model):
             out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         return out
 
-    def load_video(self, filepath: str, device: str):
-        """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
-
-        torchcodec (the base implementation) needs system FFmpeg shared
-        libraries; where they are absent, PyAV — which ships its own — decodes
-        the same frames. The metadata carries the frame rate under
-        ``average_fps`` either way (the reasoner's frame sampling and
-        timestamps read it)."""
-        from mstar.model.base import TensorAndMetadata
-
-        try:
-            return super().load_video(filepath, device)
-        except (ImportError, RuntimeError, OSError) as exc:
-            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-            logger.warning("torchcodec video decode unavailable (%s); decoding %s with PyAV.", reason, filepath)
-        import av
-
-        budget = VideoBudget()
-        frames = []
-        with av.open(filepath) as container:
-            stream = container.streams.video[0]
-            rate = stream.average_rate or stream.guessed_rate or stream.base_rate
-            fps = float(rate) if rate else None
-            for frame in container.decode(stream):
-                budget.add(frame.height, frame.width)
-                frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
-        if not frames:
-            raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float().div_(255.0)
-        metadata = {
-            "num_frames": len(frames), "average_fps": fps,
-            "duration_seconds": (len(frames) / fps) if fps else None,
-            "height": int(video.shape[-2]), "width": int(video.shape[-1]),
-        }
-        return TensorAndMetadata(data=video, metadata=metadata)
-
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "text":
             # One sampled token per chunk, emitted as the token's raw bytes
@@ -1090,6 +1023,8 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
+                from mstar.model.components.media_io import encode_mp4_pyav
+
                 data = encode_mp4_pyav(x.permute(1, 2, 3, 0).cpu(), fps=fps, crf=18, preset=preset)
             return data
         if modality == "action":

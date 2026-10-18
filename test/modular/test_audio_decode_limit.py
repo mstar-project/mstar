@@ -9,6 +9,7 @@ the real-decoder cases skip when those are not installed.
 import sys
 import tempfile
 import types
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ import torch
 
 from mstar.api_server import media_io
 from mstar.api_server.media_io import MAX_AUDIO_SECONDS, AudioTooLongError
+from mstar.model.components import media_io as model_media
 
 # a minute past the limit
 TOO_LONG = MAX_AUDIO_SECONDS + 60
@@ -121,12 +123,26 @@ def _fake_torchcodec(monkeypatch, seconds, header_seconds=None):
     pkg.decoders = decoders
     monkeypatch.setitem(sys.modules, "torchcodec", pkg)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    # and the loaders' FFmpeg decoders take it, as where torchcodec works
+    monkeypatch.setattr(
+        model_media, "_decoders",
+        lambda: model_media._Decoders(model_media._TorchcodecAudio(), model_media._TorchcodecVideo()),
+    )
     return calls
 
 
 def _use_soundfile(monkeypatch, fake):
     monkeypatch.setitem(sys.modules, "soundfile", fake)
     return fake
+
+
+def _without_torchcodec(monkeypatch):
+    """The loaders' FFmpeg decoders where torchcodec does not load (ROCm, no FFmpeg): PyAV."""
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    monkeypatch.setattr(
+        model_media, "_decoders",
+        lambda: model_media._Decoders(model_media._FallbackAudio(), model_media._PyAVVideo()),
+    )
 
 
 @pytest.fixture
@@ -253,6 +269,42 @@ def test_omnivoice_load_audio_is_capped(monkeypatch, clip):
     model = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
     with pytest.raises(AudioTooLongError):
         OmniVoiceModel.load_audio(model, clip, "cpu")
+
+
+@pytest.mark.parametrize("seconds", [12, TOO_LONG])
+def test_loaders_without_torchcodec_are_capped(monkeypatch, clip, seconds):
+    """Where torchcodec does not load, PyAV decodes up to a second past the
+    limit and the decoded samples are held to it the same way."""
+    from mstar.model.base import Model
+    from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
+    from mstar.model.components.audio_features import load_audio_file
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    _without_torchcodec(monkeypatch)
+    _use_soundfile(monkeypatch, _NoSoundfile())
+    asked = []
+
+    def decode(self, source, sample_rate, num_channels, max_seconds=None):
+        asked.append(max_seconds)
+        played = min(seconds, max_seconds)
+        return model_media.AudioSamples(torch.zeros(num_channels, int(played * sample_rate)), sample_rate)
+
+    monkeypatch.setattr(model_media._FallbackAudio, "decode", decode)
+    omnivoice = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
+    loads = (
+        lambda: media_io.decode_audio(clip, 16000),
+        lambda: load_audio_file(clip),
+        lambda: Model.load_audio(None, clip, "cpu"),
+        lambda: ChatterboxModel._decode_audio(clip),
+        lambda: OmniVoiceModel.load_audio(omnivoice, clip, "cpu"),
+    )
+    for load in loads:
+        if seconds > MAX_AUDIO_SECONDS:
+            with pytest.raises(AudioTooLongError):
+                load()
+        else:
+            load()
+    assert asked == [MAX_AUDIO_SECONDS + 1.0] * len(loads)
 
 
 def test_soundfile_loaders_are_capped(monkeypatch, clip):
@@ -456,6 +508,20 @@ def test_real_soundfile_decode_stops_at_the_limit(tmp_path):
     audio, rate = media_io.read_soundfile_capped(str(path), max_seconds=3)
     whole, _ = sf.read(path, dtype="float32", always_2d=True)
     assert rate == 8000 and np.array_equal(audio, whole.mean(axis=1))
+
+
+def test_real_pyav_decode_stops_at_the_limit(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    _without_torchcodec(monkeypatch)
+    path = tmp_path / "a.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(bytes(2 * 2 * 8000 * 3))
+    with pytest.raises(AudioTooLongError):
+        media_io.decode_media_capped(str(path), 16000, max_seconds=2)
+    assert media_io.decode_media_capped(str(path), 16000, max_seconds=3).shape == (3 * 16000,)
 
 
 def test_blockwise_mp3_decode_equals_one_read(tmp_path, monkeypatch):
