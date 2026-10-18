@@ -45,14 +45,14 @@ NODE_TYPES = {"mi325x": "MI325X", "mi300x": "MI300X"}
 
 
 def client_for(arm: Arm, row: Row) -> str:
-    # mstar's Whisper has no chat route; its native /generate is the one to time.
+    # Every ASR arm is timed on the same OpenAI transcription route.
     if arm.engine == "mstar" and row.family == "asr":
-        return "ours"
+        return "openai_transcribe"
     return arm.client
 
 
 def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, out_dir: Path, warmup: int,
-                   sets_root: Path = SETS_ROOT) -> list[str]:
+                   sets_root: Path = SETS_ROOT, request_kwargs: dict | None = None) -> list[str]:
     cmd = [sys.executable, "-m", "benchmark.runner", "--url", f"http://127.0.0.1:{port}",
            "--model", row.runner_model, "--inference-system", client_for(arm, row),
            "--request-type", wl.request_type, "--profiling-type", "closed_loop", "--max-concurrency", str(c),
@@ -70,6 +70,11 @@ def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, o
         cmd += ["--unique-prompts"]
     if row.family == "text":
         cmd += ["--chat-template-kwargs", json.dumps({"enable_thinking": False})]
+    if request_kwargs:
+        cmd += ["--request-kwargs", json.dumps(request_kwargs)]
+    if row.family == "omni" and client_for(arm, row) == "vllm_omni":
+        # Raw PCM like mstar's chat stream, instead of vllm-omni's default WAV segments.
+        cmd += ["--chat-audio-format", "pcm"]
     return cmd
 
 
@@ -114,6 +119,16 @@ def repeat_stats(results: dict, family: str, input_seconds: list[float] | None =
         if input_seconds and per and results.get("wall_time_s"):
             secs = sum(input_seconds[r["request_id"] % len(input_seconds)] for r in per)
             out["rtfx"] = secs / results["wall_time_s"]
+    elif family == "omni":
+        ttfa, ttft = (agg.get("ttft_s") or {}).get("audio"), (agg.get("ttft_s") or {}).get("text")
+        out.update(ttfa_p50_s=_p(ttfa, "p50"), ttfa_p95_s=_p(ttfa, "p95"), text_ttft_p50_s=_p(ttft, "p50"),
+                   rtf_p50=_p(agg.get("rtf"), "p50"), audio_s_per_s=agg.get("audio_seconds_throughput"),
+                   audio_s_per_req=agg.get("audio_duration_mean_s"))
+    elif family == "image":
+        out["images_per_s"] = results.get("request_throughput")
+    elif family == "video":
+        rate = results.get("request_throughput")
+        out["clips_per_min"] = 60.0 * rate if rate else None
     return out
 
 
@@ -211,7 +226,7 @@ def run_client(cmd: list[str], env: dict, log_path: Path) -> tuple[int, float]:
 
 
 def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path,
-             gpus: list[int], numa: int | None = None) -> dict:
+             gpus: list[int], numa: int | None = None, request_kwargs: dict | None = None) -> dict:
     cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
     done = cell_dir / "cell.json"
     if plan.resume and done.is_file() and json.loads(done.read_text()).get("status") != "error":
@@ -228,7 +243,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             rdir = cell_dir / f"a{attempt}r{k}"
             rdir.mkdir(parents=True, exist_ok=True)
             warm = wl.warmup_waves_first if k == 1 else wl.warmup_waves_next
-            cmd = runner_command(arm, row, wl, c, port, rdir, warm)
+            cmd = runner_command(arm, row, wl, c, port, rdir, warm, request_kwargs=request_kwargs)
             if numa is not None:
                 cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
             (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
@@ -294,13 +309,20 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
             info["startup"] = server.start()
             plan.log(f"{row.name}/{arm.name}: ready in {info['startup']['ready_s']} s, first request "
                      f"{info['startup']['first_request_s']} s")
-            if plan.correctness and row.family == "text":
+            if plan.correctness and row.family in ("text", "omni"):
                 from benchmark.amd import correctness
+                passes = {"text": correctness.text_pass, "omni": correctness.omni_pass}
                 try:
-                    info["correctness_pass"] = correctness.text_pass(plan, row, arm, port, arm_dir / "correctness")
+                    info["correctness_pass"] = passes[row.family](plan, row, arm, port, arm_dir / "correctness")
                 except Exception:
                     info["correctness_pass"] = {"error": traceback.format_exc()[-3000:]}
                     plan.log(f"{row.name}/{arm.name}: correctness pass failed, see arm.json")
+        request_kwargs = None
+        if row.family in ("image", "video"):
+            from benchmark.amd import correctness
+            # The same steps, guidance, size and frames the correctness reference was made with.
+            request_kwargs = correctness.media_request_kwargs(plan, row)
+            info["request_kwargs"] = request_kwargs
         hlth.begin()
         if arm.engine == "reference":
             from benchmark.amd import reference
@@ -310,7 +332,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 if wl.family != row.family:
                     continue
                 for c in wl.concurrency:
-                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa)
+                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa, request_kwargs)
                     s = cell["summary"].get(wl.primary[0], {})
                     plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
                              f"{s.get('median', float('nan')):.4g} spread "
