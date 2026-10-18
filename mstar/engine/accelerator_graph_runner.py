@@ -823,11 +823,15 @@ class AcceleratorGraphRunner:
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
-                    if spec.slot == 0:
+                    cost = CaptureCost(warmed.peak, None, warmed.returned, self._num_slots)
+                    if spec.slot == 0 and self._capture_refusal(spec) is not None:
+                        # runs eagerly: its peak counts toward the floor, and
+                        # without a graph the plan never takes it
+                        self._capture_costs[spec.bucket] = cost
+                    elif spec.slot == 0:
                         walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
                         self._capture_costs[spec.bucket], lent = _size_in_walk(
-                            captured.setdefault(walk, []),
-                            CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
+                            captured.setdefault(walk, []), cost, True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype,
@@ -917,16 +921,20 @@ class AcceleratorGraphRunner:
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
         captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
+        # buckets a resource cannot run inside a graph run eagerly; sizing gave
+        # them no graph, so the plan never holds one
+        refused = self._refused_buckets(slot_specs)
         for spec in sorted(slot_specs, key=lambda spec: -costs[spec.bucket]):
-            if spec.bucket not in planned:
+            # every rank refuses the same buckets, so they skip together
+            if spec.bucket not in planned or spec.bucket in refused:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
 
-            # entered on every rank, pass or fail: finishing a capture can
-            # itself be collective (see GraphCaptureScope)
+            # Every rank enters this, pass or fail, since finishing a capture
+            # can be collective (see GraphCaptureScope).
             with self._comm_group.tp_group.graph_capture() as capture:
                 try:
                     slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -969,25 +977,50 @@ class AcceleratorGraphRunner:
 
         self._dummy_rows.release_all()
         self._report_dropped(
-            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed
+            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed, refused,
         )
 
         mem_after = self._graph_backend.memory_allocated()
         self._log_memory(mem_before, mem_after)
 
-    def _report_dropped(self, wanted: list, kept) -> None:
+    def _report_dropped(self, wanted: list, kept, refused=frozenset()) -> None:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
         10-20x latency cliff otherwise, and one failure used to take every
-        later bucket with it."""
+        later bucket with it. A refused one is listed too, but was explained
+        when it was refused, so the error names only the failures."""
         wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
         self.dropped_buckets = [key for key in wanted if key not in kept]
-        if self.dropped_buckets:
+        failed = [key for key in self.dropped_buckets if key not in refused]
+        if failed:
             logger.error(
                 "AcceleratorGraphRunner[%s]: captured %d of %d buckets; these run "
                 "eagerly: %s",
                 self._submodule_name, len(wanted) - len(self.dropped_buckets),
-                len(wanted), self.dropped_buckets,
+                len(wanted), failed,
             )
+
+    def _capture_refusal(self, spec: CGSlotSpec) -> str | None:
+        """Why one of this node's resources cannot run ``spec`` in a graph."""
+        return self._step_runner.capture_refusal(
+            spec, node_name=self._submodule_name,
+        )
+
+    def _refused_buckets(self, slot_specs: list[CGSlotSpec]) -> set[BucketKey]:
+        """The buckets a resource of this node cannot run in a graph, each
+        logged once with its reason. Read off the spec and the resources'
+        configuration alone, so every rank refuses the same ones."""
+        refused: set[BucketKey] = set()
+        for spec in slot_specs:
+            if spec.slot != 0 or spec.bucket in refused:
+                continue
+            refusal = self._capture_refusal(spec)
+            if refusal is not None:
+                refused.add(spec.bucket)
+                logger.warning(
+                    "Accelerator graph bucket %s for %s runs eagerly: %s",
+                    spec.bucket, self._submodule_name, refusal,
+                )
+        return refused
 
     def _buckets_captured_everywhere(
         self,
@@ -1775,11 +1808,15 @@ class PiecewiseAcceleratorGraphRunner:
                             name: (value.shape, value.dtype, value.device)
                             for name, value in warmed.warm_outputs.items()
                         }
-                        if slot == 0:
-                            # a region's outputs and inputs live outside the pool, a set per graph
-                            kept = _tensor_bytes(warmed.warm_outputs) + _tensor_bytes(warmed.static_inputs)
+                        # a region's outputs and inputs live outside the pool, a set per graph
+                        kept = _tensor_bytes(warmed.warm_outputs) + _tensor_bytes(warmed.static_inputs)
+                        cost = CaptureCost(warmed.peak, None, kept, self._num_slots)
+                        if slot == 0 and self._capture_refusal(shape) is not None:
+                            # runs eagerly; see `AcceleratorGraphRunner.size_captures`
+                            self._capture_costs[self._bucket(shape)] = cost
+                        elif slot == 0:
                             self._capture_costs[self._bucket(shape)], lent = _size_in_walk(
-                                captured, CaptureCost(warmed.peak, None, kept, self._num_slots), False,
+                                captured, cost, False,
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
@@ -1871,10 +1908,13 @@ class PiecewiseAcceleratorGraphRunner:
             self._capture_costs[self._bucket(shape)].graph if sized and ok else 0
             for shape, ok in zip(ordered, planned_everywhere, strict=True)
         ], self._device, torch.amax)
+        # shapes a resource cannot run inside a graph run eagerly, refused
+        # alike on every rank (see `AcceleratorGraphRunner.warmup_and_capture`)
+        refused = self._refused_shapes(ordered)
         captured = [False] * len(ordered)
         for i in sorted(range(len(ordered)), key=lambda i: -costs[i]):
             shape = ordered[i]
-            if not planned_everywhere[i]:
+            if not planned_everywhere[i] or (shape.bs, shape.total_tokens) in refused:
                 continue
             shape_captured = True
             for slot in range(self._num_slots):
@@ -1898,7 +1938,7 @@ class PiecewiseAcceleratorGraphRunner:
                             "total_tokens=%d slot=%d", self._label, shape.bs,
                             shape.total_tokens, slot, exc_info=True,
                         )
-                # an unusable slot fails the shape, which drops it everywhere
+                # an unusable slot drops this bucket on every rank
                 if not capture.usable:
                     shape_captured = False
             captured[i] = shape_captured
@@ -1931,13 +1971,35 @@ class PiecewiseAcceleratorGraphRunner:
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
             self.dropped_shapes.append((shape.bs, shape.total_tokens))
-        if self.dropped_shapes:
+        failed = [shape for shape in self.dropped_shapes if shape not in refused]
+        if failed:
             logger.error(
                 "PiecewiseAcceleratorGraphRunner[%s]: captured %d of %d shapes; these "
                 "run eagerly: %s", self._label,
-                len(ordered) - len(self.dropped_shapes), len(ordered),
-                self.dropped_shapes,
+                len(ordered) - len(self.dropped_shapes), len(ordered), failed,
             )
+
+    def _capture_refusal(self, shape: PiecewiseCaptureShape) -> str | None:
+        """Why one of this region's resources cannot run ``shape`` in a graph."""
+        return self._step_runner.capture_refusal(
+            CGSlotSpec(bucket=self._bucket(shape), slot=0, config=self._config),
+            node_name=self._node_name,
+        )
+
+    def _refused_shapes(self, shapes: list[PiecewiseCaptureShape]) -> set[tuple[int, int]]:
+        """``(bs, total_tokens)`` of the shapes a resource cannot run in a
+        graph, each logged once; the same on every rank, as in
+        `AcceleratorGraphRunner._refused_buckets`."""
+        refused: set[tuple[int, int]] = set()
+        for shape in shapes:
+            refusal = self._capture_refusal(shape)
+            if refusal is not None:
+                refused.add((shape.bs, shape.total_tokens))
+                logger.warning(
+                    "PiecewiseAcceleratorGraphRunner[%s]: bs=%d total_tokens=%d runs "
+                    "eagerly: %s", self._label, shape.bs, shape.total_tokens, refusal,
+                )
+        return refused
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> None:
         # as in `AcceleratorGraphRunner._capture_one`
