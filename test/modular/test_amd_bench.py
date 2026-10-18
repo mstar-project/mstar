@@ -57,7 +57,7 @@ def test_runner_command_text_and_sets(tmp_path):
     assert "--chat-template-kwargs" not in tts and tts[tts.index("--num-requests") + 1] == "40"
     asr = sweep.runner_command(catalog.ARMS["mstar"], catalog.ROWS["whisper_large"], tables.WORKLOADS["asr-libri"], 8,
                                8400, tmp_path / "r1", 1)
-    assert asr[asr.index("--inference-system") + 1] == "ours"
+    assert asr[asr.index("--inference-system") + 1] == "openai_transcribe"
 
 
 def _results(per, wall=10.0, **agg):
@@ -363,3 +363,90 @@ def test_vllm_omni_deploy_overlays():
     assert sum(s["gpu_memory_utilization"] for s in placed["stages"]) < 0.95
     two = catalog.ROWS["qwen3omni_2gpu"]
     assert "--deploy-config" not in catalog.server_args(catalog.ARMS["vllm-omni"], two)[0]
+
+
+def test_sample_set_mixed_modalities_and_generator_params(tmp_path):
+    from benchmark.base import RequestType
+    from benchmark.dataset import SampleSetDataset
+
+    (tmp_path / "a.wav").write_bytes(b"RIFF")
+    (tmp_path / "i.jpg").write_bytes(b"\xff\xd8")
+    (tmp_path / "manifest.json").write_text(json.dumps({"items": [
+        {"id": "img", "prompt": "what food?", "files": {"image": "i.jpg"}, "params": {"seed": 3}},
+        {"id": "aud", "prompt": "what is said?", "files": {"audio": "a.wav"}, "params": {"seed": 4}}]}))
+    audio = SampleSetDataset(str(tmp_path), 2, RequestType.A2S)
+    assert audio.item_ids == ["aud"] and all(r.audio_path for r in audio.get_requests())
+    assert audio.get_requests()[0].model_kwargs == {}  # params only go to generators
+    with pytest.raises(ValueError):
+        SampleSetDataset(str(tmp_path), 1, RequestType.V2S)
+    (tmp_path / "manifest.json").write_text(json.dumps({"items": [
+        {"id": "00", "prompt": "a fox", "params": {"seed": 0, "height": 768, "width": 1344, "other": 1}}]}))
+    req = SampleSetDataset(str(tmp_path), 1, RequestType.T2I).get_requests()[0]
+    assert req.model_kwargs == {"seed": 0, "height": 768, "width": 1344}
+
+
+def test_media_fields_and_runner_flags(tmp_path):
+    from benchmark.base import ModelType, RequestType
+    from benchmark.request import RequestInput, _media_fields
+
+    req = RequestInput(req_type=RequestType.T2I, prompt="p", model_kwargs={"seed": 2, "height": 768, "width": 1344})
+    fields = _media_fields(ModelType.FLUX2_KLEIN.inst(), req, {"num_inference_steps": 4})
+    assert fields == {"seed": 2, "size": "1344x768", "num_inference_steps": 4}
+    img = sweep.runner_command(catalog.ARMS["sglang-diffusion"], catalog.ROWS["z_image_turbo"],
+                               tables.WORKLOADS["image-gen"], 4, 8400, tmp_path / "r", 1,
+                               request_kwargs={"num_inference_steps": 8, "guidance_scale": 0.0})
+    assert img[img.index("--inference-system") + 1] == "sglang_diffusion"
+    assert json.loads(img[img.index("--request-kwargs") + 1]) == {"num_inference_steps": 8, "guidance_scale": 0.0}
+    omni = sweep.runner_command(catalog.ARMS["vllm-omni"], catalog.ROWS["qwen3omni_colocated"],
+                                tables.WORKLOADS["omni-audio-speech"], 4, 8400, tmp_path / "r", 1)
+    assert omni[omni.index("--chat-audio-format") + 1] == "pcm" and "--ignore-eos" not in omni
+    ours = sweep.runner_command(catalog.ARMS["mstar"], catalog.ROWS["qwen3omni_colocated"],
+                                tables.WORKLOADS["omni-audio-speech"], 4, 8400, tmp_path / "r", 1)
+    assert "--chat-audio-format" not in ours and ours[ours.index("--inference-system") + 1] == "ours_openai"
+    asr = sweep.runner_command(catalog.ARMS["mstar"], catalog.ROWS["whisper_large"], tables.WORKLOADS["asr-libri"],
+                               1, 8400, tmp_path / "r", 1)
+    assert asr[asr.index("--inference-system") + 1] == "openai_transcribe"
+
+
+def test_repeat_stats_omni_image_video():
+    st = sweep.repeat_stats(_results([{"request_id": 0, "jct_ms": 900.0}], ttft_s={"audio": {"p50": 0.3},
+                                                                                     "text": {"p50": 0.1}},
+                                     rtf={"p50": 0.2}, audio_seconds_throughput=8.0), "omni")
+    assert (st["ttfa_p50_s"], st["text_ttft_p50_s"], st["audio_s_per_s"]) == (0.3, 0.1, 8.0)
+    assert sweep.repeat_stats(_results([{"request_id": 0, "jct_ms": 1.0}], wall=4.0), "image")["images_per_s"] == 0.25
+    assert sweep.repeat_stats(_results([{"request_id": 0, "jct_ms": 1.0}], wall=30.0), "video")["clips_per_min"] == 2.0
+
+
+def test_media_request_kwargs_come_from_the_correctness_families():
+    from benchmark.amd import correctness
+
+    wt = Path(__file__).resolve().parents[2]
+    plan = type("P", (), {"correctness_src": wt, "worktree": wt})()
+    assert correctness.media_request_kwargs(plan, catalog.ROWS["flux2_klein"]) == {
+        "num_inference_steps": 4, "guidance_scale": 1.0}
+    assert correctness.media_request_kwargs(plan, catalog.ROWS["z_image_turbo"]) == {
+        "num_inference_steps": 8, "guidance_scale": 0.0}
+    wan = correctness.media_request_kwargs(plan, catalog.ROWS["wan22"])
+    assert {k: wan[k] for k in ("height", "width", "num_frames", "num_inference_steps", "fps", "guidance_scale")} == {
+        "height": 480, "width": 832, "num_frames": 33, "num_inference_steps": 20, "fps": 24, "guidance_scale": 5.0}
+    assert wan["negative_prompt"] == ""
+
+
+def test_omni_chat_body_and_stream():
+    import base64
+
+    from benchmark.amd import correctness
+
+    item = type("I", (), {"params": {"modality": "image"}, "files": {"image": "x.jpg"}, "prompt": "what food?"})()
+    sset = type("S", (), {"path": staticmethod(lambda rel: Path(__file__))})()
+    fam = type("F", (), {"max_new_tokens": 128})()
+    body = correctness.omni_chat_body(fam, sset, item, 7, "Qwen/Qwen3-Omni-30B-A3B-Instruct", "You are Qwen.")
+    user = body["messages"][1]["content"]
+    assert user[0]["type"] == "image_url" and user[0]["image_url"]["url"].startswith("data:")
+    assert body["modalities"] == ["text", "audio"] and body["audio"] == {"format": "pcm"} and body["seed"] == 7
+    pcm = b"\x01\x00\x02\x00"
+    events = [{"choices": [{"delta": {"content": "Pas"}}]}, {"choices": [{"delta": {"content": "ta"}}]},
+              {"modality": "audio", "choices": [{"delta": {"content": base64.b64encode(pcm).decode()}}]},
+              {"choices": [{"delta": {"audio": {"data": base64.b64encode(pcm).decode()}}}]}]
+    stream = b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events) + b"data: [DONE]\n\n"
+    assert correctness.parse_omni_stream(stream) == (["Pas", "ta"], pcm + pcm)
