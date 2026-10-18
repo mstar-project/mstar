@@ -178,19 +178,25 @@ _MIN_SAMPLE_BITS = 4
 def probe_audio_seconds(filepath: str) -> float | None:
     """The duration an audio file's header declares, or None when it declares
     none (a sample count of 0 or libsndfile's "unknown" value) or neither
-    soundfile nor torchcodec can read it."""
+    soundfile nor the loaders' FFmpeg decoders (torchcodec, else PyAV) can
+    read it."""
     try:
         import soundfile
 
         info = soundfile.info(filepath)
         if 0 < info.frames < UNKNOWN_FRAMES and info.samplerate:
             return info.frames / info.samplerate
-    except Exception:  # noqa: BLE001, S110 -- not a libsndfile container: try torchcodec
+    except Exception:  # noqa: BLE001, S110 -- not a libsndfile container: try FFmpeg
         pass
     try:
-        from torchcodec.decoders import AudioDecoder
+        from mstar.model.components import media_io
 
-        seconds = AudioDecoder(filepath).metadata.duration_seconds_from_header
+        if media_io.uses_torchcodec():
+            from torchcodec.decoders import AudioDecoder
+
+            seconds = AudioDecoder(filepath).metadata.duration_seconds_from_header
+        else:
+            seconds = media_io.audio_header(filepath).duration
         if seconds:
             return float(seconds)
     except Exception:  # noqa: BLE001, S110 -- unreadable: the model's loader reports it

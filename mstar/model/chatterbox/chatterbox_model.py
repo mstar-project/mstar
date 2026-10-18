@@ -551,8 +551,8 @@ class ChatterboxModel(Model):
         """``[T]`` float32 at 24 kHz, mono.
 
         libsndfile (bundled with ``soundfile``) covers WAV/FLAC/OGG/MP3 without
-        any system library; torchcodec needs FFmpeg's shared libraries, which
-        the nodes may not have, so it is only the fallback for other codecs.
+        any system library; other codecs go to the FFmpeg-backed decoders of
+        ``media_io`` (torchcodec, else PyAV).
         """
         try:
             import soundfile as sf
@@ -560,15 +560,13 @@ class ChatterboxModel(Model):
             data, sr = sf.read(filepath, dtype="float32", always_2d=True)
             wav = torch.from_numpy(data).mean(dim=1)
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
-            logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            from torchcodec.decoders import AudioDecoder
+            logger.debug("soundfile could not decode %s (%s); trying media_io", filepath, exc)
+            from mstar.model.components.media_io import decode_audio
 
-            # an undecodable upload is the client's error (400); a missing
-            # decoder library above still surfaces as a server error
+            # an undecodable upload is the client's error (400)
             try:
-                decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-                return decoder.get_all_samples().data[0].float()
-            except RuntimeError as decode_exc:
+                return decode_audio(filepath, sample_rate=S3GEN_SR, num_channels=1).data[0].float()
+            except (RuntimeError, ValueError) as decode_exc:
                 raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip

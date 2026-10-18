@@ -207,13 +207,11 @@ class OmniVoiceModel(Model):
         24 kHz, and feeding it 16 kHz samples would not error — it would encode
         a reference pitched and paced wrong, and clone that.
         """
-        from torchcodec.decoders import AudioDecoder
-
         from mstar.model.base import TensorAndMetadata
+        from mstar.model.components.media_io import decode_audio
 
         rate = self.config.sample_rate
-        decoder = AudioDecoder(filepath, sample_rate=rate, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = decode_audio(filepath, sample_rate=rate, num_channels=1).data[0]
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=rate, num_channels=1)
         )
