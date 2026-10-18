@@ -137,7 +137,9 @@ def main(argv=None) -> int:
         overrides = args.override
     config_name = _config_name(args.config) if not args.rescore else prev["config"]
     model_key = cfg.get("model")
-    fam = family_for_config(config_name, model_key, cfg, _kv(args.family_opt))
+    # a rescore keeps the run's family options (set, mode, size, ...) unless the command line overrides them
+    opts = {**(prev.get("family_opts") or {}), **_kv(args.family_opt)} if args.rescore else _kv(args.family_opt)
+    fam = family_for_config(config_name, model_key, cfg, opts)
     sset = load_set(fam.set_name, args.data_root)
     sset.items = fam.select_items(sset.items)
     items = sset.items[: args.limit] if args.limit else sset.items
