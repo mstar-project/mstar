@@ -2012,6 +2012,7 @@ def main(argv: list[str] | None = None):
     api_key_guard.set(api_key)
     # The Rust frontend gets the key explicitly.
     keep_api_key_from_children(api_key)
+    logger.info("IPC sockets under %s, uploads under %s", args.socket_path_prefix, args.upload_dir)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
