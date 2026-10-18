@@ -295,6 +295,10 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
@@ -618,6 +622,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ltx-2-5-ltx2-5">LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
             </nav>
@@ -780,7 +785,13 @@ image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p><
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.5-Diffusers</span></code></p></td>
+<td><p>LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
+joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
+stereo audio. Gated; LTX-2.x Community License.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -1462,6 +1473,58 @@ Requests are therefore independent and the loop is resumable across ranks.</p>
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).</p>
 </section>
+<section id="ltx-2-5-ltx2-5">
+<h2>LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)<a class="headerlink" href="#ltx-2-5-ltx2-5" title="Link to this heading">#</a></h2>
+<p>Text-to-audio+video on <strong>Lightricks LTX-2.5</strong> (<code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.5-Diffusers</span></code>, gated):
+a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a
+48 kHz vocoder. The distilled checkpoint runs the model card’s recipes without
+guidance (single-stage: 8 sigmas); the two-stage recipe, the full (SFT) transformer,
+image-to-video and the duration head are not ported yet.</p>
+<p>Four nodes: <code class="docutils literal notranslate"><span class="pre">text_encoder</span></code> (native Gemma-4 + the text connectors), <code class="docutils literal notranslate"><span class="pre">dit</span></code> (the
+DiT scaffold’s denoise loop; video and audio latents carried in fp32; every attention
+through two ragged attention resources), <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> and <code class="docutils literal notranslate"><span class="pre">audio_decoder</span></code>. The walk follows the requested output
+modalities, so <code class="docutils literal notranslate"><span class="pre">[&quot;video&quot;]</span></code> skips the audio decode (the model still denoises both).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>ltx2_5<span class="w">            </span><span class="c1"># configs/ltx2_5.yaml: DiT on GPU 0, the other nodes on GPU 1</span>
+</pre></div>
+</div>
+<p>Request knobs (<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>): <code class="docutils literal notranslate"><span class="pre">height</span></code> / <code class="docutils literal notranslate"><span class="pre">width</span></code> (multiples of 32; default
+544x960), <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> (8k+1; default 121), <code class="docutils literal notranslate"><span class="pre">fps</span></code>, <code class="docutils literal notranslate"><span class="pre">seed</span></code>. Frames above 720p
+decode in VAE tiles (<code class="docutils literal notranslate"><span class="pre">vae_tile_min_pixels</span></code>) to bound the decode’s memory.</p>
+<p>Outputs are an H.264 <code class="docutils literal notranslate"><span class="pre">video</span></code> and a 48 kHz stereo <code class="docutils literal notranslate"><span class="pre">audio</span></code> chunk (16-bit PCM).
+<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/videos/generations</span></code> returns one mp4 with the audio muxed in as AAC
+(<code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;:</span> <span class="pre">false</span></code> in the body for video alone); the mux needs the <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> binary
+on the server’s <code class="docutils literal notranslate"><span class="pre">PATH</span></code> and falls back to video only without it.</p>
+<p>Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"></th>
+<th class="head"></th>
+<th class="head"></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>544x960x121, one request</p></td>
+<td><p>7.87 s</p></td>
+<td><p>6.23 s</p></td>
+</tr>
+<tr class="row-odd"><td><p>544x960x121, 2 concurrent</p></td>
+<td><p>7.6 videos/min</p></td>
+<td><p>12.7 videos/min</p></td>
+</tr>
+<tr class="row-even"><td><p>544x960x121, 4 concurrent</p></td>
+<td><p>7.6 videos/min</p></td>
+<td><p>14.0 videos/min</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Concurrency pays because the text encoder and decoders run on the second GPU while the
+DiT denoises another request; the DiT itself is GPU-bound (batching two requests costs
+two steps’ time).</p>
+<p>The DiT is compiled and its denoise step captured per shape (<code class="docutils literal notranslate"><span class="pre">capture_shapes</span></code>);
+other shapes run the compiled eager path, and the first request of a new shape pays
+its compile.</p>
+</section>
 <section id="flux-2-klein-flux2-klein-flux2-klein-9b">
 <h2>FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)<a class="headerlink" href="#flux-2-klein-flux2-klein-flux2-klein-9b" title="Link to this heading">#</a></h2>
 <p>Text-to-image and reference-image editing on the step-distilled <strong>FLUX.2 [klein]</strong>
@@ -1626,6 +1689,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ltx-2-5-ltx2-5">LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
   </nav></div>

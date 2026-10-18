@@ -35,6 +35,7 @@
    higgs_audio
    kokoro
    loader
+   ltx2_5
    multimodal
    nemotron_duplex
    omnivoice
