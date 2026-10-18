@@ -44,9 +44,10 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
                  retention policy releases frames past the context horizon at
                  each commit). Each finished window's latents leave the loop on
                  a streaming edge.
-    vae_decoder_ar (partition ``window_decoder``) - decodes each window behind
-                 re-decoded context while the loop denoises the next one, and
-                 emits the video per window (``stream_video``) or assembled.
+    vae_decoder_ar (partition ``window_decoder``) - decodes each window,
+                 continuing the stream's decoder cache, while the loop
+                 denoises the next one, and emits the video per window
+                 (``stream_video``) or assembled.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -160,6 +161,8 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
 
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
+
+    PREPROCESS_ONLY_KWARGS = ("action",)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -250,6 +253,7 @@ class Cosmos3Model(Model):
                         "Cosmos3Model: yaml model_kwargs key %r is not a Cosmos3Config "
                         "field; ignored.", k,
                     )
+        cfg.check_streaming_decode()
         return cfg
 
     def _load_tokenizer(self):
@@ -436,7 +440,7 @@ class Cosmos3Model(Model):
         # conductor, and the generation loop reads the K/V from the shared cache.
         prefill = GraphNode(
             name=DIT_NODE,
-            input_names=["text_inputs"],
+            input_names=["text_inputs", "action_inputs"],
             outputs=[],
         )
 
@@ -448,7 +452,7 @@ class Cosmos3Model(Model):
         def _prefill_cond_walk(cond_input: str) -> Parallel:
             return Parallel(
                 [
-                    GraphNode(name=DIT_NODE, input_names=["text_inputs"], outputs=[]),
+                    GraphNode(name=DIT_NODE, input_names=["text_inputs", "action_inputs"], outputs=[]),
                     GraphNode(
                         name=VAE_ENCODER_NODE,
                         input_names=[cond_input],
@@ -821,20 +825,20 @@ class Cosmos3Model(Model):
         prompt_parts: list[PromptPart] | None = None,
         input_metadata: dict | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         if "text" in (output_modalities or []):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
         if prompt is None:
-            return {}
+            return self._action_prompt_output({}, kwargs)
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
-            return {
+            return self._action_prompt_output({
                 "text_inputs": [
                     torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
                 ]
-            }
+            }, kwargs)
         # Both the conditional (positive) and unconditional (negative) prompts are
         # tokenized up front; the denoiser reads the second only when guidance is
         # on. Image/video prompts get the chat template + resolution/duration
@@ -860,12 +864,22 @@ class Cosmos3Model(Model):
             add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
             max_sequence_length=p["max_sequence_length"],
         )
-        return {
+        return self._action_prompt_output({
             "text_inputs": [
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
-        }
+        }, kwargs)
+
+    @staticmethod
+    def _action_prompt_output(tensors: NameToTensorList, kwargs: dict):
+        """Put conditioning values on a tensor edge; only their shape is metadata."""
+        mode = str(kwargs.get("action_mode", "")).strip().lower()
+        if mode != "forward_dynamics" or kwargs.get("action") is None:
+            return tensors
+        action = torch.as_tensor(kwargs["action"])
+        tensors["action_inputs"] = [action]
+        return ProcessPromptOutput(tensors, {"action_shape": list(action.shape)})
 
     def _process_reasoner_prompt(
         self, prompt, input_modalities, tensors, prompt_parts, input_metadata, model_kwargs,
@@ -895,6 +909,7 @@ class Cosmos3Model(Model):
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+            [p.role for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, IMAGE, VIDEO}
         if unsupported:
@@ -1000,7 +1015,15 @@ class Cosmos3Model(Model):
 
             if self._detokenizer is None or self._detokenizer.tokenizer is not self.tokenizer:
                 self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
+            ids = output.reshape(-1).tolist()
+            if not (request_kwargs or {}).get("ignore_eos"):
+                return self._detokenizer.to_bytes(ids)
+            # under ignore_eos the end token ended nothing and stays, one chunk per token
+            eos = self.config.reasoner.eos_token_id
+            return b"".join(
+                self.tokenizer.decode([i]).encode("utf-8") if i == eos else self._detokenizer.to_bytes([i])
+                for i in ids
+            )
         if modality == "image":
             import io
             import os
@@ -1262,6 +1285,8 @@ class Cosmos3Model(Model):
                 mk.get("domain_id"), mk.get("domain_name")
             )
             raw_dim = mk.get("raw_action_dim")
+            if raw_dim is None and action_mode == "forward_dynamics" and mk.get("action_shape"):
+                raw_dim = int(mk["action_shape"][-1])
             if raw_dim is None and action_mode == "forward_dynamics" and mk.get("action") is not None:
                 try:
                     raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
@@ -1279,9 +1304,8 @@ class Cosmos3Model(Model):
                     f"got {raw_dim}."
                 )
             params["raw_action_dim"] = raw_dim
-            for k in ("action_fps", "action"):
-                if k in mk:
-                    params[k] = mk[k]
+            if "action_fps" in mk:
+                params["action_fps"] = mk["action_fps"]
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
         if mk.get("generate_sound") or mk.get("sound_gen"):
@@ -1530,6 +1554,12 @@ class Cosmos3Model(Model):
             edge = GraphEdge(next_node=DIT_NODE, name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
             inputs.append(edge)
+        # Every DiT prefill declares this edge. An empty signal makes requests
+        # without action conditioning ready without allocating a tensor.
+        inputs.append(GraphEdge(
+            next_node=DIT_NODE, name="action_inputs",
+            tensor_info=input_signals.get("action_inputs", []),
+        ))
         cond_signal = "video_inputs" if video_cond else ("image_inputs" if image_cond else None)
         if cond_signal:
             edge = GraphEdge(next_node=VAE_ENCODER_NODE, name=cond_signal)
@@ -1728,11 +1758,15 @@ class Cosmos3Model(Model):
                 vae=self._build_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_AR_NODE:
-            # Shares the decoder VAE weights; only the streaming chunk state
+            # Shares the decoder VAE weights unless it decodes channels-last,
+            # which converts the VAE in place; only the streaming chunk state
             # and compile wrapper are per-node.
-            return Cosmos3VAEDecoderARSubmodule(
-                vae=self._build_vae(device), config=self.config
+            vae = (
+                self._build_decoder_only_vae(device)
+                if self.config.vae_decode_channels_last
+                else self._build_vae(device)
             )
+            return Cosmos3VAEDecoderARSubmodule(vae=vae, config=self.config)
         if node_name == AUDIO_DECODER_NODE:
             return Cosmos3AudioDecoderSubmodule(
                 sound_tokenizer=self._build_sound_tokenizer(device), config=self.config
@@ -1816,6 +1850,17 @@ class Cosmos3Model(Model):
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
         self._vae = vae.to(device).eval()
         return self._vae
+
+    def _build_decoder_only_vae(self, device: str):
+        # A separate instance (the decode needs no encoder), so converting it
+        # leaves the instance the whole-clip decoder uses untouched.
+        if self.skip_weight_loading:
+            return None
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        vae.encoder = None
+        return vae.to(device).eval()
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own fp32 instance instead of sharing the

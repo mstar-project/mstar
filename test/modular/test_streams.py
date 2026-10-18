@@ -1,7 +1,11 @@
 """``mstar.utils.streams.reset_device_scheduling``."""
+import ctypes
+
 import pytest
 import torch
 
+from mstar import platforms
+from mstar.platforms import RocmPlatform
 from mstar.utils.streams import reset_device_scheduling
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -32,3 +36,14 @@ def test_reset_device_scheduling_keeps_cuda_state_usable():
 
 def test_reset_device_scheduling_is_a_noop_off_cuda():
     reset_device_scheduling("cpu")
+
+
+def test_reset_device_scheduling_is_a_noop_on_rocm(monkeypatch):
+    # ROCm builds report a cuda device but have no libcuda to load
+    def no_libcuda(name, *args, **kwargs):
+        raise OSError(f"{name}: cannot open shared object file")
+
+    monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ctypes, "CDLL", no_libcuda)
+    reset_device_scheduling("cuda:0")

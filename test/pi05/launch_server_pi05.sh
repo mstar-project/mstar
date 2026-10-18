@@ -21,7 +21,7 @@
 #     the lerobot -> mstar state-dict remap automatically inside
 #     get_submodule(), so no manual conversion step is needed.
 #   * The server listens on TCP $PORT and uses ZMQ over IPC under
-#     /tmp/mstar_$WHO/ for the conductor / worker / API hand-off.
+#     /tmp/mstar_${WHO}_${PORT}/ for the conductor / worker / API hand-off.
 
 set -euo pipefail
 
@@ -58,7 +58,7 @@ CUDA_VISIBLE_DEVICES="${DEVICES}" python mstar/api_server/entrypoint.py \
     --config "${PI05_CONFIG_PATH}" \
     --port "${PORT}" \
     --cache-dir "${PI05_CACHE_DIR}" \
-    --socket-path-prefix "/tmp/mstar_${WHO}/" \
+    --socket-path-prefix "/tmp/mstar_${WHO}_${PORT}/" \
     --upload-dir "/tmp/mstar_uploads_${WHO}/" \
     --port $PORT \
     --tensor-comm-protocol $TENSOR_PROTOCOL \

@@ -67,9 +67,18 @@ class NodeResourceSpec(ABC):
 class ResourceReqConfig:
     """Per-request parameters for one resource, carried on the request and
     handed to that resource at ingest. Keyed by resource key, so it needs no
-    tag of its own — a marker base, with no contract beyond the hook below."""
+    tag of its own — a marker base, with no contract beyond the hooks below."""
 
     def apply_conductor_config(self, **kwargs):
+        return
+
+    def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
+        """Raise ``ValueError`` if a client-supplied value is out of range, or
+        one the resource built from ``spec`` cannot honour.
+
+        The conductor calls it at admission, so a bad request is a 400 before
+        any worker sees it.
+        """
         return
 
 

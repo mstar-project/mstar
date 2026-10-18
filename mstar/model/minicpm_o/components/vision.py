@@ -44,12 +44,13 @@ def navit_position_ids(h: int, w: int, num_patches_per_side: int) -> torch.Tenso
     coordinate bucketized onto the table's grid, not interpolated.
 
     The same float32 ops as upstream, on the CPU, so the buckets match
-    exactly at their boundaries.
+    exactly at their boundaries: its steps divide by the int32 ``tgt_sizes``,
+    a float32 step where a Python ``1 / h`` would be float64.
     """
     side = num_patches_per_side
     boundaries = torch.arange(1 / side, 1.0, 1 / side)
-    frac_h = torch.arange(0, 1 - 1e-6, 1 / h)
-    frac_w = torch.arange(0, 1 - 1e-6, 1 / w)
+    frac_h = torch.arange(0, 1 - 1e-6, 1 / torch.tensor(h, dtype=torch.int32))
+    frac_w = torch.arange(0, 1 - 1e-6, 1 / torch.tensor(w, dtype=torch.int32))
     bucket_h = torch.bucketize(frac_h, boundaries, right=True)
     bucket_w = torch.bucketize(frac_w, boundaries, right=True)
     return (bucket_h[:, None] * side + bucket_w).flatten()

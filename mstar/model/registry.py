@@ -18,8 +18,10 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "minicpm_o": ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel"),
+    "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
+    "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -74,10 +76,17 @@ HF_MODELS: dict[str, dict] = {
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
     "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    # Lightricks LTX-2.5: 22B joint audio-video DiT (distilled), Gemma-4 12B text
+    # encoder, video + audio VAEs and a 48 kHz vocoder. Gated on Hugging Face.
+    "ltx2_5": {"model_path_hf": "Lightricks/LTX-2.5-Diffusers"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # NVIDIA NemotronLabs VoiceChat-11B: full-duplex S2S -- Fast-Conformer STT
+    # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
+    # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
+    "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
@@ -136,6 +145,9 @@ HF_MODELS.update({
     f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
         for size in qwen_3_5_dense_sizes
 })
+# Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)
+MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
+HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
 
 
 def model_init_kwargs(name: str) -> dict:

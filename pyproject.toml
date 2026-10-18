@@ -38,7 +38,11 @@ dependencies = [
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
     "gdown",
-    "datasets",
+    # Floor only: every release from 2.14.5 caps fsspec, so once a newer fsspec
+    # is picked, an unbounded datasets backtracks to 1.2.1, whose tqdm<4.50 pulls
+    # transformers back to 5.10, which then fails to import GenerationMixin.
+    # 3.0 also needs tqdm>=4.66.3.
+    "datasets>=3",
 ]
 
 [project.urls]
@@ -156,6 +160,9 @@ qwen3_omni = [
     "Pillow",
     "regex",
     "qwen-omni-utils",
+    # qwen-omni-utils imports audioread for a video's audio track but does not
+    # declare it, and librosa no longer pulls it in
+    "audioread",
     "numba>=0.61",
     "torchvision",
     "torchaudio",
@@ -318,6 +325,7 @@ all = [
     "safetensors",
     "triton",
     "qwen-omni-utils",
+    "audioread",  # see the qwen3_omni extra
     "qwen-tts==0.1.1",
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel

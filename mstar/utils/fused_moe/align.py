@@ -110,6 +110,8 @@ def moe_align_block_size(
     """Sort ``topk_ids`` into expert-aligned blocks.
 
     ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly).
+    Ids ``>= num_experts`` mark skipped slots: they are never placed in
+    ``sorted_token_ids``, so no GEMM tile reads or writes them.
 
     Returns
     -------
@@ -164,19 +166,22 @@ def _moe_align_block_size_torch(
     """Vectorized PyTorch equivalent of the CUDA op, filling the buffers
     in place with the same semantics.
 
-    Assumes every entry of ``topk_ids`` is a valid expert in
-    ``[0, num_experts)`` (always true for mstar's routed dispatch).
+    Ids ``>= num_experts`` are skipped slots, excluded from the counts and
+    the scatter, matching the CUDA kernels.
     """
     device = topk_ids.device
     flat = topk_ids.reshape(-1)
     numel = flat.numel()
 
-    # Padding slots hold ``numel``; unused expert-id blocks hold 0.
-    sorted_ids.fill_(numel)
+    # Unused expert-id blocks hold 0; padding slots hold ``numel`` via ``staged``.
     expert_ids.zero_()
 
+    # Skipped slots go to an extra bucket num_experts, which is never scattered.
+    valid = flat < num_experts
+    bucketed = torch.where(valid, flat, num_experts).to(torch.int64)
+
     # Per-expert token counts, each rounded up to a multiple of block_size.
-    counts = torch.bincount(flat, minlength=num_experts)[:num_experts]
+    counts = torch.bincount(bucketed, minlength=num_experts + 1)[:num_experts]
     padded = ((counts + block_size - 1) // block_size) * block_size
 
     # Exclusive prefix sum of padded counts -> first slot of each expert.
@@ -193,10 +198,15 @@ def _moe_align_block_size_torch(
 
     # sorted_token_ids: group original token indices by expert into the
     # padded slot ranges. Intra-expert order is irrelevant to the GEMM kernel.
-    order = torch.argsort(flat, stable=True)
-    sorted_experts = flat[order].to(torch.int64)
+    order = torch.argsort(bucketed, stable=True)
+    sorted_experts = bucketed[order]
     ucounts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     ucounts[1:] = torch.cumsum(counts, dim=0)  # unpadded prefix over sorted tokens
     local_rank = torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
     dest = cumsum[sorted_experts] + local_rank
-    sorted_ids[dest] = order.to(torch.int32)
+    # Skipped slots write to a trailing dump slot, dropped on copy back.
+    n = sorted_ids.numel()
+    dest = torch.where(sorted_experts < num_experts, dest, n)
+    staged = torch.full((n + 1,), numel, dtype=torch.int32, device=device)
+    staged[dest] = order.to(torch.int32)
+    sorted_ids.copy_(staged[:n])

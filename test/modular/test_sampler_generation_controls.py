@@ -560,6 +560,23 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
 
 
 @needs_cuda
+@pytest.mark.parametrize("fused", [True, False])
+def test_top_p_one_keeps_every_token(fused):
+    """p = 1 filters nothing on either path, including the FlashInfer renorms
+    (vocabularies over ``FUSED_FILTER_MAX_VOCAB``), whose top-p expects p < 1."""
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(0)
+    dev, vocab = torch.device("cuda"), 32000
+    logits = torch.randn(3, vocab, device=dev)
+    logits[1:, 0] = 25.0  # peaked: the tail's mass rounds away against the top token
+    out = filter_top_k_top_p(
+        logits.softmax(-1), torch.tensor([0, 0, 50], dtype=torch.int32, device=dev),
+        torch.ones(3, device=dev), fused=fused,
+    )
+    assert (out > 0).sum(-1).tolist() == [vocab, vocab, 50]
+
+
+@needs_cuda
 @pytest.mark.parametrize("vocab", [6562, 1000, 16384])
 def test_fused_filter_matches_upstream(vocab):
     """The one-kernel filter against HF's warpers (``reference_probs``) row by row,
