@@ -383,6 +383,8 @@ class _PinnedConnection(http.client.HTTPConnection):
 
     def __init__(self, host: str, port: int, addrs: list, tls: bool, deadline: float):
         super().__init__(host, port, timeout=_time_left(deadline))
+        if tls:  # the Host header leaves out port 443, as HTTPSConnection does
+            self.default_port = http.client.HTTPS_PORT
         self._addrs, self._tls, self._deadline = addrs, tls, deadline
         self.watchdog: _Watchdog | None = None
 

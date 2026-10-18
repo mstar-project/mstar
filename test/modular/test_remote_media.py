@@ -343,6 +343,19 @@ def test_the_request_target_keeps_params_and_query_and_is_encoded(upstream, uplo
     assert [p for p, _ in up.requests] == ["/a.png;v=2?t=1", "/my%20cat%C3%A9.png"]
 
 
+@pytest.mark.parametrize("tls,port,host", [
+    (True, 443, "example.com"), (True, 8443, "example.com:8443"),
+    (False, 80, "example.com"), (False, 8080, "example.com:8080"),
+])
+def test_the_host_header_leaves_out_the_default_port(tls, port, host):
+    # signed URLs (SigV4, GCS) sign the exact Host value
+    conn = media_io._PinnedConnection("example.com", port, [], tls, time.monotonic() + 5)
+    sent = []
+    conn.send = sent.append  # capture the request instead of connecting
+    conn.request("GET", "/a.png")
+    assert f"\r\nHost: {host}\r\n".encode() in b"".join(sent)
+
+
 @pytest.mark.parametrize("url", ["http://[db.internal.corp]/a.png", "http://127.0.0.1:99999/a.png"])
 def test_unparseable_urls_are_a_short_message(uploads, monkeypatch, url):
     refused(url, uploads, "invalid URL")
