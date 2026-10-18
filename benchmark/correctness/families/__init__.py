@@ -9,7 +9,7 @@ from benchmark.correctness.families.duplex import NemotronDuplex
 from benchmark.correctness.families.image import ImageFamily, NoReferenceImage
 from benchmark.correctness.families.omni import OmniFamily, OmniText
 from benchmark.correctness.families.robotics import Cosmos3DroidActions, Pi05Actions, Vjepa2AcLatents, Vjepa2Embedding
-from benchmark.correctness.families.text import TextFamily
+from benchmark.correctness.families.text import TextFamily, TextImageFamily
 from benchmark.correctness.families.tts_models import ChatterboxTts, KokoroTts, OmniVoiceTts, OrpheusTts, Qwen3Tts
 from benchmark.correctness.families.video import NoReferenceVideo, VideoFamily
 from benchmark.correctness.families.world import WaypointWorld
@@ -129,4 +129,8 @@ def family_for_config(config_name: str, model_key: str, cfg: dict, opts: dict[st
         raise NotImplementedError(f"{config_name}: no correctness family for model {model_key!r}")
     if model_key == "qwen3_omni" and opts.get("set") == "text":
         return OmniText(model_key, cfg, opts)
+    if opts.get("set") == "image" and issubclass(FAMILIES[model_key], TextFamily):
+        hf_id = FAMILIES[model_key].hf_id
+        cls = type(f"TextImage_{hf_id.rsplit('/', 1)[-1]}", (TextImageFamily,), {"hf_id": hf_id})
+        return cls(model_key, cfg, opts)
     return FAMILIES[model_key](model_key, cfg, opts)
