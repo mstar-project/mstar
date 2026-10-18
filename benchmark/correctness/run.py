@@ -206,6 +206,8 @@ def main(argv=None) -> int:
                     raise RuntimeError(f"the server would import {header['versions']['stack'].get('mstar_file')}, "
                                        f"not {worktree}")
             print(f"[r{k}] starting server ({spec.name})", flush=True)
+            # The checkout can move between instances; a noise floor across two commits isn't one.
+            header.setdefault("served_heads", []).append(server.git_short(worktree))
             try:
                 startup.append(round(server.start(spec), 1))
                 print(f"[r{k}] ready after {startup[-1]}s; sending {len(requests)} requests "
