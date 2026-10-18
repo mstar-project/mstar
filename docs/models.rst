@@ -1247,7 +1247,7 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
 **The ÷32 rule.** Height and width must each be an exact multiple of **32**:
 a pixel dimension is downsampled 16x by the VAE and then patchified 2x by the
 DiT, and only exact multiples survive both. So ``720x1280`` is **not** a valid
-size for this model (720/32 = 22.5) — the 720p-class tier is **704**x1280. An
+size for this model (720/32 = 22.5) — the 720p-class tier is **704x1280**. An
 unaligned size is rejected at the request seam with a 400 naming the rule and
 the nearest valid sizes, because it has no clean failure deeper in: the two
 paths round the latent extent differently and the DiT dies mid-forward.
