@@ -2,11 +2,13 @@
 
 AUTO is Triton everywhere. Without a tuned table NVIDIA runs the kernel's own
 default config (same as before backends existed) and AMD adds num_stages=2.
-Tuned tables are found by GPU name and nearest token count.
+Tuned tables are found by GPU name and nearest token count. The AITER backend
+refuses unsupported platforms and sizes up front.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 
 import pytest
@@ -146,6 +148,27 @@ def test_shipped_tables_are_well_formed(path):
     assert load_tuned_configs(problem, device) == {int(m): c for m, c in entries.items()}
 
 
+def test_aiter_refuses_non_amd_platforms(on_platform):
+    on_platform(CudaPlatform())
+    with pytest.raises(ValueError, match="AMD GPUs only"):
+        make_moe_backend("aiter", THINKER)
+
+
+def test_aiter_refuses_intermediate_sizes_its_kernels_cannot_tile(on_platform, monkeypatch):
+    on_platform(RocmPlatform())
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object())
+    with pytest.raises(ValueError, match="multiple of 128"):
+        make_moe_backend("aiter", TALKER_TP2)
+
+
+def test_aiter_without_the_package_is_an_error(on_platform, monkeypatch):
+    on_platform(RocmPlatform())
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "aiter" else real(name, *a))
+    with pytest.raises(ValueError, match="needs the aiter package"):
+        make_moe_backend("aiter", THINKER)
+
+
 class _RecordingBackend(FusedMoEBackend):
     def __init__(self, problem):
         super().__init__(problem)
@@ -190,4 +213,4 @@ def test_qwen3_omni_text_configs_default_to_auto():
     from mstar.model.qwen3_omni.config import TalkerTextConfig, ThinkerTextConfig
 
     assert ThinkerTextConfig.from_dict({"head_dim": 128}).moe_backend == "auto"
-    assert TalkerTextConfig.from_dict({"moe_backend": "triton"}).moe_backend == "triton"
+    assert TalkerTextConfig.from_dict({"moe_backend": "aiter"}).moe_backend == "aiter"
