@@ -6,6 +6,7 @@ FLUX/Z-Image equivalence tests assume the same platform and SDPA, so they don't 
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import statistics
@@ -27,6 +28,24 @@ class ImageFamily(Family):
     guidance: float | None = None  # sent to the server (models that read it)
     ref_extra: dict = {}  # extra pipeline kwargs for the reference only (e.g. a guidance the server ignores)
     generator_device = "cpu"  # where the serving code draws its initial noise from the request seed
+    request_extra: dict = {}  # extra model_kwargs for the server only
+
+    @property
+    def size(self) -> tuple[int, int] | None:
+        """--family-opt size=HxW renders every prompt once at that size instead of the set's sizes."""
+        size = self.opt("size")
+        return tuple(int(v) for v in size.lower().split("x")) if size else None
+
+    def select_items(self, items: list) -> list:
+        if self.size is None:
+            return items
+        h, w = self.size
+        seen, out = set(), []
+        for it in items:
+            if (it.prompt, it.params.get("seed")) not in seen:
+                seen.add((it.prompt, it.params.get("seed")))
+                out.append(dataclasses.replace(it, params={**it.params, "height": h, "width": w}))
+        return out
 
     def model_kwargs(self, it) -> dict:
         kw = {"seed": it.params["seed"], "height": it.params["height"], "width": it.params["width"]}
@@ -34,7 +53,7 @@ class ImageFamily(Family):
             kw["num_inference_steps"] = self.steps
         if self.guidance is not None:
             kw["guidance_scale"] = self.guidance
-        return kw
+        return {**kw, **self.request_extra}
 
     def requests(self, sset: SampleSet) -> list[Request]:
         return [Request(it.id, text=it.prompt, output_modalities="image", model_kwargs=self.model_kwargs(it))
@@ -49,7 +68,8 @@ class ImageFamily(Family):
 
     # --- reference ------------------------------------------------------------------------------
     def reference_id(self) -> str:
-        return f"diffusers-{self.hf_id.replace('/', '--')}" + (f"-s{self.steps}" if self.steps else "")
+        return (f"diffusers-{self.hf_id.replace('/', '--')}" + (f"-s{self.steps}" if self.steps else "")
+                + (f"-{self.size[0]}x{self.size[1]}" if self.size else ""))
 
     def reference_description(self) -> str:
         return (f"diffusers pipeline for {self.hf_id}, bf16, {self.generator_device}-generator seed, "
@@ -78,11 +98,15 @@ class ImageFamily(Family):
             gen = torch.Generator(self.generator_device if self.generator_device == "cpu" else device)
             gen.manual_seed(int(it.params["seed"]))
             with torch.inference_mode():
-                img = pipe(prompt=it.prompt, generator=gen, **self.pipeline_kwargs(it)).images[0]
+                img = self.reference_image(pipe, it.prompt, gen, self.pipeline_kwargs(it))
             img.save(ref_dir / "outputs" / f"{it.id}.png")
             print(f"  ref {it.id}", flush=True)
         write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
                    pipeline=type(pipe).__name__)
+
+    def reference_image(self, pipe, prompt: str, generator, kwargs: dict):
+        """One PIL image from the reference pipeline."""
+        return pipe(prompt=prompt, generator=generator, **kwargs).images[0]
 
     # --- scoring --------------------------------------------------------------------------------
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
