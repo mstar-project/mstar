@@ -377,7 +377,36 @@ def test_the_probe_passes_a_correct_kernel():
 def test_the_probe_catches_a_kernel_that_skips_the_hidden_size():
     ca = _FakeCA(None, "cpu")
     ca.fused_ar_rms = lambda inp, res, **kw: (kw["out"], kw["res_out"])
-    assert "residual" in AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    # the outputs keep the NaN they were filled with
+    assert "max |err| inf" in AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+
+
+def test_the_probe_allows_the_kernels_truncation_at_eight_ranks():
+    """AITER rounds by truncation on gfx942: with eight ranks' partial sums a
+    correct kernel sits up to a unit in the last place of the sum away from a
+    round-to-nearest reference, also where the residual nearly cancels it."""
+    ca = _FakeCA(None, "cpu")
+
+    def truncating(inp, res, *, res_out, out, w, eps, gemma_norm, **kw):
+        gen = torch.Generator().manual_seed(1234)
+        tokens, hidden = inp.shape
+        xs = torch.randn(8, tokens, hidden, generator=gen).to(BF16)
+        a = _truncate(xs.float().sum(0))
+        r = _truncate(a.float() + res.float())
+        v = r.float()
+        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+        out.copy_(_truncate(v * (w.float() + float(gemma_norm))))
+        res_out.copy_(r)
+        return out, res_out
+
+    ca.fused_ar_rms = truncating
+    assert AiterARFusion._probe(ca, 0, 8, 64, BF16, 1, torch.device("cpu")) is None
+
+
+def _truncate(v: torch.Tensor) -> torch.Tensor:
+    """fp32 -> bf16 by dropping the low 16 bits, as AITER does on gfx942."""
+    bits = v.float().contiguous().view(torch.int32) & ~0xFFFF
+    return bits.view(torch.float32).to(BF16)
 
 
 def test_the_probe_catches_a_kernel_that_ignores_gemma():
