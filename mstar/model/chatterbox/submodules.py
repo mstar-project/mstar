@@ -402,7 +402,7 @@ class T3Submodule(ARNodeSubmodule):
             logits = cond + cfg_weight * (cond - uncond)
         # penalty -> temperature -> min_p -> top-p happen in the sampler, in
         # the reference's order
-        return sampler.sample(engine_inputs.request_ids, logits)
+        return sampler.sample(logits)
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
