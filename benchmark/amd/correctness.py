@@ -3,10 +3,11 @@
 
 Text arms get a greedy pass on the set right after the server starts. mstar gets the correctness
 runner's own /generate requests. vLLM and SGLang get the same prompts as chat completions with
-per-token logprobs, turned back into one chunk per token as the text metrics expect. TTS and ASR
-arms are scored on the outputs of their first timed run at concurrency 1, which covers the set
-once. Every pass is saved in the correctness runner's layout (r1/outputs, r1/responses.jsonl)
-and scored with its family code.
+per-token logprobs, turned back into one chunk per token as the text metrics expect. Omni arms get
+a pass of their own too, with spoken and written answers. TTS, ASR, image and video arms are scored
+on the outputs of their first timed run at concurrency 1, which covers the set once. Every pass is
+saved in the correctness runner's layout (r1/outputs, r1/responses.jsonl) and scored with its
+family code.
 
     python -m benchmark.amd.correctness score RUN_DIR      # what the sweep runs at the end
 """
@@ -166,12 +167,117 @@ def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
     return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
 
 
-# --- TTS and ASR from a timed run --------------------------------------------------------------
+# --- Qwen3-Omni ----------------------------------------------------------------------------------
+
+MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".wav": "audio/wav", ".mp4": "video/mp4"}
+
+
+def omni_chat_body(fam, sset, item, index: int, hf_id: str, system: str) -> dict:
+    """The omni family's request as an OpenAI chat completion with a spoken and written answer."""
+    import base64
+
+    mod = item.params["modality"]
+    path = sset.path(item.files[mod])
+    url = f"data:{MIME.get(path.suffix.lower(), 'application/octet-stream')};base64,"
+    url += base64.b64encode(path.read_bytes()).decode()
+    content = [{"type": f"{mod}_url", f"{mod}_url": {"url": url}}, {"type": "text", "text": item.prompt}]
+    return {"model": hf_id, "messages": [{"role": "system", "content": [{"type": "text", "text": system}]},
+                                         {"role": "user", "content": content}],
+            "modalities": ["text", "audio"], "audio": {"format": "pcm"}, "temperature": 0.0,
+            "max_tokens": fam.max_new_tokens, "seed": index, "stream": True}
+
+
+def parse_omni_stream(body: bytes) -> tuple[list[str], bytes]:
+    """Text deltas (one per streamed token) and raw PCM16 audio from a vllm-omni chat stream."""
+    import base64
+
+    chunks, audio = [], bytearray()
+    for block in body.split(b"\n\n"):
+        line = block.strip()
+        if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+            continue
+        try:
+            msg = json.loads(line[5:])
+        except ValueError:
+            continue
+        for choice in msg.get("choices", []):
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            audio_obj = delta.get("audio") if isinstance(delta.get("audio"), dict) else {}
+            if content and msg.get("modality") == "audio":
+                audio += base64.b64decode(content)
+            elif content:
+                chunks.append(content)
+            elif audio_obj.get("data"):
+                audio += base64.b64decode(audio_obj["data"])
+    return chunks, bytes(audio)
+
+
+def omni_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
+    """The omni family's set, answered in text and speech. mstar gets the family's own /generate
+    requests; vllm-omni gets the same questions as chat completions with text and PCM audio."""
+    C = load(plan.correctness_src)
+    fam, cfg = _family(C, plan.worktree, row.name)
+    sset = C.sets.load_set(fam.set_name, SETS_ROOT)
+    base = f"http://127.0.0.1:{port}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    if arm.engine == "mstar":
+        responses = C.client.send_all(base, fam.requests(sset), concurrency=fam.default_concurrency,
+                                      timeout_s=fam.request_timeout_s, progress=False)
+    else:
+        system = importlib.import_module("benchmark.correctness.families.omni").SYSTEM
+        reqs = [C.client.Request(it.id, route="/v1/chat/completions",
+                                 json_body=omni_chat_body(fam, sset, it, i, row.hf_id, system))
+                for i, it in enumerate(sset.items)]
+        responses = C.client.send_all(base, reqs, concurrency=fam.default_concurrency,
+                                      timeout_s=fam.request_timeout_s, progress=False)
+        for r in responses:
+            if r.ok:
+                chunks, pcm = parse_omni_stream(r.body)
+                r.text_chunks = [c.encode("utf-8") for c in chunks]
+                r.audio = bytearray(pcm)
+    header = {"config": row.name, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
+              "restarts": 1, "concurrency": fam.default_concurrency, "family_opts": {},
+              "seconds": round(time.monotonic() - t0, 1), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
+
+
+# --- generators ---------------------------------------------------------------------------------
+
+def _flow_shift(hf_id: str) -> float | None:
+    """The checkpoint's scheduler flow shift, which vllm-omni's Wan2.2 defaults would otherwise override."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        cfg = json.loads(Path(hf_hub_download(hf_id, "scheduler/scheduler_config.json",
+                                              local_files_only=True)).read_text())
+    except Exception:
+        return None
+    return cfg.get("flow_shift")
+
+
+def media_request_kwargs(plan, row) -> dict:
+    """Settings every image or video request of a row carries: those of the row's correctness family,
+    so the timed outputs can be scored against its diffusers reference."""
+    C = load(plan.correctness_src or REPO)
+    fam, _ = _family(C, plan.worktree, row.name)
+    if row.family == "image":
+        guidance = fam.guidance if fam.guidance is not None else (fam.ref_extra or {}).get("guidance_scale")
+        kw = {"num_inference_steps": fam.steps, "guidance_scale": guidance}
+    else:
+        kw = {"height": fam.height, "width": fam.width, "num_frames": fam.num_frames,
+              "num_inference_steps": fam.steps, "fps": fam.fps, "guidance_scale": fam.guidance,
+              "negative_prompt": fam.negative_prompt, "flow_shift": _flow_shift(row.hf_id)}
+    return {k: v for k, v in kw.items() if v is not None}
+
+
+# --- outputs of a timed run ---------------------------------------------------------------------
 
 def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Path, out_dir: Path,
                    ext: str) -> dict:
-    """The correctness pass of a TTS (wav) or ASR (txt) arm: its first timed run at concurrency 1,
-    which sends every item of the set once, in order."""
+    """The correctness pass of a TTS (wav), ASR (txt), image (png) or video (mp4) arm: its first timed
+    run at concurrency 1, which sends every item of the set once, in order."""
     fam, cfg = _family(C, worktree, row_name)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     run = cell_dir / "a1r1"
@@ -265,7 +371,7 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
         info = json.loads(arm_json.read_text())
         corr = arm_dir / "correctness"
         if not (corr / "pass.json").is_file():
-            for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt")):
+            for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
                 cell = arm_dir / "cells" / wl / "c1"
                 if (cell / "a1r1" / "results.json").is_file():
                     pass_from_cell(C, worktree, info["row"], info["arm"], cell, corr, ext)
