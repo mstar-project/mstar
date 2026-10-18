@@ -1,12 +1,12 @@
-"""Choosing and gating the fused TP all-reduce + residual + RMSNorm.
+"""Picking and gating the fused TP all-reduce + residual + RMSNorm.
 
-The kernels need several GPUs (``test/rocm/test_ar_fusion_tp.py``); what runs
-here is everything that decides which code path a rank takes. That has to come
-out the same on every rank of a TP group, or the group deadlocks on the next
-collective, so each test pins one decision: the platform's strategy, AITER's
-one-stage gate, the startup refusals, and how a capture that recorded AITER
-inputs is finished across ranks. AITER and the peers are fakes; the peers'
-part of an agreement is the value a test hands the fake ``_agree``.
+The kernels need several GPUs (see ``test/rocm/test_ar_fusion_tp.py``). These
+tests cover the decisions about which code path a rank takes, which have to
+come out the same on every rank or the group hangs on the next collective.
+That's the platform's strategy, AITER's one-stage gate, the startup refusals,
+and how a capture with registered AITER inputs gets finished across ranks.
+AITER and the peer ranks are fakes. A test passes the peers' side of each
+agreement to the fake ``_agree``.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def test_a_strategy_that_cannot_build_is_not_registered(monkeypatch, on_platform
 
 def _vllm_uses_one_stage(world, hidden, tokens, dtype=BF16) -> bool:
     """vLLM's ``AiterCustomAllreduce.use_1stage_fused_ar_rms`` (v0.32.0) on a
-    fully connected node, transcribed as the oracle."""
+    fully connected node, copied over as the reference."""
     if tokens > 80 or dtype not in (torch.bfloat16, torch.float16):
         return False
     elt = torch.empty((), dtype=dtype).element_size()
@@ -113,7 +113,7 @@ def _vllm_uses_one_stage(world, hidden, tokens, dtype=BF16) -> bool:
 @pytest.mark.parametrize("hidden", [512, 2048, 4096, 5120, 8192, 9216, 4100])
 @pytest.mark.parametrize("dtype", [BF16, torch.float16])
 def test_the_fused_bound_is_vllms_one_stage_predicate(world, hidden, dtype):
-    """vLLM's predicate is monotone in tokens, so it reduces to a bound."""
+    """vLLM's rule is monotone in tokens, so it comes down to a max."""
     bound = AiterARFusion.fused_token_bound(world, hidden, dtype, max_tokens=4096)
     for tokens in range(1, 130):
         assert (tokens <= bound) == _vllm_uses_one_stage(world, hidden, tokens, dtype), (
@@ -226,7 +226,7 @@ class _FakePool:
 
 @pytest.fixture
 def fake_aiter(monkeypatch):
-    """Install the fake as ``aiter``; the test sets the version it reports."""
+    """Installs the fake as ``aiter``. The test sets the version it reports."""
     _FakeCA.built = []
     _FakePool._pool_seq = 0
     mod = types.ModuleType("aiter.dist.device_communicators.custom_all_reduce")
@@ -242,7 +242,7 @@ def fake_aiter(monkeypatch):
 
 
 class _Peers:
-    """The fake ``_agree``: max of this rank's values and the peers' next ones."""
+    """Fake ``_agree``, the max of this rank's values and the peers' next ones."""
 
     def __init__(self, *rounds: list[int]):
         self.rounds = list(rounds)
@@ -254,10 +254,10 @@ class _Peers:
         return [max(a, b) for a, b in zip(values, peer, strict=True)]
 
 
-def _create(monkeypatch, peers=None, probe=None, world=2, hidden=4096):
+def _create(monkeypatch, peers=None, check=None, world=2, hidden=4096):
     peers = peers or _Peers()
     monkeypatch.setattr(ar_fusion, "_agree", peers)
-    monkeypatch.setattr(AiterARFusion, "_probe", staticmethod(lambda *a: probe))
+    monkeypatch.setattr(AiterARFusion, "_check_kernel", staticmethod(lambda *a: check))
     fusion = AiterARFusion.create(0, world, "gloo-group", 2048, hidden, BF16)
     return fusion, peers
 
@@ -270,7 +270,7 @@ def test_builds_a_workspace_sized_to_the_fused_bound(fake_aiter, monkeypatch):
     # 25 tokens x 5120 x 2 B = 250 KiB, rounded up to the 1 MiB floor
     assert ca.max_size == 1 << 20
     assert fusion.max_tokens == 25 and fusion.hidden == 5120
-    assert len(peers.seen) == 3, "refusal, construction and probe are each agreed"
+    assert len(peers.seen) == 3, "refusal, build and startup check are each agreed"
 
 
 def test_a_large_bound_rounds_max_size_up_to_whole_mebibytes(fake_aiter, monkeypatch):
@@ -279,9 +279,9 @@ def test_a_large_bound_rounds_max_size_up_to_whole_mebibytes(fake_aiter, monkeyp
 
 
 def test_pool_keys_start_from_the_groups_highest_count(fake_aiter, monkeypatch):
-    """AITER names each IPC exchange by a process-wide pool counter; a member
-    that built a pool for another group first would otherwise wait on keys no
-    peer writes."""
+    """AITER names its store keys after a per-process pool counter. A member
+    that already built a pool for another group would otherwise wait on keys
+    nobody writes."""
     _FakePool._pool_seq = 1
     peers = _Peers([0, 3])
     _create(monkeypatch, peers=peers)
@@ -340,13 +340,13 @@ def test_a_disabled_custom_all_reduce_builds_nothing(fake_aiter, monkeypatch):
     assert peers.seen[1] == [1]
 
 
-def test_wrong_probe_results_on_a_peer_build_nothing(fake_aiter, monkeypatch):
+def test_a_failed_kernel_check_on_a_peer_builds_nothing(fake_aiter, monkeypatch):
     fusion, _ = _create(monkeypatch, peers=_Peers([0, 0], [0], [1, 0]))
     assert fusion is None and _FakeCA.built[0].closed
 
 
-def test_wrong_probe_results_here_build_nothing(fake_aiter, monkeypatch):
-    fusion, peers = _create(monkeypatch, probe="norm at tokens=1: max |err| 3")
+def test_a_failed_kernel_check_here_builds_nothing(fake_aiter, monkeypatch):
+    fusion, peers = _create(monkeypatch, check="norm at tokens=1: max |err| 3")
     assert fusion is None and peers.seen[2][0] == 1
 
 
@@ -356,35 +356,35 @@ def test_unsupported_shapes_skip_aiter_and_every_collective(fake_aiter, monkeypa
 
 
 def test_registered_capture_is_agreed(fake_aiter, monkeypatch):
-    """Off when a peer's allocator uses expandable segments (AITER then copies
-    into its pool during capture), since the capture scope's collectives must
-    run on every rank or none."""
+    """Off if any peer's allocator uses expandable segments (AITER then copies
+    into its pool during capture). The capture scope's collectives must run on
+    every rank or none."""
     fusion, _ = _create(monkeypatch, peers=_Peers([0, 0], [0], [0, 1]))
     assert fusion is not None
     assert type(fusion.graph_capture()) is GraphCaptureScope
 
 
-# --- the probe ----------------------------------------------------------------
+# --- the startup kernel check -------------------------------------------------
 
 
-def test_the_probe_passes_a_correct_kernel():
+def test_the_kernel_check_passes_a_correct_kernel():
     ca = _FakeCA(None, "cpu")
-    assert AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu")) is None
+    assert AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu")) is None
     assert {c["gemma_norm"] for c in ca.calls} == {False, True}
     assert all(c["use_1stage"] and not c["registered"] for c in ca.calls)
 
 
-def test_the_probe_catches_a_kernel_that_skips_the_hidden_size():
+def test_the_kernel_check_catches_a_kernel_that_skips_the_hidden_size():
     ca = _FakeCA(None, "cpu")
     ca.fused_ar_rms = lambda inp, res, **kw: (kw["out"], kw["res_out"])
     # the outputs keep the NaN they were filled with
-    assert "max |err| inf" in AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert "max |err| inf" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
 
 
-def test_the_probe_allows_the_kernels_truncation_at_eight_ranks():
-    """AITER rounds by truncation on gfx942: with eight ranks' partial sums a
-    correct kernel sits up to a unit in the last place of the sum away from a
-    round-to-nearest reference, also where the residual nearly cancels it."""
+def test_the_kernel_check_allows_truncation_at_eight_ranks():
+    """AITER truncates to bf16 on gfx942. With eight ranks a correct kernel can
+    be off by about one ulp of the sum from a round-to-nearest reference, even
+    where the residual nearly cancels the sum."""
     ca = _FakeCA(None, "cpu")
 
     def truncating(inp, res, *, res_out, out, w, eps, gemma_norm, **kw):
@@ -400,7 +400,7 @@ def test_the_probe_allows_the_kernels_truncation_at_eight_ranks():
         return out, res_out
 
     ca.fused_ar_rms = truncating
-    assert AiterARFusion._probe(ca, 0, 8, 64, BF16, 1, torch.device("cpu")) is None
+    assert AiterARFusion._check_kernel(ca, 0, 8, 64, BF16, 1, torch.device("cpu")) is None
 
 
 def _truncate(v: torch.Tensor) -> torch.Tensor:
@@ -409,21 +409,21 @@ def _truncate(v: torch.Tensor) -> torch.Tensor:
     return bits.view(torch.float32).to(BF16)
 
 
-def test_the_probe_catches_a_kernel_that_ignores_gemma():
+def test_the_kernel_check_catches_a_kernel_that_ignores_gemma():
     ca = _FakeCA(None, "cpu")
     real = ca.fused_ar_rms
     ca.fused_ar_rms = lambda inp, res, **kw: real(inp, res, **{**kw, "gemma_norm": False})
-    assert "gemma=True" in AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert "gemma=True" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
 
 
-def test_the_probe_reports_a_raising_kernel():
+def test_the_kernel_check_reports_a_raising_kernel():
     ca = _FakeCA(None, "cpu")
 
     def boom(*a, **kw):
-        raise RuntimeError("no kernel for this shape")
+        raise RuntimeError("no kernel for this size")
 
     ca.fused_ar_rms = boom
-    assert "no kernel" in AiterARFusion._probe(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert "no kernel" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
 
 
 # --- running and capturing ----------------------------------------------------
@@ -481,9 +481,9 @@ def test_a_capture_with_nothing_recorded_needs_no_registration(monkeypatch):
 
 
 def test_differing_counts_drop_the_graph_and_stop_registering(monkeypatch):
-    """Registration pairs the ranks' i-th addresses; with different counts the
-    pairs would be wrong, so nothing is registered and the graph is dropped.
-    Later captures copy into the pool, which needs no pairing."""
+    """Registration pairs up the ranks' i-th addresses, so with different counts
+    the pairs would be wrong. Nothing gets registered and the graph is dropped.
+    Later captures copy into the pool, which doesn't need pairing."""
     f, ca, scope, _ = _finish(monkeypatch, pending=3, peer=[4, -3, 0])
     assert not scope.usable and ca.flushes == 0
     assert type(f.graph_capture()) is GraphCaptureScope
@@ -492,7 +492,7 @@ def test_differing_counts_drop_the_graph_and_stop_registering(monkeypatch):
 def test_a_peers_failed_capture_drops_the_graph_here(monkeypatch):
     f, ca, scope, _ = _finish(monkeypatch, pending=2, peer=[2, -2, 1])
     assert not scope.usable
-    assert ca.flushes == 1, "equal counts still pair; registering keeps ranks level"
+    assert ca.flushes == 1, "equal counts still pair up, registering keeps ranks in step"
     assert isinstance(f.graph_capture(), ar_fusion._RegisteredCapture)
 
 
