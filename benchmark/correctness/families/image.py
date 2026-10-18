@@ -170,6 +170,7 @@ class ImageFamily(MathSdpaReference, Family):
             sc.notes.append("The reference against itself with math SDPA: median "
                             f"{sc.metrics['reference_vs_math_sdpa_reference_psnr_db'].get('median')} dB. A served "
                             "image this far from the reference is inside the kernel spread.")
+            self.calibrated_verdict(sc, spread, statistics.median(psnrs) if psnrs else None)
         repro = [r["psnr_r1_r2"] for r in sc.rows if r.get("psnr_r1_r2") is not None]
         if repro:
             sc.metrics["psnr_r1_vs_r2_db"] = M.distribution(repro)
