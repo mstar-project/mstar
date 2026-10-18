@@ -260,6 +260,8 @@ def test_a_decode_failure_blames_the_upload_only_where_ffmpeg_loads(monkeypatch,
     if ffmpeg.startswith("ops flag"):
         ops = types.SimpleNamespace(_FFMPEG_AVAILABLE=ffmpeg == "ops flag up")
         monkeypatch.setitem(sys.modules, "torchcodec._core.ops", ops)
+    # without torchcodec's FFmpeg the decoder falls back to PyAV: no fallback here either
+    monkeypatch.setitem(sys.modules, "av", None)
     # a fresh cache, so this host's torchcodec and the fake don't answer for each other
     check = audio_features._ffmpeg_decoder_loads
     monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))

@@ -127,13 +127,9 @@ def audio_duration_seconds(path: str) -> float | None:
     except Exception:  # noqa: BLE001 — try the FFmpeg decoder
         pass
     try:
-        from torchcodec.decoders import AudioDecoder
+        from mstar.model.components.media_io import audio_duration
 
-        meta = AudioDecoder(path).metadata
-        duration = getattr(meta, "duration_seconds_from_header", None)
-        if duration is None:
-            duration = getattr(meta, "duration_seconds", None)
-        return float(duration) if duration is not None else None
+        return audio_duration(path)
     except Exception:  # noqa: BLE001 — best effort
         return None
 
