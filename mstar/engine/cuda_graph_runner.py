@@ -441,9 +441,9 @@ class CudaGraphRunner:
                     spec.bucket, self._submodule_name, refusal,
                 )
 
-            # entered on every rank, pass or fail: finishing a capture can
-            # itself be collective (see GraphCaptureScope). A refused spec
-            # leaves it uncaptured, which every rank agrees on.
+            # Every rank enters this, pass or fail, since finishing a capture
+            # can be collective (see GraphCaptureScope). A refused spec just
+            # stays uncaptured, the same on all ranks.
             with self._comm_group.tp_group.graph_capture() as capture:
                 if refusal is None:
                     try:
@@ -1274,7 +1274,7 @@ class PiecewiseCudaGraphRunner:
                                 "bs=%d total_tokens=%d slot=%d", self._label,
                                 shape.bs, shape.total_tokens, slot, exc_info=True,
                             )
-                # an unusable slot fails the shape, which drops it everywhere
+                # an unusable slot drops this bucket on every rank
                 if not capture.usable:
                     shape_captured = False
             captured.append(shape_captured)
