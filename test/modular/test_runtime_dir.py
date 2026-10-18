@@ -167,6 +167,46 @@ def test_upload_files_are_0600(umask, tmp_path):
     assert {p: _mode(p) for p in paths} == dict.fromkeys(paths, 0o600)
 
 
+def _tensor(name, data_type, shape, values):
+    return {"metadata": {"name": name, "data_type": data_type, "shape": shape},
+            "data": {"data_type": data_type, "values": values}}
+
+
+def _dynamo_tensor_uploads(spec_name, upload_dir):
+    """Run a Dynamo tensor spec's ``submit_args`` and return the files it saved."""
+    pytest.importorskip("PIL")
+    from mstar.integrations.dynamo.bridges import TENSOR_SPECS
+
+    if spec_name == "pi05":
+        tensors = {
+            "images": _tensor("images", "Uint8", [2, 2, 2, 3], list(range(24))),
+            "prompt": _tensor("prompt", "Bytes", [1], [list(b"pick")]),
+        }
+        args = TENSOR_SPECS["pi05"].submit_args(tensors, upload_dir)
+        return args.file_paths["image"]
+    trajectory = _tensor("t", "Float32", [2, 3], [0.0] * 6)
+    tensors = {
+        "video": _tensor("video", "Bytes", [1], [list(b"mp4")]),
+        "actions": trajectory,
+        "states": trajectory,
+    }
+    args = TENSOR_SPECS["vjepa2_ac"].submit_args(tensors, upload_dir)
+    return args.file_paths["video"]
+
+
+@pytest.mark.parametrize("spec_name", ["pi05", "vjepa2_ac"])
+def test_dynamo_tensor_uploads_check_the_dir_and_are_0600(spec_name, umask, tmp_path):
+    paths = _dynamo_tensor_uploads(spec_name, tmp_path / "up")
+    assert _mode(tmp_path / "up") == 0o700
+    assert paths and {p: _mode(p) for p in paths} == dict.fromkeys(paths, 0o600)
+
+
+@pytest.mark.parametrize("spec_name", ["pi05", "vjepa2_ac"])
+def test_dynamo_tensor_uploads_refuse_the_upload_dir(spec_name, bad_dir):
+    with pytest.raises(PermissionError, match="refusing"):
+        _dynamo_tensor_uploads(spec_name, bad_dir)
+
+
 def test_an_existing_file_at_the_upload_name_is_not_overwritten(tmp_path, monkeypatch):
     up = ensure_private_dir(tmp_path / "up")
     taken = up / "00000000-0000-0000-0000-000000000000.png"
