@@ -15,6 +15,7 @@ class RequestType(Enum):
     T2T = "text_to_text"
     T2I = "text_to_image"
     T2S = "text_to_speech"
+    T2V = "text_to_video"            # generated clip, saved as mp4
 
     # Robotics
     VLA = "vision_language_action"   # images + text → action  (pi0.5)
@@ -42,6 +43,8 @@ class RequestType(Enum):
             return "action"
         if self == RequestType.V2V:
             return "video"
+        if self == RequestType.T2V:
+            return "video_file"
         return "text"
 
     def get_input_modalities(self):
@@ -418,6 +421,43 @@ class HiggsAudio(Model):
         }
 
 
+class DiffusionModel(Model):
+    """Image and video generators on the OpenAI image and video routes. Steps, guidance, size and frame
+    count travel with each request (benchmark.amd passes them with --request-kwargs)."""
+
+    HF_URL = ""
+    MODALITIES: frozenset = frozenset()
+
+    def get_hf_url(self):
+        return self.HF_URL
+
+    def get_supported_modalities(self):
+        return set(self.MODALITIES)
+
+    def get_tokenizer(self):
+        return None
+
+
+class Flux2Klein(DiffusionModel):
+    HF_URL = "black-forest-labs/FLUX.2-klein-4B"
+    MODALITIES = frozenset({RequestType.T2I})
+
+
+class ZImageTurbo(DiffusionModel):
+    HF_URL = "Tongyi-MAI/Z-Image-Turbo"
+    MODALITIES = frozenset({RequestType.T2I})
+
+
+class Wan22(DiffusionModel):
+    HF_URL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    MODALITIES = frozenset({RequestType.T2V})
+
+
+class Cosmos3Nano(DiffusionModel):
+    HF_URL = "nvidia/Cosmos3-Nano"
+    MODALITIES = frozenset({RequestType.T2V, RequestType.T2I})
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -433,6 +473,10 @@ class ModelType(Enum):
     HIGGS_AUDIO = "higgs_audio"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
+    FLUX2_KLEIN = "flux2_klein"
+    Z_IMAGE_TURBO = "z_image_turbo"
+    WAN22 = "wan22"
+    COSMOS3_NANO = "cosmos3_nano"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -463,4 +507,8 @@ class ModelType(Enum):
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:
             return Qwen3_8_Dense(**kwargs)
+        diffusion = {ModelType.FLUX2_KLEIN: Flux2Klein, ModelType.Z_IMAGE_TURBO: ZImageTurbo, ModelType.WAN22: Wan22,
+                     ModelType.COSMOS3_NANO: Cosmos3Nano}
+        if self in diffusion:
+            return diffusion[self](**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")
