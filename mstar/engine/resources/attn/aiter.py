@@ -95,8 +95,7 @@ def _unified_attention():
     return unified_attention
 
 
-@torch.library.custom_op("mstar::aiter_unified_attention", mutates_args=("out",))
-def aiter_unified_attention(
+def _aiter_unified_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -124,7 +123,19 @@ def aiter_unified_attention(
     )
 
 
-@aiter_unified_attention.register_fake
+# One op with a fake, so a traced caller sees one node. Defined through
+# `Library` rather than `torch.library.custom_op`: the latter's Python
+# wrapping cost about 45 us per eager call on MI300X hosts, this about 14.
+_LIB = torch.library.Library("mstar", "FRAGMENT")
+_LIB.define(
+    "aiter_unified_attention(Tensor q, Tensor k_cache, Tensor v_cache, Tensor(a!) out, "
+    "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int max_seqlen_q, "
+    "int max_seqlen_k, float softmax_scale) -> ()"
+)
+_LIB.impl("aiter_unified_attention", _aiter_unified_attention, "CUDA")
+
+
+@torch.library.register_fake("mstar::aiter_unified_attention", lib=_LIB)
 def _aiter_unified_attention_fake(
     q, k_cache, v_cache, out, cu_seqlens_q, seqused_k, block_table,
     max_seqlen_q, max_seqlen_k, softmax_scale,
