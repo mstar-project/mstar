@@ -525,7 +525,9 @@ with a constraints file so the extras can't replace it:
        --overrides rocm-overrides.txt -e ".[kokoro,orpheus,qwen3_tts,dev]"
 
 Pick the extras for the models you serve. From PyPI, install ``"mstar-ai[...]"`` the same
-way instead of ``-e``. The never-true marker drops a package from the resolution.
+way instead of ``-e``. The never-true marker drops a package from the resolution. Without
+torchcodec, audio and video are decoded with PyAV and soundfile, so add ``av`` and
+``soundfile`` for any model that reads media (``all`` already has both).
 
 .. list-table:: Packages left out on ROCm
    :header-rows: 1
@@ -648,6 +650,37 @@ results are measured on the GPU that made them, so don't share one between MI300
 MI325X. Copy back into the saved copy from one job at a time, and only from a job that
 started from it. MIOpen keeps one database file per architecture, so a cold job's copy
 would replace the saved one instead of adding to it.
+
+In practice that's an untar before the first server and a tar at the end of the job:
+
+.. code-block:: bash
+
+   # one saved copy per GPU model and torch / HIP / Triton version
+   SAVED=/shared/compile-cache/mi300x-torch2.12.1-hip7.2.53211-triton3.7.1
+   mkdir -p $SAVED
+
+   # job start
+   for d in inductor triton miopen; do
+       mkdir -p /tmp/$USER/$d
+       [ -f $SAVED/$d.tar ] && tar -xf $SAVED/$d.tar -C /tmp/$USER/$d
+   done
+
+   # job end, one job at a time
+   for d in inductor triton miopen; do
+       tar -cf $SAVED/$d.tar.new -C /tmp/$USER/$d . && mv $SAVED/$d.tar.new $SAVED/$d.tar
+   done
+
+The rename means a job that starts during a save gets the old copy or the new one, never
+half of one. AITER's, FlyDSL's and FlashInfer's caches aren't in it. They already persist
+where steps 3 and 4 put them.
+
+**VAE-heavy models.** MIOpen searches for the fastest convolution kernel the first time it
+sees a size, and for VAE decodes that search is long. ``MIOPEN_FIND_MODE=FAST`` skips most
+of it. On an MI300X with an empty MIOpen cache, the first bf16 decode went from 161 s to
+6.6 s for Wan2.2 (480x832, 33 frames), from 82 s to 0.1 s for a Cosmos3 720p image and from
+83 s to 1.5 s for the FLUX.2 autoencoder. Later bf16 decodes stayed within 4%. It isn't a
+default because fp32 convs get slower with it (Wan2.2's fp32 decode went from 3.6 s to
+4.5 s), so set it in the environment of Wan2.2, Cosmos3 and FLUX.2 deployments.
 
 **Picking GPUs.** On ROCm ``mstar serve --gpus 0,1`` sets both ``CUDA_VISIBLE_DEVICES``
 and ``HIP_VISIBLE_DEVICES``, since HIP and torch read ``HIP_VISIBLE_DEVICES`` first.
