@@ -1,0 +1,116 @@
+"""GR00T N1.7's request preprocessing: one robot observation -> the tensors
+the model consumes. Mirrors the eval path of Isaac-GR00T's
+``Gr00tN1d7Processor.process_observation`` (``processing_gr00t_n1d7.py``),
+driven by the checkpoint's ``processor_config.json``, ``statistics.json`` and
+``embodiment_id.json``.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+
+# The one reference processor variant this port implements; any other value
+# is different preprocessing, so it fails here rather than running the wrong one.
+_REQUIRED = {
+    "use_mean_std": False,
+    "apply_sincos_state_encoding": False,
+    "exclude_state": False,
+    "use_percentiles": True,
+    "clip_outliers": True,
+}
+
+
+class Gr00tN17Preprocessor:
+    def __init__(
+        self,
+        processor_kwargs: dict,
+        statistics: dict,
+        embodiment_ids: dict[str, int],
+        max_state_dim: int,
+        max_action_horizon: int,
+    ):
+        bad = {k: processor_kwargs.get(k) for k, v in _REQUIRED.items() if processor_kwargs.get(k, v) != v}
+        modality_configs = processor_kwargs["modality_configs"]
+        for tag, mc in modality_configs.items():
+            for key in ("mean_std_embedding_keys", "sin_cos_embedding_keys"):
+                if mc["state"].get(key):
+                    bad[f"{tag}.state.{key}"] = mc["state"][key]
+        if bad:
+            raise ValueError(f"unsupported GR00T N1.7 processor variant: {bad}")
+
+        lo, hi = "q01", "q99"
+        self.state_keys = {tag: mc["state"]["modality_keys"] for tag, mc in modality_configs.items()}
+        self.state_bounds = {
+            tag: {
+                key: (np.array(statistics[tag]["state"][key][lo]), np.array(statistics[tag]["state"][key][hi]))
+                for key in keys
+            }
+            for tag, keys in self.state_keys.items()
+        }
+        self.action_horizon = {tag: len(mc["action"]["delta_indices"]) for tag, mc in modality_configs.items()}
+        self.embodiment_ids = {tag: embodiment_ids[tag] for tag in modality_configs}
+        self.max_state_dim = max_state_dim
+        self.max_action_horizon = max_action_horizon
+        too_long = {t: h for t, h in self.action_horizon.items() if h > max_action_horizon}
+        if too_long:
+            raise ValueError(f"action horizons {too_long} exceed the model's {max_action_horizon}")
+
+    @classmethod
+    def from_pretrained(cls, path: str | Path, max_state_dim: int, max_action_horizon: int):
+        path = Path(path)
+        return cls(
+            processor_kwargs=json.loads((path / "processor_config.json").read_text())["processor_kwargs"],
+            statistics=json.loads((path / "statistics.json").read_text()),
+            embodiment_ids=json.loads((path / "embodiment_id.json").read_text()),
+            max_state_dim=max_state_dim,
+            max_action_horizon=max_action_horizon,
+        )
+
+    def _tag(self, embodiment_tag: str) -> str:
+        # the checkpoint's own spelling only, not the reference's short enum
+        # names (``XDOF``): those exist only in its Python code
+        tag = embodiment_tag.lower()
+        if tag not in self.state_keys:
+            raise ValueError(
+                f"GR00T embodiment_tag {embodiment_tag!r} is not in this checkpoint; "
+                f"expected one of {sorted(self.state_keys)}"
+            )
+        return tag
+
+    def state(self, embodiment_tag: str, state: dict[str, np.ndarray]) -> torch.Tensor:
+        """Raw state per joint group ``(..., D)`` -> ``(..., max_state_dim)``:
+        min-max to [-1, 1] per group, clipped, concatenated, zero-padded."""
+        tag = self._tag(embodiment_tag)
+        parts = []
+        for key in self.state_keys[tag]:
+            # ponytail: float32 like the reference's dataset path; float64
+            # input would round differently from what NVIDIA serves.
+            x = np.asarray(state[key], dtype=np.float32)
+            lo, hi = self.state_bounds[tag][key]
+            if x.shape[-1] != lo.size:
+                raise ValueError(f"state[{key!r}] has {x.shape[-1]} values, expected {lo.size}")
+            # the reference's normalize_values_minmax, op for op: a constant
+            # dimension (isclose(lo, hi)) stays 0. Two roundings, as there: the
+            # float64 quotient is stored float32, then 2n - 1 runs in float32;
+            # folding them into one expression moves results by an ulp.
+            out = np.zeros_like(x)
+            live = ~np.isclose(hi, lo)
+            out[..., live] = (x[..., live] - lo[live]) / (hi[live] - lo[live])
+            out[..., live] = 2 * out[..., live] - 1
+            parts.append(np.clip(out, -1.0, 1.0))
+        s = torch.from_numpy(np.concatenate(parts, axis=-1))
+        if s.shape[-1] > self.max_state_dim:
+            raise ValueError(f"state has {s.shape[-1]} dims, more than max_state_dim {self.max_state_dim}")
+        return torch.cat([s, torch.zeros(*s.shape[:-1], self.max_state_dim - s.shape[-1])], dim=-1)
+
+    def embodiment_id(self, embodiment_tag: str, batch: int) -> torch.Tensor:
+        # long, not the reference's int32: it indexes the per-embodiment weights
+        return torch.full((batch,), self.embodiment_ids[self._tag(embodiment_tag)], dtype=torch.long)
+
+    def action_mask(self, embodiment_tag: str, batch: int) -> torch.Tensor:
+        mask = torch.zeros((batch, self.max_action_horizon), dtype=torch.float32)
+        mask[:, : self.action_horizon[self._tag(embodiment_tag)]] = 1.0
+        return mask
