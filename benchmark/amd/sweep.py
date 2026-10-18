@@ -4,13 +4,14 @@
         --worktree $WORK/amd/worktrees/amd-native
 
 Per table: a node health check (a FAIL aborts), then each row's arms back to back on the same
-GPUs. Per arm: start the server (ready time and first request are recorded as cold start), a
-correctness pass on WS-K's sample set, then the timed cells with health snapshots around them and
-a 1 Hz monitor during them. A cell is warmup + ``repeats`` timed runs of benchmark.runner; a cell
-whose spread exceeds the table's limit is re-run once and flagged. Everything lands under
-<run-root>/<table>/<run-id>/ and table.py turns it into table.md and table.json.
+GPUs. Per arm: start the server (ready time and first request are the cold start), a greedy pass
+on the correctness runner's sample set for text rows, then the timed cells, with health snapshots
+around them and a 1 Hz monitor during them. A cell is warmup plus ``repeats`` timed runs of
+benchmark.runner. A cell whose spread is over the table's limit is re-run once and flagged.
+Everything goes under <run-root>/<table>/<run-id>/, and table.py turns it into table.md and
+table.json.
 
-Timings only count from an exclusive full node (mi3258x / mi3008x) with a passing check; --dry
+Timings only count from an exclusive full node (mi3258x or mi3008x) with a passing check. --dry
 runs the same path anywhere and labels the table as a functional run.
 """
 
@@ -419,8 +420,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dry", action="store_true", help="functional run on any node; the table says so")
     ap.add_argument("--no-correctness", action="store_true")
     ap.add_argument("--correctness-src", default=None,
-                    help="checkout with benchmark/correctness (default: this tree, else a pinned export of "
-                         "users/atindra/ws-k-correctness)")
+                    help="checkout or git ref with benchmark/correctness (default: this tree)")
     ap.add_argument("--skip-health", action="store_true", help="dry runs only")
     args = ap.parse_args(argv)
 

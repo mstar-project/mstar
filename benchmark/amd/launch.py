@@ -148,7 +148,7 @@ class Launch:
         if self.row.family not in self.arm.families:
             raise ValueError(f"arm {self.arm.name} does not serve {self.row.family} rows")
         key = _short_key(str(self.run_dir))
-        # Unix socket paths stop at ~107 characters, so the IPC prefix lives under /tmp, not the run dir.
+        # Unix socket paths stop at ~107 characters, so the IPC prefix goes under /tmp, not the run dir.
         self.ipc_dir = Path("/tmp") / USER / f"wsj-{key}"
         self.upload_dir = Path("/tmp") / USER / f"wsj-{key}-up"
         self.state_dir = self.run_dir / ".server"
@@ -440,7 +440,8 @@ out["torch"] = torch.__version__
 out["torch_hip"] = getattr(torch.version, "hip", None)
 import mstar
 out["mstar_file"] = mstar.__file__
-for d in ("triton", "amd-aiter", "amd-flashinfer", "flashinfer-python", "transformers", "mstar-ai", "mstar_rust"):
+for d in ("triton", "triton-rocm", "amd-aiter", "amd-flashinfer", "flashinfer-python", "transformers", "mstar-ai",
+          "mstar_rust"):
     try:
         out[d] = md.version(d)
     except Exception:
