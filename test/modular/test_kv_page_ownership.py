@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 import sys
+from importlib.util import find_spec
 
 sys.path.insert(0, ".")
 
@@ -204,58 +205,63 @@ def test_a_sealed_page_comes_back_writable_when_it_is_freed():
 # ── the invariant ───────────────────────────────────────────────────────
 
 
-def _drive(kv: KVManager, rng: random.Random, ops: int, offload: bool = False):
+def _drive(kv: KVManager, seed: int, ops: int, offload: bool = False):
     """Random operations against ``kv``, with the invariant checked after each.
 
     The pool is deliberately too small, so admission is refused often and the
     half-finished paths — a fork reserved, then a segment that does not fit —
-    run here too. Returns the log of what it did, so a failure says what led up
-    to it.
+    run here too. Failures include the seed and the operations through the
+    failing one; successful runs return the log for coverage checks.
     """
+    rng = random.Random(seed)
     live: list[str] = []
     log: list[str] = []
-    for i in range(ops):
-        roll = rng.random()
-        if not live or roll < 0.2:
-            rid = f"r{i}"
-            kv.ingest_request(rid)
-            live.append(rid)
-            log.append(f"ingest {rid}")
-        elif roll < 0.6:
-            rid = rng.choice(live)
-            span = rng.randrange(1, 3 * PAGE_SIZE)
-            pre = (("main", "alt"),) if rng.random() < 0.25 else ()
-            post = (("main", "cfg"),) if rng.random() < 0.25 else ()
-            step = KVStep(
-                segments=(Segment(rid, "main", span),),
-                pre_forks=pre, post_forks=post,
-            )
-            ctx = _ctx(rid)
-            admitted = kv.admit(step, ctx).ok
-            if admitted:
-                kv.plan(step, ctx)
-                kv.commit(step, ctx)
-            log.append(
-                f"step {rid} span={span} pre={len(pre)} post={len(post)} "
-                f"admitted={admitted}"
-            )
-        elif roll < 0.75:
-            rid = rng.choice(live)
-            free = rng.random() < 0.5
-            kv.reset_request(rid, free=free)
-            log.append(f"reset {rid} free={free}")
-        elif offload and roll < 0.85:
-            rid = rng.choice(live)
-            kv.offload(rid)
+    try:
+        for i in range(ops):
+            roll = rng.random()
+            if not live or roll < 0.2:
+                rid = f"r{i}"
+                log.append(f"ingest {rid}")
+                kv.ingest_request(rid)
+                live.append(rid)
+            elif roll < 0.6:
+                rid = rng.choice(live)
+                span = rng.randrange(1, 3 * PAGE_SIZE)
+                pre = (("main", "alt"),) if rng.random() < 0.25 else ()
+                post = (("main", "cfg"),) if rng.random() < 0.25 else ()
+                log.append(f"step {rid} span={span} pre={len(pre)} post={len(post)}")
+                step = KVStep(
+                    segments=(Segment(rid, "main", span),),
+                    pre_forks=pre, post_forks=post,
+                )
+                ctx = _ctx(rid)
+                admitted = kv.admit(step, ctx).ok
+                log[-1] += f" admitted={admitted}"
+                if admitted:
+                    kv.plan(step, ctx)
+                    kv.commit(step, ctx)
+            elif roll < 0.75:
+                rid = rng.choice(live)
+                free = rng.random() < 0.5
+                log.append(f"reset {rid} free={free}")
+                kv.reset_request(rid, free=free)
+            elif offload and roll < 0.85:
+                rid = rng.choice(live)
+                log.append(f"offload {rid}")
+                kv.offload(rid)
+                kv.assert_pages_conserved()
+                reloaded = kv.reload(rid)
+                log[-1] += f" reloaded={reloaded}"
+            else:
+                rid = rng.choice(live)
+                log.append(f"remove {rid}")
+                live.remove(rid)
+                kv.remove_request(rid)
             kv.assert_pages_conserved()
-            reloaded = kv.reload(rid)
-            log.append(f"offload {rid} reloaded={reloaded}")
-        else:
-            rid = rng.choice(live)
-            live.remove(rid)
-            kv.remove_request(rid)
-            log.append(f"remove {rid}")
-        kv.assert_pages_conserved()
+    except Exception as error:
+        trace = "\n".join(f"{i}: {operation}" for i, operation in enumerate(log))
+        error.add_note(f"KV lifecycle seed={seed}, offload={offload}\n{trace}")
+        raise
     return log
 
 
@@ -269,7 +275,7 @@ def test_the_invariant_survives_a_random_lifecycle():
     order, on a pool too small to hold them all."""
     kv = _manager(max_num_pages=12)
 
-    log = _drive(kv, random.Random(SEED), ops=400)
+    log = _drive(kv, SEED, ops=400)
 
     assert sum(1 for line in log if "admitted=True" in line) > 50, (
         f"seed {SEED}: the pool was too small for the fuzz to store anything"
@@ -287,7 +293,7 @@ def test_the_invariant_survives_offload_and_reload():
     leaves an owner that is still around."""
     kv = _manager(max_num_pages=12, cpu_offload_pages=16)
 
-    log = _drive(kv, random.Random(SEED), ops=400, offload=True)
+    log = _drive(kv, SEED, ops=400, offload=True)
 
     assert any("offload" in line for line in log), f"seed {SEED}: nothing offloaded"
     _drain(kv)
@@ -312,6 +318,7 @@ def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
 
 
 @pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.skipif(find_spec("flashinfer") is None, reason="requires the optional FlashInfer backend")
 def test_kv_lens_match_flashinfer_seq_lens(page_size):
     """The host lengths handed to FlashInfer's decode plan are exactly what it
     would have rebuilt from the indptrs itself."""
