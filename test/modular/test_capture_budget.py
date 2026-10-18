@@ -79,10 +79,15 @@ class _StubMeasuredRunner:
         self._executables = {}
         self._comm_group = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         self.warmed: list[tuple[BucketKey, int]] = []
+        # buckets a resource of the node cannot run in a graph
+        self.refuse: set[BucketKey] = set()
         self.forwards: list[int] = []
 
     def prepare_for_capture(self):
         return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
+
+    def _capture_refusal(self, spec):
+        return "no capturable kernel" if spec.bucket in self.refuse else None
 
     @contextmanager
     def _warmed(self, spec, forwards):
@@ -123,6 +128,22 @@ def test_every_bucket_is_measured_once_before_any_capture(measured):
 
     assert measured == list(steps.values()), "each bucket is measured once, in capture order"
     assert _sized(kept) == steps, "every bucket's step must be kept to size its capture"
+
+
+def test_a_bucket_a_resource_refuses_is_warmed_but_never_captured_to_size_it(measured):
+    """It runs eagerly, so its warm-up peak still sets the floor. It is not
+    captured to size it, and with no graph the plan never takes it."""
+    steps = {_DECODE: CaptureCost(_GIB // 10, _GIB // 5, 0, 2), _PREFILL: CaptureCost(_GIB, 2 * _GIB, 0, 2)}
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), steps)
+    runner.refuse = {_PREFILL}
+
+    costs = _sized(runner.size_captures())
+
+    assert measured == [steps[_DECODE]], "a refused bucket must not be captured to size it"
+    assert runner.warmed.count((_PREFILL, 0)) == runner.warmed.count((_PREFILL, 1)) == 1
+    assert costs[_PREFILL].graph is None and costs[_PREFILL].peak == _GIB
+    plan = plan_captures({"Thinker": costs}, free=8 * _GIB)
+    assert plan.buckets["Thinker"] == {_DECODE} and plan.floor == _GIB
 
 
 def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
@@ -762,6 +783,8 @@ class _StubPlannedRunner:
     _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
     _register_slot = AcceleratorGraphRunner._register_slot
     _report_dropped = AcceleratorGraphRunner._report_dropped
+    _refused_buckets = AcceleratorGraphRunner._refused_buckets
+    _capture_refusal = staticmethod(lambda spec: None)
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
 
     def __init__(self, buckets: list[BucketKey], peer: list[bool]):
