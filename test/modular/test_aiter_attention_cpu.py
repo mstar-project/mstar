@@ -1,9 +1,9 @@
-"""What the AITER attention managers stage for their kernels, checked on the CPU.
+"""CPU checks of what the AITER attention managers stage for their kernels.
 
-The kernels run on ROCm only (``test/rocm/test_attention_aiter.py``); the plans
-are host work, and their layout is what a replay reads: the block table rows
-and the tail-tile padding, the per-row KV lengths, the row counts and host
-ints a captured bucket must keep, and the pre-plan protocol.
+The kernels only run on ROCm (``test/rocm/test_attention_aiter.py``), but the
+plans are host work and are what a replay reads. These cover the block table
+rows and tail padding, per-row KV lengths, the row counts and host ints a
+captured bucket must keep, and preplan.
 """
 
 import numpy as np
@@ -86,7 +86,7 @@ def test_an_eager_step_stages_its_own_layout():
     plan = m._current_plans["main"]
     assert plan.cu_seqlens_q.tolist() == [0, 20, 21, 22]
     assert plan.seqused_k.tolist() == [20, 40, 1]
-    # live maxima on an eager step, and a table only as wide as the step needs
+    # an eager step uses the batch's maxima and a table only as wide as it needs
     assert (plan.max_seqlen_q, plan.max_seqlen_k, plan.num_tokens) == (20, 40, 22)
     assert plan.block_table.shape == (3, 3 + PAD_COLS)
     table = plan.block_table.tolist()
@@ -100,7 +100,7 @@ def test_a_captured_decode_step_pins_the_kernel_variant_and_keeps_its_buffers():
     first = [view("a", [3], 5, 1), view("pad", [SINK_PAGE], 1, 1)]
     m.plan(AttentionStep(), context(first, lease(2, 2)))
     plan = m._current_plans["main"]
-    # one query per row; the cache's max context, not the batch's
+    # one query per row, and the cache's max context instead of the batch's
     assert (plan.max_seqlen_q, plan.max_seqlen_k) == (1, 512)
     # a row can hold every page of the pool
     assert plan.block_table.shape == (2, POOL + PAD_COLS)
@@ -168,7 +168,7 @@ def test_a_split_walk_plans_as_one_launch():
 
 def test_a_row_with_nothing_to_attend_points_at_the_sink():
     m = manager()
-    # a packed bucket's padding row: no tokens, no pages
+    # a packed bucket's padding row, with no tokens and no pages
     views = [view("a", [3], 7, 7), view("pad", [], 0, 0)]
     m.plan(AttentionStep(), context(views, lease(2, 16)))
     plan = m._current_plans["main"]
@@ -255,7 +255,7 @@ def test_a_captured_ragged_step_pads_to_the_buckets_segments():
     ctx = StepContext(request_ids=["a", "b"], graph_walk="w", slot=0, capture=False, slot_lease=lease(2, 64))
     m.plan(step, ctx)
     plan = m._current_plans["img"]
-    # bs 2 x 2 segments per request; the extra two are empty
+    # bs 2 x 2 segments per request, the last two empty
     assert plan.cu_seqlens_q.tolist() == [0, 30, 40, 40, 40]
     assert plan.cu_seqlens_k.tolist() == plan.cu_seqlens_q.tolist()
     assert (plan.max_seqlen_q, plan.num_segments, plan.num_tokens) == (64, 2, 40)

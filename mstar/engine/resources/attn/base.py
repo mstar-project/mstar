@@ -1,9 +1,9 @@
 """The attention resource's shared machinery: the spec-time factory, the
 custom op every backend attends through, and the workspace pool.
 
-The backends themselves live beside this — `flashinfer`, `aiter`, `cross`,
-`dense`, `flex` — and `AttentionManager.build` reaches them by deferred import,
-so naming a backend in a spec does not load the others.
+The backends are sibling modules (`flashinfer`, `aiter`, `cross`, `dense`,
+`flex`), and `AttentionManager.build` reaches them by deferred import, so
+naming a backend in a spec does not load the others.
 """
 
 import logging
@@ -39,10 +39,8 @@ def resolve_attn_backend(
     """The concrete backend for ``backend`` on ``device``.
 
     ``AUTO`` becomes the platform's default. A backend named in the spec or
-    YAML is returned as is.
-
-    ``page_size`` is the paged cache's, when there is one: on ROCm it decides
-    between AITER and FlashInfer (see ``_rocm_paged_backend``).
+    YAML is returned as is. ``page_size``, the paged cache's if there is one,
+    decides between AITER and FlashInfer on ROCm (see ``_rocm_paged_backend``).
     """
     if backend is not AttnBackend.AUTO:
         return backend
@@ -52,8 +50,8 @@ def resolve_attn_backend(
 
 
 def _rocm_paged_backend(page_size: int | None) -> AttnBackend:
-    """AITER's unified attention, unless the page size is one whose page tails
-    it reads unmasked and AMD's FlashInfer build, which masks them, is there."""
+    """AITER's unified attention, unless AITER reads page tails unmasked at this
+    page size and AMD's FlashInfer build (which masks them) is installed."""
     from mstar.engine.resources.attn import aiter as rocm
 
     aiter_reason = rocm.aiter_paged_unavailable_reason()
@@ -74,11 +72,11 @@ def flashinfer_kwargs(kv_config: KVConfig, backend: str, decode_tensor_cores: bo
     """The FlashInfer managers' platform arguments for a spec naming ``backend``
     and ``decode_tensor_cores`` (``AttentionConfig``'s choice of decode kernel).
 
-    On ROCm only AMD's FlashInfer build runs, and its ``auto`` cannot reach an
-    AITER kernel at page 128 (it falls back to fa2 after a failed probe, or
-    takes a per-token gather for prefill), so ``auto`` is pinned to fa2 there.
-    Decode runs without tensor cores, its faster path on ROCm, for the GQA
-    groups that kernel dispatches, whatever the spec asked for.
+    On ROCm only AMD's FlashInfer build runs. Its ``auto`` can't use an AITER
+    kernel at page 128 (it falls back to fa2 after a failed attempt, or gathers
+    per token for prefill), so ``auto`` is pinned to fa2 there. Decode skips
+    tensor cores, the faster path on ROCm, for the GQA groups that kernel
+    dispatches, whatever the spec asked for.
     """
     if not current_platform.is_rocm():
         return {"backend": backend, "decode_tensor_cores": decode_tensor_cores}
