@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import os
 import sys
 from pathlib import Path
 
@@ -203,9 +202,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
 
 
 def _serve(args: argparse.Namespace) -> None:
+    from mstar.platforms import apply_visible_devices
+
     config = _resolve_config(args.model, args.config)
-    if args.gpus is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    apply_visible_devices(args.gpus)
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
@@ -248,7 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("model", help=f"model name ({', '.join(sorted(DEFAULT_CONFIGS))}) or use --config")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        "--gpus", default=None,
+        help="GPUs to use, e.g. '0' or '0,1,2' (sets CUDA_VISIBLE_DEVICES, and HIP_VISIBLE_DEVICES on ROCm)",
+    )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
