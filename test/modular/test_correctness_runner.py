@@ -266,3 +266,10 @@ def test_math_sdpa_reference_spread_is_reported(tmp_path):
     spread = sc.metrics["reference_vs_math_sdpa_reference_psnr_db"]
     assert spread["n"] == 2 and 30 < spread["median"] < 40
     assert math.math_reference_dir(ref) is None and fam.math_reference_dir(ref) == alt
+
+
+def test_robotics_can_skip_episodes_without_a_task():
+    items = [sets.Item(id="ep00", prompt="Put the marker in the pot"), sets.Item(id="ep05", prompt="")]
+    fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {"skip_empty_prompt": "1"})
+    assert [it.id for it in fam.select_items(items)] == ["ep00"]
+    assert len(family_for_config("pi05", "pi05", {}, {}).select_items(items)) == 2
