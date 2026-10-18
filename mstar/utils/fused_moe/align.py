@@ -95,6 +95,26 @@ def _hip_runtime_ldflags() -> list[str]:
     return []
 
 
+def _staged_source(name: str) -> str:
+    """Copy the source into the extension's build dir and return the copy.
+
+    hipify writes .hip files next to its input, and the package dir may be
+    read-only. We only re-copy when the content changed, so ninja doesn't
+    rebuild in every new process.
+    """
+    import filecmp
+    import shutil
+
+    from torch.utils.cpp_extension import _get_build_directory
+
+    staged = os.path.join(_get_build_directory(name, verbose=False), os.path.basename(_CSRC))
+    if not (os.path.exists(staged) and filecmp.cmp(_CSRC, staged, shallow=False)):
+        tmp = f"{staged}.{os.getpid()}.tmp"  # other workers may be reading it
+        shutil.copy2(_CSRC, tmp)
+        os.replace(tmp, staged)
+    return staged
+
+
 @torch.compiler.assume_constant_result
 def _cuda_op_available() -> bool:
     """Build the vendored op on first use and say whether it loaded.
@@ -122,11 +142,13 @@ def _build_cuda_op() -> bool:
         from mstar.platforms import current_platform
 
         _clear_stale_build_lock("_mstar_moe_C")
-        # On ROCm torch hipifies the source. There are no warp-level
-        # intrinsics, and cub::BlockScan becomes hipcub's.
-        ldflags = _hip_runtime_ldflags() if current_platform.is_rocm() else []
+        sources, ldflags = [_CSRC], []
+        if current_platform.is_rocm():
+            # torch hipifies the source. There are no warp-level
+            # intrinsics, and cub::BlockScan becomes hipcub's.
+            sources, ldflags = [_staged_source("_mstar_moe_C")], _hip_runtime_ldflags()
         load(
-            name="_mstar_moe_C", sources=[_CSRC], extra_ldflags=ldflags,
+            name="_mstar_moe_C", sources=sources, extra_ldflags=ldflags,
             is_python_module=False, verbose=False,
         )
         # Touch the op so a registration failure surfaces here, not at call time.
