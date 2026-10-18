@@ -114,9 +114,9 @@ def render(data: dict) -> str:
     lines += [f"- run `{meta.get('run_id')}`, {meta.get('started')} to {meta.get('finished')}",
               f"- node {node.get('host')}, partition {node.get('partition')}, job {meta.get('job')}, "
               f"GPUs {meta.get('gpus')}, lanes {meta.get('lanes')}, NUMA binding {meta.get('numa')}",
-              f"- {meta.get('repeats')} timed repeats per cell after warmup; a cell over "
-              f"{(meta.get('spread_limit') or 0):.0%} spread is re-run once; tok/s counts at most the requested "
-              "output length per request"]
+              f"- timed runs per cell after warmup: {meta.get('repeats')}. A cell over "
+              f"{(meta.get('spread_limit') or 0):.0%} spread is re-run once. tok/s counts at most the requested "
+              "output length per request."]
     if meta.get("note"):
         lines.append(f"- {meta['note']}")
     for name, h in data["health"].items():
