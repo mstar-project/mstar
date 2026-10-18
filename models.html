@@ -1468,10 +1468,22 @@ a separate stage: the solver state (the order-2 history buffer and the
 corrector’s <code class="docutils literal notranslate"><span class="pre">last_sample</span></code>) is carried on the denoise loop’s own edges, so it
 travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.</p>
-<p><strong>Nothing is accelerated by default.</strong> wan22 serves the DiT eager: no
-<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, no CUDA-graph capture, no continuous batching, no component
-offload, and the VAE decode is always tiled (which bounds its workspace so the
-untiled conv3d cannot OOM a 32 GiB card).</p>
+<p><strong>What is accelerated by default.</strong> The DiT runs under <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>
+(<code class="docutils literal notranslate"><span class="pre">compile_dit</span></code>) and the untiled VAE decode runs the shared Wan VAE decoder,
+channels-last and compiled (<code class="docutils literal notranslate"><span class="pre">vae_decode_fast</span></code>; set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> under the
+yaml’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> for stock <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code>). Both compile on first use:
+the DiT once per resolution, frame count and CFG setting, so the first request
+at a new size is slower. The VAE decode compiles once per resolution, and only
+for the sizes in <code class="docutils literal notranslate"><span class="pre">vae_decode_fast_sizes</span></code> (default <code class="docutils literal notranslate"><span class="pre">1280x704</span></code>); any other
+size decodes with stock <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code>, frames identical to
+<code class="docutils literal notranslate"><span class="pre">vae_decode_fast:</span> <span class="pre">false</span></code>. The compile uses Inductor’s deterministic mode, so
+every server process decodes the same latents to the same frames; torch 2.9.1
+has no such mode, and there two processes can differ by a few uint8 levels.
+The VAE decode
+tiles only when free VRAM at decode time is short of the untiled estimate
+(the <code class="docutils literal notranslate"><span class="pre">auto</span></code> policy; <code class="docutils literal notranslate"><span class="pre">WAN22_VAE_DECODE_TILING</span></code> forces a path), which keeps the untiled conv3d from OOMing a
+32 GiB card. No CUDA-graph capture, no continuous batching (one request per
+step) and no component offload.</p>
 </section>
 <section id="ltx-2-5-ltx2-5">
 <h2>LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)<a class="headerlink" href="#ltx-2-5-ltx2-5" title="Link to this heading">#</a></h2>

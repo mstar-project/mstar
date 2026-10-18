@@ -983,6 +983,48 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.</span>
     <span class="n">vae_decode_tiling</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
 
+    <span class="c1"># Compiled untiled decode through the shared Wan VAE decoder. Each output size costs a compile, so only</span>
+    <span class="c1"># ``vae_decode_fast_sizes`` use it; other sizes and tiled decodes run stock ``vae.decode`` / ``tiled_decode``.</span>
+    <span class="c1"># Compiled in Inductor's deterministic mode, so the frames do not depend on the server process, except on a</span>
+    <span class="c1"># torch without that mode (2.9.1).</span>
+    <span class="n">vae_decode_fast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># "WxH" output sizes the fast decode compiles for; None is the default size</span>
+    <span class="c1"># (1280x704). Requests choose their size, so an open list would let each new</span>
+    <span class="c1"># size cost a compile on the shared worker.</span>
+    <span class="n">vae_decode_fast_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># A yaml "false" is a truthy string, so a non-boolean is rejected here</span>
+        <span class="c1"># rather than read as on.</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_decode_fast</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 vae_decode_fast must be true or false, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_decode_fast</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fast_decode_sizes</span><span class="p">()</span>
+
+<div class="viewcode-block" id="Wan22Config.fast_decode_sizes">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.wan22.config.html#mstar.model.wan22.config.Wan22Config.fast_decode_sizes">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fast_decode_sizes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""``vae_decode_fast_sizes`` as (width, height) pixel pairs."""</span>
+        <span class="n">sizes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae_decode_fast_sizes</span>
+        <span class="k">if</span> <span class="n">sizes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">({(</span><span class="bp">self</span><span class="o">.</span><span class="n">default_width</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_height</span><span class="p">)})</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sizes</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sizes</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 vae_decode_fast_sizes must be a list of 'WxH' sizes, got </span><span class="si">{</span><span class="n">sizes</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="n">align_h</span><span class="p">,</span> <span class="n">align_w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spatial_alignment</span>
+        <span class="n">parsed</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">sizes</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">size</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"x"</span><span class="p">))</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 vae_decode_fast_sizes entry must be 'WxH', got </span><span class="si">{</span><span class="n">size</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+            <span class="k">if</span> <span class="n">width</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">height</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">width</span> <span class="o">%</span> <span class="n">align_w</span> <span class="ow">or</span> <span class="n">height</span> <span class="o">%</span> <span class="n">align_h</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Wan2.2 vae_decode_fast_sizes entry </span><span class="si">{</span><span class="n">size</span><span class="si">!r}</span><span class="s2"> must be positive multiples of "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">align_w</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">align_h</span><span class="si">}</span><span class="s2">."</span>
+                <span class="p">)</span>
+            <span class="n">parsed</span><span class="o">.</span><span class="n">add</span><span class="p">((</span><span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">))</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">parsed</span><span class="p">)</span></div>
+
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">hidden_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""DiT hidden width (num_attention_heads * attention_head_dim)."""</span>
