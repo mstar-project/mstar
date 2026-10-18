@@ -2,8 +2,10 @@
 
     python -m benchmark.amd.table RUN_DIR
 
-Cells show the median over repeats; the primary metric also shows [min-max]. Flags: rerun (spread
-over the limit once), noisy (still over it after the re-run), error (failed requests or runs).
+Cells show the median over repeats, and the primary metric also its [min-max]. Flags are rerun
+(spread over the limit once), noisy (still over it after the re-run), error (failed requests or
+runs), client-bound (the benchmark client was busy most of the run) and HEALTH-FAIL (thermal
+throttling or new ECC errors during the arm).
 """
 
 from __future__ import annotations
@@ -132,8 +134,8 @@ def render(data: dict) -> str:
         if a["arm"] == "mstar" or not im:
             git = a.get("git") or {}
             what = f"mstar {git.get('branch', '')} {str(git.get('head', ''))[:9]}" if git else a["arm"]
-            ver = " ".join(f"{k} {stack[k]}" for k in ("torch", "torch_hip", "amd-aiter", "amd-flashinfer", "triton")
-                           if stack.get(k))
+            ver = " ".join(f"{k} {stack[k]}" for k in ("torch", "torch_hip", "amd-aiter", "amd-flashinfer", "triton",
+                                                        "triton-rocm") if stack.get(k))
         else:
             what = f"{src.get('repo')}:{src.get('tag')} {str(src.get('digest', ''))[:19]}"
             ver = " ".join(f"{k} {stack[k]}" for k in ("vllm", "sglang", "vllm-omni", "torch", "torch_hip",
@@ -195,7 +197,8 @@ def render(data: dict) -> str:
             lines.append("")
 
     if data["correctness"]:
-        lines += ["## Correctness (WS-K sample sets and references)", "", "| row/arm | verdict | details |",
+        lines += ["## Correctness (benchmark/correctness sample sets and references)", "",
+                  "| row/arm | verdict | details |",
                   "|---|---|---|"]
         for k, v in data["correctness"].items():
             lines.append(f"| {k} | {v.get('verdict')} | {_correctness_details(v)} |")
