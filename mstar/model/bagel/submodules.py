@@ -643,32 +643,28 @@ class LLMSubmodule(ARNodeSubmodule):
 
     _NODE_TO_CFG_LABEL = NODE_TO_CFG_LABEL
 
-    def _sample_tokens(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> torch.Tensor:
+    def _sample_tokens(self, logits: torch.Tensor) -> torch.Tensor:
         """One token per row of this step's ``[rows, vocab]`` logits.
 
-        ``request_ids`` is the batch the forward ran on, so under capture it is
-        the slot's padding ids and ``logits`` has the padded row count — which
-        is what the graph sampler's per-row params were gathered for. The
-        engine maps the entries back onto the real ids.
+        The rows are the batch the forward ran on, so under capture ``logits``
+        has the slot's padded row count, which is what the graph sampler's
+        per-row params were gathered for. The engine maps the entries back
+        onto the real ids.
         """
-        tokens = self.node_resources["sampler"].sample(request_ids, logits)
+        tokens = self.node_resources["sampler"].sample(logits)
         # FlashInfer reuses its sampling output buffer across calls, so a view
         # held past the next step aliases that step's token.
         return tokens.clone()
 
-    def _sample_one(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> NameToTensorList:
+    def _sample_one(self, logits: torch.Tensor) -> NameToTensorList:
         """The single-request forward's output shape: one flat name -> tensors."""
-        return {"new_token": [self._sample_tokens(request_ids, logits)]}
+        return {"new_token": [self._sample_tokens(logits)]}
 
     def _sample_per_request(
         self, request_ids: list[str], logits: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
         """The batched forward's output shape: rid -> that rid's outputs."""
-        tokens = self._sample_tokens(request_ids, logits)
+        tokens = self._sample_tokens(logits)
         return {
             rid: {"new_token": [token]}
             for rid, token in zip(request_ids, tokens.split(1), strict=True)
@@ -1083,7 +1079,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # A prefill hands back logits only when it is meant to sample this step
         # (`sample_prefill_token`); decode always does.
         if _LOGITS in out:
-            return self._sample_one(engine_inputs.request_ids, out.pop(_LOGITS)[0])
+            return self._sample_one(out.pop(_LOGITS)[0])
         return out
 
     def _forward_prefill_text(
