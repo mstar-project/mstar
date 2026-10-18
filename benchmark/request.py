@@ -1088,8 +1088,8 @@ def _media_fields(model: Model, req_input: RequestInput, additional_model_kwargs
 class MediaRoutes:
     """Image generation over ``/v1/images/generations`` and video generation, either mstar's synchronous
     ``/v1/videos/generations`` or the job API of vllm-omni and SGLang Diffusion (``POST /v1/videos``,
-    poll, ``GET /content``), the shapes benchmark/flux2_klein/bench_images.py and
-    benchmark/wan22/video_bench_wan22.py use for these engines."""
+    poll, ``GET /content``), as benchmark/flux2_klein/bench_images.py and
+    benchmark/wan22/video_bench_wan22.py send them to these engines."""
 
     video_poll_s = 0.1
 
