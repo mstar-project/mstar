@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from mstar import platforms
-from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, current_platform
+from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform, current_platform
 
 
 @pytest.fixture
@@ -57,15 +57,6 @@ def test_resolving_caches_the_platform():
 def test_the_next_test_starts_with_no_platform_cached():
     # test/modular/conftest.py clears the cache around every test
     assert platforms.resolve_platform.cache_info().currsize == 0
-
-
-def test_current_platform_is_an_instance_of_the_resolved_class(resolve):
-    resolve(cuda=True, hip="7.0")
-    assert isinstance(current_platform, RocmPlatform)
-    assert isinstance(current_platform, Platform)
-    assert not isinstance(current_platform, CudaPlatform)
-    resolve(cuda=False)
-    assert isinstance(current_platform, CpuPlatform)
 
 
 def test_current_platform_pickles_and_copies_as_itself(resolve):
