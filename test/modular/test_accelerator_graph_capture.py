@@ -7,8 +7,8 @@ slots — registering a partial one would hand both to the same buffers, and
 under a lower index than the one it captured under.
 
 Capture failure is also a per-rank event, so the barrier count must not depend
-on whether a capture succeeded. Nor may the TP group's capture scope, which can
-finish a capture with a collective of its own.
+on whether a capture succeeded. Same for the TP group's capture scope, which
+can run a collective of its own when the capture finishes.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ requires_cuda = pytest.mark.skipif(
 
 
 class _Scope(GraphCaptureScope):
-    """A capture scope that can declare a capture unusable, as a strategy
-    does when the ranks recorded different collectives."""
+    """A capture scope that can reject a capture, like a strategy does when
+    ranks recorded different collectives."""
 
     def __init__(self, drop: bool):
         super().__init__()
@@ -55,8 +55,8 @@ class _Scope(GraphCaptureScope):
 
 
 class _Group:
-    """A one-rank comm group, or a two-rank one whose peer's flags are given.
-    ``drop_scopes`` names, by entry order, captures its scope rejects."""
+    """A one-rank comm group, or a two-rank one with the peer's flags given.
+    ``drop_scopes`` lists, by entry order, the captures its scope rejects."""
 
     def __init__(self, peer_flags: list[bool] | None = None, drop_scopes=()):
         self.count = 0
@@ -204,8 +204,8 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
 
 
 def test_every_rank_enters_the_capture_scope_once_per_spec_whatever_happens():
-    """The scope may agree on the capture across ranks on exit, so a failing
-    rank must enter and leave it as often as the others."""
+    """The scope may sync with other ranks on exit, so a rank whose capture
+    failed has to go through it as many times as the rest."""
     clean = _FakeRunner(_specs(walks=("decode", "prefill")))
     failed = _FakeRunner(_specs(walks=("decode", "prefill")), fail={("decode", 0)})
 
@@ -218,9 +218,9 @@ def test_every_rank_enters_the_capture_scope_once_per_spec_whatever_happens():
 
 
 def test_a_capture_its_scope_rejects_drops_the_whole_bucket():
-    """A graph whose collectives could not be finished across ranks must not
-    replay, and its bucket cannot run on the remaining slot."""
-    # specs run largest-first in the given order: decode slot 0 is entry 0
+    """A rejected graph must never replay, and its bucket can't run on the
+    other slot alone."""
+    # specs run in the given order, so decode slot 0 is entry 0
     runner = _FakeRunner(_specs(walks=("decode", "prefill")), drop_scopes={0})
 
     runner.warmup_and_capture()
