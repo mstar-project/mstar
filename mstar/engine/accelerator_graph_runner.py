@@ -961,8 +961,8 @@ class AcceleratorGraphRunner:
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
 
-            # entered on every rank, pass or fail: finishing a capture can
-            # itself be collective (see GraphCaptureScope)
+            # Every rank enters this, pass or fail, since finishing a capture
+            # can be collective (see GraphCaptureScope).
             with self._comm_group.tp_group.graph_capture() as capture:
                 try:
                     slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -1965,7 +1965,7 @@ class PiecewiseAcceleratorGraphRunner:
                             "total_tokens=%d slot=%d", self._label, shape.bs,
                             shape.total_tokens, slot, exc_info=True,
                         )
-                # an unusable slot fails the shape, which drops it everywhere
+                # an unusable slot drops this bucket on every rank
                 if not capture.usable:
                     shape_captured = False
             captured[i] = shape_captured
