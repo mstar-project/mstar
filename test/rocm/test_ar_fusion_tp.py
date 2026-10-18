@@ -19,6 +19,11 @@ Modes (``--mode``):
   stages   AITER's kernels called directly, one-stage and two-stage, beyond
            the shapes mstar fuses (for the investigation of corrupt outputs;
            runs against whatever ``aiter`` is importable, any version)
+  drift    a residual stream through 2 x ``--layers`` steps, each adding the
+           all-reduce of fresh partial sums as a decoder layer does, through
+           AITER's one-stage kernel and through RCCL + add, against an fp64
+           stream fed the same sums: how far rounding moves the residual, and
+           whether it shrinks it (AITER's kernel build picks its rounding)
 
 pytest runs parity and capture at 2, 4 and 8 ranks when that many GPUs are
 visible. From the command line, e.g.::
@@ -67,6 +72,7 @@ class Options:
     timing_replays: int = 20
     stages: tuple[int, ...] = (1, 2)
     stage_max_size: int = 64 << 20
+    layers: int = 64
     timeout: float = 1800.0
 
 
@@ -412,7 +418,51 @@ def _stages(ranks: _Ranks) -> list[Row]:
     return rows
 
 
-MODES = {"parity": _parity, "capture": _capture, "timing": _timing, "stages": _stages}
+def _drift(ranks: _Ranks) -> list[Row]:
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+    ca = CustomAllreduce(ranks.cpu_group, ranks.device, max_size=ranks.opts.stage_max_size)
+    rows = []
+    for hidden in ranks.opts.hiddens:
+        for tokens in ranks.opts.tokens:
+            if tokens * hidden * 2 > ranks.opts.stage_max_size:
+                continue
+            shared = torch.Generator(device=ranks.device).manual_seed(hidden + tokens)
+            own = torch.Generator(device=ranks.device).manual_seed(7919 * (hidden + tokens) + ranks.rank)
+            r0 = torch.randn(tokens, hidden, generator=shared, device=ranks.device).to(ranks.dtype)
+            w = torch.ones(hidden, dtype=ranks.dtype, device=ranks.device)
+            r64, r_fused, r_rccl = r0.double(), r0.clone(), r0.clone()
+            out_fused = None
+            for _ in range(2 * ranks.opts.layers):
+                x = (torch.randn(tokens, hidden, generator=own, device=ranks.device)
+                     * (0.5 / ranks.world ** 0.5)).to(ranks.dtype)
+                r64 = r64 + ranks.gather(x).double().sum(0)
+                out_fused, r_fused = ca.fused_ar_rms(
+                    x, r_fused, w=w, eps=1e-6, registered=False, use_1stage=True,
+                    gemma_norm=False,
+                )
+                y = x.clone()
+                dist.all_reduce(y)
+                r_rccl = r_rccl + y
+            torch.cuda.synchronize()
+            norm64 = r64 * torch.rsqrt(r64.pow(2).mean(-1, keepdim=True) + 1e-6)
+            ref_sq = r64.pow(2).sum()
+            for path, r, out in (("aiter-1stage", r_fused, out_fused), ("rccl+add", r_rccl, None)):
+                r = r.double()
+                row = Row("drift", ranks.rank, ranks.world, hidden, tokens, path=path)
+                row.max_err_res = ((r - r64).norm() / r64.norm()).item()
+                shrink = ((r * r64).sum() / ref_sq).item() - 1.0
+                if out is not None:
+                    row.max_err_norm = ((out.double() - norm64).norm() / norm64.norm()).item()
+                row.note = (f"{2 * ranks.opts.layers} steps: residual drift "
+                            f"{row.max_err_res:.4f}, projection {shrink:+.4f}")
+                rows.append(row)
+    ca.close()
+    return rows
+
+
+MODES = {"parity": _parity, "capture": _capture, "timing": _timing, "stages": _stages,
+         "drift": _drift}
 
 
 def _entry(rank: int, world: int, port: int, opts: Options, out_dir: str) -> None:
@@ -537,15 +587,18 @@ def main(argv=None) -> int:
     p.add_argument("--replays", type=int, default=8)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--stages", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--layers", type=int, default=64, help="drift: decoder layers (2 steps each)")
     p.add_argument("--timeout", type=float, default=1800.0)
     p.add_argument("--out", type=Path, default=None, help="write merged rows as JSON")
     args = p.parse_args(argv)
-    default_tokens = {"capture": CAPTURE_TOKENS, "timing": TIMING_TOKENS}.get(args.mode, TOKENS)
+    default_tokens = {"capture": CAPTURE_TOKENS, "timing": TIMING_TOKENS,
+                      "drift": (8, 64)}.get(args.mode, TOKENS)
     opts = Options(
         mode=args.mode, hiddens=tuple(args.hidden or HIDDENS),
         tokens=tuple(args.tokens or default_tokens), dtype=args.dtype,
         max_tokens=args.max_tokens, chain=args.chain,
         replays=args.replays, repeats=args.repeats, stages=tuple(args.stages),
+        layers=args.layers,
         timeout=args.timeout,
     )
     t0 = time.monotonic()
