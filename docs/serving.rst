@@ -87,7 +87,10 @@ The server creates the socket and upload directories with mode 0700 and
 refuses to start if one already exists as a symlink, belongs to another user,
 or is writable by group or others; remove it or pass another path. Uploaded
 files are written 0600. The same holds for ``python -m
-mstar.api_server.entrypoint`` and the Rust frontend.
+mstar.api_server.entrypoint`` and the Rust frontend. Only the last path
+component is checked, so to use a shared or group-writable volume (for example
+a Kubernetes volume with ``fsGroup``), pass a subdirectory of its mount point;
+the server creates that subdirectory 0700.
 
 Each model maps to a default config (override with ``--config``):
 
