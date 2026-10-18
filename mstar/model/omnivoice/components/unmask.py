@@ -1,21 +1,21 @@
-"""The unmask step: CFG scoring, confidence ranking, and the reveal schedule.
+"""The reveal: which scored cells get committed, and how many per step.
 
-An exact port of OmniVoice's ``_predict_tokens_with_scoring`` and the schedule
-arithmetic inside ``_generate_iterative`` (``omnivoice/models/omnivoice.py``).
-Parity against the reference is decided here, so the operation order is kept
-verbatim even where it could be tidied — the log_softmax is applied twice on the
-CFG path because the reference applies it twice, and the mask id is driven to
--inf after the combine rather than before.
+Scoring itself is not here. It moved to ``DiffusionSamplerResource``, which
+does the CFG combine and the token draw batched across a step's requests;
+what is left is the part that belongs to this decoder rather than to a
+sampler. The schedule arithmetic is an exact port of ``_generate_iterative``
+(``omnivoice/models/omnivoice.py``) and the ranking of
+``_predict_tokens_with_scoring``'s tail, so the operation order is kept
+verbatim even where it could be tidied.
 
-Nothing here touches the network or the engine; it is pure tensor math over one
-request's logits, so the parity test can drive it directly.
+Nothing here touches the network or the engine; it is pure tensor math over
+one request's canvas, so the parity test can drive it directly.
 """
 
 import math
 from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 
 
 def get_time_steps(
@@ -71,14 +71,6 @@ def build_reveal_schedule(
     return tuple(schedule)
 
 
-def filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
-    """Keep the top ``ratio`` of the vocabulary, -inf elsewhere."""
-    k = math.ceil(ratio * logits.shape[-1])
-    val, ind = logits.topk(k, dim=-1)
-    probs = torch.full_like(logits, float("-inf"))
-    probs.scatter_(-1, ind, val)
-    return probs
-
 
 def gumbel_sample(
     logits: torch.Tensor,
@@ -101,54 +93,6 @@ def gumbel_sample(
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 
-
-def predict_tokens_with_scoring(
-    c_logits: torch.Tensor,
-    u_logits: torch.Tensor,
-    audio_mask_id: int,
-    guidance_scale: float,
-    class_temperature: float,
-    generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """CFG-combine conditional and unconditional logits, then rank.
-
-    Args:
-        c_logits: conditional logits, ``[1, C, T, V]``.
-        u_logits: unconditional logits, same shape.  Ignored when
-            ``guidance_scale`` is 0.
-        audio_mask_id: the MASK class, forced to -inf so it is never predicted.
-        guidance_scale: 0 disables CFG entirely (and the caller may then skip
-            the unconditional forward).
-        class_temperature: 0 takes the argmax; above 0 samples from the top
-            decile with Gumbel noise.
-        generator: the request's seeded RNG, or ``None`` for the global one.
-
-    Returns:
-        ``(pred_tokens, confidence_scores)``, each ``[1, C, T]``.  The scores
-        are max log-probabilities and drive which cells get revealed.
-    """
-    if guidance_scale != 0:
-        c_log_probs = F.log_softmax(c_logits, dim=-1)
-        u_log_probs = F.log_softmax(u_logits, dim=-1)
-        log_probs = torch.log_softmax(
-            c_log_probs + guidance_scale * (c_log_probs - u_log_probs),
-            dim=-1,
-        )
-    else:
-        log_probs = F.log_softmax(c_logits, dim=-1)
-
-    log_probs[..., audio_mask_id] = -float("inf")
-
-    if class_temperature > 0.0:
-        filtered_probs = filter_top_k(log_probs, ratio=0.1)
-        pred_tokens = gumbel_sample(
-            filtered_probs, class_temperature, generator
-        ).argmax(dim=-1)
-    else:
-        pred_tokens = log_probs.argmax(dim=-1)
-
-    confidence_scores = log_probs.max(dim=-1)[0]
-    return pred_tokens, confidence_scores
 
 
 def apply_reveal(
@@ -177,7 +121,7 @@ def apply_reveal(
 
     Args:
         tokens: ``[1, C, T]``, the request's live canvas, modified in place.
-        pred_tokens, scores: ``[1, C, T]`` from ``predict_tokens_with_scoring``.
+        pred_tokens, scores: ``[1, C, T]`` from the diffusion sampler.
         generator: the request's seeded RNG, or ``None`` for the global one.
     """
     if reveal_count <= 0:
