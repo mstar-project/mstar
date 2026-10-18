@@ -25,11 +25,11 @@ python -m benchmark.runner \
     --profiling-type "${PROF_TYPE:-offline}" \
     --request-type "${TASK:-text_to_image}" \
     --vbench-cache-dir "$VBENCH_CACHE_DIR" \
-    --local-cache "$BENCHMARK_LOCAL_DIR" \
+    --local-cache "${BENCHMARK_LOCAL_DIR:-./mstar-benchmark-cache/}" \
     --num-requests "${NUM_REQUESTS:-10}" \
     --inference-system "${INF_SYS:-ours}" \
     --num-warmup "${WARMUP:-3}" \
-    ${DATASET:+--dataset "$dataset"} \
+    ${DATASET:+--dataset "$DATASET"} \
     ${BATCH_SIZE:+--batch-size "$BATCH_SIZE"} \
     ${RATE:+--rate "$RATE"} \
-    ${EXTRA_ARGS:+"$EXTRA_ARGS"}
+    ${EXTRA_ARGS:-}
