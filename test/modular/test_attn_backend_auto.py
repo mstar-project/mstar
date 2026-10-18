@@ -143,13 +143,13 @@ def test_auto_is_resolved_before_the_kv_config_check():
 
 def test_dense_without_a_varlen_kernel_falls_back_to_autos_backend(monkeypatch, caplog):
     monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
-    dense_module._fa3_unavailable_reason.cache_clear()
+    dense_module._varlen_unavailable_reason.cache_clear()
     dense_module._warn_dense_fallback.cache_clear()
     try:
         with caplog.at_level(logging.WARNING, logger=dense_module.logger.name):
             manager = AttentionManager.build(attention_spec(backend=AttnBackend.DENSE), kv_info(paged_config()))
     finally:
-        dense_module._fa3_unavailable_reason.cache_clear()
+        dense_module._varlen_unavailable_reason.cache_clear()
         dense_module._warn_dense_fallback.cache_clear()
     assert type(manager) is FlashInferManager
     assert "using the paged 'flashinfer' backend" in caplog.text

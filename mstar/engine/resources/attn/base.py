@@ -105,7 +105,7 @@ class AttentionManager(AttentionResource):
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` degrades dense to paged
-        # where the FA3 kernel is unusable, and the two do not agree bit for bit
+        # where no varlen kernel imports, and the two do not agree bit for bit
         return fingerprint(type(self).__name__)
 
     @classmethod
@@ -143,19 +143,19 @@ class AttentionManager(AttentionResource):
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
-            # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend AUTO picks rather than failing to serve.
+            # A dense backend needs a varlen kernel (FlashAttention-3, or
+            # AITER's on ROCm). Where none imports, fall back to the paged
+            # backend AUTO picks rather than failing to serve.
             # The two are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
-                _fa3_unavailable_reason,
+                _varlen_unavailable_reason,
                 _warn_dense_fallback,
             )
 
-            reason = _fa3_unavailable_reason()
+            reason = _varlen_unavailable_reason()
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
