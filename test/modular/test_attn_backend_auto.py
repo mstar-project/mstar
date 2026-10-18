@@ -1,5 +1,4 @@
-"""``AUTO`` attention backends: the default every attention config declares,
-resolved to a concrete backend when the resource is built.
+"""``AUTO`` attention backends, resolved when the resource is built.
 
 NVIDIA, Intel and CPU processes resolve ``AUTO`` to FlashInfer, which is what
 each config defaulted to before ``AUTO`` existed; ROCm resolves it to AITER, or

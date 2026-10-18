@@ -1,8 +1,8 @@
-"""One callable, a different implementation per platform.
+"""One callable with a different implementation per platform.
 
-A ``PlatformDispatch`` holds a factory per platform and picks one the first
-time it is called, so importing the module that declares it imports no kernel
-library and probes no device.
+A ``PlatformDispatch`` holds a factory per platform and picks one on its first
+call, so declaring one at import time loads no kernel library and touches no
+device.
 """
 
 from __future__ import annotations
@@ -19,12 +19,10 @@ Factory = Callable[[], Callable[..., Any]]
 class PlatformDispatch:
     """Forwards each call to the implementation for ``current_platform``.
 
-    Each factory takes no arguments and returns the implementation, importing
-    whatever it needs; ``default`` serves any platform without its own. The
-    first call resolves and caches the implementation; after that a call costs
-    one attribute read and the forwarded call, negligible against a kernel
-    launch. None of it runs when a captured graph replays, since replay
-    relaunches the recorded kernels without Python.
+    A factory takes no arguments, does its own imports and returns the
+    implementation. ``default`` covers platforms without their own factory.
+    The first call picks and caches the implementation. After that the
+    overhead is one attribute read, and none inside a captured graph.
     """
 
     def __init__(
@@ -62,7 +60,7 @@ class PlatformDispatch:
             return self._impl
 
     def reset(self) -> None:
-        """Forget the resolved implementation; the next call resolves again."""
+        """Drop the cached implementation so the next call picks again."""
         with self._lock:
             self._impl = None
 

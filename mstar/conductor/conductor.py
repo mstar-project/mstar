@@ -158,7 +158,7 @@ def _worker_process_target(
     tcp_transfer_device="",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
-    # first, before anything in this process calls into the device runtime
+    # before anything in this process touches the device runtime
     apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
@@ -549,9 +549,9 @@ class Conductor:
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
-        # Here as well as in the worker: a spawned child inherits os.environ,
-        # and it imports the model's modules (and any kernel library they
-        # import) while unpickling its arguments, before its target runs.
+        # Set here too. A spawned child imports the model's modules (and their
+        # kernel libraries) while unpickling its arguments, before the worker
+        # target runs, and it inherits os.environ.
         apply_process_env_defaults()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):

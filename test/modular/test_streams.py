@@ -39,7 +39,7 @@ def test_reset_device_scheduling_is_a_noop_off_cuda():
 
 
 def test_reset_device_scheduling_is_a_noop_on_rocm(monkeypatch):
-    # a ROCm box: torch.cuda reports a device, but there is no libcuda to load
+    # ROCm: torch.cuda reports a device but there is no libcuda
     def no_libcuda(name, *args, **kwargs):
         raise OSError(f"{name}: cannot open shared object file")
 
