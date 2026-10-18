@@ -20,6 +20,8 @@ _REQUIRED = {
     "exclude_state": False,
     "use_percentiles": True,
     "clip_outliers": True,
+    "use_albumentations": True,  # the eval transform below; torchvision's differs
+    "letter_box_transform": False,
 }
 
 
@@ -52,6 +54,8 @@ class Gr00tN17Preprocessor:
         }
         self.action_horizon = {tag: len(mc["action"]["delta_indices"]) for tag, mc in modality_configs.items()}
         self.embodiment_ids = {tag: embodiment_ids[tag] for tag in modality_configs}
+        self.image_edge = processor_kwargs["shortest_image_edge"]
+        self.crop_fraction = processor_kwargs["crop_fraction"]
         self.max_state_dim = max_state_dim
         self.max_action_horizon = max_action_horizon
         too_long = {t: h for t, h in self.action_horizon.items() if h > max_action_horizon}
@@ -114,3 +118,26 @@ class Gr00tN17Preprocessor:
         mask = torch.zeros((batch, self.max_action_horizon), dtype=torch.float32)
         mask[:, : self.action_horizon[self._tag(embodiment_tag)]] = 1.0
         return mask
+
+    def image(self, img: np.ndarray) -> np.ndarray:
+        """One uint8 ``(H, W, 3)`` frame through the reference's eval transform:
+        shortest edge to 256 (area), centre crop 95%, shortest edge to 256 again
+        (``build_image_transformations_albumentations``)."""
+        img = self._shortest_edge_to(img)
+        h, w = img.shape[:2]
+        # FractionalCenterCrop's arithmetic
+        ch, cw = max(1, int(h * self.crop_fraction)), max(1, int(w * self.crop_fraction))
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        return self._shortest_edge_to(img[y0 : y0 + ch, x0 : x0 + cw])
+
+    def _shortest_edge_to(self, img: np.ndarray) -> np.ndarray:
+        # albumentations' SmallestMaxSize: round() each side, skip at scale 1.
+        # cv2's INTER_AREA is the reference's filter; torchvision's bilinear
+        # moved actions ~5x the whole port's error (D05).
+        import cv2
+
+        h, w = img.shape[:2]
+        scale = self.image_edge / float(min(h, w))
+        if scale == 1.0:
+            return img
+        return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
