@@ -658,6 +658,8 @@ size (up to 3e-2 in bf16 on MI300X), and the fp32 matmul precision mstar sets (`
 makes fp32 matmuls run at reduced precision on gfx942 (7.8e-4 relative error against
 8e-7 at ``highest``). Tests that compare batched and single-row outputs bit for bit don't
 hold on ROCm.
+MIOpen's split-K implicit-GEMM conv solver isn't deterministic, so the ROCm platform
+turns it off by default (see :ref:`environment_variables:Platform defaults`).
 
 **Check the install.** On a node with an MI300X or MI325X:
 
