@@ -5,6 +5,7 @@ aiter.fused_moe runs CK two-stage or asm kernels on weights pre-shuffled into
 loading. AITER picks kernels per token count from its tuned tables, or from
 heuristics for sizes they don't cover. Keep AITER_ONLINE_TUNE unset when
 serving, otherwise it tunes in-process the first time it sees new sizes.
+Its output isn't bitwise reproducible across calls, unlike Triton's.
 
 Only imported when a model picks this backend. Nothing here runs on CUDA.
 """

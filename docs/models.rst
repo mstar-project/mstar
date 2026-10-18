@@ -311,13 +311,18 @@ Qwen3-Omni notes
 
 - The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
   kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
-  instead, whose kernels read the expert weights re-tiled once at load::
+  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
+  serving config's ``model_kwargs:`` block. It's read once when the model is
+  built, so a request's own ``model_kwargs`` can't change it::
 
       model_kwargs:
         moe_backend: aiter    # auto (default, Triton) | triton | aiter
 
   ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
-  (the Talker's experts at TP2 are not) and refuses to start otherwise.
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  output isn't bitwise reproducible (identical calls differ in the last bits),
+  so greedy decoding can flip near-tied tokens and repeated requests may not
+  match. The Triton kernels are reproducible.
 - The Triton kernels take launch configs tuned per GPU model from
   ``mstar/utils/fused_moe/configs/`` when one matches the expert sizes.
   ``benchmark/fused_moe/tune_fused_moe.py`` makes one on the local GPU.
