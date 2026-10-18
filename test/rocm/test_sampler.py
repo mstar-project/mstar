@@ -152,3 +152,33 @@ def test_captured_sampler_replays_the_eager_draw():
         assert torch.equal(captured, eager), f"step {step}"
         seen.add(tuple(captured.tolist()))
     assert len(seen) > 1, "replays drew fresh numbers"
+
+
+def test_sampling_traced_by_dynamo_graph_breaks_instead_of_raising():
+    """The fork's ops raise when dynamo traces into them (unless
+    FLASHINFER_USE_TORCH_CUSTOM_OPS=1 was set before import); mstar's binding
+    runs them outside the trace, so a compiled caller still samples."""
+    import flashinfer
+
+    batch, vocab = 4, 256
+    logits = torch.randn(batch, vocab, device=DEV)
+    temperature = torch.ones(batch, device=DEV)
+    top_k = torch.full((batch,), 20, device=DEV, dtype=torch.int32)
+    top_p = torch.full((batch,), 0.9, device=DEV)
+    seed = torch.arange(batch, device=DEV, dtype=torch.long)
+    offset = torch.zeros(batch, device=DEV, dtype=torch.long)
+
+    def raw(probs):
+        return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, deterministic=True, seed=seed, offset=offset,
+        )
+
+    torch._dynamo.reset()
+    with pytest.raises(Exception, match="FLASHINFER_USE_TORCH_CUSTOM_OPS"):
+        torch.compile(raw)(torch.softmax(logits, -1))
+
+    def step(logits):
+        return sample_accelerator_graphable_gpu(logits * 1.0, temperature, top_k, top_p, seed, offset)
+
+    torch._dynamo.reset()
+    assert torch.equal(torch.compile(step)(logits), step(logits))
