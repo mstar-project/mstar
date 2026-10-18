@@ -1618,11 +1618,10 @@ class OpenAITranscribe(InferenceSystem):
 
 
 class OrpheusVLLM(InferenceSystem):
-    """Orpheus served the way the ``orpheus-speech`` package serves it: a plain vLLM server streams
-    the LM's audio tokens over ``/v1/completions`` and this client turns them into 24 kHz audio with
-    the ``snac`` package, decoding a 4-frame window each time a frame completes and keeping its
-    middle 2048 samples (``orpheus_tts.decoder``; mstar's SNAC node uses the same window). SNAC runs
-    on this process's GPU, one decode at a time, like the package's decoder thread.
+    """Orpheus the way the ``orpheus-speech`` package serves it. vLLM streams the LM's audio tokens
+    over ``/v1/completions``, and this client decodes them with the ``snac`` package, one 4-frame
+    window per new frame, keeping the middle 2048 samples (the same window as mstar's SNAC node).
+    SNAC runs on this process's GPU, one window at a time.
     """
 
     PROMPT_START = [128259]
