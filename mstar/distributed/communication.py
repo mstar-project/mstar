@@ -187,9 +187,9 @@ class CommGroup:
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
-        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs of ``dtype``; the platform's kernel may take fewer rows.
-        Returns whether it is available for them.
+        """Sets up the fused kernel behind ``allreduce_add_rmsnorm`` for up to
+        ``max_tokens`` rows of ``hidden`` in ``dtype`` (the platform's kernel may
+        take fewer, the rest stay unfused). Returns whether it's available.
 
         Collective: every member calls it at load, in the same order with the
         same arguments. The lockstep nodes of an instance share its group, so
@@ -215,9 +215,9 @@ class CommGroup:
         return True
 
     def graph_capture(self):
-        """Scope for one graph capture of a forward that may hold
-        ``allreduce_add_rmsnorm``: see ``ar_fusion.GraphCaptureScope``. Every
-        member enters it for every capture, pass or fail."""
+        """Scope for one graph capture that may contain ``allreduce_add_rmsnorm``
+        (see ``ar_fusion.GraphCaptureScope``). Every member enters it for every
+        capture, even one that fails."""
         from mstar.distributed.ar_fusion import GraphCaptureScope, JointCaptureScope
 
         scopes = [ws.fusion.graph_capture() for ws in self._ar_fusion.values()]
