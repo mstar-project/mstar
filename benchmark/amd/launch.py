@@ -44,7 +44,7 @@ CTR_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SLURM_JOB_ID", "
 CTR_FORWARDED = ("VLLM_", "SGLANG_", "AITER_", "HSA_", "NCCL_", "RCCL_", "MIOPEN_", "TORCH_", "TORCHINDUCTOR_",
                  "PYTORCH_", "HF_", "DIFFUSION_", "OMNI_", "HIP_")
 VRAM_BUSY_MB = 4096
-TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara"}
+TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian"}
 
 
 def gpu_list(text: str) -> list[int]:
@@ -153,8 +153,17 @@ class Launch:
 
     # --- what runs ---------------------------------------------------------------------------
     @property
+    def server_gpus(self) -> list[int]:
+        return self.gpus[: self.arm.server_gpus] if self.arm.server_gpus else self.gpus
+
+    @property
+    def client_gpu(self) -> int:
+        rest = self.gpus[len(self.server_gpus):]
+        return rest[0] if rest else self.gpus[0]
+
+    @property
     def gpu_text(self) -> str:
-        return ",".join(str(g) for g in self.gpus)
+        return ",".join(str(g) for g in self.server_gpus)
 
     def mstar_config(self) -> Path:
         cfg = self.worktree / "configs" / f"{self.row.name}.yaml"
@@ -380,9 +389,12 @@ def first_request(launch: Launch, timeout: float = 3600) -> tuple[float | None, 
         url, body = f"{base}/v1/chat/completions", {
             "model": row.hf_id, "messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 8,
             "temperature": 0.0}
-    elif row.family == "tts" and launch.arm.engine == "mstar":
-        url, body = f"{base}/v1/audio/speech", {"model": row.name, "input": "Hello there, this is a test.",
-                                                 "response_format": "pcm", "voice": TTS_VOICE.get(row.runner_model)}
+    elif row.family == "tts" and launch.arm.engine in ("mstar", "vllm-omni", "sglang-omni"):
+        url, body = f"{base}/v1/audio/speech", {
+            "model": row.name if launch.arm.engine == "mstar" else row.hf_id, "input": "Hello there, this is a test.",
+            "response_format": "pcm", "voice": TTS_VOICE.get(row.runner_model)}
+        if row.runner_model == "qwen3_tts":
+            body["language"] = "English"
     else:
         return None, None
     t0 = time.monotonic()
