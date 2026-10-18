@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 
 class AttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     FLEX = "flex"
@@ -25,7 +27,7 @@ class AttnBackend(Enum):
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
 
@@ -80,7 +82,7 @@ class CrossAttentionConfig:
     kv_cache: str  # name of the KV cache holding the context
     query_kv_cache: str | None = None  # KV cache driving the queries, if any
     context_label: str = "context"
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
 

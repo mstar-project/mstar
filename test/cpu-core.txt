@@ -8,6 +8,7 @@ test/modular/test_worker_drain.py
 test/modular/test_worker_message_handling.py
 test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
+test/modular/test_attn_backend_auto.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py
@@ -57,6 +58,7 @@ test/modular/test_mamba2_geometry.py
 test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_platforms.py
+test/modular/test_platform_dispatch.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
 test/modular/test_model_registration.py

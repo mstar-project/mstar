@@ -53,6 +53,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils.ipc_format import OffloadDelta
 from mstar.utils.profiler import (
@@ -568,16 +569,17 @@ class Engine:
 
             dynamic = True if node_name in self._item_encoders else None
             try:
-                submodule_mgmt.forward = torch.compile(
+                # no token count, these serve eager batches of any size
+                submodule_mgmt.forward = with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                )
-                submodule_mgmt.forward_batched = torch.compile(
+                ))
+                submodule_mgmt.forward_batched = with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                )
+                ))
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
