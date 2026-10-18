@@ -222,6 +222,28 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
     assert len(spawner._worker_processes) == 2
 
 
+MIOPEN_SPLIT_K = "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC"
+
+
+def test_only_rocm_turns_off_miopens_split_k_conv_solver():
+    assert RocmPlatform().process_env_defaults()[MIOPEN_SPLIT_K] == "0"
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert MIOPEN_SPLIT_K not in platform.process_env_defaults()
+
+
+@pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
+def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, exported, expected):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    # set first, so teardown restores the variable whatever the call does
+    monkeypatch.setenv(MIOPEN_SPLIT_K, "")
+    if exported is None:
+        monkeypatch.delenv(MIOPEN_SPLIT_K)
+    else:
+        monkeypatch.setenv(MIOPEN_SPLIT_K, exported)
+    platforms.apply_process_env_defaults()
+    assert os.environ[MIOPEN_SPLIT_K] == expected
+
+
 # --- device selection (mstar serve --gpus) ----------------------------------
 
 
