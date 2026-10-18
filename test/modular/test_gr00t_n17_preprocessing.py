@@ -47,6 +47,15 @@ def test_state_normalises_orders_and_pads():
     torch.testing.assert_close(s, expected)
 
 
+def test_group_without_stats_is_zero_filled_at_input_width():
+    # xdof's eef in the real checkpoint: 0-dim stats, 9-dim state -> 9 zeros
+    stats = copy.deepcopy(STATS)
+    stats["bot"]["state"]["arm"] = {"q01": [], "q99": []}
+    pre = Gr00tN17Preprocessor(KWARGS, stats, IDS, 5, 6)
+    s = pre.state("bot", {"arm": np.full((1, 2), 7.0), "grip": np.zeros((1, 1))})
+    assert s.tolist() == [[0, 0, 0, 0, 0]]
+
+
 def test_tag_is_case_insensitive():
     pre = _pre()
     state = {"arm": np.array(ARM), "grip": np.array(GRIP)}
