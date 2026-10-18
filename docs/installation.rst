@@ -725,8 +725,8 @@ turns it off by default (see :ref:`environment_variables:Platform defaults`).
    curl -s localhost:8000/v1/audio/speech -H 'Content-Type: application/json' \
        -d '{"model": "kokoro", "input": "Hello from an MI300X.", "voice": "af_bella"}' -o hello.wav
 
-The first start compiles a lot (Inductor, Triton, FlyDSL, FlashInfer), so it takes
-several minutes even for Kokoro. A warm cache makes later starts faster.
+The first start compiles a lot (Inductor, Triton, FlyDSL, FlashInfer). Kokoro took 15 to
+21 minutes on an MI300X with empty caches, and about 3 from a saved one.
 
 Verify the install
 ------------------
