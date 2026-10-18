@@ -1354,9 +1354,10 @@ class Qwen3OmniModel(Model):
         }
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # Each prefill samples the first token or codec frame, so decode runs one fewer.
         return {
-            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
-            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+            "thinker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs) - 1),
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

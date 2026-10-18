@@ -61,7 +61,8 @@ class TokenStepNode:
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
         ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
-        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
+        # prefill emitted the first token, so decode step k emits token k + 2
+        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 2
         return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
 
     def check_stop(

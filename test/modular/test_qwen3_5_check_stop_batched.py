@@ -35,7 +35,7 @@ def test_batched_agrees_with_per_request(shape):
     row_rids = ("d", "a", "c", "b", "e")
     infos = {
         "d": _info(),                        # EOS: stops
-        "a": _info(done=99, max_tokens=100), # out of budget: stops
+        "a": _info(done=98, max_tokens=100), # out of budget: stops
         "c": _info(ignore_eos=True),         # EOS ignored: keeps going
         "b": _info(),                        # other stop id: stops
         "e": _info(),                        # stopped a step ago, not checked

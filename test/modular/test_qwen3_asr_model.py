@@ -206,11 +206,13 @@ def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_
     stopped = next(
         k + 1 for k in range(cap + 1)
         if llm.check_stop("r", SimpleNamespace(
-            graph_walk=DECODE_WALK, max_tokens=cap, dynamic_loop_iter_counts={DECODE_LOOP: k},
+            graph_walk=DECODE_WALK, max_tokens=max_tokens, dynamic_loop_iter_counts={DECODE_LOOP: k},
             resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
         ), word)
     )
     assert stopped == cap, "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap == max(max_tokens, 2), "prefill's token plus the cap is not max_output_tokens"
 
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()

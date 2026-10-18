@@ -120,8 +120,8 @@ def test_graph_and_limits(snapshot):
     assert model.get_max_output_tokens(max_output_tokens=None) == 64 - 9
     # published, so the conductor refuses a larger request instead of cutting it short
     assert model.get_max_output_tokens_limit() == 64 - 9
-    # the request's max_output_tokens caps the loop, not the graph's max_iters
-    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 10}
+    # the request's max_output_tokens caps the loop, not the graph's max_iters, less the token prefill samples
+    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 9}
 
 
 def test_request_cap_must_fit_the_kv_pools(snapshot):

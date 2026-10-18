@@ -183,8 +183,8 @@ def test_output_and_request_limits():
     assert model.get_max_output_tokens_limit() == limit
     assert model.get_max_output_tokens(max_output_tokens=None) == limit
     assert model.get_max_output_tokens(max_output_tokens=5) == 5
-    # the request's max_output_tokens caps the loop, not the graph's max_iters
-    assert model.get_loop_caps(max_output_tokens=5) == {"decode_loop": 5}
+    # the request's max_output_tokens caps the loop, not the graph's max_iters, less the token prefill samples
+    assert model.get_loop_caps(max_output_tokens=5) == {"decode_loop": 4}
     # the shipped pool holds 64 requests at MAX_SEQ_LEN and the sink, no more
     model.validate_config_yaml({"max_concurrent_requests": 64}, "canary_qwen.yaml")
     with pytest.raises(ValueError, match=r"resources\.kv_cache"):

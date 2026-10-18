@@ -182,7 +182,8 @@ class CanaryQwenModel(Model):
         return self.MAX_OUTPUT_TOKENS
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # Prefill samples the first token, so decode runs one fewer.
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([

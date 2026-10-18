@@ -58,6 +58,8 @@ def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
         llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap == max(max_tokens, 2), "prefill's token plus the cap is not max_output_tokens"
 
 
 def _bagel():
@@ -452,6 +454,8 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
         llm.check_stop, "decode_loop", "decode", 1024,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap == max(max_tokens, 2), "prefill's token plus the cap is not max_output_tokens"
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
@@ -470,6 +474,8 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
         check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap["decode_loop"] == max(max_tokens, 2), "prefill's token plus the cap is not max_output_tokens"
 
 
 def _omni_submodule():
@@ -478,7 +484,6 @@ def _omni_submodule():
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_tokens):
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.config import THINKER_SAMPLER
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
@@ -490,11 +495,12 @@ def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_to
         2048, {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
         resource_configs={THINKER_SAMPLER: SamplingReqConfig(ignore_eos=True)},
     ), "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap["thinker_decode_loop"] == max(max_tokens, 2), "prefill's token plus the cap is not max_output_tokens"
 
 
 @pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
 def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
-    pytest.importorskip("flashinfer")
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
 
@@ -505,6 +511,10 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
     ), "the cap and the stop check end decode on different iterations"
+    # the last prefill samples the first codec frame, and a loop runs at least once
+    assert 1 + cap["talker_decode_loop"] == max(talker_max_tokens, 2), (
+        "the last prefill's frame plus the cap is not talker_max_output_tokens"
+    )
 
 
 def _tiny_qwen3_tts_talker():
@@ -646,12 +656,15 @@ def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     model = _whisper()
     bound = model.get_max_output_tokens(max_output_tokens=max_tokens)
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
 
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
+    assert cap == _stops_after(
         WhisperDecoderSubmodule(None, model.config).check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=bound,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
     ), "the cap and the stop check end decode on different iterations"
+    # prefill samples the first token, and a loop runs at least once
+    assert 1 + cap == max(bound, 2), "prefill's token plus the cap is not max_output_tokens"
 
 
 @pytest.mark.parametrize("language", ["en", None], ids=["forced", "detected"])
