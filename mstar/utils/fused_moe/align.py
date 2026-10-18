@@ -75,8 +75,19 @@ def _clear_stale_build_lock(name: str) -> None:
             pass
 
 
-@functools.lru_cache(maxsize=1)
+@torch.compiler.assume_constant_result
 def _cuda_op_available() -> bool:
+    """Build the vendored op on first use and say whether it loaded.
+
+    Dynamo traces through lru_cache, so without this mark every compiled call
+    graph-broke in here and re-ran the build check eagerly. Marked constant,
+    dynamo calls it once while tracing.
+    """
+    return _build_cuda_op()
+
+
+@functools.lru_cache(maxsize=1)
+def _build_cuda_op() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
 
     Cached so compilation is attempted once per process.  A failure (missing
