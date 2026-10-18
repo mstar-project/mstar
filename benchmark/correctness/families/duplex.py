@@ -25,13 +25,13 @@ class NemotronDuplex(Family):
     default_restarts = 2
     self_consistency_only = True
 
-    def items(self, sset: SampleSet):
-        return [it for it in sset.items if it.params.get("modality") == "audio"]
+    def select_items(self, items: list) -> list:
+        return [it for it in items if it.params.get("modality") == "audio"]
 
     def requests(self, sset: SampleSet) -> list[Request]:
         return [Request(it.id, files=[sset.path(it.files["audio"])], input_modalities="audio",
                         output_modalities="text,audio", model_kwargs={"temperature": 0.0, "seed": i})
-                for i, it in enumerate(self.items(sset))]
+                for i, it in enumerate(sset.items)]
 
     def save(self, sset: SampleSet, responses: list[Response], out_dir: Path) -> None:
         for r in responses:
@@ -50,7 +50,7 @@ class NemotronDuplex(Family):
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
               device: str) -> FamilyScore:
         sc = FamilyScore(self.name)
-        items = self.items(sset)
+        items = sset.items
         fails = failed_items(runs[0])
         sc.check("requests ok", len(items) - len(fails), "PASS" if not fails else "FAIL", "all",
                  "; ".join(f"{k}: {v[:80]}" for k, v in list(fails.items())[:3]))
