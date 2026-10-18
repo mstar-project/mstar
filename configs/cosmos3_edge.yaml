@@ -16,7 +16,7 @@ model_kwargs:
   # override.
   accelerator_graph: true
   graph_max_latent_area: 2000
-  # Video denoise steps stay eager on the dense FA3 path: capturing them
+  # Video denoise steps stay eager on the dense path: capturing them
   # (gen_capture_video) forces the paged attention into the graph, which
   # measured 3-6% slower at 832x480 for both the 121-frame clip and the
   # 29-frame window (H100, 2026-09-17). Add tiers here only for small,

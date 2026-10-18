@@ -491,7 +491,7 @@ class Cosmos3Config:
     # frames) pixel tiers: a plain t2v/i2v clip length and/or the windowed
     # rollout's window length. Pays only for small, launch-bound tiers: at
     # 832x480 the captured (paged-attention) step measured slower than the
-    # eager dense FA3 one, so the Edge yaml leaves this empty.
+    # eager dense one, so the Edge yaml leaves this empty.
     # The graph is built with every latent frame declared noisy and carries
     # the clean/noisy layout as a per-token mask input, so one graph per shape
     # serves t2v, i2v (anchor frame) and chained windows (overlap frames);
@@ -539,10 +539,10 @@ class Cosmos3Config:
     compile_reasoner_prefill: bool = False
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
-    # paged FlashInfer backend the understanding prefill and the captured
-    # denoise graphs run on, plus a dense FA3 one an eager denoise step runs
-    # instead: one varlen pass over [frozen text prefix | fresh gen tokens],
-    # skipping the paged path's per-step K/V write and wrapper plan.
+    # paged backend the understanding prefill and the captured denoise graphs
+    # run on, plus a dense one an eager denoise step runs instead: one varlen
+    # pass over [frozen text prefix | fresh gen tokens], skipping the paged
+    # path's per-step K/V write and wrapper plan.
     # "flashinfer" declares only the paged backend, so every step uses it.
     attention_backend: str = "dense_gen"
 
