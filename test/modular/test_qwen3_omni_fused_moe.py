@@ -228,3 +228,108 @@ def test_dispatch_experts_fused_sanity_cuda():
     assert out.shape == hidden_states.shape
     assert out.dtype == dtype
     assert torch.isfinite(out).all()
+
+
+# ------------------------------------------------------------------
+# Skipped slots: ids >= num_experts (the EP sentinel)
+# ------------------------------------------------------------------
+
+
+def _ids_with_sentinels(num_tokens, top_k, num_experts, device, frac=0.5):
+    """Random int32 ids with about ``frac`` of slots set to the sentinel ``num_experts``."""
+    ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device, dtype=torch.int32)
+    skip = torch.rand(num_tokens, top_k, device=device) < frac
+    return torch.where(skip, torch.full_like(ids, num_experts), ids)
+
+
+def _check_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_post_pad):
+    """Check the align output against a reference built from the valid ids only."""
+    flat = topk_ids.reshape(-1).cpu().tolist()
+    numel = len(flat)
+    slots = {e: sorted(i for i, x in enumerate(flat) if x == e) for e in range(num_experts)}
+    padded = {e: -(-len(s) // block_size) * block_size for e, s in slots.items()}
+
+    total = sum(padded.values())
+    assert int(num_post_pad.item()) == total
+
+    sorted_ids = sorted_ids.cpu().tolist()
+    expert_ids = expert_ids.cpu().tolist()
+    start = 0
+    for e in range(num_experts):
+        end = start + padded[e]
+        assert expert_ids[start // block_size : end // block_size] == [e] * (padded[e] // block_size)
+        span = sorted_ids[start:end]
+        # Intra-expert order is unspecified (the large-batch kernel uses atomics).
+        assert sorted(x for x in span if x != numel) == slots[e]
+        assert span.count(numel) == padded[e] - len(slots[e])
+        start = end
+    # Nothing past the padded region, so no skipped slot ever reaches a GEMM.
+    assert all(x == numel for x in sorted_ids[total:])
+
+
+@pytest.mark.parametrize(
+    "num_tokens,top_k,num_experts",
+    [
+        (8, 8, 64),  # small-batch kernel: EP decode, Thinker at P=2
+        (3, 8, 16),  # small-batch kernel, few experts
+        (256, 8, 64),  # large-batch kernels: numel >= 1024
+        (16, 8, 128),  # large-batch kernels: num_experts > 64
+    ],
+)
+@pytest.mark.parametrize("impl", ["cuda", "torch"])
+def test_moe_align_block_size_skips_sentinel(num_tokens, top_k, num_experts, impl):
+    from mstar.utils.fused_moe import align
+
+    if impl == "cuda" and not align._cuda_op_available():
+        pytest.skip("CUDA moe_align_block_size op could not be built")
+
+    device = torch.device("cuda")
+    block_size = 16
+    topk_ids = _ids_with_sentinels(num_tokens, top_k, num_experts, device)
+
+    max_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+    expert_ids = torch.empty(-(-max_padded // block_size), dtype=torch.int32, device=device)
+    num_post_pad = torch.empty(1, dtype=torch.int32, device=device)
+
+    if impl == "cuda":
+        torch.ops._mstar_moe_C.moe_align_block_size(
+            topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_post_pad
+        )
+    else:
+        align._moe_align_block_size_torch(
+            topk_ids, block_size, num_experts, sorted_ids, expert_ids, num_post_pad
+        )
+    _check_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_post_pad)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 256])
+@pytest.mark.parametrize("num_experts", [16, 64])
+def test_fused_experts_skip_invalid(num_tokens, num_experts):
+    from mstar.utils.fused_moe import fused_experts
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    hidden, inter, top_k = 256, 128, 8
+
+    hidden_states = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
+    w1 = torch.randn(num_experts, 2 * inter, hidden, device=device, dtype=dtype) * 0.05
+    w2 = torch.randn(num_experts, hidden, inter, device=device, dtype=dtype) * 0.05
+    topk_weights, _ = _random_router_output(hidden_states, num_experts, top_k, norm_topk_prob=True)
+    topk_ids = _ids_with_sentinels(num_tokens, top_k, num_experts, device)
+    skipped = topk_ids >= num_experts
+
+    partial = fused_experts(
+        hidden_states, w1, w2, topk_weights, topk_ids, reduce_results=False, skip_invalid=True
+    )
+    assert partial.shape == (num_tokens, top_k, hidden)
+    assert (partial[skipped] == 0).all()
+
+    # Reference: point skipped slots at expert 0 with weight 0.
+    ref_ids = torch.where(skipped, 0, topk_ids).long()
+    ref_w = torch.where(skipped, 0, topk_weights)
+    naive = _dispatch_experts_fused(hidden_states, w1, w2, num_experts, ref_ids, ref_w)
+    torch.testing.assert_close(partial.float().sum(dim=1).to(dtype), naive, atol=2e-2, rtol=2e-2)
+
+    reduced = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=True)
+    torch.testing.assert_close(reduced, naive, atol=2e-2, rtol=2e-2)

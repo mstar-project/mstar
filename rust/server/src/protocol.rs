@@ -87,9 +87,7 @@ mod flex {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     // Required, matching Python's pydantic `ChatMessage` (a message with no
-    // `role` is a 422 there). The value is otherwise flattened away — the v1
-    // simplification, as in mstar.
-    #[allow(dead_code)]
+    // `role` is a 422 there).
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,

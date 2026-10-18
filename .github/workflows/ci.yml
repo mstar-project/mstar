@@ -50,6 +50,9 @@ jobs:
           # BAGEL's CPU graph/KV tests import these model modules without
           # loading weights or requiring the CUDA-only BAGEL extras.
           python -m pip install einops regex transformers
+          # The Wan VAE decode tests build tiny random AutoencoderKLWan models
+          # (no weights); 0.39 is the release the decoder was verified on.
+          python -m pip install diffusers==0.39.0
           python -m pip check
       - name: Run CPU core tests
         env:
@@ -112,6 +115,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: cargo test --release --no-default-features
+      - run: cargo test --release --manifest-path rust/server/Cargo.toml
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
         run: cargo build --release
@@ -133,4 +137,5 @@ jobs:
           pip install triton
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
-          pytest test/rust/ -v
+          # the row store needs the columnar tensor store; cpu-core skips most of it
+          pytest test/rust/ test/modular/test_row_output_store.py -v

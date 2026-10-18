@@ -33,11 +33,19 @@ TALKER_POS = "talker_pos"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
 
+# Step-metadata keys ``process_prompt`` settles on the host for the prefill:
+# ``[instruct_len, text_len, stream_text, ref_text_len, ref_frames]``, the
+# codec speaker and language tags (-1 for none), and a clone's clip digest.
+PROMPT_LAYOUT_KEY = "prompt_layout"
+SPEAKER_ID_KEY = "speaker_id"
+LANGUAGE_ID_KEY = "language_id"
+REF_CLIP_KEY = "ref_clip_key"
+
 # ---------------------------------------------------------------------------
 # Fixed ChatML wrapper of the assistant turn, as the Qwen2 tokenizer emits it:
 # ``<|im_start|>assistant\n`` ... ``<|im_end|>\n<|im_start|>assistant\n``.
 # The reference slices the text span as ``input_id[:, 3:-5]``; the API side
-# uses these to size the span and the Talker verifies them before prefill.
+# verifies them and uses them to size the span; the Talker relies on that.
 # ---------------------------------------------------------------------------
 CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
 CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)

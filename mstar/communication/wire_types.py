@@ -16,6 +16,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
     ResultChunk,
     ResultTensors,
+    ResultTokens,
 )
 from mstar.api_server.request_types import SessionTornDown as SessionReleased
 from mstar.communication.wire import _set_polymorphic, register
@@ -84,6 +85,7 @@ _TYPES: dict[str, type] = {
     "session_torn_down": SessionTornDown,
     # api-server bodies
     "result_tensors": ResultTensors,
+    "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
     "result_chunk": ResultChunk,

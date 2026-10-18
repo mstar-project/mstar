@@ -59,6 +59,11 @@ class _Api:
         for chunk in self._chunks:
             yield chunk
 
+    async def iter_result_chunk_batches(self, request_id):
+        del request_id
+        for chunk in self._chunks:
+            yield [chunk]
+
 
 def _config(**kwargs):
     return SessionsConfig(

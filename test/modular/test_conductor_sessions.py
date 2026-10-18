@@ -199,6 +199,8 @@ def _ingestable(c, model_session=None):
     c.model = types.SimpleNamespace(
         get_initial_forward_pass_args=_initial,
         get_max_output_tokens=lambda **kw: 8,
+        get_max_output_tokens_limit=lambda: None,
+        get_node_resources=lambda: {},
         get_partitions=lambda: [partition],
         get_partition_topology=lambda: types.SimpleNamespace(connections=[]),
         get_request_resource_configs=lambda **kw: {},

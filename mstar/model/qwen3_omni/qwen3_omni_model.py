@@ -32,6 +32,7 @@ import logging
 from pathlib import Path
 
 import torch
+from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
@@ -61,6 +62,7 @@ from mstar.model.multimodal import (
     check_attachments,
     check_plan,
     find_media_spans,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
     split_around_spans,
@@ -78,7 +80,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, WeightConverter
+from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -1114,7 +1116,21 @@ class Qwen3OmniModel(Model):
         for waveform in raw_audio_inputs:
             np_audios.append(waveform.cpu().numpy())
 
-        # HF puts modality content INSIDE the user turn, each attachment
+        # input_modalities is the layout, here and in the schedule builder;
+        # prompt_parts only fills its text slots and roles.
+        texts, roles = prompt, None
+        if prompt_parts is not None:
+            texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
+            roles = [p.role for p in prompt_parts]
+        parts = parts_from_modalities(input_modalities, texts, roles)
+        if attached:
+            check_attachments(parts, {
+                "image": len(raw_image_inputs),
+                "audio": len(raw_audio_inputs),
+                "video": len(raw_video_inputs),
+            })
+
+        # HF puts modality content INSIDE its message's turn, each attachment
         # rendered as ``<|x_start|><|x_pad|><|x_end|>`` at its own place:
         #
         #   <|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>{prompt}<|im_end|>
@@ -1125,43 +1141,25 @@ class Qwen3OmniModel(Model):
         # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Qwen, a virtual human developed by the "
-                    "Qwen team, Alibaba Group, capable of perceiving "
-                    "auditory and visual inputs, as well as generating "
-                    "text and speech."
-                ),
-            },
-        ]
-        # input_modalities is the layout, here and in the schedule builder;
-        # prompt_parts only fills its text slots.
-        parts = parts_from_modalities(
-            input_modalities,
-            [p.text or "" for p in prompt_parts if p.modality == TEXT]
-            if prompt_parts is not None else prompt,
-        )
-        if attached:
-            check_attachments(parts, {
-                "image": len(raw_image_inputs),
-                "audio": len(raw_audio_inputs),
-                "video": len(raw_video_inputs),
-            })
-        content = [
-            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
-            else {"type": part.modality, part.modality: ""}
-            for part in parts
-        ]
-        if content:
-            messages.append({"role": "user", "content": content})
+        #
+        # A voice persona as the system prompt keeps the Thinker's text plain
+        # enough for the Talker to say, so a client that sends its own system
+        # message and wants audio puts the persona text in that message.
+        messages = messages_from_parts(parts, default_system=(
+            "You are Qwen, a virtual human developed by the "
+            "Qwen team, Alibaba Group, capable of perceiving "
+            "auditory and visual inputs, as well as generating "
+            "text and speech."
+        ))
 
-        text = self._processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            text = self._processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except TemplateError as exc:
+            raise ValueError(f"Qwen3-Omni's chat template refused the chat: {exc}") from exc
 
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
         spans = find_media_spans(input_ids, self._placeholder_specs())
@@ -1239,7 +1237,8 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
+            detok = self.tokenizer.decode(ids)
             return detok.encode("utf-8")
         elif modality == "audio":
             if output.numel() == 0:

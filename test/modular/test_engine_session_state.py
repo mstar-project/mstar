@@ -267,6 +267,7 @@ def _ingesting_engine(runner, submodule):
     engine = Engine.__new__(Engine)
     engine._runner = runner
     engine._request_sessions = {}
+    engine._loopback_steps = {}
     engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
     return engine
 
@@ -345,6 +346,7 @@ def _removing_engine(*nodes):
     engine = Engine.__new__(Engine)
     engine._runner = _RemovingRunner()
     engine._request_sessions = {}
+    engine._loopback_steps = {}
     engine._submodules = {
         node: SimpleNamespace(submodule=_StatefulSubmodule()) for node in nodes
     }

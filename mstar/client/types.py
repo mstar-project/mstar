@@ -17,17 +17,21 @@ class AudioBuffer:
 
     pcm: bytes
     sample_rate: int = 24000
+    # interleaved channels (the server's ``num_channels`` chunk metadata)
+    num_channels: int = 1
 
     def to_numpy(self):
-        """int16 samples as a numpy array (divide by 32768 for float in [-1, 1])."""
+        """int16 samples as a numpy array (divide by 32768 for float in [-1, 1]);
+        ``[samples, channels]`` for multichannel audio."""
         import numpy as np
 
-        return np.frombuffer(self.pcm, dtype="<i2")
+        samples = np.frombuffer(self.pcm, dtype="<i2")
+        return samples if self.num_channels == 1 else samples.reshape(-1, self.num_channels)
 
     def wav_bytes(self) -> bytes:
         from mstar.client.media import pcm16_to_wav_bytes
 
-        return pcm16_to_wav_bytes(self.pcm, self.sample_rate)
+        return pcm16_to_wav_bytes(self.pcm, self.sample_rate, self.num_channels)
 
     def to_wav(self, path) -> str:
         with open(path, "wb") as f:
