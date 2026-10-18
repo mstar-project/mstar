@@ -123,8 +123,8 @@ def render(data: dict) -> str:
                                                                if v["reasons"] else ""))
     lines.append("")
 
-    lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | recipe | cold start: ready s,"
-              " first request s |", "|---|---|---|---|---|---|---|---|"]
+    lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | attention (server log) | recipe "
+              "| cold start: ready s, first request s |", "|---|---|---|---|---|---|---|---|---|"]
     for a in data["arms"].values():
         im = a.get("image") or {}
         src = im.get("source") or {}
@@ -144,8 +144,9 @@ def render(data: dict) -> str:
         st = a.get("startup") or {}
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
-        lines.append(f"| {a['row']} | {a['arm']} | {status} | {what} | {ver} | {env} | {a.get('recipe') or ''} | "
-                     f"{cold} |")
+        backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if a["arm"] == "mstar" else "")
+        lines.append(f"| {a['row']} | {a['arm']} | {status} | {what} | {ver} | {env} | {backends} | "
+                     f"{a.get('recipe') or ''} | {cold} |")
     lines.append("")
 
     for wl_name in meta.get("workloads", []):
