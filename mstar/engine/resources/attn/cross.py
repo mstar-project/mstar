@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     EagerSlotKey,
     PlanCacheKey,
     WorkspacePool,
+    flashinfer_kwargs,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -64,7 +65,9 @@ class CrossAttentionManager(AttentionResource):
     def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
+        backend = resolve_attn_backend(
+            spec.config.backend, info.device, kv_config.page_size,
+        )
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.FLASHINFER:
@@ -75,8 +78,20 @@ class CrossAttentionManager(AttentionResource):
                 device=info.device,
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
-                decode_tensor_cores=spec.config.decode_tensor_cores,
+                **flashinfer_kwargs(
+                    kv_config, spec.config.flashinfer_backend, spec.config.decode_tensor_cores,
+                ),
+            )
+        if backend == AttnBackend.AITER:
+            from mstar.engine.resources.attn.aiter import AiterCrossManager
+
+            return AiterCrossManager(
+                kv_cache=spec.config.kv_cache,
+                query_kv_cache=spec.config.query_kv_cache,
+                context_label=spec.config.context_label,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown cross attention backend {backend!r}")
 
