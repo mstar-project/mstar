@@ -41,9 +41,12 @@ class BoundedKVConfig:
     rows_per_request: int
     # the longest source prefix a request may have; sizes the slots
     max_source_len: int
-    # source length -> what that request keeps; must not shrink as it grows
+    # source length -> what that request keeps
     retention: Callable[[int], SinkWindow]
     max_slots: int = 32
+    # the shortest source prefix a request may have: the slots also hold the part
+    # of a sink its source doesn't cover, which is largest for the shortest source
+    min_source_len: int = 0
     dtype: torch.dtype = torch.float32
     # A step's tokens join the stream last-first. Only for attention that
     # ignores key order, where it decides which of the oldest step's tokens are
@@ -53,19 +56,32 @@ class BoundedKVConfig:
     def __post_init__(self):
         if self.max_slots < 1:
             raise ValueError(f"max_slots must be >= 1, got {self.max_slots}")
-        policy = self.retention(self.max_source_len)
-        if policy.sink < 0 or policy.window < 0:
-            raise ValueError(f"retention for {self.max_source_len} source tokens is {policy}")
+        if not 0 <= self.min_source_len <= self.max_source_len:
+            raise ValueError(f"source lengths {self.min_source_len}..{self.max_source_len} are not a range")
+        sink = window = retained = 0
+        for n in range(self.min_source_len, self.max_source_len + 1):
+            policy = self.retention(n)
+            if policy.sink < 0 or policy.window < 0:
+                raise ValueError(f"retention for {n} source tokens is {policy}")
+            sink = max(sink, policy.sink - n)
+            window = max(window, policy.window)
+            retained = max(retained, policy.sink + policy.window)
+        # fixed once here: a plan reads them for every row
+        self._sink_capacity, self._window_capacity, self._max_retained = sink, window, retained
 
     @property
     def sink_capacity(self) -> int:
         """Written tokens a slot's sink region holds (the sink past the source)."""
-        policy = self.retention(self.max_source_len)
-        return max(0, policy.sink - self.max_source_len)
+        return self._sink_capacity
 
     @property
     def window_capacity(self) -> int:
-        return self.retention(self.max_source_len).window
+        return self._window_capacity
+
+    @property
+    def max_retained(self) -> int:
+        """The most entries a request retains, over every allowed source length."""
+        return self._max_retained
 
     @property
     def slot_tokens(self) -> int:

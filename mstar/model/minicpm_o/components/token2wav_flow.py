@@ -89,9 +89,7 @@ class BoundedLayerKV:
     @property
     def max_keys(self) -> int:
         """The most keys a row retains (before this step's own)."""
-        config = self.resource.config
-        policy = config.retention(config.max_source_len)
-        return policy.sink + policy.window
+        return self.resource.config.max_retained
 
     def attend(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,

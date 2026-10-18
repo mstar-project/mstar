@@ -193,10 +193,10 @@ class BoundedKVManager(Resource):
                 if pos is None:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"bounded KV step declares no position for {seg.request_id!r}"))
-                if pos.source_len > self.config.max_source_len:
+                if not self.config.min_source_len <= pos.source_len <= self.config.max_source_len:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} has a {pos.source_len}-token source; the slots "
-                        f"hold up to {self.config.max_source_len}"))
+                        f"take {self.config.min_source_len} to {self.config.max_source_len}"))
                 req = self._requests.get(seg.request_id)
                 if req is None:
                     if not self._free:

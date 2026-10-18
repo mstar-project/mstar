@@ -63,6 +63,28 @@ def test_layout_matches_stream(seed, reverse):
         stream += fresh[::-1] if reverse else fresh
 
 
+@pytest.mark.parametrize("source_len", [0, 5, 29, 30, 60])
+def test_slots_hold_the_sink_of_the_shortest_source(source_len):
+    """A fixed sink longer than a short source spills into the slot; the slots are
+    sized for the shortest source allowed, so a request with a longer one (whose
+    retention alone needs no sink region) shares the layout."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+
+    config = BoundedKVConfig(
+        num_layers=1, num_heads=1, head_dim=1, rows_per_request=1,
+        min_source_len=0, max_source_len=60, retention=lambda n: SinkWindow(30, 20),
+    )
+    assert config.sink_capacity == 30 and config.max_retained == 50
+    source = [("s", i) for i in range(source_len)]
+    sim = SlotSim(source, config.retention(source_len), config.sink_capacity)
+    stream = list(source)
+    for step in range(8):
+        fresh = [("g", len(stream) - source_len + j) for j in range(7)]
+        n = len(stream)
+        assert sim.step(fresh) == stream[:min(30, n)] + stream[max(30, n - 20):n] + fresh, step
+        stream += fresh
+
+
 # token2wav: a voice of P tokens (2P frames at 50 Hz); 28-code windows advance by 25
 P, KEEP = 60, 100
 
