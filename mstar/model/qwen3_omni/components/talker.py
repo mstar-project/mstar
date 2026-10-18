@@ -98,6 +98,7 @@ class Qwen3OmniTalkerLayer(nn.Module):
                 comm_group=comm_group,
             ),
             comm_group=comm_group,
+            moe_backend=config.moe_backend,
         )
 
     def forward(
