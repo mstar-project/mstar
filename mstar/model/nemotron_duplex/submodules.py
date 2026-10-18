@@ -861,12 +861,18 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     recomputed with its context: the emitted stream is the full-history decode
     sample for sample; the final chunk emits its held tail too.
     Requests whose windows have the same length are decoded in one batched
-    call. Declares no resources.
+    call; a steady-state window (left context + one chunk, every chunk after a
+    call's first) replays a CUDA graph (``DECODE_REGION``). Calls that started
+    at different times reach their chunk boundaries on different frames, so a
+    live load runs many small decodes. Declares no resources.
     """
 
-    # Per-request context is keyed by request id -> eager; fp32 codec.
+    # Per-request context is keyed by request id -> eager around the decode; fp32 codec.
     disable_torch_compile = True
     disable_autocast = True
+
+    DECODE_REGION = "codec_decode"
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     CONTEXT_KEY = "codec_ctx"
     TAIL_KEY = "codec_tail"              # the last chunk's held-back samples, int16
@@ -908,6 +914,34 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
+    @property
+    def _steady_window(self) -> int:
+        eartts = self.config.eartts
+        return eartts.codec_left_context_frames + eartts.codec_chunk_frames
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        del autocast_dtype, tp_world_size
+        window, num_q = self._steady_window, self.config.eartts.num_quantizers
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            return {"codes": torch.zeros(shape.bs, window, num_q, dtype=torch.long, device=device)}
+
+        return {
+            self.DECODE_REGION: PiecewiseBatchedConfig(
+                capture_fn=self._decode_region,
+                make_static_inputs=make_static_inputs,
+                seq_len=1,
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
+        }
+
+    def _decode_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        audio, _ = self.codec.decode(call.static_inputs["codes"])
+        return {"wav": audio.squeeze(1)}
+
     def _window(self, rid: str, codes: torch.Tensor) -> tuple[torch.Tensor, int]:
         """This request's ``context + new`` code window and its context length."""
         prev = self.request_state(rid).get(self.CONTEXT_KEY)             # (n_ctx, num_q) or None
@@ -935,11 +969,14 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         by_len: dict[int, list[int]] = {}
         for i, (full, _) in windows.items():
             by_len.setdefault(full.shape[0], []).append(i)
+        runner = (getattr(engine_inputs, "piecewise_runners", None) or {}).get(self.DECODE_REGION)
         for tf, idxs in by_len.items():
             batch = torch.stack([windows[i][0] for i in idxs]).long()   # (G, Tf, num_q)
-            code_len = torch.full((len(idxs),), tf, device=batch.device)
-            audio, _ = self.codec.decode(batch, code_len)               # (G, 1, samples)
-            wav = audio.squeeze(1)                                      # (G, samples)
+            if runner is not None and tf == self._steady_window and runner.can_run(len(idxs)):
+                wav = runner.run(static_inputs={"codes": batch}, real_bs=len(idxs))["wav"]
+            else:
+                audio, _ = self.codec.decode(batch)                     # (G, 1, samples)
+                wav = audio.squeeze(1)                                  # (G, samples)
             spf = wav.shape[1] // tf                                    # samples per frame
             for row, i in enumerate(idxs):
                 full, n_ctx = windows[i]

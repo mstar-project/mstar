@@ -283,7 +283,7 @@ class _FakeCodec(nn.Module):
         super().__init__()
         self.calls = 0
 
-    def decode(self, codes, code_len):
+    def decode(self, codes, code_len=None):
         self.calls += 1
         b, tf = codes.shape[0], codes.shape[1]
         per_frame = codes[:, :, 0].float() / 1000.0                     # (B, Tf)
@@ -389,12 +389,37 @@ def test_codec_cleanup_clears_per_request_context():
     assert "r" not in codec.request_states
 
 
+class _EagerDecodeRegion:
+    """The engine's piecewise runner on CPU for the codec's decode region: the
+    batch padded to its bucket with zero codes, the captured callable run eagerly."""
+
+    def __init__(self, codec, bs: int = 4):
+        self.bs, self.calls = bs, 0
+        self.config = codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
+            AudioCodecDecoderSubmodule.DECODE_REGION]
+
+    def can_run(self, batch_size):
+        return batch_size <= self.bs
+
+    def run(self, static_inputs, real_bs):
+        self.calls += 1
+        static = self.config.make_static_inputs(PiecewiseCaptureShape(bs=self.bs, seq_lens=[1] * self.bs,
+                                                                      total_tokens=self.bs))
+        for name, value in static_inputs.items():
+            static[name][:real_bs].copy_(value)
+        out = self.config.capture_fn(PiecewiseCallInputs(
+            static_inputs=static, engine_inputs=ModelInputsFromEngine(request_ids=[], per_request_info={})))
+        return {name: value[:real_bs].clone() for name, value in out.items()}
+
+
+@pytest.mark.parametrize("region", [False, True])
 @pytest.mark.parametrize("frames", [23, 25])
-def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames):
+def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, region):
     """With the real (tiny-channel, real kernel / rates / block count) decoder,
     the chunked stream -- 3 frames of left context, right edge carried into the
     next chunk -- equals the one-shot decode of all frames, sample for sample.
-    The final chunk flushes the held tail; 25 frames end on an empty one."""
+    The final chunk flushes the held tail; 25 frames end on an empty one. With
+    the decode region, the steady-state windows go through it, padded."""
     from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
     from mstar.model.nemotron_duplex.config import CodecConfig
 
@@ -407,6 +432,10 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames):
     cfg = NemotronDuplexConfig()
     codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
     assert cfg.eartts.codec_left_context_frames == 3 and codec._hold == ccfg.n_fft - ccfg.hop_length == 12
+    runners = {}
+    if region:
+        cfg.eartts.num_quantizers = ccfg.num_quantizers
+        runners[AudioCodecDecoderSubmodule.DECODE_REGION] = _EagerDecodeRegion(codec)
     chunk = 5
     codes = torch.randint(0, ccfg.codebook_size, (frames, ccfg.num_quantizers))
     with torch.no_grad():
@@ -418,10 +447,13 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames):
             piece = codes[start:start + chunk]
             inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [piece] if len(piece) else []},
                                        is_final_stream_chunk=start == starts[-1])
-            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None)
+            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None,
+                                  piecewise_runners=runners)
             out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, [inp]))
             pieces.append(out["r"]["audio_chunk"][0])
     stream = torch.cat(pieces)
+    if region:
+        assert runners[AudioCodecDecoderSubmodule.DECODE_REGION].calls >= 3
     assert stream.shape[0] == whole.shape[0]
     torch.testing.assert_close(stream, whole, atol=1, rtol=0)   # int16: one quantization step
 
