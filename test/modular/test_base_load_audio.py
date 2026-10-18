@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from mstar.model.base import Model
+from mstar.model.components import media_io as model_media
 
 
 class _VideoOnlyFFmpegDecoder:
@@ -31,6 +32,11 @@ def video_only_ffmpeg(monkeypatch):
     package.decoders = decoders
     monkeypatch.setitem(sys.modules, "torchcodec", package)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    # media_io's FFmpeg decoders take it, as where torchcodec loads
+    monkeypatch.setattr(
+        model_media, "_decoders",
+        lambda: model_media._Decoders(model_media._TorchcodecAudio(), model_media._TorchcodecVideo()),
+    )
     return _VideoOnlyFFmpegDecoder
 
 
