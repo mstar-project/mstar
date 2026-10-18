@@ -1,16 +1,14 @@
-"""Fused tensor-parallel all-reduce + residual add + RMSNorm.
+"""Fused TP all-reduce + residual add + RMSNorm.
 
-Replaces the all-reduce, add and norm after a row-parallel projection with one
-kernel: FlashInfer's ``allreduce_fusion`` on NVIDIA (~4-6us vs ~11us unfused at
-decode shapes), AITER's custom all-reduce with a fused RMSNorm on ROCm. Each is
-an ``ARFusion`` strategy behind the ``mstar::allreduce_add_rmsnorm`` op, so
-dynamo and CUDA-graph capture see one opaque node; the op reaches its strategy
-through an int-keyed registry. A strategy also says which inputs it takes
-(``accepts``); the rest keep ``CommGroup``'s all-reduce + separate norm.
+One kernel instead of all-reduce, add and norm after a row-parallel linear.
+FlashInfer's ``allreduce_fusion`` on NVIDIA (~4-6us vs ~11us unfused at decode
+sizes), AITER's custom all-reduce with fused RMSNorm on ROCm. Each is an
+``ARFusion`` behind the ``mstar::allreduce_add_rmsnorm`` op, so dynamo and graph
+capture see one opaque node. Inputs a strategy doesn't accept go through
+``CommGroup``'s plain all-reduce + norm.
 
-Building a strategy is a collective over the TP group. Every choice of code
-path is a function of shapes and world size, or is agreed across the group
-before it is acted on, so all ranks run the same collectives.
+Setting one up is collective over the TP group. Anything that picks a code path
+either depends only on sizes and world size or is agreed across ranks first.
 """
 from __future__ import annotations
 
@@ -31,13 +29,11 @@ _FUSIONS: list[ARFusion] = []
 
 
 class GraphCaptureScope:
-    """One graph capture on a TP group, entered by every rank, pass or fail.
-
-    The caller sets ``captured`` once its capture succeeded; after the scope
-    exits, ``usable`` says whether to keep the graph. A strategy that finishes
-    a capture across ranks (registering the buffers it recorded) does so on
-    exit, so ``usable`` is the same on every rank.
-    """
+    """Wraps one graph capture. Every rank enters it, whether or not its
+    capture works. The caller sets ``captured`` when the capture succeeded and
+    reads ``usable`` after exit to decide whether to keep the graph. A strategy
+    that registers captured buffers across ranks does it on exit, so ``usable``
+    agrees on every rank."""
 
     def __init__(self):
         self.captured = False
@@ -59,16 +55,16 @@ class ARFusion:
     def accepts(
         self, x: torch.Tensor, residual: torch.Tensor, weight_bias: float,
     ) -> bool:
-        """Whether ``run`` serves these inputs. Depends on shapes, dtypes and
-        layout only, so every rank of the group answers the same."""
+        """Whether ``run`` takes these inputs. Only looks at sizes, dtypes and
+        layout, so all ranks give the same answer."""
         raise NotImplementedError
 
     def run(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
         eps: float, weight_bias: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``r = allreduce(x) + residual``; returns ``(rmsnorm(r), r)``,
-        scaling by ``weight + weight_bias``. Out of place."""
+        """Returns ``(rmsnorm(r), r)`` with ``r = allreduce(x) + residual``,
+        scaled by ``weight + weight_bias``. Out of place."""
         raise NotImplementedError
 
     def accepts_allreduce(self, x: torch.Tensor) -> bool:
@@ -203,7 +199,7 @@ class FlashInferARFusion(ARFusion):
 
 
 def _agree(cpu_group, values: list[int]) -> list[int]:
-    """Element-wise max of ``values`` over ``cpu_group`` (gloo, host only)."""
+    """Element-wise max of ``values`` across ``cpu_group`` (gloo, on the host)."""
     t = torch.tensor(values, dtype=torch.int64)
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=cpu_group)
     return t.tolist()
@@ -222,7 +218,7 @@ def _aiter_version() -> str | None:
 
 
 def _release(version: str) -> tuple[int, ...] | None:
-    """``0.1.19.post1+rocm7.2`` -> ``(0, 1, 19, 1)``; ``0.1.25`` -> ``(0, 1, 25, 0)``."""
+    """``0.1.19.post1+rocm7.2`` -> ``(0, 1, 19, 1)``, ``0.1.25`` -> ``(0, 1, 25, 0)``."""
     m = re.match(r"(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?", version)
     if m is None:
         return None
@@ -235,11 +231,9 @@ def _round_up(n: int, multiple: int) -> int:
 
 def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
                weight_bias: float, eps: float):
-    """``(norm, residual)`` for the stacked per-rank inputs ``xs`` as the kernel
-    computes them (the fp32 sum rounded once, then the add rounded), and the
-    error each may carry: on gfx942 AITER rounds to bf16 by truncation, so a
-    value can sit a unit in the last place of the magnitude rounded at each
-    step away from this round-to-nearest reference."""
+    """Expected ``(norm, residual)`` for the stacked per-rank inputs ``xs``,
+    plus a tolerance for each. AITER truncates to bf16 on gfx942, so each
+    rounding step can be off by about one ulp of the value it rounds."""
     dtype = xs.dtype
     a = xs.float().sum(0)
     r = (a.to(dtype).float() + res.float()).to(dtype)
@@ -248,7 +242,7 @@ def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
     w_eff = w.float() + weight_bias
     normed = (v * scale * w_eff).to(dtype)
     step = a.abs() + v.abs()
-    rel = 2.0 ** -6  # two bf16 units in the last place
+    rel = 2.0 ** -6  # ~2 bf16 ulps
     return (normed, r), (rel * (normed.float().abs() + scale * w_eff.abs() * step) + 1e-6,
                          rel * step + 1e-6)
 
@@ -256,26 +250,25 @@ def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
 class AiterARFusion(ARFusion):
     """AITER's custom all-reduce with its one-stage fused RMSNorm.
 
-    Runs only where vLLM measured the one-stage kernel ahead of RCCL + a
-    separate norm (``use_1stage_fused_ar_rms``): at most 80 tokens, rows of
-    16-byte packs with at most 1024 packs, and under 256 KiB on 4 GPUs or
-    128 KiB on 8. Everything else keeps RCCL + norm; AITER's two-stage fused
-    kernel is slower than that pair and is never called.
+    Used only where vLLM found the one-stage kernel faster than RCCL + norm
+    (``use_1stage_fused_ar_rms``). That's up to 80 tokens, at most 1024 16-byte
+    packs per row, and under 256 KiB on 4 GPUs or 128 KiB on 8. Everything else
+    stays on RCCL + norm. The two-stage fused kernel is slower than that and
+    is never used.
 
-    Outside capture AITER copies the input into its pre-registered IPC pool. A
-    capture inside ``graph_capture`` instead records the input's own address,
-    and the scope's exit registers those addresses on every rank.
+    Outside capture AITER copies the input into its pre-registered IPC pool.
+    Inside ``graph_capture`` it records the input's own address instead, and
+    the scope registers those addresses on all ranks when it exits.
     """
 
     WORLD_SIZES = (2, 4, 8)
     MAX_TOKENS = 80
-    # strict upper bound on the input's bytes, by world size
+    # input bytes must stay below this, per world size
     MAX_BYTES = {4: 256 << 10, 8: 128 << 10}
     MAX_PACKS_PER_ROW = 1024
-    # First release whose one-stage kernel waits for every peer to finish
-    # reading before it returns, so a fast rank cannot overwrite its input pool
-    # with the next call's input while a slow one still reads it. No signature
-    # changed with it, so only the version tells.
+    # Before this the one-stage kernel returned without waiting for peers to
+    # finish reading, so a fast rank could overwrite its input pool with the
+    # next call's data. No API changed with the fix, so we check the version.
     MIN_VERSION = (0, 1, 19, 1)
 
     def __init__(self, ca, cpu_group, hidden: int, dtype: torch.dtype,
@@ -292,7 +285,7 @@ class AiterARFusion(ARFusion):
     def fused_token_bound(
         cls, world_size: int, hidden: int, dtype: torch.dtype, max_tokens: int,
     ) -> int:
-        """Most rows the one-stage kernel takes; 0 if it takes none."""
+        """Max rows the one-stage kernel takes here, 0 for none."""
         if world_size not in cls.WORLD_SIZES or dtype not in (torch.bfloat16, torch.float16):
             return 0
         elt = torch.empty((), dtype=dtype).element_size()
@@ -312,14 +305,14 @@ class AiterARFusion(ARFusion):
     ) -> AiterARFusion | None:
         bound = cls.fused_token_bound(world_size, hidden, dtype, max_tokens)
         if bound == 0:
-            # shape facts, the same on every rank
-            logger.info("AITER fused all-reduce + RMSNorm does not cover tp=%d "
-                        "hidden=%d %s; keeping RCCL + separate norm",
+            # depends only on sizes, same on every rank
+            logger.info("AITER fused all-reduce + RMSNorm doesn't cover tp=%d "
+                        "hidden=%d %s, using RCCL + separate norm",
                         world_size, hidden, dtype)
             return None
 
-        # Building the workspace is a sequence of collectives, so a rank that
-        # would refuse must say so before any rank starts.
+        # Building the workspace runs collectives, so every rank has to agree
+        # to go ahead before any of them starts.
         pool_cls = None
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
@@ -330,20 +323,20 @@ class AiterARFusion(ARFusion):
             reason = cls._unsupported(CustomAllreduce, IPCBufferPool)
         except Exception as e:  # noqa: BLE001
             reason = f"cannot import AITER's custom all-reduce: {type(e).__name__}: {e}"
-        # AITER keys each IPC exchange in the default store by a process-wide
-        # pool counter; this group's members start its pool from one count.
+        # AITER names its store keys after a per-process pool counter. Line it
+        # up across the group so all members use the same keys.
         seq = pool_cls._pool_seq if reason is None else 0
         refused, seq = _agree(cpu_group, [int(reason is not None), seq])
         if refused:
-            logger.warning("AITER fused all-reduce + RMSNorm unavailable (%s); "
-                           "keeping RCCL + separate norm",
+            logger.warning("AITER fused all-reduce + RMSNorm unavailable (%s), "
+                           "using RCCL + separate norm",
                            reason or "refused on another rank")
             return None
         pool_cls._pool_seq = seq
 
         elt = torch.empty((), dtype=dtype).element_size()
-        # The meta buffer is meta_size() + 2 * max_size: from 2 MiB up it is
-        # IPC-exportable at any size, below that only at whole 4 KiB pages.
+        # AITER's meta buffer is meta_size() + 2 * max_size. Below 2 MiB it
+        # only exports over IPC at whole 4 KiB pages, so stay above that.
         max_size = max(1 << 20, _round_up(bound * hidden * elt, 1 << 20))
         device = torch.device("cuda", torch.cuda.current_device())
         ca = None
@@ -354,20 +347,20 @@ class AiterARFusion(ARFusion):
             logger.exception("AITER CustomAllreduce construction failed")
             built = False
         if _agree(cpu_group, [int(not built)])[0]:
-            logger.warning("AITER custom all-reduce unavailable on some rank; "
-                           "keeping RCCL + separate norm")
+            logger.warning("AITER custom all-reduce failed to build on some rank, "
+                           "using RCCL + separate norm")
             if ca is not None:
                 ca.close()
             return None
 
-        bad = cls._probe(ca, rank, world_size, hidden, dtype, bound, device)
-        # registering captured inputs is off under expandable segments
+        bad = cls._check_kernel(ca, rank, world_size, hidden, dtype, bound, device)
+        # AITER turns off registering captured inputs under expandable segments
         register = bool(getattr(ca, "enable_register_for_capturing", False)
                         and hasattr(ca, "_ops_get_graph_buffer_count"))
         failed, no_register = _agree(cpu_group, [int(bad is not None), int(not register)])
         if failed:
-            logger.error("AITER fused all-reduce + RMSNorm gave wrong results "
-                         "(tp=%d hidden=%d %s): %s; keeping RCCL + separate norm",
+            logger.error("AITER fused all-reduce + RMSNorm failed its startup check "
+                         "(tp=%d hidden=%d %s, %s), using RCCL + separate norm",
                          world_size, hidden, dtype, bad or "on another rank")
             ca.close()
             return None
@@ -394,11 +387,11 @@ class AiterARFusion(ARFusion):
         return None
 
     @staticmethod
-    def _probe(ca, rank, world_size, hidden, dtype, max_tokens, device) -> str | None:
-        """Run the kernel at the smallest and largest fused shapes, both norm
-        flavours, against a host reference. A build that skips this hidden size
-        leaves the NaN the outputs were filled with. The inputs come from one
-        seeded generator, so every rank knows every rank's input."""
+    def _check_kernel(ca, rank, world_size, hidden, dtype, max_tokens, device) -> str | None:
+        """Startup check. Runs the kernel at 1 and ``max_tokens`` rows, gemma
+        on and off, and compares with a host reference. Outputs start as NaN,
+        so a build that skips this hidden size fails. All ranks draw inputs from
+        the same seeded generator, so each one can compute the full sum."""
         gen = torch.Generator().manual_seed(1234)
         try:
             for tokens in sorted({1, max_tokens}):
@@ -436,7 +429,7 @@ class AiterARFusion(ARFusion):
                 and x.is_contiguous() and residual.is_contiguous())
 
     def run(self, x, residual, weight, eps, weight_bias):
-        # AITER reads the weight in the activation dtype
+        # AITER reads the weight as the activation dtype
         if weight.dtype != x.dtype:
             weight = weight.to(x.dtype)
         registered = self._capturing and torch.cuda.is_current_stream_capturing()
@@ -451,12 +444,11 @@ class AiterARFusion(ARFusion):
         return _RegisteredCapture(self)
 
     def _finish_capture(self, captured: bool) -> bool:
-        """Register the input addresses this capture recorded, on every rank.
+        """Registers the input addresses this capture recorded, on all ranks.
 
-        Registration pairs each rank's i-th recorded address with every peer's
-        i-th, so it needs the same count everywhere. If the counts differ the
-        pairing is lost: the graph is dropped on every rank, and later
-        captures copy into the pre-registered pool instead.
+        AITER pairs each rank's i-th address with every peer's i-th, so the
+        counts have to match. If they don't, the graph is dropped everywhere
+        and later captures fall back to copying into the pool.
         """
         count = self._ca._ops_get_graph_buffer_count(self._ca._ptr)
         hi, neg_lo, failed = _agree(
@@ -464,8 +456,8 @@ class AiterARFusion(ARFusion):
         )
         if hi != -neg_lo:
             logger.error("graph capture recorded %d to %d all-reduce inputs across "
-                         "ranks; dropping it, and copying into AITER's pool in "
-                         "later captures", -neg_lo, hi)
+                         "ranks, dropping it and copying into AITER's pool from now on",
+                         -neg_lo, hi)
             self._register_in_capture = False
             return False
         if hi:
@@ -488,7 +480,7 @@ class _RegisteredCapture(GraphCaptureScope):
     def __exit__(self, exc_type, exc, tb) -> bool:
         self._fusion._capturing = False
         if exc_type is not None:
-            # unwinding; peers may never reach the agreement
+            # unwinding, peers may never get to the agreement
             self.usable = False
             return False
         self.usable = self._fusion._finish_capture(self.captured)
@@ -506,9 +498,9 @@ def create_fusion(
     rank: int, world_size: int, cpu_group, max_tokens: int, hidden: int,
     dtype: torch.dtype,
 ) -> ARFusion | None:
-    """Collective over the TP group: every member calls it, in the same order.
-    Returns the strategy behind ``allreduce_add_rmsnorm``, or None if none can
-    be built here (the caller keeps the unfused path)."""
+    """Collective over the TP group, every member calls it in the same order.
+    Returns the strategy for ``allreduce_add_rmsnorm``, or None if there's none
+    here and the caller should stay unfused."""
     fusion = _create(rank, world_size, cpu_group, max_tokens, hidden, dtype)
     if fusion is not None:
         fusion.ws_id = len(_FUSIONS)
@@ -521,8 +513,8 @@ def allreduce_add_rmsnorm(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     eps: float, weight_bias: float, ws_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``r = allreduce(x) + residual``; returns ``(rmsnorm(r), r)``, with the
-    norm scaling by ``weight + weight_bias``."""
+    """Returns ``(rmsnorm(r), r)`` with ``r = allreduce(x) + residual``,
+    scaled by ``weight + weight_bias``."""
     return _FUSIONS[ws_id].run(x, residual, weight, eps, weight_bias)
 
 
