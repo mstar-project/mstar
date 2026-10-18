@@ -1590,9 +1590,8 @@ class ARNodeSubmodule(NodeSubmodule):
         them routed, in ``input_ids`` and ``tensor_inputs[state]``, and they
         override its slot's."""
         sampler = engine_inputs.resources[self.device_loopback.sampler]
-        rids = engine_inputs.request_ids
-        out = {"input_ids": sampler.loopback_tokens(rids)}
-        out.update((name, sampler.loopback_state(name, rids)) for name in states)
+        out = {"input_ids": sampler.loopback_tokens()}
+        out.update((name, sampler.loopback_state(name)) for name in states)
         routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None and inp.input_seq_len]
         if routed:
             sampler.overwrite_rows(

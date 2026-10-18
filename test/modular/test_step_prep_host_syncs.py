@@ -650,8 +650,8 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
         overwrite_rows = SamplerResource.overwrite_rows
         _row_stager = None
 
-        def loopback_tokens(self, rids):
-            return torch.zeros(len(rids), dtype=torch.long, device="meta")
+        def loopback_tokens(self):
+            return torch.zeros(2, dtype=torch.long, device="meta")
 
     sub = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig())
     sampler = _Sampler()
