@@ -42,6 +42,9 @@ class FlashInferManager(AttentionManager):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
+        # off where the build's decode-without-tensor-cores kernel is the
+        # faster one (FlashInfer on ROCm); see `flashinfer_kwargs`
+        self._decode_tensor_cores = decode_tensor_cores
         self._device = device
         self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
@@ -69,7 +72,6 @@ class FlashInferManager(AttentionManager):
             device=device,
             backend=backend
         )
-        self._decode_tensor_cores = decode_tensor_cores
 
         self._workspaces = WorkspacePool(device)
 
@@ -151,16 +153,15 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            workspace = self._workspaces.get(label, slot)
+            kwargs = dict(self._wrapper_kv_kwargs)
             if is_decode:
-                wrapper = FlashInferDecodeWrapper(
-                    workspace_buffer=workspace,
-                    use_tensor_cores=self._decode_tensor_cores,
-                    **self._wrapper_kv_kwargs,
-                )
+                cls = FlashInferDecodeWrapper
+                kwargs["use_tensor_cores"] = self._decode_tensor_cores
             else:
-                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
-            self._eager_plan_states[key] = wrapper
+                cls = FlashInferPrefillWrapper
+            wrapper = self._eager_plan_states[key] = cls(
+                workspace_buffer=self._workspaces.get(label, slot), **kwargs,
+            )
         return wrapper
 
     @property
