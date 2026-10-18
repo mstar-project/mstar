@@ -221,26 +221,23 @@ class FlashInferAllReduce(AllReduce):
     mode = "flashinfer"
 
     def __init__(self, group: "CommGroup", max_bytes: int):
-        from mstar.distributed.ar_fusion import create_workspace
+        from mstar.distributed.ar_fusion import create_fusion
+        from mstar.platforms import current_platform
 
         super().__init__(group.device_group)
-        self.world_size = group.world_size
-        self.ws_id = create_workspace(
-            group, 1, max_bytes // 2, torch.bfloat16,
+        if not current_platform.is_cuda():
+            raise RuntimeError("tp_allreduce='flashinfer' needs FlashInfer's comm module (NVIDIA GPUs)")
+        self._fusion = create_fusion(
+            group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,
         )
-        if self.ws_id is None:
+        if self._fusion is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        from mstar.distributed.ar_fusion import _WORKSPACES, allreduce_oneshot
+        from mstar.distributed.ar_fusion import allreduce_oneshot
 
-        if (
-            not torch.compiler.is_compiling()
-            and input_.dim() == 2 and input_.dtype == torch.bfloat16
-            and input_.is_cuda and input_.is_contiguous()
-            and _WORKSPACES[self.ws_id].is_buffer_size_sufficient(self.world_size, *input_.shape, input_.dtype)
-        ):
-            return allreduce_oneshot(input_, self.ws_id)
+        if not torch.compiler.is_compiling() and self._fusion.accepts_allreduce(input_):
+            return allreduce_oneshot(input_, self._fusion.ws_id)
         return super().all_reduce(input_)
 
 
