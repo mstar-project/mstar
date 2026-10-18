@@ -701,7 +701,7 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument(
         "--unique-prompts",
         action="store_true",
-        help="Prefix each prompt with a tag unique to the run and send, so no request hits a cached prefix.",
+        help="Prefix each prompt with a tag unique to the run and send, so no request reuses a cached prefix.",
     )
 
     args = parser.parse_args()
