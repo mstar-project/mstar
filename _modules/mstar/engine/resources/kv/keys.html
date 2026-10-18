@@ -903,8 +903,9 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""Page keys for cross-request prefix reuse.</span>
 
 <span class="sd">A key commits to the whole prefix below it: the previous key, this page's token</span>
-<span class="sd">ids, and a digest for each input in the span that is not a token. One match</span>
-<span class="sd">confirms every page under it, and a new root leaves every old key unreachable.</span>
+<span class="sd">ids, and for each input on the page that is not a token, its digest and where</span>
+<span class="sd">it sits. One match confirms every page under it, and a new root leaves every</span>
+<span class="sd">old key unreachable.</span>
 
 <span class="sd">The encoding is canonical because one process builds these keys and another</span>
 <span class="sd">matches them: fixed-width little-endian ints, and a length prefix on every</span>
@@ -912,15 +913,39 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="c1"># 4 bytes a token, not 8: a full page of 128 then hashes 512 bytes</span>
 <span class="n">_TOKEN_BYTES</span> <span class="o">=</span> <span class="mi">4</span>
 <span class="n">_LEN_BYTES</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">_SLOT_BYTES</span> <span class="o">=</span> <span class="mi">4</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_field</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
     <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">_LEN_BYTES</span><span class="p">,</span> <span class="s2">"little"</span><span class="p">)</span> <span class="o">+</span> <span class="n">payload</span>
+
+
+<div class="viewcode-block" id="PageItem">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.PageItem">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PageItem</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""An input that is not a token, as it sits on one page.</span>
+
+<span class="sd">    ``start`` is its first slot on this page, ``offset`` counts its slots on</span>
+<span class="sd">    earlier pages, and ``length`` counts all of its slots.</span>
+<span class="sd">    """</span>
+    <span class="n">start</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_item</span><span class="p">(</span><span class="n">item</span><span class="p">:</span> <span class="n">PageItem</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+    <span class="k">return</span> <span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+        <span class="n">slot</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">_SLOT_BYTES</span><span class="p">,</span> <span class="s2">"little"</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">start</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
+    <span class="p">)</span> <span class="o">+</span> <span class="n">_field</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="fingerprint">
@@ -941,15 +966,58 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="page_key">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.page_key">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">page_key</span><span class="p">(</span>
-    <span class="n">prev</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">digests</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="n">prev</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">items</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PageItem</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Hash a page's parent key, its token ids and its items into the page's key.</span>
+
+<span class="sd">    The ids fill the slots the items leave, in order, so an item's ``start`` is</span>
+<span class="sd">    what tells ``[t1 t2 IMG]`` from ``[t1 IMG t2]``. Every page an item touches</span>
+<span class="sd">    carries the item's whole ``length`` and ``digest``, because attention inside</span>
+<span class="sd">    an item is not causal and a page's KV depends on the item's later slots too.</span>
+<span class="sd">    """</span>
     <span class="n">hasher</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">()</span>
     <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">prev</span><span class="p">))</span>
     <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
         <span class="n">token</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">_TOKEN_BYTES</span><span class="p">,</span> <span class="s2">"little"</span><span class="p">)</span> <span class="k">for</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">tokens</span>
     <span class="p">)))</span>
-    <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">digest</span><span class="p">)</span> <span class="k">for</span> <span class="n">digest</span> <span class="ow">in</span> <span class="n">digests</span><span class="p">)))</span>
+    <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">_item</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">)))</span>
     <span class="k">return</span> <span class="n">hasher</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="end_key">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.end_key">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">end_key</span><span class="p">(</span>
+    <span class="n">prev</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">items</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PageItem</span><span class="p">],</span> <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Key a page's first ``end`` slots, where an item on it ends."""</span>
+    <span class="n">before</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span> <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">start</span> <span class="o">&lt;</span> <span class="n">end</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">page_key</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">tokens</span><span class="p">[:</span><span class="n">end</span> <span class="o">-</span> <span class="nb">sum</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">length</span> <span class="o">-</span> <span class="n">item</span><span class="o">.</span><span class="n">offset</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">before</span><span class="p">)],</span> <span class="n">before</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="page_items">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.page_items">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">page_items</span><span class="p">(</span>
+    <span class="n">spans</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">PageItem</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Each page's items, given every span's length and digest (None for ids).</span>
+
+<span class="sd">    The preprocess worker keys a prompt's pages with this, and the engine keys</span>
+<span class="sd">    the page that generation fills after the prompt. If the two worked out the</span>
+<span class="sd">    items differently, that page's key would never match.</span>
+<span class="sd">    """</span>
+    <span class="n">items</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">PageItem</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">at</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">for</span> <span class="n">length</span><span class="p">,</span> <span class="n">digest</span> <span class="ow">in</span> <span class="n">spans</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">at</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">at</span> <span class="o">+</span> <span class="n">length</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)):</span>
+                <span class="n">first</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">at</span><span class="p">,</span> <span class="n">page</span> <span class="o">*</span> <span class="n">page_size</span><span class="p">)</span>
+                <span class="n">items</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="n">PageItem</span><span class="p">(</span><span class="n">first</span> <span class="o">-</span> <span class="n">page</span> <span class="o">*</span> <span class="n">page_size</span><span class="p">,</span> <span class="n">first</span> <span class="o">-</span> <span class="n">at</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span> <span class="n">digest</span><span class="p">),</span>
+                <span class="p">)</span>
+        <span class="n">at</span> <span class="o">+=</span> <span class="n">length</span>
+    <span class="k">return</span> <span class="n">items</span></div>
 
 
 
@@ -957,19 +1025,15 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.chain">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">chain</span><span class="p">(</span>
     <span class="n">pages_of_tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
-    <span class="n">digests_by_page</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">items_by_page</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PageItem</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Key every page of one stream, folding each key into the next.</span>
-
-<span class="sd">    ``digests_by_page`` is keyed by the page holding an item's first</span>
-<span class="sd">    placeholder, so an item spanning pages is hashed once.</span>
-<span class="sd">    """</span>
-    <span class="n">digests_by_page</span> <span class="o">=</span> <span class="n">digests_by_page</span> <span class="ow">or</span> <span class="p">{}</span>
+<span class="w">    </span><span class="sd">"""Key every page of one stream, folding each key into the next."""</span>
+    <span class="n">items_by_page</span> <span class="o">=</span> <span class="n">items_by_page</span> <span class="ow">or</span> <span class="p">{}</span>
     <span class="n">keys</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">prev</span> <span class="o">=</span> <span class="n">root</span>
     <span class="k">for</span> <span class="n">index</span><span class="p">,</span> <span class="n">tokens</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">pages_of_tokens</span><span class="p">):</span>
-        <span class="n">prev</span> <span class="o">=</span> <span class="n">page_key</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">digests_by_page</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="p">()))</span>
+        <span class="n">prev</span> <span class="o">=</span> <span class="n">page_key</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">items_by_page</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="p">()))</span>
         <span class="n">keys</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">prev</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">keys</span></div>
 

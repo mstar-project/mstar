@@ -616,6 +616,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.commit"><code class="docutils literal notranslate"><span class="pre">StepRunner.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.complete_cached_walk"><code class="docutils literal notranslate"><span class="pre">StepRunner.complete_cached_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.extend_prefix_chains_batch"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.ingest_capture_row"><code class="docutils literal notranslate"><span class="pre">StepRunner.ingest_capture_row()</span></code></a></li>
@@ -727,15 +728,15 @@ cache.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.apply_cached_prefix">
-<span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">matched_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.apply_cached_prefix" title="Link to this definition">#</a></dt>
-<dd><p>Give every resource the agreed length, with the untrimmed inputs.</p>
+<span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.apply_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>Give every resource the agreed prefix, with the untrimmed inputs.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>matched_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>prefix</strong> (<a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -783,6 +784,24 @@ batch size say nothing about a resource this node’s graphs never touch.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.complete_cached_walk">
+<span class="sig-name descname"><span class="pre">complete_cached_walk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.complete_cached_walk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.complete_cached_walk" title="Link to this definition">#</a></dt>
+<dd><p>Tell the node’s resources that the cache served this walk whole.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
@@ -1025,8 +1044,8 @@ with nothing to publish has no entry.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.resolve_cached_prefix">
-<span class="sig-name descname"><span class="pre">resolve_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.resolve_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.resolve_cached_prefix" title="Link to this definition">#</a></dt>
-<dd><p>The longest prefix every resource on <code class="docutils literal notranslate"><span class="pre">node_name</span></code> can serve.</p>
+<span class="sig-name descname"><span class="pre">resolve_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.resolve_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.resolve_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>The longest prefix of this walk every resource on <code class="docutils literal notranslate"><span class="pre">node_name</span></code> can serve.</p>
 <p>The smallest answer wins, because a step is one span: a resource that
 holds less than another has to be caught up by the tokens that run.
 A resource with no opinion is not an answer of zero.</p>
@@ -1039,7 +1058,7 @@ A resource with no opinion is not an answer of zero.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1126,6 +1145,7 @@ A resource with no opinion is not an answer of zero.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.commit"><code class="docutils literal notranslate"><span class="pre">StepRunner.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.complete_cached_walk"><code class="docutils literal notranslate"><span class="pre">StepRunner.complete_cached_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.extend_prefix_chains_batch"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.ingest_capture_row"><code class="docutils literal notranslate"><span class="pre">StepRunner.ingest_capture_row()</span></code></a></li>

@@ -23,6 +23,7 @@ mstar.engine.resources.kv.config
       KVSpec
       KVStep
       PagedKVConfig
+      PrefixSpan
       RetentionPolicy
       RingKVConfig
       RingKVLayerConfig

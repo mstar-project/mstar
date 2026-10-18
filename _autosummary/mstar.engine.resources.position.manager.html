@@ -621,7 +621,6 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager"><code class="docutils literal notranslate"><span class="pre">RopeManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.admit"><code class="docutils literal notranslate"><span class="pre">RopeManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">RopeManager.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">RopeManager.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.apply_qk"><code class="docutils literal notranslate"><span class="pre">RopeManager.apply_qk()</span></code></a></li>
@@ -754,24 +753,6 @@
 </dd>
 </dl>
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.position.manager.RopeManager.admit">
-<span class="sig-name descname"><span class="pre">admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/position/manager.html#RopeManager.admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.position.manager.RopeManager.admit" title="Link to this definition">#</a></dt>
-<dd><p>Start a matched prefix’s counter past it, as a retrieved one does.</p>
-<p>The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionStep" title="mstar.engine.resources.position.config.PositionStep"><em>PositionStep</em></a>)</p></li>
-<li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitOutcome" title="mstar.engine.resources.step.AdmitOutcome"><em>AdmitOutcome</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.position.manager.RopeManager.admit_retrieve">
 <span class="sig-name descname"><span class="pre">admit_retrieve</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">published</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/position/manager.html#RopeManager.admit_retrieve"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.position.manager.RopeManager.admit_retrieve" title="Link to this definition">#</a></dt>
 <dd><p>Take on the counters a stream was published with.</p>
@@ -797,15 +778,20 @@ them: a stale echo of this node’s own publish never rewinds it.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix">
-<span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">matched_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/position/manager.html#RopeManager.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix" title="Link to this definition">#</a></dt>
-<dd><p>Hold what the cache matched, until an admit seeds a counter with it.</p>
+<span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/position/manager.html#RopeManager.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>Move the stream’s counter past what the cache holds of this walk.</p>
+<p>The counter moves here and not at admit. A walk the cache serves never
+admits, and the walk after it can place its positions in <cite>prepare_inputs</cite>,
+before its own admit, so a counter seeded at admit would put that walk on
+top of the served ones. The position is absolute, so a repeated probe
+moves nothing.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>matched_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>prefix</strong> (<a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1087,7 +1073,6 @@ descriptor) overrides both to record a few scalars here instead.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager"><code class="docutils literal notranslate"><span class="pre">RopeManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.admit"><code class="docutils literal notranslate"><span class="pre">RopeManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">RopeManager.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">RopeManager.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.manager.RopeManager.apply_qk"><code class="docutils literal notranslate"><span class="pre">RopeManager.apply_qk()</span></code></a></li>

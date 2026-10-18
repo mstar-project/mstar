@@ -26,6 +26,7 @@ mstar.engine.resources.base
       AttentionResource
       CGSlotKey
       CGSlotSpec
+      CachedPrefix
       EngineResourceInfo
       PublishedInfo
       Resource
