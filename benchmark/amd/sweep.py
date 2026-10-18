@@ -187,7 +187,21 @@ def _numa_of(gpu: int) -> int | None:
         return None
 
 
-def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path) -> dict:
+def client_env(arm: Arm, row: Row, gpus: list[int]) -> dict:
+    """Environment of the benchmark client. It sees no GPU unless the arm decodes on one."""
+    path = [str(REPO), *arm.client_path, os.environ.get("PYTHONPATH", "")]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in path if p), "HF_HUB_OFFLINE": "1"}
+    if arm.client_gpu:
+        server = gpus[: arm.server_gpus] if arm.server_gpus else gpus
+        g = str((gpus[len(server):] or gpus)[0])
+        env.update(HIP_VISIBLE_DEVICES=g, CUDA_VISIBLE_DEVICES=g)
+    else:
+        env.update(HIP_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES="")
+    return env
+
+
+def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path,
+             gpus: list[int]) -> dict:
     cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
     done = cell_dir / "cell.json"
     if plan.resume and done.is_file() and json.loads(done.read_text()).get("status") != "error":
@@ -207,8 +221,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             cmd = runner_command(arm, row, wl, c, port, rdir, warm)
             (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
             (rdir / "command.txt").write_text(shlex.join(cmd) + "\n")
-            env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]),
-                   "HF_HUB_OFFLINE": "1"}
+            env = client_env(arm, row, gpus)
             t0 = time.monotonic()
             with open(rdir / "bench.log", "w") as log:
                 p = subprocess.run(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
@@ -281,7 +294,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 if wl.family != row.family:
                     continue
                 for c in wl.concurrency:
-                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir)
+                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus)
                     s = cell["summary"].get(wl.primary[0], {})
                     plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
                              f"{s.get('median', float('nan')):.4g} spread "
