@@ -296,11 +296,11 @@ class Cosmos3Model(Model):
         own label. Attention is declared twice because the two pathways want
         different backends and the choice cannot be per-layer:
 
-        * ``attn`` (paged FlashInfer) is what the understanding tower's
+        * ``attn`` (paged) is what the understanding tower's
           prefill writes through — the denoise steps read that K/V back out of
           the pages, so it has to land there — and what a captured denoise
           graph replays against, the dense path being eager-only.
-        * ``attn_gen`` (dense FA3) is what an eager denoise step runs: it
+        * ``attn_gen`` (dense) is what an eager denoise step runs: it
           recomputes all of its K/V every step and only reuses the frozen text
           prefix, so the paged path's per-step full-buffer write and
           ``wrapper.plan`` are dead work. ``declare_step`` names one or the
