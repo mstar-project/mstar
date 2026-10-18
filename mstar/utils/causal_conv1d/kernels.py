@@ -4,7 +4,7 @@ Vendored from vLLM's ``model_executor/layers/mamba/ops/causal_conv1d.py``
 (Apache-2.0), itself adapted from Tri Dao's causal-conv1d. Kept intact apart
 from the vLLM couplings: ``current_platform`` is M*'s (``mstar.platforms``),
 ``vllm.triton_utils`` becomes triton directly, the CPU swap at the bottom is
-dropped (the GDN path is CUDA-only), and ``causal_conv1d_fn`` takes an optional
+dropped (the GDN path runs on GPUs only), and ``causal_conv1d_fn`` takes an optional
 ``seqlens_cpu``: host lengths that replace its device-to-host read, a sync that
 is illegal under CUDA-graph capture.
 
