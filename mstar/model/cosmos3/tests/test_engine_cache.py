@@ -317,7 +317,7 @@ def _forward_step(
     pre = dit.preprocess(walk, ei, inputs)
     try:
         if lease is not None:
-            raw = cg_runner.run_forward(lease, pre)
+            raw = cg_runner.run_forward(lease, pre).per_rid_outputs
             # A captured forward emits its entries under the slot's padding
             # ids — those were the batch at capture time — so entry i belongs
             # to real request i.
