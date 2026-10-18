@@ -152,6 +152,22 @@ OmniVoice notes
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
 
+Qwen3-Omni notes
+~~~~~~~~~~~~~~~~
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
+  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
+  instead, whose kernels read the expert weights re-tiled once at load::
+
+      model_kwargs:
+        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+
+  ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
+  (the Talker's experts at TP2 are not) and refuses to start otherwise.
+- The Triton kernels take launch configs tuned per GPU model from
+  ``mstar/utils/fused_moe/configs/`` when one matches the expert sizes.
+  ``benchmark/fused_moe/tune_fused_moe.py`` makes one on the local GPU.
+
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
