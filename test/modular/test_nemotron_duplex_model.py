@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttn
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
 from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
+    ENCODER_FRONT,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -72,15 +73,17 @@ def test_duplex_node_resources():
     planned on it (NoPE: no position resource), a recurrent pool holding the 27
     Mamba-2 layers' conv + SSM state with the Mamba-2 resource planned on it,
     and one text sampler; the talker a paged KV over its 28 layers with attention
-    and RoPE positions; the encoder a recurrent pool holding each call's layer
-    state, a slot per session. The codec owns no engine resource."""
+    and RoPE positions; the encoder two recurrent pools, each call's layer state
+    and its front end's audio / mel tails, a slot per session each. The codec
+    owns no engine resource."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER,
+    assert set(by_key) == {ENCODER_FRONT, ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER,
                            TALKER_KV, TALKER_ATTN, TALKER_POS}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
-    node = {ENCODER_STATE: {"conformer_encoder"}, **dict.fromkeys(nano_keys, {"nano_llm"})}
+    node = {ENCODER_STATE: {"conformer_encoder"}, ENCODER_FRONT: {"conformer_encoder"},
+            **dict.fromkeys(nano_keys, {"nano_llm"})}
     assert all(spec.nodes == node.get(spec.resource_key, {"eartts_talker"}) for spec in specs)
 
     stt = model.config.stt

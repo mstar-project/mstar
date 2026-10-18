@@ -19,8 +19,9 @@ from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStat
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
-from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks
+from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
 from mstar.model.nemotron_duplex.config import (
+    ENCODER_FRONT,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -517,11 +518,16 @@ class _Encoder:
         p = _small_perception()
         self.node = ConformerEncoderSubmodule(p, nn.Identity(), nn.Identity(), config=NemotronDuplexConfig(),
                                               max_session_samples=max_session_samples)
-        spec = RecurrentStateSpec(ENCODER_STATE, {"conformer_encoder"}, RecurrentStateConfig(
-            num_layers=p.config.num_layers, blocks=encoder_state_blocks(p.config, torch.float32), max_slots=8))
-        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
-        self.runner = StepRunner({ENCODER_STATE: self.pool})
-        self.region = None      # a stand-in for the piecewise runner, when a test sets one
+        def pool(key, num_layers, blocks):
+            spec = RecurrentStateSpec(key, {"conformer_encoder"},
+                                      RecurrentStateConfig(num_layers=num_layers, blocks=blocks, max_slots=8))
+            return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+
+        self.pool = pool(ENCODER_STATE, p.config.num_layers, encoder_state_blocks(p.config, torch.float32))
+        self.front = pool(ENCODER_FRONT, 1, front_state_blocks(p.config))
+        self.resources = {ENCODER_STATE: self.pool, ENCODER_FRONT: self.front}
+        self.runner = StepRunner(self.resources)
+        self.regions = {}       # stand-ins for the piecewise runners, by label, when a test sets them
 
     def prepare(self, handle, chunk, final=False):
         inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
@@ -531,13 +537,14 @@ class _Encoder:
     def step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
             self.pool.ingest_request(rid)
+            self.front.ingest_request(rid)
         step = self.node.declare_step("encode", rids, inputs)
         step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
         assert self.runner.admit(step).ok
         self.runner.plan(step)
         engine_inputs = ModelInputsFromEngine(
-            request_ids=list(rids), per_request_info={}, resources={ENCODER_STATE: self.pool},
-            piecewise_runners={} if self.region is None else {ConformerEncoderSubmodule.LAYERS_REGION: self.region},
+            request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
+            piecewise_runners=dict(self.regions),
         )
         with torch.no_grad():
             out = self.node.forward_batched("encode", engine_inputs,
@@ -559,13 +566,13 @@ class _EagerRegion:
     declaration and admit / plan / commit around the region, with the captured
     callable run eagerly."""
 
-    def __init__(self, enc: _Encoder, bs: int):
+    def __init__(self, enc: _Encoder, bs: int, label: str):
         self.enc, self.bs, self.calls = enc, bs, 0
-        self.config = enc.node.get_piecewise_accelerator_graph_configs(
-            torch.device("cpu"), torch.float32)[ConformerEncoderSubmodule.LAYERS_REGION]
-        self.dummies = [f"__pad_{i}__" for i in range(bs)]
+        self.config = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label]
+        self.dummies = [f"__pad_{label}_{i}__" for i in range(bs)]
         for rid in self.dummies:
-            enc.pool.ingest_request(rid)
+            for pool in enc.resources.values():
+                pool.ingest_request(rid)
 
     def can_run(self, batch_size):
         return batch_size <= self.bs
@@ -588,7 +595,7 @@ class _EagerRegion:
         out = self.config.capture_fn(PiecewiseCallInputs(
             static_inputs=static,
             engine_inputs=ModelInputsFromEngine(request_ids=ids, per_request_info={},
-                                                resources={ENCODER_STATE: self.enc.pool}),
+                                                resources=dict(self.enc.resources)),
         ))
         self.enc.runner.commit(step)
         return {name: value[:n].clone() for name, value in out.items()}
@@ -629,7 +636,8 @@ def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
     on an empty final chunk or on the last chunk of audio (as an upload's usually
     is): the frames emitted in order are the offline encoding of the call, and
     the mel frames the offline featurizer's, the reflected right edge included
-    (a length on the hop grid is the one whose last frame reads it)."""
+    (a length on the hop grid is the one whose last frame reads it), the newest
+    of which the front end holds."""
     enc = _Encoder()
     wav = torch.randn(n) * 0.1
     want = enc.offline(wav)
@@ -646,7 +654,8 @@ def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
         assert torch.allclose(torch.stack(got), want, atol=1e-5), size
         st = enc.node.request_state(handle).get(enc.node.STATE_KEY)
         assert st.mels == mel.shape[0]
-        assert torch.allclose(st.mel[:st.mels], mel, atol=1e-5), size
+        held = enc.front.block("mel", 0)[enc.front._slots[handle]["main"].index]   # the newest, right-aligned
+        assert torch.allclose(held, mel[-held.shape[0]:], atol=1e-5), size
 
 
 def test_encoder_batches_calls_at_different_points():
@@ -659,16 +668,19 @@ def test_encoder_batches_calls_at_different_points():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
-def test_encoder_live_steps_replay_the_region_with_padding_rows():
-    """One frame a call a step replays the layer region, in a bucket wider than
-    the batch: the calls get their offline frames and the padding rows, which
-    address the pool's sink, leave them alone. A call under a frame a step
-    rides the region with no new frame."""
+def test_encoder_live_steps_replay_the_regions_with_padding_rows():
+    """Calls one frame of audio further on take the whole-step region; the
+    others in the same step (a call's first frames, one under a frame a step)
+    the eager front end and the layer region, both in buckets wider than the
+    batch. Every call gets its offline frames: the padding rows, which address
+    the pools' sinks, and the rows another path served leave them alone."""
     enc = _Encoder()
-    enc.region = _EagerRegion(enc, bs=4)
+    step = _EagerRegion(enc, bs=4, label=ConformerEncoderSubmodule.STEP_REGION)
+    layers = _EagerRegion(enc, bs=4, label=ConformerEncoderSubmodule.LAYERS_REGION)
+    enc.regions = {ConformerEncoderSubmodule.STEP_REGION: step, ConformerEncoderSubmodule.LAYERS_REGION: layers}
     wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1}
     got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
-    assert enc.region.calls >= 25
+    assert step.calls >= 20 and layers.calls >= 5
     for h, wav in wavs.items():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
@@ -782,8 +794,9 @@ def test_encoder_state_is_per_call_and_cleaned_up():
     free = enc.pool.num_free_slots
     enc.encode(1, torch.randn(4000) * 0.1)
     enc.encode(2, torch.randn(4000) * 0.1)
-    assert enc.pool.num_free_slots == free - 2
+    assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 2
     enc.node.cleanup_request(1)
-    enc.pool.remove_request(1)
+    for pool in enc.resources.values():
+        pool.remove_request(1)
     assert 1 not in enc.node.request_states and 2 in enc.node.request_states
-    assert enc.pool.num_free_slots == free - 1
+    assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 1

@@ -69,9 +69,10 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
-from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks
+from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    ENCODER_FRONT,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -405,8 +406,9 @@ class NemotronDuplexModel(Model):
     # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
     # positions; each session holds two streams (labels ``main`` / ``uncond``)
     # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. conformer_encoder: a recurrent-state pool holding
-    # each call's layer state (one slot per session). The codec declares nothing.
+    # passes at call time. conformer_encoder: two recurrent-state pools, each
+    # call's layer state and its front end's audio / mel tails (one slot per
+    # session each). The codec declares nothing.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
@@ -479,6 +481,13 @@ class NemotronDuplexModel(Model):
                     num_layers=self.config.stt.num_layers,
                     # bf16, the engine's autocast dtype, which the layers compute the state in
                     blocks=encoder_state_blocks(self.config.stt, torch.bfloat16),
+                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                ),
+            ),
+            RecurrentStateSpec(
+                resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
+                config=RecurrentStateConfig(
+                    num_layers=1, blocks=front_state_blocks(self.config.stt),
                     max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
                 ),
             ),
