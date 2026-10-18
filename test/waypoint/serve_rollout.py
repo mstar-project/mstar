@@ -66,6 +66,7 @@ DEFAULT_CONFIG = REPO / "configs/waypoint.yaml"
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from benchmark import gpu_query  # noqa: E402
 from mstar.client import MStarClient, VideoFrameChunk  # noqa: E402
 
 
@@ -529,44 +530,16 @@ def _process_group_pss_mib(process_group: int) -> float:
     return total_kib / 1024
 
 
-def _parse_nvidia_smi_processes(output: str) -> list[tuple[int, float]]:
-    rows = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 2:
-            raise ValueError(f"unexpected nvidia-smi row: {line!r}")
-        try:
-            rows.append((int(fields[0]), float(fields[1])))
-        except ValueError as exc:
-            raise ValueError(f"unusable nvidia-smi row: {line!r}") from exc
-    return rows
-
-
 def _process_group_gpu_mib(process_group: int, physical_gpu: int) -> float:
+    # nvidia-smi or amd-smi, whichever the machine has.
     try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--id={physical_gpu}",
-                "--query-compute-apps=pid,used_gpu_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"nvidia-smi telemetry unavailable: {exc}") from exc
-    if result.returncode != 0:
-        detail = result.stderr.strip() or f"exit code {result.returncode}"
-        raise RuntimeError(f"nvidia-smi telemetry unavailable: {detail}")
+        rows = gpu_query.processes(physical_gpu)
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        raise RuntimeError(f"GPU process telemetry unavailable: {exc}") from exc
 
     total = 0.0
     matched = 0
-    for pid, used_mib in _parse_nvidia_smi_processes(result.stdout):
+    for pid, used_mib in rows:
         try:
             belongs_to_server = os.getpgid(pid) == process_group
         except ProcessLookupError:
@@ -835,7 +808,7 @@ def main() -> int:
     parser.add_argument(
         "--physical-gpu",
         type=int,
-        help="physical nvidia-smi GPU index; required with --measure-memory",
+        help="physical GPU index (nvidia-smi / amd-smi numbering); required with --measure-memory",
     )
     parser.add_argument("--host-growth-mib", type=float, default=128.0)
     parser.add_argument("--gpu-growth-mib", type=float, default=64.0)
