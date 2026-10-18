@@ -14,7 +14,13 @@ import numpy as np
 
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
-from benchmark.correctness.families.base import Family, failed_items, self_consistency_check, write_meta
+from benchmark.correctness.families.base import (
+    Family,
+    MathSdpaReference,
+    failed_items,
+    self_consistency_check,
+    write_meta,
+)
 from benchmark.correctness.report import FamilyScore, band
 from benchmark.correctness.sets import SampleSet
 
@@ -33,7 +39,7 @@ def write_video(frames: np.ndarray, path: Path, fps: int) -> None:
     _write_mp4(np.asarray(frames, dtype=np.uint8), path, fps)
 
 
-class VideoFamily(Family):
+class VideoFamily(MathSdpaReference, Family):
     name = "video"
     set_name = "video_v1"
     default_concurrency = 1
@@ -71,7 +77,8 @@ class VideoFamily(Family):
 
     def reference_id(self) -> str:
         return (f"diffusers-{self.hf_id.replace('/', '--')}-{self.height}x{self.width}x{self.num_frames}"
-                f"-s{self.steps}" + ("-i2v" if self.image_to_video else ""))
+                f"-s{self.steps}" + ("-i2v" if self.image_to_video else "")
+                + (self.MATH_SUFFIX if self.ref_sdpa_math else ""))
 
     def reference_description(self) -> str:
         return (f"diffusers pipeline for {self.hf_id}, bf16, {self.generator_device}-generator seed, "
@@ -100,7 +107,7 @@ class VideoFamily(Family):
             if self.image_to_video:
                 kw["image"] = Image.open(sset.path(it.files["image"])).convert("RGB")
             kw.update(self.ref_call_kwargs)
-            with torch.inference_mode():
+            with torch.inference_mode(), self.sdpa_context():
                 gen = torch.Generator(self.generator_device if self.generator_device == "cpu" else device)
                 frames = self.reference_frames(pipe(prompt=it.prompt, generator=gen.manual_seed(int(it.params["seed"])),
                                                     **kw))
@@ -154,6 +161,18 @@ class VideoFamily(Family):
                 else:
                     sheet.append([frames[0], frames[len(frames) // 2], frames[-1]])
                 labels += [f"{tag} {it.id} first", "mid", "last"]
+        math_dir = self.math_reference_dir(ref_dir)
+        if ref_out and math_dir:
+            spread = []
+            for r in sc.rows:
+                a, b = ref_out / f"{r['id']}.npy", math_dir / "outputs" / f"{r['id']}.npy"
+                if a.is_file() and b.is_file():
+                    ps = M.frame_psnrs(np.load(a), np.load(b))
+                    r["ref_vs_math_ref_psnr_median"] = round(statistics.median(ps), 2)
+                    spread.append(r["ref_vs_math_ref_psnr_median"])
+            sc.metrics["reference_vs_math_sdpa_reference_psnr_db"] = M.distribution(spread)
+            sc.notes.append("The reference against itself with math SDPA, per-video median frame PSNR: median "
+                            f"{sc.metrics['reference_vs_math_sdpa_reference_psnr_db'].get('median')} dB.")
         if medians:
             med = statistics.median(medians)
             sc.metrics["per_video_median_frame_psnr_db"] = M.distribution(medians)
