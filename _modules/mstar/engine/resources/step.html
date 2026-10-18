@@ -903,7 +903,7 @@ window.runMermaid = runMermaid;</script>
 <span></span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 
 <div class="viewcode-block" id="Segment">
@@ -1092,7 +1092,10 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.AdmitFailedReason">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">AdmitFailedReason</span><span class="p">:</span>
-    <span class="n">message</span><span class="p">:</span> <span class="nb">str</span></div>
+    <span class="n">message</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># A terminal refusal comes back on every retry, so the caller fails the</span>
+    <span class="c1"># request instead of re-queueing the step.</span>
+    <span class="n">terminal</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 
@@ -1127,7 +1130,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Terminal, unlike the two above: no eviction and no reload makes it go</span>
 <span class="sd">    away, so the caller's answer is to fail the request, not to retry it.</span>
-<span class="sd">    """</span></div>
+<span class="sd">    ``request_ids`` names the requests at fault; empty means the refusal is</span>
+<span class="sd">    about the step as a whole.</span>
+<span class="sd">    """</span>
+    <span class="n">terminal</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span></div>
 
 
 

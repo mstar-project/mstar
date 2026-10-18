@@ -922,6 +922,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">ADMIT_OK</span><span class="p">,</span>
     <span class="n">AdmitOutcome</span><span class="p">,</span>
     <span class="n">AdmitRuntimeError</span><span class="p">,</span>
+    <span class="n">AllocationFailed</span><span class="p">,</span>
     <span class="n">ResourceStep</span><span class="p">,</span>
     <span class="n">StepContext</span><span class="p">,</span>
 <span class="p">)</span>
@@ -1189,8 +1190,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RingKVManager.admit">
 <a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.ring.manager.html#mstar.engine.resources.kv.ring.RingKVManager.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Claim a session for this step's request, or refuse it terminally.</span>
-<span class="sd">        Does not support eviction for now</span>
+<span class="w">        </span><span class="sd">"""Claim a session for this step's request. A full pool is retried; a</span>
+<span class="sd">        malformed step is refused terminally. Does not support eviction for now</span>
 <span class="sd">        """</span>
         <span class="c1"># `request_ids`, not `padded_request_ids` as the paged manager uses: a</span>
         <span class="c1"># padding row is a dummy rid a replay pads a bucket out to, and it must</span>
@@ -1222,19 +1223,28 @@ window.runMermaid = runMermaid;</script>
                         <span class="s2">"`remove_request`, which only ever runs for a request the "</span>
                         <span class="s2">"engine opened -- so a session claimed here would never "</span>
                         <span class="s2">"return to the pool and the node would lose capacity with "</span>
-                        <span class="s2">"nothing raised."</span>
+                        <span class="s2">"nothing raised."</span><span class="p">,</span>
+                        <span class="n">request_ids</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">({</span><span class="n">rid</span><span class="p">}),</span>
                     <span class="p">),</span>
                 <span class="p">)</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_sessions</span><span class="p">):</span>
+            <span class="c1"># Retryable, not terminal: config validation keeps</span>
+            <span class="c1"># `max_concurrent_requests` within `num_sessions`, so a full pool</span>
+            <span class="c1"># is a finished request whose teardown is still deferred behind an</span>
+            <span class="c1"># in-flight step. The worker holds the request named here and</span>
+            <span class="c1"># retries once that session is back.</span>
             <span class="k">return</span> <span class="n">AdmitOutcome</span><span class="p">(</span>
                 <span class="n">ok</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">reason</span><span class="o">=</span><span class="n">AdmitRuntimeError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"ring KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> holds all </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="si">}</span><span class="s2"> of its "</span>
-                    <span class="sa">f</span><span class="s2">"sessions (</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="p">)</span><span class="si">}</span><span class="s2">); request(s) </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span><span class="si">}</span><span class="s2"> "</span>
-                    <span class="s2">"cannot be served concurrently. The rings are a fixed "</span>
-                    <span class="s2">"physical buffer and there is nothing to evict -- raise "</span>
-                    <span class="s2">"`resources.kv.num_sessions` (and `max_concurrent_requests` "</span>
-                    <span class="s2">"with it) to serve more."</span>
+                <span class="n">reason</span><span class="o">=</span><span class="n">AllocationFailed</span><span class="p">(</span>
+                    <span class="n">message</span><span class="o">=</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"ring KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> holds all </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="si">}</span><span class="s2"> of "</span>
+                        <span class="sa">f</span><span class="s2">"its sessions (</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="p">)</span><span class="si">}</span><span class="s2">); request(s) "</span>
+                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span><span class="si">}</span><span class="s2"> wait for one to be released"</span>
+                    <span class="p">),</span>
+                    <span class="n">pages_short</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_sessions</span><span class="p">),</span>
+                    <span class="n">label</span><span class="o">=</span><span class="s2">"session"</span><span class="p">,</span>
+                    <span class="c1"># the latest arrival waits, so the earlier ones still run</span>
+                    <span class="n">request_id</span><span class="o">=</span><span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">wanted</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                 <span class="p">),</span>
             <span class="p">)</span>
 
@@ -1248,7 +1258,8 @@ window.runMermaid = runMermaid;</script>
                         <span class="sa">f</span><span class="s2">"clock for request </span><span class="si">{</span><span class="n">rid</span><span class="si">!r}</span><span class="s2"> (it names </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">frames</span><span class="p">)</span><span class="si">}</span><span class="s2">). "</span>
                         <span class="s2">"Every admitted request needs one: the continuity check is "</span>
                         <span class="s2">"the only thing standing between a stalled clock and a "</span>
-                        <span class="s2">"session that rewrites its own history."</span>
+                        <span class="s2">"session that rewrites its own history."</span><span class="p">,</span>
+                        <span class="n">request_ids</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">({</span><span class="n">rid</span><span class="p">}),</span>
                     <span class="p">),</span>
                 <span class="p">)</span>
             <span class="n">last</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_frames</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
@@ -1262,7 +1273,8 @@ window.runMermaid = runMermaid;</script>
                         <span class="s2">"The ring clock advances by exactly one per committed frame "</span>
                         <span class="s2">"-- a skipped or repeated frame selects the wrong ring slot "</span>
                         <span class="s2">"and hides the wrong one, which rewrites history rather than "</span>
-                        <span class="s2">"raising."</span>
+                        <span class="s2">"raising."</span><span class="p">,</span>
+                        <span class="n">request_ids</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">({</span><span class="n">rid</span><span class="p">}),</span>
                     <span class="p">),</span>
                 <span class="p">)</span>
 

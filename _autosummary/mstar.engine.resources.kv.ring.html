@@ -764,8 +764,8 @@ nothing later.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.ring.RingKVManager.admit">
 <span class="sig-name descname"><span class="pre">admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/ring/manager.html#RingKVManager.admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.ring.RingKVManager.admit" title="Link to this definition">#</a></dt>
-<dd><p>Claim a session for this step’s request, or refuse it terminally.
-Does not support eviction for now</p>
+<dd><p>Claim a session for this step’s request. A full pool is retried; a
+malformed step is refused terminally. Does not support eviction for now</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
