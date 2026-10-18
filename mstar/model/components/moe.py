@@ -26,9 +26,11 @@ Expert-parallel variant:
 * :class:`ExpertParallelSparseMoeBlock` — each rank owns a contiguous
   block of whole experts instead of a slice of every expert.
 
-When triton is installed and inputs are on CUDA, dispatch goes through
-the Triton fused-MoE kernel in :mod:`mstar.utils.fused_moe`; otherwise it
+On a GPU with triton installed, dispatch goes through the block's
+FusedMoEBackend, picked by ``moe_backend`` (Triton by default). Otherwise it
 falls back to the naive per-expert loop in :func:`dispatch_experts_fused`.
+Backends with their own weight layout need :func:`prepare_moe_weights` once
+after loading.
 
 Router contract
 ---------------
@@ -83,18 +85,27 @@ logger = logging.getLogger(__name__)
 _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 
 
-# Optional fused Triton MoE path. Imports succeed wherever triton is
-# installed; the alignment op JIT-builds a vendored CUDA kernel on first use
-# (or falls back to a torch impl), so no extra kernel package is needed. The
-# actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
+# Optional fused MoE path. Imports work wherever triton is installed. The align
+# op JIT-builds a vendored CUDA kernel on first use (or falls back to a torch
+# impl), so no extra kernel package is needed. The kernels only run on a GPU, see
+# the ``is_cuda`` check below.
 try:
-    from mstar.utils.fused_moe import fused_experts as _fused_experts
+    from mstar.utils.fused_moe.backend import make_moe_backend
+    from mstar.utils.fused_moe.config import MoEProblem
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
-    _fused_experts = None
+    make_moe_backend = None
     _HAS_FUSED = False
     logger.warning(f"Could not load fused MoE kernel: {e}")
+
+
+def _make_experts_backend(moe_backend: str, num_experts: int, intermediate_size: int,
+                          hidden_size: int, top_k: int):
+    """The block's fused backend, or None where the fused path cannot load."""
+    if make_moe_backend is None:
+        return None
+    return make_moe_backend(moe_backend, MoEProblem(num_experts, intermediate_size, hidden_size, top_k))
 
 
 class TopKRouter(nn.Module):
@@ -296,11 +307,12 @@ def _dispatch(
     num_experts: int,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
+    backend,
     skip_invalid: bool = False,
 ) -> torch.Tensor:
-    """Pick fused-Triton if available, otherwise the naive loop."""
-    if _HAS_FUSED and hidden_states.is_cuda:
-        return _fused_experts(
+    """Run the block's fused backend if available, otherwise the naive loop."""
+    if _HAS_FUSED and backend is not None and hidden_states.is_cuda:
+        return backend(
             hidden_states, gate_up_proj, down_proj,
             routing_weights, selected_experts, skip_invalid=skip_invalid,
         )
@@ -332,6 +344,15 @@ def _sync_routing(
     return packed[:, top_k:].to(routing_weights.dtype), packed[:, :top_k].long()
 
 
+def prepare_moe_weights(module: nn.Module) -> None:
+    """Convert each MoE block's expert weights to its backend's layout.
+    Call once after loading. No-op for backends that use the checkpoint layout."""
+    for m in module.modules():
+        backend = getattr(m, "experts_backend", None)
+        if backend is not None:
+            backend.prepare_weights(m.experts.gate_up_proj, m.experts.down_proj)
+
+
 class SparseMoeBlock(nn.Module):
     """Top-K sparse MoE with fused expert weights, no shared expert.
 
@@ -348,6 +369,7 @@ class SparseMoeBlock(nn.Module):
         moe_intermediate_size: int,
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
+        moe_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -368,6 +390,9 @@ class SparseMoeBlock(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, moe_intermediate_size)
         )
+        self.experts_backend = _make_experts_backend(
+            moe_backend, num_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
+        )
 
     def forward(
         self,
@@ -383,6 +408,7 @@ class SparseMoeBlock(nn.Module):
         out = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             self.num_experts, selected_experts, routing_weights,
+            self.experts_backend,
         )
         out = out.view(input_shape)
         return (out, router_states_next) if return_router_states else out
@@ -409,6 +435,7 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         shared_expert: nn.Module,
         norm_topk_prob: bool = False,
         router: nn.Module | None = None,
+        moe_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -428,6 +455,9 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         )
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, moe_intermediate_size)
+        )
+        self.experts_backend = _make_experts_backend(
+            moe_backend, num_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
         )
         self.shared_expert = shared_expert
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
@@ -449,6 +479,7 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         routed = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             self.num_experts, selected_experts, routing_weights,
+            self.experts_backend,
         )
         shared_gate = torch.sigmoid(self.shared_expert_gate(flat))
         out = (routed + shared_gate * shared).view(input_shape)
@@ -560,8 +591,8 @@ class ParallelSparseMoeBlock(nn.Module):
     When ``tp_size == 1``, the forward is identical to
     :class:`SparseMoeBlock` (full fused kernel, no communication).
     When ``tp_size > 1``, expert weights are sharded along the
-    intermediate dimension and an all-reduce is inserted between the
-    down-projection GEMM and the top-k sum-reduce.
+    intermediate dimension and an all-reduce sums the ranks' partial
+    outputs.
     """
 
     def __init__(
@@ -573,6 +604,7 @@ class ParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        moe_backend: str = "auto",
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -600,6 +632,9 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, shard_inter)
+        )
+        self.experts_backend = _make_experts_backend(
+            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok,
         )
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
@@ -642,7 +677,8 @@ class ParallelSparseMoeBlock(nn.Module):
         if self.comm_group.world_size == 1:
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
+                self.num_experts, selected_experts, routing_weights,
+                self.experts_backend, skip_invalid=skip,
             )
         else:
             routing_weights, selected_experts = _sync_routing(
@@ -658,16 +694,11 @@ class ParallelSparseMoeBlock(nn.Module):
         selected_experts: torch.Tensor,
         skip_invalid: bool = False,
     ) -> torch.Tensor:
-        from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
-
-        # (tokens, top_k, hidden) — partial results before reduce
-        cache3 = fused_experts(
+        # This rank's partial sum over its intermediate shard, then the reduce.
+        output = self.experts_backend(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
-            routing_weights, selected_experts, reduce_results=False,
-            skip_invalid=skip_invalid,
+            routing_weights, selected_experts, skip_invalid=skip_invalid,
         )
-        output = torch.empty_like(flat)
-        moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
         self.comm_group.all_reduce(output)
         return output
 
@@ -689,6 +720,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         norm_topk_prob: bool = False,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        moe_backend: str = "auto",
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -716,6 +748,9 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         )
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, shard_inter)
+        )
+        self.experts_backend = _make_experts_backend(
+            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok,
         )
         self.shared_expert = shared_expert
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
@@ -757,6 +792,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
             routed = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
                 self.num_experts, selected_experts, routing_weights,
+                self.experts_backend,
             )
         else:
             routing_weights, selected_experts = _sync_routing(
@@ -772,14 +808,11 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
-        from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
-
-        cache3 = fused_experts(
+        # This rank's partial sum over its intermediate shard, then the reduce.
+        output = self.experts_backend(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
-            routing_weights, selected_experts, reduce_results=False,
+            routing_weights, selected_experts,
         )
-        output = torch.empty_like(flat)
-        moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
         self.comm_group.all_reduce(output)
         return output
 
