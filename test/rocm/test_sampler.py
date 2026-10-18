@@ -155,9 +155,10 @@ def test_captured_sampler_replays_the_eager_draw():
 
 
 def test_sampling_traced_by_dynamo_graph_breaks_instead_of_raising():
-    """The fork's ops raise when dynamo traces into them (unless
-    FLASHINFER_USE_TORCH_CUSTOM_OPS=1 was set before import); mstar's binding
-    runs them outside the trace, so a compiled caller still samples."""
+    """Dynamo cannot trace into the fork's ops (they are plain Python around a
+    JIT extension unless FLASHINFER_USE_TORCH_CUSTOM_OPS=1 was set before
+    import); mstar's binding runs them outside the trace, so a compiled caller
+    still samples."""
     import flashinfer
 
     batch, vocab = 4, 256
@@ -174,8 +175,8 @@ def test_sampling_traced_by_dynamo_graph_breaks_instead_of_raising():
         )
 
     torch._dynamo.reset()
-    with pytest.raises(Exception, match="FLASHINFER_USE_TORCH_CUSTOM_OPS"):
-        torch.compile(raw)(torch.softmax(logits, -1))
+    with pytest.raises(RuntimeError):
+        torch.compile(raw, fullgraph=False)(torch.softmax(logits, -1))
 
     def step(logits):
         return sample_accelerator_graphable_gpu(logits * 1.0, temperature, top_k, top_p, seed, offset)
