@@ -40,6 +40,14 @@ def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row
                max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4)
 
 
+def _qwen3tts(name: str, size: str, runner_model: str, sglang_omni_config: str) -> Row:
+    # sglang-omni's pipeline configs are paths relative to its checkout (the arm runs from there).
+    tuned = str(VLLM_OMNI_DEPLOY / "qwen3_tts_rocm_tuned.yaml")
+    return Row(name, "tts", f"Qwen/Qwen3-TTS-12Hz-{size}-CustomVoice", runner_model,
+               engine_args={"sglang-omni": ("--config", f"examples/configs/{sglang_omni_config}"),
+                            "vllm-omni-tuned": ("--deploy-config", tuned)})
+
+
 ROWS: dict[str, Row] = {r.name: r for r in [
     _qwen("0.8B"),
     _qwen("2B"),
@@ -49,10 +57,8 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("kokoro", "tts", "hexgrad/Kokoro-82M", "kokoro"),
     Row("orpheus", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus", gpus=2),
     Row("orpheus_colocated", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus"),
-    Row("qwen3tts", "tts", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "qwen3_tts",
-        engine_args={"sglang-omni": ("--config", "/workspace/sglang-omni/examples/configs/"
-                                                 "qwen3_tts_0_6b_customvoice.yaml"),
-                     "vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_tts_rocm_tuned.yaml"))}),
+    _qwen3tts("qwen3tts", "0.6B", "qwen3_tts", "qwen3_tts_0_6b_customvoice.yaml"),
+    _qwen3tts("qwen3tts_1p7b", "1.7B", "qwen3_tts_1p7b", "qwen3_tts_1_7b_customvoice.yaml"),
     # Qwen3-Omni speaks its answers. vllm-omni's own layout is two GPUs; the one-GPU row places its stages
     # on one device to sit next to mstar's colocated config.
     Row("qwen3omni_colocated", "omni", "Qwen/Qwen3-Omni-30B-A3B-Instruct", "qwen3omni",
@@ -94,6 +100,8 @@ class Arm:
     # first if none is left) for work it does on a GPU, such as decoding audio.
     server_gpus: int | None = None
     client_gpu: bool = False
+    # How long the launcher waits for /health when the engine's own startup limits run past its default.
+    startup_timeout: int | None = None
     # Extra PYTHONPATH entries for the benchmark client (packages the client needs outside mstar's venv).
     client_path: tuple[str, ...] = ()
 
@@ -141,20 +149,29 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         args=("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false"),
         recipe="SGLang Diffusion with every CPU offload off (DESIGN.md section 11; benchmark/wan22/reproduce.sh)"),
     Arm("vllm-omni", "vllm-omni", ("tts", "omni", "image", "video"), client="vllm_omni", image="vllm-omni",
-        models=("qwen3_tts", "qwen3omni", "flux2_klein", "z_image_turbo", "wan22", "cosmos3_nano"),
+        models=("qwen3_tts", "qwen3_tts_1p7b", "qwen3omni", "flux2_klein", "z_image_turbo", "wan22", "cosmos3_nano"),
         args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
         recipe="vllm-omni v0.30.0 defaults on ROCm: the model's deploy YAML with its platforms.rocm section "
                "(AR stages on TRITON_ATTN, Code2Wav eager)",
         differs_for={"tts": "Code2Wav runs eager on ROCm", "omni": "Code2Wav runs eager on ROCm"}),
     Arm("vllm-omni-tuned", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
-        models=("qwen3_tts", "qwen3omni"), env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
+        models=("qwen3_tts", "qwen3_tts_1p7b", "qwen3omni"),
+        env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
         args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
         recipe="vllm-omni recipes/Qwen/Qwen3-TTS.md, 1x AMD MI300X (Code2Wav graphs allowed, MIOPEN_FIND_MODE="
                "FAST) and vLLM's AMD guide (VLLM_ROCM_USE_AITER=1, ROCM_AITER_FA on the AR stages), applied by the "
                "deploy overlays in benchmark/amd/vllm_omni/"),
-    Arm("sglang-omni", "sglang-omni", ("tts",), client="sglang_omni", image="sglang-omni", models=("qwen3_tts",),
-        recipe="sglang-omni v0.1.8 defaults, self-built on lmsysorg/sglang:v0.5.21-rocm720-mi30x",
-        differs="prefill and Code2Wav graphs are off on ROCm"),
+    # Startup and warmup limits from the launch line in containers/README.md (the 600 s defaults are too short
+    # for a cold start); the launcher waits out both back to back, plus the container start. STRICT_PORT makes a
+    # taken port an error instead of a silent move to another one.
+    Arm("sglang-omni", "sglang-omni", ("tts",), client="sglang_omni", image="sglang-omni",
+        models=("qwen3_tts", "qwen3_tts_1p7b"),
+        env={"CTR_PWD": "/workspace/sglang-omni", "SGLANG_OMNI_STARTUP_TIMEOUT": "2700",
+             "SGLANG_OMNI_WARMUP_TIMEOUT": "1800", "SGLANG_OMNI_STRICT_PORT": "1"},
+        startup_timeout=2700 + 1800 + 300,
+        recipe="sglang-omni v0.1.8 defaults with the model's examples/configs pipeline, built on "
+               "lmsysorg/sglang:v0.5.21-rocm724-mi30x (sha256:d139bdfc); on ROCm it picks AITER attention and "
+               "breakable prefill graphs (AITER cannot capture a full one)"),
     Arm("ref-kokoro", "reference", ("tts",), models=("kokoro",),
         recipe="`kokoro` 0.9.4 KPipeline, eager, one sentence at a time",
         differs="reference implementation: single stream, no server"),

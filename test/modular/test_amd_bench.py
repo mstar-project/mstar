@@ -189,6 +189,30 @@ def test_launch_commands_and_env(tmp_path, monkeypatch):
         gpu_list("1,1")
 
 
+def test_sglang_omni_launch(tmp_path):
+    from benchmark.amd.launch import backends_in_log
+
+    wt = Path(__file__).resolve().parents[2]
+    arm, row = catalog.ARMS["sglang-omni"], catalog.ROWS["qwen3tts_1p7b"]
+    s = Launch(arm, row, [2], 8403, tmp_path / "so", worktree=wt)
+    cmd = s.command()
+    assert cmd[cmd.index("--endpoints.base_path") + 1] == str(s.ipc_dir)
+    assert cmd[cmd.index("--host") + 1] == "127.0.0.1"
+    assert cmd[cmd.index("--config") + 1] == "examples/configs/qwen3_tts_1_7b_customvoice.yaml"
+    env = s.environment()
+    # ctr.sh reads CTR_PWD on the host; the SGLANG_ limits reach the container by prefix.
+    assert env["CTR_PWD"] == "/workspace/sglang-omni" and "CTR_PWD" not in env["CTR_ENV"]
+    assert env["SGLANG_OMNI_STARTUP_TIMEOUT"] == "2700" and env["SGLANG_OMNI_WARMUP_TIMEOUT"] == "1800"
+    assert arm.startup_timeout >= 2700 + 1800
+    t = tables.TABLES["tts"]
+    assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "vllm-omni", "vllm-omni-tuned",
+                                                                     "sglang-omni"]
+    log = tmp_path / "server.log"
+    log.write_text("SGLang runtime configuration: gpu_id=0, sm=94, attention_backend=aiter, "
+                   "decode_attention_backend=aiter, prefill_attention_backend=aiter, sampling_backend=pytorch\n")
+    assert backends_in_log(log) == ["aiter"]
+
+
 def test_gpu_locks(tmp_path, monkeypatch):
     from benchmark.amd import launch
 
