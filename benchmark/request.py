@@ -1016,6 +1016,16 @@ class VLLMOmni(InferenceSystem):
     streams text+audio because the talker runs unconditionally).
     """
 
+    # Chat template arguments (e.g. enable_thinking), set by the runner.
+    chat_template_kwargs: Optional[dict] = None
+
+    def _extra_fields(self) -> dict:
+        return {"chat_template_kwargs": self.chat_template_kwargs} if self.chat_template_kwargs else {}
+
+    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
+        payload["modalities"] = [output_mod]
+        return payload
+
     async def send_request(
         self,
         session: aiohttp.ClientSession,
@@ -1047,12 +1057,6 @@ class VLLMOmni(InferenceSystem):
 
         try:
             user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
-            # Always send `modalities` explicitly. Omitting the field makes
-            # vllm-omni's server fall back to text+audio output even for
-            # text-only requests (the talker runs unconditionally), inflating
-            # work and emitting unwanted audio chunks. Sending ["text"] tells
-            # the server to skip the talker.
-            modalities_arg = [output_mod]
 
             # Image outputs don't stream over /v1/chat/completions
             is_image_output = output_mod == "image"
@@ -1072,13 +1076,19 @@ class VLLMOmni(InferenceSystem):
                 # accepts ignore_eos and tolerates extra keys.
                 **req_input.model_kwargs,
                 **additional_model_kwargs,
+                **self._extra_fields(),
             }
             if is_image_output:
                 payload["stream"] = False
             else:
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
-            payload["modalities"] = modalities_arg
+            # Always send `modalities` explicitly. Omitting the field makes
+            # vllm-omni's server fall back to text+audio output even for
+            # text-only requests (the talker runs unconditionally), inflating
+            # work and emitting unwanted audio chunks. Sending ["text"] tells
+            # the server to skip the talker.
+            payload = self._finish_payload(payload, output_mod)
 
             # Match vllm-omni bench headers (`patch.py:354-358`).
             headers = {
@@ -1459,6 +1469,19 @@ class SGLangOmni(InferenceSystem):
         return metrics
 
 
+class OpenAIText(VLLMOmni):
+    """Plain OpenAI-compatible text servers (vLLM, SGLang).
+
+    Same chat request as :class:`VLLMOmni`, minus the fields these servers don't
+    know: no ``modalities`` and no mstar-only ``max_output_tokens`` (vLLM logs a
+    warning for every unknown field).
+    """
+
+    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
+        payload.pop("max_output_tokens", None)
+        return payload
+
+
 class OursOpenAI(VLLMOmni):
     """Benchmark adapter for M*'s own OpenAI-compatible ``/v1`` surface.
 
@@ -1469,6 +1492,10 @@ class OursOpenAI(VLLMOmni):
     is speech-only on M* (no chat path), so its TTS is served at
     ``/v1/audio/speech`` rather than ``/v1/chat/completions``.
     """
+
+    def _extra_fields(self) -> dict:
+        # M* takes chat template switches such as enable_thinking as top-level fields.
+        return dict(self.chat_template_kwargs or {})
 
     async def send_request(
         self,
