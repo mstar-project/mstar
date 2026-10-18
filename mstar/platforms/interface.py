@@ -45,6 +45,26 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+        """``torch._inductor.config`` values patched in while the engine compiles
+        a forward that serves ``num_tokens`` tokens (a capture bucket's count;
+        ``None`` for a forward compiled for any count).
+
+        Facts about how inductor's code generation performs on this stack, such
+        as which GEMM backends autotune well at small sizes; which kernel a
+        resource runs is not decided here. Empty keeps inductor's defaults, and
+        the compiled forward is then called unwrapped.
+        """
+        return {}
+
+    def process_env_defaults(self) -> dict[str, str]:
+        """Environment a worker process sets with ``os.environ.setdefault``
+        before its first device call, so a value already exported wins.
+
+        For settings a runtime or library reads once, when it initializes.
+        """
+        return {}
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
@@ -72,6 +92,14 @@ class RocmPlatform(Platform):
     def arch(self, device=None) -> str:
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+
+    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+        # inductor's defaults: an override lands only with a measured win on AMD GPUs
+        return {}
+
+    def process_env_defaults(self) -> dict[str, str]:
+        # none: a default lands only with a measured win on AMD GPUs
+        return {}
 
 
 class XpuPlatform(Platform):
