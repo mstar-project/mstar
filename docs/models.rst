@@ -711,8 +711,8 @@ Chatterbox notes
   attention has no float32 kernels, and fp32 token parity is checked by the
   CPU tests in ``test/chatterbox``).
 - Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
-  the bundled libsndfile); other codecs fall back to ``torchcodec``, which
-  needs FFmpeg's shared libraries on the node.
+  the bundled libsndfile); other codecs fall back to ``torchcodec`` where it
+  works (it needs FFmpeg's shared libraries on the node), else PyAV.
 - Keep each request short, a sentence or two. Text longer than 512 tokens is
   rejected, but quality drops well before that, as it does in the reference
   package: on three-sentence inputs (600-720 characters) Turbo often drops or
@@ -752,8 +752,8 @@ Cosmos3 environment requirements
   path is lost. ``model_kwargs.attention_backend: flashinfer`` in the config YAML
   selects the paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
-  conditioning clip with ``torchcodec``; environments without it reject those
-  requests at preprocessing (other modes are unaffected).
+  conditioning clip with ``torchcodec``, or with PyAV where torchcodec cannot
+  load.
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
   when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
   ``write_video``, which needs the PyAV (``av``) package.
@@ -1235,16 +1235,28 @@ checked, not that it fails.
        transformers' own bf16 logits for the top two tokens were tied. Image input,
        ``qwen3_5_9b_tp2``, ``qwen3_5_27b_tp4`` and ``qwen3_8_27b`` haven't been run.
    * - ``whisper_large``
-     - Not yet
-     - Transcription requests fail while decoding the audio, which needs ``torchcodec``.
-       torchcodec has no ROCm build.
+     - Works
+     - ``whisper_large.yaml``. On 50 LibriSpeech test-clean clips the WER was 3.17%, and
+       all 50 transcripts matched Hugging Face transformers'. torchcodec has no ROCm
+       build, so audio is decoded with soundfile or PyAV.
+   * - ``higgs_audio``
+     - Works
+     - ``higgs_audio.yaml``. WER 1.64% on the same 50 clips.
+   * - ``chatterbox``
+     - Runs
+     - ``chatterbox.yaml``. Only three sentences checked, Whisper transcribed all of
+       them correctly.
+   * - ``vjepa2``
+     - Runs, not matched yet
+     - On a UCF101 clip the predictor output's cosine similarity to Hugging Face's fp32
+       model was 0.998, but the encoder output's only 0.93 (transformers' own bf16 run
+       gets 0.97).
    * - ``cosmos3`` and its variants
      - Not yet run
      - Dense attention's AITER kernel matches an fp32 reference, but no full model run
        has been checked yet.
-   * - ``bagel``, ``chatterbox``, ``flux2_klein``, ``higgs_audio``, ``nemotron_duplex``,
-       ``omnivoice``, ``pi05``, ``qwen3_omni``, ``vjepa2``, ``wan22``, ``waypoint``,
-       ``z_image_turbo``
+   * - ``bagel``, ``flux2_klein``, ``nemotron_duplex``, ``omnivoice``, ``pi05``,
+       ``qwen3_omni``, ``wan22``, ``waypoint``, ``z_image_turbo``
      - Not yet run
      -
 
