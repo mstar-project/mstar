@@ -94,6 +94,11 @@ class Gr00tN17Preprocessor:
             # input would round differently from what NVIDIA serves.
             x = np.asarray(state[key], dtype=np.float32)
             lo, hi = self.state_bounds[tag][key]
+            if lo.size == 0:
+                # no stats for this group (xdof's eef here): the reference
+                # writes zeros as wide as the input, the layout it trained on
+                parts.append(np.zeros_like(x))
+                continue
             if x.shape[-1] != lo.size:
                 raise ValueError(f"state[{key!r}] has {x.shape[-1]} values, expected {lo.size}")
             # the reference's normalize_values_minmax, op for op: a constant
