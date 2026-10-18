@@ -9,6 +9,7 @@ test/modular/test_worker_message_handling.py
 test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
 test/modular/test_attn_backend_auto.py
+test/modular/test_aiter_attention_cpu.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py

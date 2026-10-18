@@ -22,6 +22,8 @@ class AttnBackend(Enum):
     DENSE = "dense"
     FLEX = "flex"
     XPU_PAGED = "xpu_paged"
+    # ROCm: AITER's Triton unified attention over the paged cache
+    AITER = "aiter"
 
 
 @dataclass
