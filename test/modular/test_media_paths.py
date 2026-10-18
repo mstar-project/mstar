@@ -133,14 +133,13 @@ def _clip(fmt, endian, subtype):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _audio_decoder():
-    try:
-        from torchcodec.decoders import AudioDecoder
+def _model_media():
+    """The decoders OmniVoice's ``load_audio`` uses: torchcodec, else PyAV then libsndfile."""
+    from mstar.model.components import media_io as model_media
 
-        AudioDecoder(base64.b64decode(_clip("WAV", "FILE", None)))
-    except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError without FFmpeg
-        pytest.skip(f"torchcodec cannot load here: {exc}")
-    return AudioDecoder
+    if not model_media.uses_torchcodec():
+        pytest.importorskip("av")
+    return model_media
 
 
 @pytest.mark.parametrize("clip", FFMPEG_READS + SOUNDFILE_ONLY)
@@ -154,19 +153,20 @@ def test_qwen3_tts_accepts_bare_base64_that_soundfile_reads(clip, dirs):
 
 
 @pytest.mark.parametrize("clip", FFMPEG_READS)
-def test_omnivoice_accepts_bare_base64_that_torchcodec_reads(clip, dirs):
+def test_omnivoice_accepts_bare_base64_that_its_decoder_reads(clip, dirs):
     uploads, _ = dirs
-    decoder = _audio_decoder()
+    model_media = _model_media()
     req = SpeechRequest(input="hi", ref_audio=_clip(*clip), ref_text="hi")
     (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
     assert path.startswith(str(uploads))
-    assert decoder(path, sample_rate=24000, num_channels=1).get_all_samples().data.numel()
+    assert model_media.decode_audio(path, sample_rate=24000, num_channels=1).data.numel()
 
 
 @pytest.mark.parametrize("clip", SOUNDFILE_ONLY)
 def test_omnivoice_refuses_audio_its_decoder_cannot_read(clip, dirs):
     uploads, _ = dirs
-    _audio_decoder()
+    if not _model_media().uses_torchcodec():
+        pytest.skip("without torchcodec, libsndfile reads these for OmniVoice too")
     req = SpeechRequest(input="hi", ref_audio=_clip(*clip), ref_text="hi")
     with pytest.raises(ValueError, match=REFUSED):
         adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
