@@ -1113,6 +1113,31 @@ class CanaryAdapter(OpenAIAdapter):
         )
 
 
+class CanaryQwenAdapter(OpenAIAdapter):
+    """NVIDIA Canary-Qwen: English speech recognition by an LLM, under its
+    trained instruction. OpenAI's ``prompt`` is context for the transcript
+    (and carries the previous window in sequential long form), which this
+    model was not trained to take, so it is dropped; no timestamps."""
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.utils import base_language
+
+        mk = _untimed_transcription_kwargs(req, "Canary-Qwen")
+        if base_language(mk.get("language") or "en") != "en":
+            raise ValueError("Canary-Qwen transcribes English only")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class TransducerAdapter(OpenAIAdapter):
     """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
 
@@ -1232,6 +1257,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
     "canary": CanaryAdapter(),
+    "canary_qwen": CanaryQwenAdapter(),
     "parakeet": TransducerAdapter(detects_language=True),
     "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),

@@ -1,0 +1,11 @@
+model: "canary_qwen"
+max_seq_len: 2048
+# The KV cache holds 64 requests at max_seq_len (16 pages each) plus its sink
+# page; the conductor queues the rest rather than have the worker offload.
+max_concurrent_requests: 64
+resources:
+  kv_cache:
+    max_num_pages: 1025
+node_groups:
+  - node_names: [audio_encoder, llm]
+    ranks: [0]

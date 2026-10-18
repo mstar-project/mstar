@@ -430,6 +430,11 @@ class Canary(_FastConformerAsr):
         return "nvidia/canary-1b-v2"
 
 
+class CanaryQwen(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-qwen-2.5b"
+
+
 class Parakeet(_FastConformerAsr):
     def get_hf_url(self):
         return "nvidia/parakeet-tdt-0.6b-v3"
@@ -454,6 +459,7 @@ class ModelType(Enum):
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
     CANARY = "canary"
+    CANARY_QWEN = "canary_qwen"
     PARAKEET = "parakeet"
     NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
@@ -486,6 +492,8 @@ class ModelType(Enum):
             return HiggsAudio(**kwargs)
         if self == ModelType.CANARY:
             return Canary(**kwargs)
+        if self == ModelType.CANARY_QWEN:
+            return CanaryQwen(**kwargs)
         if self == ModelType.PARAKEET:
             return Parakeet(**kwargs)
         if self == ModelType.NEMOTRON_ASR:
