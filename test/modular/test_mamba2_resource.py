@@ -278,7 +278,17 @@ def test_triton_step_matches_torch_reference(geom, rows, dtype):
     slots[1] = SINK_SLOT
     slots[-1] = PAD_SLOT_ID
     out = mamba2_state_update(x, dt, a, b, c, state, slots, d=d, dt_bias=dt_bias, time_step_limit=(0.0, 5.0))
-    ref = mamba2_state_update_torch(x, dt, a, b, c, ref_state, slots, d=d, dt_bias=dt_bias, time_step_limit=(0.0, 5.0))
+    # The oracle's einsums are fp32 matmuls, which the engine's process-wide
+    # 'high' matmul precision runs as TF32 (NVIDIA) or XF32 (AMD); keep the
+    # oracle exact so the comparison measures the kernel.
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        ref = mamba2_state_update_torch(
+            x, dt, a, b, c, ref_state, slots, d=d, dt_bias=dt_bias, time_step_limit=(0.0, 5.0),
+        )
+    finally:
+        torch.set_float32_matmul_precision(precision)
     tol = dict(atol=2e-2, rtol=2e-2) if dtype is torch.bfloat16 else dict(atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(out, ref, **tol)
     live = [i for i in range(rows) if slots[i] not in (SINK_SLOT, PAD_SLOT_ID)]
