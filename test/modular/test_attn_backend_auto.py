@@ -283,12 +283,12 @@ def test_an_explicit_backend_is_kept_on_rocm(rocm):
 def test_cuda_never_asks_for_the_rocm_kernels(monkeypatch):
     monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
 
-    def probe():
-        raise AssertionError("a CUDA process probed a ROCm kernel library")
+    def unexpected_import():
+        raise AssertionError("a CUDA process checked for a ROCm kernel library")
 
-    monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", probe)
-    monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", probe)
-    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", probe)
+    monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", unexpected_import)
+    monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", unexpected_import)
+    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", unexpected_import)
     assert resolve_attn_backend(AttnBackend.AUTO, CPU, 64) is AttnBackend.FLASHINFER
     assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is RaggedAttnBackend.FLASHINFER
     assert flashinfer_kwargs(paged(128), "auto") == {"backend": "auto"}
