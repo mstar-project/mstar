@@ -555,22 +555,24 @@ class _Workspace:
 
 @pytest.fixture
 def flashinfer(monkeypatch, fake_cuda):
-    """``AllReduce.new`` over a faked FlashInfer workspace and kernel: the group,
-    the workspaces built and the tensors routed to the kernel."""
+    """``AllReduce.new`` over a faked FlashInfer fusion (its workspace and kernel):
+    the group, the workspaces built and the tensors routed to the kernel."""
+    from mstar import platforms
     from mstar.distributed import ar_fusion
 
     built, routed = [], []
 
-    def create_workspace(group, max_tokens, hidden, dtype):
+    def create(rank, world_size, cpu_group, max_tokens, hidden, dtype):
         nbytes = max_tokens * hidden * dtype.itemsize
-        built.append((group.cpu_group, nbytes))
-        ar_fusion._WORKSPACES.append(_Workspace(nbytes))
-        return len(ar_fusion._WORKSPACES) - 1
+        built.append((cpu_group, nbytes))
+        return ar_fusion.FlashInferARFusion(_Workspace(nbytes), max_tokens, world_size)
 
-    monkeypatch.setattr(ar_fusion, "_WORKSPACES", [])
-    monkeypatch.setattr(ar_fusion, "create_workspace", create_workspace)
+    monkeypatch.setattr(ar_fusion, "_FUSIONS", [])
+    monkeypatch.setattr(ar_fusion, "_create", create)
     monkeypatch.setattr(ar_fusion, "allreduce_oneshot", lambda t, ws_id: routed.append(t) or t)
     monkeypatch.setattr(ar, "SYMM_BACKENDS", _REAL_BACKENDS)
+    # the backend is NVIDIA-only (FlashInfer's comm module)
+    monkeypatch.setattr(platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True))
     g = _group()
     g.cpu_group = SimpleNamespace(name="gloo")
     return g, built, routed
@@ -585,7 +587,7 @@ def test_flashinfer_sizes_its_workspace_in_bytes_over_the_gloo_group(flashinfer)
 def test_flashinfer_without_a_workspace_falls_back_to_nccl(monkeypatch, flashinfer, caplog):
     from mstar.distributed import ar_fusion
 
-    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *args: None)
+    monkeypatch.setattr(ar_fusion, "_create", lambda *args: None)
     with caplog.at_level(logging.WARNING, logger=ar.__name__):
         backend = AllReduce.new(flashinfer[0], "flashinfer")
     assert type(backend) is AllReduce

@@ -23,6 +23,7 @@ import pytest
 import torch
 from torch.distributed import ReduceOp
 
+from mstar.distributed.ar_fusion import GraphCaptureScope
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
@@ -749,6 +750,9 @@ class _PeerGroup:
     def agree(self, values, op):
         pick = min if op == ReduceOp.MIN else max
         return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
+
+    def graph_capture(self):
+        return GraphCaptureScope()
 
 
 class _StubPlannedRunner:
