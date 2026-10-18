@@ -268,7 +268,10 @@ class MicroScheduler:
         # (node, graph walk) -> ScheduledBatch
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
         # The key whose backlog a yield-away pass last served, until another
-        # key gets a step: it is passed over on the next yield-away.
+        # key gets a step: it is passed over on the next yield-away. It
+        # outlives that backlog draining, since a chain re-parks the served
+        # group a step or two later, so a later backlog under the key with
+        # nothing else ready costs one extra pass (the unexcluded fallback).
         self._yield_backlog_served: tuple[str, str] | None = None
 
         self.node_and_walk_to_last_batch_num = {}

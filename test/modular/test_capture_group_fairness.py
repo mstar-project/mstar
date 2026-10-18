@@ -78,6 +78,31 @@ def test_an_excluded_backlog_runs_once_then_leaves_room_for_another_ready_node()
     assert third.node_name == NODE and list(third.request_to_worker_graph) == [0]
 
 
+def test_the_served_backlog_stays_passed_over_across_a_step_that_drains_it():
+    # The yield-away serves group B's backlog (row 1). B is then in flight, so
+    # the chain's next group-A step (row 0) leaves no backlog, and B parks
+    # again on the step after. The record must outlive that drain: cleared
+    # there, every yield-away would go to B and OTHER would wait for good.
+    manager, sched = _scene(MIXED)
+    sched.runtime = manager.runtime
+    ready = manager.queues["wg0"]._ready
+    ready.pop(1)
+    ready.pop(0)
+
+    sched.backlog[(NODE, WALK)] = _batch([1])
+    assert list(sched.get_next_batch(manager, exclude_target=(NODE, WALK)).request_to_worker_graph) == [1]
+
+    ready[0] = {NODE}
+    chain_step = sched.get_next_batch(manager, target=(NODE, WALK), capture_group_of=0)
+    assert list(chain_step.request_to_worker_graph) == [0] and (NODE, WALK) not in sched.backlog
+
+    sched.backlog[(NODE, WALK)] = _batch([1])
+    batch = sched.get_next_batch(manager, exclude_target=(NODE, WALK))
+    assert batch is not None and batch.node_name == OTHER, (
+        "a drained backlog cleared the record, so the yield-away went back to the same group"
+    )
+
+
 def test_an_excluded_backlog_still_runs_once_nothing_else_is_ready():
     manager, sched = _scene(MIXED)
     sched.runtime = manager.runtime
