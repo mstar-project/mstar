@@ -859,7 +859,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         masters = None
         if any(inputs[i].input_ids is None for i in decode):
             sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-            masters = sampler.loopback_tokens(engine_inputs.request_ids)
+            masters = sampler.loopback_tokens()
         return torch.cat([
             masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
         ])
@@ -908,9 +908,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             num_valid_tokens=num_valid_tokens,
             keep_states=keep_states,
         )
-        return engine_inputs.resources[THINKER_SAMPLER].sample(
-            engine_inputs.request_ids, logits=self.model.lm_head(hidden),
-        ), layer_0_embed
+        return engine_inputs.resources[THINKER_SAMPLER].sample(self.model.lm_head(hidden)), layer_0_embed
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -1024,9 +1022,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # The last prefill samples the first token
         if request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
-            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
-                engine_inputs.request_ids, logits=logits
-            )]
+            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(logits)]
 
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
@@ -1224,7 +1220,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         last_hidden = attn_manager.select_last_hidden(hidden)
         logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-        new_tokens = sampler.sample(request_ids, logits)
+        new_tokens = sampler.sample(logits)
         if layer_n_hidden is not None:
             thinker_states = torch.cat(
                 [layer_0_embed, layer_n_hidden], dim=-1,
@@ -1645,7 +1641,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_decode_like(
-        self, request_ids: list[str],
+        self,
         talker_sampler: SamplerResource,
         code_pred_sampler: SamplerResource,
         is_batched_decode: bool,
@@ -1679,15 +1675,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Apply the repetition penalty to the Talker's layer-0 codes (the code
         # predictor depth loop below samples through its own aux config and
         # stays penalty-free). The penalty is baked into the captured graph.
-        layer0_codes = talker_sampler.sample(
-            request_ids, logits
-        )
+        layer0_codes = talker_sampler.sample(logits)
 
         # Groups 1..15 sample from the "code_predictor" aux sampler's static
         # buffers, so per-request values survive graph replay.
         all_codes, codec_emb_sum = self.code_predictor.depth_loop(
             last_hidden, layer0_codes, self.talker_code_emb(layer0_codes),
-            lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
+            code_pred_sampler.sample,
         )
 
         return {
@@ -1709,7 +1703,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         input_embeds = self._add_text_conditioning(input_embeds, kwargs.pop("text_raw", None))
         return self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             input_embeds=input_embeds,
@@ -1761,7 +1754,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
 
         fwd_out = self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             is_batched_decode=True,
