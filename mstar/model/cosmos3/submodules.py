@@ -2780,15 +2780,8 @@ def _latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch
 
 
 def _vae_decode_dtype() -> torch.dtype:
-    # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
-    # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
-    # single-variable cuDNN swap), so gate on the live version — an upgrade
-    # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
-    override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
-    if override is not None:
-        return torch.float32 if override.lower() not in ("0", "false", "no", "off") else torch.bfloat16
-    ver = torch.backends.cudnn.version() or 0
-    return torch.bfloat16 if ver >= 91600 else torch.float32
+    # see wan_vae.decode_dtype, COSMOS3_VAE_DECODE_FP32 overrides
+    return _wan_vae().decode_dtype("COSMOS3_VAE_DECODE_FP32")
 
 
 class ChainedWindowHead:
@@ -2891,8 +2884,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
         self._decode_dtype_cached = _vae_decode_dtype()
-        logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
-                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        logger.info("Cosmos3 VAE decode dtype = %s (%s)",
+                    self._decode_dtype_cached, _wan_vae().conv_library_version())
         return self._decode_dtype_cached
 
     def _vae_input(self, latents: torch.Tensor) -> torch.Tensor:
