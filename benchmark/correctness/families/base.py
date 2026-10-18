@@ -79,6 +79,34 @@ class Family:
         return d if d.is_dir() and (ref_dir / "meta.json").is_file() else None
 
 
+class MathSdpaReference:
+    """--family-opt ref_sdpa=math builds a second reference with torch's math SDPA. Scoring the
+    default reference then also reports how far the reference moves from itself when only its
+    attention kernel changes, which is the spread a served output should be judged against."""
+
+    MATH_SUFFIX = "-sdpa-math"
+
+    @property
+    def ref_sdpa_math(self) -> bool:
+        return self.opt("ref_sdpa") == "math"
+
+    def sdpa_context(self):
+        import contextlib
+
+        if not self.ref_sdpa_math:
+            return contextlib.nullcontext()
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel(SDPBackend.MATH)
+
+    def math_reference_dir(self, ref_dir: Path | None) -> Path | None:
+        """The math-SDPA sibling of the default reference, when it was built."""
+        if ref_dir is None or self.ref_sdpa_math:
+            return None
+        d = ref_dir.parent.parent / (ref_dir.parent.name + self.MATH_SUFFIX) / ref_dir.name
+        return d if (d / "meta.json").is_file() else None
+
+
 def write_meta(ref_dir: Path, **meta) -> None:
     import datetime
     import platform
