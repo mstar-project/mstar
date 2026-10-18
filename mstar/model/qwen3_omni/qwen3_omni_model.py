@@ -56,6 +56,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components.moe import prepare_moe_weights
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -119,8 +120,11 @@ class Qwen3OmniModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        moe_backend: str = "auto",
         **kwargs,
     ):
+        """``moe_backend`` comes from the serving config's ``model_kwargs:`` and
+        picks the Thinker's and Talker's MoE kernels (see MoEBackend)."""
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
 
@@ -149,6 +153,8 @@ class Qwen3OmniModel(Model):
         local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
+        self.config.thinker_text.moe_backend = moe_backend
+        self.config.talker_text.moe_backend = moe_backend
 
         # Tokenizer (Thinker uses a Qwen-family tokenizer)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -1426,6 +1432,7 @@ class Qwen3OmniModel(Model):
             stacked_params=self._get_thinker_stacked_params(),
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(thinker_model)
         thinker_model.eval()
 
 
@@ -1494,6 +1501,7 @@ class Qwen3OmniModel(Model):
             stacked_params=stacked,
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(talker_model)
         talker_model.eval()
 
         with torch.device("meta"):
