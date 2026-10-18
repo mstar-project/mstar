@@ -360,6 +360,16 @@ def test_action_engine_matches_fused() -> None:
     print(f"  action engine cache-once (sdpa) abs-max diff = {diff:.3e}")
 
 
+def _read_mp4_rgb(path: str) -> torch.Tensor:
+    """[T, H, W, 3] uint8 frames via PyAV (torchvision 0.27 dropped io.read_video)."""
+    import av
+
+    with av.open(path) as container:
+        return torch.stack([
+            torch.from_numpy(frame.to_ndarray(format="rgb24")) for frame in container.decode(video=0)
+        ])
+
+
 def test_action_id_golden_gate() -> None:
     """Inverse-dynamics on av_0 reproduces NVIDIA's reference action output
     ([60, 9]) within MSE <= 0.05 / PSNR >= 14 (NVIDIA's own thresholds)."""
@@ -369,7 +379,6 @@ def test_action_id_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -383,7 +392,7 @@ def test_action_id_golden_gate() -> None:
         return
     prompt, chunk, raw, dom, fps = "You are an autonomous vehicle planning system.", 60, 9, 1, 10.0
     nf = chunk + 1
-    frames, _, _ = torchvision.io.read_video(inp, pts_unit="sec")
+    frames = _read_mp4_rgb(inp)
     frames = frames[:nf]
     h, w = int(frames.shape[1]), int(frames.shape[2])
     procs = [mpipe.video_processor.preprocess(Image.fromarray(frames[i].numpy()), height=h, width=w).squeeze(0)
@@ -419,7 +428,6 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -455,7 +463,7 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         out.append(pred.cpu())
         cond_frame = (pred[:, -1].clamp(0, 1) * 2 - 1).to(device=device, dtype=dtype)
     pred_video = torch.cat(out, dim=1)
-    g, _, _ = torchvision.io.read_video(gold_mp4, pts_unit="sec")
+    g = _read_mp4_rgb(gold_mp4)
     gold = (g.permute(3, 0, 1, 2).float() / 255.0)
     n = min(pred_video.shape[1], gold.shape[1])
     mse = (pred_video[:, :n] - gold[:, :n]).pow(2).mean().item()
