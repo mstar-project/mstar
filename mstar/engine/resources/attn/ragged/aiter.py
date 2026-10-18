@@ -1,16 +1,16 @@
-"""Cacheless varlen attention on AMD GPUs through AITER's flash attention.
+"""Cacheless varlen attention on AMD GPUs with AITER's flash attention.
 
-The ROCm sibling of ``ragged.flashinfer``: one ``aiter.flash_attn_varlen_func``
-per layer over the packed q/k/v, the segment layout given as cumulative
-lengths (separate ones for the query and key sides of a cross pair). CK takes
-any head dim that is a multiple of 8 up to 256, so nothing is zero-padded to
-FlashInfer's 64/128/256.
+The ROCm counterpart of ``ragged.flashinfer``. Each layer is one
+``aiter.flash_attn_varlen_func`` over the packed q/k/v, with the segment layout
+as cumulative lengths (separate ones for the query and key sides of a cross
+pair). CK takes any head dim that is a multiple of 8 up to 256, so nothing is
+zero-padded to FlashInfer's 64/128/256.
 
 A captured step stages its lengths into static buffers per (bucket, slot,
-label), padded to the bucket's segment count with zero-length segments, and
-passes the bucket's token ceilings as ``max_seqlen_q``/``max_seqlen_k``: the
-kernel grid is sized from those on the host, so they stay fixed per bucket and
-``run`` reads nothing back from the device.
+label), padded to the bucket's segment count with empty segments. The kernel
+grid is sized on the host from ``max_seqlen_q``/``max_seqlen_k``, so those are
+fixed at the bucket's token ceiling and ``run`` reads nothing back from the
+device.
 """
 
 import functools
@@ -32,14 +32,14 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
-# int32 slots between the two length arrays, keeping the second 64-byte aligned
+# in int32s, so the second length array starts 64-byte aligned
 _ALIGN = 16
 _MAX_HEAD_DIM = 256
 
 
 @functools.cache
 def aiter_varlen_unavailable_reason() -> str | None:
-    """Why AITER's varlen flash attention cannot be imported; None if it can."""
+    """Why AITER's varlen flash attention can't be imported, or None."""
     try:
         from aiter import flash_attn_varlen_func  # noqa: F401
     except Exception as exc:  # noqa: BLE001
@@ -55,7 +55,7 @@ def _varlen():
 
 
 class _RaggedPlan(NamedTuple):
-    """One label's layout for this step. A NamedTuple: built per label per step."""
+    """One label's layout for this step. Built per label per step, hence a NamedTuple."""
     cu_seqlens_q: torch.Tensor  # device, [segments + 1]
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
@@ -74,8 +74,8 @@ def _cu(segments: list[Segment]) -> np.ndarray:
 
 
 class _AiterRaggedBase:
-    """What the self- and cross-attention managers share: per-key staging, the
-    preplan protocol, and ``run``. A subclass lays its step out in ``_plan_layouts``."""
+    """Staging, preplan and ``run``, shared by the self- and cross-attention
+    managers. A subclass lays out its step in ``_plan_layouts``."""
 
     def __init__(
         self,
@@ -111,7 +111,7 @@ class _AiterRaggedBase:
 
     @property
     def force_double_buffer(self):
-        # plan copies host images into device buffers a replay reads
+        # plan copies into device buffers that a replay reads
         return True
 
     @staticmethod
@@ -136,8 +136,8 @@ class _AiterRaggedBase:
             self._preplan_plans = {}
             self._preplanned = False
             return
-        # a label's segments are its whole layout; an undeclared label must not
-        # find last step's plan
+        # a fresh dict, so a label this step doesn't declare can't find last
+        # step's plan
         plans: dict[str, _RaggedPlan] = {}
         self._plan_layouts(step, ctx, plans)
         if ctx.is_preplan:
@@ -174,8 +174,8 @@ class _AiterRaggedBase:
         else:
             bucket = lease.bucket
             seg_cap = self._config.max_segments_for(bucket.bs)
-            # the bucket's own token count is the ceiling; the per-request one
-            # is for a runner that buckets by batch size alone
+            # the bucket's token count is the ceiling. The per-request one is
+            # for a runner that buckets by batch size only.
             max_tokens = max(bucket.num_tokens, self._config.max_tokens_for(bucket.bs) or 0)
             if n_seg > seg_cap or q_tokens > max_tokens or k_tokens > max_tokens:
                 raise ValueError(
@@ -192,13 +192,13 @@ class _AiterRaggedBase:
                     dtype=self._dtype, device=self._device,
                 )
             out = self._cg_out[key]
-            # rows this layout leaves unwritten read back zero, as FlashInfer's
-            # ragged wrapper's do; zeroed here, outside the graph
+            # rows past the layout read back zero, like FlashInfer's ragged
+            # wrapper. Zeroed here, outside the graph.
             out[q_tokens:].zero_()
         k_off = _round(seg_cap + 1)
         image.wait()
         host = image.np
-        # the bucket's segment count is fixed: the extra segments are empty
+        # pad to the bucket's fixed segment count with empty segments
         host[:n_seg + 1] = q_cu
         host[n_seg + 1:seg_cap + 1] = q_tokens
         host[k_off:k_off + n_seg + 1] = k_cu
@@ -238,11 +238,12 @@ class _AiterRaggedBase:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         label: str | None = None,
     ) -> torch.Tensor:
-        """One layer's attention through the plan for ``label``.
+        """One layer's attention with the plan for ``label``.
 
-        q: [total_tokens, Hq, D] by the query layout; k, v: [total_kv_tokens,
-        Hkv, D] by the key layout (the query layout, for self-attention).
-        A captured step's rows past the planned tokens read back zero.
+        ``q`` is [total_tokens, Hq, D] in the query layout, ``k`` and ``v`` are
+        [total_kv_tokens, Hkv, D] in the key layout (the query layout, for
+        self-attention). In a captured step, rows past the planned tokens read
+        back zero.
         """
         plan = self._plan(label)
         qk, kk, vk = (t if t.dtype == self._dtype else t.to(self._dtype) for t in (q, k, v))
@@ -261,7 +262,7 @@ class _AiterRaggedBase:
             softmax_scale=self._config.sm_scale, causal=plan.causal, out=out,
         )
         if plan.out is not None:
-            # the buffer is shared by every layer; the next call overwrites it
+            # every layer shares this buffer, and the next call overwrites it
             out = out.clone()
         return out if out.dtype == q.dtype else out.to(q.dtype)
 
@@ -271,8 +272,8 @@ def _round(n: int) -> int:
 
 
 class AiterRaggedManager(_AiterRaggedBase, RaggedAttnManager):
-    """Self-attention: every label in the step is its own layout, each segment
-    attending within itself."""
+    """Self-attention. Each label in the step is its own layout, and each
+    segment attends within itself."""
 
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plans) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
@@ -281,8 +282,8 @@ class AiterRaggedManager(_AiterRaggedBase, RaggedAttnManager):
 
 
 class AiterRaggedCrossManager(_AiterRaggedBase, RaggedCrossAttnManager):
-    """Cross-attention: each ``(q_label, kv_label)`` pair of the step is one plan,
-    run under ``cross_label(q_label, kv_label)``. Never causal."""
+    """Cross-attention. Each ``(q_label, kv_label)`` pair of the step is one
+    plan, run under ``cross_label(q_label, kv_label)``. Never causal."""
 
     def _plan_layouts(self, step: RaggedCrossAttentionStep, ctx: StepContext, plans) -> None:
         by_label = self._group_segments_by_label(step.segments or ())
