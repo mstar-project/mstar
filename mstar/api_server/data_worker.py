@@ -16,15 +16,6 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.graph.base import GraphEdge, TensorPointerInfo
-from mstar.graph.loop_indices import NestedLoopIndices
-
-try:
-    import torchaudio  # noqa: F401 — probes availability; real usage in callers
-    from torchcodec.decoders import VideoDecoder
-except (ImportError, RuntimeError, OSError):
-    VideoDecoder = None
-
 from mstar.api_server.request_types import (
     ClientAppend,
     DataWorkerProfile,
@@ -49,6 +40,8 @@ from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.lora.identity import AdapterPrefixRoots
 from mstar.engine.resources.lora.serving import lora_specs
+from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import (
     ClientChunk,
     Model,

@@ -2,8 +2,7 @@ import functools
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field, replace
-from fractions import Fraction
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Type
 
 import torch
@@ -31,7 +30,8 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
+from mstar.model.components.media_io import video_metadata_dict  # noqa: F401  re-exported for the video loaders
+from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.submodule_base import (
     CHUNK_LOOP_END,
@@ -295,13 +295,6 @@ def names_checkpoint(model: "Model") -> bool:
     """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
     which may download the checkpoint (BAGEL's does)."""
     return type(model).checkpoint_path is not Model.checkpoint_path
-
-
-def video_metadata_dict(metadata_obj) -> dict:
-    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
-    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
-
-
 _wg_id_counter = itertools.count(1 << 20)
 
 
@@ -1028,25 +1021,19 @@ class Model(ABC):
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
-        # video-only one); torchcodec for the other containers.
+        # video-only one); FFmpeg (torchcodec, else PyAV) for the other containers.
         from mstar.model.components.audio_features import load_audio_file
 
         audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
-        from torchcodec.decoders import VideoDecoder
+        from mstar.model.components.media_io import decode_video
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
-        budget = VideoBudget()
-        frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
-        video = torch.stack(frames)
-        del frames
-        video = video.float().div_(255.0)
-        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
+        frames = decode_video(filepath, device=device, on_frames=VideoBudget().add)
+        metadata = frames.metadata
+        video = frames.data.float().div_(255.0)
+        return TensorAndMetadata(data=video, metadata=metadata)
 
     def text_output(self) -> TextOutput | None:
         """How this model's text output, token ids, becomes bytes, or None for a
