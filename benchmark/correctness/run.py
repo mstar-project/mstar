@@ -136,6 +136,7 @@ def main(argv=None) -> int:
     model_key = cfg.get("model")
     fam = family_for_config(config_name, model_key, cfg, _kv(args.family_opt))
     sset = load_set(fam.set_name, args.data_root)
+    sset.items = fam.select_items(sset.items)
     items = sset.items[: args.limit] if args.limit else sset.items
     sset.items = items
     ref_dir = args.data_root / "references" / fam.reference_id() / fam.set_name
