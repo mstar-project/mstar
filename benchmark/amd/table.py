@@ -28,6 +28,14 @@ COLUMNS = {
             ("audio_s_per_req", "audio s/req", 1, 2), ("req_s", "req/s", 1, 2)],
     "asr": [("rtfx", "RTFx", 1, 1), ("req_s", "req/s", 1, 2), ("e2e_p50_s", "E2E p50 s", 1, 3),
             ("e2e_p95_s", "E2E p95 s", 1, 3)],
+    "omni": [("audio_s_per_s", "audio s/s", 1, 1), ("ttfa_p50_s", "TTFA p50 ms", 1e3, 0),
+             ("ttfa_p95_s", "TTFA p95 ms", 1e3, 0), ("rtf_p50", "RTF p50", 1, 3), ("e2e_p50_s", "E2E p50 s", 1, 2),
+             ("e2e_p95_s", "E2E p95 s", 1, 2), ("text_ttft_p50_s", "text TTFT p50 ms", 1e3, 0),
+             ("audio_s_per_req", "audio s/req", 1, 2)],
+    "image": [("images_per_s", "images/s", 1, 3), ("e2e_p50_s", "latency p50 s", 1, 3),
+              ("e2e_p95_s", "latency p95 s", 1, 3)],
+    "video": [("clips_per_min", "clips/min", 1, 2), ("e2e_p50_s", "E2E p50 s", 1, 1), ("e2e_p95_s", "E2E p95 s", 1, 1),
+              ("wall_s", "makespan s", 1, 1)],
 }
 
 
@@ -87,8 +95,10 @@ def _comparability(data: dict, row: str, arm: str, wl: str, fam: str) -> list[st
     """Reasons an arm's cells don't compute the same thing as mstar's, beyond the arm's own note."""
     notes = []
     a = data["arms"].get(f"{row}/{arm}", {})
-    if a.get("differs"):
-        notes.append(a["differs"])
+    spec = catalog.ARMS.get(arm)
+    differs = spec.differs_for.get(fam, spec.differs) if spec else a.get("differs")
+    if differs:
+        notes.append(differs)
     if fam == "text" and arm != "mstar":
         ours = [c for c in data["cells"] if c["row"] == row and c["arm"] == "mstar" and c["workload"] == wl]
         theirs = [c for c in data["cells"] if c["row"] == row and c["arm"] == arm and c["workload"] == wl]
@@ -98,6 +108,16 @@ def _comparability(data: dict, row: str, arm: str, wl: str, fam: str) -> list[st
             o, t = [x for x in o if x], [x for x in t if x]
             if o and t and abs(max(o) - max(t)) / max(o) > 0.02:
                 notes.append(f"{label} tokens/request {max(t):.0f} vs mstar {max(o):.0f}")
+    if fam in ("tts", "omni") and arm != "mstar":
+        # Length-sensitive metrics (audio s/s, RTF) compare only if both say about as much.
+        def audio(name):
+            vals = [c["summary"].get("audio_s_per_req", {}).get("median") for c in data["cells"]
+                    if c["row"] == row and c["arm"] == name and c["workload"] == wl]
+            vals = [v for v in vals if v]
+            return sum(vals) / len(vals) if vals else None
+        o, t = audio("mstar"), audio(arm)
+        if o and t and not 0.85 <= t / o <= 1.15:
+            notes.append(f"{t / o - 1:+.0%} audio per request vs mstar")
     return notes
 
 
