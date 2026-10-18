@@ -1,8 +1,8 @@
 """Generic token sampling utilities.
 
-Uses device-specific fused top-k/top-p sampling kernels: FlashInfer on CUDA and
-``vllm-xpu-kernels`` on XPU. Model-agnostic — any AR model returns logits, this
-module selects the next token.
+Uses device-specific fused top-k/top-p sampling kernels: FlashInfer on NVIDIA
+GPUs, FlashInfer's ROCm fork on AMD GPUs, and ``vllm-xpu-kernels`` on XPU.
+Model-agnostic — any AR model returns logits, this module selects the next token.
 
 Supports per-request sampling parameters (different temperature/top_k/top_p
 for each request in a batch) via tensor parameters.
@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms.dispatch import PlatformDispatch
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
@@ -59,6 +60,17 @@ def _xpu_generator_seed_offset(
     return seed, offset
 
 
+# A block holds at most 1024 threads on both vendors: 32 warps fits NVIDIA's
+# 32-wide warps but not AMD's 64-wide wavefronts, where it cannot launch.
+_MAX_THREADS_PER_BLOCK = 1024
+
+
+def _launchable(configs: list, device: torch.device) -> list:
+    """The autotune configs whose block fits the device."""
+    warp_size = torch.cuda.get_device_properties(device).warp_size
+    return [c for c in configs if c.num_warps * warp_size <= _MAX_THREADS_PER_BLOCK]
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
@@ -70,6 +82,9 @@ def _xpu_generator_seed_offset(
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
     ],
     key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
+    prune_configs_by={"early_config_prune": lambda configs, nargs, **kw: _launchable(
+        configs, nargs["logits_ptr"].device,
+    )},
 )
 @triton.jit
 def _fused_sampling_prep_kernel(
@@ -1210,6 +1225,35 @@ class Sampler(BaseSampler):
         return FilterOrder(top_p_first=dev[0] != 0, min_keep=dev[1].to(torch.int32))
 
 
+def _flashinfer_sampling(name: str):
+    def factory():
+        import flashinfer
+
+        return getattr(flashinfer.sampling, name)
+    return factory
+
+
+def _rocm_sampling(name: str):
+    def factory():
+        from mstar.engine.resources.sampler.rocm import sampling_from_probs
+
+        return sampling_from_probs(name)
+    return factory
+
+
+# FlashInfer's rejection samplers, reading one device seed/offset per row
+_top_p_sampling_from_probs = PlatformDispatch(
+    "top_p_sampling_from_probs",
+    cuda=_flashinfer_sampling("top_p_sampling_from_probs"),
+    rocm=_rocm_sampling("top_p_sampling_from_probs"),
+)
+_top_k_top_p_sampling_from_probs = PlatformDispatch(
+    "top_k_top_p_sampling_from_probs",
+    cuda=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
+    rocm=_rocm_sampling("top_k_top_p_sampling_from_probs"),
+)
+
+
 def _sample_cuda(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -1225,9 +1269,7 @@ def _sample_cuda(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
 ) -> torch.Tensor:
-    """Sample normalized CUDA inputs with FlashInfer."""
-    import flashinfer
-
+    """Sample normalized CUDA-device inputs with FlashInfer's sampler."""
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
     # (reads probs) to the same device/stream so the write-before-read is
     # ordered without an explicit sync. Otherwise FlashInfer runs on the
@@ -1251,7 +1293,7 @@ def _sample_cuda(
             return _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
         if top_k_zero_count == logits.shape[0]:
             # top-k is off for every row
-            result = flashinfer.sampling.top_p_sampling_from_probs(
+            result = _top_p_sampling_from_probs(
                 probs, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1259,7 +1301,7 @@ def _sample_cuda(
         else:
             # top_k 0 is off: FlashInfer reads it as k=0, so a mixed batch's 0 rows drew token 0
             top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            result = _top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1566,8 +1608,6 @@ def sample_accelerator_graphable_gpu(
                 min_p=min_p,
             )
     elif logits.device.type == "cuda":
-        import flashinfer
-
         with torch.cuda.device(logits.device):
             probs = fused_temperature_softmax(
                 logits, temperature,
@@ -1587,7 +1627,7 @@ def sample_accelerator_graphable_gpu(
             # Sampling is thus reproducible only within a fixed batch layout; under
             # continuous batching (shifting positions) a request's stream is not.
             # Measured in test/sampling_test/flashinfer_batch_test.py.
-            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            samples = _top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p, deterministic=True,
                 seed=seed, offset=offset,
             )
