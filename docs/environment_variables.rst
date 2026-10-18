@@ -692,5 +692,6 @@ with a measured win. ROCm sets none yet; CUDA's (``NCCL_GRAPH_REGISTER``,
 
 The ROCm libraries read their own variables (``AITER_JIT_DIR``,
 ``AITER_ROOT_DIR``, ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLASHINFER_WORKSPACE_BASE``,
-``HIP_VISIBLE_DEVICES`` and the MIOpen cache paths). They aren't M* knobs. See
+``HIP_VISIBLE_DEVICES``, ``MIOPEN_FIND_MODE`` and the MIOpen cache paths). They
+aren't M* knobs. See
 :ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`.
