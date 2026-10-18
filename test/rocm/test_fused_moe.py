@@ -147,6 +147,19 @@ def test_triton_backend_matches_reference(dims, num_tokens):
     _assert_matches(fused_experts(x, w1, w2, weights, ids), ref)  # the kernel's own default
 
 
+@pytest.mark.parametrize("dims", [THINKER, TALKER], ids=["thinker", "talker"])
+@pytest.mark.parametrize("num_tokens", [1, 32, 512])
+def test_triton_backend_is_bitwise_reproducible(dims, num_tokens):
+    """Greedy decoding only repeats if identical calls match bitwise."""
+    from mstar.utils.fused_moe.backend import TritonFusedMoE
+
+    x, w1, w2, weights, ids = _inputs(dims, num_tokens)
+    backend = TritonFusedMoE(_problem(dims))
+    first = backend(x, w1, w2, weights, ids).clone()
+    for _ in range(10):
+        assert torch.equal(backend(x, w1, w2, weights, ids), first)
+
+
 def _shipped_tables():
     from mstar.utils.fused_moe.config import CONFIG_DIR, MoEProblem, config_file_name, device_config_name
 
