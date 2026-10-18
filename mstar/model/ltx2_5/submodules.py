@@ -277,6 +277,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         }
 
     def build_layout(self, bucket_key: LTXShape, device):
+        # TODO: per-row tables (a positions resource) would let mixed fps/resolutions share a batch.
         return build_rope(
             self.config.transformer, bucket_key.frames, bucket_key.height, bucket_key.width, bucket_key.fps,
             bucket_key.audio_frames, device,
