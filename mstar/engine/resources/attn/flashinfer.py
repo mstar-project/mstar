@@ -31,8 +31,8 @@ class FlashInferManager(AttentionManager):
         decode_tensor_cores: bool = True,
     ):
         self._kv_cache_name = kv_cache
-        # off where the build's decode-without-tensor-cores kernel is the
-        # faster one (FlashInfer on ROCm); see `flashinfer_kwargs`
+        # False where decode without tensor cores is faster (FlashInfer on
+        # ROCm, see `flashinfer_kwargs`)
         self._decode_tensor_cores = decode_tensor_cores
         self._device = device
         self._dtype = dtype
