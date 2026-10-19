@@ -16,6 +16,7 @@ import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestFailed
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -155,8 +156,12 @@ def _worker_process_target(
     log_level: str = "INFO",
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    env: dict[str, str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    # Before anything creates a CUDA context: the MPS pipe directory decides
+    # whether this process becomes an MPS client.
+    os.environ.update(env or {})
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -351,6 +356,15 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
+        # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
+        # conductor owns, so workers sharing a GPU overlap their kernels instead
+        # of time-slicing.
+        mps = self.model_config.get("mps", False)
+        if not isinstance(mps, bool):
+            raise ValueError(f"{model_config_file}: mps must be true or false, got {mps!r}")
+        if mps and self.device_type != "cuda":
+            raise ValueError(f"{model_config_file}: mps: true needs CUDA, not {self.device_type}")
+        self._mps = MpsDaemon() if mps else None
         model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
@@ -547,6 +561,9 @@ class Conductor:
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
         ctx = mp.get_context("spawn")
+        atexit.register(self.shutdown)
+        if self._mps is not None:
+            self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -569,17 +586,23 @@ class Conductor:
                     "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
+                    "tcp_transfer_device": self.tcp_transfer_device,
+                    "env": self._mps.client_env if self._mps is not None else None,
                 },
                 daemon=False,
             )
             p.start()
             self._worker_processes.append(p)
 
-        atexit.register(self.shutdown)
-
     def shutdown(self):
-        """Terminate and join all worker processes."""
+        """Terminate and join all worker processes, then stop the MPS daemon if any."""
+        try:
+            self._stop_workers()
+        finally:
+            if self._mps is not None:
+                self._mps.stop()
+
+    def _stop_workers(self):
         if not self._worker_processes:
             return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")

@@ -1,6 +1,6 @@
 # The encoder and the decoder in separate worker processes on one GPU, so a decode step never queues
-# behind an encoder batch on the same stream (experiment: benchmark/asr_perf). Run under MPS for the
-# two processes' kernels to overlap rather than time-slice.
+# behind an encoder batch on the same stream. `mps: true` runs both as clients of one MPS daemon so
+# their kernels overlap rather than time-slice.
 model: "whisper_large"
 max_seq_len: 448
 # The decoder caches are sized for 64 requests at once (12 cross-attention
@@ -12,6 +12,7 @@ resources:
   cross_kv_cache:
     cpu_offload_pages: 128
 rank_devices: {0: 0, 1: 0}
+mps: true
 node_groups:
   - node_names: [audio_encoder]
     ranks: [0]

@@ -257,6 +257,13 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
 
+Workers that share a GPU time-slice it by default: one process's kernels wait for the
+other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
+before it spawns the workers, run every worker as its client so their kernels overlap,
+and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
+processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
+driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
+
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
 
