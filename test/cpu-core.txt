@@ -50,6 +50,7 @@ test/modular/test_cfg_tp_publish.py
 test/modular/test_bagel_cfg_parallel.py
 test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
+test/modular/test_subgroup_creation_order.py
 test/modular/test_preplan_error_paths.py
 test/modular/test_diffusion_denoise_loop.py
 test/modular/test_step_prep_host_syncs.py
