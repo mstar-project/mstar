@@ -6,7 +6,8 @@ Requirements
 
 - **Python 3.12+**.
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families, or **Intel GPUs with XPU PyTorch** for BAGEL (see `Intel XPU Docker image`_).
+  families, or **Intel GPUs with XPU PyTorch** for BAGEL
+  (see `Using Docker image on Intel GPU`_).
   A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
   (submodules return ``None``) for development and the modular tests, but not real model
   inference.
@@ -68,7 +69,7 @@ console scripts, ``mstar`` and ``mstar-serve``.
    CUDA toolkit`_ for details and the manual fallback.
 
 Using Docker image on Intel GPU
-----------------------
+-------------------------------
 
 Build the image using ``docker/Dockerfile.xpu``:
 
@@ -91,7 +92,8 @@ interactive shell and check GPU access:
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
 
-Inside the container, you can try serving BAGEL using the TP2 deployment with 2 Intel GPUs:
+Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
+one for the encoders and decoder, and two for the LLM.
 
 .. code-block:: bash
 
