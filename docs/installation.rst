@@ -67,7 +67,7 @@ console scripts, ``mstar`` and ``mstar-serve``.
    with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
    CUDA toolkit`_ for details and the manual fallback.
 
-Intel XPU Docker image
+Using Docker image on Intel GPU
 ----------------------
 
 Build the image using ``docker/Dockerfile.xpu``:
@@ -78,25 +78,6 @@ Build the image using ``docker/Dockerfile.xpu``:
    cd mstar
    docker build -t mstar:xpu - < docker/Dockerfile.xpu
 
-This supplies only the Dockerfile, with an empty build context.
-
-The image clones M* into ``/mstar-workspace`` and uses ``uv`` to install
-``.[bagel_xpu]`` and build ``mstar-rust`` from that source. The clone defaults to
-``main`` in ``https://github.com/mstar-project/mstar.git``. To build another
-branch or tag, pass ``--build-arg MSTAR_REPO=<repository-url>`` and
-``--build-arg MSTAR_REF=<branch-or-tag>``. Set these arguments when building an
-unmerged branch; local checkout changes are not used as image sources.
-Use ``--no-cache`` when rebuilding a moving branch to refresh the clone.
-
-The Dockerfile pins XPU PyTorch 2.13.0, torchvision
-0.28.0, torchaudio 2.11.0 (the latest XPU wheel), and TorchCodec 0.16.0 with the
-Intel ``torchcodec-xpu`` 0.16.0 plugin. The CPU TorchCodec base wheel avoids CUDA
-dependencies; the plugin provides XPU video acceleration through FFmpeg VAAPI.
-An inline ``uv`` override selects Torch 2.13 for this image while preserving
-upstream's ``torch<2.13`` package metadata. Consequently, ``uv pip check`` reports
-that version-cap mismatch; the install resolver validates the image's override.
-The build checks these imports and the XPU kernel extensions without requiring GPU access.
-Other model families may need additional dependencies and XPU kernel support.
 
 The host must have a working Intel GPU driver and expose ``/dev/dri``. Run an
 interactive shell and check GPU access:
@@ -110,28 +91,11 @@ interactive shell and check GPU access:
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
 
-To use the Intel media engines, pass an XPU device to the TorchCodec decoder:
-
-.. code-block:: python
-
-   from torchcodec.decoders import VideoDecoder
-
-   decoder = VideoDecoder("input.mp4", device="xpu:0")
-
-Acceleration requires a GPU with media engines; Intel Data Center GPU Max
-(Ponte Vecchio) uses the plugin's CPU fallback.
-
-Inside the container, serve BAGEL using the seven-XPU CFG TP2 deployment:
+Inside the container, you can try serving BAGEL using the TP2 deployment with 2 Intel GPUs:
 
 .. code-block:: bash
 
-   mstar serve bagel --config configs/bagel_xpu_cfg_tp2.yaml
-
-This config needs seven visible Intel GPUs. The image includes the source under
-``/mstar-workspace``; model weights are downloaded at runtime into the mounted cache.
-The GPU runtime pins in the Dockerfile can be overridden with
-``--build-arg COMPUTE_RUNTIME_VERSION=...``, ``--build-arg IGC_VERSION=...`` and
-``--build-arg GMM_VERSION=...`` to suit the host driver.
+   mstar serve bagel --config configs/bagel_xpu_tp2.yaml
 
 Optional dependencies
 ---------------------
