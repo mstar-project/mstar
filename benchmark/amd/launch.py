@@ -46,10 +46,10 @@ CTR_FORWARDED = ("VLLM_", "SGLANG_", "AITER_", "HSA_", "NCCL_", "RCCL_", "MIOPEN
                  "PYTORCH_", "HF_", "DIFFUSION_", "OMNI_", "HIP_")
 # ctr.sh's own settings: read by ctr.sh on the host, not passed into the container.
 CTR_OWN = ("CTR_PWD", "CTR_BIND")
-VRAM_BUSY_MB = 4096
-# A process that restricts only HIP_VISIBLE_DEVICES still opens every GPU, and amd-smi lists it on each with a few
-# kB; it holds a GPU only above this much VRAM there.
-PROC_VRAM_BUSY_BYTES = 256 << 20
+# A GPU is busy when this much VRAM is in use (idle: ~0.3 GB). amd-smi lists every process that opened a GPU
+# under all of them (ROCr opens every render node unless ROCR_VISIBLE_DEVICES limits it), with the process's
+# total memory rather than its share of that GPU, so process lists are recorded but don't decide.
+VRAM_BUSY_MB = 1024
 # Server log lines that say which attention backend an engine picked (vLLM, SGLang, sglang-omni).
 BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"Overriding with (\w+) out of"),
                     re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"),
@@ -136,7 +136,7 @@ def smi_gpu(hip: int) -> int:
 
 
 def gpu_occupancy(gpus: list[int]) -> dict[int, dict]:
-    """VRAM in use and the processes holding memory, per HIP device, from amd-smi. Empty if it can't tell."""
+    """VRAM in use and the processes amd-smi lists, per HIP device. Empty if amd-smi can't tell."""
     out: dict[int, dict] = {}
     want = {smi_gpu(g): g for g in gpus}
     for e in _entries(amd_smi_json("metric", "--mem-usage")):
@@ -151,12 +151,8 @@ def gpu_occupancy(gpus: list[int]) -> dict[int, dict]:
             procs = []
             for item in e.get("process_list") or []:
                 info = item.get("process_info") if isinstance(item, dict) else None
-                if not isinstance(info, dict):
-                    continue
-                vram = ((info.get("memory_usage") or {}).get("vram_mem") or {}).get("value")
-                if isinstance(vram, (int, float)) and vram < PROC_VRAM_BUSY_BYTES:
-                    continue
-                procs.append(f"{info.get('name')}:{info.get('pid')}")
+                if isinstance(info, dict):
+                    procs.append(f"{info.get('name')}:{info.get('pid')}")
             out.setdefault(g, {})["processes"] = procs
     return out
 
@@ -321,17 +317,17 @@ class Launch:
                 pass
 
     def check_free(self, settle_s: float = 120) -> dict:
-        """Refuse a busy port or a GPU another process is using. VRAM of a server that just exited
-        takes a few seconds to come back, so memory alone is waited on for up to ``settle_s``."""
+        """Refuse a busy port or a GPU with memory in use. VRAM of a server that just exited takes a few
+        seconds to come back, so it is waited on for up to ``settle_s``."""
         if not port_is_free(self.port):
             raise RuntimeError(f"port {self.port} is busy")
         deadline = time.monotonic() + settle_s
         while True:
             occ = gpu_occupancy(self.gpus)
-            busy = {g: o for g, o in occ.items() if o.get("processes") or (o.get("vram_used_mb") or 0) > VRAM_BUSY_MB}
+            busy = {g: o for g, o in occ.items() if (o.get("vram_used_mb") or 0) > VRAM_BUSY_MB}
             if not busy or self.force:
                 return occ
-            if any(o.get("processes") for o in busy.values()) or time.monotonic() > deadline:
+            if time.monotonic() > deadline:
                 raise RuntimeError(f"GPU(s) in use: {busy}")
             time.sleep(5)
 
@@ -539,7 +535,7 @@ print(json.dumps(out))
 """
 
 _ENV_RECORD = ("HIP_", "CUDA_VISIBLE", "ROCR_", "HSA_", "MSTAR_", "PYTORCH_", "TORCH", "MIOPEN_", "AITER_", "VLLM_",
-               "SGLANG_", "NCCL_", "HF_HUB_OFFLINE", "CTR_", "GPUS", "SLURM_JOB_ID", "PYTHONPATH", "TRITON_")
+               "SGLANG_", "NCCL_", "GLOO_", "HF_HUB_OFFLINE", "CTR_", "GPUS", "SLURM_JOB_ID", "PYTHONPATH", "TRITON_")
 
 
 def _last_json_line(text: str) -> dict:
