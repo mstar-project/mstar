@@ -78,10 +78,11 @@ class NemotronDuplex(Family):
         wavs = [out / f"{it.id}.wav" for it in items]
         heard = asr_judge.transcribe(wavs, device)
         norm = M.make_normalizer("whisper")
-        rows, bad, wers = [], [], []
+        rows, full, bad, wers = [], [], [], []
         for it, w, h in zip(items, wavs, heard, strict=True):
             t = (out / f"{it.id}.txt").read_text(encoding="utf-8") if (out / f"{it.id}.txt").is_file() else ""
             row = {"id": it.id, "text": t[:160], "heard": h[:160]}
+            full.append({"text": t, "heard": h})
             if w.is_file():
                 x, sr = M.read_wav(w)
                 if p := M.audio_problems(M.audio_stats(x, sr), max_silence_frac=0.95):
@@ -113,6 +114,8 @@ class NemotronDuplex(Family):
                                len(runs), lambda v: v >= 0.8, lambda v: v >= 0.5,
                                ">=0.8 PASS, >=0.5 WARN (provisional, batching can flip near ties)")
         sc.rows = rows
-        (work / "duplex.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False))
+        # the report table shows the first 160 characters; duplex.json keeps whole replies and transcripts
+        (work / "duplex.json").write_text(json.dumps([{**r, **f} for r, f in zip(rows, full, strict=True)],
+                                                     indent=1, ensure_ascii=False))
         sc.artifacts += [str(work / "duplex.json"), str(out)]
         return sc
