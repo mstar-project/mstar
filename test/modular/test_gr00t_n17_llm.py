@@ -9,8 +9,13 @@ ends up with.
 Weights reach the module the way a checkpoint's do -- separate ``q/k/v`` and ``gate/up``
 tensors, through ``load_gr00t_n17_weights`` -- so the fusing rules are part of what every
 numeric test below covers.
+
+The last section drives the ``LLM`` node, ``Gr00tN17LLMSubmodule``, the way the engine does:
+what it derives from the walk's inputs, the step it declares, and that it adds nothing to
+the forward above.
 """
 
+import dataclasses
 import itertools
 from typing import NamedTuple
 
@@ -20,10 +25,15 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch import nn
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.step import Segment
 from mstar.model.gr00t_n17.components.llm import Gr00tN17LanguageModel
+from mstar.model.gr00t_n17.components.rope import mrope_position_ids
 from mstar.model.gr00t_n17.config import LLM_ATTN, Gr00tN17Config, Gr00tN17TextConfig
+from mstar.model.gr00t_n17.submodules import Gr00tN17LLMSubmodule
 from mstar.model.gr00t_n17.weight_loader import SKIPPED, load_gr00t_n17_weights
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 _LLM = "backbone.model.model.language_model."
 _LAYERS = 3
@@ -573,3 +583,238 @@ def test_the_parameters_are_the_checkpoints_tensors_after_fusing(tmp_path):
     # the reference reads the last layer's output, so neither the final norm nor the head runs
     assert {f"{_LLM}norm.weight", "backbone.model.lm_head.weight"} == SKIPPED
     assert not any(name.startswith(("norm.", "lm_head.")) for name, _ in model.named_parameters())
+
+
+# ----------------------------------------------------------------------------
+# The node: `Gr00tN17LLMSubmodule`, driven the way the engine drives it
+# ----------------------------------------------------------------------------
+
+_WALK = "prefill"
+_FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0)
+_ENGINE = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
+_IMAGE_TOKEN = 5  # `_config`'s `image_token_id`
+_MERGE = 2  # the spatial merge the image rows were packed at
+# what `prepare_inputs` stages, which is also `forward`'s signature
+_STAGED = {"input_ids", "image_rows", "position_ids", "vision_embeds", "deepstack_embeds"}
+
+# Text-span lengths and `(t, h, w)` image grids. The two-image prompt's image rows are two
+# non-contiguous blocks, so neither side of the scatter can be reversed or rolled back onto
+# itself; a single block would still line up with itself over most of its length.
+_PROMPTS = {
+    "no images": [9],
+    "one image": [3, (1, 4, 6), 2],
+    "two images with text between": [2, (1, 4, 4), 3, (1, 2, 6), 2],
+}
+
+
+def _node_config(num_layers: int = _LAYERS) -> Gr00tN17Config:
+    """``_config`` plus the one vision field the node reads: the merge its image rows were
+    packed at, which is also what the M-RoPE grids are measured in."""
+    vision = Qwen3_5VisionConfig(
+        depth=1, hidden_size=16, intermediate_size=32, num_heads=1, in_channels=3,
+        patch_size=2, temporal_patch_size=2, spatial_merge_size=_MERGE,
+        num_position_embeddings=16, out_hidden_size=64,
+    )
+    # the node checks the feature count against this, so it has to say three
+    return dataclasses.replace(
+        _config(num_layers), vision=vision, deepstack_visual_indexes=(5, 11, 17),
+    )
+
+
+def _node(tmp_path, num_layers: int = _LAYERS) -> Gr00tN17LLMSubmodule:
+    config = _node_config(num_layers)
+    return Gr00tN17LLMSubmodule(_loaded_model(config, _checkpoint(config.text, seed=0), tmp_path), config)
+
+
+def _prompt(spec: list, seed: int = 7) -> tuple[torch.Tensor, torch.Tensor]:
+    """A spec of text-span lengths and image grids -> the walk's ``input_ids`` and its grids."""
+    generator = torch.Generator().manual_seed(seed)
+    tokens, grids = [], []
+    for item in spec:
+        if isinstance(item, int):
+            text = torch.randint(0, 96, (item,), generator=generator)
+            # the image token is what names the image rows, so the text must not carry it
+            tokens += text.masked_fill(text == _IMAGE_TOKEN, 0).tolist()
+        else:
+            t, h, w = item
+            tokens += [_IMAGE_TOKEN] * (t * (h // _MERGE) * (w // _MERGE))
+            grids.append(item)
+    return torch.tensor(tokens), torch.tensor(grids, dtype=torch.long).reshape(-1, 3)
+
+
+def _walk_inputs(config: Gr00tN17Config, ids: torch.Tensor, grid: torch.Tensor, seed: int = 11) -> dict:
+    """What the walk carries into the node: the prompt, its grids, and the vision encoder's two
+    outputs -- one embedding and ``_FEATURES`` DeepStack features, a row each per image token."""
+    rows = int((ids.reshape(-1) == _IMAGE_TOKEN).sum())
+    generator = torch.Generator().manual_seed(seed)
+
+    def rnd() -> torch.Tensor:
+        return torch.randn(rows, config.text.hidden_size, generator=generator) * 0.5
+
+    return {
+        "input_ids": [ids], "image_grid_thw": [grid],
+        "vision_embeds": [rnd()], "deepstack_embeds": [rnd() for _ in range(_FEATURES)],
+    }
+
+
+class _Run(NamedTuple):
+    """One pass of the node, with what the walk handed it and what came back."""
+
+    node: Gr00tN17LLMSubmodule
+    ids: torch.Tensor
+    grid: torch.Tensor
+    walk: dict
+    prepared: NodeInputs
+    tensors: dict
+    out: dict
+
+    @property
+    def rows(self) -> torch.Tensor:
+        return self.prepared.tensor_inputs["image_rows"]
+
+    @property
+    def features(self) -> torch.Tensor:
+        return self.out["backbone_features"][0]
+
+    @torch.no_grad()
+    def by_hand(self, scatter_rows=None, vision=None) -> torch.Tensor:
+        """``forward`` written out: embed, scatter the vision rows on, rotate, run the stack.
+
+        Derived from the prompt rather than from ``prepared``, so it owes the node nothing.
+        ``scatter_rows`` and ``vision`` are the scatter's deviations and default to the real
+        thing; DeepStack lands on the true image rows either way, leaving the scatter alone.
+        """
+        model = self.node.model
+        ids = self.ids.reshape(-1)
+        rows = (ids == _IMAGE_TOKEN).nonzero(as_tuple=True)[0]
+        vision = self.walk["vision_embeds"][0] if vision is None else vision
+        hidden = model.embed(ids).index_copy(0, rows if scatter_rows is None else scatter_rows, vision)
+        positions = mrope_position_ids(ids, self.grid, _IMAGE_TOKEN, _MERGE)
+        cos, sin = model.build_cos_sin(positions, hidden.dtype)
+        return model(hidden, cos, sin, self.walk["deepstack_embeds"], rows)
+
+
+@torch.no_grad()
+def _drive(tmp_path, spec: list) -> _Run:
+    """prepare_inputs -> declare_step's resource -> preprocess -> forward, as the engine runs it."""
+    node = _node(tmp_path)
+    ids, grid = _prompt(spec)
+    walk = _walk_inputs(node.config, ids, grid)
+    prepared = node.prepare_inputs(_WALK, _FWD, walk)
+    # the engine plans the resource from the declaration, so the stand-in is planned from it too
+    step = node.declare_step(_WALK, ["r0"], [prepared])
+    node.bind_node_resources({LLM_ATTN: _SegmentAttention(tuple(seg.span for seg in step.segments))})
+    tensors = node.preprocess(_WALK, _ENGINE, [prepared])
+    return _Run(node, ids, grid, walk, prepared, tensors, node.forward(_WALK, _ENGINE, **tensors))
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_the_step_is_one_causal_segment_over_the_whole_prompt(tmp_path, spec):
+    """Not the vision node's shape. That one cuts a segment per frame and attends
+    non-causally inside each; a prompt is one segment over all of its tokens, and causal.
+    Both live only in the declaration, so this is the only place either is said."""
+    node = _node(tmp_path)
+    ids, grid = _prompt(spec)
+    prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
+    step = node.declare_step(_WALK, ["r0"], [prepared])
+
+    assert step.segments == [Segment("r0", "main", len(ids))]
+    assert list(step.steps) == [LLM_ATTN]
+    assert step.steps[LLM_ATTN].causal is True
+    # what the resource is planned from: `SubmoduleStep` fills it in from `segments`
+    assert step.steps[LLM_ATTN].segments == step.segments
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_prepare_inputs_derives_the_rows_and_the_positions_from_the_prompt(tmp_path, spec):
+    """Everything the forward needs beyond what the walk already carries, each against the
+    prompt it came from -- and the positions against ``mrope_position_ids`` called directly,
+    which is where their own test lives."""
+    node = _node(tmp_path)
+    ids, grid = _prompt(spec)
+    walk = _walk_inputs(node.config, ids, grid)
+    prepared = node.prepare_inputs(_WALK, _FWD, walk)
+    tensors = prepared.tensor_inputs
+
+    # what the engine sizes the batch and the segment by
+    assert prepared.input_seq_len == len(ids)
+    assert set(tensors) == _STAGED
+    assert torch.equal(tensors["input_ids"], ids)
+    expected_rows = [i for i, token in enumerate(ids.tolist()) if token == _IMAGE_TOKEN]
+    assert tensors["image_rows"].tolist() == expected_rows
+    assert torch.equal(tensors["position_ids"], mrope_position_ids(ids, grid, _IMAGE_TOKEN, _MERGE))
+    assert torch.equal(tensors["vision_embeds"], walk["vision_embeds"][0])
+
+    # [taps, rows, hidden]: one tensor to stage, which the forward unbinds back to the three
+    assert tensors["deepstack_embeds"].shape == (_FEATURES, len(expected_rows), node.config.text.hidden_size)
+    unbound = tensors["deepstack_embeds"].unbind(0)
+    assert all(torch.equal(ours, theirs) for ours, theirs in zip(unbound, walk["deepstack_embeds"], strict=True))
+    # a prompt with no images has three empty features, which permute to themselves
+    assert not expected_rows or all(
+        not torch.equal(first, second) for first, second in itertools.combinations(unbound, 2)
+    )
+
+
+def test_a_prompt_that_arrives_as_a_row_is_the_same_one_request(tmp_path):
+    """``input_ids`` reaches the node as the tokenizer left it, so a ``[1, tokens]`` row is one
+    prompt and not a batch of one -- and ``input_seq_len`` is its token count either way."""
+    node = _node(tmp_path)
+    ids, grid = _prompt(_PROMPTS["one image"])
+    flat = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
+    rowed = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids.unsqueeze(0), grid))
+
+    assert rowed.input_seq_len == flat.input_seq_len == len(ids)
+    assert all(torch.equal(rowed.tensor_inputs[name], flat.tensor_inputs[name]) for name in _STAGED)
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_driving_the_node_is_the_forwards_own_pieces_called_by_hand(tmp_path, spec):
+    """The node is plumbing: prepare_inputs -> preprocess -> forward is embed, the scatter onto
+    the image rows, the rotation and the stack, over the same tensors. The same ops in the same
+    order, so this is ``torch.equal`` and not a bar -- it has been exact on every prompt here.
+
+    It also pins the output: one tensor, a row per prompt token, under ``backbone_features``.
+    """
+    run = _drive(tmp_path, spec)
+    assert list(run.out) == ["backbone_features"]
+    assert len(run.out["backbone_features"]) == 1
+    assert run.features.shape == (len(run.ids), run.node.config.text.hidden_size)
+    # preprocess stages the tensors and nothing else; there are no non-tensor kwargs here
+    assert set(run.tensors) == _STAGED
+    assert torch.equal(run.features, run.by_hand())
+
+
+_SCATTERS = {
+    "the embeddings reversed": lambda run: {"vision": run.walk["vision_embeds"][0].flip(0)},
+    "the embeddings rolled by one": lambda run: {"vision": run.walk["vision_embeds"][0].roll(1, 0)},
+    "the rows reversed": lambda run: {"scatter_rows": run.rows.flip(0)},
+    "the rows rolled by one": lambda run: {"scatter_rows": run.rows.roll(1)},
+}
+
+
+@pytest.mark.parametrize("permute", list(_SCATTERS.values()), ids=list(_SCATTERS))
+def test_row_k_of_the_vision_embeds_lands_on_image_row_k(tmp_path, permute):
+    """The vision encoder packs its rows in image-token order and the node hands them over as
+    indices, so the pairing is the node's to get right. Permuting either side is a different
+    answer: measured relative gaps 1.0e+00, 8.3e-01, 1.0e+00 and 1.0e+00 against a bar of
+    4.1e-06, the smallest of them 2.0e+05 times it.
+    """
+    run = _drive(tmp_path, _PROMPTS["two images with text between"])
+    # the unpermuted scatter is exact, which is what makes the gap below mean something
+    assert torch.equal(run.features, run.by_hand())
+    assert _relative_gap(run.features, run.by_hand(**permute(run))) > 1000 * _BAR
+
+
+def test_the_node_takes_one_request_a_step(tmp_path):
+    """No batched forward, so the batch is one row. ``preprocess`` unpacks the single request
+    (as the vision node does), so a second one raises instead of being dropped or concatenated
+    onto the first's prompt. The message is the interpreter's, not ours -- hence the loose match.
+    """
+    node = _node(tmp_path)
+    ids, grid = _prompt(_PROMPTS["one image"])
+    prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
+    two = ModelInputsFromEngine(request_ids=["r0", "r1"], per_request_info={})
+
+    assert node.max_batch_size(_WALK) == 1
+    with pytest.raises(ValueError, match="expected 1"):
+        node.preprocess(_WALK, two, [prepared, prepared])
