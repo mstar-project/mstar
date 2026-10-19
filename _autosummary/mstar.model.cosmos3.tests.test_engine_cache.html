@@ -241,8 +241,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -611,6 +613,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact()</span></code></a></li>
@@ -618,7 +621,6 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_cuda_graph_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>
@@ -659,29 +661,29 @@ matches the fused pipeline within PSNR &gt;= 30 (FlashInfer-vs-sdpa precision).<
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full" title="mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager</span></code></a>()</p></td>
+<td><p>The captured-graph denoise step is the served path's accelerator: both guidance branches run in one captured forward (~2x faster than the eager step).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full" title="mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full</span></code></a>()</p></td>
 <td><p>Image-to-video only consumes latent frame 0, and the Wan VAE encodes it as a standalone causal anchor, so the encoder node's single-frame i2v encode must give a bit-identical frame 0 to the repeat-padded full-clip encode it runs for action policy / forward-dynamics — at a fraction of the cost.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential" title="mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential" title="mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential</span></code></a>()</p></td>
 <td><p>Running both guidance branches in one batched forward must match running them sequentially.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact_t2v</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact_t2v</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual" title="mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual" title="mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual</span></code></a>()</p></td>
 <td><p>Several requests denoised together in one batch must reproduce each request run alone.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cuda_graph_matches_eager</span></code></a>()</p></td>
-<td><p>The captured-graph denoise step is the served path's accelerator: both guidance branches run in one captured forward (~2x faster than the eager step).</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr</span></code></a>()</p></td>
 <td><p></p></td>
@@ -707,6 +709,22 @@ matches the fused pipeline within PSNR &gt;= 30 (FlashInfer-vs-sdpa precision).<
 </tbody>
 </table>
 </div>
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_accelerator_graph_matches_eager</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_accelerator_graph_matches_eager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager" title="Link to this definition">#</a></dt>
+<dd><p>The captured-graph denoise step is the served path’s accelerator: both
+guidance branches run in one captured forward (~2x faster than the eager
+step). Each captured forward matches eager to within bf16 (the first step
+differs by ~one ULP); the multistep solver amplifies that into a small latent
+spread, but the decoded image is unchanged — so gate the decoded image against
+the fused pipeline, the same bar the eager engine path meets.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_anchor_encode_matches_full</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_anchor_encode_matches_full"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full" title="Link to this definition">#</a></dt>
@@ -783,22 +801,6 @@ pipeline: batching must (a) keep each request isolated — its own image far
 closer than any other request’s — and (b) not lose quality versus the bs=1
 path (per-prompt fidelity varies with the FlashInfer kernel, so the bar is
 relative to bs=1, not an absolute PSNR).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_cuda_graph_matches_eager</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_cuda_graph_matches_eager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager" title="Link to this definition">#</a></dt>
-<dd><p>The captured-graph denoise step is the served path’s accelerator: both
-guidance branches run in one captured forward (~2x faster than the eager
-step). Each captured forward matches eager to within bf16 (the first step
-differs by ~one ULP); the multistep solver amplifies that into a small latent
-spread, but the decoded image is unchanged — so gate the decoded image against
-the fused pipeline, the same bar the eager engine path meets.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -945,6 +947,7 @@ bit-exact regime), window by window.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact()</span></code></a></li>
@@ -952,7 +955,6 @@ bit-exact regime), window by window.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_cuda_graph_matches_eager()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>

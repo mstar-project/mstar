@@ -241,8 +241,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -641,7 +643,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.forward_batched()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.preprocess()</span></code></a></li>
@@ -659,7 +661,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.forward_batched()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.preprocess()</span></code></a></li>
@@ -1014,8 +1016,8 @@ returns True.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_cuda_graph_configs">
-<span class="sig-name descname"><span class="pre">get_cuda_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/submodules.html#EarTTSTalkerSubmodule.get_cuda_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_cuda_graph_configs" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_accelerator_graph_configs">
+<span class="sig-name descname"><span class="pre">get_accelerator_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/submodules.html#EarTTSTalkerSubmodule.get_accelerator_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_accelerator_graph_configs" title="Link to this definition">#</a></dt>
 <dd><p>Capture the steady-state step (one token per label per session).
 <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> (text conditioning, noise, warm-up assembly) runs eagerly
 before the graph; the captured region is the 2N-row backbone over the
@@ -1028,7 +1030,7 @@ pool and the MaskGIT sampling loop.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig" title="mstar.engine.cuda_graph_config.CudaGraphConfig"><em>CudaGraphConfig</em></a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfig"><em>AcceleratorGraphConfig</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1258,8 +1260,8 @@ own <code class="docutils literal notranslate"><span class="pre">max_iters</span
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_cuda_graph_configs">
-<span class="sig-name descname"><span class="pre">get_cuda_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/submodules.html#NemotronHLLMSubmodule.get_cuda_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_cuda_graph_configs" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_accelerator_graph_configs">
+<span class="sig-name descname"><span class="pre">get_accelerator_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/submodules.html#NemotronHLLMSubmodule.get_accelerator_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_accelerator_graph_configs" title="Link to this definition">#</a></dt>
 <dd><p>Capture the frame-synchronous decode step.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> is host-only and <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> (embedding + AddFusion)
 runs eagerly before the graph on both capture and replay; the captured
@@ -1274,7 +1276,7 @@ one fused frame: a zero audio frame plus the BOS / PAD carry-ins.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig" title="mstar.engine.cuda_graph_config.CudaGraphConfig"><em>CudaGraphConfig</em></a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfig"><em>AcceleratorGraphConfig</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1434,7 +1436,7 @@ that don’t need audio);</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.forward_batched()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">EarTTSTalkerSubmodule.preprocess()</span></code></a></li>
@@ -1452,7 +1454,7 @@ that don’t need audio);</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.forward_batched()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NemotronHLLMSubmodule.preprocess()</span></code></a></li>

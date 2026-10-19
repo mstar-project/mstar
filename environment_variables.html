@@ -241,8 +241,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -700,9 +702,9 @@ process, e.g. to run entities on separate hosts.</p></td>
 <td><p>Base of the deterministic entity-id → TCP port map (<code class="docutils literal notranslate"><span class="pre">api_server</span></code>
 = base, <code class="docutils literal notranslate"><span class="pre">conductor</span></code> = base+1, <code class="docutils literal notranslate"><span class="pre">worker_&lt;rank&gt;</span></code> = base+100+rank).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUIRE_CUDA_GRAPHS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUIRE_ACCELERATOR_GRAPHS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes a worker fail at startup when any CUDA graph bucket
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes a worker fail at startup when any accelerator graph bucket
 could not be captured, instead of serving that bucket eagerly at
 10-20x the latency. Off by default: a failed capture is logged at
 ERROR with a per-runner summary and the rest keeps running.</p></td>
@@ -830,25 +832,40 @@ images produce small bf16 drift, which at greedy <code class="docutils literal n
 flip a downstream LLM argmax. When off, <code class="docutils literal notranslate"><span class="pre">prefill_vit</span></code> runs one
 request at a time.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CUDA_GRAPH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>BAGEL: CUDA-graph capture of the ViT block loop, over the node’s ragged
-attention resource (see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). Off by default: capture
-costs one graph per (batch size, token bucket) and the eager
-flash-attn path is already fast. The win is removing per-layer launch
-overhead on small images.</p></td>
+<td><p>BAGEL: accelerator graph capture of the ViT block loop, over the node’s
+ragged attention resource (see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). Requires the
+deployment option <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph</span></code> to be true;
+BAGEL defaults this option to true (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>).
+Off by default: capture costs one graph per (batch size, token bucket)
+and the eager flash-attn path is already fast. The win is removing
+per-layer launch overhead on small images.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CG_TOKEN_BUCKETS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">512,1024,2048,4096,4900</span></code></p></td>
 <td><p>Comma-separated token-count buckets to capture, when
-<code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CUDA_GRAPH=1</span></code>. A batch longer than the largest bucket runs
+<code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH=1</span></code>. A batch longer than the largest bucket runs
 eagerly. <code class="docutils literal notranslate"><span class="pre">4900</span></code> is <code class="docutils literal notranslate"><span class="pre">70*70</span></code>, the exact length the <code class="docutils literal notranslate"><span class="pre">vllm</span></code>
 preprocess option emits.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CG_BATCH_SIZES</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4</span></code></p></td>
 <td><p>Comma-separated batch sizes to capture. Read only when
 <code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_BATCHING=1</span></code>; otherwise only batch size 1 is captured.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_ACCELERATOR_GRAPH</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Cosmos3: any nonempty value disables denoise, prefill and reasoner
+decode capture. The deployment option
+<code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph:</span> <span class="pre">false</span></code> also disables all these
+captures and cannot be overridden by this variable.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Cosmos3: any nonempty value disables only the understanding-tower
+prefill capture. Denoise and reasoner decode captures remain eligible
+when <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph</span></code> is true.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OMNIVOICE_MODEL_PATH</span></code></p></td>
 <td><p>unset</p></td>

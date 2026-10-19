@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -942,6 +944,28 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.ac_predictor">ac_predictor (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.accelerator_graph">accelerator_graph (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.accelerator_graph">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.accelerator_graph">(mstar.model.waypoint.config.WaypointConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend">AcceleratorGraphBackend (class in mstar.engine.accelerator_graph_backend)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket">AcceleratorGraphBucket (class in mstar.engine.accelerator_graph_runner)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig">AcceleratorGraphConfig (class in mstar.engine.accelerator_graph_config)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType">AcceleratorGraphConfigType (class in mstar.engine.accelerator_graph_config)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool">AcceleratorGraphPool (class in mstar.engine.accelerator_graph_backend)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner">AcceleratorGraphRunner (class in mstar.engine.accelerator_graph_runner)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot">AcceleratorGraphSlot (class in mstar.engine.accelerator_graph_runner)</a>
+</li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.accumulated_outputs">accumulated_outputs (mstar.graph.base.Loop attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">ack_unread_tensors() (mstar.communication.tensors.TensorCommunicationManager method)</a>
@@ -1082,7 +1106,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.NemotronDuplexConfig.agent_text_weight">agent_text_weight (mstar.model.nemotron_duplex.config.NemotronDuplexConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.agree_across_ranks">agree_across_ranks() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.agree_across_ranks">agree_across_ranks() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.AllocationFailed">AllocationFailed (class in mstar.engine.resources)</a>
 
@@ -1090,10 +1114,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.AllocationFailed">(class in mstar.engine.resources.step)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.any_graphs">any_graphs (mstar.engine.cuda_graph_runner.CudaGraphRunner property)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.any_graphs">any_graphs (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner property)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.any_graphs">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner property)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.any_graphs">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner property)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage">APIServerMessage (class in mstar.api_server.request_types)</a>
@@ -1132,6 +1156,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config">(mstar.engine.resources.spec.ResourceReqConfig method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.apply_masks">apply_masks() (in module mstar.model.vjepa2.components.vit_encoder)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.apply_ortho_rope">apply_ortho_rope() (in module mstar.model.waypoint.components)</a>
@@ -1140,8 +1166,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.components.rope.html#mstar.model.waypoint.components.rope.apply_ortho_rope">(in module mstar.model.waypoint.components.rope)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.qwen3_5.components.rope.html#mstar.model.qwen3_5.components.rope.apply_partial_mrope">apply_partial_mrope() (in module mstar.model.qwen3_5.components.rope)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplerStep.apply_penalty">apply_penalty (mstar.engine.resources.sampler.config.SamplerStep attribute)</a>
@@ -1320,7 +1344,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.wire.html#mstar.communication.wire.AUTO_PREFIX">AUTO_PREFIX (in module mstar.communication.wire)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.autocast_scope">autocast_scope() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.autocast_scope">autocast_scope() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.G2PFrontend.available">available() (mstar.model.kokoro.g2p.G2PFrontend method)</a>
 </li>
@@ -1386,7 +1410,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator">BaseCommunicator (class in mstar.communication.communicator)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfigType.BASIC_BATCHED">BASIC_BATCHED (mstar.engine.cuda_graph_config.CudaGraphConfigType attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType.BASIC_BATCHED">BASIC_BATCHED (mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.batch_postprocess">batch_postprocess() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
@@ -1396,11 +1420,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuildResult">BatchBuildResult (class in mstar.worker.batch_builder)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseConfigType.BATCHED">BATCHED (mstar.engine.cuda_graph_config.PiecewiseConfigType attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseConfigType.BATCHED">BATCHED (mstar.engine.accelerator_graph_config.PiecewiseConfigType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.batched_cfg">batched_cfg (mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig">BatchedCudaGraphConfig (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig">BatchedAcceleratorGraphConfig (class in mstar.engine.accelerator_graph_config)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput">BatchedModelOutput (class in mstar.model.submodule_base)</a>
 </li>
@@ -1452,6 +1476,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.block_table">block_table (mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.blocked_capture_resources">blocked_capture_resources() (in module mstar.engine.accelerator_graph_runner)</a>
+</li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuildRequest.blocked_rids">blocked_rids (mstar.worker.batch_builder.BatchBuildRequest attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.BLOCKING_POLL_SLICE_MS">BLOCKING_POLL_SLICE_MS (in module mstar.communication.rust_communicator)</a>
@@ -1478,10 +1504,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S">BRIDGE_RECV_WAIT_S (in module mstar.api_server.rust_frontend)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape.bs">bs (mstar.engine.cuda_graph_config.PiecewiseCaptureShape attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCaptureShape.bs">bs (mstar.engine.accelerator_graph_config.PiecewiseCaptureShape attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.bs">(mstar.engine.cuda_graph_runner.PiecewiseGraphKey attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphKey.bs">(mstar.engine.accelerator_graph_runner.PiecewiseGraphKey attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.CGSlotSpec.bs">(mstar.engine.resources.base.CGSlotSpec property)</a>
 </li>
@@ -1492,7 +1518,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey.bs">(mstar.engine.resources.step.BucketKey attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.bucket">bucket (mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.bucket">bucket (mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.CGSlotKey.bucket">(mstar.engine.resources.base.CGSlotKey attribute)</a>
@@ -1542,6 +1568,28 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.build">(mstar.engine.resources.Resource class method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.attn.flex.html#mstar.engine.resources.attn.flex.FlexAttentionManager.build_accelerator_graph_buffers">build_accelerator_graph_buffers() (mstar.engine.resources.attn.flex.FlexAttentionManager method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.build_accelerator_graph_buffers">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.build_accelerator_graph_buffers">(mstar.engine.resources.base.Resource method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.kv.ring.manager.html#mstar.engine.resources.kv.ring.manager.RingKVManager.build_accelerator_graph_buffers">(mstar.engine.resources.kv.ring.manager.RingKVManager method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.RingKVManager.build_accelerator_graph_buffers">(mstar.engine.resources.kv.ring.RingKVManager method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_accelerator_graph_buffers">(mstar.engine.resources.recurrent.pool.RecurrentStatePool method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool.build_accelerator_graph_buffers">(mstar.engine.resources.recurrent.RecurrentStatePool method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.build_accelerator_graph_buffers">(mstar.engine.resources.Resource method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner.build_accelerator_graph_buffers">(mstar.engine.resources.runner.StepRunner method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepRunner.build_accelerator_graph_buffers">(mstar.engine.resources.StepRunner method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_action_static_inputs">build_action_static_inputs() (in module mstar.model.cosmos3.components.packing)</a>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html#mstar.model.nemotron_duplex.realtime_api.build_app">build_app() (in module mstar.model.nemotron_duplex.realtime_api)</a>
@@ -1556,26 +1604,6 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.model.waypoint.components.layers.html#mstar.model.waypoint.components.layers.CondHead.build_cache">(mstar.model.waypoint.components.layers.CondHead method)</a>
-</li>
-      </ul></li>
-      <li><a href="_autosummary/mstar.engine.resources.attn.flex.html#mstar.engine.resources.attn.flex.FlexAttentionManager.build_cuda_graph_buffers">build_cuda_graph_buffers() (mstar.engine.resources.attn.flex.FlexAttentionManager method)</a>
-
-      <ul>
-        <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.build_cuda_graph_buffers">(mstar.engine.resources.base.Resource method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.kv.ring.manager.html#mstar.engine.resources.kv.ring.manager.RingKVManager.build_cuda_graph_buffers">(mstar.engine.resources.kv.ring.manager.RingKVManager method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.RingKVManager.build_cuda_graph_buffers">(mstar.engine.resources.kv.ring.RingKVManager method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_cuda_graph_buffers">(mstar.engine.resources.recurrent.pool.RecurrentStatePool method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool.build_cuda_graph_buffers">(mstar.engine.resources.recurrent.RecurrentStatePool method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.build_cuda_graph_buffers">(mstar.engine.resources.Resource method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner.build_cuda_graph_buffers">(mstar.engine.resources.runner.StepRunner method)</a>
-</li>
-        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepRunner.build_cuda_graph_buffers">(mstar.engine.resources.StepRunner method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.build_packed_canvas">build_packed_canvas() (in module mstar.model.omnivoice.components.backbone)</a>
@@ -1630,6 +1658,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointDitSubmodule.can_batch">(mstar.model.waypoint.submodules.WaypointDitSubmodule method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DenseAttentionManager.can_capture">can_capture() (mstar.engine.resources.attn.dense.DenseAttentionManager method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.can_capture">(mstar.engine.resources.base.Resource method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.can_capture">(mstar.engine.resources.Resource method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.PythonTensorBookkeeping.can_gc">can_gc() (mstar.communication.tensor_store.PythonTensorBookkeeping method)</a>
 
       <ul>
@@ -1646,13 +1682,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.can_reload">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run">can_run() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.can_run">can_run() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.can_run">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs">can_use_cuda_graphs() (mstar.model.submodule_base.NodeSubmodule method)</a>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_use_accelerator_graphs">can_use_accelerator_graphs() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.cangjie_file">cangjie_file (mstar.model.chatterbox.config.ChatterboxConfig attribute)</a>
 </li>
@@ -1670,33 +1706,37 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepContext.capture">(mstar.engine.resources.StepContext attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.capture_batch_sizes">capture_batch_sizes (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.capture">capture() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.CAPTURE_BATCH_SIZES">CAPTURE_BATCH_SIZES (mstar.engine.cuda_graph_runner.CudaGraphRunner attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.capture_batch_sizes">capture_batch_sizes (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.CAPTURE_BATCH_SIZES">CAPTURE_BATCH_SIZES (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.CAPTURE_BATCH_SIZES">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.CAPTURE_BATCH_SIZES">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.capture_batch_sizes">capture_batch_sizes (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.capture_dit_prime">capture_dit_prime (mstar.model.waypoint.config.WaypointConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.capture_fn">capture_fn (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.capture_fn">capture_fn (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuildRequest.capture_group">capture_group() (mstar.worker.batch_builder.BatchBuildRequest method)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuildRequest.capture_group_of">capture_group_of (mstar.worker.batch_builder.BatchBuildRequest attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_into_graph">capture_into_graph() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_into_graph">capture_into_graph() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.GenStepInfo.capture_key">capture_key (mstar.model.cosmos3.submodules.GenStepInfo attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_with_static_outputs">capture_with_static_outputs() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_with_static_outputs">capture_with_static_outputs() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.captured">captured (mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.captures_walk">captures_walk() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph">CapturedGraph (class in mstar.engine.accelerator_graph_backend)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.captures_walk">captures_walk() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.dit.html#mstar.model.waypoint.components.dit.WaypointDiT.cast_serving_dtypes">cast_serving_dtypes() (mstar.model.waypoint.components.dit.WaypointDiT method)</a>
 
@@ -1911,6 +1951,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.clear_preplan">(mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.clear_preplan">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.clear_preplan">(mstar.engine.resources.base.Resource method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.clear_preplan">(mstar.engine.resources.position.manager.RopeManager method)</a>
@@ -2002,6 +2044,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.GenStepInfo.commit">(mstar.model.cosmos3.submodules.GenStepInfo attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.commit">commit() (mstar.engine.resources.base.Resource method)</a>
 
       <ul>
@@ -2022,15 +2066,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepRunner.commit">(mstar.engine.resources.StepRunner method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.windowing.html#mstar.engine.windowing.WindowPlan.commit_end">commit_end (mstar.engine.windowing.WindowPlan property)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.windowing.html#mstar.engine.windowing.WindowPlan.commit_start">commit_start (mstar.engine.windowing.WindowPlan property)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol">CommProtocol (class in mstar.communication.communicator)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.compile">compile (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.compile">compile (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.compile_decoder">compile_decoder (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
 </li>
@@ -2116,7 +2158,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType">ConductorMessageType (class in mstar.utils.ipc_format)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphBucket.config">config (mstar.engine.cuda_graph_runner.CudaGraphBucket attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket.config">config (mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.AttentionSpec.config">(mstar.engine.resources.AttentionSpec attribute)</a>
@@ -2144,12 +2186,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStateSpec.config">(mstar.engine.resources.recurrent.RecurrentStateSpec attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for">config_for() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.config_for">config_for() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphBucket.config_idx">config_idx (mstar.engine.cuda_graph_runner.CudaGraphBucket attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket.config_idx">config_idx (mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.config_idx">(mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.config_idx">(mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.CGSlotSpec.config_idx">(mstar.engine.resources.base.CGSlotSpec attribute)</a>
 </li>
@@ -2326,6 +2368,14 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_chat.html#mstar.api_server.openai.serving_chat.create_chat_completion">create_chat_completion() (in module mstar.api_server.openai.serving_chat)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.create_graph">create_graph() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CUDAGraphBackend.create_graph">(mstar.engine.accelerator_graph_backend.CUDAGraphBackend method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphBackend.create_graph">(mstar.engine.accelerator_graph_backend.XPUGraphBackend method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.create_image_edit">create_image_edit() (in module mstar.api_server.openai.serving_images)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.create_images">create_images() (in module mstar.api_server.openai.serving_images)</a>
@@ -2384,29 +2434,15 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.cu_q">(mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.cuda_graph">cuda_graph (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
-
-      <ul>
-        <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.cuda_graph">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.cuda_graph">(mstar.model.waypoint.config.WaypointConfig attribute)</a>
-</li>
-      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs">cuda_indptrs (mstar.engine.resources.kv.plan.KVPlanOutput attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphBucket">CudaGraphBucket (class in mstar.engine.cuda_graph_runner)</a>
-</li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig">CudaGraphConfig (class in mstar.engine.cuda_graph_config)</a>
-</li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfigType">CudaGraphConfigType (class in mstar.engine.cuda_graph_config)</a>
-</li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner">CudaGraphRunner (class in mstar.engine.cuda_graph_runner)</a>
-</li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot">CudaGraphSlot (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CUDAGraphBackend">CUDAGraphBackend (class in mstar.engine.accelerator_graph_backend)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.PartitionState.curr_forward_outputs">curr_forward_outputs (mstar.conductor.request_info.PartitionState attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.curr_iter">curr_iter (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.current_stream">current_stream() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeTranscription.current_text">current_text() (mstar.api_server.openai.serving_realtime.RealtimeTranscription method)</a>
 </li>
@@ -2462,9 +2498,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.dec_cond_seconds">dec_cond_seconds (mstar.model.chatterbox.config.ChatterboxConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for">declare_inputs_for() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.declare_inputs_for">declare_inputs_for() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.declare_step">declare_step (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.declare_step">declare_step (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.declare_step">declare_step() (mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule method)</a>
 
@@ -2526,7 +2562,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput.decode_pages">decode_pages (mstar.engine.resources.kv.plan.KVPlanOutput attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.decode_rows_then_prompt">decode_rows_then_prompt() (in module mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.decode_rows_then_prompt">decode_rows_then_prompt() (in module mstar.engine.accelerator_graph_config)</a>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.decoder_attention_heads">decoder_attention_heads (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
@@ -2636,10 +2672,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec.depends_on">(mstar.engine.resources.spec.NodeResourceSpec method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY">DEPLOYMENT_ANCHOR_ENTITY (in module mstar.communication.communicator)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5VisionConfig.depth">depth (mstar.model.qwen3_5.config.Qwen3_5VisionConfig attribute)</a>
 
       <ul>
@@ -2691,6 +2727,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.device_loopback_enabled">device_loopback_enabled() (in module mstar.utils.knobs)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals">device_loopback_signals() (mstar.model.submodule_base.NodeSubmodule method)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.device_type">device_type (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend property)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability">DeviceCapability (class in mstar.utils.device)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.DeviceTableCache">DeviceTableCache (class in mstar.model.waypoint.components)</a>
 
@@ -2776,7 +2816,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.distilled_sigmas">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.distribute_tokens">distribute_tokens() (in module mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.distribute_tokens">distribute_tokens() (in module mstar.engine.accelerator_graph_config)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas.doc_lens">doc_lens (mstar.model.omnivoice.components.backbone.PackedCanvas attribute)</a>
 </li>
@@ -2804,9 +2844,9 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.dropout">(mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets">dropped_buckets (mstar.engine.cuda_graph_runner.CudaGraphRunner attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.dropped_buckets">dropped_buckets (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.dropped_shapes">dropped_shapes (mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.dropped_shapes">dropped_shapes (mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.dtype">dtype (mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig attribute)</a>
 
@@ -2830,21 +2870,21 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ColumnarTensorInfo.dtype_names">dtype_names (mstar.communication.tensor_store.ColumnarTensorInfo attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.dummy_metadata">dummy_metadata (mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.dummy_metadata">dummy_metadata (mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_metadata">dummy_metadata() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_metadata">dummy_metadata() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_handle">dummy_rid_handle() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_rid_handle">dummy_rid_handle() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_name">dummy_rid_name() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_rid_name">dummy_rid_name() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.dummy_rids">dummy_rids (mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.dummy_rids">dummy_rids (mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.dummy_rids">(mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.dummy_rids">(mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool">DummyRowPool (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool">DummyRowPool (class in mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3Config.duplicate_bos_in_prefill">duplicate_bos_in_prefill (mstar.model.chatterbox.config.T3Config attribute)</a>
 </li>
@@ -3000,13 +3040,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.end_token_ids">end_token_ids (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs.engine_inputs">engine_inputs (mstar.engine.cuda_graph_config.PiecewiseCallInputs attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs.engine_inputs">engine_inputs (mstar.engine.accelerator_graph_config.PiecewiseCallInputs attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo">EngineResourceInfo (class in mstar.engine.resources.base)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3Config.english">english() (mstar.model.chatterbox.config.T3Config class method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.ensure">ensure() (mstar.engine.cuda_graph_runner.DummyRowPool method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.ensure">ensure() (mstar.engine.accelerator_graph_runner.DummyRowPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone.entity_id">entity_id (mstar.utils.ipc_format.ReadsDone attribute)</a>
 </li>
@@ -3094,9 +3134,11 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.WaypointPosIds.f_pos">(mstar.model.waypoint.components.WaypointPosIds attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.fail_if_graphs_required">fail_if_graphs_required() (in module mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.fail_if_graphs_required">fail_if_graphs_required() (in module mstar.engine.accelerator_graph_runner)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS">FAIL_REQUESTS (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphPool.failed_graph">failed_graph (mstar.engine.accelerator_graph_backend.XPUGraphPool attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.FullAdmitOutcome.failed_resource">failed_resource (mstar.engine.resources.FullAdmitOutcome attribute)</a>
 
@@ -3176,7 +3218,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy">FixedChunkPolicy (class in mstar.streaming.chunk_policy)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfigType.FLASH_INFER_PACKED">FLASH_INFER_PACKED (mstar.engine.cuda_graph_config.CudaGraphConfigType attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType.FLASH_INFER_PACKED">FLASH_INFER_PACKED (mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttnBackend.FLASHINFER">FLASHINFER (mstar.engine.resources.attn.config.AttnBackend attribute)</a>
 
@@ -3488,7 +3530,7 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward_captured">forward_captured() (mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.forward_kwargs">forward_kwargs (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.forward_kwargs">forward_kwargs (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TransferReadInfo.fp">fp (mstar.communication.tensors.TransferReadInfo attribute)</a>
 </li>
@@ -3698,7 +3740,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.GenStepInfo">GenStepInfo (class in mstar.model.cosmos3.submodules)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.get">get() (mstar.engine.cuda_graph_runner.PiecewiseOutput method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.get">get() (mstar.engine.accelerator_graph_runner.PiecewiseOutput method)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.WorkspacePool.get">(mstar.engine.resources.attn.base.WorkspacePool method)</a>
@@ -3724,6 +3766,24 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_vae_tokens">get_3d_mrope_ids_vae_tokens() (in module mstar.model.cosmos3.components.packing)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.get_accelerator_graph_backend">get_accelerator_graph_backend() (in module mstar.engine.accelerator_graph_backend)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.get_accelerator_graph_configs">get_accelerator_graph_configs() (mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.get_accelerator_graph_configs">(mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_accelerator_graph_configs">(mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_accelerator_graph_configs">(mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_accelerator_graph_configs">(mstar.model.submodule_base.NodeSubmodule method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointDitSubmodule.get_accelerator_graph_configs">(mstar.model.waypoint.submodules.WaypointDitSubmodule method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointVaeEncoderSubmodule.get_accelerator_graph_configs">(mstar.model.waypoint.submodules.WaypointVaeEncoderSubmodule method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.get_all_new_messages">get_all_new_messages() (mstar.communication.communicator.BaseCommunicator method)</a>
 
       <ul>
@@ -3746,48 +3806,32 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype">get_autocast_dtype() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.get_capture_shapes">get_capture_shapes() (mstar.engine.cuda_graph_config.PiecewiseBatchedConfig method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_capture_shapes">get_capture_shapes() (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.get_capture_shapes">(mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.get_capture_shapes">(mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.get_capture_shapes">(mstar.engine.cuda_graph_config.PiecewisePackedConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes">(mstar.engine.accelerator_graph_config.PiecewisePackedConfig method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.get_check_stop_input">get_check_stop_input() (mstar.model.submodule_base.BatchedModelOutput method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_config_type">get_config_type() (mstar.engine.cuda_graph_config.BatchedCudaGraphConfig method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_config_type">get_config_type() (mstar.engine.accelerator_graph_config.AcceleratorGraphConfig method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_config_type">(mstar.engine.cuda_graph_config.CudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_config_type">(mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_config_type">(mstar.engine.cuda_graph_config.PackedCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_config_type">(mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.get_config_type">(mstar.engine.cuda_graph_config.PiecewiseBatchedConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_config_type">(mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.get_config_type">(mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.get_config_type">(mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.get_config_type">(mstar.engine.cuda_graph_config.PiecewisePackedConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_config_type">(mstar.engine.accelerator_graph_config.PiecewisePackedConfig method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.get_cpu_tensor">get_cpu_tensor() (mstar.communication.tensor_store.TensorStore method)</a>
 </li>
-      <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.get_cuda_graph_configs">get_cuda_graph_configs() (mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule method)</a>
-
-      <ul>
-        <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.get_cuda_graph_configs">(mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule method)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.get_cuda_graph_configs">(mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule method)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule.get_cuda_graph_configs">(mstar.model.nemotron_duplex.submodules.NemotronHLLMSubmodule method)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs">(mstar.model.submodule_base.NodeSubmodule method)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointDitSubmodule.get_cuda_graph_configs">(mstar.model.waypoint.submodules.WaypointDitSubmodule method)</a>
-</li>
-        <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointVaeEncoderSubmodule.get_cuda_graph_configs">(mstar.model.waypoint.submodules.WaypointVaeEncoderSubmodule method)</a>
-</li>
-      </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_device">get_device() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.PythonTensorBookkeeping.get_info">get_info() (mstar.communication.tensor_store.PythonTensorBookkeeping method)</a>
@@ -3842,12 +3886,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_node">get_node() (mstar.graph.graph_io.WorkerGraphIO method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_node_inputs">get_node_inputs() (mstar.engine.cuda_graph_config.BatchedCudaGraphConfig method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_node_inputs">get_node_inputs() (mstar.engine.accelerator_graph_config.AcceleratorGraphConfig method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_node_inputs">(mstar.engine.cuda_graph_config.CudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_node_inputs">(mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_node_inputs">(mstar.engine.cuda_graph_config.PackedCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_node_inputs">(mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.get_nodes">get_nodes() (mstar.graph.base.GraphNode method)</a>
@@ -3868,7 +3912,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.get_offload_priority">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs">get_piecewise_cuda_graph_configs() (mstar.model.submodule_base.NodeSubmodule method)</a>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs">get_piecewise_accelerator_graph_configs() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention.get_position_ids">get_position_ids() (mstar.model.vjepa2.components.layers.VJEPA2RopeAttention method)</a>
 </li>
@@ -3906,17 +3950,17 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput.get_total_len">get_total_len() (mstar.engine.resources.kv.plan.KVPlanOutput method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_total_tokens">get_total_tokens() (mstar.engine.cuda_graph_config.BatchedCudaGraphConfig method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_total_tokens">get_total_tokens() (mstar.engine.accelerator_graph_config.AcceleratorGraphConfig method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_total_tokens">(mstar.engine.cuda_graph_config.CudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_total_tokens">(mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_total_tokens">(mstar.engine.cuda_graph_config.PackedCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_total_tokens">(mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.get_tx_info">get_tx_info() (mstar.communication.tensors.TensorCommunicationManager method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.get_view">get_view() (mstar.engine.cuda_graph_runner.PiecewiseOutput method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.get_view">get_view() (mstar.engine.accelerator_graph_runner.PiecewiseOutput method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.global_attn_offset">global_attn_offset (mstar.model.waypoint.config.WaypointConfig attribute)</a>
 </li>
@@ -3930,10 +3974,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3BackboneConfig.gpt2_medium">gpt2_medium() (mstar.model.chatterbox.config.T3BackboneConfig class method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.graph">graph (mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.graph">graph (mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.graph">(mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.graph">(mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.graph_edge">graph_edge (mstar.api_server.request_types.ResultTensors attribute)</a>
@@ -3944,6 +3988,12 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.graph_max_latent_area">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.graph_pool_handle">graph_pool_handle() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphBackend.graph_pool_handle">(mstar.engine.accelerator_graph_backend.XPUGraphBackend method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete.graph_timings">graph_timings (mstar.api_server.request_types.RequestComplete attribute)</a>
@@ -4026,6 +4076,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.H2DMirror">H2DMirror (class in mstar.utils.h2d)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool.handle">handle (mstar.engine.accelerator_graph_backend.AcceleratorGraphPool attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeTranscription.handle">handle() (mstar.api_server.openai.serving_realtime.RealtimeTranscription method)</a>
 
       <ul>
@@ -4034,7 +4086,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.worker.rid_table.html#mstar.worker.rid_table.RidTable.handle">(mstar.worker.rid_table.RidTable method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.handles">handles() (mstar.engine.cuda_graph_runner.DummyRowPool method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.handles">handles() (mstar.engine.accelerator_graph_runner.DummyRowPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.has_chunk_ready">has_chunk_ready() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
 </li>
@@ -4114,10 +4166,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.heard">heard (mstar.api_server.openai.serving_realtime.RealtimeSession attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.height">height (mstar.model.waypoint.config.WaypointConfig attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.height">height (mstar.model.waypoint.config.WaypointConfig attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.hidden_act">hidden_act (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -4402,12 +4454,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs.input_embeds">input_embeds (mstar.model.submodule_base.ARNodeInputs attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs.input_ids">input_ids (mstar.model.submodule_base.ARNodeInputs attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.NewRequestConductor.input_metadata">input_metadata (mstar.utils.ipc_format.NewRequestConductor attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.input_modalities">input_modalities (mstar.api_server.request_types.PreprocessInput attribute)</a>
 
       <ul>
@@ -4478,6 +4530,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol.IPC">IPC (mstar.communication.communicator.CommProtocol attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability.is_accelerator">is_accelerator (mstar.utils.device.DeviceCapability property)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability.is_available">is_available (mstar.utils.device.DeviceCapability property)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.is_available">is_available() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability.is_capturing">is_capturing() (mstar.utils.device.DeviceCapability method)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.is_current_stream_capturing">is_current_stream_capturing() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.EagerSlotKey.is_decode">is_decode (mstar.engine.resources.attn.base.EagerSlotKey attribute)</a>
 
       <ul>
@@ -4524,7 +4586,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.is_offloaded">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed">is_packed() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.is_packed">is_packed() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext.is_padding_row">is_padding_row() (mstar.engine.resources.step.StepContext method)</a>
 
@@ -4630,7 +4692,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.containers.html#mstar.utils.containers.ParallelList.keys">keys (mstar.utils.containers.ParallelList attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.keys">keys() (mstar.engine.cuda_graph_runner.PiecewiseOutput method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.keys">keys() (mstar.engine.accelerator_graph_runner.PiecewiseOutput method)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep.keys">(mstar.engine.resources.step.SubmoduleStep method)</a>
@@ -4719,7 +4781,7 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardConductorMetadata.kwargs">kwargs (mstar.conductor.request_info.CurrentForwardConductorMetadata attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs.kwargs">(mstar.engine.cuda_graph_config.PiecewiseCallInputs attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs.kwargs">(mstar.engine.accelerator_graph_config.PiecewiseCallInputs attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs.kwargs">(mstar.model.submodule_base.NodeInputs attribute)</a>
 </li>
@@ -4844,16 +4906,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3Config.learned_pos_emb">learned_pos_emb (mstar.model.chatterbox.config.T3Config attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.lease_before_step">lease_before_step (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.lease_before_step">lease_before_step (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner property)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.lease_before_step">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner property)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">lease_slot() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.lease_slot">lease_slot() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.lease_slot">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
       </ul></li>
   </ul></td>
@@ -4988,7 +5050,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">make_communicator() (in module mstar.communication.communicator)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.make_static_inputs">make_static_inputs (mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.make_static_inputs">make_static_inputs (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.Mamba2Geometry">Mamba2Geometry (class in mstar.engine.resources.recurrent)</a>
 
@@ -5066,7 +5128,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointDitSubmodule.max_batch_size">(mstar.model.waypoint.submodules.WaypointDitSubmodule method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for">max_batch_size_for() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.max_batch_size_for">max_batch_size_for() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.max_chunks">max_chunks (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
 </li>
@@ -5253,6 +5315,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.VoiceEncoderConfig.mel_power">mel_power (mstar.model.chatterbox.config.VoiceEncoderConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ReferenceInfo.mem_registered">mem_registered (mstar.communication.tensor_store.ReferenceInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.memory_allocated">memory_allocated() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.ring.cache.html#mstar.engine.resources.kv.ring.cache.LayerRingCache.memory_bytes">memory_bytes (mstar.engine.resources.kv.ring.cache.LayerRingCache property)</a>
 
@@ -5462,9 +5526,11 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.html#module-mstar.engine">mstar.engine</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#module-mstar.engine.cuda_graph_config">mstar.engine.cuda_graph_config</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#module-mstar.engine.accelerator_graph_backend">mstar.engine.accelerator_graph_backend</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#module-mstar.engine.cuda_graph_runner">mstar.engine.cuda_graph_runner</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#module-mstar.engine.accelerator_graph_config">mstar.engine.accelerator_graph_config</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#module-mstar.engine.accelerator_graph_runner">mstar.engine.accelerator_graph_runner</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#module-mstar.engine.resources">mstar.engine.resources</a>
 </li>
@@ -5746,6 +5812,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.containers.html#module-mstar.utils.containers">mstar.utils.containers</a>
 </li>
+        <li><a href="_autosummary/mstar.utils.device.html#module-mstar.utils.device">mstar.utils.device</a>
+</li>
         <li><a href="_autosummary/mstar.utils.exitcode.html#module-mstar.utils.exitcode">mstar.utils.exitcode</a>
 </li>
         <li><a href="_autosummary/mstar.utils.fast_tokenize.html#module-mstar.utils.fast_tokenize">mstar.utils.fast_tokenize</a>
@@ -5803,8 +5871,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.mpc_cost_fn">mpc_cost_fn (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.mrope_interleaved">mrope_interleaved (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -5813,6 +5879,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.mrope_interleaved">(mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.components.reasoner.html#mstar.model.cosmos3.components.reasoner.mrope_position_ids">mrope_position_ids() (in module mstar.model.cosmos3.components.reasoner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.mrope_section">mrope_section (mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
@@ -5995,17 +6063,24 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
-    mstar.engine.cuda_graph_config
+    mstar.engine.accelerator_graph_backend
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#module-mstar.engine.cuda_graph_config">module</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#module-mstar.engine.accelerator_graph_backend">module</a>
 </li>
       </ul></li>
       <li>
-    mstar.engine.cuda_graph_runner
+    mstar.engine.accelerator_graph_config
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#module-mstar.engine.cuda_graph_runner">module</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#module-mstar.engine.accelerator_graph_config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.accelerator_graph_runner
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#module-mstar.engine.accelerator_graph_runner">module</a>
 </li>
       </ul></li>
       <li>
@@ -6989,6 +7064,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.utils.device
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.device.html#module-mstar.utils.device">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.utils.exitcode
 
       <ul>
@@ -7274,6 +7356,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST">(mstar.utils.ipc_format.WorkerMessageType attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.new_stream">new_stream() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerGraphsDone.new_token_counts">new_token_counts (mstar.utils.ipc_format.WorkerGraphsDone attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.NewRequest">NewRequest (class in mstar.utils.ipc_format)</a>
@@ -7656,10 +7740,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.DeltaNetGeometry.num_v_heads">(mstar.engine.resources.recurrent.DeltaNetGeometry attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_WARMUP">NUM_WARMUP (mstar.engine.cuda_graph_runner.CudaGraphRunner attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.NUM_WARMUP">NUM_WARMUP (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.NUM_WARMUP">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig.numel">numel (mstar.engine.resources.recurrent.config.RecurrentBlockConfig property)</a>
@@ -7686,6 +7770,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VoiceList.object">(mstar.api_server.openai.protocol.VoiceList attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability.of">of() (mstar.utils.device.DeviceCapability static method)</a>
+</li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.off_group_rids">off_group_rids() (in module mstar.worker.batch_builder)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.offload">offload() (mstar.engine.resources.base.Resource method)</a>
@@ -7732,16 +7818,28 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.omnivoice.submodules.html#mstar.model.omnivoice.submodules.OmniVoiceRefEncoderSubmodule">OmniVoiceRefEncoderSubmodule (class in mstar.model.omnivoice.submodules)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool.on_failure">on_failure() (mstar.engine.accelerator_graph_backend.AcceleratorGraphPool method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphPool.on_failure">(mstar.engine.accelerator_graph_backend.XPUGraphPool method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool.on_success">on_success() (mstar.engine.accelerator_graph_backend.AcceleratorGraphPool method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphPool.on_success">(mstar.engine.accelerator_graph_backend.XPUGraphPool method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckDecoder">OobleckDecoder (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckDecoderBlock">OobleckDecoderBlock (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckResidualUnit">OobleckResidualUnit (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.wire.html#mstar.communication.wire.OPAQUE">OPAQUE (in module mstar.communication.wire)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner.order">order (mstar.engine.resources.runner.StepRunner property)</a>
 
       <ul>
@@ -7824,15 +7922,15 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.pack_pieces">pack_pieces() (in module mstar.model.kokoro.g2p)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseConfigType.PACKED">PACKED (mstar.engine.cuda_graph_config.PiecewiseConfigType attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseConfigType.PACKED">PACKED (mstar.engine.accelerator_graph_config.PiecewiseConfigType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas.packed_ids">packed_ids (mstar.model.omnivoice.components.backbone.PackedCanvas attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.packed_outputs">packed_outputs (mstar.model.submodule_base.BatchedModelOutput attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas">PackedCanvas (class in mstar.model.omnivoice.components.backbone)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig">PackedAcceleratorGraphConfig (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig">PackedCudaGraphConfig (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas">PackedCanvas (class in mstar.model.omnivoice.components.backbone)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.RecurrentStatePool.pad_index">pad_index (mstar.engine.resources.recurrent.pool.RecurrentStatePool property)</a>
 
@@ -7840,7 +7938,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool.pad_index">(mstar.engine.resources.recurrent.RecurrentStatePool property)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs">pad_inputs() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.pad_inputs">pad_inputs() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.NanoConfig.pad_pair_token_id">pad_pair_token_id (mstar.model.nemotron_duplex.config.NanoConfig attribute)</a>
 </li>
@@ -8046,25 +8144,27 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.piecewise_runners">piecewise_runners (mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig">PiecewiseBatchedConfig (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig">PiecewiseAcceleratorGraphConfig (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs">PiecewiseCallInputs (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner">PiecewiseAcceleratorGraphRunner (class in mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape">PiecewiseCaptureShape (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig">PiecewiseBatchedConfig (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseConfigType">PiecewiseConfigType (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs">PiecewiseCallInputs (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig">PiecewiseCudaGraphConfig (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCaptureShape">PiecewiseCaptureShape (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner">PiecewiseCudaGraphRunner (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseConfigType">PiecewiseConfigType (class in mstar.engine.accelerator_graph_config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData">PiecewiseGraphData (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData">PiecewiseGraphData (class in mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey">PiecewiseGraphKey (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphKey">PiecewiseGraphKey (class in mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput">PiecewiseOutput (class in mstar.engine.cuda_graph_runner)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput">PiecewiseOutput (class in mstar.engine.accelerator_graph_runner)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig">PiecewisePackedConfig (class in mstar.engine.cuda_graph_config)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig">PiecewisePackedConfig (class in mstar.engine.accelerator_graph_config)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.device.html#mstar.utils.device.DeviceCapability.pin_memory">pin_memory (mstar.utils.device.DeviceCapability property)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.RingKVLayerConfig.pinned_dilation">pinned_dilation (mstar.engine.resources.kv.config.RingKVLayerConfig attribute)</a>
 
@@ -8126,7 +8226,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepContext.plan_results">(mstar.engine.resources.StepContext attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.plan_stream">plan_stream() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.plan_stream">plan_stream() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.PlanCacheKey">PlanCacheKey (class in mstar.engine.resources.attn.base)</a>
 </li>
@@ -8142,6 +8242,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator.poll_for_messages">(mstar.communication.rust_communicator.RustZMQCommunicator method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.pool">pool() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.pop">pop() (mstar.model.submodule_base.BatchedModelOutput method)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk">pop_chunk() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
@@ -8400,10 +8502,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.conditioning.html#mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames">prepare_conditioning_frames() (in module mstar.model.cosmos3.components.conditioning)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.prepare_for_capture">prepare_for_capture() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.prepare_for_capture">prepare_for_capture() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.prepare_for_capture">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.prepare_inputs">prepare_inputs() (mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule method)</a>
@@ -8840,6 +8942,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.H2DMirror.record">record() (mstar.utils.h2d.H2DMirror method)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.recover_failed_capture">recover_failed_capture() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentAddressing">RecurrentAddressing (class in mstar.engine.resources.recurrent)</a>
 
       <ul>
@@ -8976,7 +9080,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.register_shm_segment">(mstar.communication.tensor_store.TensorStore method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.release">release() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.release">release() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.model.cosmos3.sessions.html#mstar.model.cosmos3.sessions.SessionStore.release">(mstar.model.cosmos3.sessions.SessionStore method)</a>
@@ -8984,7 +9088,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.worker.rid_table.html#mstar.worker.rid_table.RidTable.release">(mstar.worker.rid_table.RidTable method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.release_all">release_all() (mstar.engine.cuda_graph_runner.DummyRowPool method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.release_all">release_all() (mstar.engine.accelerator_graph_runner.DummyRowPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.windowing.html#mstar.engine.windowing.WindowSchedule.released_end">released_end() (mstar.engine.windowing.WindowSchedule method)</a>
 </li>
@@ -9054,12 +9158,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.repetition_penalty">(mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.replay_seq_lens">replay_seq_lens() (mstar.engine.cuda_graph_config.PiecewiseBatchedConfig method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.replay">replay() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens">replay_seq_lens() (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.replay_seq_lens">(mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.replay_seq_lens">(mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.replay_seq_lens">(mstar.engine.cuda_graph_config.PiecewisePackedConfig method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.replay_seq_lens">(mstar.engine.accelerator_graph_config.PiecewisePackedConfig method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.req_rx_info">req_rx_info (mstar.communication.tensors.TensorCommunicationManager attribute)</a>
@@ -9204,9 +9310,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reseed_streaming_ready">reseed_streaming_ready() (mstar.graph.base.WorkerGraphStateRegistry method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.reset">reset() (mstar.engine.cuda_graph_runner.DummyRowPool method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.reset">reset() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.reset">(mstar.engine.accelerator_graph_runner.DummyRowPool method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.kv.ring.cache.html#mstar.engine.resources.kv.ring.cache.LayerRingCache.reset">(mstar.engine.resources.kv.ring.cache.LayerRingCache method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.LayerRingCache.reset">(mstar.engine.resources.kv.ring.LayerRingCache method)</a>
@@ -9360,7 +9468,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.ResourceReqConfig">(class in mstar.engine.resources.spec)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs.resources">resources (mstar.engine.cuda_graph_config.PiecewiseCallInputs property)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs.resources">resources (mstar.engine.accelerator_graph_config.PiecewiseCallInputs property)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner.resources">(mstar.engine.resources.runner.StepRunner property)</a>
@@ -9615,7 +9723,7 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.run">(mstar.api_server.rust_frontend.RustFrontendBridge method)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.run">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.run">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.cross.html#mstar.engine.resources.attn.cross.FlashInferCrossManager.run">(mstar.engine.resources.attn.cross.FlashInferCrossManager method)</a>
 </li>
@@ -9632,7 +9740,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.run">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.run_forward">run_forward() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.run_forward">run_forward() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.rms_norm.html#mstar.engine.resources.rms_norm.run_rms_norm">run_rms_norm() (in module mstar.engine.resources.rms_norm)</a>
 
@@ -9852,9 +9960,9 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SubmoduleStep.segments">(mstar.engine.resources.SubmoduleStep attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.select_batched_bucket">select_batched_bucket() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_batched_bucket">select_batched_bucket() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.select_bucket">select_bucket() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_bucket">select_bucket() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.select_last_hidden">select_last_hidden() (mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
 
@@ -9874,13 +9982,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator.send">(mstar.communication.rust_communicator.RustZMQCommunicator method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.seq_len">seq_len (mstar.engine.cuda_graph_config.PiecewiseBatchedConfig attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.seq_len">seq_len (mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.seq_len">(mstar.engine.cuda_graph_runner.PiecewiseGraphKey attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphKey.seq_len">(mstar.engine.accelerator_graph_runner.PiecewiseGraphKey attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape.seq_lens">seq_lens (mstar.engine.cuda_graph_config.PiecewiseCaptureShape attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCaptureShape.seq_lens">seq_lens (mstar.engine.accelerator_graph_config.PiecewiseCaptureShape attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.SequenceView">SequenceView (class in mstar.engine.resources.kv.plan)</a>
 </li>
@@ -9944,6 +10052,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.AttentionResource.set_default_layer_idx">set_default_layer_idx() (mstar.engine.resources.base.AttentionResource method)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.set_device">set_device() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.PythonTensorBookkeeping.set_mem_registered">set_mem_registered() (mstar.communication.tensor_store.PythonTensorBookkeeping method)</a>
 
       <ul>
@@ -9988,13 +10098,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.set_shm_placement">(mstar.communication.tensor_store.TensorStore method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot">set_slot() (mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.set_slot">set_slot() (mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE">SETUP_DONE (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.SetupDone">SetupDone (class in mstar.utils.ipc_format)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.shape">shape (mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.shape">shape (mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig.shape">(mstar.engine.resources.recurrent.config.RecurrentBlockConfig attribute)</a>
@@ -10082,7 +10192,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy">SlidingWindowChunkPolicy (class in mstar.streaming.chunk_policy)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.slot">slot (mstar.engine.cuda_graph_runner.PiecewiseGraphKey attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphKey.slot">slot (mstar.engine.accelerator_graph_runner.PiecewiseGraphKey attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.EagerSlotKey.slot">(mstar.engine.resources.attn.base.EagerSlotKey attribute)</a>
@@ -10108,7 +10218,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStateConfig.slot_bytes">(mstar.engine.resources.recurrent.RecurrentStateConfig property)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.slot_for">slot_for() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for">slot_for() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.RecurrentAddressing.slot_indices">slot_indices (mstar.engine.resources.recurrent.pool.RecurrentAddressing attribute)</a>
 
@@ -10130,7 +10240,7 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.SlotLease">(class in mstar.engine.resources.step)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphBucket.slots">slots (mstar.engine.cuda_graph_runner.CudaGraphBucket attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket.slots">slots (mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.SlotState">SlotState (class in mstar.engine.resources.recurrent.pool)</a>
 </li>
@@ -10382,20 +10492,20 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.state_token_offset">state_token_offset (mstar.model.pi05.config.Pi05Config attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.static_input_keys">static_input_keys (mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_input_keys">static_input_keys (mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs.static_inputs">static_inputs (mstar.engine.cuda_graph_config.PiecewiseCallInputs attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs.static_inputs">static_inputs (mstar.engine.accelerator_graph_config.PiecewiseCallInputs attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.static_inputs">(mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_inputs">(mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 </li>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_inputs">(mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.static_inputs">(mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot.static_outputs">static_outputs (mstar.engine.cuda_graph_runner.CudaGraphSlot attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_outputs">static_outputs (mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_outputs">(mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData.static_outputs">(mstar.engine.accelerator_graph_runner.PiecewiseGraphData attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary">stats_summary() (mstar.communication.arena.ArenaShmCommunicationManager method)</a>
@@ -10410,13 +10520,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.step_batch_size">step_batch_size (mstar.model.waypoint.config.WaypointConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_ids">step_ids() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_ids">step_ids() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_is_input_free">step_is_input_free() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo.step_metadata">step_metadata (mstar.conductor.request_info.CurrentForwardPassInfo attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_metadata">step_metadata() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_metadata">step_metadata() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepContext">StepContext (class in mstar.engine.resources)</a>
 
@@ -10492,6 +10602,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata.stream_chunks">stream_chunks (mstar.model.submodule_base.InputMetadata attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.stream_context">stream_context() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.stream_context_tokens">stream_context_tokens (mstar.model.chatterbox.config.ChatterboxConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.stream_first_chunk_tokens">stream_first_chunk_tokens (mstar.model.chatterbox.config.ChatterboxConfig attribute)</a>
@@ -10561,6 +10673,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.supports_preplan">(mstar.engine.resources.attn.flashinfer.FlashInferManager property)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.supports_preplan">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager property)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.supports_preplan">(mstar.engine.resources.base.Resource property)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.supports_preplan">(mstar.engine.resources.position.manager.RopeManager property)</a>
@@ -10573,6 +10687,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.suppress_tokens">suppress_tokens (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.synchronize">synchronize() (mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend method)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -10688,6 +10804,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitRuntimeError.terminal">(mstar.engine.resources.step.AdmitRuntimeError attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager">test_accelerator_graph_matches_eager() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full">test_anchor_encode_matches_full() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential">test_batched_cfg_matches_sequential() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
@@ -10701,8 +10819,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v">test_compile_vae_matches_eager_t2v() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual">test_cross_request_batch_matches_individual() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
-</li>
-      <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager">test_cuda_graph_matches_eager() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr">test_dense_fa3_image_psnr() (in module mstar.model.cosmos3.tests.test_engine_cache)</a>
 </li>
@@ -10928,10 +11044,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.RingKVManager.total_slots">(mstar.engine.resources.kv.ring.RingKVManager method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape.total_tokens">total_tokens (mstar.engine.cuda_graph_config.PiecewiseCaptureShape attribute)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCaptureShape.total_tokens">total_tokens (mstar.engine.accelerator_graph_config.PiecewiseCaptureShape attribute)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.total_tokens">(mstar.engine.cuda_graph_config.PiecewisePackedConfig attribute)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.total_tokens">(mstar.engine.accelerator_graph_config.PiecewisePackedConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC">TP_NO_SPEC (mstar.utils.ipc_format.WorkerMessageType attribute)</a>
@@ -11390,10 +11506,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.warmup">warmup() (mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.warmup_and_capture">warmup_and_capture() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture">warmup_and_capture() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 
       <ul>
-        <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
+        <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture">(mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.warmup_len">warmup_len (mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule property)</a>
@@ -11574,6 +11690,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphBackend">XPUGraphBackend (class in mstar.engine.accelerator_graph_backend)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphPool">XPUGraphPool (class in mstar.engine.accelerator_graph_backend)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager">XPUPagedAttentionManager (class in mstar.engine.resources.attn.xpu)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan">XPUPagedPlan (class in mstar.engine.resources.attn.xpu)</a>

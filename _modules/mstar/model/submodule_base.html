@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -935,8 +937,8 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">PiecewiseCudaGraphRunner</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AcceleratorGraphConfig</span><span class="p">,</span> <span class="n">PiecewiseAcceleratorGraphConfig</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">PiecewiseAcceleratorGraphRunner</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecutingBatch</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamChunkInfo</span>
 
@@ -1410,7 +1412,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># by the engine, spread in at execute time (like ``cache_manager`` /</span>
     <span class="c1"># ``sampler``). Empty when the submodule opts into no piecewise graphs or</span>
     <span class="c1"># capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.</span>
-    <span class="n">piecewise_runners</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"PiecewiseCudaGraphRunner"</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">piecewise_runners</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"PiecewiseAcceleratorGraphRunner"</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
     <span class="c1"># The batch's per-request states, injected by the engine (None on paths</span>
     <span class="c1"># that don't carry them, e.g. CUDA-graph capture with synthetic requests).</span>
@@ -1836,17 +1838,19 @@ window.runMermaid = runMermaid;</script>
 
 
     <span class="c1"># Note: do not import CudaGraphConfig; it causes a circular import situation</span>
-<div class="viewcode-block" id="NodeSubmodule.get_cuda_graph_configs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">CudaGraphConfig</span><span class="p">]:</span>
+<div class="viewcode-block" id="NodeSubmodule.get_accelerator_graph_configs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_accelerator_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_accelerator_graph_configs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">AcceleratorGraphConfig</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">[]</span></div>
 
 
-<div class="viewcode-block" id="NodeSubmodule.get_piecewise_cuda_graph_configs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_cuda_graph_configs</span><span class="p">(</span>
+<div class="viewcode-block" id="NodeSubmodule.get_piecewise_accelerator_graph_configs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_accelerator_graph_configs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span><span class="p">]:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Return the piecewise CUDA graph configs this submodule opts into.</span>
 
 <span class="sd">        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's</span>
@@ -1879,11 +1883,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">{}</span></div>
 
 
-<div class="viewcode-block" id="NodeSubmodule.can_use_cuda_graphs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">can_use_cuda_graphs</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span>
-        <span class="n">model_inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]</span>
+<div class="viewcode-block" id="NodeSubmodule.can_use_accelerator_graphs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_use_accelerator_graphs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">can_use_accelerator_graphs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span>
+        <span class="n">model_inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Return True if this submodule supports CUDA graphs for ``batch``.</span>
 
@@ -1905,12 +1910,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Subclasses can override to reject on batch shape / metadata (e.g.</span>
 <span class="sd">        codec submodules that need homogeneous frame counts).</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_cached_cuda_graph_walks"</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_cached_accelerator_graph_walks"</span><span class="p">):</span>
+            <span class="n">device</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span>
+                <span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">device</span> <span class="k">for</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">parameters</span><span class="p">()),</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">),</span>
+            <span class="p">)</span>
             <span class="n">walks</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
-            <span class="k">for</span> <span class="n">cfg</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_cuda_graph_configs</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">),</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">cfg</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_accelerator_graph_configs</span><span class="p">(</span>
+                <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span>
+            <span class="p">):</span>
                 <span class="n">walks</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">replay_graph_walks</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_cached_cuda_graph_walks</span> <span class="o">=</span> <span class="n">walks</span>
-        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_cuda_graph_walks</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_cached_accelerator_graph_walks</span> <span class="o">=</span> <span class="n">walks</span>
+        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_accelerator_graph_walks</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.postprocess">
@@ -2093,8 +2104,6 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="n">Any</span><span class="p">]:</span> <span class="c1"># input name to tensor</span>
         <span class="k">pass</span></div>
 </div>
-
-
 
 </pre></div>
 

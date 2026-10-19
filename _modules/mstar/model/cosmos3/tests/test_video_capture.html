@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -934,12 +936,12 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">_dit_with_buckets</span><span class="p">(</span><span class="n">monkeypatch</span><span class="p">):</span>
     <span class="n">monkeypatch</span><span class="o">.</span><span class="n">setenv</span><span class="p">(</span><span class="s2">"COSMOS3_GEN_CAPTURE_RES"</span><span class="p">,</span> <span class="s2">"64x64"</span><span class="p">)</span>
     <span class="n">monkeypatch</span><span class="o">.</span><span class="n">setenv</span><span class="p">(</span><span class="s2">"COSMOS3_GEN_CAPTURE_VIDEO"</span><span class="p">,</span> <span class="s2">"64x64x9"</span><span class="p">)</span>
-    <span class="n">monkeypatch</span><span class="o">.</span><span class="n">setenv</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_PREFILL_CUDA_GRAPH"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
-    <span class="n">monkeypatch</span><span class="o">.</span><span class="n">delenv</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_CUDA_GRAPH"</span><span class="p">,</span> <span class="n">raising</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">monkeypatch</span><span class="o">.</span><span class="n">setenv</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+    <span class="n">monkeypatch</span><span class="o">.</span><span class="n">delenv</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_ACCELERATOR_GRAPH"</span><span class="p">,</span> <span class="n">raising</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">sub</span> <span class="o">=</span> <span class="n">Cosmos3DiTSubmodule</span><span class="p">(</span>
         <span class="n">transformer</span><span class="o">=</span><span class="n">_fake_transformer</span><span class="p">(),</span> <span class="n">config</span><span class="o">=</span><span class="n">Cosmos3Config</span><span class="p">(</span><span class="n">compile_denoise</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span> <span class="n">scheduler</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span>
-    <span class="n">configs</span> <span class="o">=</span> <span class="n">sub</span><span class="o">.</span><span class="n">get_cuda_graph_configs</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">)</span>
+    <span class="n">configs</span> <span class="o">=</span> <span class="n">sub</span><span class="o">.</span><span class="n">get_accelerator_graph_configs</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">sub</span><span class="p">,</span> <span class="n">configs</span>
 
 

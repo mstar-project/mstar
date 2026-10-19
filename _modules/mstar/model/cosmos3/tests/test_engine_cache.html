@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -2008,13 +2010,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_run_cuda_graph_denoise</span><span class="p">(</span><span class="n">ctx</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_run_accelerator_graph_denoise</span><span class="p">(</span><span class="n">ctx</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture the image denoise step and run the whole loop through the real</span>
 <span class="sd">    CudaGraphRunner (one captured forward per step covering both guidance</span>
 <span class="sd">    branches), returning the final latents."""</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommGroup</span><span class="p">,</span> <span class="n">JointGroups</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphRunner</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">AcceleratorGraphRunner</span>
 
     <span class="n">model</span><span class="p">,</span> <span class="n">dit</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"model"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"dit"</span><span class="p">]</span>
     <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"dtype"</span><span class="p">]</span>
@@ -2039,7 +2041,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
     <span class="c1"># The runner's autocast scope is the engine's: none for a node that pins</span>
     <span class="c1"># its own precision (the DiT forwards run native bf16), else the model's.</span>
-    <span class="n">cg_runner</span> <span class="o">=</span> <span class="n">CudaGraphRunner</span><span class="p">(</span>
+    <span class="n">cg_runner</span> <span class="o">=</span> <span class="n">AcceleratorGraphRunner</span><span class="p">(</span>
         <span class="n">submodule_name</span><span class="o">=</span><span class="s2">"dit"</span><span class="p">,</span> <span class="n">submodule</span><span class="o">=</span><span class="n">dit</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="n">resources</span><span class="p">,</span>
         <span class="n">step_runner</span><span class="o">=</span><span class="n">StepRunner</span><span class="p">(</span><span class="n">resources</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span>
         <span class="n">autocast_dtype</span><span class="o">=</span><span class="kc">None</span> <span class="k">if</span> <span class="n">dit</span><span class="o">.</span><span class="n">disable_autocast</span> <span class="k">else</span> <span class="n">model</span><span class="o">.</span><span class="n">get_autocast_dtype</span><span class="p">(),</span>
@@ -2065,10 +2067,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">latents</span>
 
 
-<div class="viewcode-block" id="test_cuda_graph_matches_eager">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_cuda_graph_matches_eager">[docs]</a>
+<div class="viewcode-block" id="test_accelerator_graph_matches_eager">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager">[docs]</a>
 <span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">test_cuda_graph_matches_eager</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_accelerator_graph_matches_eager</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The captured-graph denoise step is the served path's accelerator: both</span>
 <span class="sd">    guidance branches run in one captured forward (~2x faster than the eager</span>
 <span class="sd">    step). Each captured forward matches eager to within bf16 (the first step</span>
@@ -2080,7 +2082,7 @@ window.runMermaid = runMermaid;</script>
         <span class="nb">print</span><span class="p">(</span><span class="s2">"  (skipped cuda-graph parity: needs COSMOS3_NANO_DIR + CUDA)"</span><span class="p">)</span>
         <span class="k">return</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="n">lat_graph</span> <span class="o">=</span> <span class="n">_run_cuda_graph_denoise</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">lat_graph</span> <span class="o">=</span> <span class="n">_run_accelerator_graph_denoise</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  (skipped cuda-graph parity: FlashInfer/capture unavailable: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
         <span class="k">return</span>
@@ -2109,7 +2111,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">(</span><span class="s2">"anchor_encode_matches_full"</span><span class="p">,</span> <span class="n">test_anchor_encode_matches_full</span><span class="p">),</span>
         <span class="p">(</span><span class="s2">"compile_vae_matches_eager"</span><span class="p">,</span> <span class="n">test_compile_vae_matches_eager</span><span class="p">),</span>
         <span class="p">(</span><span class="s2">"compile_vae_matches_eager_t2v"</span><span class="p">,</span> <span class="n">test_compile_vae_matches_eager_t2v</span><span class="p">),</span>
-        <span class="p">(</span><span class="s2">"cuda_graph_matches_eager"</span><span class="p">,</span> <span class="n">test_cuda_graph_matches_eager</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"accelerator_graph_matches_eager"</span><span class="p">,</span> <span class="n">test_accelerator_graph_matches_eager</span><span class="p">),</span>
         <span class="p">(</span><span class="s2">"cross_request_batch_matches_individual"</span><span class="p">,</span> <span class="n">test_cross_request_batch_matches_individual</span><span class="p">),</span>
     <span class="p">]:</span>
         <span class="k">try</span><span class="p">:</span>

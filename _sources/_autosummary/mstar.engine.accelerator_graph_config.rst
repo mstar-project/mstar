@@ -1,7 +1,7 @@
-mstar.engine.cuda\_graph\_config
-================================
+mstar.engine.accelerator\_graph\_config
+=======================================
 
-.. automodule:: mstar.engine.cuda_graph_config
+.. automodule:: mstar.engine.accelerator_graph_config
 
    
    
@@ -24,15 +24,15 @@ mstar.engine.cuda\_graph\_config
 
    .. autosummary::
    
-      BatchedCudaGraphConfig
-      CudaGraphConfig
-      CudaGraphConfigType
-      PackedCudaGraphConfig
+      AcceleratorGraphConfig
+      AcceleratorGraphConfigType
+      BatchedAcceleratorGraphConfig
+      PackedAcceleratorGraphConfig
+      PiecewiseAcceleratorGraphConfig
       PiecewiseBatchedConfig
       PiecewiseCallInputs
       PiecewiseCaptureShape
       PiecewiseConfigType
-      PiecewiseCudaGraphConfig
       PiecewisePackedConfig
    
    

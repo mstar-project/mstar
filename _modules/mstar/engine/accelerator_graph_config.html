@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mstar.engine.cuda_graph_config &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.engine.accelerator_graph_config &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -403,7 +403,7 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/cuda_graph_config';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/accelerator_graph_config';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" />
@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -824,7 +826,7 @@ window.runMermaid = runMermaid;</script>
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/cuda_graph_config.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/accelerator_graph_config.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -901,7 +903,7 @@ window.runMermaid = runMermaid;</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>Source code for mstar.engine.cuda_graph_config</h1><div class="highlight"><pre>
+  <h1>Source code for mstar.engine.accelerator_graph_config</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
@@ -913,17 +915,17 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span>
 
 
-<div class="viewcode-block" id="CudaGraphConfigType">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfigType">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphConfigType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<div class="viewcode-block" id="AcceleratorGraphConfigType">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphConfigType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
     <span class="n">BASIC_BATCHED</span> <span class="o">=</span> <span class="s2">"basic_batched"</span>
     <span class="n">FLASH_INFER_PACKED</span> <span class="o">=</span> <span class="s2">"flash_infer_packed"</span></div>
 
 
 
-<div class="viewcode-block" id="CudaGraphConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphConfig</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<div class="viewcode-block" id="AcceleratorGraphConfig">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphConfig</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">capture_graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>  <span class="c1"># "decode"</span>
@@ -964,22 +966,22 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_seq_dims</span> <span class="o">=</span> <span class="n">input_seq_dims</span>
 
-<div class="viewcode-block" id="CudaGraphConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_config_type">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphConfig.get_config_type">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_config_type">[docs]</a>
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphConfigType</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphConfigType</span><span class="p">:</span>
         <span class="k">pass</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphConfig.get_total_tokens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_total_tokens">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphConfig.get_total_tokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_total_tokens">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">pass</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphConfig.get_node_inputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_node_inputs">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphConfig.get_node_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig.get_node_inputs">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]:</span>
         <span class="k">pass</span></div>
@@ -987,9 +989,9 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="BatchedCudaGraphConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">BatchedCudaGraphConfig</span><span class="p">(</span><span class="n">CudaGraphConfig</span><span class="p">):</span>
+<div class="viewcode-block" id="BatchedAcceleratorGraphConfig">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BatchedAcceleratorGraphConfig</span><span class="p">(</span><span class="n">AcceleratorGraphConfig</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">capture_graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>  <span class="c1"># "decode"</span>
@@ -1025,20 +1027,20 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># per-label span. Default 1 preserves every existing caller.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="n">total_tokens_multiplier</span>
 
-<div class="viewcode-block" id="BatchedCudaGraphConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_config_type">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphConfigType</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">CudaGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span></div>
+<div class="viewcode-block" id="BatchedAcceleratorGraphConfig.get_config_type">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_config_type">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphConfigType</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span></div>
 
 
-<div class="viewcode-block" id="BatchedCudaGraphConfig.get_total_tokens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_total_tokens">[docs]</a>
+<div class="viewcode-block" id="BatchedAcceleratorGraphConfig.get_total_tokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_total_tokens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">single_request_inputs</span><span class="o">.</span><span class="n">input_seq_len</span> <span class="o">*</span> <span class="n">bs</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span><span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="BatchedCudaGraphConfig.get_node_inputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.BatchedCudaGraphConfig.get_node_inputs">[docs]</a>
+<div class="viewcode-block" id="BatchedAcceleratorGraphConfig.get_node_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.BatchedAcceleratorGraphConfig.get_node_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="k">del</span> <span class="n">num_tokens</span>
         <span class="k">return</span> <span class="p">[</span>
@@ -1049,7 +1051,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="distribute_tokens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.distribute_tokens">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.distribute_tokens">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">distribute_tokens</span><span class="p">(</span><span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Split ``total_tokens`` across ``bs`` requests, remainder on the first.</span>
 <span class="sd">    """</span>
@@ -1060,7 +1062,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="decode_rows_then_prompt">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.decode_rows_then_prompt">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.decode_rows_then_prompt">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">decode_rows_then_prompt</span><span class="p">(</span><span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""``bs - 1`` one-token rows and a prompt row of the rest: a mixed step's</span>
 <span class="sd">    layout, for kernels that split rows by span. `distribute_tokens` when</span>
@@ -1071,9 +1073,9 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="PackedCudaGraphConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">PackedCudaGraphConfig</span><span class="p">(</span><span class="n">CudaGraphConfig</span><span class="p">):</span>
+<div class="viewcode-block" id="PackedAcceleratorGraphConfig">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PackedAcceleratorGraphConfig</span><span class="p">(</span><span class="n">AcceleratorGraphConfig</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">capture_graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
@@ -1114,14 +1116,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="n">total_tokens_multiplier</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">token_layout</span> <span class="o">=</span> <span class="n">token_layout</span> <span class="ow">or</span> <span class="n">distribute_tokens</span>
 
-<div class="viewcode-block" id="PackedCudaGraphConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_config_type">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphConfigType</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">CudaGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span></div>
+<div class="viewcode-block" id="PackedAcceleratorGraphConfig.get_config_type">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_config_type">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphConfigType</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span></div>
 
 
-<div class="viewcode-block" id="PackedCudaGraphConfig.get_total_tokens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_total_tokens">[docs]</a>
+<div class="viewcode-block" id="PackedAcceleratorGraphConfig.get_total_tokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_total_tokens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="c1"># every real row carries a token, so a bucket with fewer tokens than</span>
         <span class="c1"># rows could never serve a step; capturing it would give rows of none</span>
@@ -1131,8 +1133,8 @@ window.runMermaid = runMermaid;</script>
         <span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="PackedCudaGraphConfig.get_node_inputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_node_inputs">[docs]</a>
+<div class="viewcode-block" id="PackedAcceleratorGraphConfig.get_node_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_node_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="c1"># ``num_tokens`` is the bucket's plan tokens; the rows get input tokens</span>
         <span class="n">seq_lens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_layout</span><span class="p">(</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
@@ -1143,7 +1145,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseConfigType">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseConfigType">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseConfigType">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseConfigType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
     <span class="n">BATCHED</span> <span class="o">=</span> <span class="s2">"batched"</span>
     <span class="n">PACKED</span> <span class="o">=</span> <span class="s2">"packed"</span></div>
@@ -1151,7 +1153,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseCaptureShape">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCaptureShape">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseCaptureShape</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""One piecewise capture bucket.</span>
@@ -1167,7 +1169,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseCallInputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCallInputs">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseCallInputs">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseCallInputs</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Everything a captured region is handed, at capture and at replay alike.</span>
@@ -1191,10 +1193,10 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseCudaGraphConfig</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseAcceleratorGraphConfig</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""One inner callable of a submodule's forward, captured on its own.</span>
 
 <span class="sd">    Unlike ``CudaGraphConfig``, which describes a whole ``forward_batched``</span>
@@ -1227,15 +1229,15 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># block loop already benefits from graph capture alone.</span>
     <span class="nb">compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
-<div class="viewcode-block" id="PiecewiseCudaGraphConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.get_config_type">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.get_config_type">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_config_type">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseConfigType</span><span class="p">:</span>
         <span class="o">...</span></div>
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphConfig.get_capture_shapes">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.get_capture_shapes">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.get_capture_shapes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_capture_shapes">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">PiecewiseCaptureShape</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""The (bs, seq_lens, total_tokens) buckets to capture.</span>
@@ -1246,8 +1248,8 @@ window.runMermaid = runMermaid;</script>
         <span class="o">...</span></div>
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphConfig.replay_seq_lens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig.replay_seq_lens">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.replay_seq_lens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">replay_seq_lens</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1259,20 +1261,20 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseBatchedConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseBatchedConfig</span><span class="p">(</span><span class="n">PiecewiseCudaGraphConfig</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseBatchedConfig</span><span class="p">(</span><span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Equal-length batched capture: static input ``[bs, seq_len, D]``."""</span>
     <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># tokens per request</span>
 
 <div class="viewcode-block" id="PiecewiseBatchedConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.get_config_type">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.get_config_type">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseConfigType</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">BATCHED</span></div>
 
 
 <div class="viewcode-block" id="PiecewiseBatchedConfig.get_capture_shapes">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.get_capture_shapes">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.get_capture_shapes">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">PiecewiseCaptureShape</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="n">PiecewiseCaptureShape</span><span class="p">(</span>
@@ -1285,7 +1287,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseBatchedConfig.replay_seq_lens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseBatchedConfig.replay_seq_lens">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseBatchedConfig.replay_seq_lens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">replay_seq_lens</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
@@ -1298,9 +1300,9 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewisePackedConfig">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PiecewisePackedConfig</span><span class="p">(</span><span class="n">PiecewiseCudaGraphConfig</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PiecewisePackedConfig</span><span class="p">(</span><span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Packed variable-length capture: static input ``[total_tokens, D]``.</span>
 
 <span class="sd">    One graph per (bs, token bucket). Each bucket is partitioned across ``bs``</span>
@@ -1310,13 +1312,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>  <span class="c1"># token-count buckets to capture</span>
 
 <div class="viewcode-block" id="PiecewisePackedConfig.get_config_type">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.get_config_type">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_config_type">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_config_type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseConfigType</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">PACKED</span></div>
 
 
 <div class="viewcode-block" id="PiecewisePackedConfig.get_capture_shapes">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.get_capture_shapes">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">PiecewiseCaptureShape</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="n">PiecewiseCaptureShape</span><span class="p">(</span>
@@ -1330,7 +1332,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewisePackedConfig.replay_seq_lens">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewisePackedConfig.replay_seq_lens">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.replay_seq_lens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">replay_seq_lens</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>

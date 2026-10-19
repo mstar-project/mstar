@@ -34,8 +34,9 @@
    :toctree:
    :recursive:
 
-   cuda_graph_config
-   cuda_graph_runner
+   accelerator_graph_backend
+   accelerator_graph_config
+   accelerator_graph_runner
    engine
    resources
    windowing

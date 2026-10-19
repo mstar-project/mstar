@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -987,13 +989,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">max_total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">),</span>
-        <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">accelerator_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="o">=</span> <span class="n">accelerator_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">=</span> <span class="n">batch_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span> <span class="o">=</span> <span class="n">max_total_tokens</span>
@@ -1006,10 +1008,10 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="n">batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"batch_size required for CUDA graph mode"</span>
-            <span class="k">assert</span> <span class="n">max_total_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_total_tokens required for CUDA graph mode"</span>
-            <span class="k">assert</span> <span class="n">max_num_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_pages required for CUDA graph mode"</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"batch_size required for accelerator graph mode"</span>
+            <span class="k">assert</span> <span class="n">max_total_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_total_tokens required for accelerator graph mode"</span>
+            <span class="k">assert</span> <span class="n">max_num_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_pages required for accelerator graph mode"</span>
 
             <span class="c1"># Pre-allocate static index buffers</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
@@ -1115,7 +1117,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        per-token bookkeeping below.</span>
 <span class="sd">        """</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
             <span class="c1"># planned inline behind the step in flight, which a pageable copy</span>
             <span class="c1"># would wait for: stage page-locked, copy the indices in ourselves</span>
             <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">paged_kv_indptr</span><span class="p">,</span> <span class="n">paged_kv_last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="p">(</span>
@@ -1149,7 +1151,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,</span>
         <span class="c1"># even if we're not in a cuda graph</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span><span class="p">:</span>
             <span class="c1"># TODO: take the cuda version as a kwarg</span>
             <span class="k">if</span> <span class="n">qo_indptr</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
                 <span class="n">qo_indptr</span> <span class="o">=</span> <span class="n">qo_indptr</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1204,13 +1206,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">),</span>
-        <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">accelerator_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="o">=</span> <span class="n">accelerator_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">=</span> <span class="n">batch_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="o">=</span> <span class="n">num_qo_heads</span>
@@ -1221,9 +1223,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="n">batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"batch_size required for CUDA graph mode"</span>
-            <span class="k">assert</span> <span class="n">max_num_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_pages required for CUDA graph mode"</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"batch_size required for accelerator graph mode"</span>
+            <span class="k">assert</span> <span class="n">max_num_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_pages required for accelerator graph mode"</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indptr_buf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
                 <span class="n">batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span>
@@ -1275,7 +1277,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        """</span>
         <span class="n">n_req</span> <span class="o">=</span> <span class="n">paged_kv_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
         <span class="k">if</span> <span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span>
             <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">()</span>
         <span class="p">):</span>
             <span class="c1"># FlashInfer copies host indices with a blocking copy; page-locked</span>

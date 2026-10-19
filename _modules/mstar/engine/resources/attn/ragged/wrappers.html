@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -943,7 +945,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">max_total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_total_kv_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">),</span>
-        <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">accelerator_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">sm_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">q_data_type</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
         <span class="n">kv_layout</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"NHD"</span><span class="p">,</span>
@@ -956,7 +958,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">padded_head_dim</span> <span class="o">=</span> <span class="n">padded_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sm_scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">sm_scale</span><span class="p">)</span> <span class="k">if</span> <span class="n">sm_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">head_dim</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">q_data_type</span> <span class="o">=</span> <span class="n">q_data_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="o">=</span> <span class="n">accelerator_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span> <span class="o">=</span> <span class="n">max_num_segments</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span> <span class="o">=</span> <span class="n">max_total_tokens</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_kv_tokens</span> <span class="o">=</span> <span class="p">(</span>
@@ -966,9 +968,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
-        <span class="k">if</span> <span class="n">use_cuda_graph</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="n">max_num_segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_segments required for CUDA graph mode"</span>
-            <span class="k">assert</span> <span class="n">max_total_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_total_tokens required for CUDA graph mode"</span>
+        <span class="k">if</span> <span class="n">accelerator_graph</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">max_num_segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_segments required for accelerator graph mode"</span>
+            <span class="k">assert</span> <span class="n">max_total_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_total_tokens required for accelerator graph mode"</span>
             <span class="k">assert</span> <span class="n">max_num_segments</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"max_num_segments must be positive"</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
@@ -1029,7 +1031,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""The layout to hand FlashInfer, and its real token count."""</span>
         <span class="n">n_seg</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span><span class="p">:</span>
             <span class="c1"># the token count is only needed to zero a graph wrapper's tail, and</span>
             <span class="c1"># reading it off a device layout would sync</span>
             <span class="k">return</span> <span class="n">cu_seqlens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="o">-</span><span class="mi">1</span>

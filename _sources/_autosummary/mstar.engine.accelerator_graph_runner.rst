@@ -1,7 +1,7 @@
-mstar.engine.cuda\_graph\_runner
-================================
+mstar.engine.accelerator\_graph\_runner
+=======================================
 
-.. automodule:: mstar.engine.cuda_graph_runner
+.. automodule:: mstar.engine.accelerator_graph_runner
 
    
    
@@ -15,6 +15,7 @@ mstar.engine.cuda\_graph\_runner
    
       agree_across_ranks
       autocast_scope
+      blocked_capture_resources
       capture_into_graph
       capture_with_static_outputs
       dummy_metadata
@@ -30,11 +31,11 @@ mstar.engine.cuda\_graph\_runner
 
    .. autosummary::
    
-      CudaGraphBucket
-      CudaGraphRunner
-      CudaGraphSlot
+      AcceleratorGraphBucket
+      AcceleratorGraphRunner
+      AcceleratorGraphSlot
       DummyRowPool
-      PiecewiseCudaGraphRunner
+      PiecewiseAcceleratorGraphRunner
       PiecewiseGraphData
       PiecewiseGraphKey
       PiecewiseOutput

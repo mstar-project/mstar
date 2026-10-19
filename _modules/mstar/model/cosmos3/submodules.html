@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -955,9 +957,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">BatchedCudaGraphConfig</span><span class="p">,</span>
-    <span class="n">PackedCudaGraphConfig</span><span class="p">,</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">PackedAcceleratorGraphConfig</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">RetentionPolicy</span>
@@ -3077,9 +3079,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># scheduler step run eagerly afterwards.</span>
     <span class="c1"># ------------------------------------------------------------------</span>
 
-<div class="viewcode-block" id="Cosmos3DiTSubmodule.get_cuda_graph_configs">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.get_cuda_graph_configs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
+<div class="viewcode-block" id="Cosmos3DiTSubmodule.get_accelerator_graph_configs">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.get_accelerator_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_accelerator_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Declare one fixed-shape capture of the image denoise step per</span>
 <span class="sd">        resolution. Requests at other resolutions, or without guidance, fall back</span>
 <span class="sd">        to the eager path. The per-resolution token layout is prompt-independent,</span>
@@ -3093,9 +3095,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched</span>
 <span class="sd">        denoise steps so concurrent requests replay a padded graph instead of</span>
 <span class="sd">        falling back to the eager path."""</span>
-        <span class="n">disable_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_CUDA_GRAPH"</span><span class="p">)</span>
-        <span class="n">disabled</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">disable_env</span><span class="p">)</span> <span class="k">if</span> <span class="n">disable_env</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">cuda_graph</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">disabled</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">accelerator_graph</span>
+            <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_ACCELERATOR_GRAPH"</span><span class="p">)</span>
+        <span class="p">):</span>
             <span class="k">return</span> <span class="p">[]</span>
         <span class="n">res_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_GEN_CAPTURE_RES"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">res_env</span><span class="p">:</span>
@@ -3144,7 +3147,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">latent_area</span> <span class="o">=</span> <span class="n">latent_shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">*</span> <span class="n">latent_shape</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span>
             <span class="k">if</span> <span class="n">latent_area</span> <span class="o">&gt;</span> <span class="n">max_area</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">"Cosmos3: skipping CUDA-graph capture for </span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2"> (latent H*W "</span>
+                    <span class="s2">"Cosmos3: skipping accelerator graph capture for </span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2"> (latent H*W "</span>
                     <span class="s2">"</span><span class="si">%d</span><span class="s2"> &gt; </span><span class="si">%d</span><span class="s2"> -&gt; graph net-slower than eager dense here -&gt; eager)"</span><span class="p">,</span>
                     <span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">frames</span><span class="p">,</span> <span class="n">latent_area</span><span class="p">,</span> <span class="n">max_area</span><span class="p">,</span>
                 <span class="p">)</span>
@@ -3163,7 +3166,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_gen_capture_config</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">frames</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">capture_batch_sizes</span><span class="p">,</span>
         <span class="n">walk</span><span class="p">,</span> <span class="n">replay_walks</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BatchedCudaGraphConfig</span><span class="p">:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""One denoise-step capture bucket per latent shape. The graph is</span>
 <span class="sd">        built with every frame declared noisy (its token layout is baked); the</span>
 <span class="sd">        request's clean/noisy layout rides in as the ``noisy_token_mask``</span>
@@ -3198,7 +3201,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">cfg</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">cfg_active</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">capture_key</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">latent_shape</span><span class="p">),</span>
             <span class="p">),</span>
         <span class="p">)</span>
-        <span class="k">return</span> <span class="n">BatchedCudaGraphConfig</span><span class="p">(</span>
+        <span class="k">return</span> <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">(</span>
             <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">walk</span><span class="p">,</span>
             <span class="n">replay_graph_walks</span><span class="o">=</span><span class="n">replay_walks</span><span class="p">,</span>
             <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">single</span><span class="p">,</span>
@@ -3230,7 +3233,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Understanding-tower text prefill: cond+uncond packed into one combined</span>
         <span class="c1"># sequence (batched CFG). The dummy zeros are placeholders — the real</span>
         <span class="c1"># input_ids / mrope ids are copied into the static buffers at replay.</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_PREFILL_CUDA_GRAPH"</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"</span><span class="p">):</span>
             <span class="n">tok_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_PREFILL_CAPTURE_TOKENS"</span><span class="p">)</span>
             <span class="n">prefill_tokens</span> <span class="o">=</span> <span class="p">(</span>
                 <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">tok_env</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)]</span> <span class="k">if</span> <span class="n">tok_env</span>
@@ -3243,7 +3246,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
             <span class="n">mrope_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
 
-            <span class="n">configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PackedCudaGraphConfig</span><span class="p">(</span>
+            <span class="n">configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PackedAcceleratorGraphConfig</span><span class="p">(</span>
                 <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">PREFILL_WALK</span><span class="p">,</span>
                 <span class="n">replay_graph_walks</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">PREFILL_WALKS</span><span class="p">),</span>
                 <span class="n">capture_token_lengths</span><span class="o">=</span><span class="n">prefill_tokens</span><span class="p">,</span>
@@ -4220,12 +4223,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="p">(</span><span class="n">REASONER_DECODE_WALK</span><span class="p">,</span> <span class="n">REASONER_PREFILL_WALK</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="Cosmos3ReasonerSubmodule.get_cuda_graph_configs">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.get_cuda_graph_configs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
+<div class="viewcode-block" id="Cosmos3ReasonerSubmodule.get_accelerator_graph_configs">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.get_accelerator_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_accelerator_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Capture the decode step (one token per request) per batch-size</span>
 <span class="sd">        bucket; prefills run eager (they are one-shot and shape-varied)."""</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_CUDA_GRAPH"</span><span class="p">):</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">accelerator_graph</span>
+            <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_DISABLE_ACCELERATOR_GRAPH"</span><span class="p">)</span>
+        <span class="p">):</span>
             <span class="k">return</span> <span class="p">[]</span>
         <span class="n">bs_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_REASONER_CAPTURE_BS"</span><span class="p">)</span>
         <span class="n">sizes</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">bs_env</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)]</span> <span class="k">if</span> <span class="n">bs_env</span> <span class="k">else</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decode_capture_batch_sizes</span><span class="p">)</span>
@@ -4237,7 +4243,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_REASONER_COMPILE"</span><span class="p">)</span>
         <span class="n">compile_decode</span> <span class="o">=</span> <span class="p">(</span><span class="n">env</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">)</span> <span class="k">if</span> <span class="n">env</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile_reasoner_decode</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[</span>
-            <span class="n">BatchedCudaGraphConfig</span><span class="p">(</span>
+            <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">(</span>
                 <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">REASONER_DECODE_WALK</span><span class="p">,</span>
                 <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">ARNodeInputs</span><span class="p">(</span>
                     <span class="n">input_ids</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>

@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -907,12 +909,16 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">SINK_PAGE</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">KVPlanOutputs</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">StepContext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">StepContext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.h2d</span><span class="w"> </span><span class="kn">import</span> <span class="n">PinnedStager</span>
 
 
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
@@ -931,7 +937,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="XPUPagedPlan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan">[docs]</a>
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">XPUPagedPlan</span><span class="p">:</span>
     <span class="n">block_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
     <span class="n">cu_q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
@@ -951,10 +957,17 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">kv_cache</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+        <span class="n">kv_config</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span> <span class="o">=</span> <span class="n">kv_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">XPUPagedPlan</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plans</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">XPUPagedPlan</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_batched_buckets</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">XPUPagedPlan</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stagers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PinnedStager</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="XPUPagedAttentionManager.depends_on">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.depends_on">[docs]</a>
@@ -962,30 +975,92 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">}</span></div>
 
 
+<div class="viewcode-block" id="XPUPagedAttentionManager.build_accelerator_graph_buffers">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.build_accelerator_graph_buffers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build_accelerator_graph_buffers</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">slots</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">],</span> <span class="n">max_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Graph configs import resources, so defer this import.</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+            <span class="n">AcceleratorGraphConfigType</span><span class="p">,</span>
+            <span class="n">PiecewiseConfigType</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">del</span> <span class="n">max_bs</span><span class="p">,</span> <span class="n">max_seq_len</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_batched_buckets</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+            <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slots</span>
+            <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="ow">in</span> <span class="p">(</span>
+                <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span><span class="p">,</span>
+                <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">BATCHED</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="XPUPagedAttentionManager.plan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.plan">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-                <span class="s2">"xpu_paged attention is eager-only: its plan metadata is "</span>
-                <span class="s2">"rebuilt for every step and does not have capture-stable addresses"</span>
-            <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
+        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
+        <span class="k">assert</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="ow">or</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">"preplan requires an accelerator graph step"</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">return</span>
+
         <span class="n">plan_outputs</span><span class="p">:</span> <span class="n">KVPlanOutputs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">plan_outputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
             <span class="sa">f</span><span class="s2">"XPU attention expected plan result from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-        <span class="p">}</span></div>
+        <span class="n">plan_states</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span>
+        <span class="p">)</span>
+        <span class="n">plan_states</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="c1"># Only fixed-length batched recipes can use the dummy row's bound.</span>
+            <span class="c1"># Packed replays may put every query in one request.</span>
+            <span class="n">max_q</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span>
+                <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_batched_buckets</span>
+                <span class="k">else</span> <span class="kc">None</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">plan</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">graph_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">key</span> <span class="o">=</span> <span class="n">CGSlotKey</span><span class="p">(</span>
+                    <span class="n">bucket</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">label</span>
+                <span class="p">)</span>
+                <span class="n">plan</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span>
+                    <span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">graph_mode</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">max_q</span><span class="o">=</span><span class="n">max_q</span><span class="p">,</span>
+                    <span class="n">out</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_cg_plans</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plans</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">plan</span>
+            <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">plan</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="XPUPagedAttentionManager.clear_preplan">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.clear_preplan">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_plan</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">graph_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">max_q</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">out</span><span class="p">:</span> <span class="n">XPUPagedPlan</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">XPUPagedPlan</span><span class="p">:</span>
         <span class="n">views</span> <span class="o">=</span> <span class="n">kv_out</span><span class="o">.</span><span class="n">views</span>
         <span class="n">max_blocks</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">)</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="n">views</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">graph_mode</span><span class="p">:</span>
+            <span class="n">max_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">max_num_pages</span>
         <span class="n">block_table</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span>
             <span class="o">+</span> <span class="p">[</span><span class="n">SINK_PAGE</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">max_blocks</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">))</span>
@@ -998,12 +1073,41 @@ window.runMermaid = runMermaid;</script>
             <span class="n">cu_q</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cu_q</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">view</span><span class="o">.</span><span class="n">to_compute</span><span class="p">)</span>
             <span class="n">kv_lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">graph_mode</span><span class="p">:</span>
+            <span class="n">metadata</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">"block_table"</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">block_table</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                <span class="s2">"cu_q"</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                <span class="s2">"host_kv_lens"</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+            <span class="p">}</span>
+            <span class="k">if</span> <span class="n">out</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">out</span> <span class="o">=</span> <span class="n">XPUPagedPlan</span><span class="p">(</span>
+                    <span class="o">**</span><span class="p">{</span>
+                        <span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">values</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">values</span> <span class="ow">in</span> <span class="n">metadata</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                    <span class="p">},</span>
+                    <span class="n">max_q</span><span class="o">=</span><span class="n">max_q</span> <span class="k">if</span> <span class="n">max_q</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">max</span><span class="p">((</span><span class="n">view</span><span class="o">.</span><span class="n">to_compute</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="n">views</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>
+                    <span class="n">max_k</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">max_num_pages</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+                    <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">values</span> <span class="ow">in</span> <span class="n">metadata</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">dst</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span> <span class="o">!=</span> <span class="n">values</span><span class="o">.</span><span class="n">shape</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"XPU graph </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> shape changed from "</span>
+                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">values</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="p">)</span>
+                <span class="n">stager</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stagers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">stager</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">stager</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stagers</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">PinnedStager</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">numel</span><span class="o">=</span><span class="n">values</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+                <span class="c1"># The stager fences its host ring before reusing a copy source.</span>
+                <span class="n">stager</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">dst</span><span class="p">,</span> <span class="n">values</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+            <span class="k">return</span> <span class="n">out</span>
+
         <span class="k">return</span> <span class="n">XPUPagedPlan</span><span class="p">(</span>
             <span class="n">block_table</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
                 <span class="n">block_table</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
             <span class="p">),</span>
             <span class="n">cu_q</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">),</span>
-            <span class="c1"># vllm-xpu-kernels consumes KV lengths from host memory.</span>
             <span class="n">host_kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
             <span class="n">max_q</span><span class="o">=</span><span class="nb">max</span><span class="p">((</span><span class="n">view</span><span class="o">.</span><span class="n">to_compute</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="n">views</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>
             <span class="n">max_k</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>

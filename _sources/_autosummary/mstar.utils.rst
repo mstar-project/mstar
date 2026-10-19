@@ -31,6 +31,7 @@
    attention
    causal_conv1d
    containers
+   device
    exitcode
    fast_tokenize
    fused_moe

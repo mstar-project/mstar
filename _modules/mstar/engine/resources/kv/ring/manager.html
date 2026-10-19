@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -1355,9 +1357,9 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># `supports_preplan` stays the inherited False.</span>
 
-<div class="viewcode-block" id="RingKVManager.build_cuda_graph_buffers">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.ring.manager.html#mstar.engine.resources.kv.ring.RingKVManager.build_cuda_graph_buffers">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">build_cuda_graph_buffers</span><span class="p">(</span>
+<div class="viewcode-block" id="RingKVManager.build_accelerator_graph_buffers">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.ring.manager.html#mstar.engine.resources.kv.ring.RingKVManager.build_accelerator_graph_buffers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build_accelerator_graph_buffers</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">slots</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">],</span> <span class="n">max_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""No-op: every buffer a replay touches was allocated at ``build``,</span>
@@ -1374,20 +1376,20 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"ring KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> is still claimed by </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="p">)</span><span class="si">}</span><span class="s2"> "</span>
-                <span class="s2">"after CUDA graph capture; a capture dummy rid was never reset, "</span>
+                <span class="s2">"after accelerator graph capture; a capture dummy rid was never reset, "</span>
                 <span class="s2">"and the session it holds is gone from the pool for good."</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_sessions</span><span class="p">)</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"ring KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> has </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_sessions</span><span class="p">)</span><span class="si">}</span><span class="s2"> of "</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="si">}</span><span class="s2"> sessions free after CUDA graph capture; a session "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="si">}</span><span class="s2"> sessions free after accelerator graph capture; a session "</span>
                 <span class="s2">"was zeroed and never returned to the pool, so the node has "</span>
                 <span class="s2">"silently lost concurrency."</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_frames</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"ring KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> recorded committed frames "</span>
-                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_frames</span><span class="o">.</span><span class="n">items</span><span class="p">())</span><span class="si">}</span><span class="s2">) during CUDA graph capture; "</span>
+                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_frames</span><span class="o">.</span><span class="n">items</span><span class="p">())</span><span class="si">}</span><span class="s2">) during accelerator graph capture; "</span>
                 <span class="s2">"capture drives admit and plan but must never commit, and the "</span>
                 <span class="s2">"first real request will be refused at admit unless it happens to "</span>
                 <span class="s2">"declare the very next frame."</span>

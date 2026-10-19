@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mstar.engine.cuda_graph_runner &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.engine.accelerator_graph_runner &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -403,7 +403,7 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/cuda_graph_runner';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/accelerator_graph_runner';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" />
@@ -594,8 +594,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -721,6 +722,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -824,7 +826,7 @@ window.runMermaid = runMermaid;</script>
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/cuda_graph_runner.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/accelerator_graph_runner.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -901,7 +903,7 @@ window.runMermaid = runMermaid;</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>Source code for mstar.engine.cuda_graph_runner</h1><div class="highlight"><pre>
+  <h1>Source code for mstar.engine.accelerator_graph_runner</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
@@ -912,18 +914,23 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">JointGroups</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">CudaGraphConfig</span><span class="p">,</span>
-    <span class="n">CudaGraphConfigType</span><span class="p">,</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_backend</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">AcceleratorGraphPool</span><span class="p">,</span>
+    <span class="n">CapturedGraph</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">AcceleratorGraphConfigType</span><span class="p">,</span>
+    <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
     <span class="n">PiecewiseCallInputs</span><span class="p">,</span>
     <span class="n">PiecewiseCaptureShape</span><span class="p">,</span>
     <span class="n">PiecewiseConfigType</span><span class="p">,</span>
-    <span class="n">PiecewiseCudaGraphConfig</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">StepRunner</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedModelOutput</span><span class="p">,</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms.compile</span><span class="w"> </span><span class="kn">import</span> <span class="n">with_inductor_overrides</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">profiler</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.device</span><span class="w"> </span><span class="kn">import</span> <span class="n">DeviceCapability</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -931,9 +938,19 @@ window.runMermaid = runMermaid;</script>
 <span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">]</span>
 
 
+<div class="viewcode-block" id="blocked_capture_resources">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.blocked_capture_resources">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">blocked_capture_resources</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Return resource keys that prevent capture of the declared step."""</span>
+    <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">can_capture</span><span class="p">())</span></div>
+
+
+
 <div class="viewcode-block" id="autocast_scope">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.autocast_scope">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">autocast_scope</span><span class="p">(</span><span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">device_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"cuda"</span><span class="p">):</span>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.autocast_scope">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">autocast_scope</span><span class="p">(</span><span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">device_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""A forward's autocast scope; ``None`` (``disable_autocast``) runs the</span>
 <span class="sd">    submodule in its own dtype and shuts out any ambient autocast."""</span>
     <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">amp</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span>
@@ -943,7 +960,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="agree_across_ranks">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.agree_across_ranks">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.agree_across_ranks">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">agree_across_ranks</span><span class="p">(</span>
     <span class="n">comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">flags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]:</span>
@@ -983,7 +1000,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="dummy_rid_handle">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_handle">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_rid_handle">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">dummy_rid_handle</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
     <span class="n">handle</span> <span class="o">=</span> <span class="n">_dummy_handles</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">handle</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -994,7 +1011,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="dummy_rid_name">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_name">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_rid_name">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">dummy_rid_name</span><span class="p">(</span><span class="n">handle</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The name a padding-row handle was minted from. Debug/logging only."""</span>
     <span class="k">return</span> <span class="n">_dummy_names</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"__cg_unknown_</span><span class="si">{</span><span class="n">handle</span><span class="si">}</span><span class="s2">__"</span><span class="p">)</span></div>
@@ -1002,7 +1019,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="dummy_metadata">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_metadata">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.dummy_metadata">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">dummy_metadata</span><span class="p">(</span>
     <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]:</span>
@@ -1021,8 +1038,8 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="capture_into_graph">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_into_graph">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_into_graph">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` into a new CUDA graph allocated from ``pool``.</span>
 
 <span class="sd">    Returns the graph and what ``run`` returned. A capture that fails part</span>
@@ -1039,26 +1056,29 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    before it compiles, which CUDA refuses during capture, so such a capture</span>
 <span class="sd">    cannot succeed and would otherwise die with an unrelated error.</span>
 <span class="sd">    """</span>
-    <span class="n">prev_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-    <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+    <span class="n">backend</span> <span class="o">=</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">graph_backend</span>
+    <span class="k">if</span> <span class="n">backend</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Accelerator graphs are unsupported on device </span><span class="si">{</span><span class="n">device</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="n">prev_stream</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+    <span class="n">graph</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">create_graph</span><span class="p">()</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">set_stance</span><span class="p">(</span><span class="s2">"fail_on_recompile"</span><span class="p">),</span> \
-                <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">):</span>
-            <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="n">pool</span><span class="p">):</span>
+                <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">backend</span><span class="o">.</span><span class="n">device_type</span><span class="p">):</span>
+            <span class="k">with</span> <span class="n">backend</span><span class="o">.</span><span class="n">capture</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="n">pool</span><span class="p">):</span>
                 <span class="n">output</span> <span class="o">=</span> <span class="n">run</span><span class="p">()</span>
     <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_stream</span><span class="p">(</span><span class="n">prev_stream</span><span class="p">)</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-        <span class="n">_stop_recording_to_pool</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span>
+        <span class="n">pool</span><span class="o">.</span><span class="n">on_failure</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span>
+        <span class="n">backend</span><span class="o">.</span><span class="n">recover_failed_capture</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">prev_stream</span><span class="p">)</span>
         <span class="k">raise</span>
-    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+    <span class="n">pool</span><span class="o">.</span><span class="n">on_success</span><span class="p">()</span>
     <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">output</span></div>
 
 
 
 <div class="viewcode-block" id="capture_with_static_outputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_with_static_outputs">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_with_static_outputs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.</span>
 
 <span class="sd">    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:</span>
@@ -1092,40 +1112,27 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="fail_if_graphs_required">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.fail_if_graphs_required">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.fail_if_graphs_required">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">fail_if_graphs_required</span><span class="p">(</span><span class="n">missing</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup</span>
 <span class="sd">    failure, for deployments that would rather not come up than serve the</span>
 <span class="sd">    eager path at 10-20x the latency."""</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">missing</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_REQUIRE_CUDA_GRAPHS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"1"</span><span class="p">:</span>
+    <span class="n">required</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_REQUIRE_ACCELERATOR_GRAPHS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">missing</span> <span class="ow">or</span> <span class="n">required</span> <span class="o">!=</span> <span class="s2">"1"</span><span class="p">:</span>
         <span class="k">return</span>
     <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-        <span class="s2">"CUDA graph capture failed for "</span> <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span>
-        <span class="o">+</span> <span class="s2">" and MSTAR_REQUIRE_CUDA_GRAPHS=1"</span>
+        <span class="s2">"accelerator graph capture failed for "</span> <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span>
+        <span class="o">+</span> <span class="s2">" and accelerator graphs are required"</span>
     <span class="p">)</span></div>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_stop_recording_to_pool</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">end</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="p">,</span> <span class="s2">"_cuda_endAllocateToPool"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">end</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span>
-    <span class="n">index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">index</span>
-    <span class="k">if</span> <span class="n">index</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">end</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
-        <span class="c1"># the capture failed before the allocator started recording</span>
-        <span class="k">pass</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_is_packed</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">CudaGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-    <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">CudaGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_packed</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">AcceleratorGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span>
 
 
 <div class="viewcode-block" id="DummyRowPool">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DummyRowPool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The padding rows captured replays pad onto.</span>
 
@@ -1145,7 +1152,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="DummyRowPool.handles">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.handles">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.handles">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">handles</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""``bs`` padding-row handles for ``key``. Negative and stable per</span>
 <span class="sd">        (prefix, key, index), so they never collide with a real request's</span>
@@ -1157,7 +1164,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="DummyRowPool.ensure">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.ensure">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.ensure">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ensure</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""</span>
         <span class="n">held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">[])</span>
@@ -1169,7 +1176,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="DummyRowPool.reset">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.reset">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.reset">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">reset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
@@ -1177,7 +1184,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="DummyRowPool.release_all">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.release_all">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.DummyRowPool.release_all">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">release_all</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Hand back every padding row's storage once capture is done: a</span>
 <span class="sd">        replay pads with zero-length rows, so it is capture-time residue."""</span>
@@ -1187,10 +1194,10 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="CudaGraphSlot">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphSlot">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphSlot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot">[docs]</a>
 <span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphSlot</span><span class="p">:</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphSlot</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""One captured graph + the buffers its replay reads and writes.</span>
 
 <span class="sd">    Double-buffer: a bucket holds one of these per slot. Replay alternates</span>
@@ -1198,7 +1205,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    concurrently with replay(N) on the active slot — so a node with nothing</span>
 <span class="sd">    to pre-plan keeps a single slot.</span>
 <span class="sd">    """</span>
-    <span class="n">graph</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span>
+    <span class="n">graph</span><span class="p">:</span> <span class="n">CapturedGraph</span>
     <span class="c1"># preprocess output as captured; tensor entries are the static buffers</span>
     <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
     <span class="n">static_input_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
@@ -1210,20 +1217,20 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="CudaGraphBucket">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphBucket">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphBucket">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket">[docs]</a>
 <span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphBucket</span><span class="p">:</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphBucket</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The captured slots for one (walk, cg_key_info, bs, num_tokens)."""</span>
-    <span class="n">config</span><span class="p">:</span> <span class="n">CudaGraphConfig</span>
+    <span class="n">config</span><span class="p">:</span> <span class="n">AcceleratorGraphConfig</span>
     <span class="n">config_idx</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">slots</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CudaGraphSlot</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+    <span class="n">slots</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">AcceleratorGraphSlot</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 
 
-<div class="viewcode-block" id="CudaGraphRunner">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphRunner</span><span class="p">:</span>
+<div class="viewcode-block" id="AcceleratorGraphRunner">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphRunner</span><span class="p">:</span>
     <span class="n">CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span>
     <span class="n">NUM_WARMUP</span> <span class="o">=</span> <span class="mi">2</span>
 
@@ -1238,17 +1245,22 @@ window.runMermaid = runMermaid;</script>
         <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span><span class="p">,</span>
         <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">device_capability</span><span class="p">:</span> <span class="n">DeviceCapability</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span> <span class="o">=</span> <span class="n">submodule_name</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_submodule</span> <span class="o">=</span> <span class="n">submodule</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="o">=</span> <span class="n">joint_comm_group</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_configs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CudaGraphConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">submodule</span><span class="o">.</span><span class="n">get_cuda_graph_configs</span><span class="p">(</span>
-            <span class="n">device</span><span class="p">,</span> <span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_configs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">AcceleratorGraphConfig</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">submodule</span><span class="o">.</span><span class="n">get_accelerator_graph_configs</span><span class="p">(</span>
+                <span class="n">device</span><span class="p">,</span> <span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span>
+            <span class="p">)</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span> <span class="o">=</span> <span class="n">resources</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span> <span class="o">=</span> <span class="n">step_runner</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_device_capability</span> <span class="o">=</span> <span class="n">device_capability</span> <span class="ow">or</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span> <span class="ow">or</span> <span class="s2">"cpu"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device_capability</span><span class="o">.</span><span class="n">graph_backend</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span> <span class="o">=</span> <span class="n">autocast_dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
 
@@ -1257,11 +1269,12 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># hold identical graphs and double the capture time and memory.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="n">num_slots</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CudaGraphBucket</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">AcceleratorGraphBucket</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># buckets that failed to capture (here or on a peer rank) and run eagerly</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_blocked_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># set by prepare_for_capture; capture reuses it rather than re-deriving</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -1293,7 +1306,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Plan-overlap stream. Lazily created the first time pre_plan</span>
         <span class="c1"># is called from Worker.plan_executor.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="c1"># Per-bucket template rows for declare-only calls; see</span>
         <span class="c1"># `declare_inputs_for`.</span>
@@ -1308,7 +1321,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">any_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_batch_sizes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">CudaGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_batch_sizes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">AcceleratorGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="n">capture_batch_sizes</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">CAPTURE_BATCH_SIZES</span>
 
     <span class="c1"># ── Capture ─────────────────────────────────────────────────────────</span>
@@ -1341,8 +1354,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">walk</span> <span class="o">!=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">capture_graph_walk</span>
         <span class="p">]</span>
 
-<div class="viewcode-block" id="CudaGraphRunner.prepare_for_capture">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.prepare_for_capture">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.prepare_for_capture">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.prepare_for_capture">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_for_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Claim the static buffers this runner's captures will read.</span>
 
@@ -1354,28 +1367,61 @@ window.runMermaid = runMermaid;</script>
             <span class="n">slot_specs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_slot_specs</span><span class="p">()</span>
             <span class="c1"># reverse sort based on batch size, then total tokens (largest first)</span>
             <span class="n">slot_specs</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">),</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">blocked_configs</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="n">checked_configs</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span> <span class="ow">in</span> <span class="n">checked_configs</span><span class="p">:</span>
+                    <span class="k">continue</span>
+                <span class="n">checked_configs</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">)</span>
+                <span class="n">rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="si">}</span><span class="s2">_slot0"</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bs</span><span class="p">)</span>
+                <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
+                    <span class="n">graph_walk</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span>
+                    <span class="n">request_ids</span><span class="o">=</span><span class="n">rids</span><span class="p">,</span>
+                    <span class="n">inputs</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">get_node_inputs</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">),</span>
+                    <span class="n">slot_lease</span><span class="o">=</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">),</span>
+                    <span class="n">per_request_info</span><span class="o">=</span><span class="n">dummy_metadata</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">),</span>
+                <span class="p">)</span>
+                <span class="n">blocked</span> <span class="o">=</span> <span class="n">blocked_capture_resources</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">blocked</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                        <span class="s2">"Dropping accelerator graph config </span><span class="si">%s</span><span class="s2"> for </span><span class="si">%s</span><span class="s2">: "</span>
+                        <span class="s2">"resources cannot capture: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                        <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="n">blocked</span><span class="p">,</span>
+                    <span class="p">)</span>
+                    <span class="n">blocked_configs</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_blocked_buckets</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span>
+                <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span> <span class="ow">in</span> <span class="n">blocked_configs</span>
+            <span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_blocked_buckets</span><span class="p">)</span>
+            <span class="n">slot_specs</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">blocked_configs</span>
+            <span class="p">]</span>
             <span class="n">max_seq_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span>
                 <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span>
             <span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">build_cuda_graph_buffers</span><span class="p">(</span>
-                <span class="n">slot_specs</span><span class="p">,</span> <span class="n">max_bs</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_bs</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
-                <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
-            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">slot_specs</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">build_accelerator_graph_buffers</span><span class="p">(</span>
+                    <span class="n">slot_specs</span><span class="p">,</span> <span class="n">max_bs</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_bs</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
+                    <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
+                <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span> <span class="o">=</span> <span class="n">slot_specs</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.warmup_and_capture">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.warmup_and_capture">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.warmup_and_capture">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Capture graphs for all configs and batch sizes."""</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"CUDA not available, skipping graph capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"</span><span class="si">%s</span><span class="s2"> is not available, skipping graph capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="s2">"type"</span><span class="p">,</span> <span class="s2">"accelerator"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">(),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="k">return</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graphs</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
-        <span class="n">mem_before</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
+        <span class="n">mem_before</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>
 
         <span class="n">slot_specs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">()</span>
 
@@ -1383,7 +1429,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># deferred to a whole bucket at a time: its slots are double buffers of</span>
         <span class="c1"># one shape, so a bucket holding only some of them would silently hand</span>
         <span class="c1"># pre-plan and replay the same buffers.</span>
-        <span class="n">captured</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">CudaGraphSlot</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">captured</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">AcceleratorGraphSlot</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span><span class="p">:</span>
             <span class="c1"># every rank barriers once per spec, pass or fail — a rank that</span>
             <span class="c1"># stopped early here would leave the others waiting</span>
@@ -1394,7 +1440,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">spec</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                    <span class="s2">"Failed to capture CUDA graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                    <span class="s2">"Failed to capture accelerator graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="n">spec</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span>
                 <span class="p">)</span>
                 <span class="k">continue</span>
@@ -1402,7 +1448,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">captured</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="p">{})[</span><span class="n">spec</span><span class="o">.</span><span class="n">slot</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
             <span class="k">if</span>  <span class="nb">len</span><span class="p">(</span><span class="n">captured</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">])</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">"Captured CUDA graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> slots)"</span><span class="p">,</span>
+                    <span class="s2">"Captured accelerator graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> slots)"</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span>
                 <span class="p">)</span>
 
@@ -1410,7 +1456,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="n">captured</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">bucket_key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">agreed</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                    <span class="s2">"Dropping CUDA graph bucket </span><span class="si">%s</span><span class="s2"> for </span><span class="si">%s</span><span class="s2">: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"Dropping accelerator graph bucket </span><span class="si">%s</span><span class="s2"> for </span><span class="si">%s</span><span class="s2">: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> "</span>
                     <span class="s2">"slots here, or fewer on another rank"</span><span class="p">,</span>
                     <span class="n">bucket_key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">slots</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">,</span>
                 <span class="p">)</span>
@@ -1429,7 +1475,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">slot</span> <span class="o">==</span> <span class="mi">0</span><span class="p">],</span> <span class="n">agreed</span>
         <span class="p">)</span>
 
-        <span class="n">mem_after</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+        <span class="n">mem_after</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_log_memory</span><span class="p">(</span><span class="n">mem_before</span><span class="p">,</span> <span class="n">mem_after</span><span class="p">)</span></div>
 
 
@@ -1437,10 +1483,11 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Say loudly which buckets run eagerly. A dropped bucket is a silent</span>
 <span class="sd">        10-20x latency cliff otherwise, and one failure used to take every</span>
 <span class="sd">        later bucket with it."""</span>
+        <span class="n">wanted</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">([</span><span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_blocked_buckets</span><span class="p">,</span> <span class="o">*</span><span class="n">wanted</span><span class="p">]))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span> <span class="o">=</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">wanted</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kept</span><span class="p">]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                <span class="s2">"CudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> buckets; these run "</span>
+                <span class="s2">"AcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> buckets; these run "</span>
                 <span class="s2">"eagerly: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">),</span>
                 <span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">,</span>
@@ -1473,10 +1520,10 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="k">return</span> <span class="p">{</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">ok</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">order</span><span class="p">,</span> <span class="n">agreed</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="k">if</span> <span class="n">ok</span><span class="p">}</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_register_slot</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="n">CudaGraphSlot</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_register_slot</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="n">AcceleratorGraphSlot</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">bucket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">bucket</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">bucket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">CudaGraphBucket</span><span class="p">(</span>
+            <span class="n">bucket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">AcceleratorGraphBucket</span><span class="p">(</span>
                 <span class="n">config</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">config_idx</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="c1"># the caller registers a bucket's slots in index order, and only once</span>
@@ -1491,10 +1538,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># for the buffer-reuse change in isolation) and the actual GPU delta</span>
         <span class="c1"># (covers FlashInfer wrappers + dummy KV state too, but is noisier).</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-            <span class="s2">"CudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: warmup_and_capture done. "</span>
+            <span class="s2">"AcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: warmup_and_capture done. "</span>
             <span class="s2">"shared_static_buffers: </span><span class="si">%d</span><span class="s2"> entries, </span><span class="si">%.2f</span><span class="s2"> MB resident "</span>
             <span class="s2">"(would have been </span><span class="si">%.2f</span><span class="s2"> MB with per-capture clones — saved </span><span class="si">%.2f</span><span class="s2"> MB). "</span>
-            <span class="s2">"Total cuda alloc delta during warmup: </span><span class="si">%.2f</span><span class="s2"> MB."</span><span class="p">,</span>
+            <span class="s2">"Total accelerator alloc delta during warmup: </span><span class="si">%.2f</span><span class="s2"> MB."</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
             <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_shared_static_buffers</span><span class="p">),</span>
             <span class="n">shared_bytes</span> <span class="o">/</span> <span class="p">(</span><span class="mi">1024</span> <span class="o">**</span> <span class="mi">2</span><span class="p">),</span>
@@ -1503,7 +1550,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="n">mem_after</span> <span class="o">-</span> <span class="n">mem_before</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="mi">1024</span> <span class="o">**</span> <span class="mi">2</span><span class="p">),</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphSlot</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphSlot</span><span class="p">:</span>
         <span class="n">walk</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
         <span class="n">dummy_rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">ensure</span><span class="p">(</span>
@@ -1570,16 +1617,16 @@ window.runMermaid = runMermaid;</script>
                     <span class="o">**</span><span class="n">static_inputs</span><span class="p">,</span>
                 <span class="p">)</span>
 
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">set_device</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
             <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">):</span>
-                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">):</span>
+                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
                     <span class="n">run_forward</span><span class="p">()</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
                 <span class="c1"># capture after it) sees the same shapes the first prepare did</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
                 <span class="n">prepare</span><span class="p">()</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
             <span class="n">graph</span><span class="p">,</span> <span class="n">output</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
                 <span class="n">run_forward</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
@@ -1697,9 +1744,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_slot_from_capture</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">output</span><span class="p">,</span> <span class="n">graph</span><span class="p">,</span> <span class="n">static_inputs</span><span class="p">,</span> <span class="n">static_input_keys</span><span class="p">,</span>
         <span class="n">dummy_rids</span><span class="p">,</span> <span class="n">dummy_metadata</span><span class="p">,</span> <span class="n">config_idx</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphSlot</span><span class="p">:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphSlot</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Wrap one slot's capture artifacts into a CudaGraphSlot."""</span>
-        <span class="k">return</span> <span class="n">CudaGraphSlot</span><span class="p">(</span>
+        <span class="k">return</span> <span class="n">AcceleratorGraphSlot</span><span class="p">(</span>
             <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
             <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
             <span class="n">static_input_keys</span><span class="o">=</span><span class="n">static_input_keys</span><span class="p">,</span>
@@ -1711,8 +1758,8 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ── Replay ──────────────────────────────────────────────────────────</span>
 
-<div class="viewcode-block" id="CudaGraphRunner.select_bucket">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.select_bucket">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.select_bucket">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_bucket">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">select_bucket</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1737,8 +1784,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">best</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.select_batched_bucket">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.select_batched_bucket">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.select_batched_bucket">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_batched_bucket">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">select_batched_bucket</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BucketKey</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -1760,7 +1807,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">continue</span>
             <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">bs</span> <span class="o">&lt;</span> <span class="n">bs</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">bucket</span><span class="o">.</span><span class="n">slots</span><span class="p">:</span>
                 <span class="k">continue</span>
-            <span class="k">if</span> <span class="n">bucket</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">!=</span> <span class="n">CudaGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">bucket</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">!=</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span><span class="p">:</span>
                 <span class="k">continue</span>
             <span class="c1"># the config's own token count for this padded batch; a bucket</span>
             <span class="c1"># whose num_tokens says otherwise belongs to a different capture</span>
@@ -1771,8 +1818,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">best</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.captures_walk">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.captures_walk">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.captures_walk">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.captures_walk">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">captures_walk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether any capture replays this walk."""</span>
         <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
@@ -1781,8 +1828,8 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.max_batch_size_for">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.max_batch_size_for">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.max_batch_size_for">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_batch_size_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Largest batch this walk was captured for, or None for no cap.</span>
 
@@ -1799,8 +1846,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="n">capped</span><span class="p">)</span> <span class="k">if</span> <span class="n">capped</span> <span class="k">else</span> <span class="kc">None</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.can_run">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.can_run">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.can_run">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">can_run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1810,15 +1857,15 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.is_packed">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.is_packed">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.is_packed">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_packed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether ``lease`` replays a packed capture."""</span>
         <span class="k">return</span> <span class="n">_is_packed</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">config</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.lease_slot">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.lease_slot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.lease_slot">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">lease_slot</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1856,20 +1903,20 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.slot_for">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.slot_for">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">slot_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphSlot</span><span class="p">:</span>
+<div class="viewcode-block" id="AcceleratorGraphRunner.slot_for">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">slot_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphSlot</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">slots</span><span class="p">[</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.config_for">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">config_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CudaGraphConfig</span><span class="p">:</span>
+<div class="viewcode-block" id="AcceleratorGraphRunner.config_for">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.config_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">config_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphConfig</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">config</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.declare_inputs_for">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.declare_inputs_for">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.declare_inputs_for">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">declare_inputs_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Template rows for a declare-only call, cached per bucket.</span>
 
@@ -1889,8 +1936,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">cached</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.pad_inputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.pad_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.pad_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">pad_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]:</span>
@@ -1906,8 +1953,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">[</span><span class="o">*</span><span class="n">inputs</span><span class="p">,</span> <span class="o">*</span><span class="n">padding</span><span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.step_ids">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_ids">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.step_ids">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_ids">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">step_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""The padded addressing for one step: real ids first, then the slot's</span>
 <span class="sd">        padding ids. Plans, commits, and advances address real request state by</span>
@@ -1916,8 +1963,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">[</span><span class="o">*</span><span class="n">request_ids</span><span class="p">,</span> <span class="o">*</span><span class="n">dummy_rids</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">):</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">bs</span><span class="p">]]</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.step_metadata">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_metadata">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.step_metadata">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_metadata">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">step_metadata</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">per_request_info</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
@@ -1957,11 +2004,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">profiler</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">slot</span><span class="o">.</span><span class="n">static_outputs</span>
 
-<div class="viewcode-block" id="CudaGraphRunner.run_forward">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.run_forward">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.run_forward">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.run_forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">run_forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">preprocessed</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span>
-        <span class="n">plan_done_event</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">plan_done_event</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">launch_started_event</span><span class="p">:</span> <span class="s2">"threading.Event | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Stage this step's inputs into the slot and replay it.</span>
@@ -1978,14 +2025,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        """</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stage</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">preprocessed</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">plan_done_event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">plan_done_event</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">plan_done_event</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">launch_started_event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">launch_started_event</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_replay</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.release">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.release">[docs]</a>
+<div class="viewcode-block" id="AcceleratorGraphRunner.release">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.release">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Return the padding rows to their at-rest state after a step.</span>
 
@@ -1997,9 +2044,9 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">[</span><span class="n">real_bs</span><span class="p">:</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">bs</span><span class="p">],</span> <span class="n">free</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CudaGraphRunner.plan_stream">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.plan_stream">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">plan_stream</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<div class="viewcode-block" id="AcceleratorGraphRunner.plan_stream">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.plan_stream">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan_stream</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Dedicated stream for pre-planning.</span>
 
 <span class="sd">        Pre-plan must not submit onto the default stream: whether its memcpys</span>
@@ -2008,10 +2055,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        event past pre-plan's own kernels. Its own stream keeps the two</span>
 <span class="sd">        independent; a plan-done event gates the replay that reads the buffers.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">new_stream</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stream</span></div>
 </div>
 
@@ -2025,11 +2072,11 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseGraphData">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphData">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseGraphData</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""One captured region, for one (bs, total_tokens) bucket."""</span>
-    <span class="n">graph</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span>
+    <span class="n">graph</span><span class="p">:</span> <span class="n">CapturedGraph</span>
     <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
     <span class="n">static_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
     <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
@@ -2039,7 +2086,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseOutput">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseOutput</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Dict-like view over a captured region's output buffers.</span>
 
@@ -2058,7 +2105,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span>
 
 <div class="viewcode-block" id="PiecewiseOutput.keys">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.keys">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.keys">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">keys</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span></div>
 
@@ -2067,7 +2114,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="n">key</span><span class="p">][:</span><span class="bp">self</span><span class="o">.</span><span class="n">_real_len</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
 
 <div class="viewcode-block" id="PiecewiseOutput.get">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.get">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.get">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -2076,7 +2123,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseOutput.get_view">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseOutput.get_view">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseOutput.get_view">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_view</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""The leading ``real_len`` slice WITHOUT copying.</span>
 
@@ -2095,7 +2142,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="PiecewiseGraphKey">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey">[docs]</a>
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseGraphKey">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseGraphKey</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
     <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span>
@@ -2103,9 +2150,9 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseCudaGraphRunner</span><span class="p">:</span>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseAcceleratorGraphRunner</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Captures one inner callable of a submodule's forward as a CUDA graph.</span>
 
 <span class="sd">    Where ``CudaGraphRunner`` replays a whole ``forward_batched`` under engine</span>
@@ -2124,7 +2171,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="n">config</span><span class="p">:</span> <span class="n">PiecewiseCudaGraphConfig</span><span class="p">,</span>
+        <span class="n">config</span><span class="p">:</span> <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
         <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">],</span>
         <span class="n">step_runner</span><span class="p">:</span> <span class="n">StepRunner</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
@@ -2132,13 +2179,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">memory_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">memory_pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">device_capability</span><span class="p">:</span> <span class="n">DeviceCapability</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_label</span> <span class="o">=</span> <span class="n">label</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span> <span class="o">=</span> <span class="n">resources</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span> <span class="o">=</span> <span class="n">step_runner</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_device_capability</span> <span class="o">=</span> <span class="n">device_capability</span> <span class="ow">or</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span> <span class="ow">or</span> <span class="s2">"cpu"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device_capability</span><span class="o">.</span><span class="n">graph_backend</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span> <span class="o">=</span> <span class="n">autocast_dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="o">=</span> <span class="n">joint_comm_group</span>
         <span class="c1"># scopes buffer allocation; `label` carries it but mangled with the region</span>
@@ -2182,8 +2232,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span>
                 <span class="k">return</span>
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.set_slot">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.set_slot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.set_slot">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_slot</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span> <span class="o">=</span> <span class="n">slot</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span></div>
 
@@ -2208,15 +2258,29 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ── Capture ─────────────────────────────────────────────────────────</span>
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.prepare_for_capture">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.prepare_for_capture">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.prepare_for_capture">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_for_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Claim this region's static buffers; see ``CudaGraphRunner``."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_shapes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_size_slots</span><span class="p">()</span>
             <span class="n">shapes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">shapes</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">shape</span> <span class="o">=</span> <span class="n">shapes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
+                    <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">),</span>
+                <span class="p">)</span>
+                <span class="n">blocked</span> <span class="o">=</span> <span class="n">blocked_capture_resources</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">blocked</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                        <span class="s2">"Dropping piecewise accelerator graph config </span><span class="si">%s</span><span class="s2">: "</span>
+                        <span class="s2">"resources cannot capture: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">blocked</span><span class="p">,</span>
+                    <span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span> <span class="o">=</span> <span class="p">[(</span><span class="n">s</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">)</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">shapes</span><span class="p">]</span>
+                    <span class="n">shapes</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="k">if</span> <span class="n">shapes</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">build_cuda_graph_buffers</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_size_slots</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">build_accelerator_graph_buffers</span><span class="p">(</span>
                     <span class="p">[</span>
                         <span class="n">CGSlotSpec</span><span class="p">(</span>
                             <span class="n">bucket</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span>
@@ -2233,18 +2297,20 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_shapes</span></div>
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.warmup_and_capture">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.warmup_and_capture">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">"CUDA not available, skipping piecewise capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span>
+                <span class="s2">"</span><span class="si">%s</span><span class="s2"> is not available, skipping piecewise capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="s2">"type"</span><span class="p">,</span> <span class="s2">"accelerator"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">(),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">return</span>
 
-        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">set_device</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graphs</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
 
         <span class="n">shapes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">()</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">shapes</span><span class="p">:</span>
@@ -2270,14 +2336,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
                     <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">False</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                        <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: failed to capture bs=</span><span class="si">%d</span><span class="s2"> "</span>
+                        <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: failed to capture bs=</span><span class="si">%d</span><span class="s2"> "</span>
                         <span class="s2">"total_tokens=</span><span class="si">%d</span><span class="s2"> slot=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span>
                         <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                     <span class="p">)</span>
             <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">shape_captured</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">shape_captured</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
                     <span class="s2">"(</span><span class="si">%d</span><span class="s2"> slots)"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">,</span>
                 <span class="p">)</span>
@@ -2299,14 +2365,14 @@ window.runMermaid = runMermaid;</script>
             <span class="p">]</span>
             <span class="k">if</span> <span class="n">dropped</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: dropping bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: dropping bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
                     <span class="s2">"slots=</span><span class="si">%s</span><span class="s2">, not captured on every rank / for every slot"</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">dropped</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">))</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> shapes; these "</span>
+                <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> shapes; these "</span>
                 <span class="s2">"run eagerly: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span>
                 <span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">),</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">,</span>
@@ -2338,16 +2404,16 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
             <span class="n">warm_outputs</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">):</span>
-                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">):</span>
+                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
                     <span class="n">warm_outputs</span> <span class="o">=</span> <span class="n">run_fn</span><span class="p">()</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
                 <span class="c1"># capture after it) sees the shapes the first plan did</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
             <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span> <span class="o">=</span> <span class="n">capture_with_static_outputs</span><span class="p">(</span>
                 <span class="n">run_fn</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
@@ -2488,8 +2554,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="nb">min</span><span class="p">(</span><span class="n">fits</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">key</span><span class="p">:</span> <span class="n">key</span><span class="o">.</span><span class="n">seq_len</span><span class="p">)]</span>
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.can_run">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.can_run">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.can_run">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">can_run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resolve</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span></div>
 
@@ -2499,8 +2565,8 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Whether this region takes its slot ahead of the declaration."""</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">lease_before_step</span>
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.lease_slot">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.lease_slot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.lease_slot">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">lease_slot</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SlotLease</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -2515,8 +2581,8 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="PiecewiseCudaGraphRunner.run">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.run">[docs]</a>
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.run">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.run">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>

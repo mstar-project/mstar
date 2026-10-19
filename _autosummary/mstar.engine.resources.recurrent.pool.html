@@ -241,8 +241,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
@@ -624,7 +626,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.block"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.block()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.cleanup"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.clear_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.commit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.commit()</span></code></a></li>
@@ -799,8 +801,8 @@ sized for the real concurrency.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_cuda_graph_buffers">
-<span class="sig-name descname"><span class="pre">build_cuda_graph_buffers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_bs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seq_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.build_cuda_graph_buffers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_cuda_graph_buffers" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_accelerator_graph_buffers">
+<span class="sig-name descname"><span class="pre">build_accelerator_graph_buffers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_bs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seq_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.build_accelerator_graph_buffers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_accelerator_graph_buffers" title="Link to this definition">#</a></dt>
 <dd><p>Size whatever the captured replays will read.</p>
 <p>Called once per runner that captures against this node — the whole
 forward’s, and one per piecewise region — so it must tolerate repeated
@@ -1011,7 +1013,7 @@ request’s state.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.block"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.block()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.cleanup"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.clear_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.pool.RecurrentStatePool.commit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.commit()</span></code></a></li>
