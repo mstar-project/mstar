@@ -310,6 +310,7 @@ class FlashInferPrefillWrapper:
             finally:
                 # also on a raise: copies already issued still read the pinned buffers
                 self._pinned_done.record()
+            self._pin_row_count()
             return
         self.dtype = dtype
         self._workspace.plan(
@@ -328,6 +329,7 @@ class FlashInferPrefillWrapper:
             seq_lens=kv_lens,
             window_left=window_left,
         )
+        self._pin_row_count()
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
@@ -336,6 +338,15 @@ class FlashInferPrefillWrapper:
             if qo_indptr.device.type != "cuda":
                 qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
+
+    def _pin_row_count(self) -> None:
+        # AMD's FlashInfer keeps a captured wrapper's row count as a view of the
+        # qo_indptr its first plan was given, and the staging buffer is rewritten
+        # every plan. Later plans would then be partitioned for their own row
+        # count, not the captured one.
+        rows = getattr(self.attn_wrapper, "_max_total_num_rows", None)
+        if isinstance(rows, torch.Tensor):
+            self.attn_wrapper._max_total_num_rows = int(rows)
 
     def _plan_staged(
         self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
