@@ -1009,10 +1009,10 @@ run the Python frontend for sound video.</p></li>
 <section id="request-media">
 <h2>Request media<a class="headerlink" href="#request-media" title="Link to this heading">#</a></h2>
 <p>Read by the model’s media loaders in the data worker’s preprocess thread,
-behind either frontend. All three are also checked once when the data worker
+behind either frontend. All four are also checked once when the data worker
 starts (<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_media_limits" title="mstar.model.media_limits.check_media_limits"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.check_media_limits()</span></code></a>), so an invalid
-value stops the server instead of failing every media request. The pixel caps
-hold for a request’s files together (<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.media_limits.RequestMediaBudget</span></code></a>),
+value stops the server instead of failing every media request. The pixel and
+audio caps hold for a request’s files together (<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.media_limits.RequestMediaBudget</span></code></a>),
 so attaching more files does not multiply them.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>
@@ -1050,7 +1050,18 @@ frame, as Cosmos3, when the clip’s header gives no frame count).</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">16</span></code></p></td>
 <td><p>Images, audio clips and videos one request may attach, together (see
 <a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_media_files" title="mstar.model.media_limits.max_media_files"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.max_media_files()</span></code></a>); more get a 400
-before any is decoded.</p></td>
+before any is decoded. A model can take fewer of one kind
+(<code class="xref py py-meth docutils literal notranslate"><span class="pre">mstar.model.base.Model.max_input_files()</span></code>; Qwen3-TTS,
+Chatterbox, Whisper and Higgs-Audio take one audio clip).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_AUDIO_SECONDS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">3600</span></code></p></td>
+<td><p>Seconds a request’s audio clips may decode to, summed over them (see
+<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_audio_seconds" title="mstar.model.media_limits.max_audio_seconds"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.max_audio_seconds()</span></code></a>), checked from each
+header before the model decodes it and again from the decoded clip (a
+file whose header gives no length, such as a FLAC with no sample count,
+is counted as it decodes, or from its size for a WAV with no data
+length); over it, the request gets a 400.</p></td>
 </tr>
 </tbody>
 </table>

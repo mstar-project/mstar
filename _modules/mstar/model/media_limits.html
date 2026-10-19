@@ -912,8 +912,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">check what a file will decode to, not how big it is. A refusal is a</span>
 <span class="sd">``ValueError``, which the data worker answers with a 400.</span>
 
-<span class="sd">The pixel caps hold for a whole request: while the data worker loads a</span>
-<span class="sd">request's files inside :class:`RequestMediaBudget`, every check also counts</span>
+<span class="sd">The pixel and audio caps hold for a whole request: while the data worker loads</span>
+<span class="sd">a request's files inside :class:`RequestMediaBudget`, every check also counts</span>
 <span class="sd">against what the request's earlier files used.</span>
 <span class="sd">"""</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
@@ -930,6 +930,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># the least a decoded frame counts against the video cap</span>
 <span class="n">MIN_FRAME_PIXELS</span> <span class="o">=</span> <span class="mi">64</span> <span class="o">*</span> <span class="mi">64</span>
 <span class="n">DEFAULT_MAX_MEDIA_FILES</span> <span class="o">=</span> <span class="mi">16</span>
+<span class="c1"># twice the transcription endpoint's 30 min upload cap, so one such upload fits</span>
+<span class="c1"># whatever its decoded length rounds to</span>
+<span class="n">DEFAULT_MAX_AUDIO_SECONDS</span> <span class="o">=</span> <span class="mi">60</span> <span class="o">*</span> <span class="mi">60</span>
 <span class="c1"># torchvision decodes these (GIF is read with Pillow); anything else is a 400</span>
 <span class="n">IMAGE_FORMATS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"PNG"</span><span class="p">,</span> <span class="s2">"JPEG"</span><span class="p">,</span> <span class="s2">"WEBP"</span><span class="p">,</span> <span class="s2">"GIF"</span><span class="p">)</span>
 <span class="c1"># a loader that decodes with Pillow also reads the other image types the API accepts</span>
@@ -976,6 +979,15 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="max_audio_seconds">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_audio_seconds">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">max_audio_seconds</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_MAX_AUDIO_SECONDS``: seconds a request's audio clips may decode</span>
+<span class="sd">    to, summed over them."""</span>
+    <span class="k">return</span> <span class="n">_positive_int_env</span><span class="p">(</span><span class="s2">"MSTAR_MAX_AUDIO_SECONDS"</span><span class="p">,</span> <span class="n">DEFAULT_MAX_AUDIO_SECONDS</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="check_media_limits">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_media_limits">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">check_media_limits</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -990,6 +1002,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">limit</span> <span class="o">=</span> <span class="n">max_image_pixels</span><span class="p">()</span>
     <span class="n">max_video_pixels</span><span class="p">()</span>
     <span class="n">max_media_files</span><span class="p">()</span>
+    <span class="n">max_audio_seconds</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">Image</span><span class="o">.</span><span class="n">MAX_IMAGE_PIXELS</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">limit</span> <span class="o">&gt;</span> <span class="n">Image</span><span class="o">.</span><span class="n">MAX_IMAGE_PIXELS</span><span class="p">:</span>
         <span class="n">Image</span><span class="o">.</span><span class="n">MAX_IMAGE_PIXELS</span> <span class="o">=</span> <span class="n">limit</span></div>
 
@@ -1005,10 +1018,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    many files in one request cannot multiply them; refuses more than</span>
 <span class="sd">    ``max_media_files()`` files before any is decoded.</span>
 
-<span class="sd">    The data worker loads each file inside :meth:`file`; the image and video</span>
-<span class="sd">    checks charge the request through it."""</span>
+<span class="sd">    The data worker loads each file inside :meth:`file`; the image, video and</span>
+<span class="sd">    audio checks charge the request through it."""</span>
 
-    <span class="n">_ENV</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="s2">"MSTAR_MAX_IMAGE_PIXELS"</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">:</span> <span class="s2">"MSTAR_MAX_VIDEO_PIXELS"</span><span class="p">}</span>
+    <span class="c1"># kind: what the refusal calls its files, their unit, the env var</span>
+    <span class="n">_LIMITS</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">"image"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"images"</span><span class="p">,</span> <span class="s2">"pixels"</span><span class="p">,</span> <span class="s2">"MSTAR_MAX_IMAGE_PIXELS"</span><span class="p">),</span>
+        <span class="s2">"video"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"videos"</span><span class="p">,</span> <span class="s2">"pixels"</span><span class="p">,</span> <span class="s2">"MSTAR_MAX_VIDEO_PIXELS"</span><span class="p">),</span>
+        <span class="s2">"audio"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"audio clips"</span><span class="p">,</span> <span class="s2">"seconds"</span><span class="p">,</span> <span class="s2">"MSTAR_MAX_AUDIO_SECONDS"</span><span class="p">),</span>
+    <span class="p">}</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_files</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">limit</span> <span class="o">=</span> <span class="n">max_media_files</span><span class="p">()</span>
@@ -1016,7 +1034,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"the request attaches </span><span class="si">{</span><span class="n">num_files</span><span class="si">}</span><span class="s2"> media files; the limit is </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2"> (MSTAR_MAX_MEDIA_FILES)"</span>
             <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">limits</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="n">max_image_pixels</span><span class="p">(),</span> <span class="s2">"video"</span><span class="p">:</span> <span class="n">max_video_pixels</span><span class="p">()}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">limits</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="n">max_image_pixels</span><span class="p">(),</span> <span class="s2">"video"</span><span class="p">:</span> <span class="n">max_video_pixels</span><span class="p">(),</span> <span class="s2">"audio"</span><span class="p">:</span> <span class="n">max_audio_seconds</span><span class="p">()}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">used</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_file</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
 
@@ -1031,28 +1049,156 @@ window.runMermaid = runMermaid;</script>
             <span class="k">yield</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="n">_request_budget</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">kind</span><span class="p">,</span> <span class="n">pixels</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+=</span> <span class="n">pixels</span>
+            <span class="k">for</span> <span class="n">kind</span><span class="p">,</span> <span class="n">amount</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+=</span> <span class="n">amount</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span></div>
 
 
 <div class="viewcode-block" id="RequestMediaBudget.charge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget.charge">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">charge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pixels</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">],</span> <span class="n">pixels</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">charge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">],</span> <span class="n">amount</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]:</span>
+            <span class="n">files</span><span class="p">,</span> <span class="n">unit</span><span class="p">,</span> <span class="n">env</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_LIMITS</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"the request's </span><span class="si">{</span><span class="n">kind</span><span class="si">}</span><span class="s2">s decode to more than </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span><span class="si">}</span><span class="s2"> pixels together; "</span>
-                <span class="sa">f</span><span class="s2">"send fewer or smaller files (the limit is </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_ENV</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span><span class="si">}</span><span class="s2">)"</span>
+                <span class="sa">f</span><span class="s2">"the request's </span><span class="si">{</span><span class="n">files</span><span class="si">}</span><span class="s2"> decode to more than </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">unit</span><span class="si">}</span><span class="s2"> together; "</span>
+                <span class="sa">f</span><span class="s2">"send fewer or smaller files (the limit is </span><span class="si">{</span><span class="n">env</span><span class="si">}</span><span class="s2">)"</span>
             <span class="p">)</span></div>
 </div>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_charge_request</span><span class="p">(</span><span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pixels</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_charge_request</span><span class="p">(</span><span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">budget</span> <span class="o">=</span> <span class="n">_request_budget</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">budget</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">budget</span><span class="o">.</span><span class="n">charge</span><span class="p">(</span><span class="n">kind</span><span class="p">,</span> <span class="n">pixels</span><span class="p">)</span>
+        <span class="n">budget</span><span class="o">.</span><span class="n">charge</span><span class="p">(</span><span class="n">kind</span><span class="p">,</span> <span class="n">amount</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="check_file_counts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_file_counts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_file_counts</span><span class="p">(</span><span class="n">counts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">model_limits</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse more files of a modality than the model takes</span>
+<span class="sd">    (:meth:`mstar.model.base.Model.max_input_files`), before any is decoded."""</span>
+    <span class="k">for</span> <span class="n">modality</span><span class="p">,</span> <span class="n">limit</span> <span class="ow">in</span> <span class="n">model_limits</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">count</span> <span class="o">=</span> <span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">modality</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">count</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"the request attaches </span><span class="si">{</span><span class="n">count</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">modality</span><span class="si">}</span><span class="s2"> files; this model takes at most </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span></div>
+
+
+
+<span class="c1"># libsndfile reports 2**63 - 1 frames for a FLAC whose STREAMINFO has no sample</span>
+<span class="c1"># count (a stream written to a pipe); anything this large is "unknown"</span>
+<span class="n">UNKNOWN_FRAMES</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">62</span>
+<span class="c1"># frames per read while counting a file whose header gives no length</span>
+<span class="n">_COUNT_BLOCK_FRAMES</span> <span class="o">=</span> <span class="mi">4096</span>
+<span class="c1"># bits a sample of each libsndfile subtype takes in the file; the file-size</span>
+<span class="c1"># bound below uses the smallest (4, an ADPCM nibble) for any it does not list</span>
+<span class="n">_SUBTYPE_BITS</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"PCM_S8"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">"PCM_U8"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">"PCM_16"</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span>
+    <span class="s2">"PCM_24"</span><span class="p">:</span> <span class="mi">24</span><span class="p">,</span>
+    <span class="s2">"PCM_32"</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
+    <span class="s2">"FLOAT"</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
+    <span class="s2">"DOUBLE"</span><span class="p">:</span> <span class="mi">64</span><span class="p">,</span>
+    <span class="s2">"ULAW"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">"ALAW"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="n">_MIN_SAMPLE_BITS</span> <span class="o">=</span> <span class="mi">4</span>
+
+
+<div class="viewcode-block" id="probe_audio_seconds">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.probe_audio_seconds">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">probe_audio_seconds</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The duration an audio file's header declares, or None when it declares</span>
+<span class="sd">    none (a sample count of 0 or libsndfile's "unknown" value) or neither</span>
+<span class="sd">    soundfile nor torchcodec can read it."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+        <span class="n">info</span> <span class="o">=</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
+        <span class="k">if</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="n">info</span><span class="o">.</span><span class="n">frames</span> <span class="o">&lt;</span> <span class="n">UNKNOWN_FRAMES</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">samplerate</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">info</span><span class="o">.</span><span class="n">frames</span> <span class="o">/</span> <span class="n">info</span><span class="o">.</span><span class="n">samplerate</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001, S110 -- not a libsndfile container: try torchcodec</span>
+        <span class="k">pass</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">torchcodec.decoders</span><span class="w"> </span><span class="kn">import</span> <span class="n">AudioDecoder</span>
+
+        <span class="n">seconds</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">duration_seconds_from_header</span>
+        <span class="k">if</span> <span class="n">seconds</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">seconds</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001, S110 -- unreadable: the model's loader reports it</span>
+        <span class="k">pass</span>
+    <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_count_audio_seconds</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Charge the request a libsndfile file's length counted as it decodes, for</span>
+<span class="sd">    a header that gives none; refuses as soon as the count passes the limit,</span>
+<span class="sd">    so the decode stops there.</span>
+
+<span class="sd">    Reads fixed blocks and charges the frames counted so far after each. A</span>
+<span class="sd">    header-less FLAC cannot seek past its last block, so libsndfile raises on</span>
+<span class="sd">    the read that returns it; that block is charged whole, which can overstate</span>
+<span class="sd">    the length by under one block (0.26 s at 16 kHz). A file libsndfile reads</span>
+<span class="sd">    as empty (a WAV whose data chunk length is 0) is charged from its size at</span>
+<span class="sd">    its subtype's sample width (4 bits for one not in the table), an upper</span>
+<span class="sd">    bound, since a loader that reads to the end of the file decodes what</span>
+<span class="sd">    libsndfile does not count.</span>
+<span class="sd">    """</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+    <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">with</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">SoundFile</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">sound</span><span class="p">:</span>
+            <span class="n">channels</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">sound</span><span class="o">.</span><span class="n">channels</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">rate</span> <span class="o">=</span> <span class="n">sound</span><span class="o">.</span><span class="n">samplerate</span>
+            <span class="n">bits</span> <span class="o">=</span> <span class="n">_SUBTYPE_BITS</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">sound</span><span class="o">.</span><span class="n">subtype</span><span class="p">,</span> <span class="n">_MIN_SAMPLE_BITS</span><span class="p">)</span>
+            <span class="n">frames</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">block</span> <span class="o">=</span> <span class="n">sound</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">_COUNT_BLOCK_FRAMES</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"int16"</span><span class="p">,</span> <span class="n">always_2d</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>  <span class="c1"># soundfile.LibsndfileError</span>
+                    <span class="c1"># the end of a header-less FLAC (or damage the loader will report)</span>
+                    <span class="n">frames</span> <span class="o">+=</span> <span class="n">_COUNT_BLOCK_FRAMES</span>
+                    <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">frames</span> <span class="o">/</span> <span class="n">rate</span><span class="p">)</span>
+                    <span class="k">return</span>
+                <span class="n">frames</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+                <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">frames</span> <span class="o">/</span> <span class="n">rate</span><span class="p">)</span>
+                <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">_COUNT_BLOCK_FRAMES</span><span class="p">:</span>
+                    <span class="k">break</span>
+            <span class="k">if</span> <span class="n">frames</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">getsize</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="o">*</span> <span class="mi">8</span> <span class="o">/</span> <span class="p">(</span><span class="n">bits</span> <span class="o">*</span> <span class="n">channels</span><span class="p">)</span> <span class="o">/</span> <span class="n">rate</span><span class="p">)</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">):</span>  <span class="c1"># soundfile.LibsndfileError, a file it cannot open</span>
+        <span class="k">return</span>  <span class="c1"># not a libsndfile container: the loader's decode is charged instead</span>
+
+
+<div class="viewcode-block" id="check_audio_duration">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_audio_duration">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_audio_duration</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Charge the request what an audio file's header declares, before the</span>
+<span class="sd">    model's loader decodes it; a file whose header declares nothing is counted</span>
+<span class="sd">    as it decodes (:func:`_count_audio_seconds`)."""</span>
+    <span class="n">seconds</span> <span class="o">=</span> <span class="n">probe_audio_seconds</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">seconds</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">seconds</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">_count_audio_seconds</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="charge_decoded_audio">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.charge_decoded_audio">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">charge_decoded_audio</span><span class="p">(</span><span class="n">audio</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Charge the request the samples a loader returned, as seconds at</span>
+<span class="sd">    ``sample_rate``; a file whose header understated its length or could not be</span>
+<span class="sd">    read is counted here."""</span>
+    <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">audio</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">/</span> <span class="n">sample_rate</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="check_image_size">

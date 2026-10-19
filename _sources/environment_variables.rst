@@ -308,10 +308,10 @@ Request media
 -------------
 
 Read by the model's media loaders in the data worker's preprocess thread,
-behind either frontend. All three are also checked once when the data worker
+behind either frontend. All four are also checked once when the data worker
 starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
-value stops the server instead of failing every media request. The pixel caps
-hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
+value stops the server instead of failing every media request. The pixel and
+audio caps hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
 so attaching more files does not multiply them.
 
 .. list-table::
@@ -342,7 +342,17 @@ so attaching more files does not multiply them.
      - ``16``
      - Images, audio clips and videos one request may attach, together (see
        :func:`mstar.model.media_limits.max_media_files`); more get a 400
-       before any is decoded.
+       before any is decoded. A model can take fewer of one kind
+       (:meth:`mstar.model.base.Model.max_input_files`; Qwen3-TTS,
+       Chatterbox, Whisper and Higgs-Audio take one audio clip).
+   * - ``MSTAR_MAX_AUDIO_SECONDS``
+     - ``3600``
+     - Seconds a request's audio clips may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_audio_seconds`), checked from each
+       header before the model decodes it and again from the decoded clip (a
+       file whose header gives no length, such as a FLAC with no sample count,
+       is counted as it decodes, or from its size for a WAV with no data
+       length); over it, the request gets a 400.
 
 Worker scheduling
 -----------------
