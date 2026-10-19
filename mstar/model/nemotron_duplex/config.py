@@ -33,6 +33,10 @@ AUDIO_IN = "audio_in"               # the client stream carrying the user's audi
 ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder layer state
 ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
 
+# Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
+# a deployment serves by default (``NemotronDuplexModel.DEFAULT_MAMBA_SLOTS``).
+SESSION_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+
 
 def session_too_long(max_session_s: float) -> ValueError:
     """The one error for a call whose audio outgrows ``max_session_s``, whichever

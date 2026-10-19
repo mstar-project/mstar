@@ -57,6 +57,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_CFG_LABEL,
     TALKER_KV,
@@ -107,7 +108,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     # Decode batch sizes captured as CUDA graphs: one row per live session per
     # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
     # one transiently), so the model's pool sizing covers the largest bucket.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
 
@@ -458,7 +459,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
     STEP_REGION = "conformer_step"
     LAYERS_REGION = "conformer_layers"
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
     STATE_KEY = "encoder_stream"         # a call's StreamState
     # Longest chunk batched with other calls': a pass pads every call to its
@@ -728,7 +729,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     GEN_KEY = "talker_gen"
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     SPEAKER = "Aria"
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
                  subword_to_char: dict | None = None, char_pad_idx: int | None = None):
@@ -963,7 +964,7 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     disable_autocast = True
 
     DECODE_REGION = "codec_decode"
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
     CONTEXT_KEY = "codec_ctx"
     TAIL_KEY = "codec_tail"              # the last chunk's held-back samples, int16
@@ -1060,7 +1061,7 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         by_len: dict[int, list[int]] = {}
         for i, (full, _) in windows.items():
             by_len.setdefault(full.shape[0], []).append(i)
-        runner = (getattr(engine_inputs, "piecewise_runners", None) or {}).get(self.DECODE_REGION)
+        runner = (engine_inputs.piecewise_runners or {}).get(self.DECODE_REGION)
         for tf, idxs in by_len.items():
             batch = torch.stack([windows[i][0] for i in idxs]).long()   # (G, Tf, num_q)
             if runner is not None and tf == self._steady_window and runner.can_run(len(idxs)):

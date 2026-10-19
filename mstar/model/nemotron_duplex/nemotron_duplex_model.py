@@ -82,6 +82,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
@@ -419,7 +420,7 @@ class NemotronDuplexModel(Model):
     # deployment raising it raises all four (see validate_config_yaml).
     # 32 is the most that keep up with real time on one H100: a tick takes
     # ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
-    DEFAULT_MAMBA_SLOTS = 32          # sessions; the runner's padding rows take no slot (#258)
+    DEFAULT_MAMBA_SLOTS = SESSION_BATCH_SIZES[-1]   # 32 sessions; padding rows take no slot (#258)
     # Longest session served (``model_kwargs: {max_session_s: ...}``). The
     # talker KV pool is sized so DEFAULT_MAMBA_SLOTS sessions this long fit at
     # once: a full pool stalls every session, not just the one that outgrew it.

@@ -300,12 +300,12 @@ def _codes(n_frames, value=0):
 
 
 def _run_codec(codec, rid, n_frames, value=0):
-    eng = SimpleNamespace(request_ids=[rid])
+    eng = SimpleNamespace(request_ids=[rid], piecewise_runners={})
     return codec.forward("codec_chunk", eng, codes=_codes(n_frames, value))["audio_chunk"][0]
 
 
 def _run_codec_batch(codec, rids, frames):
-    eng = SimpleNamespace(request_ids=list(rids))
+    eng = SimpleNamespace(request_ids=list(rids), piecewise_runners={})
     inputs = [codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(n, v)]})
               for n, v in frames]
     pre = codec.preprocess("codec_chunk", eng, inputs)
@@ -333,7 +333,7 @@ def test_codec_runs_an_empty_final_chunk_as_a_flush():
         inp = codec.prepare_inputs("codec_chunk", None, chunk, is_final_stream_chunk=True)
         assert inp is not None and inp.kwargs["flush"] and not inp.tensor_inputs
     _run_codec(codec, "a", 5, 1)
-    eng = SimpleNamespace(request_ids=["a", "b"])
+    eng = SimpleNamespace(request_ids=["a", "b"], piecewise_runners={})
     inputs = [codec.prepare_inputs("codec_chunk", None, {}, is_final_stream_chunk=True),
               codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(5, 2)]})]
     out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, inputs))
