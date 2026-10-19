@@ -349,6 +349,82 @@ def test_math_sdpa_reference_spread_is_reported(tmp_path):
     assert sc.verdict == "PASS"  # the raw gate is unchanged
 
 
+def test_fp32_anchor_arm_encodes_the_conditioning_frame_in_fp32():
+    import torch
+
+    from benchmark.correctness.families import Cosmos3I2V
+
+    fam = Cosmos3I2V("cosmos3_nano", {}, {"ref_anchor": "fp32"})
+    assert fam.reference_id() == Cosmos3I2V("cosmos3_nano", {}, {}).reference_id() + "-anchor-fp32"
+
+    class Vae(torch.nn.Linear):
+        @property
+        def dtype(self):
+            return self.weight.dtype
+
+    class Pipe:  # like Cosmos3OmniPipeline._encode_video: encode in the VAE's dtype, return the input's
+        def __init__(self):
+            self.vae = Vae(64, 64).to(torch.bfloat16)
+
+        def _encode_video(self, x):
+            return self.vae(x.to(self.vae.dtype)).to(x.dtype)
+
+    torch.manual_seed(0)
+    pipe, moves = Pipe(), []
+    x = torch.randn(1, 1, 3, 64)  # [B, C, T, ...]; the anchor is T=0
+    with torch.no_grad():
+        bf16 = pipe._encode_video(x)
+        exact = x @ pipe.vae.weight.float().T + pipe.vae.bias.float()
+        fam.fp32_anchor(pipe, moves)
+        out = pipe._encode_video(x)
+    assert pipe.vae.weight.dtype == torch.bfloat16  # back to bf16 for the decode
+    assert (out - exact).abs().max() < (bf16 - exact).abs().max()
+    assert len(moves) == 1 and 0 < moves[0] < 0.05
+
+
+def test_i2v_floor_takes_the_larger_move_per_video(tmp_path):
+    from benchmark.correctness.families import Cosmos3I2V
+    from benchmark.correctness.families.video import write_video
+
+    fam = Cosmos3I2V("cosmos3_nano", {}, {})
+    items = [sets.Item(id=f"{i:02d}", prompt="p", files={"image": "x.png"}, params={"seed": i}) for i in range(3)]
+    sset = sets.SampleSet("video_v1", tmp_path, {}, items)
+    refs = tmp_path / "references"
+    ref = refs / fam.reference_id() / "video_v1"
+    math = refs / (fam.reference_id() + "-sdpa-math") / "video_v1"
+    anchor = refs / (fam.reference_id() + "-anchor-fp32") / "video_v1"
+    run = tmp_path / "run" / "r1"
+    for d in (ref / "outputs", math / "outputs", anchor / "outputs", run / "outputs"):
+        d.mkdir(parents=True)
+    for d in (ref, math):
+        (d / "meta.json").write_text("{}")
+    (anchor / "meta.json").write_text(json.dumps({"anchor_rel_change_vs_bf16": [0.008, 0.009, 0.01]}))
+    rng = np.random.default_rng(0)
+
+    def shifted(frames, by):
+        return np.clip(frames.astype(int) + by, 0, 255).astype(np.uint8)
+
+    for k, it in enumerate(items):
+        frames = rng.integers(0, 256, (3, 16, 16, 3), dtype=np.uint8)
+        np.save(ref / "outputs" / f"{it.id}.npy", frames)
+        np.save(math / "outputs" / f"{it.id}.npy", shifted(frames, 2))  # a small move on every video
+        np.save(anchor / "outputs" / f"{it.id}.npy", shifted(frames, 40 if k == 0 else 1))  # a big one on 00
+        write_video(frames, run / "outputs" / f"{it.id}.mp4", 8)
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, [run], ref, work, "cpu")
+    by = {r["id"]: r for r in sc.rows}
+    assert by["00"]["ref_vs_anchor_ref_psnr_median"] < by["00"]["ref_vs_math_ref_psnr_median"]
+    assert by["01"]["ref_vs_anchor_ref_psnr_median"] > by["01"]["ref_vs_math_ref_psnr_median"]
+    larger = sorted(min(r["ref_vs_math_ref_psnr_median"], r["ref_vs_anchor_ref_psnr_median"]) for r in sc.rows)
+    cal = sc.metrics["rocm_calibrated"]
+    assert cal["basis"].startswith("math-SDPA and fp32-anchor") and cal["spread_median_db"] == larger[1]
+    assert sc.metrics["reference_vs_math_sdpa_reference_psnr_db"]["n"] == 3
+    assert sc.metrics["fp32_anchor_rel_change_vs_bf16"]["max"] == 0.01
+    assert fam.anchor_reference_dir(ref) == anchor
+    assert Cosmos3I2V("cosmos3_nano", {}, {"ref_anchor": "fp32"}).anchor_reference_dir(ref) is None
+
+
 def test_robotics_can_skip_episodes_without_a_task():
     items = [sets.Item(id="ep00", prompt="Put the marker in the pot"), sets.Item(id="ep05", prompt="")]
     fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {"skip_empty_prompt": "1"})
