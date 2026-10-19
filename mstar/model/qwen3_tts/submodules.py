@@ -116,8 +116,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     # for this path. The whole decode forward (CodePredictor loop included) is
     # still CUDA-graph captured.
     disable_torch_compile = True
-    MAX_BATCH_SIZE = 32
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # 64 so a step can hold every row of a c=64 load; at 32 such a load ran
+    # as two steps per frame
+    MAX_BATCH_SIZE = 64
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 48, 64]
     # Prefill prompts are short (a sentence plus the ChatML frame, an optional
     # instruction and speaker slot): a few token buckets cover them, and the
     # eager alternative costs ~20 ms of launch overhead per request.
