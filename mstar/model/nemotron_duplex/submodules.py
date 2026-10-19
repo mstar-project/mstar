@@ -2,7 +2,8 @@
 
 Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources``):
 
-    conformer_encoder  (none)                    16 kHz speech -> per-frame LLM embeds (+ RNN-T)
+    conformer_encoder  encoder_state,             16 kHz speech -> per-frame LLM embeds (+ RNN-T); per
+                       encoder_front              session, its layers' state and its audio / mel tails
     nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
                        nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
@@ -11,7 +12,9 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
     audio_codec        (none)                    RVQ codes -> 22.05 kHz PCM, per-request left context
 
 Both autoregressive nodes keep their whole state in engine resources and capture
-their decode step as a CUDA graph; the encoder and the codec run eager.
+their decode step as a CUDA graph. The encoder keeps a call's state in its two
+pools, and a live step (or its layer stack) replays a piecewise CUDA graph; the
+codec replays one for its steady-state decode window.
 """
 from __future__ import annotations
 
@@ -433,19 +436,24 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     calls' chunks run in one batched streamer pass (``ConformerStreamer``, which
     describes the state a call carries across chunks and its numerics), except
     that a chunk of more than a second (an upload, a large append) runs in a
-    pass of its own within the same engine step.
+    pass of its own within the same engine step, on its own row of the step's
+    plan. A call's state is bounded whatever its length: its newest audio and
+    mel frames (the ``ENCODER_FRONT`` pool), and the last 70 frames of each
+    layer's attention keys and values plus the conv tails (``ENCODER_STATE``);
+    its host counters live in its per-request state.
 
-    A call's layer state (attention keys / values, conv inputs) lives in the
-    ``ENCODER_STATE`` recurrent pool; its mel front end in its per-request
-    state. A live step gives every call at most one frame, and its layer stack
-    replays a CUDA graph (``LAYERS_REGION``); a step with more (a one-shot
-    request's whole clip, a large append, the call's end) runs it eagerly.
+    A call one frame of audio further on the frame grid (every live step of a
+    client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
+    other calls take the front end eagerly, then the layer stack as a graph
+    (``LAYERS_REGION``) when each got at most one frame, else eagerly (a
+    one-shot upload, a large append, the call's end).
 
     Holds the perception stack plus the RNN-T decoder/joint (loaded; the
     user-transcript channel is not emitted yet).
     """
 
-    # Variable-length front end, eager; the layer stack is the captured region.
+    # The captured regions are not compiled (compile=False); the eager front end
+    # takes variable-length chunks.
     disable_torch_compile = True
 
     STEP_REGION = "conformer_step"

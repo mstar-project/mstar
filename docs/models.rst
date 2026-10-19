@@ -429,7 +429,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   PCM: each 5-frame chunk is decoded with the previous 3 frames as left context,
   which covers the decoder's receptive field, and a window's last 12 samples,
   the inverse-STFT overlap, are held back and emitted with the next chunk, so
-  the stream equals the full-history decode sample for sample).
+  the stream equals the full-history decode sample for sample; that steady
+  window of 8 frames replays a CUDA graph, other windows decode eagerly).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -472,8 +473,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   fast as it can). Live calls paced in real time over ``/generate/ws``
   (``test/nemotron_duplex/live_ws_request.py``, 80 ms appends, 2026-10-17, one
   H100): input-to-token lag p50 48 ms with one call and about 100-120 ms with
-  8, which keep up; from 24 calls up the server falls behind real time, so lag
-  grows over the call. Served audio is checked for intelligibility by
+  8, which keep up; from 24 calls up the server fell behind real time, so lag
+  grew over the call. Capturing the encoder's live step (below) took its host
+  time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
+  (paced runs interleaved against the uncaptured encoder, ``MSTAR_SHM_ARENA=1``);
+  32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
+  user stopping to agent audio playable without gaps). Served audio is checked for intelligibility by
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.
@@ -520,10 +525,15 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (inferred from those frames, not measured on served text); under the served
   bf16 a different chunking can flip a knife-edge frame such as the agent's
   turn start.
-- The encoder keeps each call's layer state (its attention keys / values and
-  conv inputs) in a recurrent-state pool, a slot per session; a live step, one
-  frame per call, replays its layer stack as a CUDA graph, and a step with more
-  frames (a one-shot upload, a large append) runs it eagerly.
+- The encoder keeps each call's state in two recurrent-state pools, a slot per
+  session each: its layer state (attention keys / values and conv inputs,
+  ``encoder_state``) and its newest audio and mel frames (``encoder_front``). A
+  call that appends one frame of audio (1280 samples) on the frame grid, every
+  live step of an 80 ms client, runs its whole step as a CUDA graph; other calls
+  take the front end eagerly, then the layer stack as a graph when each got at
+  most one frame, or eagerly (a one-shot upload, a large append, the call's
+  end). Appends of other sizes are served the same, without the whole-step
+  graph.
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

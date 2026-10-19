@@ -32,9 +32,11 @@ The M* serving path is the walk graphs below: four async partitions
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws``; a
 one-shot upload is a stream of one chunk. ``get_node_resources`` declares
-the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
-slots), the Mamba-2 resource and the sampler, and the talker's paged KV cache,
-attention and positions. Both decode steps are CUDA graphs.
+the encoder's two recurrent-state pools (each call's layer state, and its audio /
+mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
+conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
+KV cache, attention and positions. Both decode steps are CUDA graphs, and so are
+the encoder's live step and the codec's steady-state decode (piecewise).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -412,8 +414,9 @@ class NemotronDuplexModel(Model):
     # session each). The codec declares nothing.
     # -------------------------------------------------------------------
 
-    # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
-    # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
+    # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
+    # Nemotron-H, and in encoder_state / encoder_front; pages in talker_kv). A
+    # deployment raising it raises all four (see validate_config_yaml).
     # 32 is the most that keep up with real time on one H100: a tick takes
     # ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
     DEFAULT_MAMBA_SLOTS = 32          # sessions; the runner's padding rows take no slot (#258)
