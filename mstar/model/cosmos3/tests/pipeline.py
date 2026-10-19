@@ -232,8 +232,11 @@ class Cosmos3Pipeline:
             use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
         )
 
+        # The loop state is fp32 like the served image/video path and the reference
+        # pipeline; the sound walk keeps the model dtype, as served.
+        loop_dtype = dtype if generate_sound else torch.float32
         latents, has_image_condition = self._prepare_latents(
-            image, num_frames, height, width, generator, latents, device, dtype
+            image, num_frames, height, width, generator, latents, device, loop_dtype
         )
         latent_shape = tuple(latents.shape)
 
@@ -315,10 +318,11 @@ class Cosmos3Pipeline:
             cond_v, cond_s = _forward(cond_static, vision_tokens, vision_timesteps, t)
             if guidance_scale != 1.0:
                 uncond_v, uncond_s = _forward(uncond_static, vision_tokens, vision_timesteps, t)
+                cond_v, uncond_v = cond_v.to(latents.dtype), uncond_v.to(latents.dtype)
                 velocity = uncond_v + guidance_scale * (cond_v - uncond_v)
                 sound_v = (uncond_s + guidance_scale * (cond_s - uncond_s)) if generate_sound else None
             else:
-                velocity = cond_v
+                velocity = cond_v.to(latents.dtype)
                 sound_v = cond_s
             if generate_sound:
                 # Joint [video | sound] scheduler step (one multistep history).
