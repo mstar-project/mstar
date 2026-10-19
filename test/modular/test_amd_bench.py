@@ -253,6 +253,9 @@ def test_table_render(tmp_path):
     (run / "health").mkdir()
     for name in ("check_before", "check_resume1"):
         (run / "health" / f"{name}.json").write_text(json.dumps({"verdict": {"status": "PASS", "reasons": []}}))
+    (run / "health" / "check_after.json").write_text(json.dumps({"verdict": {"status": "WARN", "reasons": [
+        "NODE bare_metal: VM/SR-IOV slice (virt=none, ifwi=AMD MI325X_SRIOV_CVS_1VF): use for correctness/dev, not "
+        "for throughput tables"]}}))
     (run / "health" / "check_resume1.raw.json").write_text("{}")
     for arm, tok, out_tok in (("mstar", 1000.0, 256), ("vllm-aiter", 900.0, 300)):
         d = run / "qwen3_5_0.8b" / arm
@@ -274,6 +277,7 @@ def test_table_render(tmp_path):
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1)" in md and "node health check_resume1: PASS" in md
+    assert "  - NODE bare_metal: VM/SR-IOV slice (virt=none" in md
     assert "| ws-j-moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
     assert "PASS exact 30/32" in md and "output tokens/request 300 vs mstar 256" in md
     assert json.loads((run / "table.json").read_text())["meta"]["table"] == "qwen35-dense"
@@ -332,9 +336,9 @@ def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
     try:
         assert launch.smi_index_map() == {0: 3, 1: 0, 2: 2, 3: 1, 4: 7, 5: 4, 6: 6, 7: 5}
         occ = launch.gpu_occupancy([0, 7])
-        # A process that only opened the GPU is not a tenant; HIP 7 is amd-smi 5, where pid 2 holds 9 GiB.
-        assert occ[0] == {"vram_used_mb": 284.0, "processes": []}
-        assert occ[7] == {"vram_used_mb": 9635.0, "processes": ["py:2"]}
+        # HIP 7 is amd-smi 5, the GPU with memory in use; process lists are recorded, memory decides.
+        assert occ[0] == {"vram_used_mb": 284.0, "processes": ["py:1"]}
+        assert occ[7] == {"vram_used_mb": 9635.0, "processes": ["py:1", "py:2"]}
         assert health.smi_gpus([4, 5]) == [7, 4]
     finally:
         launch.smi_index_map.cache_clear()
