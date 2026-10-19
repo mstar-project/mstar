@@ -21,7 +21,7 @@ The plan has three parts, in this order of priority. Size the hardware for the l
 
 ## Worker A/B set
 
-PR vs `main`, back to back per model, two or more server restarts per arm (benchmarking skill: "Repeats must span server restarts"). Pick the rows the change can plausibly reach; a scheduler change reaches all of them.
+PR vs `main`, back to back per model, three server restarts per arm by default, interleaved (A B B A A B) (benchmarking skill: "Repeats must span server restarts"). Two are enough only when they agree very closely; one never is, since a single run can't show the variance. Pick the rows the change can plausibly reach; a scheduler change reaches all of them.
 
 | Row | Server | Client | Concurrency | GPUs |
 | --- | --- | --- | --- | --- |
