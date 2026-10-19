@@ -11,6 +11,7 @@ rotation. Both belong in ``model/components/rope.py``.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def compute_inv_freq(
@@ -60,9 +61,13 @@ def compute_3d_cos_sin(
     return cos, sin
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+def _rotate_partial(x: torch.Tensor, rotary_dim: int) -> torch.Tensor:
+    """rotate_half over the leading ``rotary_dim`` dims, zeros over the rest."""
+    half = rotary_dim // 2
+    return torch.cat(
+        (-x[..., half:rotary_dim], x[..., :half], torch.zeros_like(x[..., rotary_dim:])),
+        dim=-1,
+    )
 
 
 def apply_partial_mrope(
@@ -76,18 +81,19 @@ def apply_partial_mrope(
 
     ``q``/``k`` are ``[tokens, heads, head_dim]``; cos/sin are
     ``[tokens, rotary_dim]`` and broadcast over the head axis.
+
+    Written over the whole head (cos 1 and sin 0 past the rotary dims, which
+    leaves those dims exact) rather than as a rotated slice concatenated with
+    the rest, so inductor emits one kernel per tensor, fused with the q/k norm,
+    instead of one per slice.
     """
     rotary_dim = cos.shape[-1]
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_rot = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_rot = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+    extra = q.shape[-1] - rotary_dim
+    cos = F.pad(cos, (0, extra), value=1.0).unsqueeze(unsqueeze_dim)
+    sin = F.pad(sin, (0, extra), value=0.0).unsqueeze(unsqueeze_dim)
     return (
-        torch.cat((q_rot, q_pass), dim=-1),
-        torch.cat((k_rot, k_pass), dim=-1),
+        q * cos + _rotate_partial(q, rotary_dim) * sin,
+        k * cos + _rotate_partial(k, rotary_dim) * sin,
     )
 
 
