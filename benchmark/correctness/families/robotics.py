@@ -1,13 +1,15 @@
 """Robotics and video-latent models on 10 DROID episodes.
 
-Only V-JEPA2 has a reference here (HF VJEPA2Model, cosine >= 0.999). lerobot, openpi and the
-upstream vjepa2 repo aren't installed, so the rest are checked for sane output and same-seed
-repeatability across two server instances.
+Only V-JEPA2 has a reference here (HF VJEPA2Model in fp32). Its embeddings are gated on how far they
+sit from fp32 compared with HF's own bf16 when that copy exists, else on cosine >= 0.999. lerobot,
+openpi and the upstream vjepa2 repo aren't installed, so the rest are checked for sane output and
+same-seed repeatability across two server instances.
 """
 
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -252,12 +254,27 @@ class Vjepa2Embedding(ArrayOutputFamily):
         worst = min(cos)
         sc.metrics["cosine"] = M.distribution(cos)
         # The bf16 reference against the fp32 one, when both exist: the gap bf16 alone opens.
+        spread = {}
         other = ref_dir.parent.parent / "hf-vjepa2-vitl-fpc64-256-encoder-bf16" / ref_dir.name if ref_dir else None
         if self.ref_dtype == "fp32" and other is not None and (other / "meta.json").is_file():
-            pairs = [(np.load(ref_dir / "outputs" / f"{r['id']}.npy"), np.load(other / "outputs" / f"{r['id']}.npy"))
-                     for r in rows if (other / "outputs" / f"{r['id']}.npy").is_file()]
-            sc.metrics["hf_bf16_vs_hf_fp32_cosine"] = M.distribution([M.cosine(b, a) for a, b in pairs
-                                                                      if a.shape == b.shape])
-        sc.check("min embedding cosine vs reference", round(worst, 6),
-                 band(worst, lambda v: v >= 0.999, lambda v: v >= 0.99), ">=0.999 PASS (competitor matrix bar), "
-                 ">=0.99 WARN")
+            for r in rows:
+                if "ref_cosine" in r and (other / "outputs" / f"{r['id']}.npy").is_file():
+                    a = np.load(ref_dir / "outputs" / f"{r['id']}.npy")
+                    b = np.load(other / "outputs" / f"{r['id']}.npy")
+                    if a.shape == b.shape:
+                        spread[r["id"]] = (r["ref_cosine"], M.cosine(b, a))
+            sc.metrics["hf_bf16_vs_hf_fp32_cosine"] = M.distribution([c for _, c in spread.values()])
+        raw_rule = ">=0.999 PASS (competitor matrix bar), >=0.99 WARN"
+        if not spread:
+            sc.check("min embedding cosine vs reference", round(worst, 6),
+                     band(worst, lambda v: v >= 0.999, lambda v: v >= 0.99), raw_rule)
+            return
+        # A bf16 serving path can't reach 0.999 against fp32, so compare its distance from fp32 (1 - cosine) with
+        # HF bf16's own, at the median and at the worst item. 2x distance is the 3 dB the image/video floors allow.
+        served = [1 - c for c, _ in spread.values()]
+        hf_bf16 = [1 - c for _, c in spread.values()]
+        ratio = max(statistics.median(served) / max(statistics.median(hf_bf16), 1e-12),
+                    max(served) / max(*hf_bf16, 1e-12))
+        sc.check("embedding distance from fp32 vs HF bf16's (larger of the median and worst-item ratios)",
+                 round(ratio, 3), band(ratio, lambda v: v <= 2, lambda v: v <= 4),
+                 f"<=2x PASS, <=4x WARN; raw min cosine {worst:.6f} (fixed bar for fp32 serving: {raw_rule})")
