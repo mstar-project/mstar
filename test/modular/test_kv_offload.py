@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 
 sys.path.insert(0, ".")
 
@@ -27,6 +28,7 @@ from mstar.engine.resources import (
     Segment,
     StepContext,
 )
+from mstar.engine.resources.kv import cpu_page_pool
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -761,3 +763,78 @@ def test_pool_copies_queue_behind_the_compute_stream():
     assert waited == [compute]
     assert mgr.reload("r0") is True
     assert waited == [compute, compute]
+
+
+@requires_cuda
+@pytest.mark.parametrize("memcpy_2d", [True, False], ids=["memcpy_2d", "copy_"])
+def test_pool_copies_keep_every_layer_and_element(memcpy_2d):
+    """A page is one strided block per layer, so a wrong pitch or page stride
+    mixes layers or pages; distinct values in every element catch either, and
+    pages nobody named must come through untouched."""
+    if memcpy_2d and cpu_page_pool.cudart is None:
+        pytest.skip("cuda.bindings is not installed")
+    mgr = _make_manager()
+    pool = mgr._cpu_pool
+    pool._memcpy_2d = memcpy_2d
+    device = mgr.kv_cache.tensor
+    device.copy_(torch.randn_like(device))
+    expected = device.clone()
+    src, dst = [5, 2, 9], [3, 11, 7]
+
+    assert pool.offload_stream("r0", "main", device, src, stored_len=0, position=0)
+    pool.sync()
+    device.fill_(-99.0)
+    pool.reload_stream("r0", "main", device, dst)
+    pool.sync()
+    torch.cuda.synchronize()
+
+    for s, d in zip(src, dst, strict=True):
+        assert torch.equal(device[:, d], expected[:, s])
+    others = [p for p in range(device.shape[1]) if p not in dst]
+    assert (device[:, others] == -99.0).all()
+
+
+@requires_cuda
+def test_pool_copies_do_not_block_the_host():
+    """The copies queue behind the compute stream on the GPU; the host must
+    not wait for that stream to drain before it can go on scheduling."""
+    if cpu_page_pool.cudart is None:
+        pytest.skip("cuda.bindings is not installed")
+    mgr = _make_manager()
+    pool = mgr._cpu_pool
+    device = mgr.kv_cache.tensor
+    pool.offload_stream("warm", "main", device, [1], stored_len=0, position=0)
+    pool.remove_request("warm")
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the copies
+    start = time.perf_counter()
+    pool.offload_stream("r0", "main", device, [1, 2, 3], stored_len=0, position=0)
+    pool.reload_stream("r0", "main", device, [4, 5, 6])
+    pool.sync()
+    elapsed = time.perf_counter() - start
+    torch.cuda.synchronize()
+    assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on the copies"
+
+
+@requires_cuda
+def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
+    """A full pool refuses every eviction attempt; one warning per interval,
+    counting the refusals it stood for, keeps the log readable."""
+    mgr = _make_manager(cpu_offload_pages=1)
+    pool = mgr._cpu_pool
+    device = mgr.kv_cache.tensor
+    assert pool.offload_stream("held", "main", device, [1], stored_len=0, position=0)
+    clock = [100.0]
+    monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
+
+    with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
+        for _ in range(50):
+            assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+        clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
+        assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+
+    warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
+    assert len(warnings) == 2
+    assert "0 more offloads refused" in warnings[0]
+    assert "49 more offloads refused" in warnings[1]
