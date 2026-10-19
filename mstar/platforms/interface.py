@@ -115,9 +115,15 @@ class RocmPlatform(Platform):
         # between compiles, so different compiles pick different kernels. On
         # orpheus a bad pick cost 10% of the decode step at concurrency 4.
         # hipBLASLt alone was the same or better at 1, 4, 16 and 64.
-        if num_tokens is not None and num_tokens <= self.ATEN_GEMM_MAX_TOKENS:
-            return {"max_autotune_gemm_backends": "ATEN"}
-        return {}
+        if num_tokens is None or num_tokens > self.ATEN_GEMM_MAX_TOKENS:
+            return {}
+        overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
+        from mstar.platforms.rocm_gemm import SKINNY_MAX_ROWS, skinny_gemm_passes
+
+        if num_tokens <= SKINNY_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+            # 1-2 row linears on AITER's skinny GEMM
+            overrides["pre_grad_custom_pass"], overrides["post_grad_custom_post_pass"] = passes
+        return overrides
 
     def process_env_defaults(self) -> dict[str, str]:
         return {
