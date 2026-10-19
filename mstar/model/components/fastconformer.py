@@ -18,7 +18,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.fastconformer_kernels import bias_relu_mask_, glu_depthwise_conv, use_triton
+from mstar.model.components.fastconformer_kernels import (
+    add_layer_norm,
+    bias_relu_mask_,
+    glu_depthwise_conv,
+    use_triton,
+)
 
 
 @dataclass
@@ -278,6 +283,12 @@ class FastConformerBlock(nn.Module):
         self, x: torch.Tensor, pos_emb: torch.Tensor,
         mask: torch.Tensor | None, valid: torch.Tensor | None,
     ) -> torch.Tensor:
+        if use_triton(x):
+            # each residual add runs in the kernel of the norm that reads it
+            x, h = add_layer_norm(x, self.feed_forward1(self.norm_feed_forward1(x)), 0.5, self.norm_self_att)
+            x, h = add_layer_norm(x, self.self_attn(h, pos_emb, mask), 1.0, self.norm_conv)
+            x, h = add_layer_norm(x, self.conv(h, valid), 1.0, self.norm_feed_forward2)
+            return add_layer_norm(x, self.feed_forward2(h), 0.5, self.norm_out, keep_sum=False)[1]
         # alpha folds the half step into the add (0.5 * y is exact either way)
         x = torch.add(x, self.feed_forward1(self.norm_feed_forward1(x)), alpha=0.5)
         x = x + self.self_attn(self.norm_self_att(x), pos_emb, mask)

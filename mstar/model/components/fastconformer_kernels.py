@@ -1,18 +1,19 @@
 """Triton kernels for the FastConformer encoder's memory-bound stretches.
 
 On a 32 x 1024-frame Parakeet batch about half the encoder's GPU time went to
-elementwise kernels around the GEMMs. Two stretches are fused here:
+elementwise kernels around the GEMMs. Three stretches are fused here:
 
 - the conv module's GLU, padding mask, depthwise conv over time, its bias and
   SiLU: six kernels and two transposes become one, in the ``(B, T, C)`` layout
   the pointwise convs use;
 - the subsampling's bias add, padding mask and ReLU after each conv that a
-  ReLU follows: three passes over the largest activations become one.
+  ReLU follows: three passes over the largest activations become one;
+- each residual add with the LayerNorm after it.
 
 Each rounds to the activation dtype where the eager ops do (after GLU, after
-the depthwise conv, after the bias add), so they agree with the eager path up
-to the conv's accumulation order and ``exp``'s last bit. Off CUDA, or without
-Triton, the callers keep the eager ops.
+the depthwise conv, after a bias or residual add), so they agree with the
+eager path up to accumulation order and ``exp``'s last bit. Off CUDA, or
+without Triton, the callers keep the eager ops.
 """
 from __future__ import annotations
 
@@ -103,6 +104,38 @@ if _TRITON_AVAILABLE:
             y = tl.where(offs < tl.load(len_ptr + bc // C) * F, y, 0.0)
         tl.store(ptrs, y, mask=ok)
 
+    @triton.jit
+    def _add_layer_norm_kernel(
+        x_ptr,  # (rows, N)
+        d_ptr,  # (rows, N)
+        w_ptr,  # (N,)
+        b_ptr,  # (N,)
+        sum_ptr,  # (rows, N): x + alpha * d, written when STORE_SUM
+        y_ptr,  # (rows, N): its LayerNorm
+        alpha,
+        eps,
+        N: tl.constexpr,
+        STORE_SUM: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """One row: the residual add, rounded as eager's is, then the norm of
+        what it stored, in fp32."""
+        row = tl.program_id(0).to(tl.int64) * N
+        cols = tl.arange(0, BLOCK)
+        ok = cols < N
+        x = tl.load(x_ptr + row + cols, mask=ok, other=0.0).to(tl.float32)
+        d = tl.load(d_ptr + row + cols, mask=ok, other=0.0).to(tl.float32)
+        s = (x + alpha * d).to(y_ptr.dtype.element_ty)
+        if STORE_SUM:
+            tl.store(sum_ptr + row + cols, s, mask=ok)
+        s = s.to(tl.float32)
+        mean = tl.sum(s, axis=0) / N
+        centered = tl.where(ok, s - mean, 0.0)
+        rstd = 1.0 / tl.sqrt(tl.sum(centered * centered, axis=0) / N + eps)
+        w = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        tl.store(y_ptr + row + cols, centered * rstd * w + b, mask=ok)
+
 
 def glu_depthwise_conv(
     x: torch.Tensor, valid: torch.Tensor | None, weight: torch.Tensor, bias: torch.Tensor,
@@ -138,3 +171,20 @@ def bias_relu_mask_(x: torch.Tensor, bias: torch.Tensor, lengths: torch.Tensor |
         HAS_LEN=lengths is not None, BLOCK=block,
     )
     return x
+
+
+def add_layer_norm(
+    x: torch.Tensor, delta: torch.Tensor, alpha: float, norm: torch.nn.LayerNorm, keep_sum: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """``s = x + alpha * delta`` and ``norm(s)`` over the last dim in one
+    pass: ``(s, norm(s))``, or ``(None, norm(s))`` when ``keep_sum`` is
+    False and only the norm is read on."""
+    x, delta = x.contiguous(), delta.contiguous()
+    n = x.shape[-1]
+    y = torch.empty_like(x)
+    s = torch.empty_like(x) if keep_sum else None
+    _add_layer_norm_kernel[(x.numel() // n,)](
+        x, delta, norm.weight, norm.bias, s if keep_sum else y, y, alpha, norm.eps,
+        N=n, STORE_SUM=keep_sum, BLOCK=triton.next_power_of_2(n), num_warps=4 if n <= 2048 else 8,
+    )
+    return s, y

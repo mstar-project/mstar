@@ -400,3 +400,25 @@ def test_triton_encoder_matches_eager_and_single_requests(causal, monkeypatch):
         monkeypatch.setattr(fastconformer_kernels, "_TRITON_AVAILABLE", False)
         eager, _ = enc(feats, torch.tensor(lens, device="cuda"))
     torch.testing.assert_close(fused, eager, atol=1e-4, rtol=1e-4)
+
+
+@_needs_gpu
+def test_add_layer_norm_kernel_matches_eager_ops():
+    """The residual add (alpha 0.5 and 1) and the LayerNorm after it in one
+    pass, on bf16: the sum exactly, the norm within a rounding step."""
+    from mstar.model.components.fastconformer_kernels import add_layer_norm
+
+    torch.manual_seed(17)
+    norm = torch.nn.LayerNorm(200).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.normal_(1, 0.2)
+        norm.bias.normal_(0, 0.2)
+        x = torch.randn(3, 77, 200, device="cuda", dtype=torch.bfloat16)
+        delta = torch.randn_like(x)
+        for alpha in (0.5, 1.0):
+            s, y = add_layer_norm(x, delta, alpha, norm)
+            ref = torch.add(x, delta, alpha=alpha)
+            assert torch.equal(s, ref)
+            torch.testing.assert_close(y, norm(ref), rtol=2 ** -7, atol=1e-2)
+            assert (y != norm(ref)).float().mean() < 0.01
+            assert add_layer_norm(x, delta, alpha, norm, keep_sum=False)[0] is None
