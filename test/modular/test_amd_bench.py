@@ -29,6 +29,11 @@ def test_arms_for_filters_by_family():
     names = ["mstar", "vllm", "ref-kokoro"]
     assert [a.name for a in catalog.arms_for(catalog.ROWS["kokoro"], names)] == ["mstar", "ref-kokoro"]
     assert [a.name for a in catalog.arms_for(catalog.ROWS["qwen3_5_2b"], names)] == ["mstar", "vllm"]
+    dense = list(tables.TABLES["qwen35-dense"].arms)
+    assert "mstar-tpasync" in [a.name for a in catalog.arms_for(catalog.ROWS["qwen3_5_9b_tp2"], dense)]
+    assert "mstar-tpasync" not in [a.name for a in catalog.arms_for(catalog.ROWS["qwen3_5_9b"], dense)]
+    _, env = catalog.server_args(catalog.ARMS["mstar-tpasync"], catalog.ROWS["qwen3_5_9b_tp2"])
+    assert env == {"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1", "GLOO_SOCKET_IFNAME": "lo"}
     with pytest.raises(KeyError):
         catalog.arms_for(catalog.ROWS["kokoro"], ["nope"])
 
@@ -123,6 +128,14 @@ def test_run_rows_shares_the_gpu_pool(monkeypatch):
     seen.clear()
     sweep.run_rows(plan, [catalog.ROWS["qwen3_5_9b_tp2"]], [0], 1, 8400)
     assert seen == []  # does not fit, skipped
+
+
+def test_arms_of_a_row_get_their_own_ports(monkeypatch):
+    ports = []
+    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: ports.append((arm.name, port)))
+    plan = type("P", (), {"arms": ["mstar", "vllm-omni", "vllm-omni-tuned", "sglang-omni"]})()
+    sweep.run_row(plan, catalog.ROWS["qwen3tts_1p7b"], 1, [3], 8480)
+    assert sorted(p for _, p in ports) == [8480, 8481, 8482, 8483] and ports[0][0] == "vllm-omni"
 
 
 def test_health_check_scopes_other_gpus():
