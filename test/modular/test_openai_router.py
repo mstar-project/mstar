@@ -1077,25 +1077,25 @@ def test_speech_stream_format_sse_sends_openai_audio_events(client_and_stub):
 def test_speech_stream_releases_every_piece_when_the_client_leaves_before_the_first_audio(tmp_path, stream_format):
     """No response has started while the first result is awaited, so the handler
     itself has to notice the disconnect and release the pieces it submitted."""
-    import threading
-
+    from api_server_helpers import make_test_api_server
     from starlette.requests import Request
 
-    from mstar.api_server.entrypoint import APIServer, PendingRequest
+    from mstar.api_server.entrypoint import PendingRequest
     from mstar.api_server.openai.adapters import Qwen3TTSAdapter
     from mstar.api_server.openai.protocol import SpeechRequest
     from mstar.api_server.openai.serving_speech import create_speech
 
-    api = APIServer.__new__(APIServer)
-    api.model, api.upload_dir, api.timeout_seconds = None, tmp_path, 600
-    api.pending_requests, api.recently_completed, api.request_lock = {}, {}, threading.Lock()
-    api.enable_nvtx = api.log_stats = False
     aborted = []
-    api.preprocess_worker = types.SimpleNamespace(abort_request=aborted.append)
+    api = make_test_api_server(
+        upload_dir=tmp_path, timeout_seconds=600,
+        preprocess_worker=types.SimpleNamespace(abort_request=aborted.append),
+    )
 
     def submit(**kw):
-        api.pending_requests[kw["request_id"]] = PendingRequest(kw["streaming"], ["text"], ["audio"], None)
-        return kw["request_id"]
+        rid, key = kw["request_id"], f"{kw['request_id']}#1"
+        api._live[rid], api._client_ids[key] = key, rid
+        api.pending_requests[key] = PendingRequest(kw["streaming"], ["text"], ["audio"], None)
+        return rid
 
     api.submit_request = submit
 
