@@ -26,6 +26,7 @@ from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
+    ExecutableMemory,
     GraphMemory,
     WarmedSpec,
     plan_captures,
@@ -41,6 +42,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a thro
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
     return BucketKey(graph_walk=walk, bs=bs, num_tokens=tokens)
+
+
+def _sized(costs: dict) -> dict:
+    """``costs`` without each walk's measurement, which only the plan reads."""
+    return {bucket: cost._replace(executable=None) for bucket, cost in costs.items()}
 
 
 _DECODE = _bucket("thinker_decode", 32, 32)
@@ -62,6 +68,7 @@ class _StubMeasuredRunner:
         self._num_slots = 2
         self._capture_costs = {}
         self._lent = set()
+        self._executables = {}
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
         self.warmed: list[tuple[BucketKey, int]] = []
@@ -86,7 +93,7 @@ def measured(monkeypatch):
     """Each sized bucket's cost, with the throwaway capture stubbed out."""
     runs = []
 
-    def capture(capture, what):
+    def capture(capture, what, executable):
         _, cost = capture(pool=None)
         runs.append(cost)
         return None if cost.graph is None else GraphMemory(cost.graph, cost.outside)
@@ -108,7 +115,7 @@ def test_every_bucket_is_measured_once_before_any_capture(measured):
     kept = _StubMeasuredRunner(torch.device("cuda", 0), steps).size_captures()
 
     assert measured == list(steps.values()), "each bucket is measured once, in capture order"
-    assert kept == steps, "every bucket's step must be kept to size its capture"
+    assert _sized(kept) == steps, "every bucket's step must be kept to size its capture"
 
 
 def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
@@ -124,7 +131,7 @@ def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
     }
     largest, second, *smaller = walk
 
-    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+    costs = _sized(_StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures())
 
     assert measured == [walk[largest], walk[second]], "only the walk's two largest buckets are captured to size it"
     for bucket in smaller:
@@ -142,7 +149,7 @@ def test_a_walk_whose_second_bucket_takes_more_than_its_largest_is_captured_whol
         for bs, graph in ((32, 24), (16, 56), (8, 34), (4, 34))
     }
 
-    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+    costs = _sized(_StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures())
 
     assert measured == list(walk.values())
     assert costs == walk, "a walk that doesn't nest keeps each bucket's own size"
@@ -226,7 +233,7 @@ def test_a_tp_group_sizes_its_buckets_again_together(measured, wanted, peer_want
     runner._comm_group.tp_group = _PeerGroup([peer_wanted])
     runner.size_captures()
 
-    costs = runner.size_lent_captures(wanted)
+    costs = _sized(runner.size_lent_captures(wanted))
 
     assert len(measured) == captured, "a group's ranks capture their lender-sized buckets together or not at all"
     assert (costs == walk) == (captured == 4)
@@ -237,14 +244,15 @@ def test_a_regions_inputs_and_outputs_count_outside_its_pool(monkeypatch):
     reads inputs from there, a set per graph. The pool a capture took is all
     scratch: a smaller bucket takes it whole and adds its own buffers."""
     monkeypatch.setattr(
-        accelerator_graph_runner, "_capture_thrown_away", lambda capture, what: GraphMemory(60 * _MIB, 0),
+        accelerator_graph_runner, "_capture_thrown_away", lambda capture, what, executable: GraphMemory(60 * _MIB, 0),
     )
     captured = []
 
     def size(peak: int, kept: int) -> tuple[CaptureCost, bool]:
-        return accelerator_graph_runner._size_in_walk(
-            captured, CaptureCost(peak * _MIB, None, kept * _MIB, 1), False, None, "",
+        cost, lent = accelerator_graph_runner._size_in_walk(
+            captured, CaptureCost(peak * _MIB, None, kept * _MIB, 1), False, None, "", ExecutableMemory(),
         )
+        return cost._replace(executable=None), lent
 
     assert size(peak=8, kept=4) == (CaptureCost(8 * _MIB, 64 * _MIB, 4 * _MIB, 1), False)
     assert size(peak=4, kept=2) == (CaptureCost(4 * _MIB, 62 * _MIB, 2 * _MIB, 1), False)
@@ -350,7 +358,7 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
 
     taken = accelerator_graph_runner._capture_thrown_away(
         partial(accelerator_graph_runner.capture_into_graph, lambda: forward(x), device=device, autocast_dtype=None),
-        forward.__name__,
+        forward.__name__, ExecutableMemory(),
     )
 
     assert (taken is None) == (forward is not _succeeds)
@@ -358,10 +366,12 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
 
 
 @requires_cuda
-def test_a_throwaway_capture_counts_its_graphs_nodes():
+def test_graphs_take_no_more_executable_memory_than_sizing_counts():
     """A graph's executable memory is outside the allocator, so no pool shows
-    it, and sizing counts the graph's nodes instead. On Qwen3-Omni, 162 graphs
-    of 214867 nodes held 724 MiB beyond their pools."""
+    it. On Qwen3-Omni, 162 graphs held 724 MiB beyond their pools, and capture
+    ended with less free memory than the largest eager step. The plan credits
+    a walk's graphs with what its copies held, so once the copies are released
+    the graphs must reuse at least that."""
     device = torch.device("cuda")
     x = torch.zeros(8, device=device)
 
@@ -372,13 +382,30 @@ def test_a_throwaway_capture_counts_its_graphs_nodes():
         return y
 
     many_kernels()
+    capture = partial(accelerator_graph_runner.capture_into_graph, many_kernels, device=device, autocast_dtype=None)
+    measured = ExecutableMemory()
+    memory = accelerator_graph_runner._capture_thrown_away(capture, "4096 adds", measured)
+    pool = AcceleratorGraphPool(torch.cuda.graph_pool_handle())
+    torch.cuda.empty_cache()
+    free, reserved = torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
 
-    memory = accelerator_graph_runner._capture_thrown_away(
-        partial(accelerator_graph_runner.capture_into_graph, many_kernels, device=device, autocast_dtype=None),
-        "4096 adds",
+    # captured while the copies are held, so the graphs can't reuse their memory
+    graphs = [capture(pool=pool) for _ in range(8)]
+    executable = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
+    # captured again after the copies are released, as a runner captures
+    measured.release()
+    free, reserved = torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
+    graphs += [capture(pool=pool) for _ in range(8)]
+    fresh = free - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - reserved)
+    del graphs
+
+    assert 0.75 * 8 * memory.outside <= executable <= 8 * memory.outside, (
+        f"8 graphs took {executable / _MIB:.0f} MiB outside their pool, sizing counted {8 * memory.outside / _MIB:.0f}"
     )
-
-    assert memory.outside == 4096 * accelerator_graph_runner._EXEC_BYTES_PER_NODE, "each of the 4096 adds is a node"
+    assert 0 < measured.held and fresh <= 8 * memory.outside - measured.held, (
+        f"8 graphs took {fresh / _MIB:.0f} MiB of new memory, the plan expected "
+        f"{(8 * memory.outside - measured.held) / _MIB:.0f}"
+    )
 
 
 def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monkeypatch):
@@ -391,9 +418,10 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
     monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or [])
     monkeypatch.setattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None, raising=False)
     monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
-    graph = SimpleNamespace(instantiate=lambda: None)
+    measured = ExecutableMemory()
+    measured.per_node = 0.0
 
-    accelerator_graph_runner._capture_thrown_away(lambda pool, keep_graph: (graph, {}), "decode")
+    accelerator_graph_runner._capture_thrown_away(lambda pool, keep_graph: (object(), {}), "decode", measured)
 
     (args, kwargs), = calls
     try:
@@ -509,6 +537,7 @@ class _StubPlannedRunner:
             memory_allocated=lambda: 0,
         )
         self._blocked_buckets = []
+        self._executables = {}
         self.tried: list[BucketKey] = []
         self.forwards: list[int] = []
 

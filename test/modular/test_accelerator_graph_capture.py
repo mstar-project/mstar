@@ -81,6 +81,7 @@ class _FakeRunner:
         self._buckets = {}
         self._memory_pool = None
         self._blocked_buckets = []
+        self._executables = {}
         self.barrier = _Group(peer_flags)
         self._comm_group = SimpleNamespace(
             tp_group=self.barrier, sp_group=self.barrier

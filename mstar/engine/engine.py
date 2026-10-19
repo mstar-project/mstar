@@ -731,11 +731,16 @@ class Engine:
                 }
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info(self._device)
+            reusable = None
             if self._gpu_memory_fraction is not None:
                 # shortcut: counts this worker's PyTorch allocations, not its CUDA
                 # context or NCCL buffers; add those if a capped worker still crowds another
-                free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
-            return pools, free, plan_captures(pools, free)
+                capped = int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device)
+                # Free memory already excludes what sizing holds outside the allocator, and `capped`
+                # doesn't, so the plan counts graphs as reusing that memory only up to the gap between them.
+                reusable = max(capped - free, 0)
+                free = min(free, capped)
+            return pools, free, plan_captures(pools, free, reusable)
 
         pools, free, plan = planned(lambda runner: runner.size_captures())
         # a walk's smaller buckets were sized by its largest, which is enough

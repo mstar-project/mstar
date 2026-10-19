@@ -225,12 +225,107 @@ class CaptureCost(NamedTuple):
     slots: int
     # bytes each slot's graph holds outside the allocator: its executable memory
     outside: int = 0
+    # the walk's measurement, whose copies hold memory the graphs reuse
+    executable: "ExecutableMemory | None" = None
 
 
 class GraphMemory(NamedTuple):
     """What a captured graph holds: in its pool, and outside the allocator."""
     pool: int
     outside: int
+
+
+class ExecutableMemory:
+    """The executable memory a walk's graphs take per node, outside any pool,
+    measured on copies of its first throwaway graph: executables instantiated
+    from it through libcuda. The cost per node changes with a graph's size,
+    even for the same kernels: a chain of adds takes 3.1 KiB a node at 300
+    nodes and 2.4 at 2222. A walk's graphs are about the same size, so the
+    first graph's cost per node holds for all of them.
+
+    The copies are held until the runner captures. The driver keeps a destroyed
+    graph's executable memory to reuse, and maps new memory beside it, so after
+    any destroy, free memory drops by less than a copy takes.
+    """
+
+    def __init__(self):
+        self.per_node: float | None = None
+        # a lower bound on the bytes the copies hold
+        self.held = 0
+        self._copies: list[ctypes.c_void_p] = []
+
+    def measure(self, graph, nodes: int) -> None:
+        """Set ``per_node`` and ``held`` from copies of ``graph``, held until `release`.
+
+        The count starts after the first copy that takes free memory, since
+        copies until then fill pieces the driver mapped earlier. It adds one
+        2 MiB piece, since the first counted copy may start partway into a
+        piece. Free memory is the device's, so another process allocating or
+        freeing moves it: a count is kept only if free memory never rose and no
+        copy took more than two pieces above the mean. If no count is kept,
+        ``per_node`` is the largest rate a count gave. None if no copy could be
+        counted.
+        """
+        cuda = ctypes.CDLL("libcuda.so.1")
+        largest: float | None = None
+        drops: list[int] | None = None
+        free = torch.cuda.mem_get_info()[0]
+        tries = 0
+        first = len(self._copies)
+        while tries < _MEASURE_TRIES and len(self._copies) < _MEASURE_COPIES:
+            copy = ctypes.c_void_p()
+            status = cuda.cuGraphInstantiateWithFlags(
+                ctypes.byref(copy), ctypes.c_void_p(graph.raw_cuda_graph()), ctypes.c_ulonglong(0),
+            )
+            if status != 0:
+                logger.warning("Stopped measuring graph executable memory: CUresult %d", status)
+                break
+            self._copies.append(copy)
+            drop = free - torch.cuda.mem_get_info()[0]
+            free -= drop
+            if drop < 0:
+                tries += 1
+                drops = None
+            elif drops is None:
+                if drop > 0:
+                    drops = []
+            else:
+                drops.append(drop)
+                if sum(drops) >= _MEASURE_BYTES:
+                    rate = (sum(drops) + _EXEC_PIECE) / (len(drops) * nodes)
+                    if max(drops) <= sum(drops) / len(drops) + 2 * _EXEC_PIECE:
+                        self.per_node = rate
+                        # Subtract two pieces, since the count may start partway into one and leave the last
+                        # one partly unused.
+                        each = (sum(drops) - 2 * _EXEC_PIECE) / len(drops)
+                        self.held += int((len(self._copies) - first) * each)
+                        return
+                    largest = max(rate, largest or 0)
+                    tries += 1
+                    drops = None
+        if drops:
+            largest = max((sum(drops) + _EXEC_PIECE) / (len(drops) * nodes), largest or 0)
+        elif drops is None and not tries and self._copies:
+            # every copy fit in a piece mapped before
+            largest = _EXEC_PIECE / (len(self._copies) * nodes)
+        self.per_node = largest
+
+    def release(self) -> None:
+        # copies are made only on NVIDIA GPUs, since others may have no libcuda
+        if self._copies:
+            cuda = ctypes.CDLL("libcuda.so.1")
+            for copy in self._copies:
+                cuda.cuGraphExecDestroy(copy)
+            self._copies.clear()
+
+
+#: the driver maps executable memory in pieces of 2 MiB
+_EXEC_PIECE = 2 * 2**20
+#: copies are counted until they take 16 MiB, so the one piece added to a count is an eighth of it at most
+_MEASURE_BYTES = 16 * 2**20
+#: a count spoiled by another process is tried again
+_MEASURE_TRIES = 4
+_MEASURE_COPIES = 512
 
 
 def _tensor_bytes(value: Any) -> int:
@@ -250,7 +345,9 @@ def _tensor_bytes(value: Any) -> int:
     return sum(storages.values())
 
 
-def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> GraphMemory | None:
+def _capture_thrown_away(
+    capture: Callable[..., tuple[Any, Any]], what: str, executable: ExecutableMemory,
+) -> GraphMemory | None:
     """Run ``capture`` into a pool of its own and hand it all back: what the
     graph held, None if it failed.
 
@@ -259,15 +356,26 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     """
     torch.cuda.empty_cache()
     pool = DeviceCapability.of("cuda").graph_backend.graph_pool_handle()
-    # Keep the graph so its nodes can be counted, then instantiate it as a real capture does.
-    # Only NVIDIA's cost per node was measured, so a ROCm graph's executable memory is counted as zero.
+    # Keep the graph so its nodes can be counted. It is never instantiated, so no executable is
+    # destroyed before `ExecutableMemory` measures. The measurement calls libcuda, so a ROCm
+    # graph's executable memory is counted as zero.
     counted = current_platform.is_cuda()
     nodes = 0
     try:
         graph, outputs = capture(pool=pool, keep_graph=counted)
         if counted:
             nodes = _graph_nodes(graph)
-            graph.instantiate()
+            if nodes and executable.per_node is None:
+                executable.measure(graph, nodes)
+                if executable.per_node is None:
+                    # Leave the graph unsized. Counted as zero, its executable memory would go unplanned.
+                    logger.warning("Could not measure the executable memory of %s", what)
+                    graph = outputs = None
+                else:
+                    logger.info(
+                        "%s: graph executable memory, %.0f bytes a node, %.0f MiB held for the walk's graphs",
+                        what, executable.per_node, executable.held / 2**20,
+                    )
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
@@ -279,13 +387,7 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
-    return None if taken is None else GraphMemory(taken, nodes * _EXEC_BYTES_PER_NODE)
-
-
-#: a graph's executable memory per node, which no pool holds: about 3.5 KiB on Qwen3-Omni's kernels and
-#: 2.3 KiB on a chain of adds (H100, CUDA 12.9). The driver keeps a destroyed graph's executable memory
-#: and reuses it for the next graph, so free memory can't show it.
-_EXEC_BYTES_PER_NODE = 4 * 2**10
+    return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
 
 
 def _graph_nodes(graph) -> int:
@@ -300,7 +402,7 @@ def _graph_nodes(graph) -> int:
 
 def _size_in_walk(
     captured: list[CaptureCost], cost: CaptureCost, kept_in_pool: bool,
-    capture: Callable[..., tuple[Any, Any]], what: str,
+    capture: Callable[..., tuple[Any, Any]], what: str, executable: ExecutableMemory,
 ) -> tuple[CaptureCost, bool]:
     """Return ``cost`` with its graph's size, and whether that size came from
     another bucket's capture: the bucket is captured, thrown away, unless two
@@ -321,13 +423,14 @@ def _size_in_walk(
     def scratch(bucket: CaptureCost) -> int:
         return -(-(bucket.graph - bucket.kept) // _SEGMENT)
 
+    cost = cost._replace(executable=executable)
     lender = max(captured, key=lambda bucket: bucket.peak, default=None)
     if (
         len(captured) > 1 and cost.peak <= lender.peak
         and all(scratch(bucket) <= scratch(lender) for bucket in captured)
     ):
         return cost._replace(graph=lender.graph - lender.kept + cost.kept, outside=lender.outside), True
-    memory = _capture_thrown_away(capture, what)
+    memory = _capture_thrown_away(capture, what, executable)
     if memory is not None:
         cost = cost._replace(
             graph=memory.pool if kept_in_pool else memory.pool + cost.kept, outside=memory.outside,
@@ -352,7 +455,9 @@ class CapturePlan(NamedTuple):
     floor: int
 
 
-def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> CapturePlan:
+def plan_captures(
+    pools: Mapping[str, Mapping[Any, CaptureCost]], free: int, reusable: int | None = None,
+) -> CapturePlan:
     """The cheapest buckets across every pool on a device, added while the
     largest eager step still fits in ``free`` beside them.
 
@@ -360,12 +465,24 @@ def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> 
     every graph keeps, plus the most any one graph needs beyond that. So a
     bucket adds its slots' kept bytes, and whatever it needs past the pool's
     most so far. That is a model; the boot log compares it with what capture took.
-    A bucket also adds its slots' executable memory.
+    A bucket also adds its slots' executable memory, less the memory its
+    graphs reuse from the walk's copies. A walk's copies pay for its planned
+    graphs' executable memory once, across all its buckets. ``reusable`` bounds
+    the reuse summed over all buckets, None for no bound.
     """
     floor = max((cost.peak for costs in pools.values() for cost in costs.values()), default=0)
     room = free - floor
     plan = CapturePlan({pool: set() for pool in pools}, dict.fromkeys(pools, 0), dict.fromkeys(pools, 0), floor)
     scratch = dict.fromkeys(pools, 0)
+    # walk's measurement -> what its copies held that no planned graph reuses yet
+    unused = {
+        cost.executable: cost.executable.held
+        for costs in pools.values() for cost in costs.values() if cost.executable is not None
+    }
+    bound = float("inf") if reusable is None else reusable
+
+    def reused(cost: CaptureCost) -> int:
+        return min(unused.get(cost.executable, 0), bound, cost.slots * cost.outside)
 
     def added(pool: str, cost: CaptureCost) -> int:
         # whole segments: the costliest graph's scratch may have no room left for a small tensor
@@ -374,7 +491,7 @@ def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> 
 
     def on_device(candidate) -> int:
         pool, _, _, cost = candidate
-        return added(pool, cost) + cost.slots * cost.outside
+        return added(pool, cost) + cost.slots * cost.outside - reused(cost)
 
     left = [
         (pool, index, bucket, cost) for pool, costs in pools.items()
@@ -387,6 +504,10 @@ def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> 
         if on_device(best) > room:
             break
         room -= on_device(best)
+        used = reused(cost)
+        if used:
+            unused[cost.executable] -= used
+            bound -= used
         plan.predicted[pool] += added(pool, cost)
         plan.outside[pool] += cost.slots * cost.outside
         scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
@@ -535,6 +656,8 @@ class AcceleratorGraphRunner:
         self._capture_costs: dict[BucketKey, CaptureCost] = {}
         # the buckets of them sized by a lender's capture, not their own
         self._lent: set[BucketKey] = set()
+        # walk -> its graphs' executable memory
+        self._executables: dict[tuple, ExecutableMemory] = {}
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -685,14 +808,15 @@ class AcceleratorGraphRunner:
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
+                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
                         self._capture_costs[spec.bucket], lent = _size_in_walk(
-                            captured.setdefault((spec.bucket.graph_walk, spec.bucket.cg_key_info), []),
+                            captured.setdefault(walk, []),
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype,
                             ),
-                            f"{self._submodule_name} {spec}",
+                            f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
                         if lent:
                             self._lent.add(spec.bucket)
@@ -729,6 +853,7 @@ class AcceleratorGraphRunner:
                             autocast_dtype=self._autocast_dtype,
                         ),
                         f"{self._submodule_name} {spec}",
+                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
                     )
                 if memory is not None:
                     cost = cost._replace(graph=memory.pool, outside=memory.outside)
@@ -743,6 +868,9 @@ class AcceleratorGraphRunner:
     def warmup_and_capture(self, planned: Collection[BucketKey] | None):
         """Capture the ``planned`` buckets, of every config and batch size.
         With no plan, every bucket, each warmed up first as sizing would have."""
+        # the plan has read free memory, and the graphs captured here reuse what the copies held
+        for executable in self._executables.values():
+            executable.release()
         if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping graph capture for %s",
@@ -1516,6 +1644,8 @@ class PiecewiseAcceleratorGraphRunner:
         self._capture_costs: dict[BucketKey, CaptureCost] = {}
         # the buckets of them sized by a lender's capture, not their own
         self._lent: set[BucketKey] = set()
+        # executable memory of the region's graphs, which are all one walk
+        self._executable = ExecutableMemory()
         # bucket -> the shape, dtype and device of each output of its warm-up
         self._output_likes: dict[BucketKey, dict[str, tuple]] = {}
         self._dummy_rows = DummyRowPool(
@@ -1636,7 +1766,7 @@ class PiecewiseAcceleratorGraphRunner:
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
                                 ),
-                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
+                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                             )
                             if lent:
                                 self._lent.add(self._bucket(shape))
@@ -1670,7 +1800,7 @@ class PiecewiseAcceleratorGraphRunner:
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
                         ),
-                        f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
+                        f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                     )
                 if memory is not None:
                     cost = cost._replace(graph=memory.pool + cost.kept, outside=memory.outside)
@@ -1692,6 +1822,7 @@ class PiecewiseAcceleratorGraphRunner:
         }
 
     def warmup_and_capture(self, planned: Collection[BucketKey] | None) -> None:
+        self._executable.release()
         if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping piecewise capture for %s",
