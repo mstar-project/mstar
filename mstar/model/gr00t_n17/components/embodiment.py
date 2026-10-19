@@ -91,6 +91,69 @@ class CategorySpecificMLP(nn.Module):
         return self.layer2(torch.relu(self.layer1(x, cat_ids)), cat_ids)
 
 
+class MultiEmbodimentActionEncoder(nn.Module):
+    """Noisy actions plus the denoising time, per embodiment, into DT tokens.
+
+    ``W1`` embeds the action; the time is encoded by this file's own sinusoid;
+    the two are **concatenated** (which is why the checkpoint's ``W2`` is
+    ``2 * hidden`` wide) and mixed by ``W2`` under a swish, then ``W3``.
+    """
+
+    def __init__(self, num_categories: int, action_dim: int, hidden_size: int):
+        super().__init__()
+        self.W1 = CategorySpecificLinear(num_categories, action_dim, hidden_size)
+        self.W2 = CategorySpecificLinear(num_categories, 2 * hidden_size, hidden_size)
+        self.W3 = CategorySpecificLinear(num_categories, hidden_size, hidden_size)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(
+        self,
+        actions: torch.Tensor,
+        timesteps: torch.Tensor,
+        cat_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[B, T, action_dim]`` and one timestep per request to ``[B, T, hidden]``."""
+        batch, horizon, _ = actions.shape
+        # the reference takes one scalar time per request and spreads it over
+        # the horizon itself, and refuses any other shape
+        if timesteps.dim() != 1 or timesteps.shape[0] != batch:
+            raise ValueError(
+                f"one timestep per request, so [{batch}], got {list(timesteps.shape)}"
+            )
+        timesteps = timesteps.unsqueeze(1).expand(-1, horizon)
+
+        action = self.W1(actions, cat_ids)
+        tau = self.pos_encoding(timesteps).to(dtype=action.dtype)
+        mixed = torch.cat([action, tau], dim=-1)
+        # `x * sigmoid(x)`, as the reference writes it, not `F.silu`: the two
+        # differ on a quarter of elements by up to 5e-07 (measured), which is
+        # the difference between bit-exact against the reference and not
+        mixed = self.W2(mixed, cat_ids)
+        return self.W3(mixed * torch.sigmoid(mixed), cat_ids)
+
+
+def build_action_encoder(config) -> MultiEmbodimentActionEncoder:
+    """The ``denoise_step`` node's action encoder."""
+    return MultiEmbodimentActionEncoder(
+        num_categories=config.max_num_embodiments,
+        action_dim=config.max_action_dim,
+        hidden_size=config.input_embedding_dim,
+    )
+
+
+def build_action_decoder(config) -> CategorySpecificMLP:
+    """The DT's output rows back to an action velocity, per embodiment.
+
+    Its input width is the DT's ``output_dim``, not the DT's inner width.
+    """
+    return CategorySpecificMLP(
+        num_categories=config.max_num_embodiments,
+        input_dim=config.dit.output_dim,
+        hidden_dim=config.hidden_size,
+        output_dim=config.max_action_dim,
+    )
+
+
 def build_state_encoder(config) -> CategorySpecificMLP:
     """Raw state in, one conditioning token out (``[B, 1, input_embedding_dim]``).
 
