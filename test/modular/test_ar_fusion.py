@@ -381,10 +381,9 @@ def test_the_kernel_check_catches_a_kernel_that_skips_the_hidden_size():
     assert "max |err| inf" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
 
 
-def test_the_kernel_check_allows_truncation_at_eight_ranks():
-    """AITER truncates to bf16 on gfx942. With eight ranks a correct kernel can
-    be off by about one ulp of the sum from a round-to-nearest reference, even
-    where the residual nearly cancels the sum."""
+def test_the_kernel_check_refuses_a_truncating_kernel():
+    """AITER's release builds truncate to bf16 on gfx942. The values are within
+    an ulp, but the residual is biased toward zero, so the build is refused."""
     ca = _FakeCA(None, "cpu")
 
     def truncating(inp, res, *, res_out, out, w, eps, gemma_norm, **kw):
@@ -400,7 +399,27 @@ def test_the_kernel_check_allows_truncation_at_eight_ranks():
         return out, res_out
 
     ca.fused_ar_rms = truncating
-    assert AiterARFusion._check_kernel(ca, 0, 8, 64, BF16, 1, torch.device("cpu")) is None
+    reason = AiterARFusion._check_kernel(ca, 0, 8, 64, BF16, 1, torch.device("cpu"))
+    assert "rounds toward zero" in reason
+
+
+def test_the_kernel_check_allows_sum_order_noise():
+    """With more ranks the kernel can sum in another order than the reference
+    and land an ulp off either way. That's not a bias. (One rank here, the fake
+    only sums its own input.)"""
+    ca = _FakeCA(None, "cpu")
+    real = ca.fused_ar_rms
+    flip = torch.Generator().manual_seed(5)
+
+    def noisy(inp, res, **kw):
+        out, r = real(inp, res, **kw)
+        bits = r.view(torch.int16)
+        bits += torch.randint(-1, 2, bits.shape, generator=flip, dtype=torch.int16) * (
+            torch.rand(bits.shape, generator=flip) < 0.2)
+        return out, r
+
+    ca.fused_ar_rms = noisy
+    assert AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu")) is None
 
 
 def _truncate(v: torch.Tensor) -> torch.Tensor:
