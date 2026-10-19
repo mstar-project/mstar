@@ -1,4 +1,4 @@
-"""Attention at pi05's and V-JEPA2's shapes on an AMD GPU, against fp32 SDPA.
+"""Attention at pi05's and V-JEPA2's sizes on an AMD GPU, against an fp64 reference.
 
 One case per attention call the two models make, at their head dims, lengths,
 dtypes and masks:
@@ -46,11 +46,12 @@ def _rel(out, ref):
 
 
 def _sdpa_ref(q, k, v, scale=None):
-    """fp32 math SDPA over [B, H, N, D]."""
+    """Math SDPA over [B, H, N, D] in fp64, since importing mstar.engine sets
+    fp32 matmuls to TF32 ("high"), which the math path then uses."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     with sdpa_kernel(SDPBackend.MATH):
-        return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), scale=scale)
+        return F.scaled_dot_product_attention(q.double(), k.double(), v.double(), scale=scale).float()
 
 
 # --- encoders: SDPA as the models call it ----------------------------------------
