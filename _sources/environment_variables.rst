@@ -220,7 +220,11 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Request body limit on every route, as in the Rust frontend: a larger
        body gets a 413, refused on its ``Content-Length`` or, for a chunked
        upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
-       512 MiB file cap when this is lower.
+       512 MiB file cap when this is lower. A body refused on its
+       ``Content-Length`` is answered before it is read, so a client that
+       writes the whole body before reading the reply can see a connection
+       reset instead of the 413; one that sends ``Expect: 100-continue``
+       gets the 413 before it sends the body.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
