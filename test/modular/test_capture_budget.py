@@ -117,8 +117,8 @@ def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
     smaller graphs fit in the scratch the largest leaves free: 132 MiB for the
     64-row decode, where the 4-row one took 54 MiB of a pool of its own."""
     walk = {
-        _bucket("decode", 64, 64): CaptureCost(93 * _MIB, 133 * _MIB, _MIB, 2),
-        _bucket("decode", 32, 32): CaptureCost(46 * _MIB, 94 * _MIB, _MIB // 2, 2),
+        _bucket("decode", 64, 64): CaptureCost(93 * _MIB, 133 * _MIB, _MIB, 2, 4 * _MIB),
+        _bucket("decode", 32, 32): CaptureCost(46 * _MIB, 94 * _MIB, _MIB // 2, 2, 4 * _MIB),
         _bucket("decode", 8, 8): CaptureCost(13 * _MIB, 22 * _MIB, _MIB // 8, 2),
         _bucket("decode", 4, 4): CaptureCost(7 * _MIB, 54 * _MIB, _MIB // 16, 2),
     }
@@ -128,8 +128,8 @@ def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
 
     assert measured == [walk[largest], walk[second]], "only the walk's two largest buckets are captured to size it"
     for bucket in smaller:
-        assert costs[bucket] == walk[bucket]._replace(graph=132 * _MIB + walk[bucket].kept), (
-            "a smaller bucket takes the largest's scratch and adds its own outputs"
+        assert costs[bucket] == walk[bucket]._replace(graph=132 * _MIB + walk[bucket].kept, outside=4 * _MIB), (
+            "a smaller bucket takes the largest's scratch and executable memory, and adds its own outputs"
         )
 
 
@@ -357,6 +357,30 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
     assert torch.cuda.memory_reserved(device) == reserved, "a throwaway capture must hand back all it took"
 
 
+@requires_cuda
+def test_a_throwaway_capture_counts_its_graphs_nodes():
+    """A graph's executable memory is outside the allocator, so no pool shows
+    it, and sizing counts the graph's nodes instead. On Qwen3-Omni, 162 graphs
+    of 214867 nodes held 724 MiB beyond their pools."""
+    device = torch.device("cuda")
+    x = torch.zeros(8, device=device)
+
+    def many_kernels():
+        y = x
+        for _ in range(4096):
+            y = y + 1
+        return y
+
+    many_kernels()
+
+    memory = accelerator_graph_runner._capture_thrown_away(
+        partial(accelerator_graph_runner.capture_into_graph, many_kernels, device=device, autocast_dtype=None),
+        "4096 adds",
+    )
+
+    assert memory.outside == 4096 * accelerator_graph_runner._EXEC_BYTES_PER_NODE, "each of the 4096 adds is a node"
+
+
 def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monkeypatch):
     """`memory_snapshot` takes ``include_traces`` only from torch 2.11, and
     pyproject allows 2.9. On 2.9 and 2.10 the call raised TypeError while
@@ -397,6 +421,18 @@ def test_the_plan_takes_small_graphs_from_every_pool_first():
     assert plan.buckets == {"Code2Wav": {"bs=1"}, "Talker": {"bs=1", "bs=32"}}, (
         "every pool's cheapest graphs must come before any pool's biggest"
     )
+
+
+def test_a_graphs_executable_memory_counts_against_the_floor():
+    """Planned by their pools alone, colocated Qwen3-Omni's graphs left free
+    memory 241 MiB short of its largest eager step, because each graph's
+    executable memory is outside the allocator."""
+    costs = {bs: _cost(100, kept=100, peak=1024)._replace(outside=50 * _MIB) for bs in (1, 2)}
+
+    plan = plan_captures({"Thinker": costs}, free=(1024 + 250) * _MIB)
+
+    assert len(plan.buckets["Thinker"]) == 1, "both pools fit in 250 MiB, but not with their graphs' 100 MiB outside"
+    assert (plan.predicted["Thinker"], plan.outside["Thinker"]) == (100 * _MIB, 50 * _MIB)
 
 
 def test_a_bucket_goes_in_with_all_its_slots_or_not_at_all():
