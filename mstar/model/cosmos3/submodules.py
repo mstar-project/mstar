@@ -2927,7 +2927,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
         # at higher resolutions. Contiguous whatever layout the decoder ended in.
-        return (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).contiguous()
+        # fp32 and rounded like diffusers' postprocess (bf16 math and truncation cost ~1 LSB)
+        return (decoded.float() / 2 + 0.5).clamp(0, 1).mul(255).round().to(torch.uint8).contiguous()
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
