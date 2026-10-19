@@ -406,6 +406,15 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
   is stochastic by design and seeded per request.
+- Known limitation of the checkpoint: it often answers speech that is not
+  addressed to it, such as a side conversation or background speech, where it
+  should keep its turn (about half of such pairs on Full-Duplex-Bench v1.5).
+  NVIDIA's NeMo reference inference (``examples/speechlm2/offline_voicechat_infer.py``
+  on the ``nemotron-labs-voicechat`` branch of NVIDIA-NeMo/Speech) answers the
+  same side speech on the same inputs, and the model card's known limitations
+  say the model is not suitable for noisy environments, especially where
+  background speech may occur. Nothing in the serving path tells speakers
+  apart. Real interruptions and backchannels are handled well.
 
 Chatterbox notes
 ----------------
