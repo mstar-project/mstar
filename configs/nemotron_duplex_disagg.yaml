@@ -21,6 +21,10 @@ max_seq_len: 12288
 # The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
 
+# No per-message deflate on the WebSocket routes: compressing 32 live calls'
+# 80 ms appends cost the event loop ~8% on /generate/ws (H100, 2026-10-17).
+ws_per_message_deflate: false
+
 # A live call's input files over its whole life; past it the call ends with a
 # 400. 160 s of 16 kHz audio is about 10 MB as float32 WAV: 32 leaves room for
 # stereo or a 48 kHz opening clip. A file is decoded at most one frame past

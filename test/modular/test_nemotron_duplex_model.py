@@ -141,6 +141,15 @@ def test_duplex_shipped_configs_hold_their_session_cap():
         model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
 
 
+def test_duplex_shipped_configs_turn_websocket_deflate_off():
+    """Compressing live calls' appends cost the server's event loop more than
+    the bandwidth was worth at 32 calls, where it was measured."""
+    import yaml
+
+    for name in ("nemotron_duplex.yaml", "nemotron_duplex_disagg.yaml"):
+        assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
+
+
 @pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV, NANO_KV])
 def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     """Every session holds a slot in each recurrent pool and its nano and talker

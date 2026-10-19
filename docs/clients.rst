@@ -86,8 +86,9 @@ WebSocket ``/generate/ws``
 
 ``/generate/ws`` is the same request over one persistent WebSocket, for control loops
 that cannot afford an HTTP round trip per step (robot policies, streaming world models).
-The server negotiates no per-message deflate on any WebSocket route: the audio they mostly
-carry barely compresses, and compressing it costs the event loop.
+The server negotiates per-message deflate on its WebSocket routes unless the deployment
+turns it off (``ws_per_message_deflate`` in :doc:`serving`, as the Nemotron VoiceChat
+configs do).
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
