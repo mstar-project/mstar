@@ -850,11 +850,13 @@ when neither torchcodec nor PyAV can read it.</p>
 <dt class="sig sig-object py" id="mstar.model.media_limits.read_image">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">read_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">rgb</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#read_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.read_image" title="Link to this definition">#</a></dt>
 <dd><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large.</p>
-<p><code class="docutils literal notranslate"><span class="pre">rgb</span></code> forces three channels; otherwise the file’s own channels are kept,
-as <code class="docutils literal notranslate"><span class="pre">torchvision.io.decode_image</span></code> does. A GIF or an animated WebP is read
-with Pillow, as its first frame in RGB: torchvision’s GIF decoder is not
-safe on untrusted files before torchvision 0.28, and its WebP decoder
-refuses animation.</p>
+<p><code class="docutils literal notranslate"><span class="pre">rgb</span></code> forces three channels, with any transparency composited on white
+as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
+would turn a transparent background black); otherwise the file’s own
+channels are kept, as <code class="docutils literal notranslate"><span class="pre">torchvision.io.decode_image</span></code> does. A GIF or an
+animated WebP is read with Pillow, as its first frame in RGB: torchvision’s
+GIF decoder is not safe on untrusted files before torchvision 0.28, and its
+WebP decoder refuses animation.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
