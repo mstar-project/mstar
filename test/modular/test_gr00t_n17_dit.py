@@ -18,12 +18,19 @@ rather than from this test.
 Then ``TimestepEncoder``: its 256-wide projection, which the checkpoint fixes and no config
 does, and the cast to the weights' dtype, which is a real rounding in bf16.
 
-The last section is ``MultiEmbodimentActionEncoder``, which is where that sinusoid is used:
+Next comes ``MultiEmbodimentActionEncoder``, which is where that sinusoid is used:
 the action through ``W1``, the time through the sinusoid, the two **concatenated** rather than
 added, ``W2``, a swish spelled ``x * sigmoid(x)``, ``W3``. It lives in ``embodiment.py`` next
 to the state encoder, but it is a DT piece and it depends on the sinusoid above, so it is
 tested here. ``CategorySpecificLinear`` itself is pinned in ``test_gr00t_n17_state.py`` and
 not again here.
+
+The last section is the DT block: ``AdaLayerNorm``, which carries one request's denoising
+timestep into all of that request's tokens, and ``BasicTransformerBlock``, which alternates
+cross-attention over the bridge's rows with self-attention over its own. Its attention
+arrives as a caller-supplied callable, so an inline reference can be handed the same one --
+which leaves no kernel in the comparison that this file did not call itself, and makes every
+test there ``torch.equal`` rather than a bar.
 """
 
 import glob
@@ -37,7 +44,11 @@ from diffusers.models.embeddings import Timesteps
 from safetensors import safe_open
 from torch import nn
 
-from mstar.model.gr00t_n17.components.dit import TimestepEncoder
+from mstar.model.gr00t_n17.components.dit import (
+    AdaLayerNorm,
+    BasicTransformerBlock,
+    TimestepEncoder,
+)
 from mstar.model.gr00t_n17.components.embodiment import (
     MultiEmbodimentActionEncoder,
     SinusoidalPositionalEncoding,
@@ -87,12 +98,13 @@ def _rows(shape: tuple[int, int] = (1, len(_TIMESTEPS))) -> torch.Tensor:
     return torch.tensor((_TIMESTEPS * (count // len(_TIMESTEPS) + 1))[:count]).reshape(shape)
 
 
-def _randomize(module: nn.Module, seed: int) -> None:
-    """Scaled down so the SiLU between the two linears is not saturated on every row."""
+def _randomize(module: nn.Module, seed: int, scale: float = 0.1) -> None:
+    """Scaled down so the SiLU between the two linears is not saturated on every row. The
+    DT block's section below fills wider, for a reason stated there."""
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for parameter in module.parameters():
-            parameter.copy_(0.1 * torch.randn(parameter.shape, generator=generator))
+            parameter.copy_(scale * torch.randn(parameter.shape, generator=generator))
 
 
 def _encoder(embedding_dim: int = _EMBED, seed: int = 0) -> TimestepEncoder:
@@ -793,3 +805,551 @@ def test_the_real_decoder_takes_the_dts_output_width_in_and_an_action_out():
     assert config.dit.inner_dim == 1536
     assert decoder.layer1.W.shape == (32, 1024, 1024)
     assert decoder.layer2.W.shape == (32, 1024, 132)
+
+
+# ----------------------------------------------------------------------------
+# Inline reference: `AdaLayerNorm`, written from its one line
+# ----------------------------------------------------------------------------
+
+# A tiny DT. Every width here is a different number, so no test below can pass by reading
+# one where it meant another: the block is 12 wide, its attention is 3 heads x 5 = 15 wide
+# inside, and the bridge's rows it cross-attends are 7. In the real model the first two are
+# both 1536 and only the bridge's 2048 stands apart, which is why they are spread out here.
+_DT_DIM = 12
+_DT_HEADS = 3
+_DT_HEAD_DIM = 5
+_DT_INNER = _DT_HEADS * _DT_HEAD_DIM
+_BRIDGE_DIM = 7
+# 2 requests x 4 action tokens attending 6 bridge rows: three different counts, so a query
+# count standing in for a key count is a shape error and not a quiet reinterpretation.
+_REQUESTS = 2
+_QUERIES = 4
+_BRIDGE_ROWS = 6
+# every LayerNorm in the DT, including AdaLN's inner one; spelled out, not imported
+_EPS = 1e-5
+
+# Deliberate deviations, as in the two references above. Each is a reading of the one line
+# that a reader could plausibly expect instead, and each loads the checkpoint and runs.
+_WRONG_SHIFT_FIRST = "shift first out of the chunk"
+_WRONG_BARE_SCALE = "scale and not 1 + scale"
+# `[:, None]` dropped. Only computable where the request count equals the token count, which
+# is the whole hazard: at any other shape it raises, at that one shape it silently gives
+# token t request t's conditioning.
+_WRONG_PER_TOKEN = "the pair indexed per token"
+_SWISH_LONGHAND = "x * sigmoid(x) for the activation"
+
+
+def _adaln_reference(
+    norm: AdaLayerNorm, x: torch.Tensor, temb: torch.Tensor, deviation: str | None = None,
+) -> torch.Tensor:
+    """``layer_norm(x) * (1 + scale[:, None]) + shift[:, None]``, with ``scale`` first out of
+    the chunk and the activation ``F.silu``.
+
+    The normalisation is written out as ``F.layer_norm`` with no weight and no bias rather
+    than read off the module, so the parity test pins the inner norm's two settings -- not
+    affine, eps 1e-5 -- as well as the arithmetic around it. Only the ``linear`` is borrowed.
+    """
+    activation = temb * torch.sigmoid(temb) if deviation == _SWISH_LONGHAND else F.silu(temb)
+    first, second = norm.linear(activation).chunk(2, dim=1)
+    scale, shift = (second, first) if deviation == _WRONG_SHIFT_FIRST else (first, second)
+    normed = F.layer_norm(x, (x.shape[-1],), eps=_EPS)
+    if deviation == _WRONG_PER_TOKEN:
+        return normed * (1 + scale) + shift
+    gain = scale[:, None] if deviation == _WRONG_BARE_SCALE else 1 + scale[:, None]
+    return normed * gain + shift[:, None]
+
+
+def _adaln(seed: int = 20) -> AdaLayerNorm:
+    """Ours, filled. ``_randomize``'s default scale keeps the SiLU off its saturated ends,
+    which is what the activation test below needs."""
+    norm = AdaLayerNorm(_DT_DIM)
+    _randomize(norm, seed)
+    return norm
+
+
+def _temb(requests: int = _REQUESTS, seed: int = 21) -> torch.Tensor:
+    """``[B, dim]``: one conditioning vector per request, which is what ``TimestepEncoder``
+    above returns. O(1), so the SiLU runs where its two spellings are not the same function.
+    """
+    return torch.randn(requests, _DT_DIM, generator=torch.Generator().manual_seed(seed))
+
+
+def _hidden(requests: int = _REQUESTS, tokens: int = _QUERIES, seed: int = 22) -> torch.Tensor:
+    """``[B, T, dim]``: the DT's own action tokens."""
+    return torch.randn(
+        requests, tokens, _DT_DIM, generator=torch.Generator().manual_seed(seed),
+    )
+
+
+# ----------------------------------------------------------------------------
+# `AdaLayerNorm` against the reference
+# ----------------------------------------------------------------------------
+
+_ADALN_SHAPES = {
+    "a batch of requests": (_REQUESTS, _QUERIES),
+    "as many tokens as requests": (3, 3),
+    "one request": (1, _QUERIES),
+    "one token each": (3, 1),
+}
+
+
+@pytest.mark.parametrize("shape", list(_ADALN_SHAPES.values()), ids=list(_ADALN_SHAPES))
+@torch.no_grad()
+def test_adalayernorm_is_the_reference_block(shape):
+    """One GEMM, one normalisation, a multiply and an add, in that order on the same tensors,
+    so this is ``torch.equal`` and not a bar.
+
+    The square shape is here because it is the only one where the ``[:, None]`` broadcast can
+    be dropped without raising; the test below says what it would cost.
+
+    Parity alone would also pass against an inner norm that was affine at its default
+    initialisation (weight 1, bias 0). What rules that out numerically is ``_randomize``,
+    which fills every parameter the module has -- so an affine norm would arrive here with a
+    random gain and miss. The key set is pinned separately below.
+    """
+    requests, tokens = shape
+    norm = _adaln()
+    x = _hidden(requests, tokens)
+    temb = _temb(requests)
+    out = norm(x, temb)
+
+    assert out.shape == (requests, tokens, _DT_DIM)
+    assert torch.equal(out, _adaln_reference(norm, x, temb))
+
+
+@torch.no_grad()
+def test_the_scale_comes_first_out_of_the_chunk():
+    """``linear`` is one 2x-wide projection, so the halves are interchangeable in shape and a
+    swap raises nothing, loads every weight, and leaves the output's magnitude where it was.
+    One of the two is multiplied and the other added, which is the only thing that tells
+    them apart -- measured here as a 0.97 move on an output whose largest element is 2.55.
+    """
+    norm = _adaln()
+    x, temb = _hidden(), _temb()
+    out = norm(x, temb)
+    swapped = _adaln_reference(norm, x, temb, _WRONG_SHIFT_FIRST)
+
+    assert not torch.equal(out, swapped)
+    assert (out - swapped).abs().max() > 0.1 * out.abs().max()
+
+
+@torch.no_grad()
+def test_the_scale_is_a_gain_about_one_and_not_the_gain_itself():
+    """``1 + scale`` makes a zero ``linear`` the identity, which is how a DiT block starts
+    trained: zeros in, the block passes its input through its normalisation untouched. Bare
+    ``scale`` makes the same weights annihilate the tokens instead, which is the concrete
+    difference rather than a second copy of the formula.
+
+    The trained fill is checked too, since zeros are a special case: on it the two readings
+    are 2.33 apart against an output whose largest element is 2.55.
+    """
+    zeroed = AdaLayerNorm(_DT_DIM)
+    with torch.no_grad():
+        for parameter in zeroed.parameters():
+            parameter.zero_()
+    x, temb = _hidden(), _temb()
+
+    assert torch.equal(zeroed(x, temb), F.layer_norm(x, (_DT_DIM,), eps=_EPS))
+    assert torch.equal(_adaln_reference(zeroed, x, temb, _WRONG_BARE_SCALE), torch.zeros_like(x))
+
+    norm = _adaln()
+    bare = _adaln_reference(norm, x, temb, _WRONG_BARE_SCALE)
+    assert not torch.equal(norm(x, temb), bare)
+
+
+@torch.no_grad()
+def test_one_requests_pair_reaches_every_one_of_its_tokens():
+    """Half of R10: the conditioning is per request, not per token. Argued from values rather
+    than from the formula -- every token of a request is given the same row here, so a per
+    request pair has to come back as identical rows, and the per-token reading gives each
+    token a different gain and breaks that.
+
+    The shape is square on purpose. ``scale`` is ``[B, dim]`` and the tokens are
+    ``[B, T, dim]``, so dropping the ``[:, None]`` raises at every shape except this one,
+    where it quietly applies request t's conditioning to token t of every request -- a 1.07
+    move against a 2.28 output, and the kind of mistake that a 1-token test would never see.
+    """
+    requests = tokens = 3
+    norm = _adaln()
+    row = _hidden(1, 1)
+    x = row.expand(requests, tokens, _DT_DIM).contiguous()
+    temb = _temb(requests)
+    out = norm(x, temb)
+
+    for request in range(requests):
+        for token in range(1, tokens):
+            assert torch.equal(out[request, token], out[request, 0])
+    per_token = _adaln_reference(norm, x, temb, _WRONG_PER_TOKEN)
+    assert not torch.equal(out, per_token)
+    assert (out - per_token).abs().max() > 0.1 * out.abs().max()
+
+
+@torch.no_grad()
+def test_a_batch_can_hold_requests_at_different_denoising_steps():
+    """The other half of R10, and the reason the DT can batch at all: each row's answer
+    depends on that row's timestep and on no other row's. Moving one request's ``temb``
+    moves its own tokens and leaves its neighbours' bit-identical.
+
+    Bit-identical, not close: the batch shape is the same in both runs, so the GEMM blocks
+    its reductions the same way. (Running one request alone is *not* exact -- a 1-row
+    ``linear`` and a 3-row one disagree by 2.4e-07 here -- so a "batching is independence"
+    test written as batch against singleton would have to carry a bar, and would be about
+    the GEMM rather than about this module.)
+    """
+    norm = _adaln()
+    x = _hidden(3, _QUERIES)
+    temb = _temb(3)
+    out = norm(x, temb)
+
+    moved = temb.clone()
+    moved[1] += 0.5
+    after = norm(x, moved)
+
+    assert torch.equal(after[0], out[0])
+    assert torch.equal(after[2], out[2])
+    assert not torch.equal(after[1], out[1])
+    assert torch.equal(norm(x[[2, 0, 1]], temb[[2, 0, 1]]), out[[2, 0, 1]])
+
+
+def test_the_inner_norm_is_not_affine_because_the_checkpoint_has_no_weight_for_it():
+    """``norm1`` carries ``linear.weight`` and ``linear.bias`` and nothing else, so an affine
+    inner norm would arrive with two tensors the checkpoint cannot fill. It would also load
+    and run: ``nn.LayerNorm``'s affine parameters initialise to the identity, so
+    ``load_state_dict`` with ``strict=False`` anywhere upstream would leave them at 1 and 0
+    and the forward would be right until someone trained it.
+    """
+    norm = _adaln()
+
+    assert {name for name, _ in norm.named_parameters()} == {"linear.weight", "linear.bias"}
+    assert norm.norm.weight is None and norm.norm.bias is None
+    assert norm.norm.eps == _EPS
+
+
+# ----------------------------------------------------------------------------
+# Inline reference: one DT block, written from its six steps
+# ----------------------------------------------------------------------------
+
+# The block's fill, wider than `_randomize`'s default because the attention's contribution
+# has to be comparable to the residual it is added to. At 0.1 the attention output's largest
+# element is 0.18 against a block output of 2.61, so dropping the attention residual moves
+# the answer by 1.4% -- a wiring test that reads as a rounding. At 0.3 every deviation below
+# moves it by at least a third of its largest element.
+_BLOCK_SCALE = 0.3
+
+_WRONG_NO_ATTN_RESIDUAL = "the attention residual dropped"
+_WRONG_NO_FF_RESIDUAL = "the feed-forward residual dropped"
+_WRONG_NORM3_AFTER_FF = "norm3 after the feed-forward"
+_WRONG_NORMS_SWAPPED = "AdaLN before the feed-forward instead"
+# the feed-forward reading the block's input rather than what the attention residual made
+_WRONG_FF_BEFORE_RESIDUAL = "the feed-forward reads the pre-residual tokens"
+
+_BLOCK_DEVIATIONS = (
+    _WRONG_NO_ATTN_RESIDUAL,
+    _WRONG_NO_FF_RESIDUAL,
+    _WRONG_NORM3_AFTER_FF,
+    _WRONG_NORMS_SWAPPED,
+    _WRONG_FF_BEFORE_RESIDUAL,
+)
+
+
+def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """A CPU stand-in for the resource C07 will bind: ``[B, T, heads, head_dim]`` in and out,
+    unmasked, every query over every key. It is the contract's own shape, which is why the
+    same callable can serve the module and the reference below -- so the comparison is of
+    the wiring around the attention and is exact, with no attention backend in it.
+    """
+    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+    return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+
+
+def _block(cross: bool, seed: int = 23) -> BasicTransformerBlock:
+    """One block at either attention setting, filled, with the stand-in bound."""
+    block = BasicTransformerBlock(
+        _DT_DIM,
+        _DT_HEADS,
+        _DT_HEAD_DIM,
+        cross_attention_dim=_BRIDGE_DIM if cross else None,
+        attend=_sdpa,
+    )
+    _randomize(block, seed, _BLOCK_SCALE)
+    return block
+
+
+def _bridge_rows(
+    cross: bool, requests: int = _REQUESTS, rows: int = _BRIDGE_ROWS, seed: int = 24,
+) -> torch.Tensor | None:
+    """What a cross block is handed: the bridge's rows, ``[B, S, 2048]`` in the real model.
+    A self block is handed nothing, which is what makes its k and v its own tokens."""
+    if not cross:
+        return None
+    return torch.randn(requests, rows, _BRIDGE_DIM, generator=torch.Generator().manual_seed(seed))
+
+
+def _block_reference(
+    block: BasicTransformerBlock,
+    hidden: torch.Tensor,
+    temb: torch.Tensor,
+    encoder: torch.Tensor | None,
+    deviation: str | None = None,
+) -> torch.Tensor:
+    """AdaLN, attention, ``+ residual``, a plain LayerNorm, the feed-forward, ``+ residual``.
+
+    The AdaLN is this file's reference from above, the normalisation before the feed-forward
+    is written out, and the residuals and the order are this file's. Two things are borrowed:
+    the projections, and ``block.ff`` -- diffusers' own ``FeedForward``, whose gating, widths
+    and activation are pinned on the same class in ``test_gr00t_n17_bridge.py`` and are not
+    this cycle's claim.
+    """
+    requests, queries, _ = hidden.shape
+    heads = (requests, -1, _DT_HEADS, _DT_HEAD_DIM)
+    plain = _adaln_reference(block.norm1, hidden, temb)
+    if deviation == _WRONG_NORMS_SWAPPED:
+        plain = F.layer_norm(hidden, (_DT_DIM,), eps=_EPS)
+    source = plain if encoder is None else encoder
+    out = _sdpa(
+        block.attn1.to_q(plain).view(heads),
+        block.attn1.to_k(source).view(heads),
+        block.attn1.to_v(source).view(heads),
+    )
+    attended = block.attn1.to_out[0](out.reshape(requests, queries, -1))
+
+    residual = attended if deviation == _WRONG_NO_ATTN_RESIDUAL else attended + hidden
+    if deviation == _WRONG_NORM3_AFTER_FF:
+        return F.layer_norm(block.ff(residual), (_DT_DIM,), eps=_EPS) + residual
+    normed = F.layer_norm(
+        hidden if deviation == _WRONG_FF_BEFORE_RESIDUAL else residual, (_DT_DIM,), eps=_EPS,
+    )
+    if deviation == _WRONG_NORMS_SWAPPED:
+        normed = _adaln_reference(block.norm1, residual, temb)
+    forwarded = block.ff(normed)
+    return forwarded if deviation == _WRONG_NO_FF_RESIDUAL else forwarded + residual
+
+
+# ----------------------------------------------------------------------------
+# The block against the reference, at both attention settings
+# ----------------------------------------------------------------------------
+
+# The alternation: the even DT blocks cross-attend the bridge's rows, the odd ones attend
+# their own tokens. Everything below runs at both settings, because the two differ only in
+# where k and v come from and that is the half most easily got backwards.
+_SETTINGS = {"a cross block": True, "a self block": False}
+
+
+@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
+@pytest.mark.parametrize(
+    "requests, queries", [(_REQUESTS, _QUERIES), (1, 1)],
+    ids=["a batch of requests", "one request, one token"],
+)
+@torch.no_grad()
+def test_the_block_is_the_reference_block(cross, requests, queries):
+    """``torch.equal``, and it can be: the attention is the caller's callable, so the module
+    and the reference reach the same one on the same tensors and nothing in between is a
+    kernel this file did not call itself.
+    """
+    block = _block(cross)
+    hidden = _hidden(requests, queries)
+    temb = _temb(requests)
+    encoder = _bridge_rows(cross, requests)
+    out = block(hidden, temb, encoder)
+
+    assert out.shape == (requests, queries, _DT_DIM)
+    assert torch.equal(out, _block_reference(block, hidden, temb, encoder))
+
+
+@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
+@pytest.mark.parametrize("deviation", _BLOCK_DEVIATIONS)
+@torch.no_grad()
+def test_a_block_wired_any_other_way_is_a_different_answer(cross, deviation):
+    """What makes the parity above a test. Each of these is the same six pieces in a
+    different arrangement, each loads the checkpoint and runs at every shape, and each is
+    the arrangement of some other transformer block: a pre-norm block that keeps only one
+    residual, a post-norm block that normalises after the feed-forward, a block that
+    conditions its feed-forward instead of its attention, and a parallel block whose two
+    halves both read the input.
+    """
+    block = _block(cross)
+    hidden, temb = _hidden(), _temb()
+    encoder = _bridge_rows(cross)
+    out = block(hidden, temb, encoder)
+    wrong = _block_reference(block, hidden, temb, encoder, deviation)
+
+    assert not torch.equal(out, wrong)
+    # a floor, not a fitted threshold: over weight seeds 20-31 x both settings the weakest
+    # of these five moved the answer by 0.26 of its largest element, the norm3-after-the-
+    # feed-forward reading every time -- the only one of the five that keeps both residuals
+    assert (out - wrong).abs().max() > 0.2 * out.abs().max()
+
+
+@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
+@torch.no_grad()
+def test_k_and_v_come_from_the_setting_and_q_always_from_the_tokens(cross):
+    """The alternation's correctness, and what the checkpoint's shapes encode: a cross
+    block's ``to_k`` and ``to_v`` are 2048 wide against the DT's own 1536, so they can only
+    be fed the bridge's rows, and a self block's are 1536 and can only be fed its tokens.
+
+    The widths are half the claim; the other half is which tensor is actually projected,
+    which the stand-in reports. Note what k and v are in the self setting: the AdaLN output,
+    not the block's input -- the conditioning reaches the keys as well as the queries.
+    """
+    block = _block(cross)
+    hidden, temb = _hidden(), _temb()
+    encoder = _bridge_rows(cross)
+    seen = {}
+
+    def record(q, k, v):
+        seen.update(q=q, k=k, v=v)
+        return _sdpa(q, k, v)
+
+    block.attend = record
+    block(hidden, temb, encoder)
+
+    assert block.attn1.to_q.in_features == _DT_DIM
+    assert block.attn1.to_k.in_features == block.attn1.to_v.in_features
+    assert block.attn1.to_k.in_features == (_BRIDGE_DIM if cross else _DT_DIM)
+    assert block.attn1.to_out[0].in_features == _DT_INNER
+    assert block.attn1.to_out[0].out_features == _DT_DIM
+
+    normed = _adaln_reference(block.norm1, hidden, temb)
+    source = encoder if cross else normed
+    heads = (_REQUESTS, -1, _DT_HEADS, _DT_HEAD_DIM)
+    assert torch.equal(seen["q"], block.attn1.to_q(normed).view(heads))
+    assert torch.equal(seen["k"], block.attn1.to_k(source).view(heads))
+    assert torch.equal(seen["v"], block.attn1.to_v(source).view(heads))
+
+
+@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
+@torch.no_grad()
+def test_the_callable_is_handed_heads_last_and_its_output_is_folded_back_the_same_way(cross):
+    """The contract C07's resource will be written against, pinned on both sides. In:
+    ``[B, T, heads, head_dim]`` for q and ``[B, S, heads, head_dim]`` for k and v, where S is
+    the bridge's row count in a cross block and the query count in a self one. Out: whatever
+    it returns is folded back with ``reshape(B, T, -1)``, so the heads are concatenated in
+    the order they were split.
+
+    An attention that returns its queries untouched is what makes the second half checkable
+    without a second copy of the fold: the view and the reshape have to round-trip, so the
+    block's attention output must be exactly ``to_out.0`` of the unsplit ``to_q``. A
+    ``[B, heads, T, head_dim]`` layout -- the one every kernel in M* and torch wants, and the
+    one ``_sdpa`` transposes into -- would pass a shape check and fold the heads back
+    interleaved.
+    """
+    block = _block(cross)
+    hidden, temb = _hidden(), _temb()
+    encoder = _bridge_rows(cross)
+    keys = _BRIDGE_ROWS if cross else _QUERIES
+    seen = []
+
+    def shapes(q, k, v):
+        seen.append((tuple(q.shape), tuple(k.shape), tuple(v.shape)))
+        return q
+
+    block.attend = shapes
+    out = block(hidden, temb, encoder)
+
+    assert seen == [(
+        (_REQUESTS, _QUERIES, _DT_HEADS, _DT_HEAD_DIM),
+        (_REQUESTS, keys, _DT_HEADS, _DT_HEAD_DIM),
+        (_REQUESTS, keys, _DT_HEADS, _DT_HEAD_DIM),
+    )]
+    normed = _adaln_reference(block.norm1, hidden, temb)
+    attended = block.attn1.to_out[0](block.attn1.to_q(normed)) + hidden
+    assert torch.equal(out, block.ff(F.layer_norm(attended, (_DT_DIM,), eps=_EPS)) + attended)
+
+
+def test_a_block_with_no_attention_says_so_rather_than_attending_its_own_tokens():
+    """The callable is the only seam, so the unbound case has to be an error and not a
+    default: a block that fell back to its own tokens would be a running model with every
+    second block ignoring the language and the images, which no shape and no loss curve
+    reports. The message names who supplies one, because the block is built two layers below
+    the node that does.
+    """
+    block = BasicTransformerBlock(_DT_DIM, _DT_HEADS, _DT_HEAD_DIM)
+    hidden, temb = _hidden(), _temb()
+
+    with pytest.raises(RuntimeError, match="no attention"):
+        block(hidden, temb)
+
+    block.attend = _sdpa  # and binding one is the whole of what the node has to do
+    assert block(hidden, temb).shape == (_REQUESTS, _QUERIES, _DT_DIM)
+
+
+@torch.no_grad()
+def test_adalns_activation_is_f_silu_where_the_action_encoders_is_the_long_hand():
+    """One model, the same function twice, two spellings, and they are not bit-identical: a
+    cleanup that unified them would move one of the two. Both directions are here so the
+    test says which spelling belongs where rather than that the two differ.
+
+    ``nn.SiLU`` and ``x * sigmoid(x)`` disagree on a fifth of the elements (measured 20.4%
+    here) by up to 2.4e-07, which survives into AdaLN's output. The action encoder's own
+    section above measures what the substitution costs there: 0.50 in bf16 on a trained
+    embodiment.
+    """
+    norm = _adaln()
+    x, temb = _hidden(), _temb()
+    out = norm(x, temb)
+
+    assert torch.equal(out, _adaln_reference(norm, x, temb))
+    assert not torch.equal(out, _adaln_reference(norm, x, temb, _SWISH_LONGHAND))
+
+    encoder = _action_encoder()
+    cat_ids = torch.tensor(_CAT_IDS)
+    actions, timesteps = _actions(), _flat()
+    encoded = encoder(actions, timesteps, cat_ids)
+
+    assert torch.equal(encoded, _encoder_reference(encoder, actions, timesteps, cat_ids))
+    assert not torch.equal(
+        encoded, _encoder_reference(encoder, actions, timesteps, cat_ids, silu=True),
+    )
+
+
+# ----------------------------------------------------------------------------
+# What the checkpoint says a block is
+# ----------------------------------------------------------------------------
+
+_BLOCK_PREFIX = "action_head.model.transformer_blocks."
+
+
+@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
+def test_the_checkpoints_two_block_variants_name_these_modules_parameters():
+    """32 blocks, 14 tensors each, and two variants: ``attn1.to_k`` and ``to_v`` are 2048
+    wide on the even blocks and 1536 on the odd ones. That is the whole of what says the
+    alternation starts with cross-attention -- building it the other way round makes every
+    block's k and v the wrong width here.
+
+    The 14 also say what a block does *not* have: no ``norm2``, which is where diffusers'
+    own block keeps the norm before its cross-attention, and no ``norm3.weight`` or
+    ``norm3.bias``, which is the non-affine LayerNorm again. Shapes come off the safetensors
+    header, so no tensor is read, and both variants are built on meta.
+    """
+    config = Gr00tN17Config.from_hf(_GR00T, _BACKBONE)
+    with torch.device("meta"):
+        variants = {
+            cross: BasicTransformerBlock(
+                config.dit.inner_dim,
+                config.dit.num_attention_heads,
+                config.dit.attention_head_dim,
+                cross_attention_dim=config.backbone_embedding_dim if cross else None,
+            )
+            for cross in (True, False)
+        }
+    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
+    checkpoint: dict[int, dict[str, tuple[str, str]]] = {}
+    for name, shard in weight_map.items():
+        if name.startswith(_BLOCK_PREFIX):
+            index, _, key = name[len(_BLOCK_PREFIX) :].partition(".")
+            checkpoint.setdefault(int(index), {})[key] = (name, shard)
+
+    assert sorted(checkpoint) == list(range(config.dit.num_layers))
+    # the bridge's rows are as wide as the backbone's, which is why one field sizes both
+    assert config.backbone_embedding_dim == config.bridge.inner_dim
+    assert config.attend_text_every_n_blocks == 2  # the block index decides which variant
+
+    for index, tensors in checkpoint.items():
+        cross = index % config.attend_text_every_n_blocks == 0
+        block = variants[cross]
+        assert len(tensors) == 14
+        assert set(tensors) == {name for name, _ in block.named_parameters()}
+        for name, parameter in block.named_parameters():
+            key, shard = tensors[name]
+            with safe_open(str(_GR00T / shard), framework="pt") as shard_file:
+                assert list(parameter.shape) == shard_file.get_slice(key).get_shape()
