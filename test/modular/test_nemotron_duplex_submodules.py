@@ -82,7 +82,7 @@ def test_nano_never_stops_on_a_token():
 
 
 def _decode_engine(rids):
-    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(dim=-1))
+    sampler = SimpleNamespace(sample=lambda logits: logits.argmax(dim=-1))
     return SimpleNamespace(request_ids=rids, resources={NANO_SAMPLER: sampler}, per_request_states=None)
 
 
