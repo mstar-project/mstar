@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import os
 import sys
 import threading
@@ -149,6 +150,37 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     if raw == "1":
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def _wait_ms(raw: str) -> float:
+    """Milliseconds for ``Event.wait``, which overflows past TIMEOUT_MAX."""
+    value = float(raw)
+    if not math.isfinite(value) or value / 1000.0 > threading.TIMEOUT_MAX:
+        raise ValueError(f"{raw!r} is not a usable wait")
+    return value
+
+
+def _env_number(name: str, default, parse, minimum):
+    """A numeric tuning knob from the environment.
+
+    A malformed value falls back to *default* and one below *minimum* is
+    raised to it, each with a warning, as ``MSTAR_PY_SWITCH_INTERVAL_SEC``
+    and ``MSTAR_RECOMPILE_LIMIT`` already do. The worker reads these when it
+    is built: raising from ``run()`` would come after weight load, warmup and
+    capture, and after the conductor has counted the worker ready.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = parse(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s=%r is below %s; using %s", name, raw, minimum, minimum)
+        return minimum
+    return value
 
 
 @dataclass
@@ -311,6 +343,22 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
+
+        # How long the submitter holds off the GIL waiting for the GPU thread
+        # to reach the launch. submit_spec often sits on this cap, but raising
+        # it to 8ms did not help; tunable for another look.
+        self._launch_wait_s = _env_number(
+            "MSTAR_LAUNCH_WAIT_MS", 5.0, _wait_ms, 0.0,
+        ) / 1000.0
+        self._max_consecutive_spec = _env_number(
+            "MSTAR_MAX_CONSECUTIVE_SPEC_STEPS", 1024, int, 0,
+        )
+        if self._max_consecutive_spec == 0:
+            logger.warning(
+                "Worker %s: MSTAR_MAX_CONSECUTIVE_SPEC_STEPS=0 turns speculation "
+                "off: every step yields before the next one is built",
+                worker_id,
+            )
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
         self._host_rows_slot = 0
@@ -2022,6 +2070,15 @@ class Worker:
         ``terminal`` reason would refuse the same step again on every pass, so
         the requests it names fail instead.
         """
+        # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
+        # the rid's own count is, or failed) has no step to retry: on success
+        # the routing drops it too. Re-queued, it would run again with its
+        # loop-back inputs already spent.
+        prepared = set(node_batch.request_ids)
+        for rid in list(batch.request_to_worker_graph):
+            if rid not in prepared:
+                batch.discard_rid(rid)
+
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
@@ -3250,6 +3307,7 @@ class Worker:
                     graph_walk=graph_walk,
                     skip_cuda_sync=True,
                     cpu_tensors=cpu_outputs,
+                    ready_event=batch_N.node_batch.completion_event,
                 )
             return stored
 
@@ -4104,10 +4162,7 @@ class Worker:
         # Default ON. Set MSTAR_PRE_PLAN_SPEC=0 to fall back to the
         # double-buffer-without-pre-plan baseline.
         pre_plan_spec = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
-        # How long the submitter holds off the GIL waiting for the GPU thread
-        # to reach the launch. submit_spec often sits on this cap, but raising
-        # it to 8ms did not help; tunable for another look.
-        launch_wait_s = float(os.environ.get("MSTAR_LAUNCH_WAIT_MS", "5")) / 1000.0
+        launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:
             plan_executor = ThreadPoolExecutor(
@@ -4126,12 +4181,11 @@ class Worker:
         # MicroScheduler.has_ready_excluding finds another (node, walk)
         # ready RIGHT NOW. Single-walk workers always speculate; multi-walk
         # workers yield only when there's actual contention.
-        max_consecutive_spec = int(os.environ.get("MSTAR_MAX_CONSECUTIVE_SPEC_STEPS", "1024"))
         spec_peek_for_fairness = (
             os.environ.get("MSTAR_SPEC_PEEK_FOR_FAIRNESS", "1") == "1"
         )
         fair = _SpecFairness(
-            peek=spec_peek_for_fairness, max_consecutive=max_consecutive_spec,
+            peek=spec_peek_for_fairness, max_consecutive=self._max_consecutive_spec,
         )
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None

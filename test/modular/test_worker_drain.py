@@ -412,6 +412,7 @@ def _preprocess(inflight_reads=False):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt._draining_rids = set()
     wt._reads_done_sent = set()
+    wt._live_requests = {"X": 1}
     wt.sent = []
     wt.forced = []
     wt.communicator = SimpleNamespace(send=lambda e, m: wt.sent.append((e, m)))

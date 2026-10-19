@@ -321,7 +321,16 @@ Worker scheduling
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
-       other ready work.
+       other ready work. ``0`` turns speculation off. A value that is not an
+       integer is ignored with a warning when the worker starts.
+   * - ``MSTAR_LAUNCH_WAIT_MS``
+     - ``5``
+     - Milliseconds the speculative submitter holds off the GIL waiting for
+       the GPU thread to reach the launch before it carries on. A value that
+       is not a number, is ``nan`` or ``inf``, or is past
+       ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
+       worker starts and ``5`` is used; a negative value is raised to ``0``
+       with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -348,9 +357,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's

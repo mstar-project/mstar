@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from mstar.api_server.openai._util import now, rid
+from fastapi import HTTPException
+
+from mstar.api_server.openai._util import now, release_unread, rid
 
 
 async def create_images(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
@@ -25,25 +27,43 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
         if seed is not None and i > 0:
             model_kwargs["seed"] = int(seed) + i
         request_id = rid("img")
-        api.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=["image"],
-            model_kwargs=model_kwargs,
-            streaming=False,
-            request_id=request_id,
-        )
+        # Listed before submitting: submit_request registers the request
+        # before handing it on, so a failed submit still holds an entry.
         request_ids.append(request_id)
+        try:
+            api.submit_request(
+                text=args.text,
+                file_paths=args.file_paths,
+                input_modalities=args.input_modalities,
+                output_modalities=["image"],
+                model_kwargs=model_kwargs,
+                streaming=False,
+                request_id=request_id,
+            )
+        except BaseException:
+            release_unread(api, request_ids, 0)
+            raise
 
     data = []
-    for request_id in request_ids:
-        chunks = await api.collect_results(request_id, raw_request)
-        data.extend(
-            {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
-            for c in chunks
-            if c.modality == "image"
-        )
+    read = 0  # images collect_results has released; the rest are released on early exit
+    try:
+        for request_id in request_ids:
+            try:
+                chunks = await api.collect_results(request_id, raw_request)
+            except HTTPException:
+                read += 1  # collect_results released it before raising
+                raise
+            read += 1
+            data.extend(
+                {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
+                for c in chunks
+                if c.modality == "image"
+            )
+    finally:
+        # One failed, timed-out or cancelled image fails the whole request, so
+        # nothing will read the others: abort the ones still running and drop
+        # the finished ones, which would otherwise hold their bytes forever.
+        release_unread(api, request_ids, read)
     return {"created": now(), "data": data}
 
 

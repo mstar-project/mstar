@@ -377,10 +377,11 @@ class _DecodePlanCache:
     """The last leased decode plan, as `_fast_decode_plan` continues it."""
 
     __slots__ = (
-        "step_segments", "real_segments", "n_real", "pad_layout", "views", "epoch", "pending", "derived", "_rows",
+        "step_segments", "real_segments", "n_real", "pad_layout", "combined_labels", "views", "epoch", "pending",
+        "derived", "_rows",
     )
 
-    def __init__(self, step_segments, real_segments, n_real, pad_layout, views, epoch):
+    def __init__(self, step_segments, real_segments, n_real, pad_layout, combined_labels, views, epoch):
         # the planned step's own segments tuple: a commit of that object is the
         # one commit the next plan may assume
         self.step_segments = step_segments
@@ -389,6 +390,8 @@ class _DecodePlanCache:
         self.n_real = n_real
         # (count, span) of the padding rows, which change dummy ids per slot
         self.pad_layout = pad_layout
+        # the plan labels the views were built for
+        self.combined_labels = combined_labels
         # the full plan's views per label, the source of `derived`
         self.views = views
         self.epoch = epoch
@@ -1755,7 +1758,7 @@ class KVManager(AttentionResource):
                 return
         self._decode_plan_cache = _DecodePlanCache(
             step_segments=step.segments, real_segments=step.segments[:n_real],
-            n_real=n_real, pad_layout=pad_layout,
+            n_real=n_real, pad_layout=pad_layout, combined_labels=dict(step.combined_labels),
             views={label: out.views for label, out in res.items()},
             epoch=self._plan_epoch,
         )
@@ -1774,7 +1777,12 @@ class KVManager(AttentionResource):
                     break
                 n_real += 1
             real, pad = views[:n_real], views[n_real:]
-            if pad and (len(pad), pad[0].to_compute) != cache.pad_layout:
+            # a hit rebuilds each label's padding from all the step's padding
+            # rows; in a combined label, a later source label's real rows can
+            # follow an earlier one's padding
+            if [(v.request_id, v.label, v.to_compute) for v in pad] != [
+                (seg.request_id, seg.label, seg.span) for seg in cache.step_segments[cache.n_real:]
+            ]:
                 return None
             streams = []
             for v in real:
@@ -1827,7 +1835,13 @@ class KVManager(AttentionResource):
         if (
             len(segs) != n_real + cache.pad_layout[0]
             or segs[:n_real] != cache.real_segments
+            or step.combined_labels != cache.combined_labels
             or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in segs[n_real:])
+            # padding keeps its labels: their order places the real rows in a combined label
+            or any(
+                seg.label != prev.label
+                for seg, prev in zip(segs[n_real:], cache.step_segments[n_real:], strict=True)
+            )
         ):
             stats["miss"] += 1
             return None
@@ -1882,7 +1896,8 @@ class KVManager(AttentionResource):
             else:
                 last_all, npages_all, indices, pages_all = last, npages, rows.indices, rows.last_page.copy()
             kv_indptr = np.concatenate((np.zeros(1, np.int64), np.cumsum(npages_all))).astype(np.int32)
-            n_rows = n_real + n_pad
+            # this label's rows: `n_real` counts the real rows of every label
+            n_rows = len(rows.rows) + n_pad
             qo_indptr = np.arange(n_rows + 1, dtype=np.int32)
             kv_lens = (npages_all - 1) * page_size + last_all
             row_pages_now, lens_now = rows.row_pages, lens.tolist()
@@ -2029,6 +2044,8 @@ class KVManager(AttentionResource):
             self._maybe_apply_forks(step, ctx)
             self._copy_image_ends()
 
+        if self._indptr_ring is not None:
+            self._indptr_ring.begin_plan()
         res = None
         if self._plan_cache_mode and not pending:
             res = self._fast_decode_plan(step, ctx)
