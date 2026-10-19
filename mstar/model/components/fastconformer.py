@@ -176,22 +176,25 @@ class RelPositionAttention(nn.Module):
         self.bias_v = nn.Parameter(torch.zeros(h, d))
 
     def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        """``x`` is ``(B, T, hidden)``, ``pos_emb`` ``(2T-1, hidden)`` and
-        ``mask`` ``(B, 1, T, T)`` with True where a query may attend."""
+        """``x`` is ``(B, T, hidden)``, ``pos_emb`` ``(P, hidden)`` with
+        ``P >= 2T-1`` (rows past ``2T-1`` are zero padding) and ``mask``
+        ``(B, 1, T, T)`` with True where a query may attend."""
         b, t, _ = x.shape
         h, d = self.num_heads, self.head_dim
-        q, k, v = self.qkv_proj(x).view(b, t, 3, h, d).permute(2, 0, 3, 1, 4)
-        r = self.relative_k_proj(pos_emb).view(-1, h, d).permute(1, 2, 0)  # (H, D, 2T-1)
-        bd = torch.matmul(q + self.bias_v[None, :, None, :], r)  # (B, H, T, 2T-1)
+        q, k, v = self.qkv_proj(x).view(b, t, 3, h, d).unbind(2)  # (B, T, H, D) each
+        r = self.relative_k_proj(pos_emb).view(-1, h, d).permute(1, 2, 0)  # (H, D, P)
+        # one GEMM per head over all B*T queries: no copy of r per row
+        bd = torch.bmm((q + self.bias_v).reshape(b * t, h, d).transpose(0, 1), r)  # (H, B*T, P)
         # column T-1-i+j holds distance i-j for query i, key j
         p = bd.shape[-1]
-        bd = bd.as_strided((b, h, t, t), (h * t * p, t * p, p - 1, 1), storage_offset=bd.storage_offset() + t - 1)
-        bias = bd * self.head_dim ** -0.5
-        # (B, H, T, 2T-1) is the largest tensor in the encoder: let it go
+        bd = bd.as_strided((b, h, t, t), (t * p, b * t * p, p - 1, 1), storage_offset=bd.storage_offset() + t - 1)
+        bias = torch.mul(bd, self.head_dim ** -0.5, out=torch.empty(b, h, t, t, dtype=bd.dtype, device=bd.device))
+        # (H, B*T, P) is the largest tensor in the encoder: let it go
         del bd
         if mask is not None:
             bias.masked_fill_(~mask, torch.finfo(bias.dtype).min)
-        out = F.scaled_dot_product_attention(q + self.bias_u[None, :, None, :], k, v, attn_mask=bias)
+        q, k, v = (q + self.bias_u).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
 
@@ -254,10 +257,11 @@ class FastConformerBlock(nn.Module):
         self, x: torch.Tensor, pos_emb: torch.Tensor,
         mask: torch.Tensor | None, valid: torch.Tensor | None,
     ) -> torch.Tensor:
-        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
+        # alpha folds the half step into the add (0.5 * y is exact either way)
+        x = torch.add(x, self.feed_forward1(self.norm_feed_forward1(x)), alpha=0.5)
         x = x + self.self_attn(self.norm_self_att(x), pos_emb, mask)
         x = x + self.conv(self.norm_conv(x), valid)
-        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
+        x = torch.add(x, self.feed_forward2(self.norm_feed_forward2(x)), alpha=0.5)
         return self.norm_out(x)
 
 
@@ -324,6 +328,9 @@ class FastConformerEncoder(nn.Module):
             keys = valid[:, None, None, :]
             mask = keys if mask is None else mask & keys
         pos_emb = rel_positional_encoding(t, self.config.hidden_size, x.device, x.dtype)
+        # zero rows to a multiple of 8 distances keep the position GEMM's output
+        # rows 16-byte aligned, which the fast GEMM kernels need
+        pos_emb = F.pad(pos_emb, (0, 0, 0, -pos_emb.shape[0] % 8))
         for layer in self.layers:
             x = layer(x, pos_emb, mask, valid)
         return x, out_lengths
