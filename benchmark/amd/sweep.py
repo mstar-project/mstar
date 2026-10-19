@@ -35,7 +35,17 @@ from pathlib import Path
 
 from benchmark.amd import catalog, health, tables
 from benchmark.amd.catalog import Arm, Row
-from benchmark.amd.launch import REPO, VRAM_BUSY_MB, Launch, gpu_list, gpu_occupancy, host_record, smi_gpu
+from benchmark.amd.launch import (
+    REPO,
+    VRAM_BUSY_MB,
+    Launch,
+    _entries,
+    amd_smi_json,
+    gpu_list,
+    gpu_occupancy,
+    host_record,
+    smi_gpu,
+)
 
 WORK = Path("/work1/stephaniewang/atindra")
 DEFAULT_RUN_ROOT = WORK / "amd/results/bench"
@@ -192,15 +202,12 @@ class Plan:
 
 
 def _numa_of(gpu: int) -> int | None:
-    try:
-        out = subprocess.run(["amd-smi", "static", "--numa", "-g", str(smi_gpu(gpu)), "--json"], capture_output=True,
-                             text=True, timeout=120, check=False).stdout
-        doc = json.loads(out[out.find("["):]) if "[" in out else json.loads(out)
-        entry = doc[0] if isinstance(doc, list) else doc
-        node = (entry.get("numa") or {}).get("node")
-        return int(node) if node is not None else None
-    except (ValueError, KeyError, IndexError, TypeError, subprocess.TimeoutExpired, FileNotFoundError):
-        return None
+    """NUMA node of HIP device ``gpu``. amd-smi 26 wraps its JSON in {"gpu_data": [...]}, older ones don't."""
+    for e in _entries(amd_smi_json("static", "--numa", "-g", str(smi_gpu(gpu)))):
+        node = (e.get("numa") or {}).get("node") if isinstance(e, dict) else None
+        if isinstance(node, int):
+            return node
+    return None
 
 
 def client_env(arm: Arm, row: Row, gpus: list[int]) -> dict:
