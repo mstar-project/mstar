@@ -62,6 +62,7 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    apply_yaml_overrides,
 )
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
@@ -448,11 +449,48 @@ class NemotronDuplexModel(Model):
     def max_session_frames(self) -> int:
         return self.config.stt.num_frames(self.max_session_samples)
 
-    def talker_kv_pages(self, page_size: int) -> int:
-        """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
+    def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
+        """Pages for ``sessions`` (DEFAULT_MAMBA_SLOTS) sessions of max_session_frames, both CFG streams."""
+        sessions = self.DEFAULT_MAMBA_SLOTS if sessions is None else sessions
         positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
         # + 1 for the pool's sink page
-        return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
+        return sessions * 2 * -(-positions // page_size) + 1
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a session cap that a per-session resource cannot hold.
+
+        A session holds a slot in each recurrent pool (``mamba_state``,
+        ``encoder_state``, ``encoder_front``) and its talker pages from its first
+        step to its last, so a session past any of them waits on admit until
+        another ends, and its frames with it. So ``max_concurrent_requests``
+        sessions must fit each; the conductor queues the rest.
+        """
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: a session past the per-session "
+                "resources waits on admit until another ends", config_path,
+            )
+            return
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
+        specs = self.get_node_resources()
+        apply_yaml_overrides(specs, config)
+        for spec in specs:
+            if isinstance(spec, RecurrentStateSpec):
+                held, knob = spec.config.usable_slots, "max_slots"
+            elif spec.resource_key == TALKER_KV:
+                kv = spec.config
+                per_session = self.talker_kv_pages(kv.page_size, sessions=1) - 1
+                held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
+            else:
+                continue
+            if held < cap:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "
+                    f"many in resources.{spec.resource_key}, which holds {held}; raise its {knob} "
+                    "or lower max_concurrent_requests"
+                )
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within

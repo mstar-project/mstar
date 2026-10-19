@@ -132,6 +132,31 @@ def test_duplex_node_resources():
     assert isinstance(sampler, SamplerSpec) and sampler.vocab_size == model.config.vocab_size
 
 
+def test_duplex_shipped_configs_hold_their_session_cap():
+    import yaml
+
+    model = _make_model()
+    for name in ("nemotron_duplex.yaml", "nemotron_duplex_disagg.yaml"):
+        path = CONFIG_PATH.parent / name
+        model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
+
+
+@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV])
+def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
+    """Every session holds a slot in each recurrent pool and its talker pages
+    from start to end; a session past any of them waits on admit until
+    another ends. Raising the cap means raising them all, and a deployment
+    that misses one is refused at startup, naming it."""
+    model = _make_model()
+    pages = 48 * (model.talker_kv_pages(128) - 1) // model.DEFAULT_MAMBA_SLOTS + 1
+    resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
+                 ENCODER_FRONT: {"max_slots": 49}, TALKER_KV: {"max_num_pages": pages}}
+    model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
+    del resources[key]
+    with pytest.raises(ValueError, match=f"resources.{key}"):
+        model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
+
+
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs({}, None)

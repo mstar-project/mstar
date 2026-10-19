@@ -9,8 +9,11 @@
 model: "nemotron_duplex"
 max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 
-# One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
-# on admit and wedges every session. Keep the two equal; the overflow queues.
+# Sessions at once; the overflow queues. Each session holds a slot in
+# resources mamba_state, encoder_state and encoder_front and its pages in
+# talker_kv, all sized for 32 (DEFAULT_MAMBA_SLOTS); to raise the cap, raise
+# their max_slots (cap + 1, for the sink) and talker_kv's max_num_pages with it.
+# The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
 
 # A live call's input files over its whole life; past it the call ends with a
