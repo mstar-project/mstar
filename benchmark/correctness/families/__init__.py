@@ -88,6 +88,26 @@ class Cosmos3Reference:
     def reference_frames(out):
         return out.video
 
+    def fp32_anchor(self, pipe, moves: list[float]) -> None:
+        """Cosmos3OmniPipeline encodes the conditioning clip with the VAE in bf16. Run that encode in fp32 and
+        record how far it moves the anchor (latent frame 0) from the bf16 encode."""
+        import torch
+
+        encode = pipe._encode_video
+
+        def fp32_encode(x):
+            bf16 = encode(x)[:, :, :1].float()
+            dtype = pipe.vae.dtype
+            pipe.vae.to(torch.float32)
+            try:
+                out = encode(x)
+            finally:
+                pipe.vae.to(dtype)
+            moves.append(float((out[:, :, :1].float() - bf16).norm() / bf16.norm()))
+            return out
+
+        pipe._encode_video = fp32_encode
+
 
 class Cosmos3Video(Cosmos3Reference, VideoFamily):
     hf_id = "nvidia/Cosmos3-Nano"
