@@ -357,6 +357,7 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
     calls = []
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 1))
     monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or [])
+    monkeypatch.setattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None, raising=False)
 
     accelerator_graph_runner._capture_thrown_away(lambda pool: (object(), {}), "decode")
 
