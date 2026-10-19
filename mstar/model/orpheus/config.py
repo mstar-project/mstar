@@ -102,7 +102,7 @@ class OrpheusModelConfig:
         if widest > SNAC_MAX_WINDOW_FRAMES:
             raise ValueError(
                 f"SNAC left + right context plus the largest chunk is {widest} frames; "
-                f"at most {SNAC_MAX_WINDOW_FRAMES} are supported (one CUDA graph per window size)"
+                f"at most {SNAC_MAX_WINDOW_FRAMES} are supported (one accelerator graph per window size)"
             )
 
     def snac_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:

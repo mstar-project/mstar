@@ -224,8 +224,8 @@ def _cosmos3(monkeypatch=None, capture=False):
     if capture:
         monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
         monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
-        monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH", "1")
-        monkeypatch.delenv("COSMOS3_DISABLE_CUDA_GRAPH", raising=False)
+        monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
+        monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
     transformer = SimpleNamespace(
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
         sp_group=SimpleNamespace(world_size=1), comm_group=SimpleNamespace(world_size=1),
@@ -236,7 +236,10 @@ def _cosmos3(monkeypatch=None, capture=False):
     )
     sub.get_device = lambda: torch.device("cpu")
     if capture:
-        sub.get_accelerator_graph_configs("cpu")
+        configs = sub.get_accelerator_graph_configs("cpu")
+        assert {config.capture_graph_walk for config in configs} == {
+            C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK,
+        }
     return sub
 
 
