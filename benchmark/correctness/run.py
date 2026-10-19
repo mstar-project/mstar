@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -97,8 +98,6 @@ def _now() -> str:
 
 
 def _git_short(worktree: Path) -> str:
-    import subprocess
-
     p = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
                        check=False)
     return p.stdout.strip() or "nogit"
@@ -116,6 +115,7 @@ def _save_run(fam, sset, responses, out_dir: Path) -> dict:
 
 
 def main(argv=None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
     worktree = args.worktree.resolve()
     device = args.device or "cuda:0"
@@ -153,14 +153,15 @@ def main(argv=None) -> int:
         else:
             if args.limit:
                 raise SystemExit("--limit with a reference build would save a partial reference; refusing")
-            try:
+            if args.reference_only:
                 _build_reference(fam, sset, ref_dir, device)
-            except Exception:
-                if args.reference_only:
-                    raise
-                # The served run still says something (sanity, noise floor), so keep going.
-                reference_error = traceback.format_exc()
-                print(f"reference build failed, serving without it:\n{reference_error}", file=sys.stderr, flush=True)
+            else:
+                # Built in this process, the reference would keep its GPU memory while the server starts on the same
+                # GPU, which a large model can't afford; a child process gives all of it back when it exits.
+                reference_error = _build_reference_in_child(raw_argv)
+                if reference_error:
+                    # The served run still says something (sanity, noise floor), so keep going.
+                    print(f"reference build failed, serving without it: {reference_error}", file=sys.stderr, flush=True)
         if args.reference_only:
             return 0
 
@@ -250,6 +251,12 @@ def main(argv=None) -> int:
         print(f"verdict {verdict}: {run_dir / 'report.md'}")
         return EXIT[verdict]
     return _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device, error)
+
+
+def _build_reference_in_child(raw_argv: list[str]) -> str | None:
+    """Run this command again with --reference-only; return why it failed, or None."""
+    proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), *raw_argv, "--reference-only"], check=False)
+    return None if proc.returncode == 0 else f"the --reference-only child exited with {proc.returncode} (output above)"
 
 
 def _build_reference(fam, sset, ref_dir: Path, device: str) -> None:
