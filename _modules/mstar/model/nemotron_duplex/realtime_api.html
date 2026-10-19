@@ -562,6 +562,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../../models.html">Supported Models</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -1055,11 +1056,15 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="build_app">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.realtime_api.html#mstar.model.nemotron_duplex.realtime_api.build_app">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">build_app</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model."""</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_app</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model.</span>
+<span class="sd">    With ``api_key``, the handshake needs ``Authorization: Bearer &lt;key&gt;``."""</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">FastAPI</span><span class="p">,</span> <span class="n">WebSocket</span><span class="p">,</span> <span class="n">WebSocketDisconnect</span>
 
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.auth</span><span class="w"> </span><span class="kn">import</span> <span class="n">APIKeyGuard</span><span class="p">,</span> <span class="n">APIKeyMiddleware</span>
+
     <span class="n">app</span> <span class="o">=</span> <span class="n">FastAPI</span><span class="p">()</span>
+    <span class="n">app</span><span class="o">.</span><span class="n">add_middleware</span><span class="p">(</span><span class="n">APIKeyMiddleware</span><span class="p">,</span> <span class="n">guard</span><span class="o">=</span><span class="n">APIKeyGuard</span><span class="p">(</span><span class="n">api_key</span><span class="p">))</span>
 
     <span class="nd">@app</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">"/v1/realtime"</span><span class="p">)</span>
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">realtime</span><span class="p">(</span><span class="n">ws</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">):</span>
@@ -1085,14 +1090,18 @@ window.runMermaid = runMermaid;</script>
     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--host"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"0.0.0.0"</span><span class="p">)</span>
     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--port"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">8000</span><span class="p">)</span>
     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--device"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--api-key"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">"bearer key for /v1/realtime (default: MSTAR_API_KEY)"</span><span class="p">)</span>
     <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
 
     <span class="kn">import</span><span class="w"> </span><span class="nn">uvicorn</span>
 
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.auth</span><span class="w"> </span><span class="kn">import</span> <span class="n">resolve_api_key</span><span class="p">,</span> <span class="n">warn_if_no_api_key</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">HF_MODELS</span><span class="p">,</span> <span class="n">get_model_class</span>
+    <span class="n">api_key</span> <span class="o">=</span> <span class="n">resolve_api_key</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">api_key</span><span class="p">)</span>
     <span class="n">model</span> <span class="o">=</span> <span class="n">get_model_class</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)(</span><span class="o">**</span><span class="n">HF_MODELS</span><span class="p">[</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">])</span>
     <span class="n">model</span><span class="o">.</span><span class="n">prepare_streaming</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>  <span class="c1"># warm the submodules (Phase B)</span>
-    <span class="n">uvicorn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">build_app</span><span class="p">(</span><span class="n">model</span><span class="p">),</span> <span class="n">host</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">port</span><span class="p">)</span></div>
+    <span class="n">warn_if_no_api_key</span><span class="p">(</span><span class="n">api_key</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">port</span><span class="p">)</span>
+    <span class="n">uvicorn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">build_app</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">api_key</span><span class="o">=</span><span class="n">api_key</span><span class="p">),</span> <span class="n">host</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">port</span><span class="p">)</span></div>
 
 
 

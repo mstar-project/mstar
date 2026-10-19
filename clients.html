@@ -209,6 +209,7 @@
 <li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -768,6 +769,9 @@ run anywhere:</p>
 <span class="n">client</span> <span class="o">=</span> <span class="n">MStarClient</span><span class="p">(</span><span class="s2">"http://localhost:8000"</span><span class="p">)</span>   <span class="c1"># optional: timeout=600.0</span>
 </pre></div>
 </div>
+<p>If the server requires an API key (<code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>, see
+<a class="reference internal" href="serving.html#api-key"><span class="std std-ref">API key</span></a>), pass <code class="docutils literal notranslate"><span class="pre">api_key=&quot;...&quot;</span></code>; without one the client reads <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>
+from its own environment, and sends nothing when that is unset too.</p>
 <p>The core method is <code class="docutils literal notranslate"><span class="pre">generate</span></code>:</p>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">generate(*,</span> <span class="pre">text=None,</span> <span class="pre">images=None,</span> <span class="pre">audio=None,</span> <span class="pre">video=None,</span> <span class="pre">output_modalities=(&quot;text&quot;,),</span> <span class="pre">input_modalities=None,</span> <span class="pre">stream=False,</span> <span class="pre">request_id=None,</span> <span class="pre">**model_kwargs)</span></code></dt><dd><p>Submit a request. <code class="docutils literal notranslate"><span class="pre">images</span></code> / <code class="docutils literal notranslate"><span class="pre">audio</span></code> / <code class="docutils literal notranslate"><span class="pre">video</span></code> accept a path, raw <code class="docutils literal notranslate"><span class="pre">bytes</span></code>, a
@@ -852,6 +856,8 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 <span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span><span class="n">base_url</span><span class="o">=</span><span class="s2">"http://localhost:8000/v1"</span><span class="p">,</span> <span class="n">api_key</span><span class="o">=</span><span class="s2">"none"</span><span class="p">)</span>
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">api_key</span></code> can be anything unless the server sets a key (<a class="reference internal" href="serving.html#api-key"><span class="std std-ref">API key</span></a>); then pass
+that key, which the client sends as <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>.</p>
 <p>Endpoints and model coverage:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>

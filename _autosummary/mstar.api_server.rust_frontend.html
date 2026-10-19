@@ -209,6 +209,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -666,7 +667,9 @@ its own socket dir (private to the frontend/bridge pair), so entity names
 never collide with the conductor/worker mesh.</p>
 <p>Opt-in: <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code> replaces <code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> with the
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary + this loop. Everything else in the process
-(preprocess worker, conductor spawn, tensor transport) is identical.</p>
+(preprocess worker, conductor spawn, tensor transport) is identical. The
+frontend enforces the API key (<code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>) itself; the
+bridge socket is private to the pair.</p>
 <p class="rubric">Module Attributes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -755,7 +758,7 @@ message ends the wait immediately.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.launch_rust_server">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">launch_rust_server</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">binary</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">port</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bridge_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#launch_rust_server"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.launch_rust_server" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">launch_rust_server</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">binary</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">port</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bridge_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">api_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#launch_rust_server"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.launch_rust_server" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -764,6 +767,7 @@ message ends the wait immediately.</p>
 <li><p><strong>port</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>bridge_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>upload_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>api_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

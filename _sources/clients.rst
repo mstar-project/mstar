@@ -134,6 +134,10 @@ run anywhere:
    from mstar import MStarClient
    client = MStarClient("http://localhost:8000")   # optional: timeout=600.0
 
+If the server requires an API key (``--api-key`` / ``MSTAR_API_KEY``, see
+:ref:`api-key`), pass ``api_key="..."``; without one the client reads ``MSTAR_API_KEY``
+from its own environment, and sends nothing when that is unset too.
+
 The core method is ``generate``:
 
 ``generate(*, text=None, images=None, audio=None, video=None, output_modalities=("text",), input_modalities=None, stream=False, request_id=None, **model_kwargs)``
@@ -207,6 +211,9 @@ semantics. Point any OpenAI client at ``http://<host>:<port>/v1``:
 
    from openai import OpenAI
    client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+
+``api_key`` can be anything unless the server sets a key (:ref:`api-key`); then pass
+that key, which the client sends as ``Authorization: Bearer <key>``.
 
 Endpoints and model coverage:
 

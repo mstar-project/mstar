@@ -209,6 +209,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -670,7 +671,7 @@ model; this file only does event framing.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.realtime_api.build_app" title="mstar.model.nemotron_duplex.realtime_api.build_app"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_app</span></code></a>(model)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.realtime_api.build_app" title="mstar.model.nemotron_duplex.realtime_api.build_app"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_app</span></code></a>(model[, api_key])</p></td>
 <td><p>Build a FastAPI app exposing <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> for the given loaded model.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.realtime_api.main" title="mstar.model.nemotron_duplex.realtime_api.main"><code class="xref py py-obj docutils literal notranslate"><span class="pre">main</span></code></a>()</p></td>
@@ -726,8 +727,14 @@ has <code class="docutils literal notranslate"><span class="pre">.audio</span></
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.nemotron_duplex.realtime_api.build_app">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.realtime_api.</span></span><span class="sig-name descname"><span class="pre">build_app</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/realtime_api.html#build_app"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.realtime_api.build_app" title="Link to this definition">#</a></dt>
-<dd><p>Build a FastAPI app exposing <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> for the given loaded model.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.realtime_api.</span></span><span class="sig-name descname"><span class="pre">build_app</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">api_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/realtime_api.html#build_app"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.realtime_api.build_app" title="Link to this definition">#</a></dt>
+<dd><p>Build a FastAPI app exposing <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> for the given loaded model.
+With <code class="docutils literal notranslate"><span class="pre">api_key</span></code>, the handshake needs <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>api_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py function">

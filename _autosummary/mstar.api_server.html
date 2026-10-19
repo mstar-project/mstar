@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.api_server.media_io" href="mstar.api_server.media_io.html" />
+    <link rel="next" title="mstar.api_server.auth" href="mstar.api_server.auth.html" />
     <link rel="prev" title="API Reference" href="../api.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -205,6 +205,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.api_server</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -617,16 +618,19 @@
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.media_io.html#module-mstar.api_server.media_io" title="mstar.api_server.media_io"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_io</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.auth.html#module-mstar.api_server.auth" title="mstar.api_server.auth"><code class="xref py py-obj docutils literal notranslate"><span class="pre">auth</span></code></a></p></td>
+<td><p>Optional API key for the HTTP and WebSocket surface.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.media_io.html#module-mstar.api_server.media_io" title="mstar.api_server.media_io"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_io</span></code></a></p></td>
 <td><p>Media decode/encode helpers shared by the native and OpenAI-compatible APIs.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.html#module-mstar.api_server.openai" title="mstar.api_server.openai"><code class="xref py py-obj docutils literal notranslate"><span class="pre">openai</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.html#module-mstar.api_server.openai" title="mstar.api_server.openai"><code class="xref py py-obj docutils literal notranslate"><span class="pre">openai</span></code></a></p></td>
 <td><p>OpenAI-compatible API layer for mstar.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.request_types.html#module-mstar.api_server.request_types" title="mstar.api_server.request_types"><code class="xref py py-obj docutils literal notranslate"><span class="pre">request_types</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.request_types.html#module-mstar.api_server.request_types" title="mstar.api_server.request_types"><code class="xref py py-obj docutils literal notranslate"><span class="pre">request_types</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.rust_frontend.html#module-mstar.api_server.rust_frontend" title="mstar.api_server.rust_frontend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rust_frontend</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.rust_frontend.html#module-mstar.api_server.rust_frontend" title="mstar.api_server.rust_frontend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rust_frontend</span></code></a></p></td>
 <td><p>The Rust axum frontend in front of <code class="docutils literal notranslate"><span class="pre">APIServer</span></code>.</p></td>
 </tr>
 </tbody>
@@ -655,11 +659,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="mstar.api_server.media_io.html"
+       href="mstar.api_server.auth.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.api_server.media_io</p>
+        <p class="prev-next-title">mstar.api_server.auth</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

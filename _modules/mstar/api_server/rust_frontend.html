@@ -562,6 +562,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../models.html">Supported Models</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -935,7 +936,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the</span>
 <span class="sd">``mstar-server`` binary + this loop. Everything else in the process</span>
-<span class="sd">(preprocess worker, conductor spawn, tensor transport) is identical.</span>
+<span class="sd">(preprocess worker, conductor spawn, tensor transport) is identical. The</span>
+<span class="sd">frontend enforces the API key (``--api-key`` / ``MSTAR_API_KEY``) itself; the</span>
+<span class="sd">bridge socket is private to the pair.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -947,6 +950,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.auth</span><span class="w"> </span><span class="kn">import</span> <span class="n">API_KEY_ENV</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommProtocol</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.rust_communicator</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">MsgpackCodec</span><span class="p">,</span>
@@ -989,9 +993,16 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="launch_rust_server">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.launch_rust_server">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">launch_rust_server</span><span class="p">(</span><span class="n">binary</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                       <span class="n">bridge_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
+                       <span class="n">bridge_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                       <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
+    <span class="c1"># The key goes through the environment, not argv, which any local user</span>
+    <span class="c1"># can read from the process list. ``api_key`` is the resolved setting, so</span>
+    <span class="c1"># an inherited MSTAR_API_KEY must not override it.</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="o">!=</span> <span class="n">API_KEY_ENV</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">api_key</span><span class="p">:</span>
+        <span class="n">env</span><span class="p">[</span><span class="n">API_KEY_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">api_key</span>
     <span class="n">proc</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">([</span><span class="n">binary</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">port</span><span class="p">),</span> <span class="n">bridge_dir</span><span class="p">,</span>
-                             <span class="n">upload_dir</span><span class="p">])</span>
+                             <span class="n">upload_dir</span><span class="p">],</span> <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">)</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Rust frontend started (pid=</span><span class="si">%d</span><span class="s2">, port=</span><span class="si">%d</span><span class="s2">)"</span><span class="p">,</span> <span class="n">proc</span><span class="o">.</span><span class="n">pid</span><span class="p">,</span> <span class="n">port</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">proc</span></div>
 

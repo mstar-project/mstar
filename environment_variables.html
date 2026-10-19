@@ -209,6 +209,7 @@
 <li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -919,6 +920,17 @@ every route. Empty by default, so a direct deployment is unaffected.</p></td>
 submitted. The Rust frontend and the Dynamo bridge apply the same
 variable and default.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>API key (read by <a class="reference internal" href="_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.resolve_api_key" title="mstar.api_server.auth.resolve_api_key"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.auth.resolve_api_key()</span></code></a>;
+<code class="docutils literal notranslate"><span class="pre">--api-key</span></code> overrides it). When set, every route except
+<code class="docutils literal notranslate"><span class="pre">/health</span></code> needs <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, WebSocket
+handshakes included; unset or empty turns the check off. The
+launcher passes it on to the Rust frontend only (the conductor and
+workers do not inherit it), and
+<code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.client.MStarClient</span></code> sends it when not given
+<code class="docutils literal notranslate"><span class="pre">api_key</span></code>. See <a class="reference internal" href="serving.html#api-key"><span class="std std-ref">API key</span></a>.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -946,31 +958,38 @@ variable and default.</p></td>
 <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code>, this variable, <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo
 <code class="docutils literal notranslate"><span class="pre">rust/server/target/release</span></code> build.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUEST_TIMEOUT_S</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Same rule as the Python server (<code class="docutils literal notranslate"><span class="pre">rust/server/src/auth.rs</span></code>, read
+once at startup): every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> needs
+<code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code>
+sets it from <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / its own environment.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUEST_TIMEOUT_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
 <td><p>Per-request budget in the Rust frontend; on expiry the client gets
 an error and the request is aborted in the backend.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLE_RATE</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLE_RATE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">24000</span></code></p></td>
 <td><p>Sample rate stamped on <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> WAV output.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>Allow <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> media URLs in requests (fetched server-side,
 30 s timeout). Off by default.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
 <td><p>Admission cap on in-flight generation requests; beyond it clients
 get an immediate 503 instead of queueing into the request timeout.
 <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> bypass the cap.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
 <td><p>Request body limit (multipart uploads included).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZE_PARALLEL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZE_PARALLEL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>When a long prompt is encoded as parallel chunks, set
 <code class="docutils literal notranslate"><span class="pre">TOKENIZERS_PARALLELISM=true</span></code> for the process first: the Rust
@@ -978,7 +997,7 @@ tokenizer only uses its thread pool while that variable reads true,
 and serving environments often export it false. <code class="docutils literal notranslate"><span class="pre">0</span></code> leaves the
 variable as it is (the chunked encode then runs serially).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Path to a HuggingFace <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code> enabling frontend
 tokenization. Leave unset with the Python backend — its preprocess

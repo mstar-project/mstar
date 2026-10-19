@@ -27,6 +27,7 @@
    :toctree:
    :recursive:
 
+   auth
    body_limit
    data_worker
    entrypoint

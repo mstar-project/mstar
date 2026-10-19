@@ -209,6 +209,7 @@
 <li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
@@ -616,6 +617,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar-serve">mstar serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">mstar-serve</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-key">API key</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
@@ -671,41 +673,46 @@ cache), and then delegates to it.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">8000</span></code></p></td>
 <td><p>HTTP port.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--gpus</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--api-key</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>, else off</p></td>
+<td><p>Require <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> on every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code>
+(see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--gpus</span></code></p></td>
 <td><p>all visible</p></td>
 <td><p>Sets <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">0</span></code> or <code class="docutils literal notranslate"><span class="pre">0,1,2</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--config</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--config</span></code></p></td>
 <td><p>model default</p></td>
 <td><p>Override the resolved default config with a path to your own YAML.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
 <td><p>HF default</p></td>
 <td><p>HuggingFace weight cache directory.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">SHM</span></code></p></td>
 <td><p>Tensor transport: <code class="docutils literal notranslate"><span class="pre">SHM</span></code> (safe single-node default), <code class="docutils literal notranslate"><span class="pre">TCP</span></code>, or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;_&lt;port&gt;/</span></code></p></td>
 <td><p>ZMQ IPC socket prefix; one per server, so servers on other ports do
 not share sockets.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_uploads_&lt;user&gt;/</span></code></p></td>
 <td><p>Temp directory for uploaded media.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
 <td><p>off</p></td>
 <td><p>Print a per-request profile when each request finishes (see
 <a class="reference internal" href="#request-profiling"><span class="std std-ref">Request profiling</span></a>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
 <td><p>stdout</p></td>
 <td><p>Append the per-request profiles to this file instead of stdout
 (implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
@@ -785,51 +792,56 @@ not share sockets.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.0.0.0</span></code> / <code class="docutils literal notranslate"><span class="pre">8000</span></code></p></td>
 <td><p>Bind address / HTTP port.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--api-key</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>, else off</p></td>
+<td><p>Require <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> on every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code>
+(see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">RDMA</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">RDMA</span></code>, <code class="docutils literal notranslate"><span class="pre">TCP</span></code>, or <code class="docutils literal notranslate"><span class="pre">SHM</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
 <td><p>HF default</p></td>
 <td><p>HuggingFace weight cache directory.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;_&lt;port&gt;/</span></code></p></td>
 <td><p>ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
 worker (<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.integrations.dynamo</span></code>) has no HTTP port, so
 it defaults to a new directory per launch and removes it at exit.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_uploads</span></code></p></td>
 <td><p>Temp directory for uploaded media.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--timeout</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--timeout</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
 <td><p>Per-request timeout (seconds).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--mooncake-port</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--mooncake-port</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">8080</span></code></p></td>
 <td><p>Port for the Mooncake RDMA transfer engine.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tcp-transfer-device</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--tcp-transfer-device</span></code></p></td>
 <td><p>(auto)</p></td>
 <td><p>Network device for TCP tensor transport.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-nvtx</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-nvtx</span></code></p></td>
 <td><p>off</p></td>
 <td><p>Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
 <td><p>off</p></td>
 <td><p>Print a per-request profile when each request finishes (see
 <a class="reference internal" href="#request-profiling"><span class="std std-ref">Request profiling</span></a>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
 <td><p>stdout</p></td>
 <td><p>Append the per-request profiles to this file instead of stdout
 (implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
 </tr>
@@ -842,6 +854,34 @@ it defaults to a new directory per launch and removes it at exit.</p></td>
 whereas <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. On a single node without RDMA, pass
 <code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span> <span class="pre">SHM</span></code> to <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>.</p>
 </div>
+</section>
+<section id="api-key">
+<span id="id2"></span><h2>API key<a class="headerlink" href="#api-key" title="Link to this heading">#</a></h2>
+<p>Both commands listen on all interfaces by default and accept requests from anyone who
+can reach the port. If no gateway in front of the server authenticates clients, set a
+key or bind <code class="docutils literal notranslate"><span class="pre">--host</span> <span class="pre">127.0.0.1</span></code>; the server logs a warning at startup while no key is
+set.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MSTAR_API_KEY</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>openssl<span class="w"> </span>rand<span class="w"> </span>-hex<span class="w"> </span><span class="m">32</span><span class="k">)</span><span class="s2">"</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w">            </span><span class="c1"># or: mstar-serve --config ... [--rust-frontend]</span>
+</pre></div>
+</div>
+<p>With a key set, every HTTP route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> answers <code class="docutils literal notranslate"><span class="pre">401</span></code> unless the request
+carries <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, and WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>,
+<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>) refuse the handshake without it. The check is one middleware over the
+whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+however much of the key matches. CORS preflights still get their answer, since browsers
+send them without credentials. <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> overrides the environment variable, but
+prefer the variable: a command-line flag is visible to every local user in the process
+list. An empty value turns the check off, so <code class="docutils literal notranslate"><span class="pre">--api-key</span> <span class="pre">&quot;&quot;</span></code> disables a key set in the
+environment, and so does a variable that expands to nothing (<code class="docutils literal notranslate"><span class="pre">--api-key</span> <span class="pre">&quot;$UNSET_VAR&quot;</span></code>).</p>
+<p>Clients send the key as their API key: <code class="docutils literal notranslate"><span class="pre">MStarClient(base_url,</span> <span class="pre">api_key=...)</span></code> (it reads
+<code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code> when not given one) or <code class="docutils literal notranslate"><span class="pre">OpenAI(base_url=...,</span> <span class="pre">api_key=...)</span></code>; see
+<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. The standalone Nemotron realtime server
+(<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.model.nemotron_duplex.realtime_api</span></code>) takes the same flag and
+variable.</p>
+<p>Under NVIDIA Dynamo, Dynamo’s own frontend serves HTTP and does not forward
+<code class="docutils literal notranslate"><span class="pre">Authorization</span></code> to backends, so the M* worker cannot check a key there: authenticate at
+Dynamo’s frontend or a gateway in front of it.</p>
 </section>
 <section id="config-files">
 <h2>Config files<a class="headerlink" href="#config-files" title="Link to this heading">#</a></h2>
@@ -996,7 +1036,7 @@ Pi0.5 DROID variant fixes the action horizon:</p>
 client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
 </section>
 <section id="tensor-transport">
-<span id="id2"></span><h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
+<span id="id3"></span><h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
 <p>Workers route tensors directly to one another using one of three transports, selected with
 <code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code>:</p>
 <ul class="simple">
@@ -1015,7 +1055,7 @@ version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
 CVE-2026-103761) are still open in 0.3.13.post1.</p>
 </section>
 <section id="request-profiling">
-<span id="id3"></span><h2>Request profiling<a class="headerlink" href="#request-profiling" title="Link to this heading">#</a></h2>
+<span id="id4"></span><h2>Request profiling<a class="headerlink" href="#request-profiling" title="Link to this heading">#</a></h2>
 <p>Pass <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code> (to either <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> or <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>) to print a per-request
 profile when each request finishes. Add <code class="docutils literal notranslate"><span class="pre">--log-stats-file</span> <span class="pre">&lt;path&gt;</span></code> to append the profiles
 to a file instead of stdout (it implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>):</p>
@@ -1149,6 +1189,7 @@ conductor, and data worker skip the timing/transfer bookkeeping entirely.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar-serve">mstar serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">mstar-serve</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-key">API key</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>

@@ -235,6 +235,16 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``n`` outside ``1`` to this value is a 400 before anything is
        submitted. The Rust frontend and the Dynamo bridge apply the same
        variable and default.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
+       ``--api-key`` overrides it). When set, every route except
+       ``/health`` needs ``Authorization: Bearer <key>``, WebSocket
+       handshakes included; unset or empty turns the check off. The
+       launcher passes it on to the Rust frontend only (the conductor and
+       workers do not inherit it), and
+       :class:`mstar.client.MStarClient` sends it when not given
+       ``api_key``. See :ref:`api-key`.
 
 Serving (Rust frontend)
 -----------------------
@@ -254,6 +264,12 @@ Read by the ``mstar-server`` binary and its bridge
      - Path to the ``mstar-server`` binary. Fallback order:
        ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
        ``rust/server/target/release`` build.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - Same rule as the Python server (``rust/server/src/auth.rs``, read
+       once at startup): every route except ``/health`` needs
+       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend; on expiry the client gets
