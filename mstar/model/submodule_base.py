@@ -438,8 +438,8 @@ class ModelInputsFromEngine:
     resources: dict[str, Resource] = field(default_factory=dict)
 
     # label -> warmed-up PiecewiseAcceleratorGraphRunner for inner-loop capture. Owned
-    # by the engine, spread in at execute time (like ``cache_manager`` /
-    # ``sampler``). Empty when the submodule opts into no piecewise graphs or
+    # by the engine, supplied at execute time alongside ``resources``.
+    # Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_accelerator_graph_configs``.
     piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
 
@@ -487,12 +487,12 @@ class ModelInputsFromEngine:
 
 class NodeSubmodule(torch.nn.Module, ABC):
     """Base class for a model's compute units: defines the prepare_inputs →
-    preprocess → forward(_batched) contract the engines drive."""
+    preprocess → forward(_batched) contract the engine drives."""
 
     # Set True on a submodule whose forward does not benefit from (or is broken
     # by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot
-    # forward where the trace cost dwarfs the win. The KV-cache / stateless
-    # engines skip compiling such submodules (accelerator graph capture is unaffected).
+    # forward where the trace cost dwarfs the win. The engine skips compiling
+    # such submodules (accelerator graph capture is unaffected).
     disable_torch_compile: bool = False
 
     # Set True on a submodule that must run in its own parameter dtype — e.g. a

@@ -374,7 +374,7 @@ class Worker:
         # record into it too; run() owns the periodic flush.
         self._phase_period = PHASE_PERIOD
         self._phase_buf = phase_buffer()
-        # (start, end) CUDA events per step, drained once they land
+        # (start, end) device events per step, drained once they land
         self._gpu_spans: deque = deque(maxlen=64)
 
         self.enable_prof = enable_prof
@@ -1927,8 +1927,8 @@ class Worker:
         drain the GPU on every iter and hide the overlap between
         post-processing and the next step's kernel execution.
 
-        Once the step's work is submitted we record a CUDA event on the
-        default stream; anything that reads the output VALUES waits on it.
+        Once the step's work is submitted we record a device event on the
+        execution stream; anything that reads the output values waits on it.
         """
         from mstar.utils.profiler import range_pop, range_push
 

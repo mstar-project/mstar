@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 #
 # Three submodules cover the complete text-to-speech streaming pipeline:
-#   1. TalkerSubmodule (KV_CACHE engine)
+#   1. TalkerSubmodule (paged KV, attention, positions, and samplers)
 #      - Builds the official prefill sequence for every 12 Hz variant:
 #        optional instruction turn, ChatML assistant role, codec language /
 #        speaker tags, then the text either whole (non-streaming layout) or
@@ -14,7 +14,7 @@
 #      - Supports continuous batching and whole-forward decode accelerator graphs
 #        (the CodePredictor depth loop is captured inside them), plus a
 #        piecewise graph covering that loop on eager paths like prefill.
-#   2. CodecSubmodule (STATELESS engine)
+#   2. CodecSubmodule (no resources)
 #      - Receives buffered codec frames from the Talker partition.
 #      - Pads each window of the chunk ramp to its accelerator graph capture bucket.
 #      - Runs the official speech-tokenizer decoder and trims overlap (and, for
@@ -865,9 +865,8 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         The whole-walk decode graph already covers this loop; this runner serves
         the paths it can't — chiefly voice-clone prefill, which stays eager
-        because it also emits reference codec frames. It uses no
-        paged KV cache: its frame-local cache is the engine's fixed-shape
-        scratch pool.
+        because it also emits reference codec frames. The Talker submodule
+        owns the fixed-shape dense KV cache, reused and overwritten each frame.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -933,8 +932,8 @@ class TalkerSubmodule(ARNodeSubmodule):
 class CodecSubmodule(ARNodeSubmodule):
     """Convert streamed 16-code frames into overlap-trimmed PCM chunks.
 
-    The node runs on a stateless engine, but ``ARNodeInputs`` is reused as the
-    typed container for fixed-length codec tensors. Each pass carries its
+    The node declares no resources and uses ``ARNodeInputs`` as the typed
+    container for fixed-length codec tensors. Each pass carries its
     window's geometry (real frames, repeated context); the neural decoder
     itself has no cross-call state.
 
@@ -950,8 +949,7 @@ class CodecSubmodule(ARNodeSubmodule):
     of the window.
     """
 
-    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
-    # stateless engine, stated directly now that the v1 engine reads these.
+    # Run the decoder in its parameter dtype without forward compilation.
     disable_torch_compile = True
     disable_autocast = True
 
