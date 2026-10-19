@@ -21,7 +21,7 @@ M\* serves one model per process, so the pipeline is three M\* servers. Turn det
    mstar serve kokoro --port 8003 --host localhost      # or: mstar serve qwen3_tts --port 8003 ...
    ```
 
-   Servers on one host need their own `--socket-path-prefix`. `mstar serve` derives it from `--port`. If you launch `mstar/api_server/entrypoint.py` directly, pass a distinct prefix to each server.
+   Servers on one host need their own `--socket-path-prefix`. `mstar serve` and `mstar/api_server/entrypoint.py` derive it from `--port`, so distinct ports are enough.
 
 2. **A LiveKit server.** For local development, the [release binary](https://github.com/livekit/livekit/releases) in dev mode (API key `devkey`, secret `secret`):
 
