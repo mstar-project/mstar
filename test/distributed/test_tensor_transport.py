@@ -46,7 +46,7 @@ _PROTOCOLS = [
     pytest.param(
         CommProtocol.TCP, id="TCP",
         marks=[pytest.mark.skipif(
-            not _TCP_AVAILABLE, reason="mooncake not installed",
+            not _TCP_AVAILABLE, reason=f"mooncake unavailable: {MOONCAKE_IMPORT_ERROR}",
         )],
     ),
 ]

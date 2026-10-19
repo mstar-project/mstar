@@ -24,14 +24,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from mstar.api_server.entrypoint import APIServer, PendingRequest
+from api_server_helpers import make_test_api_server
+
+from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
     RequestFailed,
     ResultChunk,
     ResultTensors,
 )
-from mstar.api_server.sessions import SessionRegistry
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -53,8 +54,8 @@ class _Runtime:
     def get_rid_string(self, h):
         return h
 
-    def set_in_flight(self, node, wg_id, rids, value):
-        del wg_id
+    def set_in_flight(self, node, rids, wg_ids, value):
+        del wg_ids
         if not value:
             self.cleared.append((node, list(rids)))
 
@@ -186,22 +187,12 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
 
 
 def _api_server(messages):
-    s = APIServer.__new__(APIServer)
-    s.pending_requests = {}
-    s.recently_completed = {}
-    s._recently_completed_ttl = 15.0
-    s.request_lock = threading.Lock()
-    s.running = True
-    s.conductor_proc = None
-    s._liveness_interval_s = 0.5
-    s.sessions = SessionRegistry(None, teardown=lambda _sid: None)
-    s._next_session_sweep = 0.0
-    s._session_sweep_interval_s = 1.0
-    s.log_stats = False
-    s.cleaned = []
-    s.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: messages.pop(0) if messages else []
+    s = make_test_api_server(
+        communicator=SimpleNamespace(
+            get_all_new_messages=lambda: messages.pop(0) if messages else []
+        ),
     )
+    s.cleaned = []
     s.preprocess_worker = SimpleNamespace(
         get_profile_updates=lambda: [],
         get_result_chunks=lambda: [],

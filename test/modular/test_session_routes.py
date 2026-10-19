@@ -31,6 +31,9 @@ class _FakeServer:
             config, teardown=teardown or self.torn_down.append,
         )
 
+    async def wait_for_request_id(self, request_id):
+        pass
+
     def submit_request(self, **kwargs):
         self.submitted.append(kwargs)
         return kwargs["request_id"]

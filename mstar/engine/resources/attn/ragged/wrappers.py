@@ -36,7 +36,7 @@ class _RaggedPrefillBase(ABC):
         max_total_tokens: int | None = None,
         max_total_kv_tokens: int | None = None,
         device: torch.device = torch.device("cuda"),
-        use_cuda_graph: bool = False,
+        accelerator_graph: bool = False,
         sm_scale: float | None = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_layout: str = "NHD",
@@ -49,7 +49,7 @@ class _RaggedPrefillBase(ABC):
         self.padded_head_dim = padded_head_dim(head_dim)
         self.sm_scale = float(sm_scale) if sm_scale is not None else head_dim ** -0.5
         self.q_data_type = q_data_type
-        self.use_cuda_graph = use_cuda_graph
+        self.accelerator_graph = accelerator_graph
         self.max_num_segments = max_num_segments
         self.max_total_tokens = max_total_tokens
         self.max_total_kv_tokens = (
@@ -59,9 +59,9 @@ class _RaggedPrefillBase(ABC):
 
         import flashinfer
 
-        if use_cuda_graph:
-            assert max_num_segments is not None, "max_num_segments required for CUDA graph mode"
-            assert max_total_tokens is not None, "max_total_tokens required for CUDA graph mode"
+        if accelerator_graph:
+            assert max_num_segments is not None, "max_num_segments required for accelerator graph mode"
+            assert max_total_tokens is not None, "max_total_tokens required for accelerator graph mode"
             assert max_num_segments > 0, "max_num_segments must be positive"
 
             self._qo_indptr_buf = torch.zeros(
@@ -122,7 +122,7 @@ class _RaggedPrefillBase(ABC):
     ) -> tuple[torch.Tensor, int]:
         """The layout to hand FlashInfer, and its real token count."""
         n_seg = int(cu_seqlens.numel()) - 1
-        if not self.use_cuda_graph:
+        if not self.accelerator_graph:
             # the token count is only needed to zero a graph wrapper's tail, and
             # reading it off a device layout would sync
             return cu_seqlens.to(torch.int32), -1

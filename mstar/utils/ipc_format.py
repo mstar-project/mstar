@@ -239,6 +239,10 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # under a combined walk, request_ids[i] runs walks[walk_idx[i]]; empty
+    # means every rid runs graph_walk
+    walks: list[str] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -282,6 +286,9 @@ class NewRequestConductor(MessageBody):
     session_id: str | None = None
     resumed: bool = False
     end_session: bool = False
+    # The client's request_id. ``request_id`` is the API server's key for this
+    # one submission, never reused; the seed still derives from the client's.
+    client_request_id: str | None = None
 
 
 @dataclass

@@ -7,10 +7,12 @@ paths are all exercised without the engine.
 
 import asyncio
 import base64
+import io
 import json
 import sys
 import tempfile
 import types
+import wave
 from pathlib import Path
 
 import pytest
@@ -170,6 +172,57 @@ def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
         r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
         assert r.status_code == 400, (ref, r.text)
         assert r.json()["error"]["message"].startswith("server file paths are refused")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_a_1_hz_data_url_with_400(client_and_stub, model):
+    if model == "omnivoice":
+        try:
+            from torchcodec.decoders import AudioDecoder  # noqa: F401
+        except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError without FFmpeg
+            pytest.skip(f"torchcodec cannot load here: {exc}")
+    else:
+        pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = model
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(1)
+        wf.writeframes(bytes(64000))
+    ref = "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode()
+    r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"].startswith("ref_audio must be audio the model can decode")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("form", ["base64", "data URL"])
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_a_61_s_clip_with_400(client_and_stub, model, form):
+    if model == "omnivoice":
+        try:
+            from torchcodec.decoders import AudioDecoder  # noqa: F401
+        except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError without FFmpeg
+            pytest.skip(f"torchcodec cannot load here: {exc}")
+    else:
+        pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = model
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(bytes(2 * 8000 * 61))
+    ref = base64.b64encode(buf.getvalue()).decode()
+    if form == "data URL":
+        ref = "data:audio/wav;base64," + ref
+    r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"].startswith("ref_audio must be 60 s or shorter")
     assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
 
 

@@ -36,6 +36,8 @@ def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
     class FailingServer:
         # sessions are off, so the route's session resolution is a no-op
         sessions = SessionRegistry(None, teardown=lambda _sid: None)
+        async def wait_for_request_id(self, request_id):
+            pass
 
         def submit_request(self, **kwargs):
             raise json.JSONDecodeError("downstream failure", "{}", 0)

@@ -122,7 +122,8 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
     batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
     for i in range(arrivals):
-        conductor._ingest_request(SimpleNamespace(request_id=f"r{i}", model_kwargs={}))
+        conductor._ingest_request(SimpleNamespace(
+            request_id=f"r{i}", model_kwargs={}, client_request_id=None))
 
     running: list[str] = []
     refused = peak = finished = 0

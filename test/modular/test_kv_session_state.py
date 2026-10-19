@@ -16,11 +16,14 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.kv import cpu_page_pool
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.page_copier import TorchCopier
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -230,6 +233,14 @@ def _keyed(n_tokens: int, first: int = 0) -> list[bytes]:
     ])
 
 
+def _layout(n_tokens: int) -> dict[str, list[PrefixSpan]]:
+    return {"main": [PrefixSpan(n_tokens, n_tokens, "prefill")]}
+
+
+def _inputs(n_tokens: int) -> ARNodeInputs:
+    return ARNodeInputs(input_seq_len=n_tokens)
+
+
 def _indexed(kv: KVManager) -> int:
     return len(kv._index.pages())
 
@@ -259,20 +270,20 @@ def test_the_session_s_first_request_keeps_the_prefix_cache():
 def test_a_resumed_request_neither_probes_the_index_nor_files_into_it():
     kv = _manager(prefix_cache=True)
     keys = {"main": _keyed(64)}
-    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
     _grow(kv, "r0", 64)
     filed = _indexed(kv)
     assert filed == 4, "the session's first request is keyed like any other"
     kv.retain_session_state("r0", "s")
 
-    kv.ingest_request("r1", KVReqConfig(prefix_keys=keys))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
     assert kv._keyed_label("r1", "LLM", "prefill") == "main"
     kv.expect_session_state("r1", "s")
 
     # one switch shuts the probe, the apply, the extend and the filing; the
     # probe runs in admit_retrieve, before the request has adopted anything
     assert kv._keyed_label("r1", "LLM", "prefill") is None
-    assert kv.resolve_cached_prefix("r1", "LLM", "prefill") is None
+    assert kv.resolve_cached_prefix("r1", "LLM", "prefill", _inputs(64)) is None
     kv.adopt_session_state("r1", "s")
     _grow(kv, "r1", 64)
     assert _indexed(kv) == filed
@@ -282,12 +293,12 @@ def test_a_resumed_request_neither_probes_the_index_nor_files_into_it():
 def test_a_fresh_request_still_hits_what_the_session_s_first_request_cached():
     kv = _manager(prefix_cache=True)
     keys = {"main": _keyed(64)}
-    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
     _grow(kv, "r0", 64)
     kv.retain_session_state("r0", "s")
 
-    kv.ingest_request("other", KVReqConfig(prefix_keys=keys))
-    matched = kv.resolve_cached_prefix("other", "LLM", "prefill")
+    kv.ingest_request("other", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
+    matched = kv.resolve_cached_prefix("other", "LLM", "prefill", _inputs(64)).tokens
 
     # one key short, so a fully cached prompt still leaves a page to run
     assert matched == 3 * PAGE_SIZE
@@ -296,10 +307,10 @@ def test_a_fresh_request_still_hits_what_the_session_s_first_request_cached():
 def test_an_adopted_stream_carries_no_chain():
     kv = _manager(prefix_cache=True)
     keys = {"main": _keyed(64)}
-    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
     _grow(kv, "r0", 64)
     kv.retain_session_state("r0", "s")
-    kv.ingest_request("r1", KVReqConfig(prefix_keys=keys))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys=keys, prefix_layout=_layout(64)))
 
     kv.adopt_session_state("r1", "s")
 
@@ -407,6 +418,8 @@ def _host_copies(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "stream", lambda stream: contextlib.nullcontext()
     )
+    # the process's copier may already be a CUDA one, picked by an earlier test
+    monkeypatch.setattr(cpu_page_pool, "make_page_copier", TorchCopier)
 
 
 def _offloading_manager(max_num_pages: int, cpu_offload_pages: int = 32) -> KVManager:

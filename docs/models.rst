@@ -208,7 +208,8 @@ Kokoro notes
 
 - Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
   spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
-  this itself on first use when it has network access). ``pip install 'misaki[en]'``
+  this itself on first use when it has network access). ``.[all]`` includes the G2P
+  dependencies, and the Docker images also install the tagger. ``pip install 'misaki[en]'``
   additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
   out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
   Italian and Portuguese voices; without it those words are skipped and those
@@ -251,7 +252,7 @@ Qwen3-TTS notes
 ---------------
 
 - Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
-  and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
+  plus ``pip install --no-deps 'qwen-tts==0.1.1'`` (see :doc:`installation`), and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
   ``<key>`` is one of ``qwen3_tts`` (0.6B CustomVoice), ``qwen3_tts_1p7b``,
   ``qwen3_tts_voicedesign`` or ``qwen3_tts_base``. One model class serves every
   12 Hz checkpoint; the variant (speakers, instruction support, reference
@@ -418,6 +419,15 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
   is stochastic by design and seeded per request.
+- Known limitation of the checkpoint: it often answers speech that is not
+  addressed to it, such as a side conversation or background speech, where it
+  should keep its turn (about half of such pairs on Full-Duplex-Bench v1.5).
+  NVIDIA's NeMo reference inference (``examples/speechlm2/offline_voicechat_infer.py``
+  on the ``nemotron-labs-voicechat`` branch of NVIDIA-NeMo/Speech) answers the
+  same side speech on the same inputs, and the model card's known limitations
+  say the model is not suitable for noisy environments, especially where
+  background speech may occur. Nothing in the serving path tells speakers
+  apart. Real interruptions and backchannels are handled well.
 
 Chatterbox notes
 ----------------
@@ -792,10 +802,22 @@ corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
 travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.
 
-**Nothing is accelerated by default.** wan22 serves the DiT eager: no
-``torch.compile``, no CUDA-graph capture, no continuous batching, no component
-offload, and the VAE decode is always tiled (which bounds its workspace so the
-untiled conv3d cannot OOM a 32 GiB card).
+**What is accelerated by default.** The DiT runs under ``torch.compile``
+(``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
+channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
+yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
+the DiT once per resolution, frame count and CFG setting, so the first request
+at a new size is slower. The VAE decode compiles once per resolution, and only
+for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
+size decodes with stock ``vae.decode``, frames identical to
+``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so
+every server process decodes the same latents to the same frames; torch 2.9.1
+has no such mode, and there two processes can differ by a few uint8 levels.
+The VAE decode
+tiles only when free VRAM at decode time is short of the untiled estimate
+(the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
+32 GiB card. No CUDA-graph capture, no continuous batching (one request per
+step) and no component offload.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

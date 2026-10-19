@@ -60,6 +60,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.media_limits import read_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
@@ -116,7 +117,7 @@ class WaypointModel(Model):
         ae_path: str | None = None,
         reference_compat: bool | None = None,
         compile_dit: bool | None = None,
-        cuda_graph: bool | None = None,
+        accelerator_graph: bool | None = None,
         capture_dit_prime: bool | None = None,
         full_global_ring: bool | None = None,
         step_batch_size: int | None = None,
@@ -143,7 +144,7 @@ class WaypointModel(Model):
             key: value for key, value in {
                 "reference_compat": reference_compat,
                 "compile_dit": compile_dit,
-                "cuda_graph": cuda_graph,
+                "accelerator_graph": accelerator_graph,
                 "capture_dit_prime": capture_dit_prime,
                 "full_global_ring": full_global_ring,
                 "step_batch_size": step_batch_size,
@@ -479,11 +480,7 @@ class WaypointModel(Model):
         """The seed frame as uint8 ``[H, W, 3]``, not the base loader's float
         ``[C, H, W]``: the AE scales it itself, in its own dtype, and a float
         round trip through the request would round twice on the way there."""
-        import torchvision
-
-        img = torchvision.io.decode_image(
-            filepath, mode=torchvision.io.ImageReadMode.RGB
-        ).to(device)  # uint8 [3, H, W]
+        img = read_image(filepath, rgb=True).to(device)  # uint8 [3, H, W]
         return TensorAndMetadata(img.permute(1, 2, 0).contiguous())
 
     def postprocess(

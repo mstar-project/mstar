@@ -303,6 +303,19 @@ class SessionRegistry:
         logger.warning("Tearing session %s down: %s", session_id, reason)
         self._teardown(session_id)
 
+    def rebind_request(self, request_id: str, key: str) -> None:
+        """Re-key a request bound by ``resolve`` under the submission key it
+        was given, which is what every later message about it names."""
+        with self._lock:
+            session_id = self._request_to_session.pop(request_id, None)
+            if session_id is None:
+                return
+            self._request_to_session[key] = session_id
+            record = self._sessions.get(session_id)
+            if record is not None:
+                record.active_request_ids.discard(request_id)
+                record.active_request_ids.add(key)
+
     def session_of(self, request_id: str) -> str | None:
         with self._lock:
             return self._request_to_session.get(request_id)

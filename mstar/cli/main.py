@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import mstar
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
@@ -210,7 +211,7 @@ def _serve(args: argparse.Namespace) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
-    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}/"
+    socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
     upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
 
     argv = [

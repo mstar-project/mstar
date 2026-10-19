@@ -383,22 +383,25 @@ The spec types are:
        Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
-       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
+       ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
+       paged backend, FlashInfer for now), ``AttnBackend.FLASHINFER``,
+       ``AttnBackend.DENSE`` or ``AttnBackend.FLEX``. Leave it at ``AUTO`` unless the
+       model needs a specific kernel. FlashInfer and dense attention require a
        ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
-     - Attention over a paged context that is written once and never extended. Only
-       the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
-       models)`_.
+     - Attention over a paged context that is written once and never extended.
+       ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
+       See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
-       defaults to ``head_dim ** -0.5``, ``flashinfer_backend``, and the two
-       CUDA-graph ceilings ``max_segments_per_request`` and
+       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
+       default, or ``RaggedAttnBackend.FLASHINFER``), ``flashinfer_backend``, and the
+       two CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
@@ -1015,6 +1018,16 @@ into one GPU call. A submodule controls this behavior with three methods:
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
 
+**Combined walks.** By default a step holds one walk. A model lets several walks of a node
+share a step by returning ``{node: {combined_walk: {walks}}}`` from
+``get_combined_graph_walks``, for example decode rows beside a prompt's prefill. The
+combined walk is a name of its own, which ``max_batch_size`` and the CUDA-graph configs
+can key on. A step of one walk keeps that walk's cap. A step that mixes walks takes the
+combined walk's ``max_batch_size`` when it has one, else the smallest cap of the walks it
+holds, so a small prefill cap never limits a decode-only step.
+``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
+step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``).
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
@@ -1364,16 +1377,16 @@ that a misspelled setting is never silently ignored:
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``AttentionSpec``
-     - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
    * - ``CrossAttentionSpec``
-     - ``backend`` (only ``flashinfer`` is implemented), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
-     - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
-       ``max_segments_per_request``, ``max_tokens_per_request``. The two ceilings size
-       CUDA-graph buckets, which is a memory-against-coverage trade the deployment makes,
-       not the model.
+     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+       (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
+       ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
+       memory-against-coverage trade the deployment makes, not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

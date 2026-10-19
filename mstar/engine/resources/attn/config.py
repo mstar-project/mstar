@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 
 class AttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     FLEX = "flex"
@@ -25,8 +27,12 @@ class AttnBackend(Enum):
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # FlashInfer only: combined walks whose captured steps plan their
+    # one-token rows on the decode wrapper and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass
@@ -80,7 +86,7 @@ class CrossAttentionConfig:
     kv_cache: str  # name of the KV cache holding the context
     query_kv_cache: str | None = None  # KV cache driving the queries, if any
     context_label: str = "context"
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
 

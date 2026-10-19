@@ -123,3 +123,6 @@ class PreprocessInput:
     session_id: str | None = None
     resumed: bool = False
     end_session: bool = False
+    # The id the client knows the request by; ``request_id`` is the API
+    # server's key for this one submission.
+    client_request_id: str | None = None

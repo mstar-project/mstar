@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
+    extract::{multipart::MultipartError, rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -54,7 +54,9 @@ use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
     VideoGenerationRequest,
 };
-use serving::{collect, now, result_stream, rid, AppState, Out};
+use serving::{
+    collect, now, result_stream, rid, try_result_stream, AppState, Out, DUPLICATE_ID_GRACE,
+};
 
 #[tokio::main]
 async fn main() {
@@ -83,6 +85,9 @@ async fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(600),
     );
+    // Same variable and default as serving_images.max_images_per_request.
+    let max_images_per_request =
+        parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
         eprintln!("bridging to conductor at {dir}");
@@ -108,6 +113,7 @@ async fn main() {
         allow_remote,
         sample_rate,
         request_timeout,
+        max_images_per_request,
         tok,
         bridge,
     };
@@ -127,10 +133,7 @@ async fn main() {
         .unwrap_or(256);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
-    let body_limit_mb: usize = std::env::var("MSTAR_MAX_BODY_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
+    let body_limit_mb = body_limit_mb();
 
     let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -242,6 +245,27 @@ fn error_type(status: u16) -> &'static str {
     }
 }
 
+/// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
+/// way (`mstar/api_server/body_limit.py`).
+fn body_limit_mb() -> usize {
+    std::env::var("MSTAR_MAX_BODY_MB")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(128)
+}
+
+/// Status and message for a failed multipart read: 413 naming the limit when
+/// the body passed `MSTAR_MAX_BODY_MB`, as the Python frontend answers, else
+/// 400 with `fallback`.
+fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        (413, format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"))
+    } else {
+        (400, fallback)
+    }
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -266,6 +290,14 @@ fn detail_error(status: u16, message: &str) -> Response {
 /// Python frontend's validation error. Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
 fn json_422(rej: JsonRejection) -> Response {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        return error(
+            413,
+            &format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"),
+            "invalid_request_error",
+        );
+    }
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({"detail": [{
@@ -636,7 +668,10 @@ async fn images_generations(
     // matching serving_images.create_images. Seeded requests follow the seed
     // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
     // the same request with n=1; unseeded requests draw independent seeds.
-    let n = req.n.unwrap_or(1).max(1);
+    let n = match image_count(req.n, st.max_images_per_request) {
+        Ok(n) => n,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -657,6 +692,29 @@ async fn images_generations(
         }
     }
     Json(images_response(all)).into_response()
+}
+
+/// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
+/// matching serving_images.image_count.
+/// `MSTAR_MAX_IMAGES_PER_REQUEST` as Python's `max_images_per_request` reads
+/// it: an ASCII integer, surrounding whitespace allowed, at least 1; anything
+/// else is the default 10.
+fn parse_max_images(raw: Option<&str>) -> i64 {
+    raw.map(str::trim)
+        .filter(|s| {
+            let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(10, |n| n.max(1))
+}
+
+fn image_count(n: Option<i64>, limit: i64) -> Result<i64, String> {
+    match n {
+        None => Ok(1),
+        Some(n) if (1..=limit).contains(&n) => Ok(n),
+        Some(n) => Err(format!("n must be between 1 and {limit}, got {n}")),
+    }
 }
 
 // ---- POST /v1/videos/generations (Cosmos3) -------------------------------
@@ -702,9 +760,10 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return error(
-                400, &format!("malformed multipart body: {e}"),
-                "invalid_request_error"),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return error(status, &msg, "invalid_request_error");
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         let has_file = field.file_name().is_some();
@@ -715,21 +774,31 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             image_filename = field.file_name().map(str::to_string);
             match field.bytes().await {
                 Ok(b) => image_bytes = Some(b.to_vec()),
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             }
         } else if name == "prompt" {
             prompt = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
         } else if known.contains(&name.as_str()) || has_file {
             if let Err(e) = field.bytes().await {
-                return error(400, &e.to_string(), "invalid_request_error");
+                let (status, msg) = multipart_failure(&e, e.to_string());
+                return error(status, &msg, "invalid_request_error");
             }
         } else {
             let v = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
             let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
             extra.insert(name, parsed);
@@ -873,7 +942,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return detail_error(400, &format!("malformed multipart body: {e}")),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return detail_error(status, &msg);
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "files" {
@@ -884,7 +956,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             }
             let bytes = match field.bytes().await {
                 Ok(b) => b,
-                Err(e) => return detail_error(400, &e.to_string()),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return detail_error(status, &msg);
+                }
             };
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
@@ -913,7 +988,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             // as an empty value.
             let val = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return detail_error(400, &format!("reading form field {name:?}: {e}")),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, format!("reading form field {name:?}: {e}"));
+                    return detail_error(status, &msg);
+                }
             };
             match name.as_str() {
                 "text" => text = Some(val),
@@ -1009,8 +1087,14 @@ async fn generate_finish(
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
+    if let Some(bridge) = &st.bridge {
+        bridge.wait_for_request_id(&request_id, DUPLICATE_ID_GRACE).await;
+    }
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
+        let base = match try_result_stream(&st, &args, &request_id, true) {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
@@ -1051,4 +1135,34 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
     .to_string();
     s.push('\n');
     s.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_count_refuses_n_outside_one_to_limit() {
+        assert_eq!(image_count(None, 10), Ok(1));
+        assert_eq!(image_count(Some(1), 10), Ok(1));
+        assert_eq!(image_count(Some(10), 10), Ok(10));
+        for n in [0, -1, 11, i64::MAX] {
+            assert_eq!(
+                image_count(Some(n), 10),
+                Err(format!("n must be between 1 and 10, got {n}"))
+            );
+        }
+        assert_eq!(image_count(Some(3), 2), Err("n must be between 1 and 2, got 3".to_string()));
+    }
+
+    #[test]
+    fn max_images_parses_as_python_does() {
+        for (raw, cap) in [
+            (None, 10), (Some("2"), 2), (Some(" 2 "), 2), (Some("2\n"), 2), (Some("+3"), 3),
+            (Some("0"), 1), (Some("-1"), 1), (Some(""), 10), (Some("abc"), 10), (Some("2_0"), 10),
+            (Some("1.5"), 10), (Some("\u{ff12}"), 10),
+        ] {
+            assert_eq!(parse_max_images(raw), cap, "{raw:?}");
+        }
+    }
 }
