@@ -429,11 +429,6 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 self._unwind(step, [*covered, *admitted, key])
-                if covered:
-                    # the unwind gave back what the stage's pre-admit took, so
-                    # the stage can't be promoted any more: a retry of this
-                    # very step has to admit its pre-planning resources afresh
-                    self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready

@@ -230,9 +230,6 @@ class CacheStream:
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
-    # the step whose admit set `step_in_flight`, so `rollback_admit` clears
-    # only the marks its own admit set, never an in-flight step's
-    marked_by: KVStep | None = field(default=None, repr=False, compare=False)
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -245,7 +242,6 @@ class CacheStream:
             self.reset_generation += 1
             self.remote_reset_generation = None
         self.step_in_flight = False
-        self.marked_by = None
 
         if freed:
             self.page_indices.clear()
@@ -516,10 +512,6 @@ class KVManager(AttentionResource):
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
-        # the step those marks name as `marked_by`: exec may re-declare the
-        # staged step as an equal but distinct object, and its unwind has to
-        # find them too
-        self._preplan_step: KVStep | None = None
 
         # (rid, label) -> pages the live reservation freshly acquired, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
@@ -1429,7 +1421,6 @@ class KVManager(AttentionResource):
                 # entries for the next clear_preplan to act on
                 self._preplan_new_labels = []
                 self._preplan_marked = []
-                self._preplan_step = step
             for (from_label, to_label), extra in forks:
                 for rid in self._forking_rids(step, ctx):
                     # checked before the reservation, which is what creates it
@@ -1488,9 +1479,7 @@ class KVManager(AttentionResource):
                 ).get(segment.label)
                 if stream is None:
                     continue
-                if not stream.step_in_flight:
-                    stream.step_in_flight = True
-                    stream.marked_by = step
+                stream.step_in_flight = True
                 if ctx.is_preplan:
                     self._preplan_marked.append(
                         (segment.request_id, segment.label)
@@ -1502,33 +1491,24 @@ class KVManager(AttentionResource):
         return ADMIT_OK
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
-        """Give back the pages this admit freshly acquired, and the
-        ``step_in_flight`` marks it set. Does not touch pages retained by a
-        shared prefix or a lease converted onto the stream, nor another step's
-        mark.
+        """Give back the pages this admit freshly acquired, and clear the
+        ``step_in_flight`` marks over the step's segments as ``commit`` does.
+        Does not touch pages retained by a shared prefix or a lease converted
+        onto the stream.
 
         ``page_indices`` maps token position to page, so the reserved pages can
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
         """
         self._touch_plan_cache()
-        # the staged step's marks, when this is that step (see `admit`'s early return)
-        staged = (
-            self._preplan_step
-            if self._preplanned and self._preplan_key == self._plan_key(step, ctx)
-            else None
-        )
         with self._lock:
+            # `.get` as in `admit`: a refusal can come before a stream exists
             for segment in step.segments:
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
-                if stream is None:
-                    continue
-                owner = stream.marked_by
-                if owner is not None and (owner is step or owner is staged):
+                if stream is not None:
                     stream.step_in_flight = False
-                    stream.marked_by = None
             reserved = self._admit_reserved_pages
             mine = [key for key in reserved if ctx.is_real_row(key[0])]
             for rid, label in mine:
@@ -2160,9 +2140,7 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is not None:
                     stream.step_in_flight = False
-                    stream.marked_by = None
             self._preplan_marked = []
-            self._preplan_step = None
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_key = None
@@ -2201,7 +2179,6 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                stream.marked_by = None
                 if step.commit and segment.span > 0:
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the

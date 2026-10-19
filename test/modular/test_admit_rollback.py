@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -31,9 +31,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import (
-    AdmitOutcome,
     AllocationFailed,
-    ResourceStep,
     Segment,
     StepContext,
     SubmoduleStep,
@@ -178,112 +176,6 @@ def test_a_refused_request_can_still_be_offloaded():
 def test_a_refused_request_can_still_release_oldest():
     cross, _ = _whisper()
     cross.release_oldest("a", PAGE)
-
-
-def test_unwinding_leaves_an_in_flight_steps_mark_alone():
-    """A mark the admit found already set belongs to a step that is still
-    running; only the step that set a mark may clear it."""
-    kv = _kv("kv", pages=16)
-    kv.ingest_request("a", None)
-    running = _kv_step("a", PAGE)
-    assert kv.admit(running, _ctx("a")).ok
-    stream = kv._streams["a"]["main"]
-    assert stream.step_in_flight
-
-    refused = _kv_step("a", 0)
-    assert kv.admit(refused, _ctx("a")).ok
-    kv.rollback_admit(refused, _ctx("a"))  # a later resource refused it
-
-    assert stream.step_in_flight, "unwinding one step cleared a running step's mark"
-
-
-class _Refuser(Resource):
-    """A resource that does not pre-plan and refuses once told to."""
-
-    refuse = False
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
-
-    def admit(self, step, ctx):
-        if not self.refuse:
-            return AdmitOutcome(ok=True)
-        return AdmitOutcome(ok=False, reason=AllocationFailed(
-            message="full", pages_short=1, label="main", request_id="a",
-        ))
-
-
-def test_a_redeclared_staged_step_unwinds_the_marks_its_pre_admit_set():
-    """An unprepared batch pre-plans over a template declaration, and exec
-    declares the same step again as a new object. The runner still treats it
-    as the staged step and skips KV's admit, so a later refusal has to clear
-    the marks the pre-admit set under the template."""
-    kv, refuser = _kv("kv", pages=16), _Refuser()
-    runner = StepRunner({"kv": kv, "z_refuser": refuser})
-    kv.ingest_request("a", None)
-
-    def declare():
-        return SubmoduleStep(steps={"kv": _kv_step("a", PAGE), "z_refuser": ResourceStep()})
-
-    assert _drive(runner, declare(), _ctx("a")).ok
-    ctx = _ctx("a")
-    template = declare()
-    template.set_ctx(ctx)
-    ctx.is_preplan = True
-    assert runner.pre_admit(template).ok
-    runner.pre_plan(template)
-    ctx.is_preplan = False
-
-    refuser.refuse = True
-    live = declare()
-    live.set_ctx(ctx)
-    assert not runner.admit(live).ok
-
-    stream = kv._streams["a"]["main"]
-    assert len(stream.page_indices) == 1, "the pre-admit's page was not given back"
-    assert not stream.step_in_flight, "the pre-admit's mark outlived the refusal"
-    assert kv.offload("a") == 1
-
-
-def test_a_refused_staged_step_drops_its_stage_so_a_retry_admits_afresh():
-    """A refusal of the staged step unwinds what its pre-admit took (here a
-    recurrent slot). The stage has to go with it: left up, a retry of the very
-    same step skips the pre-planning resources as covered and promotes a plan
-    that addresses the slot the unwind freed."""
-    pool, refuser = _pool(max_slots=4), _Refuser()
-    runner = StepRunner({"gdn_state": pool, "z_refuser": refuser})
-    pool.ingest_request("a")
-
-    def declare():
-        return SubmoduleStep(steps={
-            "gdn_state": RecurrentStep(segments=(Segment("a", "main", 1),)),
-            "z_refuser": ResourceStep(),
-        })
-
-    ctx = _ctx("a")
-    staged = declare()
-    staged.set_ctx(ctx)
-    ctx.is_preplan = True
-    assert runner.pre_admit(staged).ok
-    runner.pre_plan(staged)
-    ctx.is_preplan = False
-    assert "main" in pool._slots["a"]
-
-    refuser.refuse = True
-    live = declare()
-    live.set_ctx(ctx)
-    assert not runner.admit(live).ok
-    assert "main" not in pool._slots["a"], "the refused stage kept its slot"
-    assert not runner.staged, "the stage outlived the unwind of its pre-admit"
-
-    refuser.refuse = False
-    retry = declare()
-    retry.set_ctx(ctx)
-    assert runner.admit(retry).ok
-    assert "main" in pool._slots["a"], "the retry ran without a slot"
-    addressing = runner.plan(retry)["gdn_state"]["main"]
-    assert addressing.slot_indices[0].item() == pool._slots["a"]["main"].index
 
 
 # --- one row's admit can be unwound after later rows admitted -----------------
