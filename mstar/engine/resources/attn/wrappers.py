@@ -236,6 +236,13 @@ class FlashInferPrefillWrapper:
             seq_lens=kv_lens,
             window_left=window_left,
         )
+        rows = getattr(self.attn_wrapper, "_max_total_num_rows", None)
+        if isinstance(rows, torch.Tensor):
+            # AMD's FlashInfer keeps a captured wrapper's row count as a view
+            # of the qo_indptr its first plan was given, and the staging buffer
+            # above is rewritten every plan. Later plans would then be
+            # partitioned for their own row count, not the captured one.
+            self.attn_wrapper._max_total_num_rows = int(rows)
         if self._pinned_done is not None:
             # every copy out of the staging buffers is issued: the next
             # restage waits for them
