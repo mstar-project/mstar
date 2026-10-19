@@ -191,6 +191,10 @@ def test_launch_commands_and_env(tmp_path, monkeypatch):
                   lane="lane1")
     assert lane.environment()["CTR_SCRATCH"].endswith("ctr-123-vllm-openai-rocm_v0.31.0-lane1")
     assert w.command()[1:4] == ["vllm", "vllm", "serve"]
+    cfg = tmp_path / "cap1024.yaml"
+    cfg.write_text("model: qwen3_5\nresources:\n  linear_attn:\n    max_captured_prefill_tokens: 1024\n")
+    exp = Launch(catalog.ARMS["mstar"], catalog.ROWS["qwen3_5_2b"], [1], 8403, tmp_path / "e", worktree=wt, config=cfg)
+    assert exp.command()[exp.command().index("--config") + 1] == str(cfg)
     with pytest.raises(ValueError):
         Launch(catalog.ARMS["mstar"], catalog.ROWS["qwen3_5_9b_tp2"], [4], 8400, tmp_path / "c", worktree=wt)
     assert gpu_list("0, 3") == [0, 3]
