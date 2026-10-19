@@ -276,3 +276,55 @@ def test_robotics_can_skip_episodes_without_a_task():
     fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {"skip_empty_prompt": "1"})
     assert [it.id for it in fam.select_items(items)] == ["ep00"]
     assert len(family_for_config("pi05", "pi05", {}, {}).select_items(items)) == 2
+
+
+def test_ltx2_5_audio_video_family(tmp_path):
+    import io
+    import struct
+
+    av = pytest.importorskip("av")
+    from benchmark.correctness.client import Response
+    from benchmark.correctness.families.av import AudioVideoFamily
+
+    cfg = yaml.safe_load((REPO / "configs/ltx2_5.yaml").read_text())
+    geo = {"height": "32", "width": "32", "num_frames": "9", "fps": "9"}  # a 1 s clip
+    fam = family_for_config("ltx2_5", "ltx2_5", cfg, geo)
+    assert isinstance(fam, AudioVideoFamily) and fam.self_consistency_only
+    item = sets.Item(id="00", prompt="a cat", params={"seed": 0})
+    sset = sets.SampleSet("video_v1", tmp_path, {}, [item])
+    (req,) = fam.requests(sset)
+    assert req.output_modalities == "video,audio"
+    assert req.model_kwargs == {"seed": 0, "height": 32, "width": 32, "num_frames": 9, "fps": 9.0}
+
+    rng = np.random.default_rng(0)
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="mp4") as c:
+        s = c.add_stream("mpeg4", rate=9)
+        s.height = s.width = 32
+        s.pix_fmt = "yuv420p"
+        for _ in range(9):
+            frame = av.VideoFrame.from_ndarray(rng.integers(0, 256, (32, 32, 3), dtype=np.uint8), format="rgb24")
+            for packet in s.encode(frame):
+                c.mux(packet)
+        for packet in s.encode():
+            c.mux(packet)
+    tone = (0.3 * np.sin(2 * np.pi * 220 * np.arange(8000) / 8000) * 32767).astype("<i2")
+    pcm = np.stack([tone, tone], axis=1).tobytes()  # interleaved stereo
+    runs = []
+    for k, audio in ((1, pcm), (2, pcm[:-4] + struct.pack("<hh", 0, 0))):
+        resp = Response("00", ok=True, video=bytearray(buf.getvalue()), audio=bytearray(audio),
+                        metadata=[{"modality": "audio", "sample_rate": 8000, "num_channels": 2}])
+        out = tmp_path / "run" / f"r{k}"
+        (out / "outputs").mkdir(parents=True)
+        fam.save(sset, [resp], out / "outputs")
+        runs.append(out)
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, runs, None, work, "cpu")
+    by = {c.name: c for c in sc.checks}
+    assert by["requests ok"].verdict == "PASS"
+    assert by["videos with the requested frames and size, none flat"].verdict == "PASS"
+    assert by["audio tracks failing sanity"].value == 0, sc.rows
+    assert by["same-seed min frame PSNR, two server instances (dB)"].verdict == "PASS"  # same mp4 bytes
+    assert by["same-seed min audio SNR, two server instances (dB)"].verdict == "PASS"  # one sample differs
+    assert sc.metrics["byte_identical_r1_r2"] == {"mp4": 1, "pcm": 0, "n": 1}
