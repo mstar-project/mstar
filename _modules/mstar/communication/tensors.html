@@ -2568,9 +2568,12 @@ window.runMermaid = runMermaid;</script>
             <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Registering </span><span class="si">%s</span><span class="s2"> for send"</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
             <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+            <span class="c1"># Mooncake rejects a 0-byte region, and a reader of an empty</span>
+            <span class="c1"># tensor copies nothing (see start_read_tensors), so there is</span>
+            <span class="c1"># nothing to pin.</span>
             <span class="n">ret_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">register_memory</span><span class="p">(</span>
                 <span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span>
-            <span class="p">)</span>
+            <span class="p">)</span> <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span> <span class="k">else</span> <span class="mi">0</span>
             <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
                 <span class="n">phase_record</span><span class="p">(</span>
                     <span class="s2">"tensors.register_memory"</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">,</span>
@@ -2600,11 +2603,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">registered</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">registered</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">)</span> <span class="ow">and</span> <span class="n">registered</span><span class="p">:</span>
-            <span class="n">ret_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">unregister_memory</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
-            <span class="p">)</span>
-            <span class="k">if</span> <span class="n">ret_value</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"Mooncake memory unregistration failed."</span><span class="p">)</span>
+            <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="c1"># an empty tensor is marked ready without being registered</span>
+            <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span><span class="p">:</span>
+                <span class="n">ret_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">unregister_memory</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">())</span>
+                <span class="k">if</span> <span class="n">ret_value</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"Mooncake memory unregistration failed."</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
 
 <div class="viewcode-block" id="MooncakeCommunicationManager.start_read_tensors">
@@ -2648,6 +2652,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># +1 for graph-node usage (released by _cleanup_consumed_inputs)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span>
                 <span class="p">)</span>
+                <span class="c1"># Nothing to read, and Mooncake rejects a 0-byte region: the</span>
+                <span class="c1"># empty buffer is the whole tensor. With no reads, the edge</span>
+                <span class="c1"># gets no future and is ready once earlier reads are.</span>
+                <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="k">continue</span>
 
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">):</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">register_memory</span><span class="p">(</span><span class="n">buffer</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
