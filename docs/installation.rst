@@ -691,13 +691,19 @@ The rename means a job that starts during a save gets the old copy or the new on
 half of one. AITER's, FlyDSL's and FlashInfer's caches aren't in it. They already persist
 where steps 3 and 4 put them.
 
-**VAE-heavy models.** MIOpen searches for the fastest convolution kernel the first time it
-sees a size, and for VAE decodes that search is long. ``MIOPEN_FIND_MODE=FAST`` skips most
-of it. On an MI300X with an empty MIOpen cache, the first bf16 decode went from 161 s to
-6.6 s for Wan2.2 (480x832, 33 frames), from 82 s to 0.1 s for a Cosmos3 720p image and from
-83 s to 1.5 s for the FLUX.2 autoencoder. Later bf16 decodes stayed within 4%. It isn't a
-default because fp32 convs get slower with it (Wan2.2's fp32 decode went from 3.6 s to
-4.5 s), so set it in the environment of Wan2.2, Cosmos3 and FLUX.2 deployments.
+**Convolutions on a cold node.** The first time MIOpen sees a conv size it searches for the
+fastest kernel, and that search is slow. On an MI300X with an empty cache the first bf16 decode
+took 161 s for Wan2.2 (480x832, 33 frames), 82 s for a Cosmos3 720p image and 83 s for the
+FLUX.2 autoencoder. Qwen3-Omni's vocoder asks for the full search (``cudnn.benchmark``), and on
+an MI325X its capture took 645 s of a 1146 s cold start. The saved MIOpen database from the
+recipe above skips the search and keeps the fast kernels. The same Qwen3-Omni start took 223 s
+from a saved copy.
+
+``MIOPEN_FIND_MODE=FAST`` isn't a substitute. It doesn't skip a search the model asks for, so
+the Qwen3-Omni cold start got slower (1668 s), and the kernels it falls back to are slower in
+fp32, 35-48% per vocoder step and 3.6 s to 4.5 s for a Wan2.2 decode. It does cut a bf16 VAE's
+first decode (Wan2.2 161 s to 6.6 s, with later bf16 decodes within 4%), so it's an option for
+a bf16 VAE deployment on a node with no saved cache.
 
 **Picking GPUs.** On ROCm ``mstar serve --gpus 0,1`` sets both ``CUDA_VISIBLE_DEVICES``
 and ``HIP_VISIBLE_DEVICES``, since HIP and torch read ``HIP_VISIBLE_DEVICES`` first.
