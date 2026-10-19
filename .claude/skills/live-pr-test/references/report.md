@@ -50,6 +50,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 ## Result marks
 
 - ✅ held, ❌ failed on the setup it was measured on, ⚠️ held only partly (some cells, some restarts).
+- Before a ⚠️ or ❌ that rests on a measurement that varies run to run (throughput, latency, output identity, a fault-injection outcome), rerun it until each arm has at least three repeats. A deterministic result (a refusal, a crash with a traceback, a test, a token count) needs no repeats; say which it is. A rate that still doesn't separate after the repeats is "not separable", not ❌.
 - ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
 - ➖ inconclusive, too, when an output changes by no more than base's own run-to-run variation and there is no reference to say which side is right. Better: add a reference arm when one is cheap (fp32, `'highest'` matmul precision, or the reference implementation).
 - Before marking a description claim ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
