@@ -1,5 +1,5 @@
-"""GR00T N1.7's node submodules. The vision encoder, the LLM and the state
-encoder for now; the VL bridge and the denoise step land in later cycles."""
+"""GR00T N1.7's node submodules. Everything of the `prefill` walk; the
+denoise step lands in a later cycle."""
 from __future__ import annotations
 
 from typing import Any
@@ -11,11 +11,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
+from mstar.model.gr00t_n17.components.bridge import Gr00tN17VLBridge
 from mstar.model.gr00t_n17.components.embodiment import CategorySpecificMLP
 from mstar.model.gr00t_n17.components.llm import Gr00tN17LanguageModel
 from mstar.model.gr00t_n17.components.rope import mrope_position_ids
 from mstar.model.gr00t_n17.components.vision import Gr00tN17VisionEncoder
-from mstar.model.gr00t_n17.config import LLM_ATTN, Gr00tN17Config
+from mstar.model.gr00t_n17.config import BRIDGE_ATTN, LLM_ATTN, Gr00tN17Config
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 from mstar.model.submodule_base import (
     ModelInputsFromEngine,
@@ -233,7 +234,9 @@ class Gr00tN17LLMSubmodule(NodeSubmodule):
         features = self.model(
             hidden, cos, sin, deepstack_embeds.unbind(0), image_rows,
         )
-        return {"backbone_features": [features]}
+        # the bridge splits on these, and this node already derived them;
+        # deriving them twice is two chances to disagree
+        return {"backbone_features": [features], "image_rows": [image_rows]}
 
 
 class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
@@ -299,3 +302,93 @@ class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> NameToTensorList:
         return {"state_features": [self.state_encoder(state, embodiment_id)]}
+
+
+class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
+    """The ``vl_bridge`` node: the backbone's features become the two spans
+    the denoise loop cross-attends.
+
+    The split is the point. The reference masks every DT cross-attention
+    against the image rows or the non-image rows, alternating by block; here
+    the rows are separated **once**, into ``vl_text`` and ``vl_image``, and the
+    loop attends a whole span with no mask at all. Softmax over a span does
+    not care in what order the keys arrive, so the two are the same
+    computation (D03).
+
+    Unmasked in the reference, so one ragged segment per request is the same
+    thing at B = 1 and keeps a request independent of its neighbours (R12).
+    """
+
+    def __init__(self, model: Gr00tN17VLBridge, config: Gr00tN17Config):
+        super().__init__()
+        self.model = model
+        self.config = config
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs: Any,
+    ) -> NodeInputs:
+        features = inputs["backbone_features"][0]
+        image_rows = inputs["image_rows"][0]
+        if int(image_rows.numel()) > features.shape[0]:
+            raise ValueError(
+                f"{int(image_rows.numel())} image row(s) for "
+                f"{features.shape[0]} backbone feature row(s)"
+            )
+        return NodeInputs(
+            input_seq_len=features.shape[0],
+            tensor_inputs={"backbone_features": features, "image_rows": image_rows},
+        )
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        **kwargs: Any,
+    ) -> SubmoduleStep | None:
+        # one segment per request, unmasked: every row of a prompt sees every
+        # other row of that prompt, and none of anyone else's
+        segments = [
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        return SubmoduleStep(
+            segments=segments,
+            steps={BRIDGE_ATTN: AttentionStep(causal=False)},
+        )
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        # as the other nodes: no batched forward, so a wider batch would only
+        # be the engine's per-request fallback in disguise
+        return 1
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        (inp,) = inputs
+        device = self.get_device()
+        return {k: v.to(device) for k, v in inp.tensor_inputs.items()}
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        backbone_features: torch.Tensor,
+        image_rows: torch.Tensor,
+        **kwargs: Any,
+    ) -> NameToTensorList:
+        rows = self.model(backbone_features)
+        is_image = torch.zeros(
+            rows.shape[0], dtype=torch.bool, device=rows.device,
+        ).index_fill_(0, image_rows, True)
+        return {
+            "vl_text": [rows[~is_image]],
+            "vl_image": [rows[is_image]],
+        }

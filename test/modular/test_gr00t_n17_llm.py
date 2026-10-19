@@ -773,11 +773,13 @@ def test_driving_the_node_is_the_forwards_own_pieces_called_by_hand(tmp_path, sp
     the image rows, the rotation and the stack, over the same tensors. The same ops in the same
     order, so this is ``torch.equal`` and not a bar -- it has been exact on every prompt here.
 
-    It also pins the output: one tensor, a row per prompt token, under ``backbone_features``.
+    It also pins the output: a row per prompt token under ``backbone_features``, and the
+    image rows beside it, which the bridge splits on rather than re-deriving them (C05 CHK-3).
     """
     run = _drive(tmp_path, spec)
-    assert list(run.out) == ["backbone_features"]
+    assert list(run.out) == ["backbone_features", "image_rows"]
     assert len(run.out["backbone_features"]) == 1
+    assert torch.equal(run.out["image_rows"][0], run.tensors["image_rows"])
     assert run.features.shape == (len(run.ids), run.node.config.text.hidden_size)
     # preprocess stages the tensors and nothing else; there are no non-tensor kwargs here
     assert set(run.tensors) == _STAGED
