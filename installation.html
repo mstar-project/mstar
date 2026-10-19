@@ -980,6 +980,20 @@ PyTorch index — cu128 on CUDA 12.x, cu130 on CUDA 13.x — for the runtime <em
 isolated environment that builds <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>. The same command therefore
 works unchanged across machines. (Needs a recent <code class="docutils literal notranslate"><span class="pre">uv</span></code> — run <code class="docutils literal notranslate"><span class="pre">uv</span> <span class="pre">pip</span> <span class="pre">install</span> <span class="pre">--help</span></code> and
 look for <code class="docutils literal notranslate"><span class="pre">--torch-backend</span></code> if unsure; <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">UV_TORCH_BACKEND=auto</span></code> is equivalent.)</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Mooncake on a CUDA 13 torch.</strong> The extras install <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>,
+Mooncake’s default wheel, which is built for CUDA 12 and links <code class="docutils literal notranslate"><span class="pre">libcudart.so.12</span></code>. An extra
+can’t choose a dependency by CUDA version, so it installs that wheel next to a cu130 torch
+too. A CUDA 13 torch doesn’t bring the CUDA 12 runtime, so <code class="docutils literal notranslate"><span class="pre">TCP</span></code> and <code class="docutils literal notranslate"><span class="pre">RDMA</span></code> transport
+fail at startup with <code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code>; <code class="docutils literal notranslate"><span class="pre">SHM</span></code> is not
+affected. Swap in Mooncake’s CUDA 13 build, which installs the same <code class="docutils literal notranslate"><span class="pre">mooncake</span></code> package:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>uninstall<span class="w"> </span>mooncake-transfer-engine
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--reinstall<span class="w"> </span>--no-deps<span class="w"> </span>mooncake-transfer-engine-cuda13
+</pre></div>
+</div>
+<p>Installing an extra again puts the CUDA 12 build back, so repeat the swap afterwards.</p>
+</div>
 <p><strong>Manual fallback.</strong> If you can’t use the flag, install the pinned torch trio from the
 matching CUDA index <strong>first</strong>, then install <code class="docutils literal notranslate"><span class="pre">mstar</span></code> (the resolver then treats the
 requirement as already satisfied):</p>

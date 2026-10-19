@@ -362,6 +362,22 @@ isolated environment that builds ``flash-attn``. The same command therefore
 works unchanged across machines. (Needs a recent ``uv`` — run ``uv pip install --help`` and
 look for ``--torch-backend`` if unsure; ``export UV_TORCH_BACKEND=auto`` is equivalent.)
 
+.. note::
+
+   **Mooncake on a CUDA 13 torch.** The extras install ``mooncake-transfer-engine``,
+   Mooncake's default wheel, which is built for CUDA 12 and links ``libcudart.so.12``. An extra
+   can't choose a dependency by CUDA version, so it installs that wheel next to a cu130 torch
+   too. A CUDA 13 torch doesn't bring the CUDA 12 runtime, so ``TCP`` and ``RDMA`` transport
+   fail at startup with ``libcudart.so.12: cannot open shared object file``; ``SHM`` is not
+   affected. Swap in Mooncake's CUDA 13 build, which installs the same ``mooncake`` package:
+
+   .. code-block:: bash
+
+      uv pip uninstall mooncake-transfer-engine
+      uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13
+
+   Installing an extra again puts the CUDA 12 build back, so repeat the swap afterwards.
+
 **Manual fallback.** If you can't use the flag, install the pinned torch trio from the
 matching CUDA index **first**, then install ``mstar`` (the resolver then treats the
 requirement as already satisfied):
