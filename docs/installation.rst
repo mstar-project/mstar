@@ -70,8 +70,7 @@ console scripts, ``mstar`` and ``mstar-serve``.
 Intel XPU Docker image
 ----------------------
 
-Build from the repository root so Docker can copy the M* source and deployment
-configs:
+Build the image using ``docker/Dockerfile.xpu``:
 
 .. code-block:: bash
 
@@ -79,8 +78,15 @@ configs:
    cd mstar
    docker build -f docker/Dockerfile.xpu -t mstar:xpu .
 
-The image uses ``uv`` to install M* with ``.[bagel_xpu]`` and build ``mstar-rust``
-from the same checkout. The Dockerfile pins XPU PyTorch 2.13.0, torchvision
+The image clones M* into ``/mstar-workspace`` and uses ``uv`` to install
+``.[bagel_xpu]`` and build ``mstar-rust`` from that source. The clone defaults to
+``main`` in ``https://github.com/mstar-project/mstar.git``. To build another
+branch or tag, pass ``--build-arg MSTAR_REPO=<repository-url>`` and
+``--build-arg MSTAR_REF=<branch-or-tag>``. Set these arguments when building an
+unmerged branch; local checkout changes are not used as image sources.
+Use ``--no-cache`` when rebuilding a moving branch to refresh the clone.
+
+The Dockerfile pins XPU PyTorch 2.13.0, torchvision
 0.28.0, torchaudio 2.11.0 (the latest XPU wheel), and TorchCodec 0.16.0 with the
 Intel ``torchcodec-xpu`` 0.16.0 plugin. The CPU TorchCodec base wheel avoids CUDA
 dependencies; the plugin provides XPU video acceleration through FFmpeg VAAPI.
@@ -117,7 +123,7 @@ Inside the container, serve BAGEL using the seven-XPU CFG TP2 deployment:
    mstar serve bagel --config configs/bagel_xpu_cfg_tp2.yaml
 
 This config needs seven visible Intel GPUs. The image includes the source under
-``/opt/mstar``; model weights are downloaded at runtime into the mounted cache.
+``/mstar-workspace``; model weights are downloaded at runtime into the mounted cache.
 The GPU runtime pins in the Dockerfile can be overridden with
 ``--build-arg COMPUTE_RUNTIME_VERSION=...``, ``--build-arg IGC_VERSION=...`` and
 ``--build-arg GMM_VERSION=...`` to suit the host driver.

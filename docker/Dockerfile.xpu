@@ -74,7 +74,11 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-WORKDIR /opt/mstar
+WORKDIR /mstar-workspace
+
+ARG MSTAR_REPO=https://github.com/mstar-project/mstar.git
+ARG MSTAR_REF=main
+RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" .
 
 # uv selects the XPU index for PyTorch and TorchCodec in the single install below.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
@@ -83,7 +87,6 @@ ARG TORCHVISION_VERSION=0.28.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG TORCHCODEC_VERSION=0.16.0+cpu
 ARG TORCHCODEC_XPU_VERSION=0.16.0
-COPY . .
 RUN uv pip install --no-cache --torch-backend=xpu \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
