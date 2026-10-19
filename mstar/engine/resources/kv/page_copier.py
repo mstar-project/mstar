@@ -3,12 +3,13 @@
 Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous
 block per layer, a layer stride apart. ``copy_`` of that strided view between
 device and pinned host memory blocks the host until the copy stream drains and
-runs at a fraction of the link's bandwidth. On CUDA each page is instead one
-``cudaMemcpy2DAsync`` with the layer stride as its pitch: async, and run on the
-copy engines.
+runs at a fraction of the link's bandwidth. On CUDA and ROCm each page is
+instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync`` with the layer stride
+as its pitch: async, and run on the copy engines.
 
 `make_page_copier` picks the first copier that loads and passes a round trip,
-once per process: `CudaBindingsCopier`, then `CudartCopier`, then `TorchCopier`.
+once per process: on CUDA `CudaBindingsCopier`, then `CudartCopier`; on ROCm
+`HipCopier`; then `TorchCopier`.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
-_CUDA_MEMCPY_DEFAULT = 4  # cudaMemcpyDefault: direction from the pointers (UVA)
+_MEMCPY_DEFAULT = 4  # cudaMemcpyDefault / hipMemcpyDefault: direction from the pointers
 
 
 class PageCopier:
@@ -98,22 +99,22 @@ class CudaBindingsCopier(_Memcpy2DCopier):
         return int(err)
 
 
-class CudartCopier(_Memcpy2DCopier):
-    """Through ctypes, on the libcudart torch itself loaded (torch 2.9 ships no
-    ``cuda.bindings``). Found by its mapping rather than by name, so it is never
-    some other toolkit's runtime that happens to be on the library path."""
+class _MappedRuntimeCopier(_Memcpy2DCopier):
+    """Through ctypes, on the runtime library torch itself loaded. Found by its
+    mapping rather than by name, so it is never some other toolkit's runtime that
+    happens to be on the library path."""
 
-    name = "libcudart"
+    _lib = _symbol = ""
 
     def __init__(self):
         torch.cuda.init()
         with open("/proc/self/maps") as maps:
             paths = {
-                line.split()[-1] for line in maps if "/libcudart.so" in line
+                line.split()[-1] for line in maps if f"/{self._lib}.so" in line
             }
         if len(paths) != 1:
-            raise OSError(f"expected one libcudart mapped by torch, found {sorted(paths)}")
-        fn = ctypes.CDLL(paths.pop()).cudaMemcpy2DAsync
+            raise OSError(f"expected one {self._lib} mapped by torch, found {sorted(paths)}")
+        fn = getattr(ctypes.CDLL(paths.pop()), self._symbol)
         fn.restype = ctypes.c_int
         fn.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
@@ -123,8 +124,22 @@ class CudartCopier(_Memcpy2DCopier):
 
     def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
         return self._fn(
-            dst, dpitch, src, spitch, width, height, _CUDA_MEMCPY_DEFAULT, stream
+            dst, dpitch, src, spitch, width, height, _MEMCPY_DEFAULT, stream
         )
+
+
+class CudartCopier(_MappedRuntimeCopier):
+    """libcudart, for torch 2.9, which ships no ``cuda.bindings``."""
+
+    name = "libcudart"
+    _lib, _symbol = "libcudart", "cudaMemcpy2DAsync"
+
+
+class HipCopier(_MappedRuntimeCopier):
+    """libamdhip64 on ROCm, where ``copy_`` of a strided page blocks the host too."""
+
+    name = "libamdhip64"
+    _lib, _symbol = "libamdhip64", "hipMemcpy2DAsync"
 
 
 def _round_trips(copier: PageCopier) -> bool:
@@ -142,20 +157,24 @@ def _round_trips(copier: PageCopier) -> bool:
 
 @functools.cache
 def make_page_copier() -> PageCopier:
-    """The fastest copier that works here; `TorchCopier` off CUDA."""
-    if not current_platform.is_cuda():
+    """The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""
+    if current_platform.is_cuda():
+        candidates = (CudaBindingsCopier, CudartCopier)
+    elif current_platform.is_rocm():
+        candidates = (HipCopier,)
+    else:
         return TorchCopier()
-    for cls in (CudaBindingsCopier, CudartCopier):
+    for cls in candidates:
         try:
             copier = cls()
             if _round_trips(copier):
-                logger.info("KV page copies: one cudaMemcpy2DAsync a page, via %s", cls.name)
+                logger.info("KV page copies: one 2D async memcpy a page, via %s", cls.name)
                 return copier
             logger.warning("KV page copies: %s returned wrong data; not using it", cls.name)
         except (ImportError, OSError, AttributeError, RuntimeError) as e:
             logger.info("KV page copies: %s unavailable (%s)", cls.name, e)
     logger.warning(
-        "KV page copies: no cudaMemcpy2DAsync binding works here, so offload "
+        "KV page copies: no 2D async memcpy binding works here, so offload "
         "and reload fall back to copy_, which blocks the host and runs several "
         "times slower"
     )

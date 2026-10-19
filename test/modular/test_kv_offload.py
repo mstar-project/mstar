@@ -33,9 +33,13 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
+from mstar.platforms import current_platform
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="offload needs pinned host memory"
+)
+requires_nvidia = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="checks the CUDA copier chain"
 )
 
 PAGE_SIZE = 8
@@ -775,7 +779,8 @@ def _loadable(cls):
 @requires_cuda
 @pytest.mark.parametrize(
     "copier_cls",
-    [page_copier.CudaBindingsCopier, page_copier.CudartCopier, page_copier.TorchCopier],
+    [page_copier.CudaBindingsCopier, page_copier.CudartCopier, page_copier.HipCopier,
+     page_copier.TorchCopier],
     ids=lambda cls: cls.name,
 )
 def test_pool_copies_keep_every_layer_and_element(copier_cls):
@@ -810,7 +815,7 @@ def test_pool_copies_do_not_block_the_host():
     mgr = _make_manager()
     pool = mgr._cpu_pool
     assert not isinstance(pool._copier, page_copier.TorchCopier), (
-        "no cudaMemcpy2DAsync binding loaded on a CUDA build of torch"
+        "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"
     )
     device = mgr.kv_cache.tensor
     pool.offload_stream("warm", "main", device, [1], stored_len=0, position=0)
@@ -851,6 +856,7 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
 
 
 @requires_cuda
+@requires_nvidia
 def test_copier_falls_through_to_the_next_that_works(monkeypatch, caplog):
     """A binding that won't load, or loads and copies wrong, is skipped; with
     none left the pool keeps copy_ and warns once per process, not per pool."""

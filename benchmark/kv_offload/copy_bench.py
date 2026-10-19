@@ -1,8 +1,9 @@
 """KV offload/reload copy microbenchmark, through ``CPUPagePool`` itself.
 
 For each copier that loads here (``cudaMemcpy2DAsync`` per page through
-``cuda.bindings`` or through torch's libcudart, and the per-page ``copy_`` that
-is the fallback and was the only path before), direction and page count:
+``cuda.bindings`` or through torch's libcudart, ``hipMemcpy2DAsync`` through
+torch's libamdhip64 on ROCm, and the per-page ``copy_`` that is the fallback and
+was the only path before), direction and page count:
 
 - host: wall time from issuing the copies to ``sync()`` returning, with a
   ``--queued-ms`` kernel already queued on the compute stream. A path that
@@ -104,7 +105,7 @@ def main():
           f"{args.queued_ms:g} ms queued ahead")
     copiers = []
     for cls in (page_copier.CudaBindingsCopier, page_copier.CudartCopier,
-                page_copier.TorchCopier):
+                page_copier.HipCopier, page_copier.TorchCopier):
         try:
             copiers.append(cls())
         except (ImportError, OSError, AttributeError, RuntimeError) as e:
