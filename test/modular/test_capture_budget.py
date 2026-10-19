@@ -10,6 +10,7 @@ measured before any of them captures.
 
 from __future__ import annotations
 
+import ctypes
 import inspect
 import sys
 from contextlib import contextmanager
@@ -406,6 +407,170 @@ def test_graphs_take_no_more_executable_memory_than_sizing_counts():
         f"8 graphs took {fresh / _MIB:.0f} MiB of new memory, the plan expected "
         f"{(8 * memory.outside - measured.held) / _MIB:.0f}"
     )
+
+
+_PIECE = 2 * _MIB
+_COPY = 5300 * 2**10
+
+
+class _StubDriver:
+    """libcuda and free memory for copies of one graph: each copy takes
+    ``per_copy`` bytes, first from what is left of the last piece the driver
+    mapped, then from free memory in 2 MiB pieces. ``neighbor`` maps a copy
+    to what another process takes from free memory while it is made."""
+
+    def __init__(self, neighbor: dict[int, int], fails_at: int | None = None, per_copy: int = _COPY):
+        self.per_copy = per_copy
+        self.free = 40 * _GIB
+        self.left = 3 * _MIB
+        self.neighbor = neighbor
+        self.fails_at = fails_at
+        self.copies = 0
+        self.destroyed = 0
+
+    def cuGraphInstantiateWithFlags(self, copy, graph, flags):
+        if self.copies + 1 == self.fails_at:
+            return 2  # CUDA_ERROR_OUT_OF_MEMORY
+        self.copies += 1
+        pieces = max(-(-(self.per_copy - self.left) // _PIECE), 0)
+        self.left += pieces * _PIECE - self.per_copy
+        self.free -= pieces * _PIECE + self.neighbor.get(self.copies, 0)
+        return 0
+
+    def cuGraphExecDestroy(self, copy):
+        self.destroyed += 1
+        return 0
+
+
+def _measured(monkeypatch, driver: _StubDriver) -> ExecutableMemory:
+    """An ``ExecutableMemory`` measured on one-node copies through ``driver``."""
+    monkeypatch.setattr(ctypes, "CDLL", lambda name: driver)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (driver.free, 80 * _GIB))
+    executable = ExecutableMemory()
+    executable.measure(SimpleNamespace(raw_cuda_graph=lambda: 1), nodes=1)
+    return executable
+
+
+@pytest.mark.parametrize(
+    "neighbor", [{}, {8: -512 * _MIB}, {8: _GIB}], ids=["alone", "a_neighbor_frees", "a_neighbor_allocates"],
+)
+def test_a_graphs_executable_memory_is_measured_in_whole_pieces(monkeypatch, neighbor):
+    """The first copies of a graph fill a piece the driver mapped before, so
+    free memory drops by less than those copies take. And free memory is the
+    device's: a worker freeing memory on the same GPU while a copy is made
+    would make graphs look cheaper than they are, and a worker allocating
+    would make them look costlier."""
+    driver = _StubDriver(neighbor)
+
+    executable = _measured(monkeypatch, driver)
+
+    per_copy = executable.per_node
+    assert _COPY <= per_copy <= _COPY + _PIECE, f"measured {per_copy / _MIB:.2f} MiB a copy, not {_COPY / _MIB:.2f}"
+    assert 0 < executable.held <= driver.copies * _COPY, "the plan must not credit more than the copies hold"
+
+
+def test_a_graph_too_small_to_need_a_piece_is_counted_at_most_one(monkeypatch):
+    """512 copies of a graph of a few nodes fit in the piece the driver mapped
+    before. Left unmeasured, the graph would never be captured."""
+    driver = _StubDriver({}, per_copy=2 * 2**10)
+
+    executable = _measured(monkeypatch, driver)
+
+    assert executable.per_node >= 2 * 2**10, "a graph that fits in a piece must not be counted short"
+
+
+def test_a_walks_copies_are_held_until_its_runner_captures(monkeypatch):
+    """The driver keeps a destroyed graph's executable memory and maps new
+    memory beside it. On an H100, a graph measured after an earlier graph's
+    copies were destroyed read a third of its cost."""
+    driver = _StubDriver({})
+    runner = _StubPlannedRunner([_DECODE], peer=[True])
+    runner._executables = {("thinker_decode", None): _measured(monkeypatch, driver)}
+    assert driver.copies > 0 and driver.destroyed == 0, "the copies must be held while other walks are measured"
+
+    runner.warmup_and_capture({_DECODE})
+
+    assert driver.destroyed == driver.copies, "a runner that captures must hand its copies' memory to its graphs"
+
+
+def _measured_walk(held: int) -> ExecutableMemory:
+    executable = ExecutableMemory()
+    executable.held = held
+    return executable
+
+
+def test_a_walks_graphs_reuse_the_memory_its_copies_held():
+    """The driver keeps the memory a walk's measured copies held for graphs,
+    and free memory doesn't rise when the copies are released. Counted again
+    with each graph, that memory left colocated Qwen3-Omni with 1 GiB of
+    ballast no room for any graph. Graphs of another walk reuse only part of
+    that memory: on an H100, 4096-add graphs took back 12.6 of the 18 MiB that
+    621-add copies held."""
+    talker = _measured_walk(16 * _MIB)
+    pools = {
+        # each graph adds 8 MiB of executable memory, and the first its 4 MiB of scratch
+        "Talker": {bs: CaptureCost(0, 4 * _MIB, 0, 1, 8 * _MIB, talker) for bs in range(6)},
+        "Thinker": {0: CaptureCost(0, 2 * _MIB, 0, 1, 8 * _MIB)},
+    }
+
+    plan = plan_captures(pools, free=20 * _MIB)
+
+    assert plan.buckets == {"Talker": {0, 1, 2, 3}, "Thinker": set()}, (
+        "the Talker's copies must pay for two Talker graphs' executable memory, once, and none of the Thinker's"
+    )
+
+
+@pytest.mark.parametrize(
+    ("fraction", "reserved", "planned"), [(None, 30, 5), (0.45, 30, 2), (0.45, 26, 5)],
+    ids=["uncapped", "the_cap_binds", "free_memory_binds"],
+)
+def test_a_capped_worker_reuses_the_copies_only_within_its_cap(monkeypatch, fraction, reserved, planned):
+    """The cap counts a worker's PyTorch memory and its graphs' executable
+    memory, but not the copies. Where the cap binds, the copies' memory would
+    be room beyond the cap."""
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (8 * _GIB, 80 * _GIB))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: reserved * _GIB)
+    talker = _measured_walk(2 * _GIB)
+    # a 2 GiB eager step, and graphs of 1 GiB in their pool and 512 MiB outside it
+    costs = {bs: CaptureCost(2 * _GIB, _GIB, _GIB, 1, _GIB // 2, talker) for bs in range(8)}
+    runner = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
+    engine = SimpleNamespace(
+        _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
+    )
+
+    plan = Engine._plan_captures(engine, {"Talker": runner}, {"Talker": {}})
+
+    assert len(plan.buckets["Talker"]) == planned, "the graphs must fit in free memory and under the cap"
+
+
+def test_a_measurement_that_runs_out_of_memory_keeps_what_it_counted(monkeypatch):
+    """A crowded GPU can fail a copy's instantiation. Sizing continues with
+    the copies made before the failure."""
+    driver = _StubDriver({}, fails_at=4)
+
+    executable = _measured(monkeypatch, driver)
+    executable.release()
+
+    assert executable.per_node >= _COPY, "the copies made before the failure must not be counted short"
+    assert driver.destroyed == driver.copies == 3, "every copy the measurement made must be destroyed"
+
+
+def test_a_graph_whose_executable_memory_cannot_be_measured_is_left_unsized(monkeypatch):
+    """Every copy can fail to instantiate on a crowded GPU. Counted as zero,
+    the graph's executable memory would go unplanned."""
+    monkeypatch.setattr(accelerator_graph_runner, "current_platform", SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 1))
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: [])
+    monkeypatch.setattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None, raising=False)
+    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 1400)
+    monkeypatch.setattr(ExecutableMemory, "measure", lambda self, graph, nodes: None)
+
+    memory = accelerator_graph_runner._capture_thrown_away(
+        lambda pool, keep_graph: (object(), {}), "decode", ExecutableMemory(),
+    )
+
+    assert memory is None, "a graph whose executable memory went unmeasured must not be planned"
 
 
 def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monkeypatch):
