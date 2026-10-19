@@ -575,7 +575,7 @@ class _Encoder:
         self.front = pool(ENCODER_FRONT, 1, front_state_blocks(p.config))
         self.resources = {ENCODER_STATE: self.pool, ENCODER_FRONT: self.front}
         self.runner = StepRunner(self.resources)
-        self.regions = {}       # stand-ins for the piecewise runners, by label, when a test sets them
+        self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
 
     def prepare(self, handle, chunk, final=False):
         inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
@@ -584,9 +584,13 @@ class _Encoder:
 
     def declare(self, rids, inputs):
         """The node's declaration, with the leases the engine takes for it first."""
-        leases = {label: lease for label, region in self.regions.items()
-                  if region.lease_before_step and (lease := region.lease_slot(len(inputs))) is not None}
-        return self.node.declare_step("encode", rids, inputs, piecewise_leases=leases)
+        from mstar.engine.engine import Engine
+
+        engine = Engine.__new__(Engine)
+        engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
+        ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
+        engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
+        return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
 
     def step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
