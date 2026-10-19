@@ -35,7 +35,7 @@ from pathlib import Path
 
 from benchmark.amd import catalog, health, tables
 from benchmark.amd.catalog import Arm, Row
-from benchmark.amd.launch import REPO, Launch, gpu_list, host_record, smi_gpu
+from benchmark.amd.launch import REPO, VRAM_BUSY_MB, Launch, gpu_list, gpu_occupancy, host_record, smi_gpu
 
 WORK = Path("/work1/stephaniewang/atindra")
 DEFAULT_RUN_ROOT = WORK / "amd/results/bench"
@@ -403,6 +403,19 @@ def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_b
         t.join()
 
 
+def wait_for_free_vram(gpus: list[int], log, timeout_s: float = 180) -> None:
+    """Before the health gate: a server the previous table or prewarm just stopped takes a few seconds
+    to hand its memory back, and the gate would count that as an occupied GPU."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        busy = {g: o.get("vram_used_mb") for g, o in gpu_occupancy(gpus).items()
+                if (o.get("vram_used_mb") or 0) > VRAM_BUSY_MB}
+        if not busy:
+            return
+        log(f"waiting for VRAM on {busy} to come back")
+        time.sleep(10)
+
+
 def refuse_mixed_chips(prev: dict, node: dict, run_dir: Path) -> None:
     """A resumed run continues on the chip it started on, so a table never holds two."""
     was, now = prev.get("node_type"), node.get("node_type")
@@ -500,6 +513,7 @@ def main(argv=None) -> int:
     plan.log(f"table {table.name} -> {run_dir}")
 
     if not args.skip_health:
+        wait_for_free_vram(gpus, plan.log)
         # A resumed run keeps the first check and adds one per resume.
         name = f"check_resume{len(meta['resumed'])}" if meta.get("resumed") else "check_before"
         res = health.check(run_dir / "health", args.expect_gpus, gpus, name=name)

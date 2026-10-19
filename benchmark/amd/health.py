@@ -25,10 +25,10 @@ NODE_HEALTH = Path(os.environ.get("NODE_HEALTH", "/work1/stephaniewang/atindra/a
 ROW_RE = re.compile(r"^(NODE|GPU\d+)\s+(PASS|WARN|FAIL|INFO)\s+(\S+)\s*(.*)$")
 # Checks about other people's work on a GPU, not about its health.
 OCCUPANCY_CHECKS = {"occupancy", "hotspot_temp", "hbm_temp", "throttle_status", "violation_status"}
-# An occupancy row whose GPU holds no more than this and does no work only lists processes that opened every GPU
-# (HSA does that for a process restricted by HIP_VISIBLE_DEVICES alone); it is not a tenant.
+# An occupancy row whose GPU holds no more than this only lists processes that opened every GPU (ROCr does that
+# unless ROCR_VISIBLE_DEVICES limits it); it is not a tenant. Momentary activity at idle memory is not either.
 IDLE_VRAM_MB = 1024
-OCCUPANCY_RE = re.compile(r"vram_used=(\d+)/\d+ MB gfx_activity=(\d+)%")
+OCCUPANCY_RE = re.compile(r"vram_used=(\d+)/\d+ MB")
 
 
 def _gpu_of(scope: str) -> int | None:
@@ -45,7 +45,7 @@ def smi_gpus(gpus: list[int] | None) -> list[int] | None:
 
 def _idle_occupancy(r: dict) -> bool:
     m = OCCUPANCY_RE.search(r["detail"])
-    return r["check"] == "occupancy" and bool(m) and int(m.group(1)) <= IDLE_VRAM_MB and int(m.group(2)) == 0
+    return r["check"] == "occupancy" and bool(m) and int(m.group(1)) <= IDLE_VRAM_MB
 
 
 @dataclass
