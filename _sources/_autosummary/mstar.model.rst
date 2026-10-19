@@ -36,6 +36,7 @@
    kokoro
    loader
    ltx2_5
+   media_limits
    multimodal
    nemotron_duplex
    omnivoice

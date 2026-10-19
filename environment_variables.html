@@ -301,6 +301,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
@@ -620,6 +621,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compilation">Compilation</a></li>
 </ul>
@@ -1004,6 +1006,56 @@ run the Python frontend for sound video.</p></li>
 </ul>
 </section>
 </section>
+<section id="request-media">
+<h2>Request media<a class="headerlink" href="#request-media" title="Link to this heading">#</a></h2>
+<p>Read by the model’s media loaders in the data worker’s preprocess thread,
+behind either frontend. All three are also checked once when the data worker
+starts (<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_media_limits" title="mstar.model.media_limits.check_media_limits"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.check_media_limits()</span></code></a>), so an invalid
+value stops the server instead of failing every media request. The pixel caps
+hold for a request’s files together (<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.media_limits.RequestMediaBudget</span></code></a>),
+so attaching more files does not multiply them.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 28.0%" />
+<col style="width: 14.0%" />
+<col style="width: 58.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGE_PIXELS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">89478485</span></code></p></td>
+<td><p>Pixels a request’s images may decode to, summed over them (see
+<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_image_pixels" title="mstar.model.media_limits.max_image_pixels"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.max_image_pixels()</span></code></a>), checked from each
+header before decoding; over it, the request gets a 400. PNG, JPEG,
+WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
+reads BMP and TIFF); other formats get a 400. A GIF or an animated
+WebP is read as its first frame.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_VIDEO_PIXELS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1073741824</span></code></p></td>
+<td><p>Pixels a request’s videos may decode to (see
+<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_video_pixels" title="mstar.model.media_limits.max_video_pixels"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.max_video_pixels()</span></code></a>), summed over the
+frames the model’s loader decodes, each frame counting as at least
+64x64; over it, the request gets a 400. At 1080p30 the default refuses
+clips over about 17 s on Cosmos3, which decodes every frame, and over
+about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
+frame, as Cosmos3, when the clip’s header gives no frame count).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_MEDIA_FILES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16</span></code></p></td>
+<td><p>Images, audio clips and videos one request may attach, together (see
+<a class="reference internal" href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_media_files" title="mstar.model.media_limits.max_media_files"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.media_limits.max_media_files()</span></code></a>); more get a 400
+before any is decoded.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
 <section id="worker-scheduling">
 <h2>Worker scheduling<a class="headerlink" href="#worker-scheduling" title="Link to this heading">#</a></h2>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1263,6 +1315,7 @@ show <code class="docutils literal notranslate"><span class="pre">hit</span> <sp
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compilation">Compilation</a></li>
 </ul>

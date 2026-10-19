@@ -304,6 +304,46 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
 
+Request media
+-------------
+
+Read by the model's media loaders in the data worker's preprocess thread,
+behind either frontend. All three are also checked once when the data worker
+starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
+value stops the server instead of failing every media request. The pixel caps
+hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
+so attaching more files does not multiply them.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels a request's images may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_image_pixels`), checked from each
+       header before decoding; over it, the request gets a 400. PNG, JPEG,
+       WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
+       reads BMP and TIFF); other formats get a 400. A GIF or an animated
+       WebP is read as its first frame.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels a request's videos may decode to (see
+       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+       frames the model's loader decodes, each frame counting as at least
+       64x64; over it, the request gets a 400. At 1080p30 the default refuses
+       clips over about 17 s on Cosmos3, which decodes every frame, and over
+       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
+       frame, as Cosmos3, when the clip's header gives no frame count).
+   * - ``MSTAR_MAX_MEDIA_FILES``
+     - ``16``
+     - Images, audio clips and videos one request may attach, together (see
+       :func:`mstar.model.media_limits.max_media_files`); more get a 400
+       before any is decoded.
+
 Worker scheduling
 -----------------
 
