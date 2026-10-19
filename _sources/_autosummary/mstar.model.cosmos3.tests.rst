@@ -30,6 +30,7 @@ mstar.model.cosmos3.tests
    pipeline
    test_action
    test_distilled
+   test_dit_step_guard
    test_droid
    test_edge
    test_edge_action_parity

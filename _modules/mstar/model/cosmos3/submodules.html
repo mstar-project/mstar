@@ -1411,6 +1411,23 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">_with_host_timesteps</span><span class="p">(</span><span class="n">scheduler</span><span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_scheduler_has_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">step_index</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Refuse a denoise step the request's scheduler has already run out</span>
+<span class="sd">        for. The scheduler counts its own steps, and one past its last</span>
+<span class="sd">        timestep asserts inside diffusers (UniPC ``this_order &gt; 0``) in the</span>
+<span class="sd">        middle of a batched forward, failing every request in the batch.</span>
+<span class="sd">        Raised here, from ``prepare_inputs``, the engine fails this request</span>
+<span class="sd">        alone."""</span>
+        <span class="n">sched</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
+        <span class="n">done</span> <span class="o">=</span> <span class="n">sched</span><span class="o">.</span><span class="n">step_index</span>
+        <span class="k">if</span> <span class="n">done</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">done</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Cosmos3 DiT: request </span><span class="si">{</span><span class="n">request_id</span><span class="si">}</span><span class="s2"> was dispatched denoise step "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">step_index</span><span class="si">}</span><span class="s2"> after its scheduler ran all </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">timesteps</span><span class="p">)</span><span class="si">}</span><span class="s2"> "</span>
+                <span class="s2">"steps; refusing to step it again"</span>
+            <span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_scheduler_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">velocity</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">latents</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""One scheduler update of a ``[C, T, H, W]`` latent. A distilled</span>
 <span class="sd">        request carries its SDE generator (``sde_generator``, the same one its</span>
@@ -2070,6 +2087,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">step_index</span> <span class="o">=</span> <span class="n">local</span>
         <span class="k">elif</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_scheduler_has_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">step_index</span><span class="p">)</span>
         <span class="n">tensors</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"latents"</span><span class="p">:</span> <span class="n">latents</span><span class="p">,</span> <span class="s2">"time_index"</span><span class="p">:</span> <span class="n">time_index</span><span class="p">}</span>
         <span class="c1"># The CUDA-graph capture reads the timestep, rotary positions and the</span>
         <span class="c1"># clean/noisy token mask as static buffers (it can't reach the</span>
@@ -2143,6 +2161,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">scheduler</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_scheduler_has_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">step_index</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span>
             <span class="n">input_seq_len</span><span class="o">=</span><span class="n">st</span><span class="p">[</span><span class="s2">"cond"</span><span class="p">][</span><span class="s2">"num_vision_tokens"</span><span class="p">]</span> <span class="o">+</span> <span class="n">st</span><span class="p">[</span><span class="s2">"num_sound"</span><span class="p">],</span>
             <span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span>
@@ -2187,6 +2206,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">scheduler</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_scheduler_has_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">step_index</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span>
             <span class="n">input_seq_len</span><span class="o">=</span><span class="n">st</span><span class="p">[</span><span class="s2">"cond"</span><span class="p">][</span><span class="s2">"num_vision_tokens"</span><span class="p">]</span> <span class="o">+</span> <span class="n">st</span><span class="p">[</span><span class="s2">"cond"</span><span class="p">][</span><span class="s2">"num_action_tokens"</span><span class="p">],</span>
             <span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"latents"</span><span class="p">:</span> <span class="n">latents</span><span class="p">,</span> <span class="s2">"action_latents"</span><span class="p">:</span> <span class="n">action_latents</span><span class="p">,</span> <span class="s2">"time_index"</span><span class="p">:</span> <span class="n">time_index</span><span class="p">},</span>
