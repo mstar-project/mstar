@@ -1,3 +1,4 @@
+import ctypes
 import logging
 import os
 import threading
@@ -24,6 +25,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
@@ -117,7 +119,7 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
+def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -138,7 +140,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
     if backend is None:
         raise ValueError(f"Accelerator graphs are unsupported on device {device!r}")
     prev_stream = backend.current_stream()
-    graph = backend.create_graph()
+    graph = backend.create_graph(keep_graph)
     # benchmark off, so cuDNN searches in the warm-up and not in here: a conv
     # whose cached plan can't get its workspace would search again, timing
     # candidates and emptying the allocator's cache, which fails the capture
@@ -160,7 +162,9 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
     return graph, output
 
 
-def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype):
+def capture_with_static_outputs(
+    run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
     ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
@@ -188,7 +192,7 @@ def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, d
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype)
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
     return graph, static_outputs
 
 
@@ -219,6 +223,14 @@ class CaptureCost(NamedTuple):
     kept: int
     # graphs the bucket captures, one per slot
     slots: int
+    # bytes each slot's graph holds outside the allocator: its executable memory
+    outside: int = 0
+
+
+class GraphMemory(NamedTuple):
+    """What a captured graph holds: in its pool, and outside the allocator."""
+    pool: int
+    outside: int
 
 
 def _tensor_bytes(value: Any) -> int:
@@ -238,22 +250,27 @@ def _tensor_bytes(value: Any) -> int:
     return sum(storages.values())
 
 
-def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> int | None:
+def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> GraphMemory | None:
     """Run ``capture`` into a pool of its own and hand it all back: what the
-    pool took, None if it failed.
+    graph held, None if it failed.
 
     A capture records kernels and collectives without running them, so a rank
     short of memory fails its own capture here and no other rank waits on it.
     """
     torch.cuda.empty_cache()
     pool = DeviceCapability.of("cuda").graph_backend.graph_pool_handle()
+    # Keep the graph so its nodes can be counted, then instantiate it as a real capture does.
+    # Only NVIDIA's cost per node was measured, so a ROCm graph's executable memory is counted as zero.
+    counted = current_platform.is_cuda()
+    nodes = 0
     try:
-        graph, outputs = capture(pool=pool)
+        graph, outputs = capture(pool=pool, keep_graph=counted)
+        if counted:
+            nodes = _graph_nodes(graph)
+            graph.instantiate()
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    # shortcut: an executable graph's own memory (about 3 KiB a kernel) is
-    # outside the allocator and not counted; measure it if capture eats the floor
     taken = None if graph is None else sum(
         segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
     )
@@ -262,7 +279,23 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
-    return taken
+    return None if taken is None else GraphMemory(taken, nodes * _EXEC_BYTES_PER_NODE)
+
+
+#: a graph's executable memory per node, which no pool holds: about 3.5 KiB on Qwen3-Omni's kernels and
+#: 2.3 KiB on a chain of adds (H100, CUDA 12.9). The driver keeps a destroyed graph's executable memory
+#: and reuses it for the next graph, so free memory can't show it.
+_EXEC_BYTES_PER_NODE = 4 * 2**10
+
+
+def _graph_nodes(graph) -> int:
+    """``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""
+    count = ctypes.c_size_t(0)
+    status = ctypes.CDLL("libcuda.so.1").cuGraphGetNodes(
+        ctypes.c_void_p(graph.raw_cuda_graph()), None, ctypes.byref(count),
+    )
+    assert status == 0, f"cuGraphGetNodes failed with CUresult {status}"
+    return count.value
 
 
 def _size_in_walk(
@@ -277,7 +310,8 @@ def _size_in_walk(
     in the walk so far. A bucket that peaks no higher takes the lender's
     scratch and adds its own kept bytes: a walk runs one forward at every
     shape, and a smaller shape allocates no more at any step, so its graph
-    fits in the scratch a larger one leaves free.
+    fits in the scratch a larger one leaves free. A smaller bucket runs the same
+    kernels, so its executable memory is taken as the lender's.
 
     That holds only while no captured bucket took more scratch than the
     lender. Where one did, a lender tells nothing of this walk, and every
@@ -292,10 +326,12 @@ def _size_in_walk(
         len(captured) > 1 and cost.peak <= lender.peak
         and all(scratch(bucket) <= scratch(lender) for bucket in captured)
     ):
-        return cost._replace(graph=lender.graph - lender.kept + cost.kept), True
-    taken = _capture_thrown_away(capture, what)
-    if taken is not None:
-        cost = cost._replace(graph=taken if kept_in_pool else taken + cost.kept)
+        return cost._replace(graph=lender.graph - lender.kept + cost.kept, outside=lender.outside), True
+    memory = _capture_thrown_away(capture, what)
+    if memory is not None:
+        cost = cost._replace(
+            graph=memory.pool if kept_in_pool else memory.pool + cost.kept, outside=memory.outside,
+        )
         captured.append(cost)
     return cost, False
 
@@ -310,6 +346,8 @@ class CapturePlan(NamedTuple):
     buckets: dict[str, set]
     # pool -> bytes it is predicted to hold
     predicted: dict[str, int]
+    # pool -> bytes its graphs hold outside the allocator
+    outside: dict[str, int]
     # bytes the largest eager step on the device takes
     floor: int
 
@@ -322,10 +360,11 @@ def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> 
     every graph keeps, plus the most any one graph needs beyond that. So a
     bucket adds its slots' kept bytes, and whatever it needs past the pool's
     most so far. That is a model; the boot log compares it with what capture took.
+    A bucket also adds its slots' executable memory.
     """
     floor = max((cost.peak for costs in pools.values() for cost in costs.values()), default=0)
     room = free - floor
-    plan = CapturePlan({pool: set() for pool in pools}, dict.fromkeys(pools, 0), floor)
+    plan = CapturePlan({pool: set() for pool in pools}, dict.fromkeys(pools, 0), dict.fromkeys(pools, 0), floor)
     scratch = dict.fromkeys(pools, 0)
 
     def added(pool: str, cost: CaptureCost) -> int:
@@ -333,18 +372,23 @@ def plan_captures(pools: Mapping[str, Mapping[Any, CaptureCost]], free: int) -> 
         kept = -(-cost.kept // _SEGMENT) * _SEGMENT
         return cost.slots * kept + max(cost.graph - cost.kept - scratch[pool], 0)
 
+    def on_device(candidate) -> int:
+        pool, _, _, cost = candidate
+        return added(pool, cost) + cost.slots * cost.outside
+
     left = [
         (pool, index, bucket, cost) for pool, costs in pools.items()
         for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
     ]
     while left:
         # a tie goes to the pool named first, which leads with its node, then to capture order
-        best = min(left, key=lambda candidate: (added(candidate[0], candidate[3]), *candidate[:2]))
+        best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
         pool, _, bucket, cost = best
-        if added(pool, cost) > room:
+        if on_device(best) > room:
             break
-        room -= added(pool, cost)
+        room -= on_device(best)
         plan.predicted[pool] += added(pool, cost)
+        plan.outside[pool] += cost.slots * cost.outside
         scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
         plan.buckets[pool].add(bucket)
         left.remove(best)
@@ -679,13 +723,15 @@ class AcceleratorGraphRunner:
             cost = self._capture_costs[spec.bucket]._replace(graph=None)
             try:
                 with self._warmed(spec, forwards=0) as warmed:
-                    cost = cost._replace(graph=_capture_thrown_away(
+                    memory = _capture_thrown_away(
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
                             autocast_dtype=self._autocast_dtype,
                         ),
                         f"{self._submodule_name} {spec}",
-                    ))
+                    )
+                if memory is not None:
+                    cost = cost._replace(graph=memory.pool, outside=memory.outside)
             except Exception:
                 logger.warning(
                     "AcceleratorGraphRunner[%s]: could not prepare %s to size its capture",
@@ -1619,15 +1665,15 @@ class PiecewiseAcceleratorGraphRunner:
             cost = self._capture_costs[bucket]._replace(graph=None)
             try:
                 with self._warmed(shape, 0, forwards=0) as warmed:
-                    taken = _capture_thrown_away(
+                    memory = _capture_thrown_away(
                         partial(
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
                         ),
                         f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
                     )
-                if taken is not None:
-                    cost = cost._replace(graph=taken + cost.kept)
+                if memory is not None:
+                    cost = cost._replace(graph=memory.pool + cost.kept, outside=memory.outside)
             except Exception:
                 logger.warning(
                     "PiecewiseAcceleratorGraphRunner[%s]: could not prepare bs=%d total_tokens=%d "

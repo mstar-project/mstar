@@ -23,7 +23,13 @@ import torch
 
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, CaptureCost, WarmedSpec, plan_captures
+from mstar.engine.accelerator_graph_runner import (
+    AcceleratorGraphRunner,
+    CaptureCost,
+    GraphMemory,
+    WarmedSpec,
+    plan_captures,
+)
 from mstar.engine.engine import Engine
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
@@ -83,7 +89,7 @@ def measured(monkeypatch):
     def capture(capture, what):
         _, cost = capture(pool=None)
         runs.append(cost)
-        return cost.graph
+        return None if cost.graph is None else GraphMemory(cost.graph, cost.outside)
 
     monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
@@ -230,7 +236,9 @@ def test_a_regions_inputs_and_outputs_count_outside_its_pool(monkeypatch):
     """A region's graph copies its outputs into buffers outside the pool, and
     reads inputs from there, a set per graph. The pool a capture took is all
     scratch: a smaller bucket takes it whole and adds its own buffers."""
-    monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", lambda capture, what: 60 * _MIB)
+    monkeypatch.setattr(
+        accelerator_graph_runner, "_capture_thrown_away", lambda capture, what: GraphMemory(60 * _MIB, 0),
+    )
     captured = []
 
     def size(peak: int, kept: int) -> tuple[CaptureCost, bool]:
@@ -358,8 +366,10 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 1))
     monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or [])
     monkeypatch.setattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None, raising=False)
+    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
+    graph = SimpleNamespace(instantiate=lambda: None)
 
-    accelerator_graph_runner._capture_thrown_away(lambda pool: (object(), {}), "decode")
+    accelerator_graph_runner._capture_thrown_away(lambda pool, keep_graph: (graph, {}), "decode")
 
     (args, kwargs), = calls
     try:

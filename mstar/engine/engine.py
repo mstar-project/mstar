@@ -758,8 +758,9 @@ class Engine:
         for pool, costs in pools.items():
             if costs:
                 logger.info(
-                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted", self._device, pool,
-                    len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
+                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted, %.0f outside the allocator",
+                    self._device, pool, len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
+                    plan.outside[pool] / 2**20,
                 )
         return plan
 
