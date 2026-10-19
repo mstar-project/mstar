@@ -98,6 +98,33 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     return ["main"]
 
 
+# Shared at module level so `vit_patches` counts with the same resizes `prepare_inputs` runs.
+_VAE_TRANSFORM = ImageTransform(1024, 512, 16)
+_VIT_TRANSFORM = ImageTransform(980, 224, 14)
+# An image block is its patches between two sentinels, and occupies one position
+# regardless of token count. The walks and the prefix layout both read these.
+IMAGE_SENTINELS = 2
+IMAGE_ADVANCE = 1
+
+
+def vit_preprocess(image_preprocess: str | None) -> str:
+    """The name of the resize the ViT applies for a request's ``image_preprocess``.
+    Any name but "vllm" means the default."""
+    return "vllm" if image_preprocess == "vllm" else "default"
+
+
+def vit_patches(
+    height: int, width: int, image_preprocess: str,
+    patch_size: int, max_num_patches_per_side: int,
+) -> int:
+    """How many patches the ViT cuts an image of this size into. Its ``prepare_inputs`` asserts the same count."""
+    if image_preprocess == "vllm":
+        return max_num_patches_per_side ** 2
+    height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+    height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
+    return (height // patch_size) * (width // patch_size)
+
+
 class ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP2 ViT + connector + vit_pos_embed: pixel patches -> ViT features.
 
@@ -122,8 +149,8 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
-        self.transform = ImageTransform(980, 224, 14)
-        self.vae_transform = ImageTransform(1024, 512, 16)
+        self.transform = _VIT_TRANSFORM
+        self.vae_transform = _VAE_TRANSFORM
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
         # CUDA-graph capture of the ViT block loop, over the engine's ragged
@@ -155,7 +182,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         image_inputs = inputs["image_inputs"]
 
-        image_preprocess = fwd_info.step_metadata.get("image_preprocess", "default")
+        image_preprocess = vit_preprocess(fwd_info.step_metadata.get("image_preprocess"))
         if image_preprocess == "vllm":
             # vllm-omni parity: SiglipImageProcessor resizes to a fixed square
             # (size = max_num_patch_per_side * patch_size, e.g. 70*14=980),
@@ -180,6 +207,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
         # (C, H, W), so its .shape[0] is the channel count, not the patch
         # count flashattn / cu_seqlens needs.
         num_tokens = pixel_values.shape[0]
+        assert num_tokens == vit_patches(
+            *image_inputs[0].shape[-2:], image_preprocess,
+            self.vit_patch_size, self.vit_max_num_patch_per_side,
+        ), (
+            f"the ViT cut a {tuple(image_inputs[0].shape[-2:])} image into {num_tokens} patches, "
+            "not the count `vit_patches` gives a layout to key it by"
+        )
 
         cu_seqlens = torch.tensor(
             [0, num_tokens], dtype=torch.int32, device=device
@@ -839,7 +873,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
             node_inputs.input_embeds = self._wrap_with_boi_eoi(inputs["img_emb"][0])
-            seq_len = node_inputs.input_embeds.shape[0]
+            seq_len = inputs["img_emb"][0].shape[0] + IMAGE_SENTINELS
             node_inputs.input_seq_len = seq_len
 
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
@@ -954,8 +988,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
         if graph_walk in ("prefill_vit", "prefill_vae"):
-            # An image block occupies one position regardless of token count.
-            pos_advance = (1,) * len(segments)
+            pos_advance = (IMAGE_ADVANCE,) * len(segments)
         elif not writes:
             # Flow matching: the caches are frozen and every iteration puts the
             # latents at the same position, so the counters must not move.

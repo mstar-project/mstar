@@ -723,7 +723,6 @@ class _Rank:
 def _oom(rank, referenced_rids=frozenset()):
     batch = SimpleNamespace(
         node_name="node", graph_walk="walk",
-        node_objects={"r0": object(), "r1": object()},
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(node_name="node", failed_resource=None)

@@ -30,6 +30,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
@@ -157,6 +158,8 @@ def _worker_process_target(
     tcp_transfer_device="",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    # before anything in this process touches the device runtime
+    apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -546,6 +549,10 @@ class Conductor:
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
+        # Set here too. A spawned child imports the model's modules (and their
+        # kernel libraries) while unpickling its arguments, before the worker
+        # target runs, and it inherits os.environ.
+        apply_process_env_defaults()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
@@ -1046,6 +1053,7 @@ class Conductor:
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
@@ -1054,6 +1062,7 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
+                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
             )
 

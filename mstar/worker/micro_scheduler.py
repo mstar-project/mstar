@@ -8,7 +8,6 @@ from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
@@ -1254,11 +1253,11 @@ class MicroScheduler:
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
-        fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
+        fit) just comes back False; a ``terminal`` reason never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
         engine = self.engine_manager.get_engine(node_name)
         outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
-        if isinstance(outcome.reason, AdmitRuntimeError):
+        if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",
                 rid, node_name, outcome.failed_resource, outcome.reason.message,
