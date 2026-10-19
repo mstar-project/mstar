@@ -238,6 +238,38 @@ def test_duplex_json_keeps_whole_replies(tmp_path, monkeypatch):
     assert sc.rows[0]["text"] == text[:160]  # the report table stays short
 
 
+
+def test_vjepa2_gate_scales_with_hf_bf16_distance(tmp_path):
+    from benchmark.correctness.report import FamilyScore
+
+    rng = np.random.default_rng(0)
+    refs = tmp_path / "references"
+    fp32 = refs / "hf-vjepa2-vitl-fpc64-256-encoder-fp32" / "droid_v1"
+    bf16 = refs / "hf-vjepa2-vitl-fpc64-256-encoder-bf16" / "droid_v1"
+    (fp32 / "outputs").mkdir(parents=True)
+    (bf16 / "outputs").mkdir(parents=True)
+    ids = [f"ep{i:02d}" for i in range(4)]
+    for i in ids:
+        a = rng.standard_normal(256).astype(np.float32)
+        np.save(fp32 / "outputs" / f"{i}.npy", a)
+        np.save(bf16 / "outputs" / f"{i}.npy", a + 0.2 * rng.standard_normal(256).astype(np.float32))
+    hf_bf16 = [M.cosine(np.load(bf16 / "outputs" / f"{i}.npy"), np.load(fp32 / "outputs" / f"{i}.npy")) for i in ids]
+    fam = family_for_config("vjepa2", "vjepa2", {}, {})
+
+    def verdict(served_cos, ref_dir=fp32):
+        sc = FamilyScore("vjepa2")
+        fam.reference_check(sc, [{"id": i, "ref_cosine": c} for i, c in zip(ids, served_cos, strict=True)], ref_dir)
+        return sc.checks[-1]
+
+    (bf16 / "meta.json").write_text("{}")
+    assert verdict(hf_bf16).verdict == "PASS"  # as far from fp32 as HF's own bf16
+    assert verdict([1 - 3 * (1 - c) for c in hf_bf16]).verdict == "WARN"
+    assert verdict([1 - 6 * (1 - c) for c in hf_bf16]).verdict == "FAIL"
+    assert "raw min cosine" in verdict(hf_bf16).rule
+    (bf16 / "meta.json").unlink()
+    fixed = verdict(hf_bf16)  # without the bf16 copy the fixed bar applies
+    assert fixed.name == "min embedding cosine vs reference" and fixed.verdict == "FAIL"
+
 def test_make_reference_builds_in_a_child_process(monkeypatch):
     import subprocess
     import sys
