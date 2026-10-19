@@ -42,6 +42,7 @@ from mstar.utils.ipc_format import (
     NewRequestConductor,
     ReadsDone,
     RemoveRequest,
+    TeardownSession,
     TensorReceived,
     UnpersistTensors,
     WorkerMessageType,
@@ -200,6 +201,12 @@ class PreprocessWorker:
         self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
+        self._signal()
+
+    def session_teardown(self, session_id: str):
+        # On the request queue, not a priority queue: it must reach the
+        # conductor behind every NEW_REQUEST already submitted for the session.
+        self.request_input_queue.put(TeardownSession(session_id=session_id))
         self._signal()
 
     def abort_request(self, request_id: str):
@@ -1070,6 +1077,15 @@ class PreprocessWorkerThread:
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
+                    if isinstance(pre_input, TeardownSession):
+                        self.communicator.send(
+                            "conductor",
+                            ConductorMessage(
+                                message_type=ConductorMessageType.TEARDOWN_SESSION,
+                                body=pre_input,
+                            ),
+                        )
+                        continue
                     try:
                         self._process_input(pre_input)
                     except Exception as exc:  # noqa: BLE001 — any failure must reach the client
