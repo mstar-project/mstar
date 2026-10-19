@@ -1073,6 +1073,46 @@ def test_speech_stream_format_sse_sends_openai_audio_events(client_and_stub):
     assert "stream_format" not in stub.last_submit["model_kwargs"]
 
 
+@pytest.mark.parametrize("stream_format", ["sse", "audio"])
+def test_speech_stream_releases_every_piece_when_the_client_leaves_before_the_first_audio(tmp_path, stream_format):
+    """No response has started while the first result is awaited, so the handler
+    itself has to notice the disconnect and release the pieces it submitted."""
+    import threading
+
+    from starlette.requests import Request
+
+    from mstar.api_server.entrypoint import APIServer, PendingRequest
+    from mstar.api_server.openai.adapters import Qwen3TTSAdapter
+    from mstar.api_server.openai.protocol import SpeechRequest
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    api = APIServer.__new__(APIServer)
+    api.model, api.upload_dir, api.timeout_seconds = None, tmp_path, 600
+    api.pending_requests, api.recently_completed, api.request_lock = {}, {}, threading.Lock()
+    api.enable_nvtx = api.log_stats = False
+    aborted = []
+    api.preprocess_worker = types.SimpleNamespace(abort_request=aborted.append)
+
+    def submit(**kw):
+        api.pending_requests[kw["request_id"]] = PendingRequest(kw["streaming"], ["text"], ["audio"], None)
+        return kw["request_id"]
+
+    api.submit_request = submit
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def run():
+        req = SpeechRequest(input="A long sentence. " * 100, response_format="pcm", stream_format=stream_format)
+        return await asyncio.wait_for(
+            create_speech(api, "qwen3_tts", Qwen3TTSAdapter(), req, Request({"type": "http"}, receive)), 5,
+        )
+
+    response = asyncio.run(run())
+    assert response.status_code == 499
+    assert api.pending_requests == {} and len(aborted) >= 2
+
+
 def test_speech_sse_closes_the_audio_stream_when_the_client_leaves():
     from mstar.api_server.openai.serving_speech import _as_sse
 
