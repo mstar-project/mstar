@@ -4,9 +4,9 @@
 
 Cells show the median over repeats, and the primary metric also its [min-max]. Flags are rerun
 (spread over the limit once), noisy (still over it after the re-run), error (failed requests or
-runs), client-bound (the benchmark client was busy most of the run), HEALTH-FAIL (thermal
-throttling or new ECC errors during the arm) and moe-untuned (a fused-MoE layer ran without a tuned
-launch-config table).
+runs), client-bound (the benchmark client's event loop was busy over 90% of the timed window, so it
+may have set the pace), HEALTH-FAIL (thermal throttling or new ECC errors during the arm) and
+moe-untuned (a fused-MoE layer ran without a tuned launch-config table).
 """
 
 from __future__ import annotations
@@ -107,6 +107,8 @@ def collect(run_dir: Path) -> dict:
     for arm_json in arm_jsons:
         info = _load(arm_json) or {}
         d = arm_json.parent
+        if d.name != info.get("arm"):
+            continue  # an arm run set aside, e.g. one voided by its health check and measured again
         versions = _load(d / "server" / "versions.json") or {}
         arm = catalog.ARMS.get(info.get("arm"))
         key = f"{info.get('row')}/{info.get('arm')}"
@@ -125,6 +127,11 @@ def collect(run_dir: Path) -> dict:
         for cell_json in sorted(d.glob("cells/*/c*/cell.json")):
             cell = _load(cell_json)
             if cell:
+                # Runs from before the timed-window measure flagged client-bound from the runner's whole-process
+                # CPU, mostly imports and warmup; that flag says nothing about the cell, so it is dropped.
+                timed = any("client_loop_frac" in r for a in cell.get("attempts", []) for r in a.get("repeats", []))
+                if not timed:
+                    cell["flags"] = [f for f in cell.get("flags", []) if f != "client-bound"]
                 cell = {k: v for k, v in cell.items() if k != "attempts"}
                 cell["dir"] = str(cell_json.parent)
                 data["cells"].append(cell)
