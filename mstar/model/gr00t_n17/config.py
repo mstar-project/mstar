@@ -18,6 +18,9 @@ from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 # resource keys. The ViT keeps `qwen3_5`'s key, because the tower we reuse
 # looks itself up by that name; the LLM's attention is ours, so is this.
 LLM_ATTN = "llm_attn"
+# the bridge is 32 heads x 64 where the ViT is 16 x 64, and a ragged
+# resource is per head geometry, so it cannot share the tower's
+BRIDGE_ATTN = "bridge_attn"
 
 
 def _read(path: str | Path) -> dict:
