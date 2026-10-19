@@ -510,13 +510,28 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         )
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
-                     **kwargs) -> SubmoduleStep:
-        # Always the eager path's addressing. When the step replays a region
-        # instead, the region admits, plans and commits the same slots under
-        # its own step; for these pools that only re-reads the slot table and
-        # marks the slots written twice, so the two need no coordination.
-        del graph_walk, inputs, slot_lease, piecewise_leases, kwargs
+                     **kwargs) -> SubmoduleStep | None:
+        del graph_walk, slot_lease, kwargs
+        # A live step where every call is one frame on replays STEP_REGION
+        # over the whole batch, at the bucket its lease names, and the region's
+        # own step owns both pools. Each such call already holds its slots, from
+        # a first step declared below, so that step's admit reserves nothing.
+        if self.STEP_REGION in (piecewise_leases or {}) and all(
+            self._is_steady(rid, inp) for rid, inp in zip(request_ids, inputs, strict=True)
+        ):
+            return None
+        # Otherwise this step reserves and plans every call's slots, and the
+        # eager path reads that plan. A region the forward still replays for
+        # some calls re-plans their rows into its own buffers, after the eager
+        # path has read this plan. It can't own those rows instead: its lease
+        # names the whole batch's bucket, not the sub-batch's, and its admit
+        # can't refuse a call that has no slot yet.
         return self._declare(request_ids, (ENCODER_FRONT, ENCODER_STATE))
+
+    def _is_steady(self, rid, inputs: NodeInputs) -> bool:
+        st = self.request_state(rid).get(self.STATE_KEY)
+        return st is not None and self.streamer.is_steady(st, inputs.tensor_inputs.get("chunk"),
+                                                          inputs.kwargs["final"])
 
     @property
     def streamer(self) -> ConformerStreamer:
@@ -547,16 +562,16 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 "n": torch.zeros(shape.bs, dtype=torch.long, device=device),
             }
 
-        def region(fn, inputs, keys) -> PiecewiseBatchedConfig:
+        def region(fn, inputs, keys, lease) -> PiecewiseBatchedConfig:
             return PiecewiseBatchedConfig(
                 capture_fn=fn, make_static_inputs=inputs,
                 declare_step=lambda request_ids, seq_lens: self._declare(request_ids, keys),
-                seq_len=1, capture_batch_sizes=self.CAPTURE_BATCH_SIZES, compile=False,
+                seq_len=1, capture_batch_sizes=self.CAPTURE_BATCH_SIZES, compile=False, lease_before_step=lease,
             )
 
         return {
-            self.STEP_REGION: region(self._step_region, step_inputs, (ENCODER_FRONT, ENCODER_STATE)),
-            self.LAYERS_REGION: region(self._layers_region, layers_inputs, (ENCODER_STATE,)),
+            self.STEP_REGION: region(self._step_region, step_inputs, (ENCODER_FRONT, ENCODER_STATE), True),
+            self.LAYERS_REGION: region(self._layers_region, layers_inputs, (ENCODER_STATE,), False),
         }
 
     def _step_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
@@ -579,6 +594,12 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         return st
 
     @staticmethod
+    def _pool(engine_inputs, key) -> tuple:
+        """A pool and the plan this step made for it, read when the eager path uses it."""
+        pool = engine_inputs.resources[key]
+        return pool, pool.addressing("main")
+
+    @staticmethod
     def _counts(values, device) -> torch.Tensor:
         """Host counts on the device without a blocking copy, which would wait
         for every kernel queued ahead of this step."""
@@ -592,20 +613,58 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         states = [self._stream_state(rid) for rid in rids]
         chunks = [c.to(device, non_blocking=True) if c is not None else None for c in chunk]
         final = list(final)
-        longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
-        front, pool = engine_inputs.resources[ENCODER_FRONT], engine_inputs.resources[ENCODER_STATE]
-        # this step's own addressing: a region's plan replaces the pools' current one
-        front_rows, pool_rows = front.addressing("main"), pool.addressing("main")
         runners = engine_inputs.piecewise_runners or {}
         frames: list[torch.Tensor | None] = [None] * len(rids)
 
-        # calls one frame of audio further on the frame grid: the whole step as one graph
+        # calls one frame of audio further on the frame grid: the whole step as one graph, run last
         step_runner = runners.get(self.STEP_REGION)
         steady = [i for i, (st, c, f) in enumerate(zip(states, chunks, final, strict=True))
                   if streamer.is_steady(st, c, f)] if step_runner is not None else []
-        if steady and step_runner.can_run(len(steady)):
+        if engine_inputs.step is None:
+            # declare_step left both pools to the region (see there)
+            assert len(steady) == len(rids), "an encoder step declared nothing but is not all steady"
+        elif steady and not step_runner.can_run(len(steady)):
+            steady = []
+        steady_chunks = [chunks[i] for i in steady]
+        for i in steady:
+            chunks[i] = None            # the eager pass leaves these calls as they are
+
+        # The rest: the same math eagerly, reading this step's plans where it
+        # uses them, before any region plans its own. A pass pads every call to
+        # its longest chunk, so a chunk of more than a second (an upload, a large
+        # append) runs alone, on its own row of the plan, and the batched pass
+        # leaves that call as it is.
+        longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
+        for i, c in enumerate(chunks):
+            if c is not None and c.numel() > longest:
+                front, front_rows = self._pool(engine_inputs, ENCODER_FRONT)
+                enc = streamer.front([states[i]], [c], [final[i]], front, front_rows.narrow(i))
+                if enc is not None:
+                    pool, rows = self._pool(engine_inputs, ENCODER_STATE)
+                    frames[i] = self._eager_layers(enc, pool, rows.narrow(i), device)[0]
+                    streamer.advance([states[i]], enc)
+                chunks[i], final[i] = None, False
+        # the batched pass: its layers as a graph when no call got more than a frame
+        enc = None
+        if len(steady) < len(rids):
+            enc = streamer.front(states, chunks, final, *self._pool(engine_inputs, ENCODER_FRONT))
+        if enc is not None:
+            runner = runners.get(self.LAYERS_REGION)
+            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(rids)):
+                counts = self._counts([enc.frames, enc.n], device)
+                y = runner.run(static_inputs={"x": enc.x, "frames": counts[0], "n": counts[1]},
+                               request_ids=rids)["y"]
+                y = [row[:n] for row, n in zip(y, enc.n, strict=True)]
+            else:
+                y = self._eager_layers(enc, *self._pool(engine_inputs, ENCODER_STATE), device)
+            streamer.advance(states, enc)
+            for i, n in enumerate(enc.n):
+                if n:
+                    frames[i] = y[i]
+
+        if steady:
             y = step_runner.run(
-                static_inputs={"chunk": torch.stack([chunks[i] for i in steady]),
+                static_inputs={"chunk": torch.stack(steady_chunks),
                                "frames": self._counts([states[i].frames for i in steady], device)},
                 request_ids=[rids[i] for i in steady],
             )["y"]
@@ -615,34 +674,6 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 st.mels += streamer.c.subsampling_factor
                 st.frames += 1
                 frames[i] = y[row]
-                chunks[i] = None        # consumed; the rest of the step leaves the call as it is
-
-        # A pass pads every call to its longest chunk, so a chunk of more than a
-        # second (an upload, a large append) runs alone, on its own row of the
-        # plan; the batched pass then leaves that call as it is.
-        for i, c in enumerate(chunks):
-            if c is not None and c.numel() > longest:
-                enc = streamer.front([states[i]], [c], [final[i]], front, front_rows.narrow(i))
-                if enc is not None:
-                    frames[i] = self._eager_layers(enc, pool, pool_rows.narrow(i), device)[0]
-                    streamer.advance([states[i]], enc)
-                chunks[i], final[i] = None, False
-
-        # the rest: the same math eagerly, the layers as a graph when no call got more than a frame
-        enc = streamer.front(states, chunks, final, front, front_rows)
-        if enc is not None:
-            runner = runners.get(self.LAYERS_REGION)
-            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(rids)):
-                counts = self._counts([enc.frames, enc.n], device)
-                y = runner.run(static_inputs={"x": enc.x, "frames": counts[0], "n": counts[1]},
-                               request_ids=rids)["y"]
-                y = [row[:n] for row, n in zip(y, enc.n, strict=True)]
-            else:
-                y = self._eager_layers(enc, pool, pool_rows, device)
-            streamer.advance(states, enc)
-            for i, n in enumerate(enc.n):
-                if n:
-                    frames[i] = y[i]
         # One stream item per frame: a single (T, H) tensor would be ONE item,
         # which the chunk policy could not slice. No check_stop, so nothing to
         # copy to the host for one.

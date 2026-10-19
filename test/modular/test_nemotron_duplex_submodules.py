@@ -582,22 +582,30 @@ class _Encoder:
         return self.node.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs,
                                         is_final_stream_chunk=final)
 
+    def declare(self, rids, inputs):
+        """The node's declaration, with the leases the engine takes for it first."""
+        leases = {label: lease for label, region in self.regions.items()
+                  if region.lease_before_step and (lease := region.lease_slot(len(inputs))) is not None}
+        return self.node.declare_step("encode", rids, inputs, piecewise_leases=leases)
+
     def step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
             self.pool.ingest_request(rid)
             self.front.ingest_request(rid)
-        step = self.node.declare_step("encode", rids, inputs)
-        step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
-        assert self.runner.admit(step).ok
-        self.runner.plan(step)
+        step = self.declare(rids, inputs)
+        if step is not None:
+            step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
+            assert self.runner.admit(step).ok
+            self.runner.plan(step)
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
-            piecewise_runners=dict(self.regions),
+            piecewise_runners=dict(self.regions), step=step,
         )
         with torch.no_grad():
             out = self.node.forward_batched("encode", engine_inputs,
                                             **self.node.preprocess("encode", engine_inputs, inputs))
-        self.runner.commit(step)
+        if step is not None:
+            self.runner.commit(step)
         return out
 
     def encode(self, handle, chunk, final=False):
@@ -696,6 +704,51 @@ def test_encoder_live_steps_replay_the_regions_with_padding_rows():
     assert step.calls >= 20 and layers.calls >= 5
     for h, wav in wavs.items():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
+    """Every read and write of a pool's state, eager or in a region, uses the
+    plan the pool holds at that moment, never one held across another plan:
+    the eager path runs on this step's plan before a region plans its own. A
+    call with a chunk over a second runs on a narrow of that plan."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
+    for pool in enc.resources.values():
+        for name in ("gather", "scatter_"):
+            def checked(block, rows, *args, _pool=pool, _op=getattr(pool, name), **kwargs):
+                plan = _pool.addressing("main").slot_indices
+                assert rows.slot_indices.untyped_storage().data_ptr() == plan.untyped_storage().data_ptr(), (
+                    "a pool read through a plan it no longer holds")
+                return _op(block, rows, *args, **kwargs)
+
+            monkeypatch.setattr(pool, name, checked)
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1,
+            4: torch.randn(16000 * 3) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640, 4: 20000})
+    assert all(region.calls for region in enc.regions.values())
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
+    """When every call is one frame on and the whole-step region is captured
+    for the batch, the region's own step owns the pools: the node declares
+    nothing, so no second plan is built and thrown away. Otherwise it declares
+    every call in both pools."""
+    enc = _Encoder()
+    wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
+    for at in (0, 1280):
+        enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)])
+    nxt = [enc.prepare(h, wavs[h][2560:3840]) for h in (1, 2)]
+    assert set(enc.declare([1, 2], nxt).keys()) == {ENCODER_FRONT, ENCODER_STATE}      # no region captured
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION)
+    assert enc.declare([1, 2], nxt) is None
+    for at in range(2560, 1280 * 6, 1280):
+        out = enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)]).per_rid_outputs
+        assert all(len(out[h]["audio_frame"]) == 1 for h in (1, 2))
+    assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls == 4
+    mixed = [enc.prepare(1, torch.randn(640) * 0.1), enc.prepare(2, torch.randn(1280) * 0.1)]
+    assert set(enc.declare([1, 2], mixed).keys()) == {ENCODER_FRONT, ENCODER_STATE}
 
 
 @pytest.mark.parametrize("b_end_rides", [False, True])
