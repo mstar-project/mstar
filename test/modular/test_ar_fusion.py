@@ -428,6 +428,15 @@ def _truncate(v: torch.Tensor) -> torch.Tensor:
     return bits.view(torch.float32).to(BF16)
 
 
+def test_the_kernel_check_runs_every_case_after_a_failure():
+    """Each call is a collective. A rank that stopped at its first bad case
+    would leave the other ranks spinning in the next one."""
+    ca = _FakeCA(None, "cpu")
+    ca.fused_ar_rms = lambda inp, res, **kw: (ca.calls.append(kw), (kw["out"], kw["res_out"]))[1]
+    assert "max |err| inf" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert len(ca.calls) == 4, "1 and 8 rows, gemma on and off"
+
+
 def test_the_kernel_check_catches_a_kernel_that_ignores_gemma():
     ca = _FakeCA(None, "cpu")
     real = ca.fused_ar_rms
