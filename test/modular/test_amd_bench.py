@@ -342,7 +342,7 @@ def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
         assert health.smi_gpus([4, 5]) == [7, 4]
     finally:
         launch.smi_index_map.cache_clear()
-    rows = health.parse_rows("GPU3   FAIL  occupancy   procs=[python3.12:1] vram_used=284/262128 MB gfx_activity=0%\n"
+    rows = health.parse_rows("GPU3   FAIL  occupancy   procs=[python3.12:1] vram_used=284/262128 MB gfx_activity=2%\n"
                              "GPU5   FAIL  occupancy   procs=[python3.12:2] vram_used=9635/262128 MB gfx_activity=0%\n")
     assert health.interpret_check(rows, [3, 0]).status == "PASS"
     assert health.interpret_check(rows, [3, 5]).status == "FAIL"
