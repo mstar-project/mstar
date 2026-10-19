@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.venv*
+venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/target
+build
+.pytest_cache
+.ruff_cache
+benchmark_outputs
+vllm-xpu-kernels
+checkpoints
+outputs

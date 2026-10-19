@@ -6,7 +6,8 @@ Requirements
 
 - **Python 3.12+**.
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families. A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
+  families, or **Intel GPUs with XPU PyTorch** for BAGEL (see `Intel XPU Docker image`_).
+  A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
   (submodules return ``None``) for development and the modular tests, but not real model
   inference.
 - Enough GPU memory for the model you intend to serve — several families (e.g.
@@ -55,8 +56,9 @@ console scripts, ``mstar`` and ``mstar-serve``.
 
 .. important::
 
-   **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.9
-   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``). The flag tells 
+   **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
+   PyTorch at 2.9 (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``).
+   The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
    compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
@@ -64,6 +66,47 @@ console scripts, ``mstar`` and ``mstar-serve``.
    Without the flag ``uv`` installs PyPI's default (cu128) build. You can set it once
    with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
    CUDA toolkit`_ for details and the manual fallback.
+
+Intel XPU Docker image
+----------------------
+
+Build from the repository root so Docker can copy the M* source and deployment
+configs:
+
+.. code-block:: bash
+
+   git clone https://github.com/mstar-project/mstar.git
+   cd mstar
+   docker build -f docker/Dockerfile.xpu -t mstar:xpu .
+
+The image uses ``uv`` to install M* with ``.[bagel_xpu]`` and build ``mstar-rust``
+from the same checkout. The Dockerfile pins XPU PyTorch 2.14.0, torchvision
+0.29.0, torchaudio 2.11.0 (the latest XPU wheel), and CPU torchcodec 0.15.0. The build
+checks these imports and the XPU kernel extensions without requiring GPU access.
+Other model families may need additional dependencies and XPU kernel support.
+
+The host must have a working Intel GPU driver and expose ``/dev/dri``. Run an
+interactive shell and check GPU access:
+
+.. code-block:: bash
+
+   docker run --rm -it --device=/dev/dri --ipc=host \
+     -p 8000:8000 \
+     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     mstar:xpu
+   python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+Inside the container, serve BAGEL using the seven-XPU CFG TP2 deployment:
+
+.. code-block:: bash
+
+   mstar serve bagel --config configs/bagel_xpu_cfg_tp2.yaml
+
+This config needs seven visible Intel GPUs. The image includes the source under
+``/opt/mstar``; model weights are downloaded at runtime into the mounted cache.
+The GPU runtime pins in the Dockerfile can be overridden with
+``--build-arg COMPUTE_RUNTIME_VERSION=...``, ``--build-arg IGC_VERSION=...`` and
+``--build-arg GMM_VERSION=...`` to suit the host driver.
 
 Optional dependencies
 ---------------------
