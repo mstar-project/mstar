@@ -913,6 +913,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``input_audio_buffer.commit``      end of the utterance: flush and finish</span>
 <span class="sd">    ``input_audio_buffer.clear``       drop buffered audio and start over</span>
 
+<span class="sd">``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not</span>
+<span class="sd">pass the item cap, and the unfixed counts are non-negative integers; numeric</span>
+<span class="sd">strings count as numbers. Any other value is an ``error`` and the update</span>
+<span class="sd">changes nothing.</span>
+
 <span class="sd">Server events</span>
 <span class="sd">    ``transcription_session.created`` / ``.updated``</span>
 <span class="sd">    ``conversation.item.input_audio_transcription.delta``      append-only text</span>
@@ -928,14 +933,23 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">The adapter decides how that prefix reaches its model</span>
 <span class="sd">(``realtime_step_request``). Each step is an ordinary request, so sessions</span>
 <span class="sd">batch on the engine like any other traffic.</span>
+
+<span class="sd">Since every step decodes the whole item again, an item's work grows with the</span>
+<span class="sd">square of its length. An item is capped at ``MAX_ITEM_SECONDS`` (or the</span>
+<span class="sd">adapter's ``max_audio_seconds`` if shorter): an append past the cap is an</span>
+<span class="sd">``error`` and the client commits or clears. An append that completes several</span>
+<span class="sd">chunks at once is decoded as one step.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">itertools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">reprlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
@@ -953,6 +967,41 @@ window.runMermaid = runMermaid;</script>
 <span class="n">DEFAULT_CHUNK_SECONDS</span> <span class="o">=</span> <span class="mf">2.0</span>
 <span class="n">DEFAULT_UNFIXED_CHUNKS</span> <span class="o">=</span> <span class="mi">2</span>
 <span class="n">DEFAULT_UNFIXED_TOKENS</span> <span class="o">=</span> <span class="mi">5</span>
+<span class="c1"># Each chunk is one engine request over the whole item, so this floor bounds a</span>
+<span class="c1"># session at 2 requests per second of audio. A shorter chunk is under a word</span>
+<span class="c1"># and adds little to the hypothesis.</span>
+<span class="n">MIN_CHUNK_SECONDS</span> <span class="o">=</span> <span class="mf">0.5</span>
+<span class="c1"># Longest uncommitted item: the most audio one step decodes.</span>
+<span class="n">MAX_ITEM_SECONDS</span> <span class="o">=</span> <span class="mf">300.0</span>
+<span class="c1"># Longest excerpt of a client value quoted in an error.</span>
+<span class="n">EXCERPT_CHARS</span> <span class="o">=</span> <span class="mi">100</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_ExcerptRepr</span><span class="p">(</span><span class="n">reprlib</span><span class="o">.</span><span class="n">Repr</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``reprlib.Repr`` that reads the first items of a dict or set instead</span>
+<span class="sd">    of sorting all of them, so the work does not grow with the input."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">repr_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">level</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">x</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s2">"</span><span class="si">{}</span><span class="s2">"</span>
+        <span class="k">if</span> <span class="n">level</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s2">"{"</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">fillvalue</span> <span class="o">+</span> <span class="s2">"}"</span>
+        <span class="n">pieces</span> <span class="o">=</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">repr1</span><span class="p">(</span><span class="n">k</span><span class="p">,</span><span class="w"> </span><span class="n">level</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">repr1</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="n">level</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                  <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">itertools</span><span class="o">.</span><span class="n">islice</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">maxdict</span><span class="p">)]</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">maxdict</span><span class="p">:</span>
+            <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">fillvalue</span><span class="p">)</span>
+        <span class="k">return</span> <span class="s2">"{"</span> <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"}"</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">repr_set</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">level</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_repr_iterable</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">level</span><span class="p">,</span> <span class="s2">"{"</span><span class="p">,</span> <span class="s2">"}"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">maxset</span><span class="p">)</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">"set()"</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">repr_frozenset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">level</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_repr_iterable</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">level</span><span class="p">,</span> <span class="s2">"frozenset({"</span><span class="p">,</span> <span class="s2">"})"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">maxfrozenset</span><span class="p">)</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">"frozenset()"</span>
+
+
+<span class="c1"># Bounds the work of rendering a nested value; EXCERPT_CHARS bounds the result.</span>
+<span class="n">_EXCERPT_REPR</span> <span class="o">=</span> <span class="n">_ExcerptRepr</span><span class="p">(</span>
+    <span class="n">maxlevel</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">maxtuple</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxlist</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxarray</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxdict</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxset</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxfrozenset</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">maxdeque</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">maxstring</span><span class="o">=</span><span class="n">EXCERPT_CHARS</span><span class="p">,</span> <span class="n">maxlong</span><span class="o">=</span><span class="n">EXCERPT_CHARS</span><span class="p">,</span> <span class="n">maxother</span><span class="o">=</span><span class="n">EXCERPT_CHARS</span><span class="p">,</span>
+<span class="p">)</span>
 
 
 <div class="viewcode-block" id="RealtimeSession">
@@ -965,6 +1014,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">chunk_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">DEFAULT_CHUNK_SECONDS</span>
     <span class="n">unfixed_chunks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">DEFAULT_UNFIXED_CHUNKS</span>
     <span class="n">unfixed_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">DEFAULT_UNFIXED_TOKENS</span>
+    <span class="n">max_item_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">MAX_ITEM_SECONDS</span>
     <span class="n">pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>   <span class="c1"># audio not yet in a chunk</span>
     <span class="n">pending_samples</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">heard</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>     <span class="c1"># every chunk decoded so far</span>
@@ -985,14 +1035,22 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+=</span> <span class="nb">int</span><span class="p">(</span><span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="RealtimeSession.item_samples">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.item_samples">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">item_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">size</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">heard</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="RealtimeSession.take_chunk">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.take_chunk">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">take_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""A full chunk of pending audio, or None until enough arrived."""</span>
+<span class="w">        </span><span class="sd">"""Every full chunk of pending audio as one array, or None until</span>
+<span class="sd">        enough arrived."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">buf</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">)</span>
-        <span class="n">chunk</span><span class="p">,</span> <span class="n">rest</span> <span class="o">=</span> <span class="n">buf</span><span class="p">[:</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">],</span> <span class="n">buf</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">:]</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span>
+        <span class="n">chunk</span><span class="p">,</span> <span class="n">rest</span> <span class="o">=</span> <span class="n">buf</span><span class="p">[:</span><span class="n">n</span><span class="p">],</span> <span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">:]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">rest</span><span class="p">]</span> <span class="k">if</span> <span class="n">rest</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">rest</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">chunk</span></div>
@@ -1032,6 +1090,51 @@ window.runMermaid = runMermaid;</script>
     <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span> <span class="n">validate</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">raw</span><span class="p">[:</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;i2"</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">/</span> <span class="mf">32768.0</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_excerpt</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The repr of a client-supplied value, at most ``EXCERPT_CHARS`` long."""</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">_EXCERPT_REPR</span><span class="o">.</span><span class="n">repr</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">text</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">text</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">EXCERPT_CHARS</span> <span class="k">else</span> <span class="n">text</span><span class="p">[:</span> <span class="n">EXCERPT_CHARS</span> <span class="o">-</span> <span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="s2">"..."</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_object</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be an object"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">value</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="p">,</span> <span class="n">lo</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">hi</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">inf</span><span class="p">,</span> <span class="n">integer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">clamp_low</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``knobs[name]`` (or ``default``) checked to be a finite number in</span>
+<span class="sd">    ``[lo, hi]``, and integral when ``integer``. A numeric string is read as</span>
+<span class="sd">    its number, and with ``clamp_low`` a value below ``lo`` is raised to it.</span>
+<span class="sd">    JSON allows NaN, Infinity and integers too big for a float, so each is</span>
+<span class="sd">    checked before any conversion."""</span>
+    <span class="n">value</span> <span class="o">=</span> <span class="n">knobs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">default</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">value</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">pass</span>
+    <span class="n">kind</span> <span class="o">=</span> <span class="s2">"an integer"</span> <span class="k">if</span> <span class="n">integer</span> <span class="k">else</span> <span class="s2">"a number"</span>
+    <span class="n">ok</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">))</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">ok</span> <span class="o">=</span> <span class="n">ok</span> <span class="ow">and</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span><span class="ow">not</span> <span class="n">integer</span> <span class="ow">or</span> <span class="n">value</span> <span class="o">==</span> <span class="nb">int</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
+    <span class="k">except</span> <span class="ne">OverflowError</span><span class="p">:</span>
+        <span class="n">ok</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">if</span> <span class="n">ok</span> <span class="ow">and</span> <span class="n">clamp_low</span> <span class="ow">and</span> <span class="n">value</span> <span class="o">&lt;</span> <span class="n">lo</span><span class="p">:</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="n">lo</span>
+    <span class="n">ok</span> <span class="o">=</span> <span class="n">ok</span> <span class="ow">and</span> <span class="n">lo</span> <span class="o">&lt;=</span> <span class="n">value</span> <span class="o">&lt;=</span> <span class="n">hi</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+        <span class="n">bound</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"&gt;= </span><span class="si">{</span><span class="n">lo</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">hi</span> <span class="o">==</span> <span class="n">math</span><span class="o">.</span><span class="n">inf</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"between </span><span class="si">{</span><span class="n">lo</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> and </span><span class="si">{</span><span class="n">hi</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">"</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"mstar.</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be </span><span class="si">{</span><span class="n">kind</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">bound</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="k">if</span> <span class="n">integer</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="stable_prefix">
@@ -1116,6 +1219,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">session</span> <span class="o">=</span> <span class="n">RealtimeSession</span><span class="p">(</span>
             <span class="n">session_id</span><span class="o">=</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="p">[:</span><span class="mi">16</span><span class="p">],</span>
             <span class="n">request</span><span class="o">=</span><span class="n">TranscriptionRequest</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model_name</span><span class="p">),</span>
+            <span class="n">max_item_seconds</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="n">MAX_ITEM_SECONDS</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"max_audio_seconds"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="n">math</span><span class="o">.</span><span class="n">inf</span><span class="p">),</span>
         <span class="p">)</span>
 
 <div class="viewcode-block" id="RealtimeTranscription.send">
@@ -1139,6 +1243,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"chunk_seconds"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span>
                 <span class="s2">"unfixed_chunks"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span>
                 <span class="s2">"unfixed_tokens"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span><span class="p">,</span>
+                <span class="s2">"max_item_seconds"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="p">,</span>
                 <span class="s2">"sample_rate"</span><span class="p">:</span> <span class="n">SAMPLE_RATE</span><span class="p">,</span>
             <span class="p">},</span>
         <span class="p">}</span>
@@ -1150,11 +1255,22 @@ window.runMermaid = runMermaid;</script>
         <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_event</span><span class="p">(</span><span class="s2">"transcription_session.created"</span><span class="p">,</span> <span class="n">session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_session_view</span><span class="p">()))</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
-                <span class="n">message</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">ws</span><span class="o">.</span><span class="n">receive_text</span><span class="p">()</span>
+                <span class="c1"># receive_text() raises KeyError on a binary frame</span>
+                <span class="n">message</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">ws</span><span class="o">.</span><span class="n">receive</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">message</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"websocket.disconnect"</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="n">WebSocketDisconnect</span><span class="p">(</span><span class="n">message</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"code"</span><span class="p">,</span> <span class="mi">1000</span><span class="p">),</span> <span class="n">message</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"reason"</span><span class="p">))</span>
+                <span class="k">if</span> <span class="n">message</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text"</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"an event must be a JSON text message, not binary"</span><span class="p">))</span>
+                    <span class="k">continue</span>
                 <span class="k">try</span><span class="p">:</span>
-                    <span class="n">event</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
-                <span class="k">except</span> <span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">:</span>
+                    <span class="n">event</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">message</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
+                <span class="c1"># ValueError covers JSONDecodeError and integers past Python's</span>
+                <span class="c1"># int-string digit limit; RecursionError is deep nesting</span>
+                <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">RecursionError</span><span class="p">):</span>
                     <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"not JSON"</span><span class="p">))</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">event</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                    <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"an event must be a JSON object"</span><span class="p">))</span>
                     <span class="k">continue</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">handle</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
         <span class="k">except</span> <span class="n">WebSocketDisconnect</span><span class="p">:</span>
@@ -1167,7 +1283,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">kind</span> <span class="o">=</span> <span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"transcription_session.update"</span><span class="p">:</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"session"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_object</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"session"</span><span class="p">),</span> <span class="s2">"session"</span><span class="p">))</span>
             <span class="k">except</span> <span class="p">(</span><span class="ne">TypeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)))</span>
                 <span class="k">return</span>
@@ -1178,8 +1294,15 @@ window.runMermaid = runMermaid;</script>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — bad base64</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"audio is not base64"</span><span class="p">))</span>
                 <span class="k">return</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
-            <span class="k">while</span> <span class="p">(</span><span class="n">chunk</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">take_chunk</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
+            <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">item_samples</span><span class="p">()</span> <span class="o">+</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span><span class="p">:</span>
+                <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"the item would pass </span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s of audio; "</span>
+                    <span class="s2">"commit or clear the input audio buffer first"</span><span class="p">,</span>
+                <span class="p">))</span>
+                <span class="k">return</span>
+            <span class="n">s</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">chunk</span> <span class="o">:=</span> <span class="n">s</span><span class="o">.</span><span class="n">take_chunk</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"input_audio_buffer.commit"</span><span class="p">:</span>
             <span class="n">tail</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
@@ -1198,7 +1321,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_event</span><span class="p">(</span><span class="s2">"input_audio_buffer.cleared"</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unknown event </span><span class="si">{</span><span class="n">kind</span><span class="si">!r}</span><span class="s2">"</span><span class="p">))</span></div>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unknown event </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">kind</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="RealtimeTranscription.update">
@@ -1208,12 +1331,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
         <span class="n">fmt</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_format"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">fmt</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="s2">"pcm16"</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"only pcm16 input is supported; got </span><span class="si">{</span><span class="n">fmt</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="n">knobs</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"mstar"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
-        <span class="n">chunk_seconds</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">knobs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"chunk_seconds"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">)),</span> <span class="mf">0.1</span><span class="p">)</span>
-        <span class="n">unfixed_chunks</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">knobs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"unfixed_chunks"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">))</span>
-        <span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">knobs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"unfixed_tokens"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span><span class="p">))</span>
-        <span class="n">transcription</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_transcription"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"only pcm16 input is supported; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">fmt</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">knobs</span> <span class="o">=</span> <span class="n">_object</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"mstar"</span><span class="p">),</span> <span class="s2">"mstar"</span><span class="p">)</span>
+        <span class="n">chunk_seconds</span> <span class="o">=</span> <span class="n">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">,</span> <span class="s2">"chunk_seconds"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">MIN_CHUNK_SECONDS</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="p">,</span>
+                                <span class="n">clamp_low</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">unfixed_chunks</span> <span class="o">=</span> <span class="n">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">,</span> <span class="s2">"unfixed_chunks"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">integer</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="n">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">,</span> <span class="s2">"unfixed_tokens"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">integer</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">transcription</span> <span class="o">=</span> <span class="n">_object</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_transcription"</span><span class="p">),</span> <span class="s2">"input_audio_transcription"</span><span class="p">)</span>
         <span class="n">fields</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">transcription</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"language"</span><span class="p">,</span> <span class="s2">"prompt"</span><span class="p">)}</span>
         <span class="k">if</span> <span class="n">fields</span><span class="p">:</span>
             <span class="n">s</span><span class="o">.</span><span class="n">request</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span><span class="n">update</span><span class="o">=</span><span class="n">fields</span><span class="p">)</span>
@@ -1244,7 +1368,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"realtime step failed"</span><span class="p">)</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">),</span> <span class="n">kind</span><span class="o">=</span><span class="s2">"server_error"</span><span class="p">))</span>
             <span class="k">return</span>
-        <span class="n">s</span><span class="o">.</span><span class="n">chunk_id</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="c1"># a coalesced step counts every chunk it heard, so the prefix that keeps</span>
+        <span class="c1"># sent text fixed starts after the same audio as with one step per chunk</span>
+        <span class="n">s</span><span class="o">.</span><span class="n">chunk_id</span> <span class="o">+=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">chunk</span><span class="o">.</span><span class="n">size</span> <span class="o">//</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">)</span>
         <span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_text</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">final</span> <span class="ow">or</span> <span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">hold</span> <span class="o">=</span> <span class="mi">0</span>
