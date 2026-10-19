@@ -25,10 +25,27 @@ NODE_HEALTH = Path(os.environ.get("NODE_HEALTH", "/work1/stephaniewang/atindra/a
 ROW_RE = re.compile(r"^(NODE|GPU\d+)\s+(PASS|WARN|FAIL|INFO)\s+(\S+)\s*(.*)$")
 # Checks about other people's work on a GPU, not about its health.
 OCCUPANCY_CHECKS = {"occupancy", "hotspot_temp", "hbm_temp", "throttle_status", "violation_status"}
+# An occupancy row whose GPU holds no more than this and does no work only lists processes that opened every GPU
+# (HSA does that for a process restricted by HIP_VISIBLE_DEVICES alone); it is not a tenant.
+IDLE_VRAM_MB = 1024
+OCCUPANCY_RE = re.compile(r"vram_used=(\d+)/\d+ MB gfx_activity=(\d+)%")
 
 
 def _gpu_of(scope: str) -> int | None:
     return int(scope[3:]) if scope.startswith("GPU") else None
+
+
+def smi_gpus(gpus: list[int] | None) -> list[int] | None:
+    """amd-smi's numbers for HIP devices; node_health.sh rows and monitor samples use amd-smi's."""
+    if gpus is None:
+        return None
+    from benchmark.amd.launch import smi_gpu
+    return [smi_gpu(g) for g in gpus]
+
+
+def _idle_occupancy(r: dict) -> bool:
+    m = OCCUPANCY_RE.search(r["detail"])
+    return r["check"] == "occupancy" and bool(m) and int(m.group(1)) <= IDLE_VRAM_MB and int(m.group(2)) == 0
 
 
 @dataclass
@@ -51,13 +68,16 @@ class Verdict:
 
 
 def interpret_check(rows: list[dict], own_gpus: list[int] | None) -> Verdict:
-    """Verdict of node_health.sh check rows for a run that owns ``own_gpus`` (None: the whole node)."""
+    """Verdict of node_health.sh check rows for a run that owns ``own_gpus`` (amd-smi numbers; None: the whole
+    node)."""
     v = Verdict()
     for r in rows:
         gpu = _gpu_of(r["scope"])
         mine = gpu is None or own_gpus is None or gpu in own_gpus
         what = f"{r['scope']} {r['check']}: {r['detail']}"
-        if r["status"] == "FAIL":
+        if r["status"] == "FAIL" and _idle_occupancy(r):
+            v.notes.append("no memory or work on it, " + what)
+        elif r["status"] == "FAIL":
             if mine:
                 v.fail(what)
             elif r["check"] in OCCUPANCY_CHECKS:
@@ -96,11 +116,12 @@ def check(out_dir: Path, expect_gpus: int | None, own_gpus: list[int] | None, na
         rows = json.loads((out_dir / f"{name}.raw.json").read_text())["rows"]
     except (OSError, ValueError, KeyError):
         rows = parse_rows(p.stdout)
-    v = interpret_check(rows, own_gpus)
+    smi = smi_gpus(own_gpus)
+    v = interpret_check(rows, smi)
     if not rows:
         v.fail(f"node_health.sh check gave no rows (rc {p.returncode})")
-    res = {"verdict": v.as_dict(), "own_gpus": own_gpus, "expect_gpus": expect_gpus, "rc": p.returncode,
-           "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    res = {"verdict": v.as_dict(), "own_gpus": own_gpus, "own_gpus_amd_smi": smi, "expect_gpus": expect_gpus,
+           "rc": p.returncode, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     (out_dir / f"{name}.json").write_text(json.dumps(res, indent=1))
     return res
 
@@ -173,7 +194,8 @@ def arm_verdict(delta_rows: list[dict], summary_text: str, own_gpus: list[int]) 
 
 @dataclass
 class ArmHealth:
-    """Snapshot before, monitor during, snapshot + delta + summary after one arm."""
+    """Snapshot before, monitor during, snapshot + delta + summary after one arm. ``own_gpus`` are amd-smi
+    numbers (smi_gpus)."""
 
     out_dir: Path
     own_gpus: list[int]
@@ -204,7 +226,7 @@ class ArmHealth:
 
 def write_health_md(path: Path, res: dict, delta_text: str, summary_text: str) -> None:
     v = res["verdict"]
-    lines = [f"# Health: {v['status']}", "", f"GPUs: {res['own_gpus']}", ""]
+    lines = [f"# Health: {v['status']}", "", f"GPUs (amd-smi numbers): {res['own_gpus']}", ""]
     if v["reasons"]:
         lines += ["Reasons:", *[f"- {r}" for r in v["reasons"]], ""]
     if v["notes"]:
