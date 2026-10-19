@@ -172,6 +172,36 @@ def test_duplex_encoder_state_is_stored_in_the_compute_dtype(dtype, monkeypatch)
         model.validate_config_yaml({"autocast_dtype": other}, "c.yaml")
 
 
+class _LoadReachedError(Exception):
+    """Raised where the model would load a node's weights: its modules were built."""
+
+
+def _stub_checkpoint(monkeypatch, config=None):
+    """The model's checkpoint access, stubbed: no snapshot, ``config`` as its
+    config.json, and each node's modules returned as built."""
+    import mstar.model.nemotron_duplex.nemotron_duplex_model as ndm
+
+    monkeypatch.setattr(ndm, "_resolve_local_hf_snapshot", lambda *a, **k: "/nonexistent")
+    monkeypatch.setattr(NemotronDuplexConfig, "from_pretrained", classmethod(lambda cls, d: config or cls()))
+
+
+@pytest.mark.parametrize("node", sorted(NODES))
+def test_duplex_builds_every_node_on_meta(monkeypatch, node):
+    """Each node's modules are built under ``torch.device("meta")`` before their
+    weights load, so no constructor may read a tensor's values."""
+    model = _make_model()
+    model.model_path_hf, model.cache_dir = "unused", None
+    _stub_checkpoint(monkeypatch)
+
+    def built(self, module, device, autocast_dtype, local_dir):
+        assert next(module.parameters()).device.type == "meta"
+        raise _LoadReachedError
+
+    monkeypatch.setattr(NemotronDuplexModel, "_build_and_load", built)
+    with pytest.raises(_LoadReachedError):
+        model.get_submodule(node, device="cpu")
+
+
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs({}, None)

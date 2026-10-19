@@ -225,7 +225,8 @@ class AudioCodec(nn.Module):
         self.hop_length = cfg.hop_length
         self.wav_to_token_ratio = cfg.wav_to_token_ratio
         self.max_magnitude = cfg.max_magnitude
-        check_window_envelope(torch.hann_window(cfg.n_fft), cfg.hop_length)
+        # on the host: the model builds the codec under torch.device("meta")
+        check_window_envelope(torch.hann_window(cfg.n_fft, device="cpu"), cfg.hop_length)
 
     # ---- autoencoder halves -------------------------------------------------
     def ae_encode(self, x: torch.Tensor) -> torch.Tensor:
