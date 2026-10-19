@@ -3,23 +3,32 @@
 ``REFERENCE`` holds what ``CosyVoiceFrontEnd.text_normalize`` (FunAudioLLM/
 CosyVoice at 074ca6d, ``split=True``) returns with neither ttsfrd nor wetext
 installed, its fallback, for the CosyVoice3 texts in the reference's
-``example.py`` and for sentences with digits, dates and units. Each returned
-one piece. The cases that spell out digits need ``inflect`` (the cosyvoice3
-extra) and skip without it.
+``example.py`` and for text whose digits read the same either way. Each
+returned one piece.
+
+``SPOKEN`` holds what the reference's default install (``wetext`` 0.0.4)
+makes of English numbers, by category; the built-in rules read them the same.
+``MONTH_CASE`` and ``DIFFERENT`` are where they deliberately do not, with
+``wetext``'s reading kept for comparison. With ``wetext`` installed and its
+grammars cached, ``test_wetext_reads_as_recorded`` checks those readings.
 """
 
 from __future__ import annotations
 
-import builtins
 import logging
 import math
 import re
+import sys
+import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.model.cosyvoice3.components import text_frontend
+from mstar.model.cosyvoice3.components.english_normalizer import normalize_english
 from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend, close_sentences
 from mstar.model.cosyvoice3.config import END_OF_PROMPT, END_OF_PROMPT_ID, SYSTEM_PROMPT
 from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
@@ -60,20 +69,7 @@ REFERENCE = [
         "在他讲述那个荒诞故事的过程中，他突然[laughter]停下来，因为他自己也被逗笑了[laughter]。",
         "在他讲述那个荒诞故事的过程中，他突然[laughter]停下来，因为他自己也被逗笑了[laughter]。",
     ),
-    # digits, dates and units
-    ("Flight 247 leaves from gate 12.", "Flight two hundred and forty-seven leaves from gate twelve."),
-    (
-        "The company was founded in 2021 and hired 350 people by 2023",
-        "The company was founded in two thousand and twenty-one and hired three hundred and fifty people by "
-        "two thousand and twenty-three.",
-    ),
-    ("It costs $12.50, or 15% off the list price.", "It costs $twelve.fifty, or fifteen% off the list price."),
-    (
-        "Call 555-0123 between 9 and 5.",
-        "Call five hundred and fifty-five-one hundred and twenty-three between nine and five.",
-    ),
-    ("The meeting starts at 3:45 PM on March 3.", "The meeting starts at three:forty-five PM on March three."),
-    ("Version 2.0.5 is 3x faster over 10 km.", "Version two.zero.five is threex faster over ten km."),
+    # digits that read the same with and without wetext
     ("Wait... 3 more minutes!", "Wait. three more minutes!"),
     ('He said "I have 2 dogs." Then he left.', 'He said "I have two dogs." Then he left.'),
     (
@@ -86,19 +82,208 @@ REFERENCE = [
 ]
 
 
-def _needs_inflect(text: str) -> bool:
-    return (
-        any(c.isdecimal() for c in text)
-        and not ("<|" in text and "|>" in text)
-        and not any("\u4e00" <= c <= "\u9fff" for c in text)
-    )
+SPOKEN = [
+    ("thousands", "The prize was 1,000,000 dollars.", "The prize was one million dollars."),
+    (
+        "thousands",
+        "The population reached 8,045,311 in the census.",
+        "The population reached eight million forty five thousand three hundred and eleven in the census.",
+    ),
+    ("thousands", "It is about 29,032 feet.", "It is about twenty nine thousand and thirty two feet."),
+    ("cardinal", "Flight 247 leaves from gate 12.", "Flight two hundred and forty seven leaves from gate twelve."),
+    ("cardinal", "The building has 102 floors.", "The building has one hundred and two floors."),
+    ("cardinal", "We have 5000 units.", "We have five thousand units."),
+    ("decimal", "Pi is about 3.14159.", "Pi is about three point one four one five nine."),
+    ("decimal", "It is 0.5 now.", "It is zero point five now."),
+    ("decimal", "About 1.5 million people.", "About one point five million people."),
+    (
+        "ordinal",
+        "She finished 21st, he came 3rd and their cousin was 22nd.",
+        "She finished twenty first, he came third and their cousin was twenty second.",
+    ),
+    ("ordinal", "1st 2nd 3rd 4th 101st 1000th", "first second third fourth one hundred first one thousandth"),
+    ("ordinal", "The 19th century.", "The nineteenth century."),
+    ("currency", "The house sold for $250,000.", "The house sold for two hundred fifty thousand dollars."),
+    ("currency", "Pay $1 now.", "Pay one dollar now."),
+    ("currency", "It costs €20 and £5.", "It costs twenty euros and five pounds."),
+    ("currency", "Revenue was $3.2 billion.", "Revenue was three point two billion dollars."),
+    ("currency", "Tickets cost $85 each.", "Tickets cost eighty five dollars each."),
+    ("percent", "Growth hit 12.5% last year.", "Growth hit twelve point five percent last year."),
+    (
+        "percent",
+        "Rates rose from 6.25% to 7.1%.",
+        "Rates rose from six point two five percent to seven point one percent.",
+    ),
+    ("percent", "It is 100% done.", "It is one hundred percent done."),
+    ("year", "He was born in 1987.", "He was born in nineteen eighty seven."),
+    ("year", "In 2008, prices fell.", "In two thousand eight, prices fell."),
+    ("year", "It opened in 2010.", "It opened in twenty ten."),
+    ("year", "In 1900 the city was small.", "In nineteen hundred the city was small."),
+    ("year", "The 2020 census.", "The twenty twenty census."),
+    ("year", "Run 1500 meters.", "Run fifteen hundred meters."),
+    ("time", "Meet me at 4:05 pm.", "Meet me at four o five PM."),
+    ("time", "It is 5:00.", "It is five o'clock."),
+    (
+        "time",
+        "The train leaves at 06:40 and arrives at 13:05.",
+        "The train leaves at six forty and arrives at thirteen o five.",
+    ),
+    ("time", "The meeting is at 10:15 AM.", "The meeting is at ten fifteen AM."),
+    ("time", "Flight 247 leaves at 7:30.", "Flight two hundred and forty seven leaves at seven thirty."),
+    ("phone", "Call 555-867-5309 now.", "Call five five five, eight six seven, five three zero nine now."),
+    ("phone", "Call (415) 555-0199 today.", "Call four one five, five five five, zero one nine nine today."),
+    ("range", "Read pages 10-20.", "Read pages ten to twenty."),
+    ("range", "Rooms 3-5 are open.", "Rooms three to five are open."),
+    ("range", "The score was 3:2.", "The score was three to two."),
+    ("negative", "The temperature fell to -12 degrees.", "The temperature fell to negative twelve degrees."),
+    ("negative", "-17", "negative seventeen"),
+    (
+        "fraction",
+        "Add 1/2 cup of milk and 3/4 cup of sugar.",
+        "Add one half cup of milk and three quarters cup of sugar.",
+    ),
+    ("fraction", "Use 2 1/2 cups of flour.", "Use two and a half cups of flour."),
+    ("fraction", "1/3 and 5/8 and 2/3.", "one third and five eighths and two thirds."),
+    ("unit", "It weighs 2.5 kg.", "It weighs two point five kilograms."),
+    ("unit", "The limit is 65 mph.", "The limit is sixty five miles per hour."),
+    ("unit", "It is 30°C outside.", "It is thirty degrees Celsius outside."),
+    ("unit", "It weighs 5 lbs.", "It weighs five pounds."),
+    ("alphanumeric", "Model GPT4 in Q4 at gate B12.", "Model GPT four in Q four at gate B twelve."),
+    ("alphanumeric", "Use 3 x 4.", "Use three times four."),
+    ("digits", "The code is 4 8 1 5.", "The code is four eight one five."),
+    ("other", "Top 10.", "Top ten."),
+]
+
+# numeric dates: the same words, the month capitalized
+MONTH_CASE = [
+    (
+        "The concert on 12/25/2023 starts soon.",
+        "The concert on the twenty fifth of December twenty twenty three starts soon.",
+        "The concert on the twenty fifth of december twenty twenty three starts soon.",
+    ),
+    (
+        "It was 2023-10-19.",
+        "It was the nineteenth of October twenty twenty three.",
+        "It was the nineteenth of october twenty twenty three.",
+    ),
+]
+
+# (text, the rules' reading, wetext's reading): where wetext is wrong or raises, or reorders
+# a date written with a month name
+DIFFERENT = [
+    (
+        "Your appointment is on Monday, March 3rd, at noon.",
+        "Your appointment is on Monday, March third, at noon.",
+        "Your appointment is on Monday, the third of march, at noon.",
+    ),
+    (
+        "The meeting is on March 3, 2024.",
+        "The meeting is on March third, twenty twenty four.",
+        "The meeting is on the third of march, twenty twenty four.",
+    ),
+    (
+        "His score went from 1,180 to 1,420.",
+        "His score went from one thousand one hundred and eighty to one thousand four hundred and twenty.",
+        "His score went from thousand one hundred and eighty to thousand four hundred and twenty.",
+    ),
+    (
+        "It costs $4.99 today.",
+        "It costs four dollars and ninety nine cents today.",
+        "It costs four point nine nine dollars today.",
+    ),
+    (
+        "She paid $12.50 for parking.",
+        "She paid twelve dollars and fifty cents for parking.",
+        "She paid twelve point five dollars for parking.",
+    ),
+    (
+        "The fare is $1,299.99.",
+        "The fare is one thousand two hundred and ninety nine dollars and ninety nine cents.",
+        "The fare is thousand two hundred and ninety nine point nine nine dollars.",
+    ),
+    ("It costs $0.01.", "It costs one cent.", "It costs zero point oh one dollars."),
+    ("It was built in 1905.", "It was built in nineteen oh five.", "It was built in nineteen zero five."),
+    (
+        "The 1990s were fun.",
+        "The nineteen nineties were fun.",
+        "The one thousand nine hundred and ninety seconds were fun.",
+    ),
+    (
+        "He was born on July 4, 1976, and moved.",
+        "He was born on July fourth, nineteen seventy six, and moved.",
+        "He was born on the fourth of july, nineteen seventy six and moved.",
+    ),
+    ("It ships on 11/02.", "It ships on the second of November.", "It ships on eleven slash oh two."),
+    (
+        "Call 555-0199 today.",
+        "Call five five five, zero one nine nine today.",
+        "Call five hundred and fifty five-oh one hundred and ninety nine today.",
+    ),
+    (
+        "The years 2019-2021 were hard.",
+        "The years twenty nineteen to twenty twenty one were hard.",
+        "The years two thousand and nineteen to two thousand and twenty one were hard.",
+    ),
+    ("1,2,3,4,5", "one, two, three, four, five", "one,two,three,four,five"),
+    ("Version 2.10.3 is out.", "Version two point ten point three is out.", "Version two.ten point three is out."),
+    ("Item #5.", "Item number five.", "<raises AssertionError>"),
+]
 
 
 @pytest.mark.parametrize("text, expected", REFERENCE, ids=[t[:24] for t, _ in REFERENCE])
 def test_normalize_matches_the_reference_frontend(text, expected):
-    if _needs_inflect(text):
-        pytest.importorskip("inflect")
     assert CosyVoice3TextFrontend().normalize(text) == expected
+
+
+@pytest.mark.parametrize("category, text, expected", SPOKEN, ids=[f"{c}-{t[:20]}" for c, t, _ in SPOKEN])
+def test_numbers_read_as_the_reference_reads_them(category, text, expected):  # noqa: ARG001
+    assert normalize_english(text) == expected
+    assert CosyVoice3TextFrontend().normalize(text) == close_sentences(expected, "en")
+
+
+@pytest.mark.parametrize("text, expected, wetext", MONTH_CASE, ids=[t[:24] for t, _, _ in MONTH_CASE])
+def test_a_month_keeps_its_case(text, expected, wetext):
+    assert normalize_english(text) == expected
+    assert expected.lower() == wetext.lower()
+
+
+@pytest.mark.parametrize("text, expected, wetext", DIFFERENT, ids=[t[:24] for t, _, _ in DIFFERENT])
+def test_where_the_rules_read_numbers_differently_from_wetext(text, expected, wetext):
+    assert normalize_english(text) == expected
+    assert expected != wetext
+
+
+def test_wetext_reads_as_recorded():
+    frontend = CosyVoice3TextFrontend()
+    pytest.importorskip("wetext")
+    frontend.warmup()
+    if not frontend._wetext:
+        pytest.skip("wetext could not load its grammars")
+    for text, wetext in [(t, w) for _, t, w in SPOKEN] + [(t, w) for t, _, w in MONTH_CASE + DIFFERENT]:
+        if not wetext.startswith("<raises"):
+            assert frontend.normalize(text) == close_sentences(wetext, "en"), text
+    # wetext raises on this one; the rules read it
+    assert frontend.normalize("Item #5.") == "Item number five."
+
+
+def test_the_rules_take_linear_time():
+    for text in ("7" * 100_000, "1," * 50_000, "1-" * 50_000, "1:" * 50_000, "$1 " * 30_000, "a1" * 50_000):
+        start = time.perf_counter()
+        normalize_english(text)
+        assert time.perf_counter() - start < 5, text[:8]
+
+
+def test_a_run_past_the_largest_scale_is_read_digit_by_digit():
+    digits = "9" * 40
+    assert normalize_english(f"Code {digits} and 7") == "Code " + " ".join(["nine"] * 40) + " and seven"
+    assert normalize_english("The national debt is 34,567,891,234,567 dollars.").startswith(
+        "The national debt is thirty four trillion five hundred sixty seven billion"
+    )
+
+
+def test_text_without_digits_is_unchanged():
+    assert normalize_english("Prices: $, %, # and ½.") == "Prices: $, %, # and ½."
+    assert normalize_english("about 50 percent more") == "about fifty percent more"
 
 
 def test_a_decimal_point_in_chinese_text_stays_a_point():
@@ -108,15 +293,8 @@ def test_a_decimal_point_in_chinese_text_stays_a_point():
 
 
 def test_superscript_digits_are_not_spelled_out():
-    pytest.importorskip("inflect")
-    # inflect reads "²" as "zero"; the reference's fallback gives "ten mzero room."
+    # inflect, the reference's fallback, reads "²" as "zero": "ten mzero room."
     assert CosyVoice3TextFrontend().normalize("A 10 m² room") == "A ten m² room."
-
-
-def test_a_digit_run_too_long_for_inflect_stays_as_written():
-    pytest.importorskip("inflect")
-    digits = "9" * 40
-    assert CosyVoice3TextFrontend().normalize(f"Code {digits} and 7") == f"Code {digits} and seven."
 
 
 @pytest.mark.parametrize(
@@ -143,21 +321,99 @@ def test_text_left_alone():
     assert frontend.normalize("  ") == "  "
 
 
-def test_without_inflect_digits_pass_through_with_one_warning(monkeypatch, caplog):
-    real_import = builtins.__import__
+# -- wetext -----------------------------------------------------------------------------
 
-    def no_inflect(name, *args, **kwargs):
-        if name == "inflect":
-            raise ImportError("No module named 'inflect'")
-        return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", no_inflect)
+class _FakeWetext:
+    """``wetext.Normalizer``: reads "Gate 12" and "12.5元", raises on "#"."""
+
+    made: list[tuple[str, str, str]] = []
+
+    def __init__(self, tagger, verbalizer, lang):
+        self.lang = lang
+        _FakeWetext.made.append((tagger, verbalizer, lang))
+
+    def normalize(self, text):
+        assert "#" not in text
+        return text.replace("Gate 12", "Gate twelve").replace("12.5元", "十二点五元")
+
+
+def _fake_wetext(monkeypatch, snapshot):
+    _FakeWetext.made = []
+    monkeypatch.setitem(sys.modules, "wetext", SimpleNamespace(Normalizer=_FakeWetext))
+    monkeypatch.setitem(sys.modules, "modelscope", SimpleNamespace(snapshot_download=snapshot))
+
+
+def test_wetext_runs_before_the_rules_when_installed(monkeypatch):
+    calls = []
+
+    def snapshot(repo, local_files_only=False):
+        calls.append((repo, local_files_only))
+        return "/cache/wetext"
+
+    _fake_wetext(monkeypatch, snapshot)
+    frontend = CosyVoice3TextFrontend()
+    frontend.warmup()
+    assert calls == [("pengzhendong/wetext", True)]
+    assert _FakeWetext.made == [
+        ("/cache/wetext/en/tn/tagger.fst", "/cache/wetext/en/tn/verbalizer.fst", "en"),
+        ("/cache/wetext/zh/tn/tagger.fst", "/cache/wetext/zh/tn/verbalizer.fst", "zh"),
+    ]
+    # what wetext leaves (here "4:05") the rules read
+    assert frontend.normalize("Gate 12 at 4:05") == "Gate twelve at four o five."
+    assert frontend.normalize("价格是12.5元") == "价格是十二点五元。"
+    # a text wetext raises on, or one too long for it, goes to the rules alone
+    assert frontend.normalize("Gate 12, item #5") == "Gate twelve, item number five."
+    long = "Gate 12 " + "word " * text_frontend.WETEXT_MAX_CHARS
+    assert frontend.normalize(long).startswith("Gate twelve word")
+    assert len(_FakeWetext.made) == 2
+
+
+def test_wetext_grammars_come_from_the_cache_before_the_network(monkeypatch):
+    calls = []
+
+    def snapshot(repo, local_files_only=False):
+        calls.append(local_files_only)
+        if local_files_only:
+            raise FileNotFoundError("not cached")
+        return "/downloaded"
+
+    _fake_wetext(monkeypatch, snapshot)
+    frontend = CosyVoice3TextFrontend()
+    frontend.warmup()
+    assert calls == [True, False]
+    assert [t for t, _, _ in _FakeWetext.made] == ["/downloaded/en/tn/tagger.fst", "/downloaded/zh/tn/tagger.fst"]
+
+
+def test_wetext_that_cannot_load_leaves_the_rules_with_one_warning(monkeypatch, caplog):
+    def snapshot(repo, local_files_only=False):
+        raise OSError("403: rate limited")
+
+    _fake_wetext(monkeypatch, snapshot)
     frontend = CosyVoice3TextFrontend()
     with caplog.at_level(logging.WARNING):
         frontend.warmup()
-        assert frontend.normalize("Flight 247") == "Flight 247."
-        assert frontend.normalize("Gate 12") == "Gate 12."
-    assert sum("inflect" in r.getMessage() for r in caplog.records) == 1
+        frontend.warmup()
+        assert frontend.normalize("Gate 12") == "Gate twelve."
+    assert sum("wetext could not load" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_without_wetext_the_rules_run(monkeypatch):
+    monkeypatch.setitem(sys.modules, "wetext", None)
+    frontend = CosyVoice3TextFrontend()
+    frontend.warmup()
+    assert frontend.normalize("Gate 12") == "Gate twelve."
+    # text with Chinese keeps its digits, as the reference's fallback does
+    assert frontend.normalize("价格是12.5元") == "价格是12.5元。"
+
+
+def test_normalize_never_loads_wetext(monkeypatch):
+    def snapshot(repo, local_files_only=False):
+        raise AssertionError("normalize reached ModelScope")
+
+    _fake_wetext(monkeypatch, snapshot)
+    assert CosyVoice3TextFrontend().normalize("Gate 12") == "Gate twelve."
+    assert _FakeWetext.made == []
 
 
 # -- piece sizing in the API server ----------------------------------------------------
@@ -167,7 +423,7 @@ _tokens = adapters.CosyVoice3Adapter._estimated_tokens
 
 
 class _TenfoldDigits:
-    """A frontend that spells each digit as ten characters, without ``inflect``."""
+    """A frontend that spells each digit as ten characters."""
 
     def normalize(self, text: str) -> str:
         return re.sub(r"\d", "x" * 10, text)
@@ -220,8 +476,7 @@ def test_an_input_over_the_piece_cap_is_not_normalized_piece_by_piece(monkeypatc
     assert len(calls) < 3 * adapter.speech_chunk_max_pieces
 
 
-def test_digit_heavy_pieces_fit_the_model_with_inflect(monkeypatch):
-    pytest.importorskip("inflect")
+def test_digit_heavy_pieces_fit_the_model(monkeypatch):
     monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", None)
     frontend = CosyVoice3TextFrontend()
     pieces = adapters.CosyVoice3Adapter().split_speech_text(_IDS)
@@ -261,8 +516,8 @@ def _text_ids(out, prompt: str) -> torch.Tensor:
     return ids[_Tokenizer()(prompt).numel() :]
 
 
-def test_process_prompt_tokenizes_the_normalized_text(model):
-    pytest.importorskip("inflect")
+def test_process_prompt_tokenizes_the_normalized_text(model, monkeypatch):
+    monkeypatch.setitem(sys.modules, "wetext", None)
     model.warmup_preprocess()
     tok = _Tokenizer()
     clip = {"audio_inputs": [_clip()]}
@@ -270,14 +525,14 @@ def test_process_prompt_tokenizes_the_normalized_text(model):
     # the transcript stays as written: the reference's callers write <|endofprompt|> into it
     prompt = f"{SYSTEM_PROMPT}{END_OF_PROMPT}Gate 12"
     assert torch.equal(zero.new_input_tensors[TEXT_INPUTS][0][: tok(prompt).numel()], tok(prompt))
-    assert torch.equal(_text_ids(zero, prompt), tok("Flight two hundred and forty-seven."))
+    assert torch.equal(_text_ids(zero, prompt), tok("Flight two hundred and forty seven."))
 
     cross = model.process_prompt("Flight 247", ["text", "audio"], ["audio"], tensors=clip)
-    assert torch.equal(_text_ids(cross, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("Flight two hundred and forty-seven."))
+    assert torch.equal(_text_ids(cross, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("Flight two hundred and forty seven."))
 
     instruct = model.process_prompt("Flight 247", ["text", "audio"], ["audio"], tensors=clip, instruct="Speak 2x")
     prompt = f"{SYSTEM_PROMPT} Speak 2x{END_OF_PROMPT}"
-    assert torch.equal(_text_ids(instruct, prompt), tok("Flight two hundred and forty-seven."))
+    assert torch.equal(_text_ids(instruct, prompt), tok("Flight two hundred and forty seven."))
 
 
 def test_text_frontend_false_sends_the_text_as_written(model):

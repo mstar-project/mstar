@@ -270,12 +270,10 @@ chatterbox_multilingual = [
 
 # Fun-CosyVoice3: reference clips decode through Chatterbox's loader (soundfile,
 # torchcodec as the fallback); the speech tokenizer and speaker encoder load from
-# the checkpoint's ONNX files without onnxruntime; inflect spells out digits as
-# the reference's text frontend does.
+# the checkpoint's ONNX files without onnxruntime.
 cosyvoice3 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "inflect>=7.3.1",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",
@@ -293,6 +291,13 @@ voxcpm2 = [
     "soundfile",
     "soxr",
     "transformers",
+]
+
+# CosyVoice3's text normalization as the reference frontend runs it: wetext's
+# grammars (fetched from ModelScope on first start). Without it, built-in rules
+# read English numbers, money, dates and times.
+cosyvoice3_wetext = [
+    "wetext==0.0.4",
 ]
 
 orpheus = [
@@ -470,7 +475,6 @@ all = [
     "num2words",
     "audioseal>=0.2,<0.3",  # see the audioseal extra
     "soxr",  # see the voxcpm2 extra
-    "inflect>=7.3.1",  # see the cosyvoice3 extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.
