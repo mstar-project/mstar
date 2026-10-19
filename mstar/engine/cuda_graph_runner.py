@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
 
 logger = logging.getLogger(__name__)
@@ -659,6 +660,10 @@ class CudaGraphRunner:
         compiled code by shape, so every bucket of a config shares a cache and
         the second slot's identical shapes are free. A wrapper per capture
         would recompile — and re-autotune — all of them.
+
+        The platform's inductor overrides wrap that shared callable per bucket,
+        so each bucket compiles on its first call under the overrides for its
+        own token count.
         """
         forward = getattr(self._submodule, spec.config.capture_forward_method)
         if not spec.config.compile:
@@ -667,7 +672,9 @@ class CudaGraphRunner:
             self._compiled_forwards[spec.config_idx] = torch.compile(
                 forward, **compile_kwargs(spec.config.compile_mode),
             )
-        return self._compiled_forwards[spec.config_idx]
+        return with_inductor_overrides(
+            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+        )
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -1287,7 +1294,10 @@ class PiecewiseCudaGraphRunner:
 
         fn = self._config.capture_fn
         if self._config.compile:
-            fn = torch.compile(fn, **compile_kwargs(self._config.compile_mode))
+            fn = with_inductor_overrides(
+                torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
+                shape.total_tokens,
+            )
 
         def run_fn():
             return self._normalize_output(fn(call))

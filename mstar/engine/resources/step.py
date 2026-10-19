@@ -1,7 +1,7 @@
 
 from collections.abc import KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 
 class Segment(NamedTuple):
@@ -150,6 +150,9 @@ class SubmoduleStep:
 @dataclass
 class AdmitFailedReason:
     message: str
+    # A terminal refusal comes back on every retry, so the caller fails the
+    # request instead of re-queueing the step.
+    terminal: ClassVar[bool] = False
 
 
 @dataclass
@@ -175,7 +178,11 @@ class AdmitRuntimeError(AdmitFailedReason):
 
     Terminal, unlike the two above: no eviction and no reload makes it go
     away, so the caller's answer is to fail the request, not to retry it.
+    ``request_ids`` names the requests at fault; empty means the refusal is
+    about the step as a whole.
     """
+    terminal: ClassVar[bool] = True
+    request_ids: frozenset[str] = frozenset()
 
 
 class AdmitOutcome(NamedTuple):

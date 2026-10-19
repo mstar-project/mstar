@@ -107,10 +107,11 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
 
 
 def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:
-    """Once the GPU thread has the plan future, the speculation carries no
-    future any more and the handler has nothing to drain or reset."""
+    """Once the GPU thread has the speculation (and its plan future), its rids
+    are that step's, so the handler has nothing to drain, reset or give back."""
     w = _fake_worker()
     spec = _speculation(None, "a")
+    spec.submitted = True
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [] and w.pushed_back == []
     assert w.despeculated == []  # nothing de-speculated: not this handler's batch

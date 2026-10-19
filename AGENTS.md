@@ -44,7 +44,7 @@ For example, nothing under `mstar/model/` should:
 - **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
 - **Manage streams or synchronize.** No `torch.cuda.Stream`, `torch.cuda.synchronize`, or `torch.cuda.Event` under `mstar/model/`.
-- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
+- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_` ([#383](https://github.com/mstar-project/mstar/pull/383), open PR), `attend` over the current plan), so eager and captured paths address rows the same way.
 
 Things that look model-specific but belong to the system:
 
@@ -55,7 +55,7 @@ Some caveats:
 - Sometimes, building a cross-layer feature will be a long-running effort that should not block the implementation of a model. In that case, the right outcome is to note it, land the per-model version, and assign the system-level work.
 - There are cases where model-level state is lightweight enough that it can be held in the model itself; e.g., Qwen3-Omni allocates a fixed-size dense KV cache for the code predictor module.
 
-The converse matters just as much: **model-level concerns shouldn't leak into engine code.** If a behavior only makes sense for some models, the engine should provide it as a helper that the model opts into, rather than applying it to every model. For example, with chunked prefill, only the last chunk of a prompt samples a real token. Rather than the engine filtering sampler rows for every model, `keep_final_chunk_samples` ([#365](https://github.com/mstar-project/mstar/pull/365)) wraps a submodule's `SamplerStep`, and each submodule whose sampled token is meaningful only on the final chunk calls it in `declare_step`.
+The converse matters just as much: **model-level concerns shouldn't leak into engine code.** If a behavior only makes sense for some models, the engine should provide it as a helper that the model opts into, rather than applying it to every model. For example, with chunked prefill, only the last chunk of a prompt samples a real token. Rather than the engine filtering sampler rows for every model, `keep_final_chunk_samples` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR) wraps a submodule's `SamplerStep`, and each submodule whose sampled token is meaningful only on the final chunk calls it in `declare_step`.
 
 ### 2. Resources are declared per graph node, and a node gets only what it declares
 
@@ -115,6 +115,8 @@ Some additional information:
 ### 8. Configs map nodes to hardware; code stays hardware-agnostic
 
 `configs/*.yaml` `node_groups` map graph node names to GPU ranks. The same model code must run on one GPU or many with only the config changing. Don't branch on rank counts or device indices in model code; any branching should be contained to engine-level code (or worker, conductor, etc.), and should ideally be done in a modular manner (e.g., the `XPUAttentionManager` is a good example -- a new resource that encapsulates the accelerator-specific logic). 
+
+To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platform` (`is_rocm()`, `arch()`, `has_cuda_capability()`) rather than `torch.version.hip`, the `cuda` device type, or a raw compute capability. PyTorch's ROCm build calls AMD GPUs `cuda` devices and reports an MI300X as compute capability 9.4, so neither tells you the vendor. Checking `device.type == "cuda"` to ask "is this a GPU" is still fine.
 
 ### 9. Update the documentation
 
@@ -191,15 +193,17 @@ pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features && pytest ../test/rust/
 ```
 
-Adding a CPU-only module to CI means adding its path to [test/cpu-core.txt](test/cpu-core.txt) — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Adding a CPU-only module to CI means adding its path to [test/cpu-core.txt](test/cpu-core.txt) — see [CONTRIBUTING.md](CONTRIBUTING.md). `test/modular/test_cpu_core_list.py` checks that each entry exists and appears once. Most of `test/modular/` is not in that list and no CI job runs it ([#498](https://github.com/mstar-project/mstar/issues/498)): if a PR edits or adds a test there, run that file and say so, or add it to the list.
+
+CI has no GPU. A PR whose change runs on the GPU says which GPU tests it ran, on what hardware and torch/CUDA build. Real-weights tests skip when the checkpoint isn't cached, so a passing CPU run of them shows only that they import: rerun them on CUDA on the commit being pushed, and report them as run, not skipped.
 
 The modular tests exist because these are the parts that are easy to get wrong: `test_resource_runner.py` (the admit/plan/commit lifecycle from `declare_step`), `test_cuda_graph_capture.py` (bucket keys, `cg_key_info`, `additional_key_info`), `test_micro_scheduler.py` (admission, failure, backpressure), `test_admit_failure_handling.py`, `test_kv_offload.py`.
 
-Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep.
+Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker or engine method, build the smallest real object (`Worker.__new__(Worker)` plus the attributes the method reads) and call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
 
 If a bug only reproduces through a running server, write a standalone harness before the third attempt. A server restart can be minutes of compilation, while a harness that builds the resources directly, drives `admit`/`plan`/`commit` by hand, and captures and replays a graph runs in seconds — [test/modular/test_gdn_cuda_graph.py](test/modular/test_gdn_cuda_graph.py) is the shape to copy. Where the bug is inside a captured graph, intermediates are invisible after a replay; returning `torch.isfinite(x).all()` per layer as an extra graph output gives a flag tensor readable afterwards, which names the first bad kernel instead of the first place the damage shows.
 
-Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count.
+Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count. Bit-exact CPU tests (`torch.equal`) can depend on the intra-op thread count: two wan22 cases in `test/modular/test_wan_vae_decode.py` fail with `OMP_NUM_THREADS` 4 or 8 on a 32-vCPU AMD EPYC host and pass with 1 or 2. Run the CPU suite with `OMP_NUM_THREADS=2` before treating such a failure as yours, and pin the thread count (`torch.set_num_threads`) in a fixture when writing a new bit-exact test.
 
 Output-quality artifacts get the same check, against the reference implementation as well as `main`, and measured over several samples per prompt rather than judged by ear: some are the checkpoint's own behavior (e.g. Qwen3-Omni's spoken replies sometimes start garbled in the reference too).
 
@@ -244,9 +248,9 @@ Readability rules the reviewer may cite as **S1** through **S4**. These are the 
 
 Not rules, and the reviewer shouldn't cite them; these are cleanups that came out of review and made the code easier to work with.
 
-**One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365)), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
+**One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
 
-**If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365)), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
+**If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
 
 ## Performance ideas from past work
 

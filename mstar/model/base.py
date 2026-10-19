@@ -50,13 +50,32 @@ class ProcessPromptOutput(NamedTuple):
 
 
 class PrefixStream(NamedTuple):
-    """The input tensor whose token ids key one cache stream's pages."""
+    """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
     tensor: str
     keyed_by: str
-    # the walk that writes the keyed span; a write from any other walk ends the chain
+    # the walk that writes the keyed span; a write from a walk not named here ends the chain
     walk: str
     # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None
+    # the other walks a layout may name
+    layout_walks: tuple[str, ...] = ()
+
+
+class Span(NamedTuple):
+    """One write to a keyed stream. A layout lists them in the order the walks write.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file.
+    """
+    kind: str
+    walk: str
+    length: int
+    advance: int
+    source: str | tuple[str, int]
+    params: tuple = ()
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -581,6 +600,9 @@ class Model(ABC):
         preprocess worker keys that tensor and the KV resource matches what it
         already holds. Empty leaves the model uncached whatever the deployment
         asks for.
+
+        A stream with ``layout_walks`` takes its ``prefix_layout`` from
+        `process_prompt`'s metadata, as ``{resource: {label: [Span, ...]}}``.
         """
         return {}
 

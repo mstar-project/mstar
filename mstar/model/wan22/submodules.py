@@ -588,6 +588,16 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
     via ``torch.cuda.mem_get_info``; ``config.vae_decode_tiling`` /
     ``WAN22_VAE_DECODE_TILING`` force either path; the chosen path is logged per
     request. The tiled/untiled numeric gap is priced by the tiled-vs-untiled test.
+
+    With ``config.vae_decode_fast`` the untiled path at a size in
+    ``config.vae_decode_fast_sizes`` runs the shared Wan VAE decoder
+    (``mstar.model.components.wan_vae``) instead of ``vae.decode``: the same
+    per-latent decoder calls from an empty cache, on channels-last weights and
+    activations, compiled. Every other decode switches the VAE back to the
+    layout it loaded in first (an exact copy of the decoder weights), so it is
+    stock ``vae.decode`` / ``tiled_decode`` and compiles nothing. The engine
+    still never wraps the forward; only the decoder's steady-state call is
+    compiled.
     """
 
     disable_torch_compile = True
@@ -605,6 +615,20 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
         self._record_fp32_islands()
+        self._fast_step = None
+        self._fast_sizes = config.fast_decode_sizes()
+        if config.vae_decode_fast:
+            from mstar.model.components import wan_vae
+
+            # Before the compile traces the decoder; this VAE instance is the
+            # decoder node's own.
+            wan_vae.to_channels_last(self.vae)
+            self._fast_step = wan_vae.DecoderStep(self.vae, compile=True, deterministic=True)
+            logger.info(
+                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled); "
+                "other sizes decode stock",
+                ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
+            )
 
     def _decode_dtype(self):
         # TODO: pull conv3d-dtype resolution into a common helper shared with
@@ -719,8 +743,22 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 "tiled" if tiled else "untiled", height, width, num_frames,
                 estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
             )
+            fast = self._fast_step is not None and not tiled and (width, height) in self._fast_sizes
+            if self._fast_step is not None:
+                from mstar.model.components import wan_vae
+
+                # One request per step, so nothing else decodes on this VAE
+                # while its layout switches. Outside inference mode: a weight
+                # made in it is an inference tensor, whose dispatch keys the
+                # compiled graph's parameter guards reject (a recompile).
+                with torch.inference_mode(False):
+                    (wan_vae.to_channels_last if fast else wan_vae.to_default_layout)(vae)
             if tiled:
                 video = vae.tiled_decode(latents, return_dict=False)[0]
+            elif fast:
+                video = wan_vae.decode_causal(
+                    vae, latents, wan_vae.new_feat_cache(vae), self._fast_step, clip_start=True,
+                )
             else:
                 video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary (see class docstring).

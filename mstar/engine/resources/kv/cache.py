@@ -298,6 +298,12 @@ class KVCache:
         # in both src and dst.
         self.tensor[:, dst] = self.tensor[:, src]
 
+    def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
+        """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
+        # Index with slices rather than tensors. Slices need no copy from the host,
+        # so the copy doesn't wait on the stream.
+        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+
     def chunk_view(
         self, layer_idx: int, page_idx: int,
         token_start: int, token_end: int,

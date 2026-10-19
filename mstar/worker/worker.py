@@ -30,7 +30,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -217,6 +217,9 @@ class Speculation:
     dropped: set[int] = field(default_factory=set)
 
     plan_future: Future | None = None
+    # Handed to the GPU thread: its rids are that step's now, and the error
+    # handler fails them with it instead of giving them back.
+    submitted: bool = False
     # TP async scheduling: the broadcast seq of this speculation (leader:
     # assigned at broadcast; follower: the head's). PendingBatch.tp_seq on submit.
     tp_seq: int = -1
@@ -1987,14 +1990,19 @@ class Worker:
     ) -> None:
         """Re-queue a batch whose admit refused it, so the step can be retried.
 
-        Every admit failure needs the push-back; only an ``AllocationFailed``
-        also needs an eviction. ``RequestOffloading`` means the rid is already
-        on its way to the host, so evicting anything else is wasted work — the
-        retry is gated on ``check_ready`` reloading it.
+        Every retryable admit failure needs the push-back; only an
+        ``AllocationFailed`` also needs an eviction. ``RequestOffloading`` means
+        the rid is already on its way to the host, so evicting anything else is
+        wasted work: the retry is gated on ``check_ready`` reloading it. A
+        ``terminal`` reason would refuse the same step again on every pass, so
+        the requests it names fail instead.
         """
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
+            return
+        if reason.terminal:
+            self._handle_unservable(batch, reason)
             return
 
         self._push_back_batch(batch)
@@ -2003,6 +2011,35 @@ class Worker:
             batch.node_name, batch.graph_walk,
             type(reason).__name__, len(batch),
         )
+
+    def _handle_unservable(
+        self, batch: ScheduledBatch, reason: AdmitFailedReason,
+    ) -> None:
+        """Fail the requests a terminal admit refusal names, and re-queue the
+        rest of the batch; the whole batch when the refusal names no row of it.
+
+        A TP follower only re-queues: rank 0 refused the same step, fails the
+        same requests, and their teardown reaches this rank as a REMOVE.
+        """
+        rids = batch.request_to_worker_graph
+        named = getattr(reason, "request_ids", ())
+        doomed = {rid for rid in rids if rid in named} or set(rids)
+        if self._is_tp_follower_node(batch.node_name):
+            doomed = set()
+        survivors = [rid for rid in rids if rid not in doomed]
+        if survivors:
+            self._graph_runtime.push_back_node(
+                batch.node_name, survivors, [rids[rid] for rid in survivors],
+            )
+        if doomed:
+            logger.error(
+                "Admit refused node=%s walk=%s terminally (%s): failing %d of "
+                "%d requests", batch.node_name, batch.graph_walk,
+                reason.message, len(doomed), len(rids),
+            )
+            self._fail_requests({
+                rid: f"Error in worker: {reason.message}" for rid in doomed
+            })
 
     def _handle_allocation_failure(
         self, batch: ScheduledBatch, node_batch: ExecutingBatch,
@@ -2304,6 +2341,14 @@ class Worker:
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
         speculation.consumed_streaming_edges.clear()
+
+    @staticmethod
+    def _speculated_rids(speculation: Speculation | None) -> frozenset[int]:
+        """The rids a built speculation will run, which a teardown or eviction
+        on the current step's behalf must leave alone."""
+        if speculation is None:
+            return frozenset()
+        return frozenset(speculation.scheduled_batch.request_to_worker_graph)
 
     def _is_tearing_down(self, rid: int) -> bool:
         """Removed, aborted or failed: no further speculative work for ``rid``.
@@ -2847,7 +2892,7 @@ class Worker:
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
         # If any nodes in the batch have "overstayed" their loop stop, then make
         # sure to not route their outputs
-        valid_rids = set(batch_N.node_batch.request_ids)
+        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.cached_rids
         if batch_N.speculative_new_iter:
             stopped_rids = self._graph_runtime.pending_loop_stop_rids(
                 batch_N.graph_walk, batch_N.loop_name,
@@ -2872,7 +2917,8 @@ class Worker:
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
         # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
-        # the routing/output loops below only touch rids that produced outputs.
+        # the routing/output loops below only touch rids that ran or that the
+        # cache served.
         for rid in list(batch_N.batch.request_to_worker_graph):
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
@@ -3577,21 +3623,26 @@ class Worker:
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)
-        if speculation is not None and speculation.plan_future is not None:
-            # Armed but never submitted: the plan thread may still be staging
-            # a pre-plan for a step that will now never run. Drain it, then
-            # drop the stage, or the next step to lease that slot would find
-            # it. Its fresh rids go back to their queues; the continuing ones
-            # belong to the pending batch and fail with it.
-            try:
-                speculation.plan_future.result()
-            except Exception:
-                logger.debug(
-                    "Worker %s discarding the pre-plan of the failed iteration",
-                    self.worker_id,
-                )
-            speculation.plan_future = None
-            self._reset_skip_plan_flags(speculation.node_batch)
+        if speculation is not None and not speculation.submitted:
+            # Built but never submitted. Its fresh rids came off their queues
+            # (a yield-away step is all fresh rids), so they go back or nothing
+            # would schedule them again; the continuing ones belong to the
+            # pending batch and fail with it. Keyed on submission rather than
+            # on an armed pre-plan: the plan future is None without pre-plan
+            # and after a refusal reset it, and the rids are stranded either way.
+            if speculation.plan_future is not None:
+                # The plan thread may still be staging a pre-plan for a step
+                # that will now never run. Drain it, then drop the stage, or
+                # the next step to lease that slot would find it.
+                try:
+                    speculation.plan_future.result()
+                except Exception:
+                    logger.debug(
+                        "Worker %s discarding the pre-plan of the failed iteration",
+                        self.worker_id,
+                    )
+                speculation.plan_future = None
+                self._reset_skip_plan_flags(speculation.node_batch)
             sb = speculation.scheduled_batch
             # This step never ran, so its staged chunks go back to their
             # buffers -- in particular for the fresh rids pushed back below,
@@ -4068,9 +4119,7 @@ class Worker:
                         _maybe_clear_spec()
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch,
-                            referenced_rids=frozenset(
-                                speculation.scheduled_batch.node_objects
-                            ) if speculation is not None else frozenset(),
+                            referenced_rids=self._speculated_rids(speculation),
                         )
 
                     if pending.node_batch.failed_requests:
@@ -4119,9 +4168,10 @@ class Worker:
                                 spec_batch, spec_node_batch,
                                 speculation.plan_future,
                             )
-                            # the GPU thread owns the pre-plan from here; see
-                            # _handle_main_loop_error
+                            # the GPU thread owns the pre-plan and the rids
+                            # from here; see _handle_main_loop_error
                             speculation.plan_future = None
+                            speculation.submitted = True
                             self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)

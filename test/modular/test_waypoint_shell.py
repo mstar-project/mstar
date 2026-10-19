@@ -746,10 +746,10 @@ def test_validate_config_yaml_refuses_invalid_world_pool_size(
 def test_validate_config_yaml_refuses_more_arrivals_than_worlds(
     model, tmp_path, limit, worlds
 ):
-    """A queue longer than the pool is a delayed failure: the conductor admits
+    """A queue longer than the pool would wait forever: the conductor admits
     ``limit`` requests, the ring hands out ``num_sessions``, and the
-    difference dies at ``admit`` with an ``AdmitRuntimeError`` no retry,
-    eviction, or reload can clear.
+    difference is refused at ``admit`` until a session is released, which a
+    request that never finishes never does. Refused at startup instead.
 
     ``worlds=None`` is the accidental case: raising
     ``max_concurrent_requests`` without touching ``resources``, the shape
