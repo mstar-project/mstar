@@ -1014,6 +1014,14 @@ window.runMermaid = runMermaid;</script>
 <span class="n">VIDEO_SOUND_GEN_LOOP</span> <span class="o">=</span> <span class="s2">"video_sound_gen_loop"</span>
 <span class="n">ACTION_GEN_LOOP</span> <span class="o">=</span> <span class="s2">"action_gen_loop"</span>
 <span class="n">ACTION_VIDEO_GEN_LOOP</span> <span class="o">=</span> <span class="s2">"action_video_gen_loop"</span>
+<span class="c1"># Each denoise walk's loop; any other walk runs the image loop.</span>
+<span class="n">DENOISE_LOOP_FOR_WALK</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">ACTION_GEN_WALK</span><span class="p">:</span> <span class="n">ACTION_GEN_LOOP</span><span class="p">,</span>
+    <span class="n">ACTION_VIDEO_GEN_WALK</span><span class="p">:</span> <span class="n">ACTION_VIDEO_GEN_LOOP</span><span class="p">,</span>
+    <span class="n">VIDEO_GEN_WALK</span><span class="p">:</span> <span class="n">VIDEO_GEN_LOOP</span><span class="p">,</span>
+    <span class="n">VIDEO_GEN_AR_WALK</span><span class="p">:</span> <span class="n">VIDEO_GEN_AR_LOOP</span><span class="p">,</span>
+    <span class="n">VIDEO_SOUND_GEN_WALK</span><span class="p">:</span> <span class="n">VIDEO_SOUND_GEN_LOOP</span><span class="p">,</span>
+<span class="p">}</span>
 
 <span class="c1"># Both action walks run the joint video+action denoise loop body; they differ</span>
 <span class="c1"># only in what they emit (the predicted action vs the predicted video).</span>
@@ -1052,6 +1060,40 @@ window.runMermaid = runMermaid;</script>
 <span class="n">REASONER_DECODE_LOOP</span> <span class="o">=</span> <span class="s2">"reasoner_decode_loop"</span>
 <span class="c1"># The reasoner keeps every request's text under one cache label.</span>
 <span class="n">REASONER_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">time_index</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The denoise iteration a step runs, from the engine's loop counter.</span>
+
+<span class="sd">    ``time_index`` holds the same value (global over a windowed request's</span>
+<span class="sd">    windows and commits, like the counter), but it is the previous step's</span>
+<span class="sd">    device output: reading it on the host waits for that step to finish, which</span>
+<span class="sd">    stalls the speculative preparation of this one. Callers that drive the</span>
+<span class="sd">    submodule without a loop counter (tests, harnesses) fall back to the edge.</span>
+<span class="sd">    """</span>
+    <span class="n">loop</span> <span class="o">=</span> <span class="n">DENOISE_LOOP_FOR_WALK</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">IMAGE_GEN_LOOP</span><span class="p">)</span>
+    <span class="n">counts</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="s2">"dynamic_loop_iter_counts"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="n">loop</span> <span class="ow">in</span> <span class="n">counts</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">loop</span><span class="p">])</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">time_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+
+
+<span class="c1"># Attribute a request's scheduler carries its timesteps under as a host list,</span>
+<span class="c1"># filled once at build time. ``set_timesteps`` puts them on the device, and a</span>
+<span class="c1"># per-step read there (the guidance-interval test) would be a host sync.</span>
+<span class="n">_HOST_TIMESTEPS</span> <span class="o">=</span> <span class="s2">"mstar_host_timesteps"</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_with_host_timesteps</span><span class="p">(</span><span class="n">scheduler</span><span class="p">):</span>
+    <span class="nb">setattr</span><span class="p">(</span><span class="n">scheduler</span><span class="p">,</span> <span class="n">_HOST_TIMESTEPS</span><span class="p">,</span> <span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+    <span class="k">return</span> <span class="n">scheduler</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_host_timesteps</span><span class="p">(</span><span class="n">scheduler</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The scheduler's timesteps as Python numbers (the values ``.item()``</span>
+<span class="sd">    returns), from the host copy when it was built here."""</span>
+    <span class="n">host</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">scheduler</span><span class="p">,</span> <span class="n">_HOST_TIMESTEPS</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">host</span> <span class="k">if</span> <span class="n">host</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
 
 
 <div class="viewcode-block" id="native_flow_sigmas">
@@ -1346,7 +1388,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">scheduler</span><span class="o">.</span><span class="n">set_timesteps</span><span class="p">(</span><span class="n">num_inference_steps</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">sigmas</span><span class="o">=</span><span class="n">sigmas</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">scheduler</span><span class="o">.</span><span class="n">set_timesteps</span><span class="p">(</span><span class="n">num_inference_steps</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">scheduler</span>
+        <span class="k">return</span> <span class="n">_with_host_timesteps</span><span class="p">(</span><span class="n">scheduler</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_new_distilled_scheduler</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""The 4-step distilled sampler: a FlowMatchEuler scheduler with the</span>
@@ -1366,7 +1408,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">stochastic_sampling</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">sc</span><span class="o">.</span><span class="n">stochastic_sampling</span><span class="p">),</span>
             <span class="p">)</span>
         <span class="n">scheduler</span><span class="o">.</span><span class="n">set_timesteps</span><span class="p">(</span><span class="n">sigmas</span><span class="o">=</span><span class="p">[</span><span class="nb">float</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">distilled_sigmas</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">scheduler</span>
+        <span class="k">return</span> <span class="n">_with_host_timesteps</span><span class="p">(</span><span class="n">scheduler</span><span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_scheduler_step</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">velocity</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">latents</span><span class="p">):</span>
@@ -1413,7 +1455,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">SOUND_WALKS</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_video_sound_gen</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">ACTION_WALKS</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_action_gen</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_action_gen</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown Cosmos3 DiT graph walk: </span><span class="si">{</span><span class="n">graph_walk</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 
 
@@ -2009,12 +2051,13 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># from the noise drawn above (the reference RNG order).</span>
                 <span class="n">latents</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"vmask"</span><span class="p">]</span> <span class="o">*</span> <span class="n">st</span><span class="p">[</span><span class="s2">"cond_video_latents"</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="mf">1.0</span> <span class="o">-</span> <span class="n">st</span><span class="p">[</span><span class="s2">"vmask"</span><span class="p">])</span> <span class="o">*</span> <span class="n">latents</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">latents</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"time_index"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="n">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">time_index</span><span class="p">)</span>
 
         <span class="n">scheduler</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
-        <span class="n">step_index</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">time_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
         <span class="k">if</span> <span class="n">windowed</span><span class="p">:</span>
             <span class="c1"># The loop counter is global over every window's iterations; the</span>
             <span class="c1"># schedule index is the within-window step, and in kv mode the</span>
@@ -2090,13 +2133,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">st</span><span class="p">[</span><span class="s2">"num_sound"</span><span class="p">]),</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span>
             <span class="p">)</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">latents</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="n">sound_latents</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"sound_latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"time_index"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="n">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">VIDEO_SOUND_GEN_WALK</span><span class="p">,</span> <span class="n">time_index</span><span class="p">)</span>
 
         <span class="n">scheduler</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
-        <span class="n">step_index</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">time_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
         <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span>
@@ -2109,7 +2153,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">),</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_action_gen</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_action_gen</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
         <span class="n">st</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="p">[</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">rid_handle</span><span class="p">]</span>
         <span class="k">if</span> <span class="s2">"latents"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">inputs</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">])</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_ingest_cond_latents</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
@@ -2133,13 +2177,14 @@ window.runMermaid = runMermaid;</script>
             <span class="n">v_noise</span> <span class="o">=</span> <span class="n">randn_tensor</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"latent_shape"</span><span class="p">],</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
             <span class="n">latents</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"vmask"</span><span class="p">]</span> <span class="o">*</span> <span class="n">st</span><span class="p">[</span><span class="s2">"cond_video_latents"</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="mf">1.0</span> <span class="o">-</span> <span class="n">st</span><span class="p">[</span><span class="s2">"vmask"</span><span class="p">])</span> <span class="o">*</span> <span class="n">v_noise</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">latents</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="n">action_latents</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"action_latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="n">time_index</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"time_index"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">step_index</span> <span class="o">=</span> <span class="n">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">time_index</span><span class="p">)</span>
 
         <span class="n">scheduler</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
-        <span class="n">step_index</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">time_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
         <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span>
@@ -2498,10 +2543,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">gi</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"guidance_interval"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">gi</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
-        <span class="n">sched</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">timesteps</span><span class="p">):</span>
+        <span class="n">timesteps</span> <span class="o">=</span> <span class="n">_host_timesteps</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">step_index</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">timesteps</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">False</span>
-        <span class="n">t</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">timesteps</span><span class="p">[</span><span class="n">step_index</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">timesteps</span><span class="p">[</span><span class="n">step_index</span><span class="p">])</span>
         <span class="k">return</span> <span class="n">gi</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="n">t</span> <span class="o">&lt;=</span> <span class="n">gi</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_forward_image_gen</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">attn</span><span class="p">,</span> <span class="n">st</span><span class="p">,</span> <span class="n">latents</span><span class="p">,</span> <span class="n">time_index</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
@@ -3336,13 +3381,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">st</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">st</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
-        <span class="n">loop</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">ACTION_GEN_WALK</span><span class="p">:</span> <span class="n">ACTION_GEN_LOOP</span><span class="p">,</span>
-            <span class="n">ACTION_VIDEO_GEN_WALK</span><span class="p">:</span> <span class="n">ACTION_VIDEO_GEN_LOOP</span><span class="p">,</span>
-            <span class="n">VIDEO_GEN_WALK</span><span class="p">:</span> <span class="n">VIDEO_GEN_LOOP</span><span class="p">,</span>
-            <span class="n">VIDEO_GEN_AR_WALK</span><span class="p">:</span> <span class="n">VIDEO_GEN_AR_LOOP</span><span class="p">,</span>
-            <span class="n">VIDEO_SOUND_GEN_WALK</span><span class="p">:</span> <span class="n">VIDEO_SOUND_GEN_LOOP</span><span class="p">,</span>
-        <span class="p">}</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_info</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">IMAGE_GEN_LOOP</span><span class="p">)</span>
+        <span class="n">loop</span> <span class="o">=</span> <span class="n">DENOISE_LOOP_FOR_WALK</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_info</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">IMAGE_GEN_LOOP</span><span class="p">)</span>
         <span class="n">iter_idx</span> <span class="o">=</span> <span class="n">request_info</span><span class="o">.</span><span class="n">dynamic_loop_iter_counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">loop</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="c1"># Windowed requests run every window's iterations in one loop; others</span>
         <span class="c1"># stop at their scheduler's step count.</span>

@@ -814,9 +814,8 @@ plus one request in float32.</p>
 <dd><p>Turn this request’s logits into its next canvas.</p>
 <p>Scoring, the reveal schedule and the in-place write are per-request and
 data-dependent, which is what keeps them out of <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>.
-The iteration index is read off the <code class="docutils literal notranslate"><span class="pre">step_index</span></code> edge rather than
-<code class="docutils literal notranslate"><span class="pre">dynamic_loop_iter_counts</span></code>, which the worker sets wrong on the
-speculative path; everything else comes from step metadata.</p>
+The iteration index is the engine’s loop counter (see <code class="docutils literal notranslate"><span class="pre">_loop_step</span></code>);
+everything else comes from step metadata.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

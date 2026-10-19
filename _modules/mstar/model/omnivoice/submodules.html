@@ -945,6 +945,21 @@ window.runMermaid = runMermaid;</script>
 <span class="n">UNMASK_LOOP_NAME</span> <span class="o">=</span> <span class="s2">"unmask_loop"</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">step_index</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The unmask iteration a step runs, from the engine's loop counter.</span>
+
+<span class="sd">    ``step_index`` holds the same value, but it is the previous step's device</span>
+<span class="sd">    output: reading it on the host waits for that step to finish, which stalls</span>
+<span class="sd">    the speculative preparation of the next one. The counter is per batch and</span>
+<span class="sd">    counts speculative iterations too (#351). Callers that drive the</span>
+<span class="sd">    submodule without a loop counter (tests, harnesses) fall back to the edge.</span>
+<span class="sd">    """</span>
+    <span class="n">counts</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="s2">"dynamic_loop_iter_counts"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="n">UNMASK_LOOP_NAME</span> <span class="ow">in</span> <span class="n">counts</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">UNMASK_LOOP_NAME</span><span class="p">])</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">step_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">_SingleRequestMixin</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Serve one request per step through the engine's batched entry point.</span>
 
@@ -1088,9 +1103,6 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">prefix_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"prefix_ids"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
         <span class="n">prefix_audio_mask</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"prefix_audio_mask"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-        <span class="c1"># target_len rides an edge rather than step_metadata: computing it needs</span>
-        <span class="c1"># the tokenizer and the duration estimator, both data-worker assets.</span>
-        <span class="n">target_len</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s2">"target_len"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
 
         <span class="c1"># Cloning walk only: the codec's reference tokens close out the prefix.</span>
         <span class="c1"># They are joined here rather than on the data worker because the encode</span>
@@ -1112,7 +1124,11 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># Iteration 0: the loop-back edges arrive empty. Seed a fully</span>
             <span class="c1"># masked canvas; there is no noise and no seed to honour, because</span>
             <span class="c1"># the stochastic part of this model is the reveal order, not the</span>
-            <span class="c1"># starting state.</span>
+            <span class="c1"># starting state. target_len rides an edge rather than</span>
+            <span class="c1"># step_metadata: computing it needs the tokenizer and the duration</span>
+            <span class="c1"># estimator, both data-worker assets. Later iterations read it off</span>
+            <span class="c1"># the canvas shape instead, which costs no host read.</span>
+            <span class="n">target_len</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s2">"target_len"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
             <span class="n">tokens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">(</span>
                 <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_audio_codebook</span><span class="p">,</span> <span class="n">target_len</span><span class="p">),</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">audio_mask_id</span><span class="p">,</span>
@@ -1124,11 +1140,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">step_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">step_index</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"step_index"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
-            <span class="c1"># Read the counter off the edge tensor, not from</span>
-            <span class="c1"># fwd_info.dynamic_loop_iter_counts: the worker sets that wrong on</span>
-            <span class="c1"># the speculative path, so the edge is the reliable source until</span>
-            <span class="c1"># that is fixed upstream. Costs a .item() per iteration.</span>
-            <span class="n">k</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">step_index</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+            <span class="n">k</span> <span class="o">=</span> <span class="n">_loop_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">step_index</span><span class="p">)</span>
             <span class="n">num_step</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">meta</span><span class="p">[</span><span class="s2">"num_step"</span><span class="p">])</span>
             <span class="k">if</span> <span class="n">k</span> <span class="o">&gt;=</span> <span class="n">num_step</span><span class="p">:</span>
                 <span class="c1"># Async scheduling dispatched an iteration past this request's</span>
@@ -1140,6 +1152,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
                 <span class="k">return</span> <span class="kc">None</span>
             <span class="n">tokens</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"audio_tokens"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">target_len</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
 
         <span class="k">return</span> <span class="n">NodeInputs</span><span class="p">(</span>
             <span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span>
@@ -1280,13 +1293,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Scoring, the reveal schedule and the in-place write are per-request and</span>
 <span class="sd">        data-dependent, which is what keeps them out of ``forward_batched``.</span>
-<span class="sd">        The iteration index is read off the ``step_index`` edge rather than</span>
-<span class="sd">        ``dynamic_loop_iter_counts``, which the worker sets wrong on the</span>
-<span class="sd">        speculative path; everything else comes from step metadata.</span>
+<span class="sd">        The iteration index is the engine's loop counter (see ``_loop_step``);</span>
+<span class="sd">        everything else comes from step metadata.</span>
 <span class="sd">        """</span>
         <span class="k">assert</span> <span class="n">inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"OmniVoice backbone postprocess needs its inputs"</span>
         <span class="n">meta</span> <span class="o">=</span> <span class="n">request_info</span><span class="o">.</span><span class="n">step_metadata</span>
-        <span class="n">k</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">inputs</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="p">[</span><span class="s2">"step_index"</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+        <span class="n">k</span> <span class="o">=</span> <span class="n">_loop_step</span><span class="p">(</span><span class="n">request_info</span><span class="p">,</span> <span class="n">inputs</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="p">[</span><span class="s2">"step_index"</span><span class="p">])</span>
 
         <span class="c1"># Cloned because apply_reveal writes in place and this tensor is the</span>
         <span class="c1"># edge the engine routed in from the previous iteration; mutating it</span>
