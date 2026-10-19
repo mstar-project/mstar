@@ -7,6 +7,7 @@ import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -157,14 +158,58 @@ def block_only(monkeypatch, net):
     "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.100.100.200", "0.0.0.0",
     "224.0.0.1", "239.1.1.1", "255.255.255.255", "::1", "::", "fe80::1", "fe80::1%2", "fd00:ec2::254",
     "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+    # NAT64, 6to4 and IPv4-compatible forms of internal IPv4 addresses, and local-use NAT64
+    "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b:1::808:808", "2002:7f00:1::", "2002:a00:1:2::3",
+    "::127.0.0.1", "::169.254.169.254",
 ])
 def test_internal_addresses_are_blocked(addr):
     assert media_io._blocked_address(addr)
 
 
-@pytest.mark.parametrize("addr", ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"])
+@pytest.mark.parametrize("addr", [
+    "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::1",
+    "::8.8.8.8",
+])
 def test_public_addresses_are_not_blocked(addr):
     assert not media_io._blocked_address(addr)
+
+
+# The same table as only_the_canonical_spelling_matches_the_allowlist in rust/server/src/media.rs.
+@pytest.mark.parametrize("url, host", [
+    ("http://127.0.0.1:8000/a.png", "127.0.0.1"),
+    ("http://127.0.0.1./a.png", "127.0.0.1"),
+    ("http://user@Example.ORG/a.png", "example.org"),
+    ("https://[::1]:8443/a.png", "::1"),
+    ("http://[::ffff:7f00:1]/a.png", "::ffff:7f00:1"),
+    ("http://0xg/a.png", "0xg"),
+    ("http://2130706433/a.png", None),
+    ("http://0x7f000001/a.png", None),
+    ("http://127.1/a.png", None),
+    ("http://127.0.0.01/a.png", None),
+    ("http://0177.0.0.1/a.png", None),
+    ("http://[0:0:0:0:0:0:0:1]/a.png", None),
+    ("http://[::ffff:127.0.0.1]/a.png", None),
+    ("http://%31%32%37.0.0.1/a.png", None),
+    ("http://b\u00fccher.example/a.png", None),
+])
+def test_only_the_canonical_spelling_matches_the_allowlist(url, host):
+    written = urlsplit(url).hostname.rstrip(".")
+    assert media_io._host_allowlisted(written, [written]) == (host is not None)
+    if host is not None:
+        assert written == host
+
+
+def test_other_spellings_of_an_allowlisted_address_are_refused(upstream, uploads, monkeypatch):
+    up = upstream()
+    up.routes["/a.png"] = reply(body=PNG)
+    up.routes["/r"] = redirect(f"//127.1:{up.port}/a.png")
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
+    for host in ("2130706433", "0x7f000001", "127.1", "127.0.0.01"):
+        refused(up.url("/a.png", host=host), uploads, "host not allowed")
+    refused(up.url("/r"), uploads, "host not allowed")
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "2130706433")
+    refused(up.url("/a.png", host="2130706433"), uploads, "host not allowed")
+    assert [p for p, _ in up.requests] == ["/r"]
 
 
 def test_allowlisted_host_is_fetched(upstream, uploads, monkeypatch):

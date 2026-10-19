@@ -178,27 +178,61 @@ const BLOCKED_V4: [(Ipv4Addr, u32); 11] = [
     (Ipv4Addr::new(224, 0, 0, 0), 4),
     (Ipv4Addr::new(240, 0, 0, 0), 4),
 ];
-const BLOCKED_V6: [(Ipv6Addr, u32); 6] = [
+const BLOCKED_V6: [(Ipv6Addr, u32); 7] = [
     (Ipv6Addr::UNSPECIFIED, 128),
     (Ipv6Addr::LOCALHOST, 128),
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
     (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
     (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
     (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
     (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
 ];
 
+/// The IPv4 address an IPv4-mapped, 6to4 (2002::/16), NAT64 (64:ff9b::/96) or
+/// IPv4-compatible (::/96) address reaches. NAT64 is not refused outright: on an
+/// IPv6-only network with DNS64 every IPv4-only host resolves into it.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let bits = u128::from(v6);
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        Some(v4)
+    } else if bits >> 112 == 0x2002 {
+        Some(Ipv4Addr::from((bits >> 80) as u32))
+    } else if bits >> 32 == 0x64_ff9b_0000_0000_0000_0000 || bits >> 32 == 0 {
+        Some(Ipv4Addr::from(bits as u32))
+    } else {
+        None
+    }
+}
+
 fn blocked_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => BLOCKED_V4
             .iter()
             .any(|&(net, len)| u32::from(v4) >> (32 - len) == u32::from(net) >> (32 - len)),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match embedded_v4(v6) {
             Some(v4) => blocked_address(IpAddr::V4(v4)),
             None => BLOCKED_V6
                 .iter()
                 .any(|&(net, len)| u128::from(v6) >> (128 - len) == u128::from(net) >> (128 - len)),
         },
     }
+}
+
+/// The host of `url` as written (lower-cased, without brackets or a trailing
+/// dot), or `None` when the text has no `//` authority.
+fn written_host(url: &str) -> Option<String> {
+    let after_scheme = match url.split_once(':') {
+        Some((scheme, rest)) if !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)) => rest,
+        _ => url,
+    };
+    let rest = after_scheme.strip_prefix("//")?;
+    let authority = &rest[..rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => &v6[..v6.find(']')?],
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+    };
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// Limits on remote fetch: `MSTAR_REMOTE_ALLOWED_HOSTS` (comma-separated hosts
@@ -231,11 +265,16 @@ impl RemotePolicy {
         })
     }
 
-    /// `host` equals an entry, or ends in `.suffix` for a `*.suffix` entry.
-    fn allowlisted(&self, host: &str) -> bool {
-        self.allowed_hosts
-            .iter()
-            .any(|p| host == p || (p.starts_with("*.") && host.ends_with(&p[1..])))
+    /// `host` (as the URL parser prints it) equals an entry, or ends in `.suffix`
+    /// for a `*.suffix` entry. Only a host the URL wrote that same way can match,
+    /// so another spelling of a listed address (`2130706433`, `0x7f000001`,
+    /// `127.1`) gets the address check instead, as in the Python frontend.
+    fn allowlisted(&self, host: &str, written: Option<&str>) -> bool {
+        written == Some(host)
+            && self
+                .allowed_hosts
+                .iter()
+                .any(|p| host == p || (p.starts_with("*.") && host.ends_with(&p[1..])))
     }
 }
 
@@ -263,16 +302,18 @@ fn save_remote_url(
     policy: &RemotePolicy,
 ) -> Result<(String, String), String> {
     let deadline = Instant::now() + policy.timeout;
+    let mut written = written_host(url);
     let mut url = url::Url::parse(url).map_err(|e| fetch_error("", "invalid URL", e))?;
     let mut host = String::new();
     for _ in 0..=REMOTE_MAX_REDIRECTS {
-        host = match url.host() {
-            Some(url::Host::Domain(d)) => d.trim_end_matches('.').to_ascii_lowercase(),
-            Some(url::Host::Ipv4(a)) => a.to_string(),
-            Some(url::Host::Ipv6(a)) => a.to_string(),
-            None => String::new(),
-        };
-        let allowlisted = policy.allowlisted(&host);
+        host = url
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let allowlisted = policy.allowlisted(&host, written.as_deref());
         if !matches!(url.scheme(), "http" | "https") || host.is_empty() {
             return Err(fetch_error(&host, "invalid URL", &url));
         }
@@ -286,7 +327,15 @@ fn save_remote_url(
             return Err(fetch_error(&host, "host not allowed", format!("resolves to {addrs:?}")));
         }
         match fetch_hop(&url, &host, &addrs, upload_dir, policy.max_bytes, deadline)? {
-            Hop::Redirect(next) => url = next,
+            Hop::Redirect(next, location) => {
+                // a Location without an authority stays on this host, written as before
+                if let Some(w) = written_host(&location) {
+                    written = Some(w);
+                } else if next.host_str() != url.host_str() {
+                    written = None;
+                }
+                url = next;
+            }
             Hop::Saved(modality, path) => return Ok((modality, path)),
         }
     }
@@ -298,7 +347,8 @@ const MAX_LINE: usize = 65536;
 const MAX_HEADERS: usize = 100;
 
 enum Hop {
-    Redirect(url::Url),
+    /// The next URL and the `Location` text it came from.
+    Redirect(url::Url, String),
     Saved(String, String),
 }
 
@@ -560,7 +610,10 @@ fn fetch_hop(
         301 | 302 | 303 | 307 | 308 => {
             let location = header(&headers, "location")
                 .ok_or_else(|| fetch_error(host, "bad redirect", format!("{code} without Location")))?;
-            return url.join(location).map(Hop::Redirect).map_err(|e| fetch_error(host, "invalid URL", e));
+            return url
+                .join(location)
+                .map(|next| Hop::Redirect(next, location.to_string()))
+                .map_err(|e| fetch_error(host, "invalid URL", e));
         }
         200..=299 => {}
         _ => return Err(fetch_error(host, &format!("upstream returned {code}"), "")),
@@ -834,6 +887,7 @@ mod tests {
             "/r3" => redirect("308 Permanent Redirect", "a.png"),
             "/loop" => redirect("302 Found", "/loop"),
             "/to-localhost" => redirect("302 Found", &format!("http://localhost:{port}/a.png")),
+            "/to-short-form" => redirect("302 Found", &format!("//127.1:{port}/a.png")),
             "/to-file" => redirect("302 Found", "file:///etc/passwd"),
             // a body this size would never finish
             "/big.png" => Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\n".to_vec()),
@@ -955,10 +1009,15 @@ mod tests {
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
             "100.100.100.200", "0.0.0.0", "224.0.0.1", "239.1.1.1", "255.255.255.255", "::1", "::",
             "fe80::1", "fd00:ec2::254", "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b:1::808:808", "2002:7f00:1::",
+            "2002:a00:1:2::3", "::127.0.0.1", "::169.254.169.254",
         ] {
             assert!(blocked_address(a.parse().unwrap()), "{a}");
         }
-        for a in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+        for a in [
+            "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808",
+            "2002:808:808::1", "::8.8.8.8",
+        ] {
             assert!(!blocked_address(a.parse().unwrap()), "{a}");
         }
     }
@@ -967,11 +1026,59 @@ mod tests {
     fn wildcard_entries_match_subdomains_only() {
         let p = policy(&["*.media.test", "example.org"], 1, Duration::ZERO);
         for host in ["cdn.media.test", "a.b.media.test", "example.org"] {
-            assert!(p.allowlisted(host), "{host}");
+            assert!(p.allowlisted(host, Some(host)), "{host}");
         }
         for host in ["media.test", "evilmedia.test", "www.example.org"] {
-            assert!(!p.allowlisted(host), "{host}");
+            assert!(!p.allowlisted(host, Some(host)), "{host}");
         }
+    }
+
+    /// The host each URL is matched against, or `None` when another spelling
+    /// keeps it from matching any allowlist entry. Same table as
+    /// `test_only_the_canonical_spelling_matches_the_allowlist` in Python.
+    fn allowlist_host(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        let host = url.host_str()?.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+        (written_host(raw).as_deref() == Some(host)).then(|| host.to_string())
+    }
+
+    #[test]
+    fn only_the_canonical_spelling_matches_the_allowlist() {
+        for (raw, host) in [
+            ("http://127.0.0.1:8000/a.png", "127.0.0.1"),
+            ("http://127.0.0.1./a.png", "127.0.0.1"),
+            ("http://user@Example.ORG/a.png", "example.org"),
+            ("https://[::1]:8443/a.png", "::1"),
+            ("http://[::ffff:7f00:1]/a.png", "::ffff:7f00:1"),
+            ("http://0xg/a.png", "0xg"),
+        ] {
+            assert_eq!(allowlist_host(raw).as_deref(), Some(host), "{raw}");
+        }
+        for raw in [
+            "http://2130706433/a.png",
+            "http://0x7f000001/a.png",
+            "http://127.1/a.png",
+            "http://127.0.0.01/a.png",
+            "http://0177.0.0.1/a.png",
+            "http://[0:0:0:0:0:0:0:1]/a.png",
+            "http://[::ffff:127.0.0.1]/a.png",
+            "http://%31%32%37.0.0.1/a.png",
+            "http://b\u{fc}cher.example/a.png",
+        ] {
+            assert_eq!(allowlist_host(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn other_spellings_of_an_allowlisted_address_are_refused() {
+        let (port, seen) = serve();
+        for host in ["2130706433", "0x7f000001", "127.1", "127.0.0.01"] {
+            refused(&format!("http://{host}:{port}/a.png"), &local(), "host not allowed");
+        }
+        let numeric = policy(&["2130706433"], REMOTE_MAX_BYTES, Duration::from_secs(30));
+        refused(&format!("http://2130706433:{port}/a.png"), &numeric, "host not allowed");
+        refused(&format!("http://127.0.0.1:{port}/to-short-form"), &local(), "host not allowed");
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the redirecting hop reaches the server");
     }
 
     #[test]

@@ -25,6 +25,7 @@ import ipaddress
 import logging
 import math
 import os
+import re
 import socket
 import ssl
 import threading
@@ -315,8 +316,11 @@ _URL_SAFE = "".join(map(chr, range(0x21, 0x7F)))  # printable ASCII, so existing
 _BLOCKED_NETS = tuple(ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
     "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
-    "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+    "::/128", "::1/128", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 ))
+# IPv6 forms that reach the IPv4 address in their low 32 bits: NAT64 and IPv4-compatible.
+_V4_IN_LOW_BITS = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+_IPV4_NUMBER = re.compile(r"[0-9]+|0x[0-9a-f]*")
 
 
 class RemoteFetchError(ValueError):
@@ -330,13 +334,42 @@ def _fetch_error(host: str, reason: str, detail: object = "") -> RemoteFetchErro
 
 def _blocked_address(addr: str) -> bool:
     ip = ipaddress.ip_address(addr)
-    ip = getattr(ip, "ipv4_mapped", None) or ip
+    if ip.version == 6:
+        # IPv4-mapped, 6to4 (2002::/16), NAT64 and IPv4-compatible addresses are
+        # judged by the IPv4 address they carry. NAT64 is not refused outright:
+        # on an IPv6-only network with DNS64 every IPv4-only host resolves into it.
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif any(ip in net for net in _V4_IN_LOW_BITS):
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
     return any(ip in net for net in _BLOCKED_NETS)
 
 
+def _canonical_host(host: str) -> bool:
+    """Whether ``host`` (lower-cased, no brackets or trailing dot) is spelled the way
+    the Rust frontend's URL parser prints it: an ASCII name, dotted-decimal IPv4 or
+    compressed IPv6. ``2130706433``, ``0x7f000001``, ``127.1`` and ``::ffff:127.0.0.1``
+    are not; a name whose last label is a number is an IPv4 address to that parser."""
+    if not host.isascii() or "%" in host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return not _IPV4_NUMBER.fullmatch(host.rsplit(".", 1)[-1])
+    if ip.version == 6 and ip.ipv4_mapped is not None:  # the URL parser prints these in hex
+        v4 = int(ip.ipv4_mapped)
+        return host == f"::ffff:{v4 >> 16:x}:{v4 & 0xFFFF:x}"
+    return ip.compressed == host
+
+
 def _host_allowlisted(host: str, patterns: list[str]) -> bool:
-    """``host`` equals an entry, or ends in ``.suffix`` for a ``*.suffix`` entry."""
-    return any(host == p or (p.startswith("*.") and host.endswith(p[1:])) for p in patterns)
+    """``host`` equals an entry, or ends in ``.suffix`` for a ``*.suffix`` entry. Only a
+    canonically spelled host can match, so another spelling of a listed address gets the
+    address check instead, as in the Rust frontend."""
+    return _canonical_host(host) and any(
+        host == p or (p.startswith("*.") and host.endswith(p[1:])) for p in patterns)
 
 
 def _time_left(deadline: float) -> float:

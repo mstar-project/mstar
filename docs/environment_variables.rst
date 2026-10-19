@@ -351,15 +351,24 @@ Read by the ``mstar-server`` binary and its bridge
        used, so the connection goes to the address that was checked. A host
        that resolves to a loopback, private, link-local, multicast or
        reserved address (cloud metadata included) is refused unless
-       allowlisted. Failures return a 400 with a short message; the details
-       are only logged.
+       allowlisted; an IPv6 address that carries an IPv4 one (IPv4-mapped,
+       NAT64 ``64:ff9b::/96``, 6to4 ``2002::/16``, IPv4-compatible) is
+       judged by that IPv4 address. Failures return a 400 with a short
+       message; the details are only logged. HTTPS certificates are checked
+       against the system trust store on the Python frontend and against
+       the bundled Mozilla roots (``webpki-roots``) on the Rust frontend,
+       so a private CA added to the system store is trusted by Python only.
    * - ``MSTAR_REMOTE_ALLOWED_HOSTS``
      - unset
      - Comma-separated hosts and ``*.suffix`` patterns (``*.example.com``
        matches its subdomains, not ``example.com``). When set, only these
        hosts are fetched, on every redirect hop; listed hosts skip the
-       address check. Read by the same two functions; the Rust frontend
-       reads it once at startup.
+       address check. An entry matches only a host the URL spells in
+       canonical form (an ASCII name, dotted-decimal IPv4, compressed IPv6
+       such as ``[::1]``); other spellings of an address (``2130706433``,
+       ``0x7f000001``, ``127.1``, ``[0:0:0:0:0:0:0:1]``) never match. Read
+       by the same two functions; the Rust frontend reads it once at
+       startup.
    * - ``MSTAR_REMOTE_MAX_BYTES``
      - ``67108864``
      - Largest remote media file fetched (64 MiB), checked against
