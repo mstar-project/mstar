@@ -122,7 +122,7 @@ def test_a_fresh_off_group_row_goes_back_on_a_backlog_step():
     result = FIFOBatchBuilder().build_batch(BatchBuildRequest(
         node_name=NODE, graph_walk=WALK,
         backlog=_batch([1]), fresh=_batch([0]),
-        max_batch_size=32, capture_group=groups.get,
+        walk_caps={WALK: 32}, capture_group=groups.get,
     ))
 
     assert list(result.scheduled.request_to_worker_graph) == [1]
@@ -140,7 +140,7 @@ def test_a_fresh_off_group_row_parks_when_no_backlogged_row_ran():
     result = FIFOBatchBuilder().build_batch(BatchBuildRequest(
         node_name=NODE, graph_walk=WALK,
         backlog=_batch([2]), fresh=_batch([0, 1]), blocked_rids={2},
-        max_batch_size=32, capture_group=groups.get,
+        walk_caps={WALK: 32}, capture_group=groups.get,
     ))
 
     assert list(result.scheduled.request_to_worker_graph) == [0]
@@ -217,8 +217,10 @@ class _AsyncRuntime(_Runtime):
     def is_async_schedulable(self, node, walk):
         return node == NODE
 
-    def speculate_node(self, node, walk, rid):
-        return [SimpleNamespace(node_name=node, is_new_loop_iter=True, loop_name="decode")]
+    def speculate_node(self, node, walks, rids):
+        return [SimpleNamespace(
+            node_name=node, graph_walk=walks[0], is_new_loop_iter=True, loop_name="decode",
+        )]
 
     def prep_spec_rids(self, inp):
         raise _PastBacklogGateError(list(inp.rids))
@@ -238,7 +240,9 @@ class _Loop:
     """
 
     _build_speculation = Worker._build_speculation
+    _async_schedulable = Worker._async_schedulable
     _can_speculate = Worker._can_speculate
+    _choose_spec_target = Worker._choose_spec_target
     _tp_lead_needs_marker = Worker._tp_lead_needs_marker
     _is_tp_lead_pending = Worker._is_tp_lead_pending
     _tp_async_for = Worker._tp_async_for
@@ -272,9 +276,9 @@ class _Loop:
     def _build_executing_batch(self, batch):
         return SimpleNamespace(request_ids=list(batch.request_to_worker_graph))
 
-    def _try_speculate_next(self, pending):
+    def _try_speculate_next(self, pending, target):
         try:
-            return self._real_try_speculate_next(pending)
+            return self._real_try_speculate_next(pending, target)
         except _PastBacklogGateError as gate:
             rids = list(gate.args[0])
         fresh = self.scheduler.get_next_batch(
