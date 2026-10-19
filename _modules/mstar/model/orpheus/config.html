@@ -902,11 +902,19 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.model.orpheus.config</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ScheduledLeftContextChunkPolicy</span>
+
 <span class="c1"># Constants</span>
 <span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
 <span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"rope"</span>
+
+<span class="c1"># SNAC captures one CUDA graph per window size at every capture batch size,</span>
+<span class="c1"># and every size from 1 frame up to the widest window occurs (final flushes),</span>
+<span class="c1"># so the widest window (left + right context + largest chunk) bounds startup</span>
+<span class="c1"># and graph memory.</span>
+<span class="n">SNAC_MAX_WINDOW_FRAMES</span> <span class="o">=</span> <span class="mi">16</span>
 
 <div class="viewcode-block" id="OrpheusModelConfig">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig">[docs]</a>
@@ -943,11 +951,25 @@ window.runMermaid = runMermaid;</script>
     <span class="n">tokens_per_frame</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">7</span>
     <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">24000</span>
 
-    <span class="c1"># Streaming chunking params (for async partition mode)</span>
-    <span class="n">snac_window_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">28</span>      <span class="c1"># 4 frames * 7 tokens/frame</span>
-    <span class="n">snac_stride_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">7</span>       <span class="c1"># 1 frame advance per chunk</span>
-    <span class="n">snac_audio_slice_start</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>  <span class="c1"># middle region start in decoded audio</span>
-    <span class="n">snac_audio_slice_end</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4096</span>    <span class="c1"># middle region end in decoded audio</span>
+    <span class="n">snac_hop_samples</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>      <span class="c1"># audio samples per 7-token frame</span>
+
+    <span class="c1"># Streaming SNAC decode (async partition mode), in 7-token frames. The</span>
+    <span class="c1"># decoder is not causal, so a frame's audio depends on frames on both</span>
+    <span class="c1"># sides: each chunk decodes its frames with up to ``left_context`` earlier</span>
+    <span class="c1"># and ``right_context`` later ones and emits only its own. The last</span>
+    <span class="c1"># ``right_context`` frames of a chunk are emitted by the next one, and the</span>
+    <span class="c1"># final flush decodes the real tail of the stream. Chunk k takes</span>
+    <span class="c1"># ``snac_chunk_schedule[k]`` new frames (``snac_chunk_frames`` after it),</span>
+    <span class="c1"># so the first audio leaves after ``snac_chunk_schedule[0]`` frames.</span>
+    <span class="c1"># The first audio is 2 frames (the first chunk's 4 less its right</span>
+    <span class="c1"># context); three 2-frame chunks then keep ahead of the listener until the</span>
+    <span class="c1"># buffer covers a 4-frame chunk, at 32 streams too.</span>
+    <span class="c1"># Deployment YAML ``model_kwargs`` override these; left + right context</span>
+    <span class="c1"># plus the largest chunk may be at most ``SNAC_MAX_WINDOW_FRAMES``.</span>
+    <span class="n">snac_chunk_schedule</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="n">snac_chunk_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span>
+    <span class="n">snac_left_context_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span>
+    <span class="n">snac_right_context_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span>
 
     <span class="c1"># Generation defaults</span>
     <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.6</span>
@@ -966,7 +988,66 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">available_voices</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"default_voice </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span><span class="si">!r}</span><span class="s2"> is not in available_voices"</span>
-            <span class="p">)</span></div>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_left_context_frames</span> <span class="o">&lt;</span> <span class="mi">0</span> \
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"snac_chunk_frames must be positive and SNAC context frames non-negative"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">n</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"snac_chunk_schedule sizes must be positive"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span> <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span><span class="p">,))[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"the first SNAC chunk must exceed snac_right_context_frames, "</span>
+                <span class="s2">"or it emits no audio"</span>
+            <span class="p">)</span>
+        <span class="n">widest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_left_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span> \
+            <span class="o">+</span> <span class="nb">max</span><span class="p">((</span><span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">widest</span> <span class="o">&gt;</span> <span class="n">SNAC_MAX_WINDOW_FRAMES</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"SNAC left + right context plus the largest chunk is </span><span class="si">{</span><span class="n">widest</span><span class="si">}</span><span class="s2"> frames; "</span>
+                <span class="sa">f</span><span class="s2">"at most </span><span class="si">{</span><span class="n">SNAC_MAX_WINDOW_FRAMES</span><span class="si">}</span><span class="s2"> are supported (one CUDA graph per window size)"</span>
+            <span class="p">)</span>
+
+<div class="viewcode-block" id="OrpheusModelConfig.snac_chunk_policy">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_chunk_policy">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">snac_chunk_policy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ScheduledLeftContextChunkPolicy</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The LLM -&gt; SNAC edge's chunking, in tokens.</span>
+
+<span class="sd">        A chunk's leading ``context_items`` are its left context plus the</span>
+<span class="sd">        previous chunk's right context, which this chunk emits.</span>
+<span class="sd">        """</span>
+        <span class="n">tpf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_frame</span>
+        <span class="k">return</span> <span class="n">ScheduledLeftContextChunkPolicy</span><span class="p">(</span>
+            <span class="n">schedule</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">n</span> <span class="o">*</span> <span class="n">tpf</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">),</span>
+            <span class="n">chunk</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span> <span class="o">*</span> <span class="n">tpf</span><span class="p">,</span>
+            <span class="n">left_context</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_left_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span><span class="p">)</span> <span class="o">*</span> <span class="n">tpf</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OrpheusModelConfig.snac_window_frames">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_frames">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">snac_window_frames</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Every window size, in frames, a stream can hand the decoder.</span>
+
+<span class="sd">        The schedule's windows and every final flush: the policy runs over</span>
+<span class="sd">        each stream length until the windows repeat. The windows do not depend</span>
+<span class="sd">        on when tokens arrive, only on how many there are. A window shorter</span>
+<span class="sd">        than a frame (a stream shorter than a frame, or a final flush holding</span>
+<span class="sd">        only the EOS token) decodes one silent frame, as in ``prepare_inputs``.</span>
+<span class="sd">        """</span>
+        <span class="n">tpf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_frame</span>
+        <span class="n">steady</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_left_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span>
+        <span class="n">sizes</span> <span class="o">=</span> <span class="p">{</span><span class="mi">1</span><span class="p">}</span>
+        <span class="k">for</span> <span class="n">frames</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">steady</span> <span class="o">+</span> <span class="mi">1</span><span class="p">):</span>
+            <span class="n">policy</span><span class="p">,</span> <span class="n">left</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_policy</span><span class="p">(),</span> <span class="n">frames</span> <span class="o">*</span> <span class="n">tpf</span> <span class="o">+</span> <span class="mi">1</span>  <span class="c1"># the EOS token streams last</span>
+            <span class="k">while</span> <span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">left</span><span class="p">):</span>
+                <span class="n">sizes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">window_size</span><span class="p">()</span> <span class="o">//</span> <span class="n">tpf</span><span class="p">)</span>
+                <span class="n">stride</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">next_chunk_size</span><span class="p">(</span><span class="n">left</span><span class="p">)</span>
+                <span class="n">policy</span><span class="o">.</span><span class="n">register_chunk</span><span class="p">(</span><span class="n">stride</span><span class="p">)</span>
+                <span class="n">left</span> <span class="o">-=</span> <span class="n">stride</span>
+            <span class="n">sizes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">left</span> <span class="o">//</span> <span class="n">tpf</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+        <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span></div>
+</div>
 
 </pre></div>
 
