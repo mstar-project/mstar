@@ -677,6 +677,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.decode_rows_then_prompt"><code class="docutils literal notranslate"><span class="pre">decode_rows_then_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.distribute_tokens"><code class="docutils literal notranslate"><span class="pre">distribute_tokens()</span></code></a></li>
 </ul>
             </nav>
@@ -694,7 +695,10 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_config.distribute_tokens" title="mstar.engine.cuda_graph_config.distribute_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distribute_tokens</span></code></a>(total_tokens, bs)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_config.decode_rows_then_prompt" title="mstar.engine.cuda_graph_config.decode_rows_then_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_rows_then_prompt</span></code></a>(total_tokens, bs)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bs</span> <span class="pre">-</span> <span class="pre">1</span></code> one-token rows and a prompt row of the rest: a mixed step's layout, for kernels that split rows by span.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_config.distribute_tokens" title="mstar.engine.cuda_graph_config.distribute_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distribute_tokens</span></code></a>(total_tokens, bs)</p></td>
 <td><p>Split <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> across <code class="docutils literal notranslate"><span class="pre">bs</span></code> requests, remainder on the first.</p></td>
 </tr>
 </tbody>
@@ -871,7 +875,7 @@
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_config.PackedCudaGraphConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_config.</span></span><span class="sig-name descname"><span class="pre">PackedCudaGraphConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">capture_graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_token_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">make_node_input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">replay_graph_walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">additional_key_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_batch_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_forward_method</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'forward_batched'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps_eager_batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_tokens_multiplier</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_dims</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_config.html#PackedCudaGraphConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_config.PackedCudaGraphConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_config.</span></span><span class="sig-name descname"><span class="pre">PackedCudaGraphConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">capture_graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_token_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">make_node_input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">replay_graph_walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">additional_key_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_batch_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_forward_method</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'forward_batched'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps_eager_batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_tokens_multiplier</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_dims</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_config.html#PackedCudaGraphConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_config.PackedCudaGraphConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.cuda_graph_config.CudaGraphConfig" title="mstar.engine.cuda_graph_config.CudaGraphConfig"><code class="xref py py-class docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -887,6 +891,7 @@
 <li><p><strong>caps_eager_batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>total_tokens_multiplier</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>input_seq_dims</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>token_layout</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1263,6 +1268,25 @@ replay.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_config.decode_rows_then_prompt">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_config.</span></span><span class="sig-name descname"><span class="pre">decode_rows_then_prompt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_config.html#decode_rows_then_prompt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_config.decode_rows_then_prompt" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">bs</span> <span class="pre">-</span> <span class="pre">1</span></code> one-token rows and a prompt row of the rest: a mixed step’s
+layout, for kernels that split rows by span. <cite>distribute_tokens</cite> when
+there are fewer tokens than rows.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>total_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_config.distribute_tokens">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_config.</span></span><span class="sig-name descname"><span class="pre">distribute_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_config.html#distribute_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_config.distribute_tokens" title="Link to this definition">#</a></dt>
 <dd><p>Split <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> across <code class="docutils literal notranslate"><span class="pre">bs</span></code> requests, remainder on the first.</p>
@@ -1396,6 +1420,7 @@ replay.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.decode_rows_then_prompt"><code class="docutils literal notranslate"><span class="pre">decode_rows_then_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_config.distribute_tokens"><code class="docutils literal notranslate"><span class="pre">distribute_tokens()</span></code></a></li>
 </ul>
   </nav></div>

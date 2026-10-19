@@ -24,6 +24,7 @@ mstar.engine.resources.attn.wrappers
    .. autosummary::
    
       FlashInferDecodeWrapper
+      FlashInferMixedWrapper
       FlashInferPrefillWrapper
    
    

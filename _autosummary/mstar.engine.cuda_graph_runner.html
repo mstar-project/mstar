@@ -624,6 +624,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.config_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.declare_inputs_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.dropped_buckets</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.is_packed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.max_batch_size_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.pad_inputs()</span></code></a></li>
@@ -905,6 +906,20 @@ passes it to <code class="docutils literal notranslate"><span class="pre">prepro
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets">
 <span class="sig-name descname"><span class="pre">dropped_buckets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><span class="pre">BucketKey</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed">
+<span class="sig-name descname"><span class="pre">is_packed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lease</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner.is_packed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed" title="Link to this definition">#</a></dt>
+<dd><p>Whether <code class="docutils literal notranslate"><span class="pre">lease</span></code> replays a packed capture.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lease</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SlotLease" title="mstar.engine.resources.step.SlotLease"><em>SlotLease</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">
@@ -1772,6 +1787,7 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.config_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.declare_inputs_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.dropped_buckets</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.is_packed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.max_batch_size_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.pad_inputs()</span></code></a></li>

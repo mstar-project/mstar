@@ -913,6 +913,13 @@ window.runMermaid = runMermaid;</script>
 <span class="n">LINEAR_ATTENTION</span> <span class="o">=</span> <span class="s2">"linear_attention"</span>
 <span class="n">FULL_ATTENTION</span> <span class="o">=</span> <span class="s2">"full_attention"</span>
 
+<span class="c1"># text prefill and decode rows batched in one step (Model.get_combined_graph_walks)</span>
+<span class="n">LLM_MIXED</span> <span class="o">=</span> <span class="s2">"mixed"</span>
+<span class="c1"># Prompt rows a mixed step may carry: its GDN runs them on the chunked kernel,</span>
+<span class="c1"># which gathers and scatters each one's whole state (`GDNMixedWrapper`), and</span>
+<span class="c1"># the decode rows on the decode kernel.</span>
+<span class="n">MIXED_MAX_PREFILL_ROWS</span> <span class="o">=</span> <span class="mi">4</span>
+
 <span class="c1"># resource keys this model declares</span>
 <span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>

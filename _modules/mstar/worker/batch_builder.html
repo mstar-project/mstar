@@ -931,10 +931,17 @@ window.runMermaid = runMermaid;</script>
     <span class="n">fresh</span><span class="p">:</span> <span class="s2">"ScheduledBatch | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Rows of `backlog` that cannot run this step; they stay parked.</span>
     <span class="n">blocked_rids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
-    <span class="c1"># Rows left in the step once the caller's own are counted (&gt; 0); None is uncapped.</span>
-    <span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># The rid whose capture group the step must share, else its first row's.</span>
     <span class="n">capture_group_of</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Each real walk's cap (None or absent: uncapped); under `graph_walk`, the</span>
+    <span class="c1"># cap of a step mixing walks.</span>
+    <span class="n">walk_caps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># Under a combined walk: how many rows of each real walk a step mixing</span>
+    <span class="c1"># walks may hold (absent is uncapped). A step of one walk is not bound.</span>
+    <span class="n">walk_row_caps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># The caller's own rows (a speculation merge's continuing ones) and their walk.</span>
+    <span class="n">pre_existing_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">pre_existing_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># `Engine.capture_group` for one rid of this (node, walk).</span>
     <span class="n">capture_group</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="k">lambda</span> <span class="n">_</span><span class="p">:</span> <span class="kc">None</span></div>
 
@@ -1034,6 +1041,12 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Backlog first, then fresh rows, in arrival order, up to the cap; one</span>
 <span class="sd">    capture group per step.</span>
 
+<span class="sd">    Under a combined walk a step of one walk takes that walk's cap and a mixed</span>
+<span class="sd">    step the combined walk's own, or with none the smallest of the caps of the</span>
+<span class="sd">    walks present in it; a walk with no row in the step does not cap it. Rows join in</span>
+<span class="sd">    order; one whose walk would cap the step at or below the rows already in</span>
+<span class="sd">    it is left out, and is first in line next step.</span>
+
 <span class="sd">    Where this differs from the scheduler it replaces, and why. main had two</span>
 <span class="sd">    paths: with a backlog it drained that alone, never touching the ready</span>
 <span class="sd">    queues, so the backlog strictly shrank; with none it popped a fresh set,</span>
@@ -1051,13 +1064,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    no backlog it parks, exactly as main did, and the remainder keeps its</span>
 <span class="sd">    arrival order instead of being re-popped and reordered. A row held back</span>
 <span class="sd">    for any other reason -- OOM backoff, pending remove, a foreign capture</span>
-<span class="sd">    group -- always parks: it cannot run this step whoever holds it.</span>
+<span class="sd">    group, a walk the combined cap left out -- always parks: it cannot run</span>
+<span class="sd">    this step whoever holds it.</span>
 <span class="sd">    """</span>
 
 <div class="viewcode-block" id="FIFOBatchBuilder.build_batch">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">build_batch</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">BatchBuildRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BatchBuildResult</span><span class="p">:</span>
-        <span class="n">max_bs</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">max_batch_size</span>
         <span class="c1"># both read before `_merged`, which folds `fresh` into `backlog` in place</span>
         <span class="n">had_backlog</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">backlog</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">fresh_rids</span> <span class="o">=</span> <span class="p">(</span>
@@ -1071,6 +1084,15 @@ window.runMermaid = runMermaid;</script>
             <span class="n">batch</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">capture_group</span><span class="p">,</span>
             <span class="n">exclude_rids</span><span class="o">=</span><span class="n">request</span><span class="o">.</span><span class="n">blocked_rids</span><span class="p">,</span> <span class="n">anchor</span><span class="o">=</span><span class="n">request</span><span class="o">.</span><span class="n">capture_group_of</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="n">_single_walk</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">request</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">walk</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">max_bs</span><span class="p">,</span> <span class="n">left_out</span> <span class="o">=</span> <span class="n">_compose_walks</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">exclude</span><span class="p">,</span> <span class="n">request</span><span class="p">)</span>
+            <span class="n">exclude</span> <span class="o">=</span> <span class="n">exclude</span> <span class="o">|</span> <span class="n">left_out</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">cap</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">walk_caps</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
+            <span class="n">max_bs</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">cap</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">cap</span> <span class="o">-</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_batch_size</span>
+        <span class="k">if</span> <span class="n">max_bs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">max_bs</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">batch</span><span class="p">)</span>  <span class="c1"># the caller's rows fill it</span>
         <span class="n">scheduled</span><span class="p">,</span> <span class="n">remainder</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">split_off_first</span><span class="p">(</span><span class="n">max_bs</span><span class="p">,</span> <span class="n">exclude_rids</span><span class="o">=</span><span class="n">exclude</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">remainder</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="n">scheduled</span><span class="p">)</span>
@@ -1087,6 +1109,66 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 </div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_single_walk</span><span class="p">(</span><span class="n">batch</span><span class="p">:</span> <span class="s2">"ScheduledBatch"</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">BatchBuildRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The one walk of every row, the caller's included, else None."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_walks</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">request</span><span class="o">.</span><span class="n">graph_walk</span>
+    <span class="n">walks</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">request_walks</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>  <span class="c1"># rows and request_walks share keys</span>
+    <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">walks</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">walks</span><span class="o">.</span><span class="n">pop</span><span class="p">()</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">walks</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_min_cap</span><span class="p">(</span><span class="o">*</span><span class="n">caps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">return</span> <span class="nb">min</span><span class="p">((</span><span class="n">cap</span> <span class="k">for</span> <span class="n">cap</span> <span class="ow">in</span> <span class="n">caps</span> <span class="k">if</span> <span class="n">cap</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_compose_walks</span><span class="p">(</span>
+    <span class="n">batch</span><span class="p">:</span> <span class="s2">"ScheduledBatch"</span><span class="p">,</span> <span class="n">exclude</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">request</span><span class="p">:</span> <span class="n">BatchBuildRequest</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Rows left for the step after the caller's, and the rows left out."""</span>
+    <span class="n">caps</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">walk_caps</span>
+    <span class="n">row_caps</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">walk_row_caps</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_batch_size</span>
+    <span class="n">walks</span> <span class="o">=</span> <span class="p">{</span><span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span><span class="p">}</span> <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span> <span class="k">else</span> <span class="nb">set</span><span class="p">()</span>
+    <span class="n">counts</span> <span class="o">=</span> <span class="p">{</span><span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span><span class="p">:</span> <span class="n">n</span><span class="p">}</span> <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_walk</span> <span class="k">else</span> <span class="p">{}</span>
+    <span class="n">cap</span> <span class="o">=</span> <span class="n">_min_cap</span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="n">caps</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">walks</span><span class="p">))</span>
+    <span class="n">left_out</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_to_worker_graph</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">exclude</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">walk_of</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="n">new_cap</span> <span class="o">=</span> <span class="n">cap</span>
+        <span class="k">if</span> <span class="n">walk</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">walks</span><span class="p">:</span>
+            <span class="n">mixed_cap</span> <span class="o">=</span> <span class="n">caps</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">)</span> <span class="k">if</span> <span class="n">walks</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="c1"># a mixed step: the combined walk's own cap where it has one,</span>
+            <span class="c1"># else the smallest of the walks present</span>
+            <span class="n">new_cap</span> <span class="o">=</span> <span class="n">mixed_cap</span> <span class="k">if</span> <span class="n">mixed_cap</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">_min_cap</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="n">caps</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">new_cap</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">new_cap</span> <span class="o">&lt;=</span> <span class="n">n</span><span class="p">:</span>
+            <span class="n">left_out</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">row_caps</span> <span class="ow">and</span> <span class="n">walks</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">walk</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">walks</span><span class="p">:</span>
+                <span class="c1"># the row makes the step mix walks: every walk's rows count</span>
+                <span class="n">over</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span>
+                    <span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">w</span> <span class="o">==</span> <span class="n">walk</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">row_caps</span><span class="p">[</span><span class="n">w</span><span class="p">]</span>
+                    <span class="k">for</span> <span class="n">w</span> <span class="ow">in</span> <span class="p">(</span><span class="o">*</span><span class="n">walks</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span> <span class="k">if</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">row_caps</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># already mixed or not, only this walk's count moves</span>
+                <span class="n">cap_w</span> <span class="o">=</span> <span class="n">row_caps</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
+                <span class="n">over</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">walks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">cap_w</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">counts</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&gt;</span> <span class="n">cap_w</span>
+            <span class="k">if</span> <span class="n">over</span><span class="p">:</span>
+                <span class="c1"># the step would mix walks past one's row cap</span>
+                <span class="n">left_out</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="k">continue</span>
+        <span class="n">walks</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
+        <span class="n">counts</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span> <span class="o">=</span> <span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="n">cap</span> <span class="o">=</span> <span class="n">new_cap</span>
+        <span class="n">n</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">return</span> <span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">cap</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">cap</span> <span class="o">-</span> <span class="n">request</span><span class="o">.</span><span class="n">pre_existing_batch_size</span><span class="p">),</span> <span class="n">left_out</span>
 
 
 <div class="viewcode-block" id="BatchBuilderType">

@@ -911,6 +911,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -965,7 +966,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">slot_indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>  <span class="c1"># [rows] int32, `pad_index` where nothing is addressed</span>
     <span class="n">has_state</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>     <span class="c1"># [rows] bool, False where the slot reads as zeros</span>
-    <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span>               <span class="c1"># real rows, before a capture bucket's padding</span></div>
+    <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span>               <span class="c1"># real rows, before a capture bucket's padding</span>
+    <span class="c1"># The same two on the host, as built: a backend that splits rows between</span>
+    <span class="c1"># kernels by them must not read the device copies back</span>
+    <span class="n">host_slot_indices</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">host_has_state</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1326,6 +1331,10 @@ window.runMermaid = runMermaid;</script>
             <span class="n">slot_indices</span><span class="o">=</span><span class="n">target</span><span class="o">.</span><span class="n">slot_indices</span><span class="p">,</span>
             <span class="n">has_state</span><span class="o">=</span><span class="n">target</span><span class="o">.</span><span class="n">has_state</span><span class="p">,</span>
             <span class="n">num_rows</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
+            <span class="c1"># the lists as built, not copies: this call made them and nothing</span>
+            <span class="c1"># changes them after</span>
+            <span class="n">host_slot_indices</span><span class="o">=</span><span class="n">indices</span><span class="p">,</span>
+            <span class="n">host_has_state</span><span class="o">=</span><span class="n">has_state</span><span class="p">,</span>
         <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_addressing_buffers</span><span class="p">(</span>

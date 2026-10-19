@@ -921,6 +921,30 @@ window.runMermaid = runMermaid;</script>
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 
+<div class="viewcode-block" id="CombinedSplit">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.CombinedSplit">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CombinedSplit</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A combined walk run on two kernels: decode for one-token rows, prefill</span>
+<span class="sd">    for the rows of ``prefill_walks``, captured for as many as</span>
+<span class="sd">    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""</span>
+    <span class="n">combined_walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">prefill_walks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+
+<div class="viewcode-block" id="CombinedSplit.max_prefill_rows">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.CombinedSplit.max_prefill_rows">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_prefill_rows</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"int | None"</span><span class="p">],</span> <span class="n">bucket_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">total</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefill_walks</span><span class="p">:</span>
+            <span class="n">cap</span> <span class="o">=</span> <span class="n">max_rows_in_combined</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
+            <span class="n">total</span> <span class="o">+=</span> <span class="n">bucket_rows</span> <span class="k">if</span> <span class="n">cap</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">cap</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">total</span><span class="p">,</span> <span class="n">bucket_rows</span><span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="NodeResourceSpec">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec">[docs]</a>
 <span class="nd">@dataclass</span>

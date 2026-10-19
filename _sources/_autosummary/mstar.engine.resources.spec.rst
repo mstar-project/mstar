@@ -24,6 +24,7 @@ mstar.engine.resources.spec
 
    .. autosummary::
    
+      CombinedSplit
       NodeResourceSpec
       ResourceReqConfig
    

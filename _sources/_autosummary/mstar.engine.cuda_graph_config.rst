@@ -13,6 +13,7 @@ mstar.engine.cuda\_graph\_config
 
    .. autosummary::
    
+      decode_rows_then_prompt
       distribute_tokens
    
    

@@ -1002,6 +1002,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># No per-rid entries were built: every output signal of the step stays on</span>
     <span class="c1"># the device (see ``ExecutingBatch.rows_only``). Readers use the rows.</span>
     <span class="n">rows_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># A mixed step's rows whose own walk keeps every output signal on the</span>
+    <span class="c1"># device (see ``ExecutingBatch.loopback_rids``)</span>
+    <span class="n">loopback_rids</span><span class="p">:</span> <span class="nb">frozenset</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
 <div class="viewcode-block" id="BatchedModelOutput.coerce">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.coerce">[docs]</a>
@@ -1147,6 +1150,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># capture bucket and to size padding, and a step declares its spans from</span>
     <span class="c1"># it. 0 for a submodule whose inputs aren't sequence-shaped.</span>
     <span class="n">input_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="c1"># The request's real walk, stamped by the engine; None on capture templates</span>
+    <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="NodeInputs.clone">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs.clone">[docs]</a>
@@ -1801,6 +1807,16 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.max_rows_in_combined">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_rows_in_combined</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How many rows of this real walk a step mixing it with another walk</span>
+<span class="sd">        of its combined walk may hold; None is uncapped. For a backend whose</span>
+<span class="sd">        mixed step runs the walk's rows on a path sized to a few of them."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.get_autocast_dtype">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_autocast_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -1977,12 +1993,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
         <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
         <span class="n">host_rows</span><span class="p">:</span> <span class="n">HostRows</span><span class="p">,</span>
+        <span class="n">step_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``check_stop`` for the whole batch at once, off the host rows.</span>
 
 <span class="sd">        Optional. Returns rid -&gt; loops to stop (rids with none left out), and</span>
 <span class="sd">        must agree with ``check_stop`` for every rid. None, or a raise, falls</span>
-<span class="sd">        back to the per-request path.</span>
+<span class="sd">        back to the per-request path. ``step_walk`` is the walk every row ran,</span>
+<span class="sd">        or None when the step mixes walks (each row's is on its info).</span>
 <span class="sd">        """</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 

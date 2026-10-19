@@ -976,6 +976,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">dependencies</span><span class="p">:</span> <span class="s2">"Mapping[str, NodeResourceSpec]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
     <span class="p">)</span>
+    <span class="c1"># walk -&gt; rows of it a step of its combined walk may hold (None uncapped),</span>
+    <span class="c1"># for every walk of this resource's local nodes</span>
+    <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="s2">"Mapping[str, int | None]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
+    <span class="p">)</span>
 
 <div class="viewcode-block" id="EngineResourceInfo.dependency">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.EngineResourceInfo.dependency">[docs]</a>

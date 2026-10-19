@@ -1019,6 +1019,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                 <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
+                <span class="n">splits</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">splits</span><span class="p">,</span>
+                <span class="n">max_rows_in_combined</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">max_rows_in_combined</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLEX</span><span class="p">:</span>

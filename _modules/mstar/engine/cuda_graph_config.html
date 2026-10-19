@@ -1057,6 +1057,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="decode_rows_then_prompt">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.decode_rows_then_prompt">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">decode_rows_then_prompt</span><span class="p">(</span><span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``bs - 1`` one-token rows and a prompt row of the rest: a mixed step's</span>
+<span class="sd">    layout, for kernels that split rows by span. `distribute_tokens` when</span>
+<span class="sd">    there are fewer tokens than rows."""</span>
+    <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&lt;</span> <span class="n">bs</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">distribute_tokens</span><span class="p">(</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">bs</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="p">[</span><span class="n">total_tokens</span> <span class="o">-</span> <span class="p">(</span><span class="n">bs</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)]</span></div>
+
+
+
 <div class="viewcode-block" id="PackedCudaGraphConfig">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PackedCudaGraphConfig</span><span class="p">(</span><span class="n">CudaGraphConfig</span><span class="p">):</span>
@@ -1078,6 +1090,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the resources size their per-bucket buffers for the whole plan.</span>
         <span class="n">total_tokens_multiplier</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
         <span class="n">input_seq_dims</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="c1"># (input tokens, bs) -&gt; each capture row's span; `distribute_tokens`</span>
+        <span class="c1"># by default. A walk whose kernels split rows by span (a mixed step's</span>
+        <span class="c1"># one-token rows beside a prompt) captures a layout it will replay.</span>
+        <span class="n">token_layout</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">capture_graph_walk</span><span class="p">,</span>
@@ -1094,6 +1110,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span> <span class="o">=</span> <span class="n">make_node_input</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">capture_token_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="n">total_tokens_multiplier</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">token_layout</span> <span class="o">=</span> <span class="n">token_layout</span> <span class="ow">or</span> <span class="n">distribute_tokens</span>
 
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_config_type">[docs]</a>
@@ -1104,14 +1121,19 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_total_tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_total_tokens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="p">[</span><span class="n">n</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span><span class="p">]</span></div>
+        <span class="c1"># every real row carries a token, so a bucket with fewer tokens than</span>
+        <span class="c1"># rows could never serve a step; capturing it would give rows of none</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="n">n</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span>
+            <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">bs</span>
+        <span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_node_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_node_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="c1"># ``num_tokens`` is the bucket's plan tokens; the rows get input tokens</span>
-        <span class="n">seq_lens</span> <span class="o">=</span> <span class="n">distribute_tokens</span><span class="p">(</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
+        <span class="n">seq_lens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_layout</span><span class="p">(</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span><span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">seq_lens</span>
         <span class="p">]</span></div>

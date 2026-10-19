@@ -1018,6 +1018,16 @@ into one GPU call. A submodule controls this behavior with three methods:
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
 
+**Combined walks.** By default a step holds one walk. A model lets several walks of a node
+share a step by returning ``{node: {combined_walk: {walks}}}`` from
+``get_combined_graph_walks``, for example decode rows beside a prompt's prefill. The
+combined walk is a name of its own, which ``max_batch_size`` and the CUDA-graph configs
+can key on. A step of one walk keeps that walk's cap. A step that mixes walks takes the
+combined walk's ``max_batch_size`` when it has one, else the smallest cap of the walks it
+holds, so a small prefill cap never limits a decode-only step.
+``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
+step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``).
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.

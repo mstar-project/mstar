@@ -185,6 +185,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``speculation_mixes_walks``
+     - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
+       walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
+       chain on it merges ready rows of the other walks of its combined walk, so
+       decode steps take in new prompts as they arrive. Off (the default), a chain
+       keeps to its own walk and yields to the others, and a step mixes walks only
+       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       walk outside its combined walks, fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,

@@ -1118,6 +1118,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">pass</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_packed</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">CudaGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">CudaGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span>
+
+
 <div class="viewcode-block" id="DummyRowPool">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DummyRowPool</span><span class="p">:</span>
@@ -1518,6 +1522,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">slot</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span>
                 <span class="n">capture</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                 <span class="n">slot_lease</span><span class="o">=</span><span class="n">lease</span><span class="p">,</span>
+                <span class="n">force_prefill</span><span class="o">=</span><span class="n">_is_packed</span><span class="p">(</span><span class="n">config</span><span class="p">),</span>
             <span class="p">))</span>
 
         <span class="n">engine_inputs</span><span class="o">.</span><span class="n">step</span> <span class="o">=</span> <span class="n">step</span>
@@ -1801,6 +1806,13 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">select_bucket</span><span class="p">(</span>
             <span class="n">graph_walk</span><span class="p">,</span> <span class="n">bs</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">,</span> <span class="n">cg_key_info</span>
         <span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="CudaGraphRunner.is_packed">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.is_packed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_packed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``lease`` replays a packed capture."""</span>
+        <span class="k">return</span> <span class="n">_is_packed</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">config</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="CudaGraphRunner.lease_slot">
@@ -2406,6 +2418,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span>
             <span class="n">capture</span><span class="o">=</span><span class="n">capture</span><span class="p">,</span>
             <span class="n">slot_lease</span><span class="o">=</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">bucket</span><span class="p">),</span>
+            <span class="n">force_prefill</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">PACKED</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="n">ctx</span><span class="o">.</span><span class="n">set_padded_rids</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))</span>
         <span class="n">step</span><span class="o">.</span><span class="n">set_ctx</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
