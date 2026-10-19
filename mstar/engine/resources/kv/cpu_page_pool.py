@@ -8,6 +8,7 @@ The pool stores pages and the stream metadata that has to survive the round
 trip; which request to evict, and when, is the worker's decision.
 """
 
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -19,13 +20,23 @@ from mstar.platforms import current_platform
 
 try:
     from cuda.bindings import runtime as cudart
-except ImportError:  # torch's ROCm, XPU and CPU builds don't ship it
+except ImportError:  # torch 2.9, and torch's ROCm, XPU and CPU builds
     cudart = None
 
 logger = logging.getLogger(__name__)
 
 # a full pool refuses every eviction attempt, which can be thousands a second
 _EXHAUSTED_LOG_INTERVAL = 5.0
+
+
+@functools.cache
+def _warn_slow_copies() -> None:
+    logger.warning(
+        "cuda.bindings is not installed, so KV offload and reload copies block "
+        "the host and run several times slower. torch 2.10+ installs it; with "
+        "an older torch, install cuda-bindings for your CUDA major version "
+        "(see docs/installation.rst)."
+    )
 
 
 @dataclass
@@ -69,6 +80,8 @@ class CPUPagePool:
         # copies run here so they don't serialize with compute
         self._stream: torch.cuda.Stream | None = None
         self._memcpy_2d = cudart is not None and current_platform.is_cuda()
+        if cudart is None and current_platform.is_cuda():
+            _warn_slow_copies()
 
         self._refused_logged_at: float | None = None
         self._refused_unlogged = 0

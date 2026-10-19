@@ -838,3 +838,17 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
     assert len(warnings) == 2
     assert "0 more offloads refused" in warnings[0]
     assert "49 more offloads refused" in warnings[1]
+
+
+@requires_cuda
+def test_missing_bindings_falls_back_and_says_so_once(monkeypatch, caplog):
+    """Without cuda.bindings (torch 2.9) the pool keeps the blocking copy_, and
+    says so once per process rather than once per pool."""
+    monkeypatch.setattr(cpu_page_pool, "cudart", None)
+    cpu_page_pool._warn_slow_copies.cache_clear()
+    with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
+        pools = [_make_manager()._cpu_pool for _ in range(2)]
+    assert not any(pool._memcpy_2d for pool in pools)
+    warnings = [r for r in caplog.records if "cuda.bindings is not installed" in r.getMessage()]
+    assert len(warnings) == 1
+    cpu_page_pool._warn_slow_copies.cache_clear()

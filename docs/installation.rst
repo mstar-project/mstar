@@ -179,8 +179,15 @@ The GPU model families depend on:
 - **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
   deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
   instead (see :doc:`serving`).
+- **cuda-bindings** — KV-cache offload (``cpu_offload_pages``) copies pages between the GPU
+  and host memory through it. torch 2.10 and later install it on Linux, built for their CUDA
+  major. With torch 2.9, install it yourself for that major: ``"cuda-bindings>=12.9,<13"`` with
+  a cu12 torch, ``"cuda-bindings>=13,<14"`` with cu13. Without it offload still works, but
+  every offload and reload stalls the worker until the GPU catches up, and the copies run
+  several times slower.
 
-Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
+Apart from ``flash-attn``, ``flash-attn-4`` and (with torch 2.9) ``cuda-bindings``, these are
+installed by the extras above or by torch itself. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
 that for you (next section).
 
