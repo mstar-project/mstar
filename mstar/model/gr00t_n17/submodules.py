@@ -1,5 +1,5 @@
-"""GR00T N1.7's node submodules. The vision encoder and the LLM for now; the
-VL bridge, the state encoder and the denoise step land in later cycles."""
+"""GR00T N1.7's node submodules. The vision encoder, the LLM and the state
+encoder for now; the VL bridge and the denoise step land in later cycles."""
 from __future__ import annotations
 
 from typing import Any
@@ -11,6 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
+from mstar.model.gr00t_n17.components.embodiment import CategorySpecificMLP
 from mstar.model.gr00t_n17.components.llm import Gr00tN17LanguageModel
 from mstar.model.gr00t_n17.components.rope import mrope_position_ids
 from mstar.model.gr00t_n17.components.vision import Gr00tN17VisionEncoder
@@ -233,3 +234,68 @@ class Gr00tN17LLMSubmodule(NodeSubmodule):
             hidden, cos, sin, deepstack_embeds.unbind(0), image_rows,
         )
         return {"backbone_features": [features]}
+
+
+class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
+    """The ``state_encoder`` node: a request's raw state becomes the single
+    conditioning token the denoise loop carries beside the action tokens.
+
+    No attention and no resource, so there is no step to declare -- the base
+    class's ``None`` is the whole declaration. The child is named
+    ``state_encoder`` because every action-head node strips ``action_head.``
+    and keeps the reference's attribute names below it.
+    """
+
+    def __init__(self, state_encoder: CategorySpecificMLP):
+        super().__init__()
+        self.state_encoder = state_encoder
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs: Any,
+    ) -> NodeInputs:
+        state = inputs["state"][0].reshape(1, -1, inputs["state"][0].shape[-1])
+        embodiment_id = inputs["embodiment_id"][0].reshape(-1)
+        # `W[cat_ids]` would read -1 as the last embodiment and serve the
+        # wrong robot in silence, which is the failure D06 exists to stop.
+        # The request carries this id, so it is checked where it arrives.
+        categories = self.state_encoder.layer1.W.shape[0]
+        if int(embodiment_id.min()) < 0 or int(embodiment_id.max()) >= categories:
+            raise ValueError(
+                f"embodiment id {embodiment_id.tolist()} outside the "
+                f"checkpoint's {categories} embodiments"
+            )
+        return NodeInputs(
+            # one token per state row, which is one while the checkpoint's
+            # `state_history_length` is 1
+            input_seq_len=state.shape[1],
+            tensor_inputs={"state": state, "embodiment_id": embodiment_id},
+        )
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        # as the other nodes: no batched forward, so a wider batch would only
+        # be the engine's per-request fallback in disguise
+        return 1
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        (inp,) = inputs
+        device = self.get_device()
+        return {k: v.to(device) for k, v in inp.tensor_inputs.items()}
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        state: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        **kwargs: Any,
+    ) -> NameToTensorList:
+        return {"state_features": [self.state_encoder(state, embodiment_id)]}
