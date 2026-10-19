@@ -111,7 +111,7 @@ after a server exits is reported as a warning.
 Tiers: `smoke` runs only cases marked `smoke=True` (one fast case per family;
 omni has none, since its only profile is a 30B model) with
 `TORCH_COMPILE_DISABLE=1`; `full` runs every case with configs as written,
-including any compilation and CUDA-graph capture, which can add minutes to a
+including any compilation and accelerator graph capture, which can add minutes to a
 server's startup.
 
 ## Model requirements
@@ -149,7 +149,7 @@ outputs are deterministic:
 
 - the same GPU model, driver, CUDA, PyTorch and other library versions on both sides;
 - fixed seeds (every case sets one) and no sampling where the API allows;
-- no compilation or CUDA-graph capture whose results vary between launches.
+- no compilation or accelerator graph capture whose results vary between launches.
   Several configs enable both (for example `configs/flux2_klein.yaml` and
   `configs/cosmos3_nano.yaml`); pass eager configs with `--config MODEL=PATH`
   and use `--eager` to set `TORCH_COMPILE_DISABLE=1` for every server.

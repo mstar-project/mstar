@@ -170,7 +170,7 @@ def euler_step(
     sample's rank, so ``[B, L, C]`` token layouts and ``[B, C, H, W]`` latent
     layouts both broadcast over the batch (right-aligned broadcasting would pair
     the batch with the channel dimension of a 4-D latent). Every operand is a
-    tensor so the step captures into a CUDA graph with per-request values staged
+    tensor so the step captures into an accelerator graph with per-request values staged
     into static buffers.
 
     Op order and dtypes follow the reference scheduler's ``step`` exactly: the

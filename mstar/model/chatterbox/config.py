@@ -438,14 +438,14 @@ class ChatterboxConfig:
     # chunk and stays as close to the whole-utterance decode as the full
     # history does (log-mel correlation 0.988 vs 0.985 on CPU).
     stream_context_tokens: int = 25
-    # torch.compile the flow-matching estimator instead of the CUDA graphs
+    # torch.compile the flow-matching estimator instead of accelerator graphs
     # below (the older, slower alternative: +14 % at concurrency 8, nothing at
     # 32; asking for it turns ``s3gen_graphs`` off). Dynamic shapes, so one
     # compile covers every chunk length; costs a few minutes at startup.
     s3gen_compile: bool = False
     # ``torch.compile`` mode for the estimator: "default" fuses kernels
     # (measured +14 % at concurrency 8, nothing at 32); "reduce-overhead"
-    # would replay CUDA graphs but trips an Inductor assertion with dynamic
+    # would replay accelerator graphs but trips an Inductor assertion with dynamic
     # shapes on torch 2.11, so it is not usable yet.
     s3gen_compile_mode: str = "default"
     # Pad every flow solve to a multiple of this many mel frames (0 = exact
@@ -453,7 +453,7 @@ class ChatterboxConfig:
     # it bounds the number of distinct shapes the graph-captured (or compiled)
     # estimator sees (graphs need a bucket; 0 becomes 64 with them on).
     s3gen_frame_bucket: int = 64
-    # Replay the S3Gen stages from CUDA graphs, one per shape: the estimator's
+    # Replay the S3Gen stages from accelerator graphs, one per shape: the estimator's
     # hundreds of tiny kernels per Euler step make an eager solve launch-bound
     # (a 10-step solve of one row went from 170 ms to 45 ms on an H100, the
     # streamed first chunk from 0.22 s to 0.12 s, throughput at concurrency
@@ -470,7 +470,7 @@ class ChatterboxConfig:
     # float32 log-mel (bfloat16: 0.1-1.8, same speed); float32 is the
     # reference path, bit-exact with the package at a fixed seed.
     s3gen_estimator_dtype: str = "float16"
-    # Capture T3 prefill as packed CUDA graphs (token buckets x small batch
+    # Capture T3 prefill as packed accelerator graphs (token buckets x small batch
     # sizes, both guidance modes); off = eager prefill, decode still captured.
     t3_prefill_graphs: bool = True
     # Requests whose flow solves share one padded batch (the scheduler groups

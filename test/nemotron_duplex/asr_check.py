@@ -3,7 +3,7 @@
 intelligible and says the reply text.
 
 The talker's MaskGIT sampling is knife-edge, so a different attention backend
-or a CUDA-graph replay changes the waveform without changing the words;
+or an accelerator graph replay changes the waveform without changing the words;
 comparing transcripts (not samples) is the right parity check for audio. An
 RMS "voiced" heuristic is not: it passed on pure hiss once.
 

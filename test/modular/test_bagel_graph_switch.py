@@ -1,3 +1,4 @@
+"""BAGEL deployment graph switches without checkpoints or GPU allocation."""
 
 import json
 from pathlib import Path
@@ -78,6 +79,8 @@ def test_disabled_llm_capture_skips_template_allocation(device_type, node_name):
     nn.Module.__init__(module)
     module.config = load_bagel_config({"accelerator_graph": False})
     module.node_name = node_name
+    # No weights or other attributes: a disabled getter must return before
+    # reading them or allocating any capture templates on the requested GPU.
     assert module.get_accelerator_graph_configs(torch.device(device_type)) == []
 
 

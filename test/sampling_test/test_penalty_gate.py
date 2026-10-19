@@ -30,7 +30,7 @@ VOCAB = 64
 
 
 class _RecordingSampler:
-    """Stands in for the CudaGraphableSampler a plan hands back."""
+    """Stands in for the AcceleratorGraphableSampler a plan hands back."""
 
     def __init__(self):
         self.synced = 0
@@ -88,7 +88,7 @@ def _resource(*, capable: bool = True) -> SamplerResource:
         enable_repetion_penalty=capable,
         device=torch.device("cpu"),
     )
-    # Skip build_cuda_graph_buffers: the real buffers would allocate a
+    # Skip build_accelerator_graph_buffers: the real buffers would allocate a
     # [capacity, VOCAB] mask, and the gate is what's under test, not the copies.
     res._cg_buffers = _RecordingBuffers()
     return res

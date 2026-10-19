@@ -180,6 +180,7 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
     })
     eager.plan(prompt, eager_ctx)
     captured.plan(prompt, captured_ctx)
+    # Warm the native sampler, then restore canonical state before capture.
     for _ in range(2):
         captured.sample(padded_rids, logits)
     captured.plan(SamplerStep(), captured_ctx)

@@ -37,7 +37,7 @@ PROMPT = "A red cube resting on a polished wooden table, soft daylight."
 # CUDA-graph check below captures at whatever (H, W) it sets. NOTE: the in-process
 # graph-vs-fused PSNR is a coarse smoke check — it carries a cache-setup artifact
 # of this harness. The authoritative bit-exactness gate for the served graph is
-# the HTTP A/B (graph-on vs COSMOS3_DISABLE_CUDA_GRAPH=1), which is byte-identical
+# the HTTP A/B (graph-on vs COSMOS3_DISABLE_ACCELERATOR_GRAPH=1), which is byte-identical
 # at every resolution.
 H = W = 256
 STEPS = 12
@@ -1064,7 +1064,7 @@ def test_windowed_kv_dense_matches_paged() -> None:
 @torch.no_grad()
 def _run_accelerator_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
-    CudaGraphRunner (one captured forward per step covering both guidance
+    AcceleratorGraphRunner (one captured forward per step covering both guidance
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.distributed.communication import CommGroup, JointGroups

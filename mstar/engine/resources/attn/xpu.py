@@ -137,6 +137,9 @@ class XPUPagedAttentionManager(AttentionManager):
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
         if graph_mode:
+            # Multimodal prefixes can exceed the model's text max_seq_len.
+            # A graph must keep room for any context the resident cache can
+            # hold, rather than resize its table when an image edit arrives.
             max_blocks = self._kv_config.max_num_pages
         block_table = [
             view.page_idxs

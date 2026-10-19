@@ -1,8 +1,7 @@
 """NoiseStager: the pinned-staging path must match the pageable one exactly, and must
 never let a buffer be rewritten while its copy is still in flight.
 
-The CPU cases run anywhere. The pinned/async cases need CUDA, since there is nothing
-to pin and nothing to overlap without it.
+The CPU cases run anywhere. The pinned/async cases run on CUDA and XPU.
 """
 
 from __future__ import annotations

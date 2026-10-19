@@ -1,4 +1,4 @@
-"""Ragged attention head-dimension padding checks that need no GPU."""
+"""Attention wrapper contracts and head-dimension checks that need no GPU."""
 
 import sys
 from types import SimpleNamespace

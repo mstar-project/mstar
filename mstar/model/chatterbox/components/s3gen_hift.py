@@ -130,7 +130,7 @@ class HarmonicSource(nn.Module):
         # torch.distributions.Uniform(-pi, pi).sample(): low + u*high - u*low, with
         # the bounds as Python floats (cast to the tensor dtype per op, the same
         # float32 arithmetic) rather than device tensors built from the host,
-        # which a CUDA graph capture cannot copy in
+        # which an accelerator graph capture cannot copy in
         u = noise.phase
         low, high = -math.pi, math.pi
         phase_vec = low + u * high - u * low
@@ -233,7 +233,7 @@ class HiFTGenerator(nn.Module):
 
     def waveform(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         """Output spectrum -> waveform: the inverse STFT and the clamp. Kept out
-        of the vocoder's CUDA graph because ``torch.istft`` synchronises on its
+        of the vocoder's accelerator graph because ``torch.istft`` synchronises on its
         window-overlap check, which a capture forbids; it is a handful of
         16-point frames, so it costs next to nothing eagerly."""
         x = self._istft(magnitude, phase)

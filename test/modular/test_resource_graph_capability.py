@@ -1,3 +1,4 @@
+"""Unsupported resources reject recipes before capture buffers are allocated."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock

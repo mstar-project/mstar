@@ -1,10 +1,10 @@
 """FlashInfer utility wrappers for batched paged attention.
 
 Provides:
-- FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode
-- FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode
+- FlashInferPrefillWrapper: paged batched prefill, optional accelerator graph mode
+- FlashInferDecodeWrapper: paged batched decode, optional accelerator graph mode
 
-CUDA graph mode requires:
+Accelerator graph mode requires:
 - Static buffer pointers passed at construction (qo_indptr_buf, paged_kv_indptr_buf, etc.)
 - plan() updates values via .copy_() without reallocating
 - The same wrapper object must be used during both capture and replay
@@ -52,7 +52,7 @@ class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
     Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with optional
-    CUDA graph mode using static buffers. KV writes are the KVManager's job.
+    accelerator graph mode using static buffers. KV writes are the KVManager's job.
 
     Args:
         workspace_buffer: FlashInfer workspace (256MB+ recommended)
@@ -60,11 +60,11 @@ class FlashInferPrefillWrapper:
         num_kv_heads: number of key/value heads
         head_dim: dimension per head
         page_size: KV cache page size
-        batch_size: required for CUDA graph mode (max requests in batch)
-        max_total_tokens: required for CUDA graph mode (max total new tokens across batch)
-        max_num_pages: required for CUDA graph mode (max pages across all requests)
+        batch_size: required for accelerator graph mode (max requests in batch)
+        max_total_tokens: required for accelerator graph mode (max new tokens across batch)
+        max_num_pages: required for accelerator graph mode (max pages across all requests)
         device: torch device
-        use_cuda_graph: if True, pre-allocate static buffers for graph capture
+        accelerator_graph: if True, pre-allocate static buffers for graph capture
     """
 
     def __init__(
@@ -192,7 +192,7 @@ class FlashInferPrefillWrapper:
     ):
         """Plan attention and compute KV write indices.
 
-        In CUDA graph mode, updates static buffers via .copy_() so that
+        In accelerator graph mode, updates static buffers via .copy_() so that
         the same GPU addresses are used during graph replay.
 
         Inputs may be on CPU — that's preferred because FlashInfer's
@@ -237,7 +237,7 @@ class FlashInferPrefillWrapper:
             self._pinned_done.record()
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
-        # even if we're not in a cuda graph
+        # even if we're not in an accelerator graph
         if not self.accelerator_graph:
             # TODO: take the cuda version as a kwarg
             if qo_indptr.device.type != "cuda":
@@ -270,10 +270,10 @@ class FlashInferDecodeWrapper:
         num_kv_heads: number of key/value heads
         head_dim: dimension per head
         page_size: KV cache page size
-        batch_size: required for CUDA graph mode (max requests in batch)
-        max_num_pages: required for CUDA graph mode (max pages across all requests)
+        batch_size: required for accelerator graph mode (max requests in batch)
+        max_num_pages: required for accelerator graph mode (max pages across all requests)
         device: torch device
-        use_cuda_graph: if True, pre-allocate static buffers for graph capture
+        accelerator_graph: if True, pre-allocate static buffers for graph capture
     """
 
     def __init__(
