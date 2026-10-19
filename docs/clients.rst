@@ -181,8 +181,11 @@ plus one each for the opening message's media and the end of input; the next end
 with ``status`` 503. Other models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
 The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
-CUDA graph only for a call whose appends are exactly 80 ms (1280 samples at 16 kHz) on its
-frame grid; other sizes are served the same, more slowly (see :doc:`models`).
+CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
+audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
+multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
+the call off the graph for the rest of its life. Other sizes are served the same, more
+slowly (see :doc:`models`).
 
 .. code-block:: python
 
