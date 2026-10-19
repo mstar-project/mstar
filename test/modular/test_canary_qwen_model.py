@@ -126,6 +126,7 @@ def test_adapter():
     assert args.text == "" and "initial_prompt" not in args.model_kwargs
     assert adapter.transcription_to_request(TranscriptionRequest(model="canary_qwen", language="en-US"), "")
     for bad in (TranscriptionRequest(model="canary_qwen", language="de"),
+                TranscriptionRequest(model="canary_qwen", task="translate"),
                 TranscriptionRequest(model="canary_qwen", timestamp_granularities=["segment"])):
         with pytest.raises(ValueError):
             adapter.transcription_to_request(bad, "")

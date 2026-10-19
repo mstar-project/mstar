@@ -99,7 +99,8 @@ def test_caps_captures_and_stops():
         for rid, n in (("eos", 0), ("limit", 9), ("go", 0))
     }
     rows = HostRows(request_ids=("go", "limit", "eos"), buffers={"new_token": torch.tensor([[7], [7], [3]])})
-    assert node.check_stop_batched(["eos", "limit", "go"], infos, rows) == {
+    # step_walk=None: the engine's call for a step that mixes walks
+    assert node.check_stop_batched(["eos", "limit", "go"], infos, rows, step_walk=None) == {
         "eos": {"decode_loop"}, "limit": {"decode_loop"},
     }
     assert node.check_stop("go", infos["go"], {"new_token": [torch.tensor([7])]}) == set()

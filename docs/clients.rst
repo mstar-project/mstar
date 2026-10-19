@@ -327,8 +327,8 @@ Per-model notes:
   dropped) and no timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
   ``verbose_json`` get one segment per window. Canary takes ``language`` (the speech's,
   English by default) and, through ``extra_body``, ``target_language`` or
-  ``task="translate"`` (into English) and ``punctuation``. Canary-Qwen is English only.
-  Parakeet detects the language itself and refuses a ``language`` outside the 25 it knows;
+  ``task="translate"`` (into English) and ``punctuation``; the other three only transcribe,
+  and refuse a ``task`` other than ``transcribe``. Canary-Qwen is English only. Parakeet detects the language itself and refuses a ``language`` outside the 25 it knows;
   Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
   model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
   parallel windows.

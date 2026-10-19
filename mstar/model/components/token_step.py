@@ -78,8 +78,11 @@ class TokenStepNode:
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
+        """``check_stop`` for every request off one ``tolist``. ``step_walk``
+        changes nothing: as in ``check_stop``, prefill's token can end the
+        decode loop too."""
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None

@@ -1065,18 +1065,34 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     return language, segments, parts, start is not None
 
 
-def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str) -> dict:
+def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str, *, translates: bool = False) -> dict:
     """``model_kwargs`` for a model that takes no conditioning text and emits
-    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused."""
+    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused.
+    Whisper's ``task`` is the caller's to read when the model ``translates``;
+    otherwise anything but ``transcribe`` is refused, not silently ignored."""
     mk = _transcription_kwargs(req)
     mk.pop("initial_prompt", None)
     if req.timestamp_granularities:
         raise ValueError(f"{model} does not produce timestamps; leave timestamp_granularities unset")
     mk.pop("timestamps", None)
+    if not translates:
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe"):
+            raise ValueError(f"{model} only transcribes; task must be 'transcribe'; got {task!r}")
     return mk
 
 
-class CanaryAdapter(OpenAIAdapter):
+class _UntimedTranscriptionAdapter(OpenAIAdapter):
+    """The FastConformer ASR models' adapters: plain text, which a
+    SentencePiece vocabulary starts with a space."""
+
+    def stream_text(self, raw: str) -> str:
+        # parse_transcript strips the text, so the deltas drop the leading
+        # space too; lstrip keeps a growing stream growing
+        return raw.lstrip()
+
+
+class CanaryAdapter(_UntimedTranscriptionAdapter):
     """NVIDIA Canary: speech recognition, and translation to or from English.
 
     ``language`` is the speech's language (English by default); an
@@ -1094,7 +1110,7 @@ class CanaryAdapter(OpenAIAdapter):
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         from mstar.model.canary.config import check_task
 
-        mk = _untimed_transcription_kwargs(req, "Canary")
+        mk = _untimed_transcription_kwargs(req, "Canary", translates=True)
         # Whisper's convention: translate means into English
         task = mk.pop("task", None)
         if task not in (None, "transcribe", "translate"):
@@ -1113,7 +1129,7 @@ class CanaryAdapter(OpenAIAdapter):
         )
 
 
-class CanaryQwenAdapter(OpenAIAdapter):
+class CanaryQwenAdapter(_UntimedTranscriptionAdapter):
     """NVIDIA Canary-Qwen: English speech recognition by an LLM, under its
     trained instruction. OpenAI's ``prompt`` is context for the transcript
     (and carries the previous window in sequential long form), which this
@@ -1138,7 +1154,7 @@ class CanaryQwenAdapter(OpenAIAdapter):
         )
 
 
-class TransducerAdapter(OpenAIAdapter):
+class TransducerAdapter(_UntimedTranscriptionAdapter):
     """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
 
     Parakeet-TDT (``detects_language``) detects the language from the speech

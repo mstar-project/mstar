@@ -513,6 +513,30 @@ def test_streaming_parallel_windows_stream_token_by_token(client_and_stub):
     assert events[-1]["text"] == "one two three"
 
 
+@pytest.mark.parametrize("long_form, expected", [
+    ("parallel", ["one", " two", " ", "three"]),
+    ("sequential", ["one two", " ", "three"]),
+])
+def test_streamed_deltas_add_up_to_the_final_text(client_and_stub, monkeypatch, long_form, expected):
+    """A SentencePiece model's text starts with a space, and a silent window
+    has no text: the deltas still join to exactly the done event's text."""
+    client, stub = client_and_stub
+    stub.model_name = "nemotron_asr"
+    monkeypatch.setattr(adapters.TransducerAdapter, "max_audio_seconds", 20.0)
+    stub.queued_chunks = [_text(" one", " two"), [], _text(" three")]
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "nemotron_asr", "stream": "true", "long_form": long_form},
+        files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    events = [json.loads(ln[len("data: "):]) for ln in lines[:-1]]
+    deltas = [e["delta"] for e in events if e["type"] == "transcript.text.delta"]
+    assert len(stub.submits) == 3
+    assert deltas == expected
+    assert "".join(deltas) == events[-1]["text"] == "one two three"
+
+
 def _wav_seconds(path: str) -> float:
     import wave
 

@@ -670,11 +670,14 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 yield SSE_DONE
                 return
             submitted = 0
+            # the final text joins windows by a space, so the stream sends one
+            # before a window's first text: a silent window adds none
+            spoken = False
             for i, window in enumerate(windows):
                 while submitted < min(len(windows), i + PARALLEL_INFLIGHT):
                     _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
-                raw, emitted = "", ""
+                raw, emitted, gap = "", "", spoken
                 # holds back a character split across tokens until its last byte
                 decoder = codecs.getincrementaldecoder("utf-8")("replace")
                 async for c in api.iter_result_chunks(window.request_id):
@@ -687,27 +690,33 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     raw += decoder.decode(c.data)
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
+                        if gap:
+                            yield sse({"type": "transcript.text.delta", "delta": " "})
+                            gap = False
                         yield sse({"type": "transcript.text.delta", "delta": delta})
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     raw += tail
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
+                        if gap:
+                            yield sse({"type": "transcript.text.delta", "delta": " "})
                         yield sse({"type": "transcript.text.delta", "delta": delta})
                 inflight.discard(window.request_id)
                 window.raw_text = raw
-                if i + 1 < len(windows):
-                    # windows are joined by a space in the final text, say so mid-stream
-                    yield sse({"type": "transcript.text.delta", "delta": " "})
+                # as merge_windows, which joins only the windows with text
+                spoken = spoken or bool(emitted.strip())
                 await asyncio.sleep(0)
         else:
             try:
+                spoken = False
                 async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
-                    if windows:
-                        yield sse({"type": "transcript.text.delta", "delta": " "})
                     windows.append(window)
                     if window.transcript.text:
+                        if spoken:
+                            yield sse({"type": "transcript.text.delta", "delta": " "})
                         yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
+                        spoken = True
                     await asyncio.sleep(0)
             except (HTTPException, ImportError, MemoryError) as exc:
                 yield _cutting_error_event(exc)

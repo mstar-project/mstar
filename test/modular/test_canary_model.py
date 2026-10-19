@@ -341,7 +341,10 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     rows = ("go", "limit", "eos", "ignored")
     tokens = torch.tensor([[7], [7], [3], [3]])
     asked = ["eos", "ignored", "limit", "go"]
-    batched = node.check_stop_batched(asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}))
+    # called as the engine calls it, with the step's walk
+    batched = node.check_stop_batched(
+        asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}), step_walk="decode",
+    )
     one_by_one = {rid: node.check_stop(rid, infos[rid], {"new_token": [tokens[rows.index(rid)]]}) for rid in asked}
     assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {
         "eos": {"decode_loop"}, "limit": {"decode_loop"},

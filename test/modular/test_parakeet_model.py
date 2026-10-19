@@ -111,6 +111,13 @@ def test_adapter(detects_language):
     assert args.model_kwargs == {"language": "en", "temperature": 0.0}
     with pytest.raises(ValueError):
         adapter.transcription_to_request(TranscriptionRequest(model="parakeet", timestamp_granularities=["word"]), "")
+    # Whisper's task: a translation would come back as a same-language transcript
+    with pytest.raises(ValueError, match="only transcribes"):
+        adapter.transcription_to_request(TranscriptionRequest(model="parakeet", task="translate"), "")
+    mk = adapter.transcription_to_request(TranscriptionRequest(model="parakeet", task="transcribe"), "").model_kwargs
+    assert "task" not in mk
+    # streamed text drops the space SentencePiece starts it with, as the final text does
+    assert adapter.stream_text(" Hello") == "Hello" and adapter.stream_text(" ") == ""
     # Parakeet's languages are known up front, so a stream is refused before it starts;
     # Nemotron's locales come from the checkpoint and are checked at preprocessing
     for language in ("de-AT", "PT_br", "auto"):
