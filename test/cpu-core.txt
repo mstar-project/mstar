@@ -115,4 +115,5 @@ test/modular/test_correctness_runner.py
 test/modular/test_media_decode.py
 test/modular/test_hf_attention.py
 test/modular/test_pi05_siglip_keys.py
+test/modular/test_loader_dropped_keys.py
 test/modular/vjepa2/test_preprocess.py
