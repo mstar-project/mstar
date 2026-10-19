@@ -151,6 +151,15 @@ def test_the_communicator_creates_its_socket_dir_0700(umask, tmp_path):
         os.close(comm._deployment_lock_fd)
 
 
+def test_a_parent_created_for_a_nested_dir_passes_its_own_check(umask, tmp_path):
+    """The upload dir inside the socket dir, created first: the socket dir it
+    made on the way passes the socket dir's check."""
+    runtime = tmp_path / "runtime"
+    ensure_private_dir(runtime / "uploads")
+    assert _mode(runtime) == 0o700
+    assert ensure_private_dir(runtime) == runtime
+
+
 def test_a_subdir_of_a_shared_mount_is_accepted(umask, tmp_path):
     """A volume mounted group-writable and setgid (e.g. Kubernetes ``fsGroup``)
     is refused as the directory itself, but works as the parent of one."""

@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 ///
 /// The default locations sit in a shared `/tmp` under predictable names, so an
 /// existing directory is only accepted after this check; anything else is a
-/// `PermissionDenied` error naming the path. Missing parents are created as
-/// usual: only the final component has to be ours.
+/// `PermissionDenied` error naming the path. Only the final component has to
+/// be ours; missing parents are created 0700 too, so a parent that is itself a
+/// runtime dir (a socket dir holding the upload dir) passes its own check under
+/// any umask.
 pub fn ensure_private_dir(path: &Path) -> io::Result<PathBuf> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     ensure_private_dir_for(path, unsafe { libc::geteuid() })
@@ -27,7 +29,7 @@ fn ensure_private_dir_for(path: &Path, uid: u32) -> io::Result<PathBuf> {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)?;
+                DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
             }
             match DirBuilder::new().mode(0o700).create(&path) {
                 Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
@@ -104,6 +106,21 @@ mod tests {
             assert_eq!(mode_of(&made), 0o700);
             // An existing private dir is accepted as is.
             ensure_private_dir(&made).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_parent_created_for_a_nested_dir_passes_its_own_check() {
+        let root = scratch("nested");
+        for umask in [0o022, 0o002] {
+            let old = unsafe { libc::umask(umask) };
+            let runtime = root.join(format!("{umask:o}/runtime"));
+            let made = ensure_private_dir(&runtime.join("uploads"))
+                .and_then(|_| ensure_private_dir(&runtime));
+            unsafe { libc::umask(old) };
+            assert_eq!(made.unwrap(), runtime);
+            assert_eq!(mode_of(&runtime), 0o700);
         }
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -13,19 +13,24 @@ def ensure_private_dir(path: str | os.PathLike) -> Path:
 
     The default locations sit in a shared ``/tmp`` under predictable names, so
     an existing directory is only accepted after this check; anything else
-    raises ``PermissionError`` naming the path. Missing parents are created
-    as usual: only the final component has to be ours.
+    raises ``PermissionError`` naming the path. Only the final component has
+    to be ours; missing parents are created 0700 too, so a parent that is
+    itself a runtime dir (a socket dir holding the upload dir) passes its own
+    check under any umask.
     """
     # Path() drops a trailing slash, without which lstat would follow a symlink.
     path = Path(path)
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.mkdir(path, 0o700)
-        except FileExistsError:
-            pass
+        missing = [path]
+        while not os.path.lexists(missing[-1].parent):
+            missing.append(missing[-1].parent)
+        for p in reversed(missing):
+            try:
+                os.mkdir(p, 0o700)
+            except FileExistsError:
+                pass
         st = os.lstat(path)
     uid = os.geteuid()
     if stat.S_ISLNK(st.st_mode):
