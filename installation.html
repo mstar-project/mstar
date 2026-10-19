@@ -615,6 +615,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
@@ -766,7 +767,8 @@ from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 <td><p>The union of the index-hosted dependencies from every model extra above.
 Convenient for a machine that serves multiple models; heavier and slower to
 install than a single family’s extra. It excludes the separately installed
-TAEHV and <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> packages; see below and <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>.</p></td>
+TAEHV, <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> and <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> packages; see below,
+<a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a> and <a class="reference internal" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -797,7 +799,8 @@ python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </sp
 <p class="admonition-title">Tip</p>
 <p>If you’re just getting started or have the disk/time to spare, <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> installs all
 index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
-command above, and Qwen3-Omni still needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>:</p>
+command above, Qwen3-Omni still needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, and Qwen3-TTS still needs
+<code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> (see <a class="reference internal" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a>):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all,dev]"</span>
 </pre></div>
 </div>
@@ -845,6 +848,23 @@ and not a dependency. Verify with:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"from omnivoice.models import omnivoice_flashinfer; print('ok')"</span>
 </pre></div>
 </div>
+</section>
+<section id="qwen-tts-qwen3-tts">
+<h2>qwen-tts (Qwen3-TTS)<a class="headerlink" href="#qwen-tts-qwen3-tts" title="Link to this heading">#</a></h2>
+<p><strong>Qwen3-TTS</strong> loads its 12 Hz speech tokenizer from the <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> package, which
+<code class="docutils literal notranslate"><span class="pre">.[qwen3_tts]</span></code> and <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> do <strong>not</strong> install. Add it as a separate step, without
+its dependencies:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span><span class="s2">"qwen-tts==0.1.1"</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> pins <code class="docutils literal notranslate"><span class="pre">transformers==4.57.3</span></code> and <code class="docutils literal notranslate"><span class="pre">accelerate==1.12.0</span></code>. Installed with
+them, it can’t share an environment with <code class="docutils literal notranslate"><span class="pre">diffusers&gt;=0.40</span></code> (Wan 2.2, Cosmos3,
+FLUX.2 [klein]), which needs <code class="docutils literal notranslate"><span class="pre">huggingface-hub&gt;=1.23</span></code>, or with OmniVoice, which needs
+<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.3</span></code>, and installing it after them downgrades their dependencies.
+mstar reads only the speech-tokenizer source files and runs them under transformers
+4.57.3 or 5.x, so the package’s own requirements are not needed. <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">check</span></code> still
+lists them (<code class="docutils literal notranslate"><span class="pre">transformers==4.57.3</span></code>, <code class="docutils literal notranslate"><span class="pre">accelerate==1.12.0</span></code>, <code class="docutils literal notranslate"><span class="pre">gradio</span></code>, <code class="docutils literal notranslate"><span class="pre">sox</span></code> and
+others) as unmet for <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code>; that is expected.</p>
 </section>
 <section id="flash-attn-qwen3-omni">
 <h2>flash-attn (Qwen3-Omni)<a class="headerlink" href="#flash-attn-qwen3-omni" title="Link to this heading">#</a></h2>
@@ -1124,6 +1144,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
