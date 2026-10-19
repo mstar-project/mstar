@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
 from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.plan import group_by_plan_label
-from mstar.model.cosmos3.submodules import ATTN, KV_CACHE
+from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, LATENT_DTYPE
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.platforms import current_platform
 
@@ -513,7 +513,8 @@ def _scenario(num_frames):
     )
     lat_t = 1 if num_frames == 1 else 1 + (num_frames - 1) // mpipe.vae_scale_temporal
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    # the served loop state's dtype, so the engine path and the fused pipeline step the same latents
+    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     lat_fused = mpipe(
         prompt=PROMPT, negative_prompt="", num_frames=num_frames, height=H, width=W,
         num_inference_steps=STEPS, guidance_scale=GS, latents=init.clone(), decode=False,
@@ -802,7 +803,7 @@ def test_cross_request_batch_matches_individual() -> None:
         conds.append(c)
         unconds.append(u)
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     shape = (1, 48, 1, H // 16, W // 16)
 
     def _dec(lat):
