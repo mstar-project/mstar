@@ -331,6 +331,15 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
 
+``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers.
+Each worker's engine picks its handshake and data ports at startup, so restrict by host: only
+the deployment's own hosts should reach the workers. The model extras require
+``mooncake-transfer-engine`` 0.3.13.post1
+or newer: earlier than 0.3.12.post1, any host that reaches the TCP data port can read or
+write the worker's memory (CVE-2026-103764), and a worker warns at startup if it finds such a
+version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
+CVE-2026-103761) are still open in 0.3.13.post1.
+
 .. _request-profiling:
 
 Request profiling

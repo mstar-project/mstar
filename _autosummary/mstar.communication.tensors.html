@@ -639,6 +639,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.LocalTransferEngine.unregister_memory"><code class="docutils literal notranslate"><span class="pre">LocalTransferEngine.unregister_memory()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MOONCAKE_PATCHED_VERSION"><code class="docutils literal notranslate"><span class="pre">MOONCAKE_PATCHED_VERSION</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager.register_for_send_uuids()</span></code></a></li>
@@ -734,6 +735,15 @@
                   
   <section id="module-mstar.communication.tensors">
 <span id="mstar-communication-tensors"></span><h1>mstar.communication.tensors<a class="headerlink" href="#module-mstar.communication.tensors" title="Link to this heading">#</a></h1>
+<p class="rubric">Module Attributes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.MOONCAKE_PATCHED_VERSION" title="mstar.communication.tensors.MOONCAKE_PATCHED_VERSION"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MOONCAKE_PATCHED_VERSION</span></code></a></p></td>
+<td><p>Earlier Mooncake releases let any host that reaches the TCP data port read or write arbitrary process memory (CVE-2026-103764).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -973,6 +983,15 @@ is ready before the background thread reads it.</p>
 </dl>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.communication.tensors.MOONCAKE_PATCHED_VERSION">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">MOONCAKE_PATCHED_VERSION</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0.3.12.post1'</span></span><a class="headerlink" href="#mstar.communication.tensors.MOONCAKE_PATCHED_VERSION" title="Link to this definition">#</a></dt>
+<dd><p>Earlier Mooncake releases let any host that reaches the TCP data port read
+or write arbitrary process memory (CVE-2026-103764). NVD lists “before
+0.3.13” because it points at a later refactor; the fix (Mooncake #2314)
+shipped in 0.3.12.post1, see <a class="github reference external" href="https://github.com/kvcache-ai/Mooncake/issues/4626">kvcache-ai/Mooncake#4626</a>.</p>
 </dd></dl>
 
 <dl class="py class">
@@ -1985,6 +2004,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.LocalTransferEngine.unregister_memory"><code class="docutils literal notranslate"><span class="pre">LocalTransferEngine.unregister_memory()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MOONCAKE_PATCHED_VERSION"><code class="docutils literal notranslate"><span class="pre">MOONCAKE_PATCHED_VERSION</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">MooncakeCommunicationManager.register_for_send_uuids()</span></code></a></li>

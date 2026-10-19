@@ -5,6 +5,12 @@ mstar.communication.tensors
 
    
    
+   .. rubric:: Module Attributes
+
+   .. autosummary::
+   
+      MOONCAKE_PATCHED_VERSION
+   
    
 
    

@@ -178,9 +178,10 @@ The GPU model families depend on:
   (see `flash-attn (Qwen3-Omni)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
-- **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
-  deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
-  instead (see :doc:`serving`).
+- **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
+  multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
+  (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
+  it needs).
 
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
