@@ -682,7 +682,8 @@ class Cosmos3OmniTransformer(nn.Module):
             latent = latent.reshape(latent_channel, t_actual, h_patches, p, w_patches, p)
             latent = torch.einsum("cthpwq->thwpqc", latent).reshape(-1, p * p * latent_channel)
             packed_latent.append(latent)
-        return torch.cat(packed_latent, dim=0), original_latent_shapes
+        # the denoise loop keeps its latents in fp32; the projection takes them in the model dtype
+        return torch.cat(packed_latent, dim=0).to(self.proj_in.weight.dtype), original_latent_shapes
 
     def _unpatchify_and_unpack_latents(
         self,
