@@ -438,7 +438,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   positional encoding, so no position resource), a recurrent-state pool holding
   the 27 Mamba-2 layers' conv window and SSM state, one slot per session
   (``mamba_state``: 32 sessions by default, ~137 MB per slot in fp32, tunable
-  with ``max_slots`` / ``state_dtype``), the Mamba-2 resource planned on it
+  with ``max_slots``), the Mamba-2 resource planned on it
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
@@ -537,9 +537,10 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
   the call's start: an opening clip or append that is not a multiple of 1280
   samples keeps the call off it for good); other calls take the front end
-  eagerly, then the layer stack as a graph when each got at most one frame, or
-  eagerly (a one-shot upload, a large append, the call's end). Appends of other
-  sizes are served the same, without the whole-step graph.
+  eagerly, then the layer stack as a graph when each got at most one frame (a
+  live step, the call's end), or eagerly (a one-shot upload, a large append,
+  run in a pass of its own). Appends of other sizes are served the same,
+  without the whole-step graph.
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

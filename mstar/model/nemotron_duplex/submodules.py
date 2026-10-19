@@ -106,8 +106,8 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
 
     # Decode batch sizes captured as CUDA graphs: one row per live session per
-    # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
-    # one transiently), so the model's pool sizing covers the largest bucket.
+    # 80 ms tick. The recurrent pool holds a slot per session; padding rows
+    # take none (they address the sink).
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
@@ -446,8 +446,8 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     A call one frame of audio further on the frame grid (every live step of a
     client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
     other calls take the front end eagerly, then the layer stack as a graph
-    (``LAYERS_REGION``) when each got at most one frame, else eagerly (a
-    one-shot upload, a large append, the call's end).
+    (``LAYERS_REGION``) when each got at most one frame (a live step, the
+    call's end), else eagerly (a one-shot upload, a large append).
 
     Holds the perception stack plus the RNN-T decoder/joint (loaded; the
     user-transcript channel is not emitted yet).
@@ -971,7 +971,8 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     live load runs many small decodes. Declares no resources.
     """
 
-    # Per-request context is keyed by request id -> eager around the decode; fp32 codec.
+    # Per-request context is keyed by request id -> eager around the decode. No
+    # autocast: the codec runs in the dtype it was loaded in (the engine's).
     disable_torch_compile = True
     disable_autocast = True
 
