@@ -903,6 +903,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">errno</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
@@ -2084,13 +2085,22 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># Canonical layout has shard_dim leading and is contiguous, so a</span>
             <span class="c1"># contiguous byte range maps to a contiguous range of rows along</span>
             <span class="c1"># dim 0. Slicing along dim 0 keeps the view contiguous.</span>
-            <span class="n">bytes_per_row</span> <span class="o">=</span> <span class="n">canonical_tensor</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">nbytes</span>
-            <span class="k">assert</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span> <span class="o">%</span> <span class="n">bytes_per_row</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">%</span> <span class="n">bytes_per_row</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"slice offset </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="si">}</span><span class="s2"> / nbytes </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="si">}</span><span class="s2"> not aligned "</span>
-                <span class="sa">f</span><span class="s2">"to canonical row size </span><span class="si">{</span><span class="n">bytes_per_row</span><span class="si">}</span><span class="s2">"</span>
+            <span class="n">bytes_per_row</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">canonical_tensor</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+                <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">canonical_tensor</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
             <span class="p">)</span>
-            <span class="n">start</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span> <span class="o">//</span> <span class="n">bytes_per_row</span>
-            <span class="n">end</span> <span class="o">=</span> <span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">//</span> <span class="n">bytes_per_row</span>
+            <span class="k">if</span> <span class="n">bytes_per_row</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="c1"># Rows of zero bytes (a [4, 0] tensor) carry no offset to</span>
+                <span class="c1"># recover the start from, and hold nothing to read: only the</span>
+                <span class="c1"># row count matters.</span>
+                <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span> <span class="o">%</span> <span class="n">bytes_per_row</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">%</span> <span class="n">bytes_per_row</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"slice offset </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="si">}</span><span class="s2"> / nbytes </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="si">}</span><span class="s2"> not aligned "</span>
+                    <span class="sa">f</span><span class="s2">"to canonical row size </span><span class="si">{</span><span class="n">bytes_per_row</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+                <span class="n">start</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span> <span class="o">//</span> <span class="n">bytes_per_row</span>
+                <span class="n">end</span> <span class="o">=</span> <span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">//</span> <span class="n">bytes_per_row</span>
             <span class="n">slice_view</span> <span class="o">=</span> <span class="n">canonical_tensor</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
             <span class="n">new_uuid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span><span class="o">.</span><span class="n">mint</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">new_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
