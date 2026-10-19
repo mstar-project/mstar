@@ -1053,10 +1053,11 @@ an abstract interface for graph capture, streams, pools and capture recovery.
 ``torch.cuda.CUDAGraph`` and ``torch.xpu.XPUGraph``, respectively.
 To add another backend, implement the interface and register its device type
 in ``_GRAPH_BACKENDS``; the runners use that registry to check capture support.
-``DeviceCapability.of(device)`` caches capability queries for a device: accelerator
-availability, pinned-memory support, the graph backend, and capture state. The
-worker shares its capability with the engine and runners; staging utilities use
-the same cache. Runtime operations use PyTorch directly: ``torch.Stream(device=...)``,
+``DeviceCapability.of(device)`` caches a capability object for each device, including
+its graph backend. Accelerator availability, pinned-memory support, and current-stream
+capture state are queried when accessed. The worker shares its capability object with
+the engine and runners; staging utilities use the same cache.
+Runtime operations use PyTorch directly: ``torch.Stream(device=...)``,
 ``torch.Event(device=...)``, stream context managers, and ``torch.accelerator``.
 
 Models declare capture recipes without testing device types. Each resource's
@@ -1112,9 +1113,13 @@ Both types share the base ``AcceleratorGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
-- ``required`` makes every bucket in the config mandatory. If capture fails locally or
-  on another participating rank, warmup raises after rank-wide agreement instead of
-  dropping the bucket and falling back to eager execution. The default is ``False``.
+- ``input_seq_dims`` maps a tensor key returned by ``preprocess`` to its sequence
+  dimension, for example ``{"hidden_states": 0}``. This overrides the runner's
+  size-based guess when another axis happens to match the bucket's token count.
+  The default is ``None``.
+
+Set ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` to fail startup if any declared bucket
+cannot be captured. By default, failed buckets fall back to eager execution.
 
 ``BatchedAcceleratorGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
@@ -1227,9 +1232,9 @@ Both types share the base ``PiecewiseAcceleratorGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
-- ``required`` makes every declared shape mandatory. If any participating rank cannot
-  capture one, warmup raises instead of leaving that shape on the eager path. The default
-  is ``False``.
+
+``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` also makes dropped piecewise capture shapes
+a startup failure. By default, those shapes run eagerly.
 
 **Splitting the declaration.** When a region leases its own slot, exactly one of the two
 declarations must own each resource. The common pattern is for the outer ``declare_step``

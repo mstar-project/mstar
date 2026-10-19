@@ -196,10 +196,10 @@ class XPUPagedAttentionManager(AttentionManager):
 
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
-        """Return this eager step's query indptr.
+        """Return the current step's query indptr.
 
-        Unlike CUDA-graph FlashInfer buffers, this tensor is newly allocated
-        by every plan and therefore has no address-stability guarantee.
+        Eager plans allocate a new tensor; captured plans reuse the buffer
+        for their capture bucket, slot, and label.
         """
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q

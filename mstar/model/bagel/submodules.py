@@ -784,15 +784,10 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
         """Declare matching CUDA/XPU decode and text-prefill captures.
 
-        cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
-        prefill_text declares a pre-forward fork of the main stream
-        (main to cfg_text), an allocating operation. Replay addresses the
-        cache manager at the real request ids, so the fork would land on
-        real state now, but a captured cfg-on prefill has never been
-        exercised and stays off until verified on its own. cfg-on prefill_text continues to
-        use the eager path; downstream image_gen / decode+cfg captures are
-        unaffected (they don't depend on this capture's snapshot
-        semantics).
+        CFG-on text prefill stays eager pending capture validation of its
+        allocating main-to-cfg_text KV fork. Decode recipes cover CFG on and
+        off; text-prefill recipes cover CFG off. Image-generation walks have
+        no capture recipe and run eagerly.
         """
         if not self.config.accelerator_graph:
             return []
