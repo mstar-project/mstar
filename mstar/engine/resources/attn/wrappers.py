@@ -236,8 +236,8 @@ class FlashInferPrefillWrapper:
             # restage waits for them
             self._pinned_done.record()
 
-        # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
-        # even if we're not in an accelerator graph
+        # Keep query offsets available to the attention manager for last-token
+        # selection in eager execution.
         if not self.accelerator_graph:
             # TODO: take the cuda version as a kwarg
             if qo_indptr.device.type != "cuda":

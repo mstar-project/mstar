@@ -182,8 +182,7 @@ def _drive(
     fwd_info: CurrentForwardPassInfo,
     inputs: dict[str, list[torch.Tensor]],
 ) -> dict[str, list[torch.Tensor]]:
-    """One engine-shaped pass: prepare_inputs -> preprocess -> forward
-    (StatelessEngine._execute_sequential's exact call sequence)."""
+    """Drive one request through prepare_inputs, preprocess, and forward."""
     node_inputs = submodule.prepare_inputs(graph_walk=graph_walk, fwd_info=fwd_info, inputs=inputs)
     engine_inputs = _engine_inputs(fwd_info)
     preprocessed = submodule.preprocess(

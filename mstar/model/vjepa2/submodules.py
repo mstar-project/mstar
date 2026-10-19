@@ -1,16 +1,10 @@
 """NodeSubmodule wrappers for the V-JEPA 2 graph nodes.
 
-Three submodules:
-
-  VJepa2EncoderSubmodule   - ViT 3D-patch video encoder.
-  VJepa2PredictorSubmodule - masked latent predictor (single forward per call).
-  VJepa2ACPredictorSubmodule - action-conditioned predictor (ditto).
-
-All three are stateless (no KV cache, no per-iteration state) and are
-dispatched through ``StatelessEngine``.  ``preprocess`` stacks
-per-request tensors into a batch (dim 0) — the single-request case
-through ``_execute_sequential`` looks like B=1 and goes through ``forward``;
-``_execute_batched`` with B>1 goes through ``forward_batched``.
+Wrappers cover the video encoder, masked and action-conditioned predictors,
+rollout, and MPC prediction and scoring. The engine dispatches their forwards
+and manages declared resources. Masked predictors use no KV cache; the
+action-conditioned rollout caches KV across steps through model-declared KV
+and attention resources and supports piecewise capture of its block loop.
 
 The masked-vs-AC choice is made by ``VJepa2Model.get_submodule`` based on
 ``config.predictor_kind``.  Both predictor submodules emit the same output
