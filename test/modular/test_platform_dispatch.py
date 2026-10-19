@@ -15,7 +15,7 @@ import torch._inductor.config as inductor_config
 from mstar import platforms
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
-from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
+from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, rocm_gemm
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
 
@@ -171,9 +171,10 @@ def test_no_overrides_returns_the_callable_itself(on_platform, platform, num_tok
 @pytest.mark.parametrize(
     ("num_tokens", "aten_only"), [(1, True), (32, True), (33, False), (1024, False), (None, False)],
 )
-def test_rocm_keeps_small_buckets_gemms_on_aten(num_tokens, aten_only):
+def test_rocm_keeps_small_buckets_gemms_on_aten(monkeypatch, num_tokens, aten_only):
     """Small buckets autotune GEMMs over hipBLASLt only. Bigger ones, and
     forwards compiled for any token count, keep inductor's defaults."""
+    monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: None)
     overrides = RocmPlatform().inductor_overrides(num_tokens)
     assert overrides == ({"max_autotune_gemm_backends": "ATEN"} if aten_only else {})
 

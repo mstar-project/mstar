@@ -80,6 +80,7 @@ test/modular/test_streams.py
 test/modular/test_platforms.py
 test/modular/test_nccl_loopback.py
 test/modular/test_platform_dispatch.py
+test/modular/test_rocm_skinny_gemm_pass.py
 test/modular/test_rocm_op_dispatch.py
 test/modular/test_fused_moe_backend.py
 test/modular/test_cli_serve.py
