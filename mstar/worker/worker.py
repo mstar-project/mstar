@@ -6,7 +6,7 @@ import threading
 import time
 import time as _time
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -62,6 +62,7 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     NewRequest,
+    OffloadDelta,
     ReadsDone,
     RemoveRequest,
     ScheduleTPNode,
@@ -464,8 +465,11 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
             os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and
+        # the last one each follower was sent, which its forwards are stamped
+        # with (one rank may lead several nodes, each with its own followers).
         self._tp_broadcast_seq = 0
+        self._tp_last_seq_sent: dict[str, int] = {}
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -523,13 +527,14 @@ class Worker:
         # rank that leads a request mints it. See RemoveRequest.session_idle_seq.
         self._session_idle_seq = 0
 
-        # step seq -> rids rank 0 released after that step, held until this rank
-        # has consumed it. See ``_removal_step_reached``.
-        # seq -> the removals parked for it, the whole body so a replay carries
-        # every field it arrived with.
-        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
-        # The same for session teardowns rank 0 forwarded.
-        self._teardowns_awaiting_step: dict[int, list[TeardownSession]] = {}
+        # Rank 0's stamped forwards (removals and session teardowns), in the
+        # order it sent them, each held until this rank has consumed the step
+        # it was made after. One queue for both: each moves the state an
+        # offload picks its victims from, so they land in rank 0's order. See
+        # ``_hold_until_step``.
+        self._tp_forwards_awaiting_step: deque[
+            RemoveRequest | TeardownSession
+        ] = deque()
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
@@ -552,6 +557,12 @@ class Worker:
             pending_removes=self._pending_removes,
             handles_awaiting_admit=self._handles_awaiting_admit,
         )
+        self.scheduler.share_tp_forwards(self._tp_forwards_awaiting_step)
+        # rank 0: node -> the workers that follow this one for it
+        self._lockstep_followers: dict[str, tuple[str, ...]] = {}
+        # TP follower: wire rids rank 0 forwarded a drain for before this rank
+        # had their NEW_REQUEST, applied once it lands; see ``_drain_request``.
+        self._drains_awaiting_new: set[str] = set()
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
@@ -728,15 +739,18 @@ class Worker:
             # skips it, and a follower answers REMOVED_RID so a batch naming it
             # defers rather than running against engine state that is not open.
             self._handles_awaiting_admit.add(request_id)
+            # it answers a drain while it waits, as it answers a removal
+            self._apply_drain_awaiting_new(body.request_id)
             return
         self._finish_admission(body, request_id)
 
     def _finish_admission(self, body: NewRequest, request_id: int) -> None:
         """Open the request's engine state and let it be scheduled.
 
-        Split off at the engine call because that is the step that adopts the
-        session's state, which its previous request has to hand back first.
-        Everything before it is keyed by the handle and safe to do meanwhile.
+        Split off at the engine call because from there the request may adopt
+        the session's state (at its first admit), which its previous request
+        has to hand back first. Everything before it is keyed by the handle and
+        safe to do meanwhile.
         """
         session = body.request_info.session
         session_id = None if session is None else session.session_id
@@ -786,9 +800,19 @@ class Worker:
 
     def _process_unprocessed(self, wire_rid: str) -> None:
         """Process messages for ``wire_rid`` that came in before its NEW_REQUEST."""
+        self._apply_drain_awaiting_new(wire_rid)
         if wire_rid in self._unprocessed_messages:
             self._process_message_list(self._unprocessed_messages[wire_rid])
             del self._unprocessed_messages[wire_rid]
+
+    def _apply_drain_awaiting_new(self, wire_rid: str) -> None:
+        """The drain rank 0 forwarded before this request's NEW_REQUEST, now
+        that it has a handle here. As if it came after the NEW."""
+        if wire_rid in self._drains_awaiting_new:
+            self._drains_awaiting_new.discard(wire_rid)
+            self._drain_request(
+                DrainRequest(request_id=wire_rid, source=MessageSource.SELF),
+            )
 
     def _open_stream_buffers(self, body: NewRequest, request_id: int) -> None:
         """The request's consumer-side stream buffers.
@@ -824,15 +848,12 @@ class Worker:
         if self.is_tp_follower:
             if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
                 return # wait for rank 0's forward, to avoid race conditions
-            if not self._removal_step_reached(body):
+            if self._hold_until_step(body):
                 # Rank 0 released these pages between two steps; tearing down
                 # before this rank finishes the earlier one would have it admit
                 # that step with pages rank 0 no longer held. Follower-only:
                 # ``last_consumed_tp_seq`` never advances on a leader, which
                 # would park a stamped teardown for good.
-                self._removes_awaiting_step.setdefault(
-                    body.after_tp_seq, []
-                ).append(body)
                 return
 
         # Async-scheduling deferral: if this rid is currently held by an
@@ -870,7 +891,9 @@ class Worker:
         # remove it too. Followers defer removal until they get this message
         # (see the guard at the top of this method) so they can't tear down
         # state we're still reading from an in-flight step/speculation.
-        for worker in self._tp_followers(request_id):
+        followers = self._tp_followers(request_id)
+        deltas = self._take_resident_deltas(followers)
+        for worker in followers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
                     message_type=WorkerMessageType.REMOVE_REQUEST,
@@ -880,8 +903,9 @@ class Worker:
                         # this rank is about to release the pages, having
                         # broadcast up to here; followers must do it in the
                         # same gap between steps
-                        after_tp_seq=self._tp_broadcast_seq - 1,
+                        after_tp_seq=self._tp_last_seq_sent.get(worker, -1),
                         session_idle_seq=idle_seq,
+                        resident_deltas=deltas[worker],
                     )
                 )
             )
@@ -934,6 +958,18 @@ class Worker:
             MessageSource.TP_RANK_0, MessageSource.SELF
         ):
             return  # honor only the leader's forwarded drain, like REMOVE_REQUEST
+        if (
+            body.source == MessageSource.TP_RANK_0
+            and self._rid(body.request_id) is None
+        ):
+            # Rank 0 forwards a drain only for a request it has, so this rank's
+            # NEW_REQUEST for it is on its way from the conductor, which sends
+            # it to every rank at once; the forward just overtook it. Applied
+            # once it lands rather than now, which would refuse that NEW and
+            # leave this rank out of the moves and the removal rank 0 makes
+            # for the request.
+            self._drains_awaiting_new.add(body.request_id)
+            return
 
         # Defer behind an in-flight GPU step, same as REMOVE_REQUEST: clearing
         # the scheduler while a step references the rid would race the GPU thread.
@@ -1034,50 +1070,49 @@ class Worker:
         if self.is_tp_follower:
             if body.source == MessageSource.CONDUCTOR:
                 return  # wait for rank 0's forward
-            if not self._removal_step_reached(body):
-                self._teardowns_awaiting_step.setdefault(
-                    body.after_tp_seq, []
-                ).append(body)
+            if self._hold_until_step(body):
                 return
         if self._sessions.requests_still_leaving(session_id):
             self._sessions.hold_teardown(session_id)
             return
-        for worker in self._sessions.tp_followers(session_id):
+        followers = self._sessions.tp_followers(session_id)
+        deltas = self._take_resident_deltas(followers)
+        for worker in followers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
                     message_type=WorkerMessageType.TEARDOWN_SESSION,
                     body=TeardownSession(
                         session_id=session_id,
                         source=MessageSource.TP_RANK_0,
-                        after_tp_seq=self._tp_broadcast_seq - 1,
+                        after_tp_seq=self._tp_last_seq_sent.get(worker, -1),
+                        resident_deltas=deltas[worker],
                     ),
                 ),
             )
         self._fail_requests_awaiting_session(
             self._sessions.forget_session(session_id), session_id,
+            adopting=self.engine_manager.remove_session(session_id),
         )
-        self.engine_manager.remove_session(session_id)
         self._ack_session_torn_down(session_id)
 
     def _fail_requests_awaiting_session(
         self, bodies: list[NewRequest], session_id: str,
+        adopting: Collection[int] = (),
     ) -> None:
         """Fail requests that were waiting on a session that has now gone.
 
-        Admitting one would resume it from an empty context; 410 is what the
-        route promises for state that is gone. Keyed by handle, so a request
-        with several partitions here is reported once.
+        ``bodies`` were held before ingest; ``adopting`` were ingested but had
+        not taken the session's state yet. Running either would resume it from
+        an empty context; 410 is what the route promises for state that is
+        gone. Keyed by handle, so a request with several partitions here is
+        reported once.
         """
-        errors, statuses = {}, {}
-        for body in bodies:
-            handle = body.request_info.rid_handle
-            self._handles_awaiting_admit.discard(handle)
-            errors[handle] = (
-                f"session {session_id} was torn down before this request ran"
-            )
-            statuses[handle] = 410
+        handles = [body.request_info.rid_handle for body in bodies]
+        self._handles_awaiting_admit.difference_update(handles)
+        message = f"session {session_id} was torn down before this request ran"
+        errors = dict.fromkeys([*handles, *adopting], message)
         if errors:
-            self._fail_requests(errors, statuses)
+            self._fail_requests(errors, dict.fromkeys(errors, 410))
 
     def _rid_is_leaving(self, rid: int) -> bool:
         """Whether this rid handle is still on its way out: held by an
@@ -1264,6 +1299,17 @@ class Worker:
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):
+                if (
+                    message.message_type == WorkerMessageType.REMOVE_REQUEST
+                    and message.body.source == MessageSource.TP_RANK_0
+                ):
+                    # Not expected: the conductor removes a request only once
+                    # every rank has drained it, which needs its NEW here. Held
+                    # until the NEW lands, this forward is out of rank 0's order.
+                    logger.warning(
+                        "Worker %s: rank 0's removal of %s arrived before its "
+                        "NEW_REQUEST", self.worker_id, message.body.request_id,
+                    )
                 # got an out-of-order request
                 self._unprocessed_messages.setdefault(
                     message.body.request_id, []
@@ -1744,6 +1790,7 @@ class Worker:
             node_batch.node_name, node_batch.graph_walk
         )._workers[1:]
         for worker in workers:
+            self._tp_last_seq_sent[worker] = seq
             self.communicator.send(
                 worker, msg=WorkerMessage(
                     message_type=WorkerMessageType.SCHEDULE_TP,
@@ -2227,7 +2274,7 @@ class Worker:
         # A teardown this rank has been holding releases pages, and spending one
         # can mean no eviction is needed at all. After the push-back above, so a
         # rid torn down here cannot be pushed onto queues that have just been dismantled.
-        self._apply_removes_whose_step_landed()
+        self._apply_forwards_whose_step_landed()
 
         # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
         # so no forward ran and its own pages are fair game. Empty in practice —
@@ -2896,6 +2943,7 @@ class Worker:
                 self.worker_id, message.node_name, message.graph_walk,
                 message.spec_seq,
             )
+            self.scheduler.discard_tp_follow(message)
             return
         if (
             self._tp_async_for(message.node_name) and message.speculative
@@ -2905,6 +2953,7 @@ class Worker:
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
+            self.scheduler.discard_tp_follow(message)
             return
         self.scheduler.register_tp_follow(message)
 
@@ -2972,6 +3021,10 @@ class Worker:
                 return outputs, None
             self.communicator.wait_for_work(20)
             self._process_messages()
+            # A refused forward holds the head's moves behind it; retried only
+            # by the main loop, the head could never build and this never
+            # return. N admitted before this was entered (the fence).
+            self._apply_forwards_whose_step_landed()
             self._check_ready_tensors()
             self._poll_stream_buffers()
             if outputs is not None:
@@ -3667,36 +3720,96 @@ class Worker:
         for group in sharding.groups:
             if group.tp_size > 1 and group._tp_rank == 0:
                 followers.update(group._workers[1:])
+                # A node's instance is fixed per worker, so this is topology,
+                # not per-request state; see ``_take_resident_deltas``.
+                for node_name in group.nodes:
+                    self._lockstep_followers[node_name] = tuple(group._workers[1:])
         return followers
 
-    def _removal_step_reached(
-        self, body: RemoveRequest | TeardownSession,
-    ) -> bool:
-        """Whether this rank has consumed the step rank 0 released these pages
-        after. Unstamped removals (``-1``) are not ordered against anything."""
+    def _take_resident_deltas(
+        self, recipients: Collection[str],
+    ) -> dict[str, dict[str, OffloadDelta]]:
+        """Rank 0's moves since its last broadcast, for a forward to carry: per
+        recipient, per node it follows here.
+
+        A removal or teardown changes the pages the moves after it are made
+        against, so the moves made before it go with it rather than with the
+        next broadcast; a follower applies the forward once it has consumed
+        the last step broadcast, and replaying them after it would replay
+        them against a different state from the one rank 0 made them in.
+
+        A node's moves are taken only if the forward reaches every follower of
+        that node, since what is taken is sent nowhere else. A node it does not
+        reach keeps them for its next broadcast, which is still in order: this
+        forward is about a request or session that has no pages there.
+        """
+        per_worker: dict[str, dict[str, OffloadDelta]] = {
+            worker: {} for worker in recipients
+        }
+        if not per_worker:
+            return per_worker
+        for node_name, followers in self._lockstep_followers.items():
+            if node_name not in self.parallel_leader_nodes or not all(
+                worker in per_worker for worker in followers
+            ):
+                continue
+            delta = self.engine_manager.get_engine(node_name).take_resident_delta(
+                node_name,
+            )
+            if delta:
+                # one each: a follower pops its copy as it replays
+                for worker in followers:
+                    per_worker[worker][node_name] = delta.copy()
+        return per_worker
+
+    def _tp_step_reached(self, body: RemoveRequest | TeardownSession) -> bool:
+        """Whether this rank has consumed the step rank 0 made this change
+        after. Unstamped bodies (``-1``) are not ordered against anything."""
         return (
             body.after_tp_seq < 0
             or self.scheduler.last_consumed_tp_seq >= body.after_tp_seq
         )
 
-    def _apply_removes_whose_step_landed(self) -> None:
-        """Tear down the requests rank 0 released once this rank reaches the step
-        it released them after. Cannot strand them: the step was broadcast before
-        the removal, so this rank gets there."""
-        if not (self._removes_awaiting_step or self._teardowns_awaiting_step):
-            return
-        reached = self.scheduler.last_consumed_tp_seq
-        for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
-            for parked in self._removes_awaiting_step.pop(seq):
-                # replace, not a fresh body: every field it carried survives
-                self._remove_request(replace(
-                    parked, source=MessageSource.SELF, after_tp_seq=-1,
-                ))
-        for seq in sorted(s for s in self._teardowns_awaiting_step if s <= reached):
-            for parked in self._teardowns_awaiting_step.pop(seq):
-                self._teardown_session(replace(
-                    parked, source=MessageSource.SELF, after_tp_seq=-1,
-                ))
+    def _hold_until_step(self, body: RemoveRequest | TeardownSession) -> bool:
+        """Queue a forward from rank 0 behind any still held, and apply what has
+        reached its step; ``_apply_forwards_whose_step_landed``. True when it
+        was rank 0's: the queue owns it now.
+
+        Behind any earlier forward still held, even if its own step has been
+        reached: rank 0's stamps never decrease, so this only keeps its order.
+        Only rank 0's forwards: a replay is SELF and runs as it is.
+        """
+        if body.source != MessageSource.TP_RANK_0:
+            return False
+        self._tp_forwards_awaiting_step.append(body)
+        # through the queue even when its step is reached, so the moves it
+        # carries are replayed first and a refused one keeps it waiting
+        self._apply_forwards_whose_step_landed()
+        return True
+
+    def _apply_forwards_whose_step_landed(self) -> None:
+        """Replay rank 0's held forwards, in order, up to the step this rank has
+        reached. Cannot strand them: each step was broadcast before the forward
+        made after it, so this rank gets there."""
+        held = self._tp_forwards_awaiting_step
+        while held and self._tp_step_reached(held[0]):
+            # The moves rank 0 made before this change, which it made against
+            # the state they left. A refusal (a step still holds the pages)
+            # leaves the forward at the head, retried next pass; the next
+            # step's delta waits behind it (``settle_tp_follow_delta``).
+            if not self.scheduler.replay_forwarded_deltas(held[0].resident_deltas):
+                return
+            # replace, not a fresh body: every field it carried survives
+            body = replace(
+                held.popleft(), source=MessageSource.SELF, after_tp_seq=-1,
+            )
+            if isinstance(body, RemoveRequest):
+                self._remove_request(body)
+            else:
+                self._teardown_session(body)
+            # the step moves it held back; a refusal is retried by the next
+            # step's settle, which they are queued ahead of
+            self.scheduler.replay_owed_step_deltas()
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[int]
@@ -4179,8 +4292,8 @@ class Worker:
                 if self.enable_nvtx:
                     range_push("worker.process_messages", synchronize=False)
                 self._process_messages()
-                # Removals rank 0 stamped with a step this rank has now reached.
-                self._apply_removes_whose_step_landed()
+                # Forwards rank 0 stamped with a step this rank has now reached.
+                self._apply_forwards_whose_step_landed()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 

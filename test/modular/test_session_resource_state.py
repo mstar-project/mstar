@@ -14,7 +14,14 @@ import sys
 sys.path.insert(0, ".")
 
 
-from mstar.engine.resources import Resource, StepRunner
+from mstar.engine.resources import (
+    KVStep,
+    Resource,
+    Segment,
+    StepContext,
+    StepRunner,
+    SubmoduleStep,
+)
 from mstar.model.sessions import RequestSession, SessionResourceConfig
 
 
@@ -55,12 +62,27 @@ class _Stub(Resource):
         self.calls.append(f"retain:{rid}:{session_id}")
         self.sessions[session_id] = self.requests.pop(rid, 0)
 
+    def release_session(self, session_id, idle_seq=-1):
+        self.calls.append(f"release:{session_id}:{idle_seq}")
+
     def remove_session(self, session_id):
         self.calls.append(f"remove_session:{session_id}")
         self.sessions.pop(session_id, None)
 
     def session_state_size(self, session_id):
         return self.sessions.get(session_id, 0)
+
+
+def _step(keys, rids):
+    segs = tuple(Segment(rid, "main", 1) for rid in rids)
+    step = SubmoduleStep(
+        segments=list(segs),
+        steps={key: KVStep(segments=segs) for key in keys},
+    )
+    step.set_ctx(StepContext(
+        request_ids=tuple(rids), graph_walk="decode", slot=0, capture=False,
+    ))
+    return step
 
 
 def _runner(session_keys=(), max_state=None, derived=()):
@@ -116,6 +138,9 @@ def test_the_session_hands_its_state_to_the_next_request():
     assert kv.sessions == {"s": 12}
 
     runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    # not at ingest: that point differs across a TP instance's ranks
+    assert kv.sessions == {"s": 12}
+    runner.admit(_step(["kv"], ["r1"]))
 
     assert kv.requests["r1"] == 12
     assert kv.sessions == {}  # held by the request while it runs
@@ -221,7 +246,59 @@ def test_only_a_resumed_request_adopts():
     assert "adopt:r0:s" not in res["kv"].calls
 
     runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    assert runner.adopt("r1") is True
     assert "adopt:r1:s" in res["kv"].calls
+    assert runner.adopt("r1") is False  # once
+
+
+def test_the_first_admit_or_pre_admit_naming_a_request_adopts():
+    runner, res = _runner(session_keys=("kv",))
+    res["kv"].sessions["s"] = 7
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    assert runner.pending_session("r1") == "s"
+
+    runner.admit(_step(["kv"], ["other"]))
+    assert "adopt:r1:s" not in res["kv"].calls
+
+    runner.pre_admit(_step(["kv"], ["other", "r1"]))
+    assert runner.pending_session("r1") is None
+    assert res["kv"].requests["r1"] == 7
+
+
+def test_a_request_removed_before_it_adopts_releases_the_session():
+    """It holds nothing of the session's, so the session keeps its own state,
+    released back to idle under the new stamp (``release_session``) whether or
+    not it was held for this request."""
+    runner, res = _runner(session_keys=("kv",))
+    res["kv"].sessions["s"] = 7
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+
+    assert runner.remove_request("r1", session_id="s", idle_seq=4) is True
+
+    assert res["kv"].sessions == {"s": 7}
+    assert res["kv"].calls[-2:] == ["remove:r1", "release:s:4"]
+    assert "adopt:r1:s" not in res["kv"].calls
+    assert runner.pending_session("r1") is None
+
+
+def test_a_request_that_ran_reports_so_on_removal():
+    runner, _ = _runner(session_keys=("kv",))
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    runner.adopt("r1")
+
+    assert runner.remove_request("r1", session_id="s") is False
+
+
+def test_remove_session_names_the_requests_still_waiting_to_adopt():
+    runner, _ = _runner(session_keys=("kv",))
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    runner.ingest_request("r2", session=RequestSession("t", resumed=True))
+    runner.ingest_request("r3", session=RequestSession("s", resumed=True))
+    runner.adopt("r3")
+
+    assert runner.remove_session("s") == ["r1"]
+    assert runner.pending_session("r1") is None
+    assert runner.pending_session("r2") == "t"
 
 
 def test_session_holds_state_asks_every_session_resource():

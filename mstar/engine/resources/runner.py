@@ -8,7 +8,8 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 
@@ -57,6 +58,43 @@ def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
     return tuple(order)
 
 
+@dataclass(slots=True)
+class PendingAdoptions:
+    """Requests that resume a session but have not taken its state yet.
+
+    A request adopts at its first admit (or the reload ahead of it), not at
+    ingest. Ingest happens whenever its NEW_REQUEST is processed, which differs
+    across the ranks of a TP instance, and adopting takes the session out of
+    the idle set each rank offloads from in the same order. Until then, the
+    request counts as offloaded if its session's state is.
+    """
+
+    # rid -> the session whose state it will adopt
+    sessions: dict[str, str] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.sessions)
+
+    def __contains__(self, rid: str) -> bool:
+        return rid in self.sessions
+
+    def add(self, rid: str, session_id: str) -> None:
+        self.sessions[rid] = session_id
+
+    def session_of(self, rid: str) -> str | None:
+        return self.sessions.get(rid)
+
+    def take(self, rid: str) -> str | None:
+        return self.sessions.pop(rid, None)
+
+    def take_session(self, session_id: str) -> list[str]:
+        """Forget every rid waiting on the session, and name them."""
+        rids = [rid for rid, sid in self.sessions.items() if sid == session_id]
+        for rid in rids:
+            del self.sessions[rid]
+        return rids
+
+
 class StepRunner:
     """drives resources through per-step cycle"""
 
@@ -72,6 +110,7 @@ class StepRunner:
         self._resources: dict[str, Resource] = dict(resources)
         # Budget overflows owed to a session, read at its next ingest
         self._session_errors: dict[str, str] = {}
+        self._pending_adoptions = PendingAdoptions()
         self._order = topo_sort(self._resources) # only toposort once to minimize cpu time on python
         self._preplan_order = [
             res for res in self._order if self._resources[res].supports_preplan
@@ -270,9 +309,9 @@ class StepRunner:
         """open state on all resources; `overrides` are per-resource. All or
         nothing: a resource that raises leaves the request on none of them.
 
-        A request resuming a session also takes on whatever that session's
-        resources already hold (`adopt_session_state`). One that starts a
-        session adopts nothing, whatever is parked under its id.
+        A request resuming a session will take on whatever that session's
+        resources hold, at its first admit; see ``PendingAdoptions``. One that
+        starts a session adopts nothing, whatever is parked under its id.
         """
         adopt = session is not None and session.resumed
         for i, key in enumerate(self._order):
@@ -282,22 +321,40 @@ class StepRunner:
                     rid, None if overrides is None else overrides.get(key)
                 )
                 if adopt and resource.session_config is not None:
-                    resource.adopt_session_state(rid, session.session_id)
+                    resource.expect_session_state(rid, session.session_id)
             except Exception:
-                # the raising resource may have taken part of it too; what was
-                # adopted goes back to the session rather than being freed
+                # the raising resource may have taken part of it too
                 for done in self._order[:i + 1]:
-                    undo = self._resources[done]
                     try:
-                        if adopt and undo.session_config is not None:
-                            undo.retain_session_state(rid, session.session_id)
-                        else:
-                            undo.remove_request(rid)
+                        self._resources[done].remove_request(rid)
                     except Exception:
                         logger.exception(
                             "rolling back request %s on resource %s failed", rid, done,
                         )
                 raise
+        if adopt:
+            self._pending_adoptions.add(rid, session.session_id)
+
+    def pending_session(self, rid: str) -> str | None:
+        """The session ``rid`` has yet to adopt the state of, if any."""
+        return self._pending_adoptions.session_of(rid)
+
+    def adopt(self, rid: str) -> bool:
+        """Hand ``rid`` its session's state now, if it is still waiting for
+        it. False when it was not."""
+        session_id = self._pending_adoptions.take(rid)
+        if session_id is None:
+            return False
+        for key in self.session_resource_keys():
+            self._resources[key].adopt_session_state(rid, session_id)
+        return True
+
+    def _adopt_step(self, rids: Iterable[str]) -> None:
+        # guarded: a step's rids are only walked while someone is waiting
+        if self._pending_adoptions:
+            for rid in rids:
+                if rid in self._pending_adoptions:
+                    self.adopt(rid)
 
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
@@ -306,7 +363,7 @@ class StepRunner:
 
     def remove_request(
         self, rid: str, session_id: str | None = None, idle_seq: int = -1,
-    ) -> None:
+    ) -> bool:
         """drop the request's state, or hand it back to its session
 
         A session resource keeps what the request built; every other resource
@@ -317,15 +374,24 @@ class StepRunner:
         resource that reclaims parked state; see ``retain_session_state``.
 
         A rid no resource ever ingested is a no-op; see ``Engine.remove_request``.
+        Returns whether the request was still waiting to adopt its session's
+        state, in which case the session is released (``release_session``)
+        rather than handed this request's: it holds nothing of the session's,
+        and the session is stamped with ``idle_seq`` as if the request had run.
         """
+        was_pending = self._pending_adoptions.take(rid) is not None
         for key in self._order:
             resource = self._resources[key]
             if session_id is None or resource.session_config is None:
                 resource.remove_request(rid)
-                continue
-            resource.retain_session_state(rid, session_id, idle_seq)
+            elif was_pending:
+                resource.remove_request(rid)
+                resource.release_session(session_id, idle_seq)
+            else:
+                resource.retain_session_state(rid, session_id, idle_seq)
         if session_id is not None:
             self._enforce_session_budget(session_id)
+        return was_pending
 
     def _enforce_session_budget(self, session_id: str) -> None:
         """Bring the session within every resource's budget.
@@ -360,11 +426,16 @@ class StepRunner:
         for key in self.session_resource_keys():
             self._resources[key].clear_session_state(session_id)
 
-    def remove_session(self, session_id: str) -> None:
-        """free everything every resource holds for the session"""
+    def remove_session(self, session_id: str) -> list[str]:
+        """free everything every resource holds for the session
+
+        Returns the requests that were waiting to adopt its state: they now
+        have nothing to resume from.
+        """
         self._session_errors.pop(session_id, None)
         for key in self.session_resource_keys():
             self._resources[key].remove_session(session_id)
+        return self._pending_adoptions.take_session(session_id)
 
     def take_session_error(self, session_id: str) -> str | None:
         """The budget overflow owed to this session, consumed once."""
@@ -478,6 +549,7 @@ class StepRunner:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved.
         """
+        self._adopt_step(step.ctx.request_ids)
         staged_key = self._drop_stale_preplan(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
         # up for it, skips the resources that sweep covered: each would only
@@ -549,8 +621,10 @@ class StepRunner:
         the later full `admit` covers the rest; these resources see their own
         state as already reserved and no-op
 
-        Unwound on refusal exactly as ``admit`` is.
+        Unwound on refusal exactly as ``admit`` is. Adoption is not: a request
+        that adopted stays the holder of its session's state.
         """
+        self._adopt_step(step.ctx.request_ids)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):

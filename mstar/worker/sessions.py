@@ -5,9 +5,8 @@ decision that state drives: which requests belong to a session, whether a
 resumed request may be ingested yet, which deferred removal also ends its
 session, and which held teardown is free to run.
 
-Requests are the worker's rid *handles*, like the rest of its per-request state;
-a held NEW_REQUEST is the one exception, since its handle is minted only once the
-worker admits it.
+Requests are the worker's rid *handles*, like the rest of its per-request state,
+held ones included: the handle is minted on arrival, before the wait.
 
 Nothing here talks to the engine or the communicator — the worker does that. The
 one thing it cannot answer for itself is whether a request is still on its way
@@ -103,7 +102,7 @@ class WorkerSessionManager:
             session.session_id, except_rid=own_handle,
         ):
             return False
-        # ingesting now would adopt nothing
+        # once ingested it may adopt at any admit, and would find nothing
         if not any(
             held.request_id == body.request_id
             for held in self._pending_session_ingests

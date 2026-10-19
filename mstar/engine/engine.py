@@ -437,6 +437,8 @@ class Engine:
         # that is not sharded is in neither: it owns its own eviction.
         self._tp_leader_nodes: set[str] = set()
         self._tp_follower_nodes: set[str] = set()
+        # the request a replay last stopped for, so the wait is logged once
+        self._replay_waiting_on: str | None = None
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
@@ -770,16 +772,16 @@ class Engine:
     def _refuse_undersized_session_pools(self, sessions_config) -> None:
         """A pool that cannot move parked state aside must fit every session's.
 
-        Recurrent state has no host offload, so a parked session holds its slots
-        out of circulation until it ends. A pool one slot short of what the cap
-        allows does not fail at load today -- it turns into requests waiting at
-        admission for sessions to end, which reads as a hang rather than a
-        misconfiguration.
+        Recurrent state has no host offload, and neither does a KV cache
+        without ``cpu_offload_pages``, so a parked session holds its slots or
+        pages out of circulation until it ends. A pool short of what the cap
+        allows would otherwise turn into requests waiting at admission for
+        sessions to end, which reads as a hang rather than a misconfiguration.
 
         A lower bound, so it never refuses a pool that would have worked:
-        running requests need slots of their own on top of this, but
+        running requests need room of their own on top of this, but
         ``max_concurrent_requests`` is usually unset, and a session with no
-        ``max_state`` still holds at least one slot.
+        ``max_state`` still holds at least one unit.
         """
         sessions = sessions_config.max_concurrent_sessions
         if not sessions:
@@ -800,7 +802,8 @@ class Engine:
                         if cfg.max_state else ""
                     )
                     + ", and running requests need their own on top. Parked "
-                    f"{key!r} cannot be offloaded, so raise its pool or lower "
+                    f"{key!r} cannot be offloaded, so raise its pool, give it a "
+                    "host pool (cpu_offload_pages, for a KV cache) or lower "
                     "max_concurrent_sessions."
                 )
 
@@ -1958,7 +1961,19 @@ class Engine:
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id):
+        session_id = (
+            self._runner.pending_session(request_id)
+            if allow_reload and node_name not in self._tp_follower_nodes
+            else None
+        )
+        if session_id is not None:
+            # Held once it is found ready, not only once offloaded: left idle,
+            # its state is the next reload's reclaim victim, after this scan
+            # judged it resident, and a follower replaying that reload first
+            # would never find it ready.
+            if not self._hold_for_request(node_name, request_id, session_id):
+                return FULL_ADMIT_NOT_READY
+        elif self.is_offloaded(node_name, request_id):
             if not allow_reload:
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
@@ -2167,10 +2182,16 @@ class Engine:
         )
 
     def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        return any(
-            resource.is_offloaded(request_id)
-            for resource in self._submodules[node_name].resources.values()
-        )
+        """A request still waiting to adopt its session's state is offloaded
+        if that state is: it has to be brought back before the request runs."""
+        resources = self._submodules[node_name].resources.values()
+        session_id = self._runner.pending_session(request_id)
+        if session_id is not None:
+            return any(
+                resource.session_offloaded(session_id)
+                for resource in resources if resource.session_config is not None
+            )
+        return any(resource.is_offloaded(request_id) for resource in resources)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
@@ -2203,6 +2224,11 @@ class Engine:
             # eviction freed, so it is just as much rank 0's call. Not ready here
             # until the delta says so.
             return False
+        session_id = self._runner.pending_session(request_id)
+        if session_id is not None:
+            # Waiting to adopt: what is offloaded is the session's state, so
+            # that is what comes back, held for it until its first admit.
+            return self._hold_for_request(node_name, request_id, session_id)
         offloaded = [
             resource
             for resource in self._submodules[node_name].resources.values()
@@ -2231,6 +2257,53 @@ class Engine:
             self._resident_delta[node_name].add_reloaded(
                 self._graph_runtime.get_rid_string(request_id)
             )
+        return True
+
+    def _hold_for_request(
+        self, node_name: str, request_id: int, session_id: str,
+    ) -> bool:
+        """Rank 0: hold the session ``request_id`` is waiting to adopt, and
+        journal it by session. Once: a request waiting in the backlog is
+        checked every pass."""
+        if not any(
+            resource.session_needs_hold(session_id)
+            for resource in self._session_holders(node_name)
+        ):
+            return True
+        if not self._hold_session(node_name, session_id):
+            return False
+        logger.info(
+            "Held session %s on %s for request %s", session_id, node_name,
+            self._graph_runtime.get_rid_string(request_id),
+        )
+        if node_name in self._resident_delta:
+            self._resident_delta[node_name].add_session_held(session_id)
+        return True
+
+    def _session_holders(self, node_name: str) -> list[Resource]:
+        return [
+            resource
+            for resource in self._submodules[node_name].resources.values()
+            if resource.supports_eviction and resource.session_config is not None
+        ]
+
+    def _hold_session(self, node_name: str, session_id: str) -> bool:
+        """Hold the session's state on device across this node's resources;
+        see ``Resource.hold_session``. All or nothing."""
+        holders = self._session_holders(node_name)
+        # check every resource fits first, as ``reload_request`` does
+        if not all(
+            resource.can_reload_session(session_id)
+            for resource in holders if resource.session_offloaded(session_id)
+        ):
+            return False
+        held: list[Resource] = []
+        for resource in holders:
+            if not resource.hold_session(session_id):
+                for done in held:
+                    done.unhold_session(session_id)
+                return False
+            held.append(resource)
         return True
 
     def _classify_tp_roles(
@@ -2279,22 +2352,42 @@ class Engine:
 
         resources = self._submodules[node_name].resources.values()
         for _ in range(len(delta)):
-            wire_rid, is_offload = delta.peek_left()
-            # Wire strings, not handles: a handle is minted per worker, so rank
-            # 0's is meaningless here. None means this rank has no live request
-            # by that name -- it removed it already, on the other side of the
-            # step rank 0 recorded the move. Its pages are gone, so the move is
-            # moot and the entry is spent; logged because reaching this for a
-            # rid the rank has NOT YET admitted would silently lose a move and
-            # diverge the resident set for good.
-            rid = self._graph_runtime.get_rid_handle(wire_rid)
-            if rid is None:
-                logger.debug(
-                    "Replay: no live request named %s on %s; move is moot",
-                    wire_rid, node_name,
+            name, is_offload, is_session = delta.peek_left()
+            if is_session:
+                # Keyed by the session, so it needs nothing of the request it
+                # is held for, which this rank may not have yet.
+                if not self._hold_session(node_name, name):
+                    logger.warning(
+                        "Replay of rank 0's hold of session %s on %s does not "
+                        "fit; %d moves still owed. This rank cannot run rank "
+                        "0's next step until it catches up.",
+                        name, node_name, len(delta),
+                    )
+                    return False
+                logger.info(
+                    "Replayed rank 0's hold of session %s on %s", name, node_name,
                 )
                 delta.pop_left()
                 continue
+            wire_rid = name
+            # Wire strings, not handles: a handle is minted per worker, so rank
+            # 0's is meaningless here. A request entry names one rank 0 admitted
+            # into a step, which this rank admits too before it replays the
+            # moves after that step, and a removal carries the moves made
+            # before it (``RemoveRequest.resident_deltas``). So no handle means
+            # its NEW_REQUEST has not landed here yet: wait for it. Treating the
+            # move as moot would lose it and diverge the resident set for good.
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is None:
+                if self._replay_waiting_on != wire_rid:
+                    self._replay_waiting_on = wire_rid
+                    logger.warning(
+                        "Replay: rank 0 moved %s on %s, which this rank has "
+                        "no request for yet; waiting for it",
+                        wire_rid, node_name,
+                    )
+                return False
+            self._replay_waiting_on = None
             if is_offload:
                 if self.is_offloaded(node_name, rid):
                     logger.debug(
@@ -2404,7 +2497,13 @@ class Engine:
                 )
                 self.remove_session(session_id)
             self._request_sessions[request_id] = session_id
-        self._runner.ingest_request(request_id, overrides, session=session)
+        try:
+            self._runner.ingest_request(request_id, overrides, session=session)
+        except Exception:
+            # the removal that follows must not hand this request's (empty)
+            # state over the session's
+            self._request_sessions.pop(request_id, None)
+            raise
 
     def _session_holds_state(self, session_id: str) -> bool:
         return self._runner.session_holds_state(session_id) or any(
@@ -2431,16 +2530,19 @@ class Engine:
         A rid that was never admitted is a no-op, not an error: the worker mints
         a handle before a resumed request's session has handed its state over,
         so a removal can arrive for one this engine never saw. Keep it that way
-        — index resources with ``get``/``pop``, never ``[rid]``.
+        — index resources with ``get``/``pop``, never ``[rid]``. One that was
+        ingested but never adopted its session's state leaves the session as
+        it was, stamped with ``session_idle_seq``.
         """
         self._loopback_steps.pop(request_id, None)
         session_id = self._request_sessions.pop(request_id, None)
-        self._runner.remove_request(
+        never_ran = self._runner.remove_request(
             request_id, session_id=session_id, idle_seq=session_idle_seq,
         )
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
-        if session_id is None:
+        if session_id is None or never_ran:
+            # nothing this request did may speak for the session's last turn
             return
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
@@ -2453,14 +2555,19 @@ class Engine:
                     OVERSHOT_LAST_ITER, None,
                 )
 
-    def remove_session(self, session_id: str) -> None:
-        """Free everything the session holds, resources and submodules alike."""
+    def remove_session(self, session_id: str) -> list[str]:
+        """Free everything the session holds, resources and submodules alike.
+
+        Returns the requests that were still waiting to adopt its state, for
+        the caller to fail: they would resume from an empty context.
+        """
         for rid, sid in list(self._request_sessions.items()):
             if sid == session_id:
                 self._request_sessions.pop(rid, None)
-        self._runner.remove_session(session_id)
+        waiting = self._runner.remove_session(session_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_session(session_id)
+        return waiting
 
     def take_session_error(self, session_id: str) -> str | None:
         """The budget overflow this session owes its next request, if any."""

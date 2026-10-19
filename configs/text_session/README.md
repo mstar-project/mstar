@@ -9,6 +9,7 @@ block; see `docs/sessions.rst` for what each knob means, and
 | `capacity_evict`  | `evict`  | 600s idle    | happy path, LRU eviction, budget            |
 | `ttl_idle`        | `keep`   | 20s idle     | idle expiry, refreshed by traffic           |
 | `ttl_absolute`    | `keep`   | 30s absolute | expiry while busy                           |
+| `tp2_offload`     | `keep`   | 600s idle    | TP2, idle-session offload under pressure (`offload_stress.py`) |
 
 All four keep the model's declared `kv` budget of 64 pages (~8k tokens): a
 session that outgrows it is dropped and its next request is refused. The TTL

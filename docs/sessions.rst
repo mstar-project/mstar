@@ -259,19 +259,33 @@ its state is being freed; the conductor and the workers carry that out.
   last request of one that carried ``end_session`` — goes to every worker the
   session ran on as its own ``TEARDOWN_SESSION``, and each ACKs once its state
   is gone. Never as a flag on that request's removal: a worker parks the
-  removal of a request it has no handle for, which is exactly the case of a
-  resumed request it was still holding, so a flag there would strand the
-  teardown and its ACK behind the barrier's TTL. Until every ACK is in, the API
+  removal of a request it has no handle for until its ``NEW_REQUEST`` arrives,
+  which never happens for one drained before it got there, so a flag there
+  would strand the teardown and its ACK behind the barrier's TTL. Until every
+  ACK is in, the API
   server refuses the id. A worker that never ACKs is timed out
   (``MSTAR_DRAIN_TTL_S``) so one faulty worker cannot hold an id forever, and
   the API server releases a tombstone that stands past
   ``MSTAR_SESSION_TOMBSTONE_GRACE_S`` (180s) regardless.
-- **Under TP, one rank decides.** A session's state is freed at the same point
-  in the step sequence on every rank: rank 0 forwards both the removal and the
-  teardown stamped with the last step it broadcast, and a follower ignores the
-  conductor's copy. The order idle sessions are offloaded in comes from rank 0
-  too — it numbers each session as it parks its state and forwards the number —
-  so every rank reclaims the same sessions in the same order.
+- **Under TP, one rank decides.** A session's state changes hands at the same
+  point in the step sequence on every rank. Rank 0 forwards the removal that
+  parks it and the teardown that frees it, each stamped with the last step it
+  sent that follower and carrying the page moves rank 0 made since, which a
+  removal changes the outcome of; a follower ignores the conductor's copies and
+  applies rank 0's, in order, once it reaches that step, before the next
+  step's moves. A resumed request takes the session's state at its first admit
+  rather than at ingest, since each rank ingests whenever its own
+  ``NEW_REQUEST`` arrives. Until then the request counts as offloaded if its
+  session's state is, and bringing it back holds the *session* (reloaded, and
+  out of the idle set), which rank 0 journals by session id so a follower
+  replays it whether or not the request has reached it yet; a removal before
+  the first admit hands the session back, and a teardown that lands first
+  fails the request with 410. So every rank has the same sessions idle at
+  every step. The order idle sessions are offloaded in comes from rank 0 too —
+  it numbers each session as it parks its state and forwards the number — so
+  every rank reclaims the same sessions in the same order. A follower likewise
+  drains a request only on rank 0's forward, which can overtake the
+  conductor's ``NEW_REQUEST``, so a drain that arrives first waits for it.
 - **A failure ends the session.** v1 keeps no rollback, so a request that
   failed or was abandoned mid-generation leaves state a later request should
   not continue from. Its session is torn down with it.
@@ -390,9 +404,9 @@ Limits in this version
   ``max_state`` against the pool, leaving room for the requests
   ``max_concurrent_requests`` allows. For a resource that cannot offload, the
   engine refuses that config at load rather than letting it become an
-  admission wait, so a recurrent pool's ``max_slots`` has to cover the parked
-  sessions' slots — plus one per label for every running request, which it
-  cannot check for you. A request that does not fit anyway is not refused: it
+  admission wait, so a recurrent pool's ``max_slots`` (or a host-pool-less KV
+  cache's ``max_num_pages``) has to cover the parked sessions' state — plus
+  what every running request needs, which it cannot check for you. A request that does not fit anyway is not refused: it
   waits in admission, retrying until pages free up or the client gives up, as
   on a pool full of running requests. (A session's state does follow its
   request through an offload while that request is running.)

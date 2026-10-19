@@ -1093,3 +1093,14 @@ def test_a_builder_that_loses_a_row_is_refused():
         _next_batch(sched, _Manager(["r0", "r1", "r2"]))
 
 
+
+
+def test_the_peek_ignores_a_rid_awaiting_its_session():
+    """Nothing can schedule it until its session hands over, so counting it as
+    other ready work would break the speculation chain every step it waits."""
+    sched = _scheduler(_Engine(max_bs=8))
+    assert _has_ready(sched, _Manager(["w"]), ("other", "prefill")) is True
+
+    sched.handles_awaiting_admit.add("w")
+
+    assert _has_ready(sched, _Manager(["w"]), ("other", "prefill")) is False

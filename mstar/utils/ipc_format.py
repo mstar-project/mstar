@@ -1,5 +1,6 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
@@ -70,6 +71,9 @@ class RemoveRequest(MessageBody):
     # rank 0 rather than counting locally is what makes every rank pick the
     # same sessions in the same order. -1 when the request has no session.
     session_idle_seq: int = -1
+    # Rank 0's resident-set moves since its last broadcast, per node, replayed
+    # just before the removal; see ``OffloadDelta``.
+    resident_deltas: dict[str, "OffloadDelta"] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,6 +116,12 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
+class ResidentMove(NamedTuple):
+    name: str  # a wire request id, or a session id when ``is_session``
+    is_offload: bool
+    is_session: bool
+
+
 @dataclass
 class OffloadDelta:
     """A rank's offloads and reloads, in the order it made them.
@@ -120,7 +130,14 @@ class OffloadDelta:
     sequence that worked for the leader works for the followers too.
 
     Holds WIRE request ids, not worker-local handles: a handle is minted per
-    worker, so rank 0's would name different requests on the follower.
+    worker, so rank 0's would name different requests on the follower. A
+    session entry names the session instead: a request waiting to adopt its
+    session's state has rank 0 bring that state back and hold it for it, which
+    a follower can replay whether or not it has the request yet.
+
+    Rank 0 sends what it journals with its next broadcast, or with a forwarded
+    removal or teardown made before that, so the follower replays every move in
+    rank 0's order against the changes those make.
 
     A dataclass of lists rather than a NamedTuple of deques so that the wire codec
     can automatically encode it. ``pop_left`` is O(n) on a list, which costs nothing
@@ -130,41 +147,55 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    # parallel lists: names[i] was offloaded if is_offload[i], else reloaded;
+    # a session rather than a request if is_session[i]
     rids: list[str] = field(default_factory=list)
     is_offload: list[bool] = field(default_factory=list)
+    is_session: list[bool] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
         return cls()
 
+    def _add(self, name: str, is_offload: bool, is_session: bool = False):
+        self.rids.append(name)
+        self.is_offload.append(is_offload)
+        self.is_session.append(is_session)
+
     def add_offloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(True)
+        self._add(rid, True)
 
     def add_reloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(False)
+        self._add(rid, False)
+
+    def add_session_held(self, session_id: str):
+        """The session's parked state was brought back and held for the
+        request about to adopt it."""
+        self._add(session_id, False, is_session=True)
 
     def __len__(self):
         return len(self.rids)
 
-    def peek_left(self) -> tuple[str, bool] | None:
-        if not len(self):
-            return
-        return (self.rids[0], self.is_offload[0])
-
-    def pop_left(self) -> tuple[str, bool] | None:
+    def peek_left(self) -> ResidentMove | None:
         if not len(self):
             return None
-        return (self.rids.pop(0), self.is_offload.pop(0))
+        return ResidentMove(self.rids[0], self.is_offload[0], self.is_session[0])
+
+    def pop_left(self) -> ResidentMove | None:
+        if not len(self):
+            return None
+        return ResidentMove(
+            self.rids.pop(0), self.is_offload.pop(0), self.is_session.pop(0),
+        )
 
     def copy(self) -> "OffloadDelta":
         """An independent queue holding the same moves.
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.is_offload))
+        return OffloadDelta(
+            list(self.rids), list(self.is_offload), list(self.is_session),
+        )
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
@@ -175,11 +206,13 @@ class OffloadDelta:
         taken = self.copy()
         self.rids.clear()
         self.is_offload.clear()
+        self.is_session.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
         self.is_offload.extend(other.is_offload)
+        self.is_session.extend(other.is_session)
 
 
 @dataclass
@@ -193,6 +226,8 @@ class TeardownSession(MessageBody):
     session_id: str
     source: int = MessageSource.CONDUCTOR
     after_tp_seq: int = -1
+    # as on RemoveRequest: replayed just before the teardown
+    resident_deltas: dict[str, "OffloadDelta"] = field(default_factory=dict)
 
 
 @dataclass

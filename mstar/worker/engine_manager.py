@@ -222,8 +222,8 @@ class EngineManager:
             session_idle_seq=session_idle_seq,
         )
 
-    def remove_session(self, session_id: str) -> None:
-        self.engine.remove_session(session_id)
+    def remove_session(self, session_id: str) -> list[int]:
+        return self.engine.remove_session(session_id)
 
     def take_session_error(self, session_id: str) -> str | None:
         return self.engine.take_session_error(session_id)

@@ -455,3 +455,63 @@ def test_ending_waits_for_the_last_request_of_several():
         m.body.session_id
         for m in _sent(c, "w0", WorkerMessageType.TEARDOWN_SESSION)
     ] == ["s"]
+
+
+# ── a resume whose session went while it was in preprocessing ───────────────
+
+def _failures(c):
+    return [
+        (m.body.request_id, m.body.status) for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    ]
+
+
+def _resume(rid, session_id="s"):
+    body = _new_request(rid, session_id=session_id)
+    body.resumed = True
+    return body
+
+
+def test_a_resume_of_a_session_that_is_gone_is_refused_410():
+    """The client cancelled the previous request, which tore the session down,
+    while this one was in preprocessing. Ingesting it would reopen the id with
+    an empty context, under an id the API server has already released."""
+    c = _ingestable(_conductor(), {})
+
+    c._ingest_request(_resume("r1"))
+
+    assert _failures(c) == [("r1", 410)]
+    assert _new_requests_sent(c) == []
+    assert "s" not in c.sessions, "reopened the session"
+
+
+def test_a_resume_of_a_session_being_torn_down_is_refused_410():
+    c = _ingestable(_conductor(
+        sessions=[SessionData(session_id="s", worker_graph_to_workers={1: ["w0"]})],
+    ), {})
+    c.session_teardowns["s"] = types.SimpleNamespace(expected_acks={"w0"})
+
+    c._ingest_request(_resume("r1"))
+
+    assert _failures(c) == [("r1", 410)]
+    assert _new_requests_sent(c) == []
+
+
+def test_a_resume_of_a_live_session_is_ingested():
+    c = _ingestable(_conductor(
+        sessions=[SessionData(session_id="s", worker_graph_to_workers={1: ["w0"]})],
+    ), {})
+
+    c._ingest_request(_resume("r1"))
+
+    assert _failures(c) == []
+    assert [b.request_id for b in _new_requests_sent(c)] == ["r1"]
+
+
+def test_a_session_s_first_request_opens_it():
+    c = _ingestable(_conductor(), {})
+
+    c._ingest_request(_new_request("r0", session_id="s"))
+
+    assert _failures(c) == []
+    assert "s" in c.sessions

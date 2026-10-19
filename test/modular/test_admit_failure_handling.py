@@ -180,7 +180,7 @@ class _HoldingWorker:
         self.parallel_leader_nodes = set()
         self._in_flight_rids: set[str] = set()
 
-    def _apply_removes_whose_step_landed(self):
+    def _apply_forwards_whose_step_landed(self):
         pass
 
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):

@@ -315,11 +315,15 @@ def test_a_second_partition_s_ingest_does_not_clear_the_first_s_state():
 # ── telling a continuing session its last token is in the KV ────────────────
 
 class _RemovingRunner:
+    def __init__(self):
+        # rids still waiting to adopt their session's state
+        self.pending: dict[str, str] = {}
+
     def remove_request(self, rid, session_id=None, idle_seq=-1):
-        pass
+        return self.pending.pop(rid, None) is not None
 
     def remove_session(self, session_id):
-        pass
+        return [r for r, s in self.pending.items() if s == session_id]
 
 
 class _StatefulSubmodule:
@@ -400,6 +404,29 @@ def test_removing_the_session_drops_the_flag_the_last_turn_left():
     engine.remove_session("s")
 
     assert engine._submodules["LLM"].submodule.session_states == {}
+
+
+def test_a_request_removed_before_it_adopted_leaves_the_last_turn_s_flag():
+    """It never ran, so whether the last turn overshot is still the last
+    turn's to say."""
+    engine = _removing_engine("LLM")
+    engine._request_sessions["r0"] = "s"
+    engine.remove_request("r0", overshot_nodes={"LLM"})
+
+    engine._request_sessions["r1"] = "s"
+    engine._runner.pending["r1"] = "s"
+    engine.remove_request("r1")
+
+    assert _flag(engine, "LLM") is True
+
+
+def test_removing_the_session_names_the_requests_waiting_to_adopt():
+    engine = _removing_engine("LLM")
+    engine._request_sessions["r1"] = "s"
+    engine._runner.pending["r1"] = "s"
+
+    assert engine.remove_session("s") == ["r1"]
+    assert engine._request_sessions == {}
 
 
 # ── a node holds all its state for the session, or the load is refused ─────

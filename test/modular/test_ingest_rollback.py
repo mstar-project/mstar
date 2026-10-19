@@ -44,6 +44,9 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
 class _SessionRes(_Res):
     session_config = object()
 
+    def expect_session_state(self, rid, session_id):
+        self.log.append(("expect", self.name, rid))
+
     def adopt_session_state(self, rid, session_id):
         self.log.append(("adopt", self.name, rid))
 
@@ -51,20 +54,23 @@ class _SessionRes(_Res):
         self.log.append(("retain", self.name, rid))
 
 
-def test_a_raising_ingest_hands_adopted_state_back_to_the_session():
-    """A resumed request whose ingest fails must not take its session's
-    context down with it: what it adopted goes back rather than being freed."""
+def test_a_raising_ingest_leaves_the_session_s_state_where_it_was():
+    """A resumed request adopts at its first admit, not at ingest, so one whose
+    ingest fails has taken nothing from its session and frees only its own."""
+    from mstar.engine.resources.runner import PendingAdoptions
     from mstar.model.sessions import RequestSession
 
     log = []
     runner = _runner([_SessionRes("kv", log), _Res("sampler", log, fail=True)])
+    runner._pending_adoptions = PendingAdoptions()
     runner._resources["sampler"].session_config = None
     with pytest.raises(RuntimeError, match="over capacity"):
         runner.ingest_request(7, session=RequestSession("s", resumed=True))
     assert log == [
-        ("ingest", "kv", 7), ("adopt", "kv", 7), ("ingest", "sampler", 7),
-        ("retain", "kv", 7), ("remove", "sampler", 7),
+        ("ingest", "kv", 7), ("expect", "kv", 7), ("ingest", "sampler", 7),
+        ("remove", "kv", 7), ("remove", "sampler", 7),
     ]
+    assert 7 not in runner._pending_adoptions
 
 
 def test_the_worker_fails_only_the_request_whose_ingest_raised():
@@ -88,6 +94,8 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     )
     w._my_consumer_connections = []
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
+    w._lockstep_followers = {}
     w._sessions = SimpleNamespace(
         hold_if_not_ready=lambda body, rid: False, bind=lambda *a, **kw: None,
     )

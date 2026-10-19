@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -26,11 +27,14 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
+from mstar.engine.resources.runner import PendingAdoptions
 from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.utils.ipc_format import (
+    MessageSource,
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
+    TeardownSession,
 )
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
@@ -60,9 +64,9 @@ def test_pop_left_takes_the_oldest_entry():
     delta.add_offloaded("a")
     delta.add_reloaded("b")
 
-    assert delta.pop_left() == ("a", True)
+    assert delta.pop_left() == ("a", True, False)
     assert len(delta) == 1, "pop_left returned an entry without removing it"
-    assert delta.pop_left() == ("b", False)
+    assert delta.pop_left() == ("b", False, False)
     assert len(delta) == 0
 
 
@@ -76,7 +80,7 @@ def test_peek_left_does_not_consume():
     delta = OffloadDelta.new()
     delta.add_offloaded("a")
 
-    assert delta.peek_left() == ("a", True)
+    assert delta.peek_left() == ("a", True, False)
     assert len(delta) == 1
     assert OffloadDelta.new().peek_left() is None
 
@@ -192,6 +196,10 @@ class _Engine:
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
+    _hold_session = Engine._hold_session
+    _hold_for_request = Engine._hold_for_request
+    _session_holders = Engine._session_holders
+    _replay_waiting_on = None
 
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
@@ -203,7 +211,10 @@ class _Engine:
         self._submodules = {
             "node": SimpleNamespace(resources={"kv": self.resource})
         }
-        self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
+        self._runner = SimpleNamespace(
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK,
+            pending_session=lambda rid: None, adopt=lambda rid: False,
+        )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
@@ -213,6 +224,79 @@ class _Engine:
 
 def _info():
     return SimpleNamespace(graph_walk="walk", resource_publish_info={})
+
+
+class _SessionResource(_Resource):
+    """``_Resource`` that also parks a session's state, on or off device, and
+    can hold it on device for the request about to adopt it."""
+
+    session_config = object()
+
+    def __init__(self):
+        super().__init__()
+        self.parked_offloaded: set[str] = set()
+        self.parked_resident: set[str] = set()
+        self.held: set[str] = set()
+        self.refuse_session_reload = False
+        self.adopted: list[str] = []
+
+    def session_offloaded(self, session_id):
+        return session_id in self.parked_offloaded
+
+    def can_reload_session(self, session_id):
+        return not self.refuse_session_reload
+
+    def session_needs_hold(self, session_id):
+        parked = self.parked_offloaded | self.parked_resident
+        return session_id in parked and session_id not in self.held
+
+    def hold_session(self, session_id):
+        if session_id in self.parked_offloaded:
+            if self.refuse_session_reload:
+                return False
+            self.parked_offloaded.discard(session_id)
+        self.held.add(session_id)
+        return True
+
+    def unhold_session(self, session_id):
+        self.held.discard(session_id)
+
+    def release_session(self, session_id, idle_seq=-1):
+        self.held.discard(session_id)
+
+    def adopt_session_state(self, rid, session_id):
+        self.adopted.append(rid)
+        self.held.discard(session_id)
+        if session_id in self.parked_offloaded:
+            self.parked_offloaded.discard(session_id)
+            self.offloaded.add(rid)
+
+
+def _adopting_engine(role, waiting=("a",)):
+    """An engine whose requests in ``waiting`` resume session ``s``, whose
+    state is parked on the host."""
+    engine = _Engine(role)
+    resource = _SessionResource()
+    resource.parked_offloaded.add("s")
+    engine.resource = resource
+    engine._resources = {"kv": resource}
+    engine._submodules = {"node": SimpleNamespace(resources={"kv": resource})}
+    pending = PendingAdoptions()
+    for rid in waiting:
+        pending.add(rid, "s")
+
+    def adopt(rid):
+        session_id = pending.take(rid)
+        if session_id is None:
+            return False
+        resource.adopt_session_state(rid, session_id)
+        return True
+
+    engine._runner = SimpleNamespace(
+        admit_retrieve=lambda **kw: FULL_ADMIT_OK,
+        pending_session=pending.session_of, adopt=adopt,
+    )
+    return engine
 
 
 def test_a_follower_may_not_start_an_offload_of_its_own():
@@ -423,23 +507,27 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
 
 
-def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
-    """``get_rid_handle`` answers None for a rid this rank has already removed --
-    a real race, since the conductor's REMOVE and rank 0's delta come from
-    different peers. Its pages went with the teardown, so the move is moot.
+def test_a_move_for_a_request_this_rank_does_not_have_yet_waits():
+    """A request entry names one rank 0 admitted into a step, which this rank
+    admits too before it replays the moves after it, and a removal carries the
+    moves made before it. So no handle here means its NEW_REQUEST has not
+    landed yet: the move waits for it. Treated as moot, it would be lost and
+    the resident sets would differ for good.
 
-    It must be POPPED, not retried, or the replay wedges on an entry that can
-    never land; and it must not reach the resources, which is what an unguarded
-    None did -- ``offload(None)`` logged a move of "request None"."""
+    Nor may it reach the resources as None: ``offload(None)`` once logged a
+    move of "request None"."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-gone")     # _Rids answers None for unknown ids
-    delta.add_offloaded("wire-a")        # and the rest of the queue still lands
+    delta.add_offloaded("wire-late")     # _Rids answers None for unknown ids
+    delta.add_offloaded("wire-a")
 
+    assert engine.apply_resident_delta("node", delta) is False
+    assert len(delta) == 2, "the move was dropped"
+    assert not engine.resource.offloaded, "it ran past the entry it waits on"
+
+    engine._graph_runtime._live.add("late")  # its NEW_REQUEST lands
     assert engine.apply_resident_delta("node", delta) is True
-    assert len(delta) == 0, "the moot entry was left to be retried for ever"
-    assert engine.is_offloaded("node", "a"), "it stopped short of the next move"
-    assert None not in engine.resource.offloaded, "None reached the resources"
+    assert engine.resource.offloaded == {"late", "a"}
 
 
 def test_a_request_holding_nothing_is_not_a_refusal():
@@ -598,6 +686,7 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
+        self._tp_last_seq_sent: dict[str, int] = {}
         group = SimpleNamespace(_workers=["rank0", *followers])
         # The runtime owns both the sharding config and the handle table now.
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
@@ -669,6 +758,19 @@ def test_the_journal_is_drained_by_the_broadcast():
     )
 
 
+def test_the_broadcast_records_the_last_step_each_follower_was_sent():
+    # what a forward to that follower is stamped with: a rank leading two nodes
+    # numbers both from one counter, so the last seq overall may be a step
+    # this follower never receives, and a forward stamped with it would wait
+    leader = _Leader(followers=("rank1",))
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader._tp_broadcast_seq += 3  # another node's steps, to other followers
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert leader._tp_last_seq_sent == {"rank1": 4}
+
+
 # --- the wiring: a follower does not run rank 0's OOM recovery --------------
 
 
@@ -705,7 +807,7 @@ class _Rank:
         self.flushed_removes = 0
         self.flush_protected: set[str] | None = None
 
-    def _apply_removes_whose_step_landed(self):
+    def _apply_forwards_whose_step_landed(self):
         self.flushed_removes += 1
 
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
@@ -811,7 +913,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     """A refused replay leaves moves owed, so the rids the head names do not mean
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
-        apply_resident_delta=lambda node, delta: False,  # refuses
+        apply_resident_delta=lambda node, delta, **kw: False,  # refuses
         is_offloaded=lambda node, rid: False,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
@@ -839,26 +941,54 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
 # after, and a follower holds it until it has consumed that step.
 
 
+class _ReplayingScheduler:
+    """The two things a forward's replay asks of the scheduler: the step this
+    rank has consumed, and the moves a forward carries."""
+
+    def __init__(self, consumed: int):
+        self.last_consumed_tp_seq = consumed
+        self.refuse = False
+        self.replayed: list[tuple[str, list]] = []
+
+    def replay_forwarded_deltas(self, deltas):
+        for node in list(deltas):
+            self.replayed.append((node, deltas.pop(node).rids))
+        return not self.refuse
+
+    def replay_owed_step_deltas(self):
+        return True
+
+
 class _RemoveRank:
     """``_remove_request``'s ordering, over stubs."""
 
-    _apply_removes_whose_step_landed = Worker._apply_removes_whose_step_landed
-    _removal_step_reached = Worker._removal_step_reached
+    _apply_forwards_whose_step_landed = Worker._apply_forwards_whose_step_landed
+    _tp_step_reached = Worker._tp_step_reached
+    _hold_until_step = Worker._hold_until_step
 
     def __init__(self, consumed: int):
-        self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
-        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
-        self._teardowns_awaiting_step: dict = {}
+        self.scheduler = _ReplayingScheduler(consumed)
+        self._tp_forwards_awaiting_step = deque()
         self.applied: list[str] = []
 
     def _remove_request(self, body):
         self.applied.append(body.request_id)
 
+    def _teardown_session(self, body):
+        self.applied.append(f"teardown {body.session_id}")
+
+
+
+def _forward(request_id: str, seq: int) -> RemoveRequest:
+    return RemoveRequest(
+        request_id=request_id, source=MessageSource.TP_RANK_0, after_tp_seq=seq,
+    )
+
 
 def test_a_removal_for_a_step_not_yet_reached_waits():
     rank = _RemoveRank(consumed=5)
 
-    assert rank._removal_step_reached(
+    assert rank._tp_step_reached(
         RemoveRequest(request_id="r", after_tp_seq=7)
     ) is False
 
@@ -866,7 +996,7 @@ def test_a_removal_for_a_step_not_yet_reached_waits():
 def test_a_removal_for_a_step_already_consumed_applies():
     rank = _RemoveRank(consumed=7)
 
-    assert rank._removal_step_reached(
+    assert rank._tp_step_reached(
         RemoveRequest(request_id="r", after_tp_seq=7)
     ) is True
 
@@ -875,66 +1005,104 @@ def test_an_unstamped_removal_is_not_ordered():
     """The conductor's own sends, and a rank re-applying its own deferral."""
     rank = _RemoveRank(consumed=-1)
 
-    assert rank._removal_step_reached(RemoveRequest(request_id="r")) is True
+    assert rank._tp_step_reached(RemoveRequest(request_id="r")) is True
 
 
 def test_a_held_removal_lands_once_its_step_does():
-    rank = _RemoveRank(consumed=5)
-    rank._removes_awaiting_step = {
-        7: [RemoveRequest(request_id="late", after_tp_seq=7)],
-        4: [RemoveRequest(request_id="early", after_tp_seq=4)],
-    }
+    rank = _RemoveRank(consumed=3)
+    assert rank._hold_until_step(_forward("early", 4))
+    assert rank._hold_until_step(_forward("late", 7))
+    rank.scheduler.last_consumed_tp_seq = 5
 
-    rank._apply_removes_whose_step_landed()
+    rank._apply_forwards_whose_step_landed()
 
     assert rank.applied == ["early"], "applied a teardown from a step not reached"
-    assert [b.request_id for b in rank._removes_awaiting_step[7]] == ["late"]
+    assert [b.request_id for b in rank._tp_forwards_awaiting_step] == ["late"]
 
     rank.scheduler.last_consumed_tp_seq = 7
-    rank._apply_removes_whose_step_landed()
+    rank._apply_forwards_whose_step_landed()
 
     assert rank.applied == ["early", "late"]
-    assert rank._removes_awaiting_step == {}
+    assert not rank._tp_forwards_awaiting_step
 
 
-def test_held_removals_land_in_step_order():
-    """Two teardowns from different gaps have to be applied in the order rank 0
-    made them, for the same reason the delta is a queue."""
-    rank = _RemoveRank(consumed=9)
-    rank._removes_awaiting_step = {
-        8: [RemoveRequest(request_id="second", after_tp_seq=8)],
-        3: [RemoveRequest(request_id="first", after_tp_seq=3)],
-    }
+def test_a_forward_whose_step_was_reached_still_waits_behind_an_earlier_one():
+    """Rank 0's forwards have to land in the order it made them: they all move
+    the state an offload picks victims from. One arriving for a step already
+    reached queues behind one still held rather than overtaking it."""
+    rank = _RemoveRank(consumed=5)
+    rank._tp_forwards_awaiting_step.append(_forward("first", 6))
 
-    rank._apply_removes_whose_step_landed()
+    assert rank._hold_until_step(_forward("second", 5)) is True
+    assert rank.applied == []
+
+    rank.scheduler.last_consumed_tp_seq = 6
+    rank._apply_forwards_whose_step_landed()
 
     assert rank.applied == ["first", "second"]
+
+
+def test_removals_and_teardowns_replay_in_rank_0_s_order():
+    """Both move the state an offload picks victims from, so they share one
+    queue rather than each kind replaying on its own."""
+    rank = _RemoveRank(consumed=0)
+    for body in (
+        TeardownSession(
+            session_id="first", source=MessageSource.TP_RANK_0, after_tp_seq=1,
+        ),
+        _forward("second", 2),
+        TeardownSession(
+            session_id="third", source=MessageSource.TP_RANK_0, after_tp_seq=2,
+        ),
+    ):
+        assert rank._hold_until_step(body)
+    rank.scheduler.last_consumed_tp_seq = 2
+
+    rank._apply_forwards_whose_step_landed()
+
+    assert rank.applied == ["teardown first", "second", "teardown third"]
+
+
+def test_only_rank_0_s_forwards_are_held():
+    """A replay is SELF and runs as it is, or it would queue behind itself."""
+    rank = _RemoveRank(consumed=-1)
+    rank._tp_forwards_awaiting_step.append(_forward("held", 4))
+
+    assert rank._hold_until_step(
+        RemoveRequest(request_id="replay", source=MessageSource.SELF)
+    ) is False
 
 
 class _ForwardingLeader:
     """Rank 0's ``_remove_request``, over stubs, to pin what it forwards."""
 
     _remove_request = Worker._remove_request
-    _removal_step_reached = Worker._removal_step_reached
+    _tp_step_reached = Worker._tp_step_reached
     _rid = Worker._rid
     _tp_followers = Worker._tp_followers
+    _take_resident_deltas = Worker._take_resident_deltas
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
-        self._tp_broadcast_seq = broadcast_seq
+        # the last step broadcast to each follower, which stamps its forwards
+        self._tp_last_seq_sent = {"rank1": broadcast_seq - 1, "rank2": broadcast_seq - 1}
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
         self._pending_removes: set[int] = set()
+        self._handles_awaiting_admit: set[int] = set()
+        self._deferred_idle_seq: dict[int, int] = {}
+        self._stream_buffer_rids = None
         self._last_active: dict = {}
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
-        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
-        self._teardowns_awaiting_step: dict = {}
+        self._tp_forwards_awaiting_step = deque()
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
-        group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
+        group = SimpleNamespace(
+            tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"], nodes={"LLM"},
+        )
         # The runtime owns the handle table and the sharding config now, and
         # ``remove_request`` there is what frees the handle.
         self._graph_runtime = SimpleNamespace(
@@ -955,6 +1123,8 @@ class _ForwardingLeader:
             clear_wire_rid=lambda rid: None,
             last_consumed_tp_seq=-1,
         )
+        self.parallel_leader_nodes = set()
+        self._lockstep_followers: dict = {}
         self.sent: list = []
         self.communicator = SimpleNamespace(
             send=lambda worker, msg: self.sent.append((worker, msg))
@@ -978,6 +1148,99 @@ def test_the_forwarded_teardown_carries_the_step_it_follows():
     )
 
 
+def _journals(leader, **moves: list[str]) -> dict[str, OffloadDelta]:
+    """Give ``leader`` one journal per node, with ``moves`` offloaded on it."""
+    journals = {node: OffloadDelta.new() for node in moves}
+    for node, rids in moves.items():
+        for rid in rids:
+            journals[node].add_offloaded(rid)
+    leader.engine_manager.get_engine = lambda node: SimpleNamespace(
+        take_resident_delta=lambda node_name: journals[node_name].take(),
+    )
+    return journals
+
+
+def test_the_forwarded_removal_carries_the_moves_made_before_it():
+    """The removal frees pages the moves after it are made against; carried by
+    the next broadcast instead, a follower would replay them after it."""
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader.parallel_leader_nodes = {"LLM"}
+    journals = _journals(leader, LLM=["V"])
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    body = leader.sent[0][1].body
+    assert body.resident_deltas["LLM"].rids == ["V"]
+    assert len(journals["LLM"]) == 0, "the next broadcast would carry them again"
+
+
+def test_a_removal_with_nothing_journaled_carries_nothing():
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader.parallel_leader_nodes = {"LLM"}
+    _journals(leader, LLM=[])
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    assert leader.sent[0][1].body.resident_deltas == {}
+
+
+def test_each_follower_gets_its_own_copy_of_the_moves():
+    # a follower pops its copy as it replays; shared, the second would see none
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader.parallel_leader_nodes = {"LLM"}
+    group = SimpleNamespace(
+        tp_size=3, _tp_rank=0, _workers=["rank0", "rank1", "rank2"],
+        nodes={"LLM"},
+    )
+    leader._graph_runtime.get_sharding_config = (
+        lambda rid: SimpleNamespace(groups=[group])
+    )
+    _journals(leader, LLM=["V"])
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    deltas = {w: msg.body.resident_deltas["LLM"] for w, msg in leader.sent}
+    assert sorted(deltas) == ["rank1", "rank2"]
+    assert deltas["rank1"] is not deltas["rank2"]
+    deltas["rank1"].pop_left()
+    assert deltas["rank2"].rids == ["V"]
+
+
+def test_a_node_the_forward_does_not_reach_keeps_its_moves():
+    """Taken, they would be sent nowhere: another node's followers only learn of
+    them from that node's next broadcast."""
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader.parallel_leader_nodes = {"LLM", "Talker"}
+    leader._lockstep_followers = {"Talker": ("rank2",)}
+    journals = _journals(leader, LLM=["V"], Talker=["W"])
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    assert list(leader.sent[0][1].body.resident_deltas) == ["LLM"]
+    assert journals["Talker"].rids == ["W"]
+
+
+def test_a_node_this_rank_does_not_lead_is_left_alone():
+    # a rank that follows one node and leads another forwards only for the one
+    # it leads; the other's journal is its leader's to send
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    journals = _journals(leader, LLM=["V"])
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    assert leader.sent[0][1].body.resident_deltas == {}
+    assert journals["LLM"].rids == ["V"]
+
+
+def test_each_follower_s_forward_is_stamped_with_its_own_last_step():
+    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader._tp_last_seq_sent = {"rank1": 1100}
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    assert leader.sent[0][1].body.after_tp_seq == 1100
+
+
 def test_a_rank_that_leads_never_parks_a_teardown():
     """``last_consumed_tp_seq`` only advances on a rank that consumes follow
     steps, so a leader that parked a stamped teardown would hold it for good —
@@ -989,7 +1252,7 @@ def test_a_rank_that_leads_never_parks_a_teardown():
         RemoveRequest(request_id="gone", after_tp_seq=9999)
     )
 
-    assert leader._removes_awaiting_step == {}, "a leader parked a teardown"
+    assert not leader._tp_forwards_awaiting_step, "a leader parked a teardown"
     assert [w for w, _ in leader.sent] == ["rank1"], "and it still forwarded"
 
 
@@ -1054,7 +1317,7 @@ class _FollowSpec:
     def __init__(self, *, replay_refuses: bool):
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
-            apply_resident_delta=lambda node, delta: not replay_refuses,
+            apply_resident_delta=lambda node, delta, **kw: not replay_refuses,
             is_offloaded=lambda node, rid: False,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
@@ -1131,3 +1394,308 @@ def test_the_async_follow_path_proceeds_once_the_replay_lands():
 
     assert worker._try_follow_speculation(parent) is None
     assert parent.reads == 1, "the gate blocked a build it should have allowed"
+
+
+# --- a resumed request that has not adopted its session's state yet ---------
+
+
+def test_a_request_waiting_on_an_offloaded_session_is_offloaded():
+    """It has to be brought back before it runs, like any offloaded request,
+    so ``check_ready`` sends it through ``reload_request``."""
+    engine = _adopting_engine("leader")
+
+    assert engine.is_offloaded("node", "a")
+    engine.resource.parked_offloaded.clear()
+    assert not engine.is_offloaded("node", "a"), "parked on device: resident"
+
+
+def test_the_leader_holds_the_session_and_journals_it_by_session():
+    """What comes back is the session's state, so that is what is journalled:
+    a follower can replay it whether or not it has the request yet. The request
+    adopts at its first admit, on every rank, not here."""
+    engine = _adopting_engine("leader")
+
+    assert engine.reload_request("node", "a") is True
+
+    assert engine.resource.held == {"s"}
+    assert engine.resource.adopted == [], "adopted outside an admit"
+    assert not engine.is_offloaded("node", "a")
+    assert list(engine.take_resident_delta("node").peek_left()) == ["s", False, True]
+
+
+def test_a_ready_request_holds_its_resident_session_out_of_the_idle_set():
+    """Found ready with its session resident, it has to stay that way: left
+    idle, a reload later in the same scan could reclaim it, and a follower
+    replaying that reload before it builds the step would never find this
+    request ready."""
+    engine = _adopting_engine("leader")
+    engine.resource.parked_offloaded.clear()
+    engine.resource.parked_resident.add("s")
+
+    assert engine.check_ready("node", "a", _info()) is FULL_ADMIT_OK
+
+    assert engine.resource.held == {"s"}
+    assert list(engine.take_resident_delta("node").peek_left()) == ["s", False, True]
+
+
+def test_a_request_waiting_in_the_backlog_journals_its_hold_once():
+    engine = _adopting_engine("leader")
+    for _ in range(3):
+        assert engine.check_ready("node", "a", _info()) is FULL_ADMIT_OK
+
+    assert len(engine.take_resident_delta("node")) == 1
+
+
+def test_a_session_with_nothing_parked_journals_nothing():
+    # the session's first request: nothing to hold
+    engine = _adopting_engine("leader")
+    engine.resource.parked_offloaded.clear()
+
+    assert engine.check_ready("node", "a", _info()) is FULL_ADMIT_OK
+    assert len(engine.take_resident_delta("node")) == 0
+
+
+def test_a_follower_does_not_hold_on_its_own():
+    # it holds when rank 0's journal says so, at the same point in the steps
+    engine = _adopting_engine("follower")
+    engine.resource.parked_offloaded.clear()
+    engine.resource.parked_resident.add("s")
+
+    engine.check_ready("node", "a", _info(), allow_reload=False)
+
+    assert engine.resource.held == set()
+
+
+def test_a_session_that_cannot_come_back_is_not_held():
+    """Refused before anything moves, so rank 0 journals nothing and its state
+    is still the followers'."""
+    engine = _adopting_engine("leader")
+    engine.resource.refuse_session_reload = True
+
+    assert engine.reload_request("node", "a") is False
+
+    assert engine.resource.held == set()
+    assert engine.is_offloaded("node", "a")
+    assert len(engine.take_resident_delta("node")) == 0
+
+
+def test_a_hold_refused_by_one_resource_is_undone_on_the_others():
+    engine = _adopting_engine("leader")
+    second = _SessionResource()
+    second.parked_offloaded.add("s")
+    second.refuse_session_reload = True
+    second.can_reload_session = lambda session_id: True  # passes the precheck
+    engine._submodules["node"].resources["second"] = second
+
+    assert engine.reload_request("node", "a") is False
+
+    assert engine.resource.held == set(), "the first resource kept its hold"
+    assert len(engine.take_resident_delta("node")) == 0
+
+
+def test_a_follower_replays_the_hold_without_the_request():
+    """The case a request-keyed entry could not serve: this rank has not seen
+    the request's NEW_REQUEST yet, so it has no handle to name."""
+    engine = _adopting_engine("follower", waiting=())
+    engine._graph_runtime = _Rids(live=())
+    assert engine.reload_request("node", "a") is False, "rank 0's call"
+    delta = OffloadDelta.new()
+    delta.add_session_held("s")
+
+    assert engine.apply_resident_delta("node", delta) is True
+
+    assert engine.resource.held == {"s"} and len(delta) == 0
+    assert not engine.resource.session_offloaded("s")
+
+
+def test_a_replayed_hold_that_does_not_fit_stays_owed():
+    engine = _adopting_engine("follower")
+    engine.resource.refuse_session_reload = True
+    delta = OffloadDelta.new()
+    delta.add_session_held("s")
+    delta.add_offloaded("wire-b")
+
+    assert engine.apply_resident_delta("node", delta) is False
+    assert len(delta) == 2 and not engine.resource.offloaded
+
+    engine.resource.refuse_session_reload = False
+    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.resource.held == {"s"} and engine.resource.offloaded == {"b"}
+
+
+def test_session_entries_survive_copy_take_and_extend():
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_session_held("s")
+    owed = OffloadDelta.new()
+    owed.extend(delta.copy())
+    owed.extend(delta.take())
+
+    assert [tuple(owed.pop_left()) for _ in range(4)] == [
+        ("a", True, False), ("s", False, True),
+    ] * 2
+    assert len(delta) == 0
+
+
+def test_a_forward_carries_its_moves_across_the_wire():
+    import mstar.communication.wire_types  # noqa: F401  (registers the messages)
+    from mstar.communication import wire
+    from mstar.utils.ipc_format import WorkerMessage, WorkerMessageType
+
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_session_held("s")
+    for message_type, body in (
+        (WorkerMessageType.REMOVE_REQUEST, RemoveRequest(
+            request_id="r", source=MessageSource.TP_RANK_0, after_tp_seq=3,
+            resident_deltas={"LLM": delta},
+        )),
+        (WorkerMessageType.TEARDOWN_SESSION, TeardownSession(
+            session_id="s", source=MessageSource.TP_RANK_0, after_tp_seq=3,
+            resident_deltas={"LLM": delta},
+        )),
+    ):
+        sent = WorkerMessage(message_type=message_type, body=body)
+        assert wire.decode(wire.encode(sent)).body == body
+
+
+# --- rank 0's order, end to end on a follower's real scheduler ---------------
+#
+# Rank 0 makes moves, broadcasts step S with them, makes more moves, releases a
+# request (the forward, stamped S, carrying those moves), then makes more moves
+# and broadcasts S+1 with them. A follower must replay them in that order
+# whichever path takes each step off its FIFO.
+
+
+class _OrderedEngine:
+    """Applies a delta by popping it, into one log shared with the removals."""
+
+    def __init__(self, log: list[str]):
+        self.log = log
+        self.refuse = False
+
+    def apply_resident_delta(self, node_name, delta):
+        if self.refuse:
+            return False
+        while len(delta):
+            self.log.append(delta.pop_left().name)
+        return True
+
+
+class _FollowerRank:
+    """A follower's forward queue and its real scheduler, sharing the queue as
+    the worker does."""
+
+    _apply_forwards_whose_step_landed = Worker._apply_forwards_whose_step_landed
+    _tp_step_reached = Worker._tp_step_reached
+    _hold_until_step = Worker._hold_until_step
+
+    def __init__(self):
+        self.log: list[str] = []
+        self.engine = _OrderedEngine(self.log)
+        self.scheduler = MicroScheduler(
+            engine_manager=SimpleNamespace(get_engine=lambda node: self.engine),
+            parallel_leader_nodes=set(),
+        )
+        self._tp_forwards_awaiting_step = deque()
+        self.scheduler.share_tp_forwards(self._tp_forwards_awaiting_step)
+
+    def _remove_request(self, body):
+        self.log.append(f"remove {body.request_id}")
+
+    def forward(self, request_id: str, after: int, *moves: str) -> None:
+        delta = OffloadDelta.new()
+        for rid in moves:
+            delta.add_offloaded(rid)
+        self._hold_until_step(RemoveRequest(
+            request_id=request_id, source=MessageSource.TP_RANK_0,
+            after_tp_seq=after, resident_deltas={"node": delta},
+        ))
+
+
+def _step(seq: int, *moves: str, speculative: bool = False) -> ScheduleTPNode:
+    message = ScheduleTPNode(
+        node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=seq,
+        speculative=speculative, spec_from_seq=seq - 1 if speculative else -1,
+    )
+    for rid in moves:
+        message.resident_delta.add_offloaded(rid)
+    return message
+
+
+def _at_step_5_with_6_queued(rank: _FollowerRank) -> None:
+    """Step 5 consumed, the forward made after it held, step 6 queued."""
+    rank.scheduler.register_tp_follow(_step(5, "a"))
+    assert rank.scheduler.settle_tp_follow_delta()
+    rank.scheduler.pop_tp_follow_head()
+    rank.engine.refuse = True  # step 5 still holds the pages the forward moves
+    rank.forward("gone", 5, "b")
+    rank.engine.refuse = False
+    rank.scheduler.register_tp_follow(_step(6, "c"))
+
+
+def test_the_next_step_s_moves_wait_for_the_forward_made_before_them():
+    rank = _FollowerRank()
+    _at_step_5_with_6_queued(rank)
+
+    assert not rank.scheduler.settle_tp_follow_delta()
+    assert rank.log == ["a"], "step 6's moves landed before the removal"
+
+    rank._apply_forwards_whose_step_landed()
+    assert rank.scheduler.settle_tp_follow_delta()
+
+    assert rank.log == ["a", "b", "remove gone", "c"]
+
+
+def test_a_step_taken_off_without_a_settle_still_waits_for_the_forward():
+    # the async follower drops a voided head straight off the FIFO
+    rank = _FollowerRank()
+    _at_step_5_with_6_queued(rank)
+
+    rank.scheduler.pop_tp_follow_head()
+    assert rank.log == ["a"], "a dropped head's moves jumped the removal"
+
+    rank._apply_forwards_whose_step_landed()
+    rank.scheduler.settle_tp_follow_delta()
+
+    assert rank.log == ["a", "b", "remove gone", "c"]
+
+
+def test_a_head_dropped_before_it_is_queued_still_counts():
+    """Its parent closed here, so it never reaches the FIFO; but rank 0 made its
+    moves, and forwarded removals stamped with its seq wait for it."""
+    rank = _FollowerRank()
+    rank.scheduler.register_tp_follow(_step(5, "a"))
+    rank.scheduler.pop_tp_follow_head()
+
+    rank.scheduler.discard_tp_follow(_step(6, "b", speculative=True))
+    rank.forward("gone", 6)
+
+    assert rank.log == ["a", "b", "remove gone"]
+    assert rank.scheduler.last_consumed_tp_seq == 6
+
+
+def test_a_forward_whose_moves_are_refused_stays_ahead_of_the_next_step():
+    rank = _FollowerRank()
+    _at_step_5_with_6_queued(rank)
+    rank.engine.refuse = True
+
+    rank._apply_forwards_whose_step_landed()
+    assert [b.request_id for b in rank._tp_forwards_awaiting_step] == ["gone"]
+    assert not rank.scheduler.settle_tp_follow_delta()
+
+    rank.engine.refuse = False
+    rank._apply_forwards_whose_step_landed()
+    rank.scheduler.settle_tp_follow_delta()
+
+    assert rank.log == ["a", "b", "remove gone", "c"]
+
+
+def test_steps_with_no_forward_between_them_replay_as_before():
+    rank = _FollowerRank()
+    for seq, rid in ((5, "a"), (6, "b")):
+        rank.scheduler.register_tp_follow(_step(seq, rid))
+        assert rank.scheduler.settle_tp_follow_delta()
+        rank.scheduler.pop_tp_follow_head()
+
+    assert rank.log == ["a", "b"], "a settled head's moves replayed twice"

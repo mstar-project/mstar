@@ -219,12 +219,18 @@ class MicroScheduler:
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
+        # Heads taken off the FIFO (dropped, or popped without a settle) whose
+        # moves wait on a forward rank 0 made before them.
+        self._owed_step_deltas: deque[ScheduleTPNode] = deque()
+        # Worker-owned, adopted by share_tp_forwards: rank 0's removals and
+        # teardowns still to be applied here, in its order.
+        self._tp_forwards: deque = deque()
 
     @property
     def last_consumed_tp_seq(self) -> int:
         """Highest leader step this rank has taken off the FIFO. What orders a
         forwarded removal against the step stream — see
-        ``Worker._removal_step_reached``."""
+        ``Worker._tp_step_reached``."""
         return self._last_popped_tp_seq
 
     def _select_node_rr(
@@ -257,6 +263,11 @@ class MicroScheduler:
         """
         self.pending_removes = pending_removes
         self.handles_awaiting_admit = handles_awaiting_admit
+
+    def share_tp_forwards(self, forwards: deque) -> None:
+        """Adopt the worker's queue of rank 0's held forwards by reference; see
+        ``settle_tp_follow_delta``."""
+        self._tp_forwards = forwards
 
     @property
     def unschedulable_rids(self) -> set[int]:
@@ -317,11 +328,31 @@ class MicroScheduler:
         engine = self.engine_manager.get_engine(node_name)
         return engine.apply_resident_delta(node_name, delta)
 
-    def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+    def _forward_owed_before(self, spec_seq: int) -> bool:
+        """Whether rank 0 made a removal or teardown still to be applied here
+        before step ``spec_seq``'s moves; it lands first:
+        ``Worker._apply_forwards_whose_step_landed``."""
+        forwards = self._tp_forwards
+        return bool(forwards) and forwards[0].after_tp_seq < spec_seq
+
+    def _queue_step_delta(self, message: ScheduleTPNode) -> None:
+        """Owe ``message``'s moves, once: a settled head is popped later."""
         if self._last_resident_delta < message.spec_seq:
             self._last_resident_delta = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            self._owed_step_deltas.append(message)
+
+    def _settle_owed_step_deltas(self) -> bool:
+        """Move the owed step deltas, in seq order, into the per-node replay
+        queues, up to the first that waits on a forward. True if none does."""
+        owed = self._owed_step_deltas
+        while owed:
+            if self._forward_owed_before(owed[0].spec_seq):
+                return False
+            message = owed.popleft()
+            self._pending_resident_deltas.setdefault(
+                message.node_name, OffloadDelta.new(),
+            ).extend(message.resident_delta)
+        return True
 
     def settle_tp_follow_delta(self) -> bool:
         """Replay the front head's resident delta; True once every move landed.
@@ -336,15 +367,59 @@ class MicroScheduler:
         head = self.peek_tp_follow()
         if head is None:
             return True
-        return self._apply_delta_from_message(head)
+        self._queue_step_delta(head)
+        if not self._settle_owed_step_deltas():
+            return False
+        return self._apply_resident_delta(head.node_name)
+
+    def replay_owed_step_deltas(self) -> bool:
+        """Replay the step moves a forward that has now landed held back; True
+        once every one has."""
+        self._settle_owed_step_deltas()
+        return self._apply_all_pending()
+
+    def _apply_all_pending(self) -> bool:
+        return all(
+            self._apply_resident_delta(node_name)
+            for node_name, owed in list(self._pending_resident_deltas.items())
+            if len(owed)
+        )
+
+    def replay_forwarded_deltas(self, deltas: dict[str, OffloadDelta]) -> bool:
+        """Replay the moves rank 0 made before a removal or teardown it
+        forwarded; True once every one has landed.
+
+        Takes ``deltas`` over (it is emptied), queued behind whatever is still
+        owed, so a retry after a refusal passes the emptied dict back.
+        """
+        # the steps before this forward, up to the first one after it
+        self._settle_owed_step_deltas()
+        for node_name in list(deltas):
+            self._pending_resident_deltas.setdefault(
+                node_name, OffloadDelta.new(),
+            ).extend(deltas.pop(node_name))
+        return self._apply_all_pending()
+
+    def _take_off_fifo(self, message: ScheduleTPNode) -> None:
+        """Consume ``message``'s seq and its moves, built or not: rank 0 made
+        the moves either way, and its forwards are ordered against the seq."""
+        self._queue_step_delta(message)
+        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
+        if self._settle_owed_step_deltas():
+            self._apply_resident_delta(message.node_name)
+
+    def discard_tp_follow(self, message: ScheduleTPNode) -> None:
+        """A head that never reaches the FIFO: its parent step closed here, so
+        it is the next seq and nothing before it is still queued (or it is
+        empty, which no leader sends)."""
+        self._take_off_fifo(message)
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
-        self._apply_delta_from_message(message)
-        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
+        self._take_off_fifo(message)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
@@ -927,7 +1002,7 @@ class MicroScheduler:
             rid for rid in self.failed_rids if rid not in tp_pend_rids
         } | {
             rid for rid, t in self.held_until.items() if t > now
-        }
+        } | self.handles_awaiting_admit
 
         # Graph readiness is necessary but not sufficient, so a False here is
         # final and skips the engine pass.

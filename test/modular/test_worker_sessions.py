@@ -3,8 +3,9 @@
 A request in a session gives its resource state back to the session instead of
 freeing it. Ending the session is a message of its own: the removal never
 carries a flag for it, because ``_process_message_list`` parks a REMOVE whose
-rid has no handle — the held-request case — until an admission that may never
-come, which would strand the teardown and its ACK behind the barrier's TTL. A
+rid has no handle — a request drained before its NEW_REQUEST arrived — until an
+admission that never comes, which would strand the teardown and its ACK behind
+the barrier's TTL. A
 TEARDOWN_SESSION is never parked, so it is the one that frees the state and
 ACKs, and the worker only has to hold it while one of the session's requests is
 still on its way out: that request's removal would otherwise hand state back to
@@ -18,15 +19,19 @@ that is the hop the parking happens on.
 from __future__ import annotations
 
 import sys
+from collections import deque
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.sessions import RequestSession
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
     MessageSource,
+    NewRequest,
+    OffloadDelta,
     RemoveRequest,
     TeardownSession,
     WorkerMessage,
@@ -56,11 +61,14 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._reads_done_sent = set()
     w._pending_removes = set()
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
+    w._lockstep_followers = {}
+    w.parallel_leader_nodes = set()
     w._deferred_idle_seq = {}
     w._session_idle_seq = 0
-    w._removes_awaiting_step = {}
-    w._teardowns_awaiting_step = {}
+    w._tp_forwards_awaiting_step = deque()
     w._tp_broadcast_seq = 0
+    w._tp_last_seq_sent = {}
     w._last_active = {}
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
@@ -72,6 +80,8 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
         fail_rids=lambda rids: None,
         pending_tp_follow_count={},
         last_consumed_tp_seq=0,
+        replay_forwarded_deltas=lambda deltas: True,
+        replay_owed_step_deltas=lambda: True,
     )
     # Identity interning, as main's worker tests do: the rid string is its own
     # handle, so the string/handle split is exercised without a real runtime.
@@ -111,7 +121,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
             w.overshot.append((rid, overshot_nodes)),
             w.idle_seqs.append((rid, kw.get("session_idle_seq", -1))),
         ),
-        remove_session=w.removed_sessions.append,
+        remove_session=lambda sid: w.removed_sessions.append(sid) or [],
         add_request=lambda rid, cfgs, session=None: w.admitted.append(rid),
         take_session_error=lambda sid: w.session_errors.pop(sid, None),
         evictable_nodes=lambda: [],
@@ -242,7 +252,7 @@ def test_a_follower_that_waits_for_step_symmetry_still_ends_the_session():
     assert w.removed_sessions == [] and _acks(w) == []
 
     w.scheduler.last_consumed_tp_seq = 7
-    Worker._apply_removes_whose_step_landed(w)
+    Worker._apply_forwards_whose_step_landed(w)
 
     assert w.removed == ["X"]
     assert w.removed_sessions == ["s"]
@@ -252,7 +262,9 @@ def test_a_follower_that_waits_for_step_symmetry_still_ends_the_session():
 def test_the_tp_leader_forwards_a_removal_that_says_nothing_of_the_session():
     w = _worker(sessions={"s": {"X"}})
     w._graph_runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[
-        SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["w0", "w1"]),
+        SimpleNamespace(
+            tp_size=2, _tp_rank=0, _workers=["w0", "w1"], nodes={"LLM"},
+        ),
     ])
 
     Worker._remove_request(w, RemoveRequest(request_id="X"))
@@ -322,14 +334,14 @@ def test_teardown_waits_behind_an_in_flight_step_too():
 # ── ingest ──────────────────────────────────────────────────────────────────
 
 def _new_request(rid="Y", session_id=None):
-    return SimpleNamespace(
+    return NewRequest(
         request_id=rid,
         partition_worker_graph_ids=[],
         worker_graph_to_workers={},
         initial_inputs=[],
-        request_info=SimpleNamespace(
-            resource_configs={}, graph_walk="prefill", partition_name="default",
-            rid_handle=-1,
+        request_info=CurrentForwardPassInfo(
+            request_id=rid, graph_walk="prefill", fwd_index=0, random_seed=0,
+            max_tokens=1,
             session=None if session_id is None else RequestSession(session_id),
         ),
     )
@@ -445,6 +457,24 @@ def test_a_teardown_that_runs_at_once_still_fails_the_waiter():
     assert w._sessions.has_pending is False
 
 
+def test_a_teardown_fails_the_requests_still_waiting_to_adopt_too():
+    # ingested, but not yet admitted into a step, so it has taken nothing
+    # from the session and would resume from an empty context
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    failed = []
+    w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
+    w.engine_manager.remove_session = (
+        lambda sid: w.removed_sessions.append(sid) or ["Z"]
+    )
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    _deliver(w, TeardownSession(session_id="s"))
+
+    [(errors, statuses)] = failed
+    assert set(errors) == {"Y", "Z"} and statuses == {"Y": 410, "Z": 410}
+
+
 def test_a_request_whose_session_dies_while_it_waits_is_failed_410():
     # admitting it would resume from an empty context, which is worse than an
     # error; 410 is what the route promises for state that is gone
@@ -536,7 +566,7 @@ def test_a_follower_that_parks_a_removal_for_a_step_keeps_the_number():
     assert w.idle_seqs == []
 
     w.scheduler.last_consumed_tp_seq = 7
-    Worker._apply_removes_whose_step_landed(w)
+    Worker._apply_forwards_whose_step_landed(w)
 
     assert w.idle_seqs == [("X", 42)]
 
@@ -552,7 +582,9 @@ def _drains(w):
 
 def _leads_one_follower(w):
     w._graph_runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[
-        SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["w0", "w1"]),
+        SimpleNamespace(
+            tp_size=2, _tp_rank=0, _workers=["w0", "w1"], nodes={"LLM"},
+        ),
     ])
 
 
@@ -735,7 +767,7 @@ def test_the_leader_forwards_the_teardown_stamped_with_its_last_step():
     w = _worker(known_rids=())
     w._sessions.bind("X", "s", tp_followers={"w1"})
     w._sessions.release("X")
-    w._tp_broadcast_seq = 8
+    w._tp_last_seq_sent = {"w1": 7}
 
     Worker._teardown_session(w, TeardownSession(session_id="s"))
 
@@ -755,7 +787,7 @@ def test_a_held_teardown_is_forwarded_when_it_runs_not_when_it_arrived():
     Worker._teardown_session(w, TeardownSession(session_id="s"))
     assert _forwarded_teardowns(w) == []
 
-    w._tp_broadcast_seq = 5
+    w._tp_last_seq_sent = {"w1": 4}
     w._in_flight_rids.clear()
     Worker._remove_request(w, RemoveRequest(request_id="X"))
     Worker._apply_pending_sessions(w)
@@ -775,7 +807,7 @@ def test_a_follower_frees_the_session_once_it_reaches_rank_0_s_step():
     assert w.removed_sessions == []
 
     w.scheduler.last_consumed_tp_seq = 3
-    Worker._apply_removes_whose_step_landed(w)
+    Worker._apply_forwards_whose_step_landed(w)
 
     assert w.removed_sessions == ["s"]
     assert _acks(w) == ["s"]
@@ -802,3 +834,70 @@ def test_a_follower_ends_the_session_of_a_request_it_never_admitted():
     assert w._sessions.has_pending is False
     assert w.removed_sessions == ["s"]
     assert _acks(w) == ["s"]
+
+
+
+# ── what rank 0 forwards carries the moves it made before it ────────────────
+
+def test_the_teardown_forward_carries_the_moves_made_before_it():
+    # A teardown frees pages, so the moves rank 0 made since its last
+    # broadcast were made against the state before it; a follower that met
+    # them in the next broadcast would replay them after the teardown instead.
+    w = _worker(known_rids=())
+    w._sessions.bind("X", "s", tp_followers={"w1"})
+    w._sessions.release("X")
+    w.parallel_leader_nodes = {"LLM"}
+    w._lockstep_followers = {"LLM": ("w1",)}
+    journal = OffloadDelta.new()
+    journal.add_offloaded("V")
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(
+        take_resident_delta=lambda node_name: journal.take(),
+    )
+
+    Worker._teardown_session(w, TeardownSession(session_id="s"))
+
+    [(_, body)] = _forwarded_teardowns(w)
+    assert body.resident_deltas["LLM"].rids == ["V"]
+    assert len(journal) == 0, "the next broadcast would carry them a second time"
+
+
+# ── a drain rank 0 forwards ahead of the conductor's NEW_REQUEST ────────────
+
+def test_a_drain_rank_0_forwarded_before_the_new_request_waits_for_it():
+    # Rank 0's forward and the conductor's NEW come from different senders,
+    # so the forward can win. Applied at once it would refuse the NEW, and this
+    # rank would sit out every move and the removal rank 0 makes for it.
+    w = _worker(known_rids=(), is_follower=True)
+    Worker._drain_request(
+        w, DrainRequest(request_id="Y", source=MessageSource.TP_RANK_0),
+    )
+    assert "Y" not in w._draining_rids
+    assert _reads_done(w) == []
+
+    Worker._add_new_request(w, _new_request())
+
+    assert w.admitted == ["Y"], "the NEW was refused"
+    assert "Y" in w._draining_rids
+    assert _reads_done(w) == ["Y"]
+    assert w._drains_awaiting_new == set()
+
+
+def test_a_drain_that_overtook_a_request_held_for_its_session_still_lands():
+    # held, it has a handle, and answers a drain as it answers a removal
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}}, is_follower=True)
+    Worker._drain_request(
+        w, DrainRequest(request_id="Y", source=MessageSource.TP_RANK_0),
+    )
+
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    assert w._handles_awaiting_admit == {"Y"} and w.admitted == []
+    assert "Y" in w._draining_rids
+    assert _reads_done(w) == ["Y"]
+
+
+def test_a_follower_still_ignores_the_conductor_s_drain():
+    w = _worker(known_rids=(), is_follower=True)
+    Worker._drain_request(w, DrainRequest(request_id="Y"))
+
+    assert w._drains_awaiting_new == set() and "Y" not in w._draining_rids

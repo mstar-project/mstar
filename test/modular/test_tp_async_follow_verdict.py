@@ -29,6 +29,7 @@ is exercised against the graph API elsewhere; here we pin the protocol.
 
 import sys
 import types
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MessageSource,
+    OffloadDelta,
+    RemoveRequest,
+    ScheduleTPNode,
+    TPNoSpeculation,
+)
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker, _parse_tp_async_sched  # noqa: E402
 
@@ -46,8 +53,23 @@ WALK = "decode"
 
 
 class _FakeEngineManager:
+    def __init__(self):
+        self.refusals = 0  # resident-delta replays to refuse before accepting
+        self.replayed: list[str] = []
+
+    def _apply(self, node_name, delta):
+        if self.refusals:
+            self.refusals -= 1
+            return False
+        while len(delta):
+            self.replayed.append(delta.pop_left().name)
+        return True
+
     def get_engine(self, node_name):
-        return types.SimpleNamespace(check_ready=lambda *a: FULL_ADMIT_OK)
+        return types.SimpleNamespace(
+            check_ready=lambda *a: FULL_ADMIT_OK,
+            apply_resident_delta=self._apply,
+        )
 
 
 class _Communicator:
@@ -79,8 +101,17 @@ def _stub():
     stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
     stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     stub._tp_leader_gap_warned = False
+    stub.engine_manager = _FakeEngineManager()
     stub.scheduler = MicroScheduler(
-        engine_manager=_FakeEngineManager(), parallel_leader_nodes=set(),
+        engine_manager=stub.engine_manager, parallel_leader_nodes=set(),
+    )
+    stub._tp_forwards_awaiting_step = deque()
+    stub.scheduler.share_tp_forwards(stub._tp_forwards_awaiting_step)
+    stub.removed = []
+    stub._remove_request = lambda body: stub.removed.append(body.request_id)
+    stub._tp_step_reached = lambda body: Worker._tp_step_reached(stub, body)
+    stub._apply_forwards_whose_step_landed = (
+        lambda: Worker._apply_forwards_whose_step_landed(stub)
     )
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None
@@ -271,6 +302,22 @@ def test_empty_schedule_message_is_dropped_not_queued():
     s = _stub()
     s._register_tp_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
     assert s.scheduler.peek_tp_follow() is None
+    # but consumed: a forward rank 0 stamped with it would otherwise wait on it
+    assert s.scheduler.last_consumed_tp_seq == 3
+
+
+def test_a_head_dropped_for_a_closed_parent_is_consumed_with_its_moves():
+    """Rank 0 made the moves the head carries whether or not it ran it."""
+    s = _stub()
+    s._tp_nospec.add(4)
+    head = _head(["r0"], seq=5, from_seq=4)
+    head.resident_delta.add_offloaded("victim")
+
+    s._register_tp_follow(head)
+
+    assert s.scheduler.peek_tp_follow() is None
+    assert s.scheduler.last_consumed_tp_seq == 5
+    assert s.engine_manager.replayed == ["victim"], "its moves went with it"
 
 
 def test_nospec_store_is_bounded():
@@ -430,3 +477,32 @@ def test_await_never_returns_without_a_decision_once_N_finished():
     s = _stub()   # nothing ever arrives
     with pytest.raises(TimeoutError):
         _await(s, _pending(4, _future(s, _output())))
+
+
+# ------------------------------------------- a forward rank 0 made before N+1
+
+def test_await_retries_a_refused_forward_that_holds_the_head_back():
+    """The head's moves wait behind a removal rank 0 made before them, and the
+    removal's own moves were refused (a step still held the pages). Retried
+    only by the main loop, the head could never build and this never return."""
+    s = _stub()
+    s.scheduler.register_tp_follow(ScheduleTPNode(NODE, WALK, ["r0"], spec_seq=4))
+    s.scheduler.pop_tp_follow_head()  # N, in flight
+    s.engine_manager.refusals = 1
+    moves = OffloadDelta.new()
+    moves.add_offloaded("victim")
+    s._tp_forwards_awaiting_step.append(RemoveRequest(
+        request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=4,
+        resident_deltas={NODE: moves},
+    ))
+    s._apply_forwards_whose_step_landed()
+    assert s.removed == [], "the refusal should have held the forward"
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    spec = object()
+    s._try_follow_speculation = (
+        lambda pending: spec if s.scheduler.settle_tp_follow_delta() else None
+    )
+
+    out = _output()
+    assert _await(s, _pending(4, _future(s, out))) == (out, spec)
+    assert s.removed == ["gone"]

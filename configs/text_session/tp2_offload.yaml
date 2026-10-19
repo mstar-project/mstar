@@ -1,0 +1,30 @@
+# TP2 under idle-session offload: parked sessions outnumber the device pool many
+# times over, so resumes reload from host and admissions offload other sessions
+# all the time. What test/text_session/offload_stress.py drives.
+model: "test_text_session"
+max_seq_len: 32768
+max_concurrent_requests: 8
+
+resources:
+  kv:
+    # 96 pages of 128 tokens: room for the running requests and a few parked
+    # sessions, nowhere near all of them
+    max_num_pages: 96
+    # ~7 MB of pinned host memory a page for this model, per rank: 1024 pages
+    # is ~7.5 GB each and still ten times the device pool
+    cpu_offload_pages: 1024
+
+sessions:
+  max_concurrent_sessions: 64
+  default_timeout_s: 600.0
+  max_timeout_s: 1800.0
+  ttl_mode: idle
+  resources:
+    kv:
+      max_state: 64
+
+node_groups:
+  - node_names:
+      - LLM
+    ranks: [0, 1]
+    tp_size: 2

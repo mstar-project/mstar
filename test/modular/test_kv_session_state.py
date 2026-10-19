@@ -241,8 +241,9 @@ def test_a_resumed_request_stops_using_the_prefix_cache():
     kv.retain_session_state("r0", "s")
 
     kv.ingest_request("r1", KVReqConfig(prefix_cache=True))
-    kv.adopt_session_state("r1", "s")
+    kv.expect_session_state("r1", "s")
 
+    # off from ingest, ahead of the adoption at its first admit
     assert kv._overrides["r1"].prefix_cache is False
 
 
@@ -266,11 +267,13 @@ def test_a_resumed_request_neither_probes_the_index_nor_files_into_it():
 
     kv.ingest_request("r1", KVReqConfig(prefix_keys=keys))
     assert kv._keyed_label("r1", "LLM", "prefill") == "main"
-    kv.adopt_session_state("r1", "s")
+    kv.expect_session_state("r1", "s")
 
-    # one switch shuts the probe, the apply, the extend and the filing
+    # one switch shuts the probe, the apply, the extend and the filing; the
+    # probe runs in admit_retrieve, before the request has adopted anything
     assert kv._keyed_label("r1", "LLM", "prefill") is None
     assert kv.resolve_cached_prefix("r1", "LLM", "prefill") is None
+    kv.adopt_session_state("r1", "s")
     _grow(kv, "r1", 64)
     assert _indexed(kv) == filed
     kv.assert_pages_conserved()
@@ -317,6 +320,12 @@ def test_session_state_size_counts_the_pages_it_holds():
 
 
 # ── positions over the session's pages ──────────────────────────────────────
+
+def test_without_a_host_pool_the_pool_bounds_the_parked_sessions():
+    # parked pages stay on device until the session ends, so the engine checks
+    # the sessions config against the pool at load
+    assert _manager(max_num_pages=32).session_capacity() == 31  # less the sink
+
 
 def _position_manager():
     from mstar.engine.resources.position.config import PositionConfig
@@ -556,6 +565,25 @@ def test_an_offloaded_session_comes_back_on_reload(_host_copies):
     kv.assert_pages_conserved()
 
 
+def test_a_request_waiting_to_adopt_can_ask_after_its_session(_host_copies):
+    # before it adopts, the parked state is the session's, not the request's
+    kv = _offloading_manager(max_num_pages=16)
+    _park(kv, "r0", "s", 10)
+    kv.ingest_request("r2", KVReqConfig())
+    kv.expect_session_state("r2", "s")
+    assert not kv.session_offloaded("s")
+
+    kv.ingest_request("r1", KVReqConfig())
+    _grow(kv, "r1", 10 * PAGE_SIZE)
+
+    assert kv.session_offloaded("s")
+    assert not kv.is_offloaded("r2"), "nothing is the request's yet"
+    assert not kv.can_reload_session("s"), "r1 holds the room"
+    kv.remove_request("r1")
+    assert kv.can_reload_session("s")
+    kv.assert_pages_conserved()
+
+
 def test_reload_counts_and_offloads_idle_sessions(_host_copies):
     kv = _offloading_manager(max_num_pages=16)
     kv.ingest_request("r0", KVReqConfig())
@@ -580,3 +608,219 @@ def test_without_a_host_pool_idle_sessions_keep_their_pages():
     )
     assert not kv.admit(step, ctx).ok
     assert _idle_pages(kv) == {"s": 10}
+
+
+def test_with_a_host_pool_parked_pages_are_not_bounded_by_the_pool():
+    # they move to host when a running request needs the room
+    assert _offloading_manager(max_num_pages=8).session_capacity() is None
+
+
+# ── holding a session for a request that has not adopted it yet ─────────────
+
+def _offloaded_session(kv: KVManager, session_id: str = "s") -> None:
+    """Park 10 pages for ``session_id`` and push them to the host."""
+    _park(kv, "r0", session_id, 10)
+    kv.ingest_request("r1", KVReqConfig())
+    _grow(kv, "r1", 10 * PAGE_SIZE)
+    kv.remove_request("r1")
+    assert kv.session_offloaded(session_id)
+
+
+def test_hold_reloads_an_offloaded_session_and_takes_it_off_the_idle_list(
+    _host_copies,
+):
+    kv = _offloading_manager(max_num_pages=16)
+    _offloaded_session(kv)
+
+    assert kv.hold_session("s")
+
+    assert not kv.session_offloaded("s")
+    assert kv._pages_held(kv.session_rid("s")) == 10
+    assert "s" not in kv._idle_sessions
+    kv.assert_pages_conserved()
+
+
+def test_a_held_session_is_not_offloaded_for_another_request(_host_copies):
+    # the point of the hold: a reload made for the request it waits on is not
+    # undone by the next request that needs pages
+    kv = _offloading_manager(max_num_pages=16)
+    _park(kv, "r0", "s", 10)
+    assert kv.hold_session("s")
+
+    kv.ingest_request("r1", KVReqConfig())
+    step = KVStep(segments=(Segment("r1", "main", 10 * PAGE_SIZE),))
+    ctx = StepContext(
+        request_ids=("r1",), graph_walk="prefill", slot=0, capture=False,
+    )
+
+    assert not kv.admit(step, ctx).ok
+    assert not kv.session_offloaded("s")
+
+
+def test_holding_twice_is_holding_once(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    _offloaded_session(kv)
+    assert kv.hold_session("s") and kv.hold_session("s")
+
+    kv.unhold_session("s")
+
+    assert kv.session_offloaded("s"), "the second hold must not forget the reload"
+    kv.assert_pages_conserved()
+
+
+def test_a_session_with_nothing_parked_holds_trivially():
+    kv = _manager()
+    assert kv.hold_session("s")
+    assert "s" not in kv._held_sessions
+
+
+def test_a_hold_that_cannot_reload_holds_nothing(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    _offloaded_session(kv)
+    kv.ingest_request("r2", KVReqConfig())
+    _grow(kv, "r2", 10 * PAGE_SIZE)
+
+    assert not kv.hold_session("s")
+
+    assert "s" not in kv._held_sessions
+    assert kv.session_offloaded("s") and "s" in kv._idle_sessions
+
+
+def test_unhold_puts_back_what_the_hold_changed(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    _offloaded_session(kv)
+    seq = kv._idle_sessions["s"].idle_seq
+    assert kv.hold_session("s")
+
+    kv.unhold_session("s")
+
+    assert kv.session_offloaded("s")
+    assert kv._idle_sessions["s"].idle_seq == seq
+    kv.assert_pages_conserved()
+
+
+def test_unhold_of_a_resident_session_leaves_it_resident_and_idle():
+    kv = _manager()
+    _park(kv, "r0", "s", 3, idle_seq=4)
+    assert kv.hold_session("s")
+
+    kv.unhold_session("s")
+
+    assert _idle_pages(kv) == {"s": 3}
+    assert kv._idle_sessions["s"].idle_seq == 4
+    kv.assert_pages_conserved()
+
+
+def test_release_reparks_the_held_session_from_the_new_seq():
+    # the request that held it was removed before it adopted
+    kv = _manager()
+    _park(kv, "r0", "s", 3, idle_seq=4)
+    assert kv.hold_session("s")
+
+    kv.release_session("s", idle_seq=9)
+
+    assert "s" not in kv._held_sessions
+    assert _idle_pages(kv) == {"s": 3}
+    assert kv._idle_sessions["s"].idle_seq == 9
+
+
+def test_release_of_an_unheld_session_restamps_it():
+    kv = _manager()
+    _park(kv, "r0", "s", 3, idle_seq=4)
+
+    kv.release_session("s", idle_seq=9)
+
+    assert kv._idle_sessions["s"].idle_seq == 9
+
+
+def test_release_of_an_empty_session_leaves_no_idle_record():
+    kv = _manager()
+    kv.release_session("s", idle_seq=9)
+    assert kv._idle_sessions == {} and kv._held_sessions == {}
+
+
+@pytest.mark.parametrize("ends_it", ["adopt", "remove_session", "retain"])
+def test_whatever_ends_the_wait_drops_the_hold(ends_it):
+    kv = _manager()
+    _park(kv, "r0", "s", 3)
+    assert kv.hold_session("s")
+    assert "s" in kv._held_sessions
+
+    kv.ingest_request("r2", KVReqConfig())
+    if ends_it == "adopt":
+        kv.adopt_session_state("r2", "s")
+    elif ends_it == "remove_session":
+        kv.remove_session("s")
+    else:
+        kv.adopt_session_state("r2", "s")
+        _grow(kv, "r2", PAGE_SIZE)
+        kv.retain_session_state("r2", "s", idle_seq=5)
+
+    assert kv._held_sessions == {}
+    kv.assert_pages_conserved()
+
+
+def _rank_before_the_reload() -> KVManager:
+    """15 usable pages: an idle session T (4), live R (5) and Y (3), and X (5)
+    offloaded, so 3 free."""
+    kv = _offloading_manager(max_num_pages=16)
+    kv.ingest_request("X", KVReqConfig())
+    _grow(kv, "X", 5 * PAGE_SIZE)
+    assert kv.offload("X") == 5
+    _park(kv, "t0", "T", 4)
+    for rid, pages in (("R", 5), ("Y", 3)):
+        kv.ingest_request(rid, KVReqConfig())
+        _grow(kv, rid, pages * PAGE_SIZE)
+    assert kv._arena.num_free == 3 and not kv.session_offloaded("T")
+    return kv
+
+
+def test_a_reload_and_a_removal_replayed_out_of_order_diverge(_host_copies):
+    """Why a forward carries the moves rank 0 made before it. Rank 0 reloads X,
+    which offloads T for room, and then removes R. A follower that removed R
+    first would have the room already and leave T on device."""
+    leader, follower = _rank_before_the_reload(), _rank_before_the_reload()
+
+    assert leader.reload("X")
+    leader.remove_request("R")
+    follower.remove_request("R")
+    assert follower.reload("X")
+
+    assert leader.session_offloaded("T")
+    assert not follower.session_offloaded("T"), (
+        "the reload no longer depends on what was freed before it; the forward "
+        "ordering may be simpler than it needs to be"
+    )
+
+
+def test_replayed_in_rank_0_s_order_they_agree(_host_copies):
+    leader, follower = _rank_before_the_reload(), _rank_before_the_reload()
+    for kv in (leader, follower):
+        assert kv.reload("X")
+        kv.remove_request("R")
+
+    assert leader.session_offloaded("T") and follower.session_offloaded("T")
+    assert leader._pages_held("X") == follower._pages_held("X") == 5
+    for kv in (leader, follower):
+        kv.assert_pages_conserved()
+
+
+def test_needs_hold_says_whether_a_hold_would_change_anything():
+    kv = _manager()
+    assert not kv.session_needs_hold("s"), "nothing parked"
+    _park(kv, "r0", "s", 3)
+    assert kv.session_needs_hold("s")
+    assert kv.hold_session("s")
+    assert not kv.session_needs_hold("s")
+
+
+def test_a_held_session_survives_another_request_s_reload(_host_copies):
+    # the live hang: ready with its session resident, the request lost it to
+    # the next reload's idle offload before its first admit
+    kv = _rank_before_the_reload()
+    assert kv.hold_session("T")
+
+    assert not kv.reload("X"), "the only room was T's"
+
+    assert not kv.session_offloaded("T")
+    kv.assert_pages_conserved()

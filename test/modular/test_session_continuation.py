@@ -82,7 +82,9 @@ class _Node:
         self.kv = KVManager(
             cfg=PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-                max_num_pages=64, page_size=PAGE_SIZE,
+                # room for the default 8 sessions at every budget used here,
+                # which the engine checks at load for a pool with no host pool
+                max_num_pages=128, page_size=PAGE_SIZE,
             ),
             name=KV, joint_comm_group=None, transfer_engine_info=None,
             device=device, dtype=torch.float32,

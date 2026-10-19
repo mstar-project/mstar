@@ -343,7 +343,8 @@ class Conductor:
 
         # Live persistent sessions, and the teardown barriers for the ones
         # being freed. A session in `session_teardowns` is refused by the API
-        # server until its ACK comes back.
+        # server until its ACK comes back, and a resume already past that check
+        # is refused here (``_admit_request``).
         self.sessions: dict[str, SessionData] = {}
         self.session_teardowns: dict[str, SessionTeardown] = {}
         self._session_teardown_deadlines: deque[tuple[float, str]] = deque()
@@ -966,6 +967,22 @@ class Conductor:
         it, and the client would wait for its timeout. A ``ValueError`` raised
         before any worker heard of the request is the client's fault: a 400.
         """
+        if (
+            body.session_id is not None and body.resumed
+            and (
+                body.session_id not in self.sessions
+                or body.session_id in self.session_teardowns
+            )
+        ):
+            # Torn down while this request was in preprocessing (a cancel of
+            # the same session, say). Ingesting would reopen the id with an
+            # empty context, under an id the API server has already released.
+            self._reject_request(
+                body.request_id,
+                f"session {body.session_id} was torn down before this request ran",
+                status=410,
+            )
+            return
         try:
             self._do_ingest_request(body)
         # Any failure must reach the client.

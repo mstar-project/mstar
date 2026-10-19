@@ -174,6 +174,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     )
     w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
     return w, t
 
 
@@ -197,6 +198,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._session_idle_seq = 0
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
     w._last_active = {}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(
@@ -286,6 +288,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     )
     w._draining_rids = set()
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
     w._last_active = {}
     w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
@@ -329,6 +332,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
     w._handles_awaiting_admit = set()
+    w._drains_awaiting_new = set()
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._consumer_node_cache = {"codec_tokens": "Codec"}
     w._my_consumer_connections = [Connection(

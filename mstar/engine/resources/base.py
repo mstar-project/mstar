@@ -163,12 +163,58 @@ class Resource(ABC):
     # set by the engine at load; None means this resource is cleared with the request
     session_config: "SessionResourceConfig | None" = None
 
+    def expect_session_state(self, rid: str, session_id: str) -> None:
+        """``rid`` resumes the session and will adopt its state.
+
+        Called at ingest. The adoption itself waits for the request's first
+        admit (``adopt_session_state``); anything that must not happen to a
+        resuming request before then (a prefix-cache probe, say) is turned off
+        here.
+        """
+        return
+
     def adopt_session_state(self, rid: str, session_id: str) -> None:
         """Hand the session's held state to ``rid``, if the session holds any.
 
-        Called at ingest, after ``ingest_request``, so the request starts where
-        the session's last request left off.
+        Called at the request's first admit (or the reload ahead of it), not at
+        ingest: that is a point every rank of a TP instance reaches in the same
+        step order, so the set of idle sessions an offload picks from is the
+        same on every rank.
         """
+        return
+
+    def session_offloaded(self, session_id: str) -> bool:
+        """Whether the session's parked state is off device. A request waiting
+        to adopt it counts as offloaded until it is brought back."""
+        return False
+
+    def can_reload_session(self, session_id: str) -> bool:
+        """``can_reload``, for the session's parked state."""
+        return True
+
+    def hold_session(self, session_id: str) -> bool:
+        """Bring the session's parked state back on device and keep it there,
+        out of reach of reclaim, for the request about to adopt it. False when
+        it does not fit yet; nothing changes then. True with nothing parked.
+
+        Keyed by the session, not the request: a TP follower replays it whether
+        or not it has that request yet.
+        """
+        return True
+
+    def session_needs_hold(self, session_id: str) -> bool:
+        """Whether the session has parked state that is not held yet: what
+        ``hold_session`` would change."""
+        return False
+
+    def unhold_session(self, session_id: str) -> None:
+        """Undo ``hold_session`` exactly, for a hold refused by another
+        resource."""
+        return
+
+    def release_session(self, session_id: str, idle_seq: int = -1) -> None:
+        """The request the session was waiting on left without adopting its
+        state: park it again, idle from ``idle_seq``, held or not."""
         return
 
     def retain_session_state(
@@ -195,11 +241,12 @@ class Resource(ABC):
         """How much parked session state this resource can hold at once, in its
         own units, or ``None`` when nothing fixed bounds it.
 
-        Only a resource that cannot move parked state out of the way answers:
-        its pool has to fit every session at once, which the engine checks
-        against the sessions config at load. One that can offload (a KV cache
-        with a host pool) returns ``None`` -- a pool too small for the parked
-        state costs it page moves, not a refusal.
+        Only a resource that cannot move parked state out of the way answers
+        (recurrent state, or a KV cache without a host pool): its pool has to
+        fit every session at once, which the engine checks against the
+        sessions config at load. One that can offload (a KV cache with a host
+        pool) returns ``None`` -- a pool too small for the parked state costs
+        it page moves, not a refusal.
         """
         return None
 

@@ -506,6 +506,11 @@ class KVManager(AttentionResource):
         # session id -> what its parked state holds; adopting or removing the
         # session takes it out.
         self._idle_sessions: dict[str, IdleSession] = {}
+        # Sessions held on device for the request about to adopt them, kept out
+        # of _idle_sessions so nothing offloads them meanwhile. Each keeps the
+        # idle record it had and whether the hold reloaded it, so
+        # ``unhold_session`` can put both back.
+        self._held_sessions: dict[str, tuple[IdleSession | None, bool]] = {}
         # (idle_seq, session id) min-heap: which parked session to offload
         # next, longest idle first. Stale entries are dropped at the pop, not
         # the change; see _next_offload_candidate.
@@ -2572,6 +2577,17 @@ class KVManager(AttentionResource):
         """
         return f"__mstar_session__{session_id}"
 
+    def expect_session_state(self, rid: str, session_id: str) -> None:
+        # its keys describe the new turn only, not the pages it will inherit;
+        # off from ingest, since admit_retrieve probes before the adoption
+        overrides = self._overrides.get(rid)
+        if overrides is not None and overrides.prefix_cache:
+            overrides.prefix_cache = False
+            logger.debug(
+                "KV %s: prefix cache off for %s; it resumes session %s",
+                self.name, rid, session_id,
+            )
+
     def adopt_session_state(self, rid: str, session_id: str) -> None:
         with self._lock:
             if not self._move_streams(self.session_rid(session_id), rid):
@@ -2582,22 +2598,78 @@ class KVManager(AttentionResource):
                 )
                 return
             self._idle_sessions.pop(session_id, None)
-            # Offloaded parked state is not reloaded here: `check_ready` sees
-            # the request offloaded and reloads it at admission once it fits,
-            # through `Engine.reload_request`, which journals the move for TP
-            # followers. A reload from here would bypass that journal.
+            self._held_sessions.pop(session_id, None)
+            # Offloaded parked state is brought back before this, by
+            # `Engine.reload_request` holding the session, which journals the
+            # move for TP followers. A reload from here would bypass that.
             logger.info(
                 "KV %s: %s adopted %d pages from session %s",
                 self.name, rid, self._pages_held(rid), session_id,
             )
-            # its keys describe the new turn only, not the pages it inherited
-            overrides = self._overrides.get(rid)
-            if overrides is not None and overrides.prefix_cache:
-                overrides.prefix_cache = False
-                logger.debug(
-                    "KV %s: prefix cache off for %s; it resumes session %s",
-                    self.name, rid, session_id,
-                )
+
+    def session_offloaded(self, session_id: str) -> bool:
+        return self.is_offloaded(self.session_rid(session_id))
+
+    def can_reload_session(self, session_id: str) -> bool:
+        return self.can_reload(self.session_rid(session_id))
+
+    def hold_session(self, session_id: str) -> bool:
+        rid = self.session_rid(session_id)
+        with self._lock:
+            if session_id in self._held_sessions:
+                return True
+            if self.session_state_size(session_id) == 0:
+                return True  # nothing parked: the session's first request
+            reloaded = False
+            if self.is_offloaded(rid):
+                if not self.reload(rid):
+                    return False
+                reloaded = True
+            self._held_sessions[session_id] = (
+                self._idle_sessions.pop(session_id, None), reloaded,
+            )
+            logger.info(
+                "KV %s: holding session %s (%d pages%s) for its next request",
+                self.name, session_id, self._pages_held(rid),
+                ", reloaded" if reloaded else "",
+            )
+            return True
+
+    def session_needs_hold(self, session_id: str) -> bool:
+        with self._lock:
+            return (
+                session_id not in self._held_sessions
+                and self.session_state_size(session_id) > 0
+            )
+
+    def unhold_session(self, session_id: str) -> None:
+        with self._lock:
+            held = self._held_sessions.pop(session_id, None)
+            if held is None:
+                return
+            idle, reloaded = held
+            if reloaded:
+                self.offload(self.session_rid(session_id))
+            if idle is not None:
+                self._park_idle(session_id, idle.idle_seq)
+
+    def release_session(self, session_id: str, idle_seq: int = -1) -> None:
+        with self._lock:
+            self._held_sessions.pop(session_id, None)
+            if self.session_state_size(session_id) == 0:
+                self._idle_sessions.pop(session_id, None)
+                return
+            self._park_idle(session_id, idle_seq)
+
+    def _park_idle(self, session_id: str, idle_seq: int) -> None:
+        """Record the session idle from ``idle_seq``. Caller holds the lock."""
+        pages = self._pages_held(self.session_rid(session_id))
+        self._idle_sessions[session_id] = IdleSession(
+            idle_seq=idle_seq, pages=pages,
+        )
+        if pages:  # nothing to reclaim from one already on the host
+            heapq.heappush(self._offload_candidates, (idle_seq, session_id))
+            self._prune_offload_candidates()
 
     def retain_session_state(
         self, rid: str, session_id: str, idle_seq: int = -1,
@@ -2605,13 +2677,8 @@ class KVManager(AttentionResource):
         with self._lock:
             if not self._move_streams(rid, self.session_rid(session_id)):
                 return
-            pages = self._pages_held(self.session_rid(session_id))
-            self._idle_sessions[session_id] = IdleSession(
-                idle_seq=idle_seq, pages=pages,
-            )
-            if pages:  # nothing to reclaim from one already on the host
-                heapq.heappush(self._offload_candidates, (idle_seq, session_id))
-                self._prune_offload_candidates()
+            self._held_sessions.pop(session_id, None)
+            self._park_idle(session_id, idle_seq)
             logger.info(
                 "KV %s: session %s keeps %d pages (%s tokens) from %s",
                 self.name, session_id, self.session_state_size(session_id),
@@ -2625,7 +2692,15 @@ class KVManager(AttentionResource):
     def remove_session(self, session_id: str) -> None:
         with self._lock:
             self._idle_sessions.pop(session_id, None)
+            self._held_sessions.pop(session_id, None)
         self.remove_request(self.session_rid(session_id))
+
+    def session_capacity(self) -> int | None:
+        # With a host pool, parked pages are offloaded when running requests
+        # need them; without one, they stay on device until the session ends.
+        if self._cpu_pool is not None:
+            return None
+        return self.config.max_num_pages - 1  # less the sink page
 
     def session_state_size(self, session_id: str) -> int:
         """Pages the session holds, on device and offloaded to host."""
