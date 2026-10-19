@@ -35,7 +35,7 @@ from pathlib import Path
 
 from benchmark.amd import catalog, health, tables
 from benchmark.amd.catalog import Arm, Row
-from benchmark.amd.launch import REPO, Launch, gpu_list, host_record
+from benchmark.amd.launch import REPO, Launch, gpu_list, host_record, smi_gpu
 
 WORK = Path("/work1/stephaniewang/atindra")
 DEFAULT_RUN_ROOT = WORK / "amd/results/bench"
@@ -193,7 +193,7 @@ class Plan:
 
 def _numa_of(gpu: int) -> int | None:
     try:
-        out = subprocess.run(["amd-smi", "static", "--numa", "-g", str(gpu), "--json"], capture_output=True,
+        out = subprocess.run(["amd-smi", "static", "--numa", "-g", str(smi_gpu(gpu)), "--json"], capture_output=True,
                              text=True, timeout=120, check=False).stdout
         doc = json.loads(out[out.find("["):]) if "[" in out else json.loads(out)
         entry = doc[0] if isinstance(doc, list) else doc
@@ -300,7 +300,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                   "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cells": []}
     numa = _numa_of(gpus[0]) if plan.numa else None
     server = None
-    hlth = health.ArmHealth(arm_dir / "health", gpus)
+    hlth = health.ArmHealth(arm_dir / "health", health.smi_gpus(gpus))
     try:
         if arm.engine != "reference":
             server = Launch(arm=arm, row=row, gpus=gpus, port=port, run_dir=arm_dir / "server", worktree=plan.worktree,
