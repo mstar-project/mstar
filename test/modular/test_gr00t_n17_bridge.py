@@ -19,6 +19,7 @@ two spans, and that it adds nothing to the forward above.
 import glob
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -27,13 +28,16 @@ from diffusers.models.attention import FeedForward
 from safetensors import safe_open
 from torch import nn
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.gr00t_n17.components.bridge import (
     BasicTransformerBlock,
     Gr00tN17VLBridge,
 )
 from mstar.model.gr00t_n17.config import BRIDGE_ATTN, Gr00tN17Config, Gr00tN17StackConfig
+from mstar.model.gr00t_n17.submodules import Gr00tN17VLBridgeSubmodule
 from mstar.model.gr00t_n17.weight_loader import _remapper
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
 _HUB = Path.home() / ".cache/huggingface/hub"
 _GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -441,3 +445,179 @@ def test_binding_the_node_reaches_every_blocks_attention():
     assert [block.attn1.ragged_attn for block in blocks] == [attention] * _BLOCKS
 
 
+# ----------------------------------------------------------------------------
+# The node: `Gr00tN17VLBridgeSubmodule`, driven the way the engine drives it
+# ----------------------------------------------------------------------------
+
+_WALK = "prefill"
+_FWD = CurrentForwardPassInfo(
+    request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0,
+)
+_ENGINE = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
+# what `prepare_inputs` stages, which is also `forward`'s signature
+_STAGED = {"backbone_features", "image_rows"}
+
+# Runs of text and image rows down a prompt. The mixed one puts the image rows in two
+# non-contiguous blocks, as a real prompt's two cameras do, so neither span can be
+# reversed or rolled back onto itself; one block would still line up with itself over
+# most of its length. The other two are the degenerate splits.
+_PROMPTS = {
+    "no image rows": (("text", 9),),
+    "two image blocks with text between": (
+        ("text", 2), ("image", 4), ("text", 3), ("image", 6), ("text", 2),
+    ),
+    "every row an image": (("image", 7),),
+}
+
+
+def _prompt(spec: tuple) -> tuple[int, list[int]]:
+    """A spec of runs -> the prompt's row count and its image rows, in prompt order."""
+    rows: int = 0
+    image: list[int] = []
+    for kind, length in spec:
+        if kind == "image":
+            image += range(rows, rows + length)
+        rows += length
+    return rows, image
+
+
+def _node(seed: int = 0) -> Gr00tN17VLBridgeSubmodule:
+    """Ours, filled. The resource is bound in `_drive`, from the step's own segments."""
+    config = _config(*_GEOMETRIES["the checkpoint's head width"])
+    bridge = Gr00tN17VLBridge(config)
+    _randomize(bridge, seed)
+    return Gr00tN17VLBridgeSubmodule(bridge, config)
+
+
+class _Run(NamedTuple):
+    """One pass of the node, with what the walk handed it and what came back."""
+
+    node: Gr00tN17VLBridgeSubmodule
+    features: torch.Tensor
+    image: list[int]
+    text: list[int]
+    step: SubmoduleStep
+    tensors: dict
+    out: dict
+
+    @torch.no_grad()
+    def by_hand(self) -> torch.Tensor:
+        """The bridge called directly on the same rows: what the node's two spans are cut
+        from, and what scattering them back has to reproduce."""
+        return self.node.model(self.features)
+
+
+@torch.no_grad()
+def _drive(spec: tuple, seed: int = 1) -> _Run:
+    """prepare_inputs -> declare_step's resource -> preprocess -> forward, as the engine
+    runs it. The image rows are derived from the spec, so the split is checked against the
+    prompt rather than against the mask the node built."""
+    node = _node()
+    rows, image = _prompt(spec)
+    features = _rows(rows, node.config.backbone_embedding_dim, seed=seed)
+    walk = {
+        "backbone_features": [features],
+        "image_rows": [torch.tensor(image, dtype=torch.long)],
+    }
+    prepared = node.prepare_inputs(_WALK, _FWD, walk)
+    # the engine plans the resource from the declaration, so the stand-in is planned from it
+    step = node.declare_step(_WALK, ["r0"], [prepared])
+    node.bind_node_resources(
+        {BRIDGE_ATTN: _SegmentAttention(tuple(seg.span for seg in step.segments))}
+    )
+    tensors = node.preprocess(_WALK, _ENGINE, [prepared])
+    text = [row for row in range(rows) if row not in set(image)]
+    return _Run(
+        node, features, image, text, step, tensors,
+        node.forward(_WALK, _ENGINE, **tensors),
+    )
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_the_step_is_one_non_causal_segment_over_the_whole_prompt(spec):
+    """Neither of the other two nodes' shapes. The vision node cuts a segment per frame;
+    the LLM node cuts one per request but attends causally. The bridge is one segment over
+    all of a prompt's rows, unmasked -- every row sees every other row of that prompt, and
+    none of anyone else's. All of that lives only in the declaration, so this is the only
+    place any of it is said.
+    """
+    node = _node()
+    rows, image = _prompt(spec)
+    prepared = node.prepare_inputs(
+        _WALK, _FWD,
+        {
+            "backbone_features": [_rows(rows, node.config.backbone_embedding_dim, seed=1)],
+            "image_rows": [torch.tensor(image, dtype=torch.long)],
+        },
+    )
+    step = node.declare_step(_WALK, ["r0"], [prepared])
+
+    assert step.segments == [Segment("r0", "main", rows)]
+    assert list(step.steps) == [BRIDGE_ATTN]
+    assert step.steps[BRIDGE_ATTN].causal is False
+    # what the resource is planned from: `SubmoduleStep` fills it in from `segments`
+    assert step.steps[BRIDGE_ATTN].segments == step.segments
+    # no batched forward, so a wider batch would only be the engine's per-request fallback
+    assert node.max_batch_size(_WALK) == 1
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_the_split_is_the_mask_and_keeps_every_row_in_prompt_order(spec):
+    """``vl_image`` is the bridge's image rows and ``vl_text`` the rest, each in prompt
+    order, and the two together are the bridge's output with nothing dropped, duplicated or
+    re-ordered. Gathers of the same rows, so this is ``torch.equal`` and not a bar.
+
+    The order is pinned on purpose: a later change that sorted or grouped the rows would be
+    invisible to a set-based check and would still break anyone lining our spans up against
+    the reference's masked attention.
+    """
+    run = _drive(spec)
+    rows = run.by_hand()
+
+    assert list(run.out) == ["vl_text", "vl_image"]
+    assert torch.equal(run.out["vl_image"][0], rows[run.image])
+    assert torch.equal(run.out["vl_text"][0], rows[run.text])
+
+    # nothing lost: the two spans scattered back onto their own rows are the output again
+    reconstructed = torch.empty_like(rows)
+    reconstructed[run.image] = run.out["vl_image"][0]
+    reconstructed[run.text] = run.out["vl_text"][0]
+    assert torch.equal(reconstructed, rows)
+
+    # the rows differ down each span, which is what makes the equalities above bite: a
+    # reversed or rolled span would not match
+    for span in (run.out["vl_image"][0], run.out["vl_text"][0]):
+        assert span.shape[0] < 2 or not torch.equal(span, span.flip(0))
+
+
+@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
+def test_driving_the_node_is_the_bridge_called_directly_and_split_by_hand(spec):
+    """The node is plumbing: ``prepare_inputs -> preprocess -> forward`` is the bridge over
+    the walk's rows, cut in two. Same ops on the same tensors, so ``torch.equal``."""
+    run = _drive(spec)
+    rows = run.by_hand()
+
+    # preprocess stages the two tensors and nothing else; there are no non-tensor kwargs
+    assert set(run.tensors) == _STAGED
+    assert torch.equal(run.tensors["backbone_features"], run.features)
+    assert run.tensors["image_rows"].tolist() == run.image
+    assert torch.equal(torch.cat([run.out["vl_text"][0], run.out["vl_image"][0]]),
+                       torch.cat([rows[run.text], rows[run.image]]))
+    assert run.out["vl_text"][0].shape == (len(run.text), rows.shape[1])
+    assert run.out["vl_image"][0].shape == (len(run.image), rows.shape[1])
+
+
+def test_more_image_rows_than_feature_rows_is_refused_where_they_arrive():
+    """The LLM node derives the image rows from a prompt the bridge never sees, so a count
+    that cannot fit the features it sent is a disagreement between the two nodes. Left to
+    the forward it would be an ``index_fill_`` out of range mid-step; the mask is built from
+    these, so it is checked where they arrive.
+    """
+    node = _node()
+    features = _rows(2, node.config.backbone_embedding_dim, seed=1)
+
+    with pytest.raises(ValueError, match=r"3 image row\(s\) for 2 backbone feature row\(s\)"):
+        node.prepare_inputs(
+            _WALK, _FWD,
+            {"backbone_features": [features], "image_rows": [torch.arange(3)]},
+        )
