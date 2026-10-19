@@ -186,6 +186,40 @@ def test_pieces_are_sized_on_the_spelled_out_text(monkeypatch):
     assert adapter.split_speech_text(words) == split_sentences(words, max_chars=320, min_chars=80)
 
 
+def test_pieces_are_sized_as_written_with_the_frontend_off(monkeypatch):
+    from types import SimpleNamespace
+
+    from mstar.api_server.openai.serving_speech import _plan_chunks
+
+    monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", _TenfoldDigits())
+    adapter = adapters.CosyVoice3Adapter()
+    text = ", ".join(["48213907"] * 200)
+    as_written = split_sentences(text, max_chars=320, min_chars=80)
+    off = SimpleNamespace(model_extra={"text_frontend": False})
+    assert _plan_chunks(off, adapter, text) == as_written
+    assert len(_plan_chunks(SimpleNamespace(model_extra={}), adapter, text[:600])) > len(as_written[:2])
+
+
+def test_an_input_over_the_piece_cap_is_not_normalized_piece_by_piece(monkeypatch):
+    calls = []
+
+    class Counting(_TenfoldDigits):
+        def normalize(self, text):
+            calls.append(text)
+            return super().normalize(text)
+
+    monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", Counting())
+    adapter = adapters.CosyVoice3Adapter()
+    pieces = adapter.split_speech_text("7 " * 50000)
+    assert len(pieces) > adapter.speech_chunk_max_pieces
+    assert calls == []
+    # past the cap partway: the rest is left as split, it is refused either way
+    calls.clear()
+    pieces = adapter.split_speech_text(" ".join(["48213907"] * 600))
+    assert len(pieces) > adapter.speech_chunk_max_pieces
+    assert len(calls) < 3 * adapter.speech_chunk_max_pieces
+
+
 def test_digit_heavy_pieces_fit_the_model_with_inflect(monkeypatch):
     pytest.importorskip("inflect")
     monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", None)

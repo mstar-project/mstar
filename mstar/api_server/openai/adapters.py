@@ -313,8 +313,10 @@ class OpenAIAdapter:
     # most sub-requests one input may split into; longer inputs get a 400
     speech_chunk_max_pieces: int = 32
 
-    def split_speech_text(self, text: str) -> list[str]:
-        """The sentence chunks of a ``/v1/audio/speech`` input that chunking applies to."""
+    def split_speech_text(self, text: str, req=None) -> list[str]:  # noqa: ARG002
+        """The sentence chunks of a ``/v1/audio/speech`` input that chunking
+        applies to; ``req`` is the speech request, for adapters whose split
+        depends on its fields."""
         return split_sentences(text, max_chars=self.speech_chunk_max_chars)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
@@ -855,7 +857,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
     # the transcript of a 30 s reference clip, and 300 for the piece.
     _ZH_MAX_PIECE_CHARS = 300
 
-    def split_speech_text(self, text: str) -> list[str]:
+    def split_speech_text(self, text: str, req=None) -> list[str]:
         if re.search(r"[\u4e00-\u9fff]", text):  # the reference's ``contains_chinese``
             return self._split_chinese(text)
         # The reference counts real tokens here; characters per token differ
@@ -863,7 +865,17 @@ class CosyVoice3Adapter(OpenAIAdapter):
         chars_per_token = len(text) / max(1.0, self._estimated_tokens(text))
         max_chars = min(self.speech_chunk_max_chars, max(80, int(80 * chars_per_token)))
         pieces = split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
-        return [p for piece in pieces for p in self._fit_spoken(piece, max_chars)]
+        extra = getattr(req, "model_extra", None) or {}
+        if extra.get("text_frontend", getattr(req, "text_frontend", True)) is False:
+            return pieces  # the model tokenizes the text as written
+        if len(pieces) > self.speech_chunk_max_pieces:
+            return pieces  # refused for its piece count; re-splitting only adds pieces
+        fitted: list[str] = []
+        for i, piece in enumerate(pieces):
+            if len(fitted) > self.speech_chunk_max_pieces:
+                return fitted + pieces[i:]
+            fitted += self._fit_spoken(piece, max_chars)
+        return fitted
 
     @classmethod
     def _split_chinese(cls, text: str) -> list[str]:
