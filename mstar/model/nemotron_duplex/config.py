@@ -34,7 +34,7 @@ ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streamin
 ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
 
 # Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
-# a deployment serves by default (``NemotronDuplexModel.DEFAULT_MAMBA_SLOTS``).
+# a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).
 SESSION_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
 

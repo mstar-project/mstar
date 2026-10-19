@@ -205,7 +205,7 @@ def test_nano_captures_the_decode_step():
     assert isinstance(cfg, BatchedAcceleratorGraphConfig)
     assert cfg.capture_graph_walk == "decode" and cfg.replay_graph_walks == ["decode"]
     assert cfg.compile is False and cfg.additional_key_info == nano.DECODE_KEY
-    assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_MAMBA_SLOTS
+    assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_SESSIONS
     row = cfg.single_request_inputs
     assert row.input_seq_len == 1 and row.kwargs["mode"] == "frame"
     assert row.tensor_inputs["audio_frame"].shape == (1, nano.config.nano.hidden_size)

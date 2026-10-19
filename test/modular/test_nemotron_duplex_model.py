@@ -91,7 +91,7 @@ def test_duplex_node_resources():
     assert isinstance(enc, RecurrentStateSpec) and enc.config.num_layers == stt.num_layers
     assert enc.config.blocks["k"].shape == (stt.num_heads, stt.att_context_size[0], stt.head_dim)
     assert enc.config.blocks["conv"].shape == (stt.d_model, stt.conv_kernel_size - 1)
-    assert enc.config.usable_slots == model.DEFAULT_MAMBA_SLOTS
+    assert enc.config.usable_slots == model.DEFAULT_SESSIONS
 
     eartts = model.config.eartts
     tkv = by_key[TALKER_KV]
@@ -113,7 +113,7 @@ def test_duplex_node_resources():
     dims = (geom.num_heads, geom.head_dim, geom.state_size, geom.n_groups, geom.conv_kernel_size)
     assert dims == (128, 80, 128, 8, 4)
     assert pool.config.blocks["ssm"].dtype is torch.float32 and pool.config.blocks["conv"].shape == (12288, 3)
-    assert pool.config.usable_slots == model.DEFAULT_MAMBA_SLOTS      # the sink is extra; padding rows take none
+    assert pool.config.usable_slots == model.DEFAULT_SESSIONS      # the sink is extra; padding rows take none
     mamba = by_key[MAMBA]
     assert isinstance(mamba, LinearAttnSpec) and mamba.config.variant is LinearAttnVariant.MAMBA2
     assert mamba.config.recurrent_state == MAMBA_STATE and mamba.depends_on() == {MAMBA_STATE}

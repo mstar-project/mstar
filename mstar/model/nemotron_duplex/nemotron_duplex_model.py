@@ -83,7 +83,6 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
-    SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
@@ -417,13 +416,13 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front; pages in talker_kv). A
-    # deployment raising it raises all four (see validate_config_yaml).
-    # 32 is the most that keep up with real time on one H100: a tick takes
-    # ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
-    DEFAULT_MAMBA_SLOTS = SESSION_BATCH_SIZES[-1]   # 32 sessions; padding rows take no slot (#258)
+    # Nemotron-H, and in encoder_state / encoder_front; pages in nano_kv and
+    # talker_kv). A deployment raising it raises all five (see
+    # validate_config_yaml). 32 is the most that keep up with real time on one
+    # H100: a tick takes ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
+    DEFAULT_SESSIONS = 32           # padding rows take no slot (#258)
     # Longest session served (``model_kwargs: {max_session_s: ...}``). The
-    # talker KV pool is sized so DEFAULT_MAMBA_SLOTS sessions this long fit at
+    # talker KV pool is sized so DEFAULT_SESSIONS sessions this long fit at
     # once: a full pool stalls every session, not just the one that outgrew it.
     # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
     # head dim) x K,V x bf16 = 28 MiB. 160 s = 2001 frames, so 37 warm-up + 2001
@@ -455,15 +454,15 @@ class NemotronDuplexModel(Model):
         return self.config.stt.num_frames(self.max_session_samples)
 
     def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_MAMBA_SLOTS) sessions of max_session_frames, both CFG streams."""
+        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of max_session_frames, both CFG streams."""
         return self._session_kv_pages(self.TALKER_WARMUP_POSITIONS, 2, page_size, sessions)
 
     def nano_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_MAMBA_SLOTS) sessions of the longest prompt and max_session_frames."""
+        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of the longest prompt and max_session_frames."""
         return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
 
     def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
-        sessions = self.DEFAULT_MAMBA_SLOTS if sessions is None else sessions
+        sessions = self.DEFAULT_SESSIONS if sessions is None else sessions
         positions = prefix + self.max_session_frames + 1
         # + 1 for the pool's sink page
         return sessions * streams * -(-positions // page_size) + 1
@@ -533,14 +532,14 @@ class NemotronDuplexModel(Model):
                 config=RecurrentStateConfig(
                     num_layers=self.config.stt.num_layers,
                     blocks=encoder_state_blocks(self.config.stt),       # in the engine's compute dtype
-                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                    max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
             ),
             RecurrentStateSpec(
                 resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
                 config=RecurrentStateConfig(
                     num_layers=1, blocks=front_state_blocks(self.config.stt),
-                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                    max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
             ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
@@ -559,8 +558,8 @@ class NemotronDuplexModel(Model):
                         n_groups=nano.n_groups,
                         conv_kernel_size=nano.conv_kernel,
                     ).to_blocks(),
-                    # + 1 for the pool's sink slot, so DEFAULT_MAMBA_SLOTS sessions fit
-                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                    # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
+                    max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
             ),
             LinearAttnSpec(
