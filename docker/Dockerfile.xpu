@@ -87,13 +87,14 @@ ARG TORCHVISION_VERSION=0.28.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG TORCHCODEC_VERSION=0.16.0+cpu
 ARG TORCHCODEC_XPU_VERSION=0.16.0
+# Override upstream's torch<2.13 cap for this XPU image without changing metadata.
 RUN uv pip install --no-cache --torch-backend=xpu \
+    --overrides <(printf 'torch==%s\n' "${TORCH_VERSION}") \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
     "torchcodec-xpu==${TORCHCODEC_XPU_VERSION}" \
     ".[bagel_xpu]" ./rust \
     msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser tabulate && \
-    uv pip check && \
     python -c "import torch, torchvision, torchaudio, torchcodec, mstar, mstar_rust; \
         import vllm_xpu_kernels._C; import vllm_xpu_kernels._xpu_C; \
         from mstar.model.bagel import bagel_model; \

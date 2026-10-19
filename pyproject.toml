@@ -31,8 +31,7 @@ dependencies = [
     "msgpack",
     "python-multipart",
     "requests",
-    # Allow the torch 2.13 XPU wheels used by the Intel media codec plugin.
-    "torch>=2.9.1,<2.14.0",
+    "torch>=2.9.1,<2.13.0",
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
     "uvicorn",

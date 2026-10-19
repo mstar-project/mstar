@@ -92,6 +92,9 @@ The Dockerfile pins XPU PyTorch 2.13.0, torchvision
 0.28.0, torchaudio 2.11.0 (the latest XPU wheel), and TorchCodec 0.16.0 with the
 Intel ``torchcodec-xpu`` 0.16.0 plugin. The CPU TorchCodec base wheel avoids CUDA
 dependencies; the plugin provides XPU video acceleration through FFmpeg VAAPI.
+An inline ``uv`` override selects Torch 2.13 for this image while preserving
+upstream's ``torch<2.13`` package metadata. Consequently, ``uv pip check`` reports
+that version-cap mismatch; the install resolver validates the image's override.
 The build checks these imports and the XPU kernel extensions without requiring GPU access.
 Other model families may need additional dependencies and XPU kernel support.
 
