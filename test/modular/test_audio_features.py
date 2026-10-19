@@ -151,6 +151,27 @@ def test_nemo_log_mel_refuses_clips_under_two_frames():
         NemoLogMel()(torch.randn(300))
 
 
+
+@pytest.mark.parametrize("normalize", [True, False])
+def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize):
+    """The encoder node computes a batch's features in one pass: padding a
+    clip, and the preemphasis reaching past its end, must not change it."""
+    torch.manual_seed(7)
+    clips = [torch.randn(n) * 0.2 for n in (16_000, 5_123, 40_000, 321)]
+    clips.append(torch.zeros(8_000))  # digital silence stays zero in a batch too
+    log_mel = NemoLogMel(normalize=normalize)
+    batch = log_mel.batch(clips)
+    for clip, feats in zip(clips, batch, strict=True):
+        alone = log_mel.batch([clip])[0]
+        assert feats.shape == alone.shape == (clip.numel() // 160, 128)
+        torch.testing.assert_close(feats, alone, rtol=1e-5, atol=1e-5)
+    assert torch.equal(batch[-1], torch.zeros_like(batch[-1])) or not normalize
+
+
+def test_nemo_log_mel_batch_refuses_a_clip_under_two_frames():
+    with pytest.raises(ValueError, match="300 samples"):
+        NemoLogMel().batch([torch.randn(16_000), torch.randn(300)])
+
 def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
     from mstar.model.components import audio_features
 

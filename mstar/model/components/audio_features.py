@@ -217,12 +217,30 @@ class NemoLogMel:
         return num_samples // self.hop_length
 
     def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
-        x = to_device_nonblocking(waveform.reshape(-1).to(torch.float32), self.window.device)
-        frames = self.num_frames(x.shape[0])
-        if frames < 2:
-            raise ValueError(f"audio of {x.shape[0]} samples is shorter than two {self.hop_length}-sample frames")
+        return self.batch([waveform])[0]
+
+    def batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        """``__call__`` for several clips in one pass and one host-to-device
+        copy: each clip gets what it gets alone. A clip is preemphasized, then
+        zero past its end, which is what the STFT pads a lone clip with; and
+        standardized over its own frames."""
+        lengths = [w.numel() for w in waveforms]
+        frames = [self.num_frames(n) for n in lengths]
+        if min(frames) < 2:
+            n = lengths[frames.index(min(frames))]
+            raise ValueError(f"audio of {n} samples is shorter than two {self.hop_length}-sample frames")
+        device = self.window.device
+        source = waveforms[0].device
+        # host clips are padded straight into pinned memory: one copy to the device
+        pin = source.type == "cpu" and device.type == "cuda"
+        x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
+        for row, w in enumerate(waveforms):
+            x[row, :lengths[row]] = w.reshape(-1)
+        x = to_device_nonblocking(x, device)
+        n_samples = to_device_nonblocking(torch.tensor(lengths), device)
         if self.preemphasis:
-            x = torch.cat([x[:1], x[1:] - self.preemphasis * x[:-1]])
+            x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
+            x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
         stft = torch.stft(
             x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
             window=self.window, return_complex=True, pad_mode="constant",
@@ -230,16 +248,18 @@ class NemoLogMel:
         # sqrt then square, as the reference does: it rounds differently
         power = torch.view_as_real(stft).pow(2).sum(-1).sqrt().pow(2)
         with ieee_fp32_matmul():
-            mel = torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :frames].T
+            mel = torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
         if self.normalize:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
             # zero where the reference's rounding amplifies it into noise
-            ref = mel[:1]
-            mean = ref + (mel - ref).sum(dim=0, keepdim=True) / frames
-            std = ((mel - mean).pow(2).sum(dim=0, keepdim=True) / (frames - 1)).sqrt()
+            n = to_device_nonblocking(torch.tensor(frames), device)[:, None, None]
+            valid = torch.arange(mel.shape[2], device=device) < n
+            ref = mel[:, :, :1]
+            mean = ref + ((mel - ref) * valid).sum(dim=2, keepdim=True) / n
+            std = (((mel - mean) * valid).pow(2).sum(dim=2, keepdim=True) / (n - 1)).sqrt()
             mel = (mel - mean) / (std + 1e-5)
-        return mel
+        return [mel[row, :, :f].T for row, f in enumerate(frames)]
 
 
 @functools.cache
