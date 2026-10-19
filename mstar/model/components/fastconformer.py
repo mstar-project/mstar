@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.fastconformer_kernels import bias_relu_mask_, glu_depthwise_conv, use_triton
+
 
 @dataclass
 class FastConformerConfig:
@@ -99,8 +101,10 @@ class _Subsampling(nn.Module):
     from the flattened channels x remaining mel bins.
 
     ``layers`` keeps the checkpoint's ModuleList layout, ReLUs included, so
-    parameter names match. Padded frames are zeroed after every conv, so a
-    batch gives each request what it would get alone.
+    parameter names match. Padded frames are zeroed after every conv a ReLU
+    follows, so a batch gives each request what it would get alone; a
+    depthwise conv feeds a 1x1 conv, which keeps padding in its own frames,
+    so that conv's mask covers both.
     """
 
     def __init__(self, config: FastConformerConfig):
@@ -125,15 +129,26 @@ class _Subsampling(nn.Module):
         """``(B, T, mel)`` -> ``(B, T', hidden)``."""
         k, s = self.config.subsampling_kernel_size, self.config.subsampling_stride
         x = features.unsqueeze(1)
-        for layer in self.layers:
-            if isinstance(layer, nn.Conv2d) and self.config.causal and layer.stride[0] > 1:
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, nn.ReLU):
+                continue  # applied with the conv before it
+            if self.config.causal and layer.stride[0] > 1:
                 # causal: k-1 frames of history plus s-1 on the right, on both axes
                 x = F.pad(x, (k - 1, s - 1, k - 1, s - 1))
-            x = layer(x)
-            if isinstance(layer, nn.Conv2d) and lengths is not None:
-                if layer.stride[0] > 1:
-                    lengths = _conv_out_len(lengths, k, s, self.config.causal)
-                x = x * _time_mask(lengths, x.shape[2])[:, None, :, None]
+            if lengths is not None and layer.stride[0] > 1:
+                lengths = _conv_out_len(lengths, k, s, self.config.causal)
+            if not isinstance(self.layers[i + 1], nn.ReLU):
+                x = layer(x)
+            elif use_triton(x):
+                x = bias_relu_mask_(
+                    F.conv2d(x, layer.weight, None, layer.stride, layer.padding, layer.dilation, layer.groups),
+                    layer.bias, lengths,
+                )
+            else:
+                x = layer(x)
+                if lengths is not None:
+                    x = x * _time_mask(lengths, x.shape[2])[:, None, :, None]
+                x = torch.relu(x)
         b, c, t, f = x.shape
         return self.linear(x.transpose(1, 2).reshape(b, t, c * f))
 
@@ -216,7 +231,13 @@ class ConvModule(nn.Module):
         self.pointwise_conv2 = nn.Linear(c, c, bias=config.convolution_bias)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
-        x = F.glu(self.pointwise_conv1(x), dim=-1)
+        x = self.pointwise_conv1(x)
+        if use_triton(x):
+            conv = self.depthwise_conv
+            left_pad = self.kernel_size - 1 if self.causal else conv.padding[0]
+            x = glu_depthwise_conv(x, valid, conv.weight, conv.bias, left_pad, silu=self.norm is None)
+            return self.pointwise_conv2(x if self.norm is None else F.silu(self.norm(x)))
+        x = F.glu(x, dim=-1)
         if valid is not None:
             # padding must not reach real frames through the kernel's window
             x = x.masked_fill(~valid[:, :, None], 0.0)

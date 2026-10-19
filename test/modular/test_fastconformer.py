@@ -315,3 +315,88 @@ def test_reproduces_the_duplex_encoder():
         out, out_lens = ours(feats, torch.tensor([203]))
     assert out_lens.tolist() == expected_lens.tolist()
     assert torch.allclose(out, expected.transpose(1, 2), atol=1e-5), (out - expected.transpose(1, 2)).abs().max()
+
+
+_needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the Triton kernels need a GPU")
+
+
+@_needs_gpu
+@pytest.mark.parametrize("causal", [False, True], ids=["offline", "causal"])
+def test_conv_module_kernel_matches_eager_ops(causal):
+    """GLU, padding mask, depthwise conv, bias and SiLU in one kernel against
+    the eager ops on bf16: within two rounding steps of them everywhere, and
+    no further from the same function in fp32 than they are. Which elements
+    differ by a step depends on the platform (``exp``'s last bit; ROCm's eager
+    depthwise conv runs on MIOpen's naive kernel), so the test bounds the
+    error rather than counting matches. Odd T and C exercise the tile edges."""
+    from mstar.model.components.fastconformer_kernels import glu_depthwise_conv
+
+    F = torch.nn.functional
+    torch.manual_seed(14)
+    b, t, c, k = 3, 77, 200, 9
+    dev, dt = "cuda", torch.bfloat16
+    x = torch.randn(b, t, 2 * c, device=dev, dtype=dt)
+    weight = (torch.randn(c, 1, k, device=dev) * 0.3).to(dt)
+    bias = torch.randn(c, device=dev).to(dt)
+    valid = torch.arange(t, device=dev)[None] < torch.tensor([77, 40, 9], device=dev)[:, None]
+    left_pad = k - 1 if causal else (k - 1) // 2
+
+    def eager(x, weight, bias, silu):
+        y = F.glu(x, dim=-1).masked_fill(~valid[:, :, None], 0.0).transpose(1, 2)
+        y = F.conv1d(F.pad(y, (left_pad, k - 1 - left_pad)), weight, bias, groups=c).transpose(1, 2)
+        return F.silu(y) if silu else y
+
+    for silu in (True, False):
+        fused = glu_depthwise_conv(x, valid, weight, bias, left_pad, silu=silu)
+        ref = eager(x, weight, bias, silu)
+        exact = eager(x.float(), weight.float(), bias.float(), silu)
+        torch.testing.assert_close(fused, ref, rtol=2 ** -6, atol=1e-2)
+        err_fused = (fused.float() - exact).abs().mean().item()
+        err_eager = (ref.float() - exact).abs().mean().item()
+        assert err_fused <= 1.1 * err_eager, (err_fused, err_eager)
+
+
+@_needs_gpu
+def test_subsampling_kernel_matches_eager_ops():
+    """Bias, ReLU and the padding mask on a conv output, in place: the eager
+    ops' rounding exactly."""
+    from mstar.model.components.fastconformer_kernels import bias_relu_mask_
+
+    torch.manual_seed(15)
+    x = torch.randn(3, 24, 37, 11, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(24, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([37, 20, 1], device="cuda")
+    mask = (torch.arange(37, device="cuda")[None] < lengths[:, None])[:, None, :, None]
+    ref = torch.relu((x + bias[None, :, None, None]) * mask)
+    assert torch.equal(bias_relu_mask_(x.clone(), bias, lengths), ref)
+    assert torch.equal(bias_relu_mask_(x.clone(), bias, None), torch.relu(x + bias[None, :, None, None]))
+
+
+@_needs_gpu
+@pytest.mark.parametrize("causal", [False, True], ids=["offline", "causal"])
+def test_triton_encoder_matches_eager_and_single_requests(causal, monkeypatch):
+    """The whole encoder on the GPU, fp32 without TF32: the Triton path
+    agrees with the eager one, and a padded batch gives each row what it
+    gets alone."""
+    from mstar.model.components import fastconformer_kernels
+
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(16)
+    config = _causal_config(3) if causal else FastConformerConfig.from_hf(TINY)
+    enc = FastConformerEncoder(config).eval().cuda()
+    for p in enc.parameters():
+        torch.nn.init.normal_(p, std=0.2)
+    lens = [203, 97, 150]
+    feats = torch.zeros(3, 203, 16, device="cuda")
+    for i, n in enumerate(lens):
+        feats[i, :n] = torch.randn(n, 16)
+    with torch.no_grad():
+        fused, out_lens = enc(feats, torch.tensor(lens, device="cuda"))
+        for i, n in enumerate(lens):
+            single, _ = enc(feats[i:i + 1, :n], torch.tensor([n], device="cuda"))
+            m = int(out_lens[i])
+            torch.testing.assert_close(fused[i, :m], single[0], atol=1e-4, rtol=1e-4)
+        monkeypatch.setattr(fastconformer_kernels, "_TRITON_AVAILABLE", False)
+        eager, _ = enc(feats, torch.tensor(lens, device="cuda"))
+    torch.testing.assert_close(fused, eager, atol=1e-4, rtol=1e-4)
