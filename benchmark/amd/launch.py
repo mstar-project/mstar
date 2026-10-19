@@ -13,6 +13,7 @@ a clean environment.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -46,6 +47,9 @@ CTR_FORWARDED = ("VLLM_", "SGLANG_", "AITER_", "HSA_", "NCCL_", "RCCL_", "MIOPEN
 # ctr.sh's own settings: read by ctr.sh on the host, not passed into the container.
 CTR_OWN = ("CTR_PWD", "CTR_BIND")
 VRAM_BUSY_MB = 4096
+# A process that restricts only HIP_VISIBLE_DEVICES still opens every GPU, and amd-smi lists it on each with a few
+# kB; it holds a GPU only above this much VRAM there.
+PROC_VRAM_BUSY_BYTES = 256 << 20
 # Server log lines that say which attention backend an engine picked (vLLM, SGLang, sglang-omni).
 BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"Overriding with (\w+) out of"),
                     re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"),
@@ -55,6 +59,12 @@ BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"
 MOE_TUNED_PATTERNS = (re.compile(r"fused MoE: tuned Triton configs from (\S+\.json)"),
                       re.compile(r"Using configuration from (\S+\.json) for MoE layer"))
 MOE_DEFAULT_PATTERN = re.compile(r"Using default MoE config\..*?Config file not found at (.+)")
+# mstar's fused all-reduce + norm under TP: the backend it set up, or why it fell back to RCCL and a separate norm.
+ALLREDUCE_FUSED = re.compile(r"all-reduce fusion workspace: (.+?(?:up to \d+ tokens x \d+|$))", re.M)
+ALLREDUCE_FALLBACK = re.compile(r"((?:AITER fused all-reduce \+ RMSNorm (?:failed its startup check|unavailable"
+                                r"|doesn't cover)|AITER custom all-reduce failed to build|FlashInfer all-reduce "
+                                r"fusion unavailable|no FlashInfer all-reduce fusion backend works here"
+                                r"|TP ranks lost sync building the fusion workspace).*)$", re.M)
 TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian", "qwen3_tts_1p7b": "vivian"}
 
 
@@ -110,23 +120,43 @@ def _entries(doc) -> list[dict]:
     return doc if isinstance(doc, list) else []
 
 
+@functools.cache
+def smi_index_map() -> dict[int, int]:
+    """amd-smi's number for each HIP device. HIP counts GPUs in KFD topology order and amd-smi by PCI address,
+    which differ on some nodes, so every amd-smi lookup about a HIP device goes through this. Identity if
+    amd-smi doesn't give the KFD node."""
+    entries = [e for e in _entries(amd_smi_json("list")) if isinstance(e.get("gpu"), int)]
+    if not entries or any(not isinstance(e.get("node_id"), int) for e in entries):
+        return {}
+    return {hip: e["gpu"] for hip, e in enumerate(sorted(entries, key=lambda e: e["node_id"]))}
+
+
+def smi_gpu(hip: int) -> int:
+    return smi_index_map().get(hip, hip)
+
+
 def gpu_occupancy(gpus: list[int]) -> dict[int, dict]:
-    """VRAM in use and processes per GPU, from amd-smi. Empty if amd-smi can't tell."""
+    """VRAM in use and the processes holding memory, per HIP device, from amd-smi. Empty if it can't tell."""
     out: dict[int, dict] = {}
+    want = {smi_gpu(g): g for g in gpus}
     for e in _entries(amd_smi_json("metric", "--mem-usage")):
-        g = e.get("gpu")
-        if g in gpus:
+        g = want.get(e.get("gpu"))
+        if g is not None:
             used = (e.get("mem_usage") or {}).get("used_vram")
             used = used.get("value") if isinstance(used, dict) else used
             out.setdefault(g, {})["vram_used_mb"] = float(used) if isinstance(used, (int, float)) else None
     for e in _entries(amd_smi_json("process")):
-        g = e.get("gpu")
-        if g in gpus:
+        g = want.get(e.get("gpu"))
+        if g is not None:
             procs = []
             for item in e.get("process_list") or []:
                 info = item.get("process_info") if isinstance(item, dict) else None
-                if isinstance(info, dict):
-                    procs.append(f"{info.get('name')}:{info.get('pid')}")
+                if not isinstance(info, dict):
+                    continue
+                vram = ((info.get("memory_usage") or {}).get("vram_mem") or {}).get("value")
+                if isinstance(vram, (int, float)) and vram < PROC_VRAM_BUSY_BYTES:
+                    continue
+                procs.append(f"{info.get('name')}:{info.get('pid')}")
             out.setdefault(g, {})["processes"] = procs
     return out
 
@@ -343,6 +373,7 @@ class Launch:
             startup = {"ready_s": round(ready_s, 1), "first_request_s": first_s, "first_request_error": first_err,
                        "backends": backends_in_log(self.run_dir / "server.log"),
                        "moe_configs": moe_configs_in_log(self.run_dir / "server.log"),
+                       "allreduce": allreduce_in_log(self.run_dir / "server.log"),
                        "server_pid": pid, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                        "ipc_dir": str(self.ipc_dir), "upload_dir": str(self.upload_dir)}
             (self.run_dir / "startup.json").write_text(json.dumps(startup, indent=1))
@@ -411,6 +442,20 @@ def moe_configs_in_log(path: Path) -> dict:
     tuned = {Path(m).name for pat in MOE_TUNED_PATTERNS for m in pat.findall(text)}
     default = {Path(p.strip()).name for m in MOE_DEFAULT_PATTERN.findall(text) for p in m.split(", ")}
     return {"tuned": sorted(tuned), "default": sorted(default)}
+
+
+def allreduce_in_log(path: Path) -> dict | None:
+    """Whether the server fused all-reduce with the norm (and with what), or the line saying why not. None if
+    the log says neither, as without TP."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    fallback = ALLREDUCE_FALLBACK.search(text)
+    if fallback:
+        return {"fused": False, "line": fallback.group(1).strip()[:400]}
+    fused = ALLREDUCE_FUSED.search(text)
+    return {"fused": True, "backend": fused.group(1).strip()} if fused else None
 
 
 def session_processes(sid: int) -> list[int]:
@@ -538,11 +583,12 @@ def host_record(gpus: list[int]) -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         rec["amd_smi_version"] = None
     names = {}
+    want = {smi_gpu(g): g for g in gpus}
     for e in _entries(amd_smi_json("static", "--asic")):
-        if e.get("gpu") in gpus:
+        if e.get("gpu") in want:
             asic = e.get("asic") or {}
-            names[e.get("gpu")] = {"market_name": asic.get("market_name"),
-                                   "arch": asic.get("target_graphics_version"), "device_id": asic.get("device_id")}
+            names[want[e["gpu"]]] = {"market_name": asic.get("market_name"), "amd_smi_gpu": e["gpu"],
+                                     "arch": asic.get("target_graphics_version"), "device_id": asic.get("device_id")}
     rec["gpus"] = names
     return rec
 
