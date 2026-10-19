@@ -88,6 +88,9 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
+        for block in config.blocks.values():
+            if block.dtype is None:
+                block.dtype = info.kv_dtype if info.kv_dtype is not None else torch.get_default_dtype()
         return cls(device=info.device, config=config)
 
     def __init__(self, device: torch.device, config: RecurrentStateConfig):

@@ -468,8 +468,7 @@ class NemotronDuplexModel(Model):
         return sessions * streams * -(-positions // page_size) + 1
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse an autocast dtype the encoder's state is not stored in, and a
-        session cap that a per-session resource cannot hold.
+        """Refuse a session cap that a per-session resource cannot hold.
 
         A session holds a slot in each recurrent pool (``mamba_state``,
         ``encoder_state``, ``encoder_front``) and its nano and talker pages from
@@ -477,12 +476,6 @@ class NemotronDuplexModel(Model):
         another ends, and its frames with it. So ``max_concurrent_requests``
         sessions must fit each; the conductor queues the rest.
         """
-        dtype, state_dtype = config.get("autocast_dtype"), str(self.get_autocast_dtype()).removeprefix("torch.")
-        if dtype is not None and str(dtype).removeprefix("torch.") != state_dtype:
-            raise ValueError(
-                f"{config_path}: autocast_dtype {dtype} is not the {state_dtype} that "
-                f"resources.{ENCODER_STATE} stores the encoder's layer state in"
-            )
         cap = config.get("max_concurrent_requests")
         if cap is None:
             logger.warning(
@@ -538,8 +531,7 @@ class NemotronDuplexModel(Model):
                 resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
                 config=RecurrentStateConfig(
                     num_layers=self.config.stt.num_layers,
-                    # in the dtype the layers compute it in, so a step stores what it computed
-                    blocks=encoder_state_blocks(self.config.stt, self.get_autocast_dtype()),
+                    blocks=encoder_state_blocks(self.config.stt),       # in the engine's compute dtype
                     max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
                 ),
             ),

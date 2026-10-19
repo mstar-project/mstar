@@ -438,7 +438,8 @@ The spec types are:
      - A pool of fixed-size per-request state slots (a Mamba or gated-DeltaNet
        layer's conv window and SSM state, a streaming encoder's caches), one slot per
        request and label, held until the request ends. ``blocks`` names each tensor of
-       a slot and its shape and dtype; ``max_slots`` (one more than the requests, for
+       a slot and its shape and dtype (None: the engine's compute dtype, what its KV
+       caches store); ``max_slots`` (one more than the requests, for
        the sink that padding rows address) is deployment-tunable. A recurrent kernel
        reads the step's ``addressing``; plain torch reads and writes a block through
        ``gather`` / ``scatter_`` with that addressing (or its ``narrow``, for rows a

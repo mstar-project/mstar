@@ -357,9 +357,12 @@ def front_state_blocks(config: ConformerSTTConfig) -> dict[str, RecurrentBlockCo
     }
 
 
-def encoder_state_blocks(config: ConformerSTTConfig, dtype: torch.dtype) -> dict[str, RecurrentBlockConfig]:
+def encoder_state_blocks(config: ConformerSTTConfig,
+                         dtype: torch.dtype | None = None) -> dict[str, RecurrentBlockConfig]:
     """A call's layer state, per layer: the last ``att_context`` keys and values
-    of its attention and the last ``kernel - 1`` inputs of its depthwise conv."""
+    of its attention and the last ``kernel - 1`` inputs of its depthwise conv.
+    By default in the engine's compute dtype, which the layers compute it in:
+    stored in another, a call's frames drift from the offline ones."""
     ctx = config.att_context_size[0]
     return {
         "k": RecurrentBlockConfig(shape=(config.num_heads, ctx, config.head_dim), dtype=dtype),

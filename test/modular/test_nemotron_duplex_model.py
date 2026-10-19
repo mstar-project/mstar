@@ -171,19 +171,21 @@ def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
                                    "c.yaml")
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_duplex_encoder_state_is_stored_in_the_compute_dtype(dtype, monkeypatch):
+@pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16, None])
+def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dtype):
     """The encoder stores each step's layer state for the next; in another
     dtype than the layers compute it in, live frames drift from one-shot ones.
-    A deployment that computes in another dtype is refused at startup."""
+    So the pool takes the dtype the engine resolved (``autocast_dtype: null``
+    computes in fp32), and no deployment dtype is refused for it."""
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
     model = _make_model()
-    monkeypatch.setattr(model, "get_autocast_dtype", lambda: dtype)
+    model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == ENCODER_STATE]
-    assert {block.dtype for block in spec.config.blocks.values()} == {dtype}
-    model.validate_config_yaml({"autocast_dtype": str(dtype).removeprefix("torch.")}, "c.yaml")
-    other = "float16"
-    with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
-        model.validate_config_yaml({"autocast_dtype": other}, "c.yaml")
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype))
+    want = torch.float32 if autocast_dtype is None else autocast_dtype
+    assert {pool.block(name, 0).dtype for name in spec.config.blocks} == {want}
 
 
 class _LoadReachedError(Exception):

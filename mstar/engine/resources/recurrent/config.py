@@ -24,11 +24,12 @@ class RecurrentBlockConfig:
     """One per-slot, per-layer tensor block.
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
-    across ranks.
+    across ranks. A ``dtype`` of None is the engine's compute dtype (what its
+    KV caches store), settled when the pool is built.
     """
 
     shape: tuple[int, ...]
-    dtype: torch.dtype
+    dtype: torch.dtype | None
     shard_dims: tuple[int, ...] = ()
 
     def __post_init__(self):
