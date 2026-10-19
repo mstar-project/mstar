@@ -448,6 +448,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   to match; to serve more, raise the cap and all four with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
+  The nano, the talker, the encoder and the codec each run at most 32 sessions
+  a step, their widest CUDA graph; more are split over several steps rather
+  than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
   through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
   ``talker_pos``): each session owns two streams, the conditional and the

@@ -511,6 +511,11 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
+    def max_batch_size(self, graph_walk: str) -> int:
+        # The engine caps a batch at its whole-forward graphs only; past the
+        # widest region capture every call of the step would run eagerly.
+        return self.CAPTURE_BATCH_SIZES[-1]
+
     @staticmethod
     def _declare(request_ids, keys) -> SubmoduleStep:
         return SubmoduleStep(
@@ -1005,6 +1010,10 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
 
     def can_batch(self, batch, model_inputs) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        # as the encoder's: the region's widest capture, which the engine's cap does not see
+        return self.CAPTURE_BATCH_SIZES[-1]
 
     @property
     def _steady_window(self) -> int:
