@@ -134,6 +134,17 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``NCCL_SOCKET_IFNAME``
+     - ``lo``
+     - NCCL's own variable. Every worker runs on the conductor's host, so
+       the conductor sets ``lo`` for its workers and NCCL's bootstrap
+       sockets listen on loopback only. A value you set, or a set
+       ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``GLOO_SOCKET_IFNAME``
+     - ``lo``
+     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+       Same rule: the conductor sets ``lo`` for its workers unless you set
+       it, so Gloo does not listen on the address the hostname resolves to.
 
 Models
 ------

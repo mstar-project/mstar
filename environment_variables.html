@@ -788,6 +788,19 @@ and with the periodic stats sweep, logging loudly.</p></td>
 fragmentation snapshot (segments, free bytes, largest contiguous
 free block, pinned bytes).</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_IFNAME</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
+<td><p>NCCL’s own variable. Every worker runs on the conductor’s host, so
+the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers and NCCL’s bootstrap
+sockets listen on loopback only. A value you set, or a set
+<code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_FAMILY</span></code>, is kept as is.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
+<td><p>PyTorch’s variable for the Gloo groups next to each TP/SP group.
+Same rule: the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers unless you set
+it, so Gloo does not listen on the address the hostname resolves to.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
