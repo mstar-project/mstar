@@ -247,6 +247,23 @@ def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
                          rel * step + 1e-6)
 
 
+def _compare(xs, res, w, gemma, out, r, tokens) -> str | None:
+    """What's wrong with one startup-check case, or None."""
+    want, tol = _reference(xs, res, w, float(gemma), 1e-6)
+    for name, got, ref, bound in zip(("norm", "residual"), (out, r), want, tol, strict=True):
+        err = (got.float().cpu() - ref.float()).abs().nan_to_num(float("inf"))
+        if (err > bound).any():
+            return f"{name} at tokens={tokens} gemma={gemma}: max |err| {err.max().item():.3g}"
+    # AITER's release builds truncate to bf16 on gfx942, which shrinks the
+    # residual stream a bit more every layer (~15% over 64 layers).
+    got_r, ref_r = r.float().cpu().abs(), want[1].float().abs()
+    toward_zero = int((got_r < ref_r).sum()) - int((got_r > ref_r).sum())
+    if toward_zero > 0.05 * ref_r.numel():
+        return (f"residual rounds toward zero ({toward_zero} of {ref_r.numel()} values), "
+                f"needs an AITER build with OPUS_FP32_to_BF16_DEFAULT=0")
+    return None
+
+
 class AiterARFusion(ARFusion):
     """AITER's custom all-reduce with its one-stage fused RMSNorm.
 
@@ -395,15 +412,19 @@ class AiterARFusion(ARFusion):
         """Startup check. Runs the kernel at 1 and ``max_tokens`` rows, gemma
         on and off, and compares with a host reference. Outputs start as NaN,
         so a build that skips this hidden size fails. All ranks draw inputs from
-        the same seeded generator, so each one can compute the full sum."""
+        the same seeded generator, so each one can compute the full sum.
+
+        Every rank runs every case even after one fails: each call is a
+        collective, and a rank that stops early leaves its peers spinning in
+        the kernel."""
         gen = torch.Generator().manual_seed(1234)
+        bad = None
         try:
             for tokens in sorted({1, max_tokens}):
                 xs = torch.randn(world_size, tokens, hidden, generator=gen).to(dtype)
                 res = torch.randn(tokens, hidden, generator=gen).to(dtype)
                 w = (torch.randn(hidden, generator=gen) * 0.1).to(dtype)
                 for gemma in (False, True):
-                    want, tol = _reference(xs, res, w, float(gemma), 1e-6)
                     out = torch.full(
                         (tokens, hidden), float("nan"), dtype=dtype, device=device,
                     )
@@ -413,24 +434,14 @@ class AiterARFusion(ARFusion):
                         w=w.to(device), eps=1e-6, registered=False,
                         use_1stage=True, gemma_norm=gemma,
                     )
-                    for name, got, ref, bound in zip(
-                        ("norm", "residual"), (out, r), want, tol, strict=True,
-                    ):
-                        err = (got.float().cpu() - ref.float()).abs().nan_to_num(float("inf"))
-                        if (err > bound).any():
-                            return (f"{name} at tokens={tokens} gemma={gemma}: "
-                                    f"max |err| {err.max().item():.3g}")
-                    # AITER's release builds truncate to bf16 on gfx942, which shrinks
-                    # the residual stream a bit more every layer (~15% over 64 layers).
-                    got_r, ref_r = r.float().cpu().abs(), want[1].float().abs()
-                    toward_zero = int((got_r < ref_r).sum()) - int((got_r > ref_r).sum())
-                    if toward_zero > 0.05 * ref_r.numel():
-                        return (f"residual rounds toward zero ({toward_zero} of "
-                                f"{ref_r.numel()} values), needs an AITER build with "
-                                f"OPUS_FP32_to_BF16_DEFAULT=0")
+                    if bad is None:
+                        bad = _compare(xs, res, w, gemma, out, r, tokens)
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}"
-        return None
+        if bad is not None:
+            logger.warning("AITER fused all-reduce + RMSNorm startup check failed on "
+                           "this rank (rank %d): %s", rank, bad)
+        return bad
 
     def accepts(self, x, residual, weight_bias) -> bool:
         return (0 < x.shape[0] <= self.max_tokens
