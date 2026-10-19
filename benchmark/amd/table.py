@@ -135,6 +135,9 @@ def _comparability(data: dict, row: str, arm: str, wl: str, fam: str) -> list[st
     """Reasons an arm's cells don't compute the same thing as mstar's, beyond the arm's own note."""
     notes = []
     a = data["arms"].get(f"{row}/{arm}", {})
+    ar = (a.get("startup") or {}).get("allreduce") or {}
+    if ar and not ar.get("fused"):
+        notes.append("fused all-reduce: RCCL fallback")
     spec = catalog.ARMS.get(arm)
     differs = spec.differs_for.get(fam, spec.differs) if spec else a.get("differs")
     if differs:
@@ -212,7 +215,10 @@ def render(data: dict) -> str:
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
         backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if a["arm"] == "mstar" else "")
         moe_txt = _moe_status(a)[0]
-        backends = "; ".join(x for x in (backends, moe_txt) if x)
+        ar = st.get("allreduce") or {}
+        ar_txt = "" if not ar else (f"fused all-reduce: {ar.get('backend')}" if ar.get("fused")
+                                    else f"fused all-reduce: RCCL fallback ({ar.get('line')})")
+        backends = "; ".join(x for x in (backends, moe_txt, ar_txt) if x)
         co = a.get("cotenants") or {}
         co_txt = ", ".join(co.get("markers") or []) or "none"
         if co.get("peak_load") is not None:
