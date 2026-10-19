@@ -186,8 +186,8 @@ def render(data: dict) -> str:
         lines.append(f"- resumed {r.get('at')} on {r.get('host')} (job {r.get('job')}); finished arms and cells kept")
     for name, h in data["health"].items():
         v = h["verdict"]
-        lines.append(f"- node health {name}: {v['status']}" + (f" ({'; '.join(v['reasons'])[:300]})"
-                                                               if v["reasons"] else ""))
+        lines.append(f"- node health {name}: {v['status']}")
+        lines += [f"  - {r[:400]}" for r in v["reasons"]]  # each WARN or FAIL as node_health.sh wrote it
     lines.append("")
 
     lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | attention and MoE configs "
@@ -208,7 +208,7 @@ def render(data: dict) -> str:
             ver = " ".join(f"{k} {stack[k]}" for k in ("vllm", "sglang", "vllm-omni", "torch", "torch_hip",
                                                         "amd-aiter") if stack.get(k))
         env = " ".join(f"{k}={v}" for k, v in (a.get("env") or {}).items()
-                       if k.startswith(("VLLM_", "SGLANG_", "MSTAR_", "NCCL_", "AITER_", "MIOPEN_FIND"))
+                       if k.startswith(("VLLM_", "SGLANG_", "MSTAR_", "NCCL_", "GLOO_", "AITER_", "MIOPEN_FIND"))
                        and not k.endswith("_DIR"))
         st = a.get("startup") or {}
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
