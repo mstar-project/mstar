@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -59,6 +60,10 @@ class RecurrentAddressing:
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # real rows, before a capture bucket's padding
+    # The same two on the host, as built: a backend that splits rows between
+    # kernels by them must not read the device copies back
+    host_slot_indices: Sequence[int] | None = None
+    host_has_state: Sequence[bool] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -389,6 +394,10 @@ class RecurrentStatePool(Resource):
             slot_indices=target.slot_indices,
             has_state=target.has_state,
             num_rows=num_rows,
+            # the lists as built, not copies: this call made them and nothing
+            # changes them after
+            host_slot_indices=indices,
+            host_has_state=has_state,
         )
 
     def _addressing_buffers(
@@ -440,7 +449,7 @@ class RecurrentStatePool(Resource):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len

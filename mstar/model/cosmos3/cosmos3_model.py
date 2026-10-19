@@ -320,7 +320,7 @@ class Cosmos3Model(Model):
                 resource_key=ATTN,
                 nodes=kv_nodes,
                 config=AttentionConfig(
-                    kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
+                    kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
                 ),
             ),
         ]

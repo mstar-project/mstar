@@ -50,13 +50,32 @@ class ProcessPromptOutput(NamedTuple):
 
 
 class PrefixStream(NamedTuple):
-    """The input tensor whose token ids key one cache stream's pages."""
+    """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
     tensor: str
     keyed_by: str
-    # the walk that writes the keyed span; a write from any other walk ends the chain
+    # the walk that writes the keyed span; a write from a walk not named here ends the chain
     walk: str
     # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None
+    # the other walks a layout may name
+    layout_walks: tuple[str, ...] = ()
+
+
+class Span(NamedTuple):
+    """One write to a keyed stream. A layout lists them in the order the walks write.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file.
+    """
+    kind: str
+    walk: str
+    length: int
+    advance: int
+    source: str | tuple[str, int]
+    params: tuple = ()
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -379,6 +398,7 @@ class Model(ABC):
             for graph_walk, graph in walk_graphs.items()
         }
         self._check_stream_driven_walks(walk_to_wgs, config_path)
+        self._check_loop_successors(walk_to_wgs, config_path)
         return sum(walk_to_wgs.values(), start=[])
 
     def _check_walk_placement(
@@ -482,6 +502,35 @@ class Model(ABC):
                     "after it into a downstream partition fed by a StreamingGraphEdge."
                 )
 
+    def _check_loop_successors(
+        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
+    ) -> None:
+        """Reject a Loop member with an edge to a node outside the Loop in the
+        same worker graph.
+
+        A worker graph counts top-level completions, and that successor
+        completes once per iteration, so the pass ends before the Loop and the
+        successor's later inputs are done, and the pass-end reset drops them.
+        ``Loop.accumulated_outputs`` hands the successor every iteration's
+        output once, when the Loop finishes.
+        """
+        for walk, wgs in walk_to_wgs.items():
+            for wg in wgs:
+                wg_nodes = wg.section.get_nodes()
+                for loop in wg.section.get_loops().values():
+                    members = loop.get_nodes()
+                    for name, node in members.items():
+                        for edge in node.outputs:
+                            if edge.next_node in wg_nodes and edge.next_node not in members:
+                                raise ValueError(
+                                    f"{config_path}: graph walk {walk!r}: node {name!r} of Loop "
+                                    f"{loop.name!r} sends {edge.name!r} to {edge.next_node!r}, "
+                                    "outside the Loop in the same worker graph. The worker graph "
+                                    "would report done before the Loop and its successor finish. "
+                                    "Send it through Loop.accumulated_outputs (every iteration's "
+                                    "output, once the Loop finishes) or Loop.outputs instead."
+                                )
+
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
@@ -574,6 +623,35 @@ class Model(ABC):
         """
         return type(self).__name__
 
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def combined_walk_of(self) -> dict[tuple[str, str], str]:
+        """``(node, real walk) -> combined walk``, validated."""
+        walks = self.get_graph_walk_graphs()
+        out: dict[tuple[str, str], str] = {}
+        for node, combined in self.get_combined_graph_walks().items():
+            for name, members in combined.items():
+                if name in walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: combined walk {name!r} of {node!r} "
+                        "reuses the name of a real walk"
+                    )
+                for walk in members:
+                    if walk not in walks or node not in walks[walk].get_nodes():
+                        raise ValueError(
+                            f"{type(self).__name__}: combined walk {name!r} names "
+                            f"{walk!r}, which is not a walk of node {node!r}"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: walk {walk!r} of {node!r} is in "
+                            f"both {out[(node, walk)]!r} and {name!r}"
+                        )
+                    out[(node, walk)] = name
+        return out
+
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.
 
@@ -581,6 +659,9 @@ class Model(ABC):
         preprocess worker keys that tensor and the KV resource matches what it
         already holds. Empty leaves the model uncached whatever the deployment
         asks for.
+
+        A stream with ``layout_walks`` takes its ``prefix_layout`` from
+        `process_prompt`'s metadata, as ``{resource: {label: [Span, ...]}}``.
         """
         return {}
 

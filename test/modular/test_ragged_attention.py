@@ -20,12 +20,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.cuda_graph_config import (
+from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources import (
     AttentionStep,
     BucketKey,
@@ -117,7 +117,7 @@ def wrapper(**overrides) -> RaggedPrefillWrapper:
 
 def graph_wrapper() -> RaggedPrefillWrapper:
     return wrapper(
-        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True
+        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True
     )
 
 
@@ -255,7 +255,7 @@ def test_graph_mode_priming_survives_a_small_first_plan():
 
 def test_graph_mode_requires_bucket_bounds():
     with pytest.raises(AssertionError, match="max_num_segments required"):
-        wrapper(use_cuda_graph=True)
+        wrapper(accelerator_graph=True)
 
 
 # --- the resource ----------------------------------------------------------
@@ -390,7 +390,7 @@ def test_cg_wrapper_is_sized_by_the_config_not_the_first_plan():
     w = mgr._current_plan_states["main"]
     assert w.max_num_segments == 2 * 3
     assert w.max_total_tokens == MAX_TOKENS
-    assert w.use_cuda_graph
+    assert w.accelerator_graph
 
 
 def test_cg_wrapper_is_per_bucket_slot_and_label():
@@ -453,7 +453,7 @@ def test_preplan_promotes_on_the_next_plan():
 def test_preplan_requires_a_capture_slot():
     """Eager wrappers share one workspace per label with the in-flight forward."""
     mgr = manager()
-    with pytest.raises(AssertionError, match="preplan requires a cuda graph step"):
+    with pytest.raises(AssertionError, match="preplan requires a captured graph step"):
         mgr.plan(step(8), ctx(["r0"], is_preplan=True))
 
 
@@ -498,7 +498,7 @@ def piecewise_runner(mgr, capture_fn):
             steps={ATTN: AttentionStep(causal=False)},
         )
 
-    runner = PiecewiseCudaGraphRunner(
+    runner = PiecewiseAcceleratorGraphRunner(
         label="encoder_block_loop",
         config=PiecewisePackedConfig(
             capture_fn=capture_fn,
@@ -649,7 +649,7 @@ def test_cross_plan_rejects_unpaired_segments():
 
 
 def test_graph_cross_rejects_too_many_key_tokens():
-    w = cross_wrapper(max_num_segments=2, max_total_tokens=64, max_total_kv_tokens=128, use_cuda_graph=True)
+    w = cross_wrapper(max_num_segments=2, max_total_tokens=64, max_total_kv_tokens=128, accelerator_graph=True)
     w.plan(cu([32, 32]), cu([64, 64]))
     with pytest.raises(ValueError, match="key tokens exceeds"):
         w.plan(cu([32, 32]), cu([64, 65]))
@@ -663,7 +663,7 @@ def test_graph_cross_rejects_too_many_key_tokens():
 def test_graph_cross_replay_matches_reference(q_lens, kv_lens):
     """A cross plan re-planned before each replay of one captured graph, with
     query and key layouts changing independently."""
-    w = cross_wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True)
+    w = cross_wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
     sq, sk, sv = (torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3))
     w.plan(cu([MAX_TOKENS // MAX_SEGMENTS] * MAX_SEGMENTS), cu([64] * MAX_SEGMENTS))
     stream = torch.cuda.Stream()
@@ -750,5 +750,5 @@ def test_cross_pair_under_a_lease_gets_a_graph_wrapper_sized_for_its_keys():
         ctx(["r0", "r1"], lease=lease),
     )
     w = mgr._current_plan_states[cross_label("video", "text")]
-    assert isinstance(w, RaggedCrossPrefillWrapper) and w.use_cuda_graph
+    assert isinstance(w, RaggedCrossPrefillWrapper) and w.accelerator_graph
     assert w.max_total_kv_tokens == MAX_TOKENS

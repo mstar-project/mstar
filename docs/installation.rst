@@ -118,7 +118,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - The union of the index-hosted dependencies from every model extra above.
        Convenient for a machine that serves multiple models; heavier and slower to
        install than a single family's extra. It excludes the separately installed
-       TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
+       TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
+       `flash-attn (Qwen3-Omni)`_ and `qwen-tts (Qwen3-TTS)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -152,7 +153,8 @@ Or, in an existing Python 3.12 environment:
 
    If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
    index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
-   command above, and Qwen3-Omni still needs ``flash-attn``:
+   command above, Qwen3-Omni still needs ``flash-attn``, and Qwen3-TTS still needs
+   ``qwen-tts`` (see `qwen-tts (Qwen3-TTS)`_):
 
    .. code-block:: bash
 
@@ -176,9 +178,10 @@ The GPU model families depend on:
   (see `flash-attn (Qwen3-Omni)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
-- **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
-  deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
-  instead (see :doc:`serving`).
+- **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
+  multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
+  (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
+  it needs).
 
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
@@ -205,6 +208,26 @@ and not a dependency. Verify with:
 .. code-block:: bash
 
    python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
+
+qwen-tts (Qwen3-TTS)
+--------------------
+
+**Qwen3-TTS** loads its 12 Hz speech tokenizer from the ``qwen-tts`` package, which
+``.[qwen3_tts]`` and ``.[all]`` do **not** install. Add it as a separate step, without
+its dependencies:
+
+.. code-block:: bash
+
+   uv pip install --no-deps "qwen-tts==0.1.1"
+
+``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
+them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
+FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice, which needs
+``transformers>=5.3``, and installing it after them downgrades their dependencies.
+mstar reads only the speech-tokenizer source files and runs them under transformers
+4.57.3 or 5.x, so the package's own requirements are not needed. ``pip check`` still
+lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
+others) as unmet for ``qwen-tts``; that is expected.
 
 flash-attn (Qwen3-Omni)
 -----------------------
@@ -340,6 +363,22 @@ isolated environment that builds ``flash-attn``. The same command therefore
 works unchanged across machines. (Needs a recent ``uv`` — run ``uv pip install --help`` and
 look for ``--torch-backend`` if unsure; ``export UV_TORCH_BACKEND=auto`` is equivalent.)
 
+.. note::
+
+   **Mooncake on a CUDA 13 torch.** The extras install ``mooncake-transfer-engine``,
+   Mooncake's default wheel, which is built for CUDA 12 and links ``libcudart.so.12``. An extra
+   can't choose a dependency by CUDA version, so it installs that wheel next to a cu130 torch
+   too. A CUDA 13 torch doesn't bring the CUDA 12 runtime, so ``TCP`` and ``RDMA`` transport
+   fail at startup with ``libcudart.so.12: cannot open shared object file``; ``SHM`` is not
+   affected. Swap in Mooncake's CUDA 13 build, which installs the same ``mooncake`` package:
+
+   .. code-block:: bash
+
+      uv pip uninstall mooncake-transfer-engine
+      uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13
+
+   Installing an extra again puts the CUDA 12 build back, so repeat the swap afterwards.
+
 **Manual fallback.** If you can't use the flag, install the pinned torch trio from the
 matching CUDA index **first**, then install ``mstar`` (the resolver then treats the
 requirement as already satisfied):
@@ -466,5 +505,28 @@ Fix — complete the environment's own cuDNN so it never falls back to the syste
 
 ``--no-deps`` leaves torch in place; pip may print a harmless warning that torch pins
 ``9.20.0.48``. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.
+
+``libcudart.so.12: cannot open shared object file``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Symptom: with ``--tensor-comm-protocol TCP`` or ``RDMA``, startup fails with::
+
+   RuntimeError: Mooncake TransferEngine is required for RDMA/TCP protocol. Failed to load
+   mooncake: ImportError: libcudart.so.12: cannot open shared object file: ...
+
+The extras install ``mooncake-transfer-engine``, Mooncake's default wheel, which is built for
+CUDA 12. A CUDA 13 torch (``+cu130`` or newer, which ``--torch-backend=auto`` picks on a
+CUDA 13 driver) doesn't bring the CUDA 12 runtime, so the wheel can't load. ``SHM`` is not
+affected.
+
+Fix: swap in Mooncake's CUDA 13 build, which installs the same ``mooncake`` package:
+
+.. code-block:: bash
+
+   uv pip uninstall mooncake-transfer-engine
+   uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13
+
+Both wheels install the same files, so installing an extra again puts the CUDA 12 build back.
+Repeat the swap afterwards.
 
 Next: :doc:`quickstart`.

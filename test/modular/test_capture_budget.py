@@ -21,8 +21,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine import cuda_graph_runner
-from mstar.engine.cuda_graph_runner import CaptureCost, CudaGraphRunner, WarmedSpec, plan_captures
+from mstar.engine import accelerator_graph_runner
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, CaptureCost, WarmedSpec, plan_captures
 from mstar.engine.engine import Engine
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
@@ -43,9 +44,9 @@ _PREFILL = _bucket("prefill_vision", 1, 16384)
 class _StubMeasuredRunner:
     """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
-    size_captures = CudaGraphRunner.size_captures
-    size_lent_captures = CudaGraphRunner.size_lent_captures
-    NUM_WARMUP = CudaGraphRunner.NUM_WARMUP
+    size_captures = AcceleratorGraphRunner.size_captures
+    size_lent_captures = AcceleratorGraphRunner.size_lent_captures
+    NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps
@@ -84,10 +85,10 @@ def measured(monkeypatch):
         runs.append(cost)
         return cost.graph
 
-    monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", capture)
+    monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
     monkeypatch.setattr(
-        cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
     )
     return runs
 
@@ -229,11 +230,11 @@ def test_a_regions_inputs_and_outputs_count_outside_its_pool(monkeypatch):
     """A region's graph copies its outputs into buffers outside the pool, and
     reads inputs from there, a set per graph. The pool a capture took is all
     scratch: a smaller bucket takes it whole and adds its own buffers."""
-    monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", lambda capture, what: 60 * _MIB)
+    monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", lambda capture, what: 60 * _MIB)
     captured = []
 
     def size(peak: int, kept: int) -> tuple[CaptureCost, bool]:
-        return cuda_graph_runner._size_in_walk(
+        return accelerator_graph_runner._size_in_walk(
             captured, CaptureCost(peak * _MIB, None, kept * _MIB, 1), False, None, "",
         )
 
@@ -262,11 +263,13 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     runner._memory_pool = None
     runner._build_slot_from_capture = lambda **slot: slot
     runner.size_captures()
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}))
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}),
+    )
 
     for spec in runner.prepare_for_capture():
-        CudaGraphRunner._capture_one(runner, spec)
+        AcceleratorGraphRunner._capture_one(runner, spec, forwards=0)
 
     assert runner.forwards == [2, 2, 0, 0], "a spec sizing warmed up is captured without another forward"
 
@@ -327,7 +330,7 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
     failed in capture_end kept its pool, and the cuBLAS workspace the capture
     stream took in it, for good: memory every later bucket was sized without."""
     # a captured log record would keep the failed capture's frames, and its memory, alive
-    monkeypatch.setattr(cuda_graph_runner.logger, "disabled", True)
+    monkeypatch.setattr(accelerator_graph_runner.logger, "disabled", True)
     device = torch.device("cuda")
     x = torch.randn(2048, 2048, device=device)
     # warmed up, as before any capture: cuBLAS can't make its handle inside one
@@ -337,8 +340,8 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
     torch.cuda.empty_cache()
     reserved = torch.cuda.memory_reserved(device)
 
-    taken = cuda_graph_runner._capture_thrown_away(
-        partial(cuda_graph_runner.capture_into_graph, lambda: forward(x), device=device, autocast_dtype=None),
+    taken = accelerator_graph_runner._capture_thrown_away(
+        partial(accelerator_graph_runner.capture_into_graph, lambda: forward(x), device=device, autocast_dtype=None),
         forward.__name__,
     )
 
@@ -355,7 +358,7 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 1))
     monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or [])
 
-    cuda_graph_runner._capture_thrown_away(lambda pool: (object(), {}), "decode")
+    accelerator_graph_runner._capture_thrown_away(lambda pool: (object(), {}), "decode")
 
     (args, kwargs), = calls
     try:
@@ -437,10 +440,11 @@ class _PeerGroup:
 class _StubPlannedRunner:
     """The real capture loop over stub captures, one slot per bucket, on a rank whose peer planned ``peer``."""
 
-    warmup_and_capture = CudaGraphRunner.warmup_and_capture
-    _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
-    _register_slot = CudaGraphRunner._register_slot
-    _report_dropped = CudaGraphRunner._report_dropped
+    warmup_and_capture = AcceleratorGraphRunner.warmup_and_capture
+    _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
+    _register_slot = AcceleratorGraphRunner._register_slot
+    _report_dropped = AcceleratorGraphRunner._report_dropped
+    NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
 
     def __init__(self, buckets: list[BucketKey], peer: list[bool]):
         self._specs = [CGSlotSpec(bucket=bucket, slot=0, config=SimpleNamespace()) for bucket in buckets]
@@ -453,28 +457,27 @@ class _StubPlannedRunner:
             tp_group=_PeerGroup(peer), sp_group=SimpleNamespace(world_size=1, barrier=lambda: None),
         )
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
+        self._graph_backend = SimpleNamespace(
+            is_available=lambda: True, graph_pool_handle=lambda: AcceleratorGraphPool(object()),
+            memory_allocated=lambda: 0,
+        )
+        self._blocked_buckets = []
         self.tried: list[BucketKey] = []
+        self.forwards: list[int] = []
 
     def prepare_for_capture(self):
         return self._specs
 
-    def _capture_one(self, spec):
+    def _capture_one(self, spec, forwards):
         self.tried.append(spec.bucket)
+        self.forwards.append(forwards)
         return spec.bucket
 
     _get_addtl_slot_specs = staticmethod(lambda spec: [])
     _log_memory = staticmethod(lambda before, after: None)
 
 
-@pytest.fixture
-def capture_loop(monkeypatch):
-    """The CUDA calls around the capture loop, stubbed so it runs on the CPU."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", object)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
-
-
-def test_a_tp_runner_captures_only_what_every_rank_planned(capture_loop):
+def test_a_tp_runner_captures_only_what_every_rank_planned():
     """Each rank plans on its own device. A bucket only this rank planned would
     be replayed here while the peer runs it eager, and a collective inside it
     would hang."""
@@ -485,7 +488,7 @@ def test_a_tp_runner_captures_only_what_every_rank_planned(capture_loop):
     assert runner.tried == [_DECODE], "a bucket the peer did not plan must not be captured here"
 
 
-def test_a_runner_captures_its_costliest_bucket_first(capture_loop):
+def test_a_runner_captures_its_costliest_bucket_first():
     """The Codec's buckets come in batch-size order, its smallest window first
     at each size. Captured that way, every larger window outgrew what the last
     had left, and the pool took 11222 MiB against 9068 predicted."""
@@ -495,6 +498,21 @@ def test_a_runner_captures_its_costliest_bucket_first(capture_loop):
     runner.warmup_and_capture({_DECODE, _PREFILL})
 
     assert runner.tried == [_PREFILL, _DECODE], "the costliest graph must go first, so the rest reuse its pool"
+
+
+@pytest.mark.parametrize(
+    ("planned", "forwards"), [({_DECODE, _PREFILL}, 0), (None, AcceleratorGraphRunner.NUM_WARMUP)],
+    ids=["sized", "no_plan"],
+)
+def test_capture_warms_a_bucket_up_only_when_sizing_did_not(planned, forwards):
+    """Only CUDA plans, and sizing runs each forward a capture needs first. An
+    XPU device has no plan, so it captures every bucket and warms each up itself."""
+    runner = _StubPlannedRunner([_DECODE, _PREFILL], peer=[True, True])
+
+    runner.warmup_and_capture(planned)
+
+    assert sorted(runner.tried, key=str) == sorted([_DECODE, _PREFILL], key=str)
+    assert runner.forwards == [forwards, forwards], "a capture must run the warm-up sizing didn't"
 
 
 @pytest.mark.parametrize(
@@ -526,7 +544,7 @@ def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     covers eager steps only up to its largest bucket."""
     code2wav = SimpleNamespace(
         submodule=SimpleNamespace(max_batch_size=lambda walk: None),
-        cuda_graph_runner=None,
+        accelerator_graph_runner=None,
         capture_runner=SimpleNamespace(max_batch_size_for=lambda walk: 32),
     )
     engine = SimpleNamespace(_submodules={"Code2Wav": code2wav})

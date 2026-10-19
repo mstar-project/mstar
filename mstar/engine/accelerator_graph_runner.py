@@ -10,17 +10,23 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups
-from mstar.engine.cuda_graph_config import (
-    CudaGraphConfig,
-    CudaGraphConfigType,
+from mstar.engine.accelerator_graph_backend import (
+    AcceleratorGraphPool,
+    CapturedGraph,
+)
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    AcceleratorGraphConfigType,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
-    PiecewiseCudaGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +34,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
-def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
+def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
+    """Return resource keys that prevent capture of the declared step."""
+    if step is None:
+        return []
+    return sorted(key for key in step.steps if not resources[key].can_capture())
+
+
+def autocast_scope(dtype: torch.dtype | None, device_type: str):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast."""
     return torch.amp.autocast(
@@ -104,7 +117,7 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool, device, autocast_dtype):
+def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -121,8 +134,11 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     before it compiles, which CUDA refuses during capture, so such a capture
     cannot succeed and would otherwise die with an unrelated error.
     """
-    prev_stream = torch.cuda.current_stream(device)
-    graph = torch.cuda.CUDAGraph()
+    backend = DeviceCapability.of(device).graph_backend
+    if backend is None:
+        raise ValueError(f"Accelerator graphs are unsupported on device {device!r}")
+    prev_stream = backend.current_stream()
+    graph = backend.create_graph()
     # benchmark off, so cuDNN searches in the warm-up and not in here: a conv
     # whose cached plan can't get its workspace would search again, timing
     # candidates and emptying the allocator's cache, which fails the capture
@@ -130,21 +146,21 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
-                autocast_scope(autocast_dtype):
-            with torch.cuda.graph(graph, pool=pool):
+                autocast_scope(autocast_dtype, backend.device_type):
+            with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
-        torch.cuda.set_stream(prev_stream)
-        torch.cuda.synchronize(device)
-        _stop_recording_to_pool(device, pool)
+        pool.on_failure(graph)
+        backend.recover_failed_capture(pool, prev_stream)
         raise
     finally:
         torch.backends.cudnn.benchmark = benchmark
-    torch.cuda.synchronize(device)
+    backend.synchronize()
+    pool.on_success()
     return graph, output
 
 
-def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype):
+def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
     ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
@@ -180,28 +196,17 @@ def fail_if_graphs_required(missing: list[str]) -> None:
     """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
-    if not missing or os.environ.get("MSTAR_REQUIRE_CUDA_GRAPHS", "0") != "1":
+    required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
+    if not missing or required != "1":
         return
     raise RuntimeError(
-        "CUDA graph capture failed for " + ", ".join(missing)
-        + " and MSTAR_REQUIRE_CUDA_GRAPHS=1"
+        "accelerator graph capture failed for " + ", ".join(missing)
+        + " and accelerator graphs are required"
     )
 
 
-def _stop_recording_to_pool(device, pool) -> None:
-    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
-    if end is None:
-        return
-    index = torch.device(device).index
-    if index is None:
-        index = torch.cuda.current_device()
-    try:
-        end(index, pool)
-    except RuntimeError:
-        # not recording: it never started, or capture_end stopped it and the graph releases the pool
-        return
-    # still recording, so the capture never ended and no graph will release the pool
-    torch._C._cuda_releasePool(index, pool)
+def _is_packed(config: AcceleratorGraphConfig) -> bool:
+    return config.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
 
 class CaptureCost(NamedTuple):
@@ -241,7 +246,7 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     short of memory fails its own capture here and no other rank waits on it.
     """
     torch.cuda.empty_cache()
-    pool = torch.cuda.graph_pool_handle()
+    pool = DeviceCapability.of("cuda").graph_backend.graph_pool_handle()
     try:
         graph, outputs = capture(pool=pool)
     except RuntimeError:
@@ -250,7 +255,7 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     # shortcut: an executable graph's own memory (about 3 KiB a kernel) is
     # outside the allocator and not counted; measure it if capture eats the floor
     taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool)
+        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
     )
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
@@ -395,7 +400,7 @@ class DummyRowPool:
 
 
 @dataclass
-class CudaGraphSlot:
+class AcceleratorGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
 
     Double-buffer: a bucket holds one of these per slot. Replay alternates
@@ -403,7 +408,7 @@ class CudaGraphSlot:
     concurrently with replay(N) on the active slot — so a node with nothing
     to pre-plan keeps a single slot.
     """
-    graph: torch.cuda.CUDAGraph
+    graph: CapturedGraph
     # preprocess output as captured; tensor entries are the static buffers
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
@@ -415,11 +420,11 @@ class CudaGraphSlot:
 
 
 @dataclass
-class CudaGraphBucket:
+class AcceleratorGraphBucket:
     """The captured slots for one (walk, cg_key_info, bs, num_tokens)."""
-    config: CudaGraphConfig
+    config: AcceleratorGraphConfig
     config_idx: int
-    slots: list[CudaGraphSlot] = field(default_factory=list)
+    slots: list[AcceleratorGraphSlot] = field(default_factory=list)
 
 
 class WarmedSpec(NamedTuple):
@@ -435,7 +440,7 @@ class WarmedSpec(NamedTuple):
     returned: int
 
 
-class CudaGraphRunner:
+class AcceleratorGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
 
@@ -450,17 +455,22 @@ class CudaGraphRunner:
         joint_comm_group: JointGroups,
         num_slots: int,
         enable_nvtx: bool=False,
+        device_capability: DeviceCapability | None = None,
     ):
         self._submodule_name = submodule_name
         self._submodule = submodule
         self._comm_group = joint_comm_group
 
-        self._capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
-            device, joint_comm_group.world_size
+        self._capture_configs: list[AcceleratorGraphConfig] = (
+            submodule.get_accelerator_graph_configs(
+                device, joint_comm_group.world_size
+            )
         )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
+        self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
+        self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
         self._enable_nvtx = enable_nvtx
 
@@ -469,11 +479,12 @@ class CudaGraphRunner:
         # hold identical graphs and double the capture time and memory.
         self._num_slots = num_slots
 
-        self._buckets: dict[BucketKey, CudaGraphBucket] = {}
+        self._buckets: dict[BucketKey, AcceleratorGraphBucket] = {}
 
-        self._memory_pool = None
+        self._memory_pool: AcceleratorGraphPool | None = None
         # buckets that failed to capture (here or on a peer rank) and run eagerly
         self.dropped_buckets: list[BucketKey] = []
+        self._blocked_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
         # bucket -> what it costs, from size_captures
@@ -509,7 +520,7 @@ class CudaGraphRunner:
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
-        self._plan_stream: torch.cuda.Stream | None = None
+        self._plan_stream: Any | None = None
 
         # Per-bucket template rows for declare-only calls; see
         # `declare_inputs_for`.
@@ -524,7 +535,7 @@ class CudaGraphRunner:
     def any_graphs(self):
         return bool(self._buckets)
 
-    def _batch_sizes(self, config: CudaGraphConfig) -> list[int]:
+    def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
 
     # ── Capture ─────────────────────────────────────────────────────────
@@ -568,13 +579,43 @@ class CudaGraphRunner:
             slot_specs = self._get_slot_specs()
             # reverse sort based on batch size, then total tokens (largest first)
             slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
+            blocked_configs = set()
+            checked_configs = set()
+            for spec in slot_specs:
+                if spec.config_idx in checked_configs:
+                    continue
+                checked_configs.add(spec.config_idx)
+                rids = self._dummy_rows.handles(f"{spec.config_idx}_slot0", spec.bs)
+                step = self._submodule.declare_step(
+                    graph_walk=spec.bucket.graph_walk,
+                    request_ids=rids,
+                    inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
+                    slot_lease=SlotLease(slot=0, bucket=spec.bucket),
+                    per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
+                )
+                blocked = blocked_capture_resources(step, self._resources)
+                if blocked:
+                    logger.error(
+                        "Dropping accelerator graph config %s for %s: "
+                        "resources cannot capture: %s",
+                        spec.config_idx, self._submodule_name, blocked,
+                    )
+                    blocked_configs.add(spec.config_idx)
+            self._blocked_buckets = list(dict.fromkeys(
+                spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs
+            ))
+            self.dropped_buckets = list(self._blocked_buckets)
+            slot_specs = [
+                spec for spec in slot_specs if spec.config_idx not in blocked_configs
+            ]
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs
             ), default=1)
-            self._step_runner.build_cuda_graph_buffers(
-                slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
-                node_name=self._submodule_name,
-            )
+            if slot_specs:
+                self._step_runner.build_accelerator_graph_buffers(
+                    slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
+                    node_name=self._submodule_name,
+                )
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
@@ -615,7 +656,7 @@ class CudaGraphRunner:
                 # Fail the boot. A skipped step would leave its peak out of the plan's floor.
                 # A step that cannot run here cannot run once graphs hold memory either.
                 raise RuntimeError(
-                    f"CudaGraphRunner[{self._submodule_name}]: could not run {spec} eagerly to size "
+                    f"AcceleratorGraphRunner[{self._submodule_name}]: could not run {spec} eagerly to size "
                     f"its capture, with {free / 2**20:.0f} MiB free before it: {e}"
                 ) from e
         return self._capture_costs
@@ -647,39 +688,45 @@ class CudaGraphRunner:
                     ))
             except Exception:
                 logger.warning(
-                    "CudaGraphRunner[%s]: could not prepare %s to size its capture",
+                    "AcceleratorGraphRunner[%s]: could not prepare %s to size its capture",
                     self._submodule_name, spec, exc_info=True,
                 )
             self._capture_costs[spec.bucket] = cost
         return self._capture_costs
 
-    def warmup_and_capture(self, planned: Collection[BucketKey]):
-        """Capture the ``planned`` buckets, of every config and batch size."""
-        if self._device is None or not torch.cuda.is_available():
-            logger.warning("CUDA not available, skipping graph capture for %s",
-                            self._submodule_name)
+    def warmup_and_capture(self, planned: Collection[BucketKey] | None):
+        """Capture the ``planned`` buckets, of every config and batch size.
+        With no plan, every bucket, each warmed up first as sizing would have."""
+        if self._graph_backend is None or not self._graph_backend.is_available():
+            logger.warning(
+                "%s is not available, skipping graph capture for %s",
+                getattr(self._device, "type", "accelerator").upper(),
+                self._submodule_name,
+            )
             return
 
-        self._memory_pool = torch.cuda.graphs.graph_pool_handle()
-        mem_before = torch.cuda.memory_allocated(self._device)
+        self._memory_pool = self._graph_backend.graph_pool_handle()
+        mem_before = self._graph_backend.memory_allocated()
 
         slot_specs = self.prepare_for_capture()
+        sized = planned is not None
         # what every rank planned, as though captured in full (see `_buckets_captured_everywhere`)
-        planned = self._buckets_captured_everywhere(
-            slot_specs, {bucket: range(self._num_slots) for bucket in planned},
-        )
+        planned = self._buckets_captured_everywhere(slot_specs, {
+            bucket: range(self._num_slots)
+            for bucket in (planned if sized else {spec.bucket for spec in slot_specs})
+        })
         # costliest first, so the graphs after it fit in what it leaves free; by
         # the most each costs on any rank, so every rank warms up in one order
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
         costs = dict(zip(buckets, agree_across_ranks(self._comm_group, [
-            self._capture_costs[bucket].graph if bucket in planned else 0 for bucket in buckets
+            self._capture_costs[bucket].graph if sized and bucket in planned else 0 for bucket in buckets
         ], self._device, torch.amax), strict=True))
 
         # bucket -> slot index -> (spec, captured slot). Registration is
         # deferred to a whole bucket at a time: its slots are double buffers of
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
-        captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, CudaGraphSlot]]] = {}
+        captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
         for spec in sorted(slot_specs, key=lambda spec: -costs[spec.bucket]):
             if spec.bucket not in planned:
                 continue
@@ -689,10 +736,10 @@ class CudaGraphRunner:
             self._comm_group.sp_group.barrier()
 
             try:
-                slot = self._capture_one(spec)
+                slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
             except Exception:
                 logger.error(
-                    "Failed to capture CUDA graph for %s: %s",
+                    "Failed to capture accelerator graph for %s: %s",
                     self._submodule_name, spec, exc_info=True
                 )
                 continue
@@ -700,7 +747,7 @@ class CudaGraphRunner:
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
             if  len(captured[spec.bucket]) == self._num_slots:
                 logger.info(
-                    "Captured CUDA graph for %s: %s (%d slots)",
+                    "Captured accelerator graph for %s: %s (%d slots)",
                     self._submodule_name, spec.bucket, self._num_slots
                 )
 
@@ -708,7 +755,7 @@ class CudaGraphRunner:
         for bucket_key, slots in captured.items():
             if bucket_key not in agreed:
                 logger.error(
-                    "Dropping CUDA graph bucket %s for %s: captured %d of %d "
+                    "Dropping accelerator graph bucket %s for %s: captured %d of %d "
                     "slots here, or fewer on another rank",
                     bucket_key, self._submodule_name, len(slots), self._num_slots,
                 )
@@ -719,7 +766,7 @@ class CudaGraphRunner:
                 for key_spec in [spec, *self._get_addtl_slot_specs(spec)]:
                     self._register_slot(key_spec, slot)
             config = self._buckets[bucket_key].config
-            if self._num_slots > 1 and config.get_config_type() == CudaGraphConfigType.BASIC_BATCHED:
+            if self._num_slots > 1 and config.get_config_type() == AcceleratorGraphConfigType.BASIC_BATCHED:
                 # pre-seed preplan inputs; cached per bucket, so once is enough.
                 # A packed bucket's rows would never be read: a batch with no inputs
                 # yet can only lease a batched one (see `select_batched_bucket`).
@@ -730,17 +777,18 @@ class CudaGraphRunner:
             [spec.bucket for spec in slot_specs if spec.slot == 0], agreed
         )
 
-        mem_after = torch.cuda.memory_allocated(self._device)
+        mem_after = self._graph_backend.memory_allocated()
         self._log_memory(mem_before, mem_after)
 
     def _report_dropped(self, wanted: list, kept) -> None:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
         10-20x latency cliff otherwise, and one failure used to take every
         later bucket with it."""
+        wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
         self.dropped_buckets = [key for key in wanted if key not in kept]
         if self.dropped_buckets:
             logger.error(
-                "CudaGraphRunner[%s]: captured %d of %d buckets; these run "
+                "AcceleratorGraphRunner[%s]: captured %d of %d buckets; these run "
                 "eagerly: %s",
                 self._submodule_name, len(wanted) - len(self.dropped_buckets),
                 len(wanted), self.dropped_buckets,
@@ -773,10 +821,10 @@ class CudaGraphRunner:
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
-    def _register_slot(self, spec: CGSlotSpec, slot: CudaGraphSlot) -> None:
+    def _register_slot(self, spec: CGSlotSpec, slot: AcceleratorGraphSlot) -> None:
         bucket = self._buckets.get(spec.bucket)
         if bucket is None:
-            bucket = self._buckets[spec.bucket] = CudaGraphBucket(
+            bucket = self._buckets[spec.bucket] = AcceleratorGraphBucket(
                 config=spec.config, config_idx=spec.config_idx,
             )
         # the caller registers a bucket's slots in index order, and only once
@@ -791,10 +839,10 @@ class CudaGraphRunner:
         # for the buffer-reuse change in isolation) and the actual GPU delta
         # (covers FlashInfer wrappers + dummy KV state too, but is noisier).
         logger.info(
-            "CudaGraphRunner[%s]: warmup_and_capture done. "
+            "AcceleratorGraphRunner[%s]: warmup_and_capture done. "
             "shared_static_buffers: %d entries, %.2f MB resident "
             "(would have been %.2f MB with per-capture clones — saved %.2f MB). "
-            "Total cuda alloc delta during warmup: %.2f MB.",
+            "Total accelerator alloc delta during warmup: %.2f MB.",
             self._submodule_name,
             len(self._shared_static_buffers),
             shared_bytes / (1024 ** 2),
@@ -803,12 +851,12 @@ class CudaGraphRunner:
             (mem_after - mem_before) / (1024 ** 2),
         )
 
-    def _capture_one(self, spec: CGSlotSpec) -> CudaGraphSlot:
-        # no forward first: `size_captures` already ran this spec's
-        with self._warmed(spec, forwards=0) as warmed:
+    def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
+        # no forward after sizing, which already ran this spec's
+        with self._warmed(spec, forwards) as warmed:
             # what preparing it left cached in the allocator is out of the
             # capture pool's reach
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
             )
@@ -846,6 +894,7 @@ class CudaGraphRunner:
                 slot=spec.slot,
                 capture=True,
                 slot_lease=lease,
+                force_prefill=_is_packed(config),
             ))
 
         engine_inputs.step = step
@@ -891,21 +940,21 @@ class CudaGraphRunner:
                     **static_inputs,
                 )
 
-            torch.cuda.set_device(self._device)
-            torch.cuda.synchronize()
+            self._graph_backend.set_device()
+            self._graph_backend.synchronize()
             peak = returned = 0
             for _ in range(forwards):
                 # the last forward's peak, not the first's: that one may compile and autotune
-                live = torch.cuda.memory_allocated(self._device)
-                torch.cuda.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype):
+                live = torch.accelerator.memory_allocated(self._device)
+                torch.accelerator.reset_peak_memory_stats(self._device)
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     returned = _tensor_bytes(run_forward())
-                peak = torch.cuda.max_memory_allocated(self._device) - live
+                peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
                 self._dummy_rows.reset(dummy_rids)
                 prepare()
-            torch.cuda.synchronize()
+            self._graph_backend.synchronize()
 
             yield WarmedSpec(
                 run=run_forward,
@@ -928,6 +977,10 @@ class CudaGraphRunner:
         compiled code by shape, so every bucket of a config shares a cache and
         the second slot's identical shapes are free. A wrapper per capture
         would recompile — and re-autotune — all of them.
+
+        The platform's inductor overrides wrap that shared callable per bucket,
+        so each bucket compiles on its first call under the overrides for its
+        own token count.
         """
         forward = getattr(self._submodule, spec.config.capture_forward_method)
         if not spec.config.compile:
@@ -939,7 +992,9 @@ class CudaGraphRunner:
                 fullgraph=False,
                 dynamic=False,
             )
-        return self._compiled_forwards[spec.config_idx]
+        return with_inductor_overrides(
+            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+        )
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -1012,9 +1067,9 @@ class CudaGraphRunner:
     def _build_slot_from_capture(
         self, output, graph, static_inputs, static_input_keys,
         dummy_rids, dummy_metadata, config_idx,
-    ) -> CudaGraphSlot:
+    ) -> AcceleratorGraphSlot:
         """Wrap one slot's capture artifacts into a CudaGraphSlot."""
-        return CudaGraphSlot(
+        return AcceleratorGraphSlot(
             graph=graph,
             static_inputs=static_inputs,
             static_input_keys=static_input_keys,
@@ -1070,7 +1125,7 @@ class CudaGraphRunner:
                 continue
             if key.bs < bs or not bucket.slots:
                 continue
-            if bucket.config.get_config_type() != CudaGraphConfigType.BASIC_BATCHED:
+            if bucket.config.get_config_type() != AcceleratorGraphConfigType.BASIC_BATCHED:
                 continue
             # the config's own token count for this padded batch; a bucket
             # whose num_tokens says otherwise belongs to a different capture
@@ -1110,6 +1165,10 @@ class CudaGraphRunner:
             graph_walk, bs, num_tokens, cg_key_info
         ) is not None
 
+    def is_packed(self, lease: SlotLease) -> bool:
+        """Whether ``lease`` replays a packed capture."""
+        return _is_packed(self._buckets[lease.bucket].config)
+
     def lease_slot(
         self, graph_walk: str, bs: int,
         slot: int,
@@ -1146,10 +1205,10 @@ class CudaGraphRunner:
             bucket=replace(key, graph_walk=bucket.config.capture_graph_walk),
         )
 
-    def slot_for(self, lease: SlotLease) -> CudaGraphSlot:
+    def slot_for(self, lease: SlotLease) -> AcceleratorGraphSlot:
         return self._buckets[lease.bucket].slots[lease.slot]
 
-    def config_for(self, lease: SlotLease) -> CudaGraphConfig:
+    def config_for(self, lease: SlotLease) -> AcceleratorGraphConfig:
         return self._buckets[lease.bucket].config
 
     def declare_inputs_for(self, lease: SlotLease) -> list[NodeInputs]:
@@ -1231,7 +1290,7 @@ class CudaGraphRunner:
 
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
-        plan_done_event: torch.cuda.Event | None = None,
+        plan_done_event: Any | None = None,
         launch_started_event: "threading.Event | None" = None,
     ) -> dict:
         """Stage this step's inputs into the slot and replay it.
@@ -1248,7 +1307,7 @@ class CudaGraphRunner:
         """
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
-            torch.cuda.default_stream(self._device).wait_event(plan_done_event)
+            self._graph_backend.current_stream().wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
         return self._replay(lease)
@@ -1263,7 +1322,7 @@ class CudaGraphRunner:
         dummy_rids = self.slot_for(lease).dummy_rids
         self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
-    def plan_stream(self) -> torch.cuda.Stream | None:
+    def plan_stream(self) -> Any | None:
         """Dedicated stream for pre-planning.
 
         Pre-plan must not submit onto the default stream: whether its memcpys
@@ -1272,10 +1331,10 @@ class CudaGraphRunner:
         event past pre-plan's own kernels. Its own stream keeps the two
         independent; a plan-done event gates the replay that reads the buffers.
         """
-        if not torch.cuda.is_available():
+        if self._graph_backend is None or not self._graph_backend.is_available():
             return None
         if self._plan_stream is None:
-            self._plan_stream = torch.cuda.Stream(device=self._device)
+            self._plan_stream = self._graph_backend.new_stream()
         return self._plan_stream
 
 
@@ -1289,7 +1348,7 @@ PIECEWISE_WALK = "__piecewise__"
 @dataclass
 class PiecewiseGraphData:
     """One captured region, for one (bs, total_tokens) bucket."""
-    graph: torch.cuda.CUDAGraph
+    graph: CapturedGraph
     static_inputs: dict[str, torch.Tensor]
     static_outputs: dict[str, torch.Tensor]
     dummy_rids: list[int]
@@ -1356,7 +1415,7 @@ class WarmedRegion(NamedTuple):
     peak: int
 
 
-class PiecewiseCudaGraphRunner:
+class PiecewiseAcceleratorGraphRunner:
     """Captures one inner callable of a submodule's forward as a CUDA graph.
 
     Where ``CudaGraphRunner`` replays a whole ``forward_batched`` under engine
@@ -1375,7 +1434,7 @@ class PiecewiseCudaGraphRunner:
     def __init__(
         self,
         label: str,
-        config: PiecewiseCudaGraphConfig,
+        config: PiecewiseAcceleratorGraphConfig,
         resources: Mapping[str, Resource],
         step_runner: StepRunner,
         device: torch.device,
@@ -1383,13 +1442,16 @@ class PiecewiseCudaGraphRunner:
         num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
-        memory_pool=None,
+        memory_pool: AcceleratorGraphPool | None = None,
+        device_capability: DeviceCapability | None = None,
     ):
         self._label = label
         self._config = config
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
+        self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
+        self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
         self._comm_group = joint_comm_group
         # scopes buffer allocation; `label` carries it but mangled with the region
@@ -1465,10 +1527,24 @@ class PiecewiseCudaGraphRunner:
     def prepare_for_capture(self) -> list:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
-            self._size_slots()
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+            if shapes and self._config.declare_step is not None:
+                shape = shapes[0]
+                step = self._config.declare_step(
+                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
+                    list(shape.seq_lens),
+                )
+                blocked = blocked_capture_resources(step, self._resources)
+                if blocked:
+                    logger.error(
+                        "Dropping piecewise accelerator graph config %s: "
+                        "resources cannot capture: %s", self._label, blocked,
+                    )
+                    self.dropped_shapes = [(s.bs, s.total_tokens) for s in shapes]
+                    shapes = []
             if shapes:
-                self._step_runner.build_cuda_graph_buffers(
+                self._size_slots()
+                self._step_runner.build_accelerator_graph_buffers(
                     [
                         CGSlotSpec(
                             bucket=self._bucket(shape), slot=slot,
@@ -1486,8 +1562,8 @@ class PiecewiseCudaGraphRunner:
 
     def size_captures(self) -> dict[BucketKey, CaptureCost]:
         """Warm every shape up and capture the largest once, thrown away; see
-        `CudaGraphRunner.size_captures`."""
-        torch.cuda.set_device(self._device)
+        `AcceleratorGraphRunner.size_captures`."""
+        self._graph_backend.set_device()
         shapes = sorted(
             self.prepare_for_capture(), key=lambda s: (s.bs, s.total_tokens), reverse=True,
         )
@@ -1519,9 +1595,9 @@ class PiecewiseCudaGraphRunner:
                             if lent:
                                 self._lent.add(self._bucket(shape))
                 except Exception as e:
-                    # as in `CudaGraphRunner.size_captures`
+                    # as in `AcceleratorGraphRunner.size_captures`
                     raise RuntimeError(
-                        f"PiecewiseCudaGraphRunner[{self._label}]: could not run bs={shape.bs} "
+                        f"PiecewiseAcceleratorGraphRunner[{self._label}]: could not run bs={shape.bs} "
                         f"total_tokens={shape.total_tokens} slot={slot} eagerly to size its capture, "
                         f"with {free / 2**20:.0f} MiB free before it: {e}"
                     ) from e
@@ -1532,7 +1608,7 @@ class PiecewiseCudaGraphRunner:
 
     def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
         """Capture every shape a lender sized, thrown away, if ``wanted`` here
-        or on another rank; see `CudaGraphRunner.size_lent_captures`."""
+        or on another rank; see `AcceleratorGraphRunner.size_lent_captures`."""
         if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
             return self._capture_costs
         for shape in self.prepare_for_capture():
@@ -1554,7 +1630,7 @@ class PiecewiseCudaGraphRunner:
                     cost = cost._replace(graph=taken + cost.kept)
             except Exception:
                 logger.warning(
-                    "PiecewiseCudaGraphRunner[%s]: could not prepare bs=%d total_tokens=%d "
+                    "PiecewiseAcceleratorGraphRunner[%s]: could not prepare bs=%d total_tokens=%d "
                     "to size its capture", self._label, shape.bs, shape.total_tokens, exc_info=True,
                 )
             self._capture_costs[bucket] = cost
@@ -1569,16 +1645,18 @@ class PiecewiseCudaGraphRunner:
             for name, (size, dtype, device) in self._output_likes[bucket].items()
         }
 
-    def warmup_and_capture(self, planned: Collection[BucketKey]) -> None:
-        if self._device is None or not torch.cuda.is_available():
+    def warmup_and_capture(self, planned: Collection[BucketKey] | None) -> None:
+        if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
-                "CUDA not available, skipping piecewise capture for %s", self._label
+                "%s is not available, skipping piecewise capture for %s",
+                getattr(self._device, "type", "accelerator").upper(),
+                self._label,
             )
             return
 
-        torch.cuda.set_device(self._device)
+        self._graph_backend.set_device()
         if self._memory_pool is None:
-            self._memory_pool = torch.cuda.graphs.graph_pool_handle()
+            self._memory_pool = self._graph_backend.graph_pool_handle()
 
         shapes = self.prepare_for_capture()
         if not shapes:
@@ -1588,12 +1666,14 @@ class PiecewiseCudaGraphRunner:
         ordered = sorted(
             shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
         )
-        # as in `CudaGraphRunner.warmup_and_capture`: what every rank planned, costliest first
+        # as in `AcceleratorGraphRunner.warmup_and_capture`: what every rank planned, costliest first
+        sized = planned is not None
         planned_everywhere = agree_across_ranks(
-            self._comm_group, [self._bucket(shape) in planned for shape in ordered], self._device, torch.amin,
+            self._comm_group, [not sized or self._bucket(shape) in planned for shape in ordered],
+            self._device, torch.amin,
         )
         costs = agree_across_ranks(self._comm_group, [
-            self._capture_costs[self._bucket(shape)].graph if ok else 0
+            self._capture_costs[self._bucket(shape)].graph if sized and ok else 0
             for shape, ok in zip(ordered, planned_everywhere, strict=True)
         ], self._device, torch.amax)
         captured = [False] * len(ordered)
@@ -1611,18 +1691,18 @@ class PiecewiseCudaGraphRunner:
                     self._comm_group.tp_group.barrier()
                     self._comm_group.sp_group.barrier()
                 try:
-                    self._capture_one(shape, slot)
+                    self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
                     shape_captured = False
                     logger.error(
-                        "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
+                        "PiecewiseAcceleratorGraphRunner[%s]: failed to capture bs=%d "
                         "total_tokens=%d slot=%d", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
                     )
             captured[i] = shape_captured
             if shape_captured:
                 logger.info(
-                    "PiecewiseCudaGraphRunner[%s]: captured bs=%d total_tokens=%d "
+                    "PiecewiseAcceleratorGraphRunner[%s]: captured bs=%d total_tokens=%d "
                     "(%d slots)", self._label, shape.bs, shape.total_tokens,
                     self._num_slots,
                 )
@@ -1644,26 +1724,26 @@ class PiecewiseCudaGraphRunner:
             ]
             if dropped:
                 logger.error(
-                    "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d "
+                    "PiecewiseAcceleratorGraphRunner[%s]: dropping bs=%d total_tokens=%d "
                     "slots=%s, not captured on every rank / for every slot",
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
             self.dropped_shapes.append((shape.bs, shape.total_tokens))
         if self.dropped_shapes:
             logger.error(
-                "PiecewiseCudaGraphRunner[%s]: captured %d of %d shapes; these "
+                "PiecewiseAcceleratorGraphRunner[%s]: captured %d of %d shapes; these "
                 "run eagerly: %s", self._label,
                 len(ordered) - len(self.dropped_shapes), len(ordered),
                 self.dropped_shapes,
             )
 
-    def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
-        # as in `CudaGraphRunner._capture_one`
-        with self._warmed(shape, slot, forwards=0) as warmed:
-            torch.cuda.empty_cache()
+    def _capture_one(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> None:
+        # as in `AcceleratorGraphRunner._capture_one`
+        with self._warmed(shape, slot, forwards) as warmed:
+            torch.accelerator.empty_cache()
             graph, static_outputs = capture_with_static_outputs(
-                warmed.run, self._outputs_like(self._bucket(shape)), self._memory_pool, self._device,
-                self._autocast_dtype,
+                warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
+                self._memory_pool, self._device, self._autocast_dtype,
             )
 
         self._graphs[PiecewiseGraphKey(
@@ -1680,7 +1760,7 @@ class PiecewiseCudaGraphRunner:
     @contextmanager
     def _warmed(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> Iterator[WarmedRegion]:
         """Plan ``shape`` and run the region eagerly ``forwards`` times; see
-        ``CudaGraphRunner._warmed``."""
+        ``AcceleratorGraphRunner._warmed``."""
         dummy_rids = self._dummy_rows.ensure(
             self._dummy_key(shape, slot), shape.bs
         )
@@ -1693,8 +1773,11 @@ class PiecewiseCudaGraphRunner:
 
         fn = self._config.capture_fn
         if self._config.compile:
-            fn = torch.compile(
-                fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
+            fn = with_inductor_overrides(
+                torch.compile(
+                    fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
+                ),
+                shape.total_tokens,
             )
 
         def run_fn():
@@ -1702,20 +1785,20 @@ class PiecewiseCudaGraphRunner:
 
         try:
             self._plan(step, shape)
-            torch.cuda.synchronize()
+            self._graph_backend.synchronize()
             warm_outputs, peak = None, 0
             for _ in range(forwards):
-                # as in `CudaGraphRunner._warmed`
-                live = torch.cuda.memory_allocated(self._device)
-                torch.cuda.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype):
+                # as in `AcceleratorGraphRunner._warmed`
+                live = torch.accelerator.memory_allocated(self._device)
+                torch.accelerator.reset_peak_memory_stats(self._device)
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     warm_outputs = run_fn()
-                peak = torch.cuda.max_memory_allocated(self._device) - live
+                peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
-            torch.cuda.synchronize()
+            self._graph_backend.synchronize()
 
             yield WarmedRegion(
                 run=run_fn, static_inputs=static_inputs,
@@ -1777,6 +1860,7 @@ class PiecewiseCudaGraphRunner:
             slot=slot,
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
+            force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)

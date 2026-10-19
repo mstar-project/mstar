@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import collections
+import itertools
 import json
 import logging
 import multiprocessing as mp
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
+from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -37,6 +39,7 @@ from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +176,29 @@ def _shutdown_conductor_process(
 # ------------------------------------------------------------------
 
 
+#: How long ``/generate`` waits for a request still in flight under a
+#: ``request_id`` to end before it refuses a new one with a 409. A client that
+#: drops a stream and resubmits at once can arrive before the server has seen
+#: the drop and aborted the old stream; that takes a few event-loop steps.
+#: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
+DUPLICATE_ID_GRACE_S = 0.5
+
+
+def _client_text(text: str, key: str, request_id: str | None) -> str:
+    """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
+    as the client's ``request_id``: engine and data-worker errors can name
+    the key, which the client never sent."""
+    return text if request_id is None else text.replace(key, request_id)
+
+
+def request_id_in_use(request_id: str) -> str:
+    """The 409 detail for a ``request_id`` that still has a request in flight."""
+    return (
+        f"request_id {request_id!r} already has a request in flight; "
+        "wait for it to finish or abort it first"
+    )
+
+
 @dataclass
 class PendingRequest:
     streaming: bool
@@ -190,6 +216,9 @@ class PendingRequest:
     # sleeps between chunks instead of polling every millisecond per request.
     wake: Any | None = None
     loop: Any | None = None
+    # The client's request_id. The engine knows the request by its key, so
+    # the message thread restamps each chunk with this before the client sees it.
+    request_id: str | None = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -314,25 +343,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
         )
 
-        # Concurrent request tracking
-        self.pending_requests: dict[str, PendingRequest] = {}
-        self.recently_completed: collections.OrderedDict[str, float] = (
-            collections.OrderedDict()
-        )
-        self._recently_completed_ttl = 15.0
-        self.request_lock = threading.Lock()
-        self.running = True
-
-        # Set by main() once the conductor is spawned. It gets polled because a
-        # conductor that dies sends nothing (see finalize_setup and
-        # _process_messages).
-        self.conductor_proc: mp.Process | None = None
-        # Non-None once the deployment is going down because the conductor
-        # died. It is the error every pending (and later) request gets, and the
-        # reason main() exits non-zero. on_fatal stops the HTTP server.
-        self.fatal_error: str | None = None
-        self.on_fatal: Callable[[], None] | None = None
-        self._liveness_interval_s = 0.5
+        self._init_request_state()
 
         # ZMQ channel shared with conductor / workers
         self.communicator = make_communicator(
@@ -348,6 +359,39 @@ class APIServer:
             target=self._process_messages, daemon=True
         )
 
+    def _init_request_state(self) -> None:
+        """Set the in-memory request bookkeeping. It must stay free of
+        processes, sockets and files: tests that skip ``__init__`` call it to
+        get every one of these fields (see test/modular/api_server_helpers.py).
+        """
+        # Concurrent request tracking, keyed by each submission's internal key
+        # (see submit_request), which is what the engine knows the request by.
+        self.pending_requests: dict[str, PendingRequest] = {}
+        self.recently_completed: collections.OrderedDict[str, float] = (
+            collections.OrderedDict()
+        )
+        self._recently_completed_ttl = 15.0
+        # request_id -> its newest submission's key, and key -> request_id,
+        # until the key has left both dicts above.
+        self._live: dict[str, str] = {}
+        self._client_ids: dict[str, str] = {}
+        # request_ids a caller is waiting on in wait_for_request_id
+        self._id_waiters: set[str] = set()
+        self._generation = itertools.count(1)
+        self.request_lock = threading.Lock()
+        self.running = True
+
+        # Set by main() once the conductor is spawned. It gets polled because a
+        # conductor that dies sends nothing (see finalize_setup and
+        # _process_messages).
+        self.conductor_proc: mp.Process | None = None
+        # Non-None once the deployment is going down because the conductor
+        # died. It is the error every pending (and later) request gets, and the
+        # reason main() exits non-zero. on_fatal stops the HTTP server.
+        self.fatal_error: str | None = None
+        self.on_fatal: Callable[[], None] | None = None
+        self._liveness_interval_s = 0.5
+
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
         setup (weight load + warmup + CUDA-graph capture), then start draining
@@ -358,7 +402,7 @@ class APIServer:
         """
         logger.info(
             "Waiting for workers to finish setup "
-            "(loading weights, capturing CUDA graphs)..."
+            "(loading weights, capturing accelerator graphs)..."
         )
         while True:
             for message in self.communicator.get_all_new_messages():
@@ -447,6 +491,14 @@ class APIServer:
         caller it is used as-is (useful for deterministic-noise debugging,
         since the conductor's per-request seed is derived from
         ``hash(request_id)``); otherwise a fresh uuid4 is generated.
+
+        The engine runs the request under a key of its own,
+        ``<request_id>#<generation>``, that is never reused: a client may
+        reuse its ``request_id`` while the engine is still tearing the older
+        request down, and every message the engine sends names only the key.
+        A submission under an id whose previous request is still running is
+        refused with a 409 and the running one is untouched; once that one has
+        finished, failed or been aborted the id is free.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -468,7 +520,12 @@ class APIServer:
         with self.request_lock:
             if self.fatal_error is not None:
                 raise HTTPException(status_code=503, detail=self.fatal_error)
-            self.pending_requests[request_id] = PendingRequest(
+            if self._in_flight(request_id):
+                raise HTTPException(status_code=409, detail=request_id_in_use(request_id))
+            key = f"{request_id}#{next(self._generation)}"
+            self._live[request_id] = key
+            self._client_ids[key] = request_id
+            self.pending_requests[key] = PendingRequest(
                 streaming=streaming,
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
@@ -476,10 +533,12 @@ class APIServer:
                     rid=request_id,
                     timing=RequestTiming(recv_time=time.perf_counter()),
                 ),
+                request_id=request_id,
             )
 
         self.preprocess_worker.new_request(PreprocessInput(
-            request_id=request_id,
+            request_id=key,
+            client_request_id=request_id,
             text=text,
             file_paths=file_paths,
             input_modalities=input_modalities,
@@ -489,10 +548,52 @@ class APIServer:
         ))
 
         logger.info(
-            "Request %s submitted  in=%s  out=%s",
-            request_id, input_modalities, output_modalities,
+            "Request %s submitted as %s  in=%s  out=%s",
+            request_id, key, input_modalities, output_modalities,
         )
         return request_id
+
+    def _in_flight(self, request_id: str) -> bool:
+        """The newest submission under ``request_id`` is still running: not
+        finished, failed or aborted. Caller holds ``request_lock``."""
+        req = self.pending_requests.get(self._live.get(request_id))
+        return req is not None and not req.event.is_set()
+
+    async def wait_for_request_id(self, request_id: str | None) -> None:
+        """Give a request still in flight under ``request_id`` up to
+        :data:`DUPLICATE_ID_GRACE_S` to end, so a client's immediate retry
+        after dropping a stream is not refused before the server has seen the
+        drop. A request that is still running after that is refused by
+        :meth:`submit_request`.
+
+        One caller per id waits; another that arrives meanwhile returns at
+        once and is refused while the id is in flight, so N duplicates of a
+        live id cost one poll loop, not N."""
+        if request_id is None:
+            return
+        with self.request_lock:
+            if not self._in_flight(request_id) or request_id in self._id_waiters:
+                return
+            self._id_waiters.add(request_id)
+        try:
+            deadline = time.monotonic() + DUPLICATE_ID_GRACE_S
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+                with self.request_lock:
+                    if not self._in_flight(request_id):
+                        return
+        finally:
+            with self.request_lock:
+                self._id_waiters.discard(request_id)
+
+    def _retire(self, key: str) -> None:
+        """Forget ``key``'s request_id once neither dict holds the key.
+        Caller holds ``request_lock``."""
+        if key in self.pending_requests or key in self.recently_completed:
+            return
+        request_id = self._client_ids.pop(key, None)
+        if request_id is not None and self._live.get(request_id) == key:
+            del self._live[request_id]
 
     # ----------------------------------------------------------
     # Result collection (background thread)
@@ -554,6 +655,7 @@ class APIServer:
             # others make the data worker gate the ACK on its own reads first.
             self.preprocess_worker.finished_reading(rid, drained=drained)
             self.recently_completed.pop(rid, None)
+            self._retire(rid)
 
     def _process_messages(self) -> None:
         """Drain the ZMQ pull socket and route results to pending requests.
@@ -624,7 +726,9 @@ class APIServer:
                                 # error (e.g. a preprocess failure) with a
                                 # downstream one.
                                 if req.error is None:
-                                    req.error = message.body.error_message
+                                    req.error = _client_text(
+                                        message.body.error_message, rid, req.request_id,
+                                    )
                                     req.error_status = message.body.status
                                 # Release the waiting client immediately: no
                                 # result is coming, so the alternative is the
@@ -712,6 +816,13 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if req.request_id is not None:
+                            result_chunk.request_id = req.request_id
+                        if result_chunk.modality == "error":
+                            result_chunk.data = _client_text(
+                                result_chunk.data.decode("utf-8", "replace"),
+                                rid, req.request_id,
+                            ).encode("utf-8")
                         req.chunks.append(result_chunk)
                         to_wake[id(req)] = req
 
@@ -742,7 +853,7 @@ class APIServer:
     # Streaming helper
     # ----------------------------------------------------------
 
-    async def iter_result_chunks(self, request_id: str):
+    def iter_result_chunks(self, request_id: str):
         """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.
 
         Shared source for both output surfaces: ``/generate`` formats each
@@ -752,7 +863,10 @@ class APIServer:
         hands out the chunks the way they arrive (several per wake under load)
         and owns the timeout, the drain and the abort on an early exit.
         """
-        batches = self.iter_result_chunk_batches(request_id)
+        return self._flatten(self.iter_result_chunk_batches(request_id))
+
+    @staticmethod
+    async def _flatten(batches):
         try:
             async for batch in batches:
                 for chunk in batch:
@@ -760,7 +874,23 @@ class APIServer:
         finally:
             await batches.aclose()
 
-    async def iter_result_chunk_batches(self, request_id: str):
+    def _bind(self, request_id: str) -> tuple[str | None, PendingRequest | None]:
+        """The newest submission under ``request_id``: its key and request.
+        Called when a handler is created, right after ``submit_request`` and
+        before the event loop runs anything else, so a later submission under
+        the same id is never taken for this one."""
+        with self.request_lock:
+            key = self._live.get(request_id)
+            return key, self.pending_requests.get(key)
+
+    def submission_key(self, request_id: str) -> str | None:
+        """The key of the newest submission under ``request_id``, for a caller
+        that aborts it later, when the id may have been submitted again:
+        take it right after ``submit_request`` and pass it to
+        :meth:`abort_submission`."""
+        return self._bind(request_id)[0]
+
+    def iter_result_chunk_batches(self, request_id: str):
         """Yield the :class:`ResultChunk` objects as they arrive, as one list
         per drain: everything the message thread appended since the last
         wake. Under load several tokens of a request are often waiting when
@@ -769,16 +899,21 @@ class APIServer:
         length one and nothing is delayed. The final flush and an in-band
         error come as the last list.
         """
+        key, own = self._bind(request_id)
+        return self._iter_result_chunk_batches(request_id, key, own)
+
+    async def _iter_result_chunk_batches(
+        self, request_id: str, key: str | None, own: PendingRequest | None,
+    ):
         start = time.time()
         finished = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
         with self.request_lock:
-            req = self.pending_requests.get(request_id)
-            if req is not None:
-                req.loop = asyncio.get_running_loop()
-                req.wake = wake
+            if own is not None:
+                own.loop = asyncio.get_running_loop()
+                own.wake = wake
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
@@ -790,7 +925,7 @@ class APIServer:
                 new_chunks: list[ResultChunk] = []
                 done = False
                 with self.request_lock:
-                    req = self.pending_requests.get(request_id)
+                    req = self.pending_requests.get(key)
                     if req:
                         avail = len(req.chunks)
                         consumed = req.consumed_chunks
@@ -812,10 +947,11 @@ class APIServer:
                     remaining: list[ResultChunk] = []
                     finished_req: PendingRequest | None = None
                     with self.request_lock:
-                        req = self.pending_requests.get(request_id)
+                        req = self.pending_requests.get(key)
                         if req:
                             remaining = req.chunks[req.consumed_chunks:]
-                            finished_req = self.pending_requests.pop(request_id, None)
+                            finished_req = self.pending_requests.pop(key, None)
+                            self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
@@ -845,7 +981,7 @@ class APIServer:
                     pass
         finally:
             if not finished:
-                self.abort_request(request_id)
+                self.abort_submission(key)
 
     def async_stream_results(self, request_id: str, binary: bool = False):
         """Yield the serialized body of ``/generate`` one piece at a time.
@@ -856,14 +992,16 @@ class APIServer:
 
         Deliberately a plain ``def`` returning the chosen async generator rather
         than an ``async def`` delegating to it: the branch is per-request, not
-        per-chunk, and this keeps both bodies flat.
+        per-chunk, and this keeps both bodies flat. It also binds the
+        submission now, before Starlette starts iterating the body.
         """
+        chunks = self.iter_result_chunks(request_id)
         if binary:
-            return self._stream_binary(request_id)
-        return self._stream_ndjson(request_id)
+            return self._stream_binary(chunks)
+        return self._stream_ndjson(chunks)
 
-    async def _stream_ndjson(self, request_id: str):
-        async for chunk in self.iter_result_chunks(request_id):
+    async def _stream_ndjson(self, chunks):
+        async for chunk in chunks:
             line = self._chunk_to_ndjson(chunk)
             if not self.enable_nvtx:
                 yield line
@@ -879,8 +1017,8 @@ class APIServer:
             finally:
                 profiler.range_pop()
 
-    async def _stream_binary(self, request_id: str):
-        async for chunk in self.iter_result_chunks(request_id):
+    async def _stream_binary(self, chunks):
+        async for chunk in chunks:
             header, payload = _chunk_to_binary_frame(chunk)
             # Two yields rather than one concatenation: joining them would copy
             # the whole payload to prepend ~100 bytes, which is the class of
@@ -927,22 +1065,24 @@ class APIServer:
         """Wait for the request to finish (or the client to disconnect), then
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
+        key = self.submission_key(request_id)
         while True:
             with self.request_lock:
-                req = self.pending_requests.get(request_id)
+                req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
             if done:
                 break
             if time.time() - start > self.timeout_seconds:
-                self.abort_request(request_id)
+                self.abort_submission(key)
                 raise HTTPException(status_code=500, detail="Request timed out")
             if raw_request is not None and await raw_request.is_disconnected():
-                self.abort_request(request_id)
+                self.abort_submission(key)
                 return []
             await asyncio.sleep(0.005)
 
         with self.request_lock:
-            req = self.pending_requests.pop(request_id, None)
+            req = self.pending_requests.pop(key, None)
+            self._retire(key)
         if req is None:
             return []
         if req.error is not None:
@@ -984,29 +1124,42 @@ class APIServer:
             logger.exception("Failed to emit request profile for %s", req.profile.rid)
 
     def abort_request(self, request_id: str) -> None:
-        """Stop GPU work for a request the client abandoned and drop its state."""
+        """Stop GPU work for a request the client abandoned and drop its state.
+        Acts on the newest submission under ``request_id``."""
+        with self.request_lock:
+            key = self._live.get(request_id)
+        self.abort_submission(key)
+
+    def abort_submission(self, key: str | None) -> None:
+        """:meth:`abort_request` for one submission, by its key
+        (:meth:`submission_key`); a newer submission under the id is untouched."""
+        if key is None:
+            return
         with self.request_lock:
             active = (
-                request_id in self.pending_requests
-                or request_id in self.recently_completed
+                key in self.pending_requests
+                or key in self.recently_completed
             )
-            self.pending_requests.pop(request_id, None)
-            self.recently_completed.pop(request_id, None)
+            self.pending_requests.pop(key, None)
+            self.recently_completed.pop(key, None)
+            self._retire(key)
         if not active:
             return
-        logger.info("Client cancelled request %s; releasing resources", request_id)
-        self.preprocess_worker.abort_request(request_id)
+        logger.info("Client cancelled request %s; releasing resources", key)
+        self.preprocess_worker.abort_request(key)
 
     def release_request(self, request_id: str) -> None:
         """Drop a request whose results will never be read: abort it if it is
         still running, else just forget it (an ended request needs no abort)."""
         with self.request_lock:
-            req = self.pending_requests.get(request_id)
+            key = self._live.get(request_id)
+            req = self.pending_requests.get(key)
             finished = req is not None and req.event.is_set()
             if finished:
-                self.pending_requests.pop(request_id)
+                self.pending_requests.pop(key)
+                self._retire(key)
         if not finished:
-            self.abort_request(request_id)
+            self.abort_submission(key)
 
     # ----------------------------------------------------------
     # Cleanup
@@ -1163,6 +1316,8 @@ app = FastAPI(
     description="Multimodal Inference API",
     root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
 )
+# Added before CORS so CORS stays outermost and a 413 still carries its headers.
+app.add_middleware(BodyLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1279,7 +1434,8 @@ async def generate_ws(websocket: WebSocket):
     ``{"request_id", "modality", "data", "metadata"}``, followed by
     ``{"request_id", "finish": true}``. A rejected message answers
     ``{"request_id", "error": ...}``, and so does a request that fails after
-    it was accepted (with the HTTP ``status`` it would have had); no finish
+    it was accepted. Both carry the HTTP ``status`` when there is one (409
+    for a ``request_id`` still in flight, as on ``/generate``); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
@@ -1325,6 +1481,7 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
                 file_paths=file_paths or None,
@@ -1359,9 +1516,18 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            logger.exception("generate/ws request failed")
+            reply = {"request_id": request_id, "error": str(exc)}
+            if isinstance(exc, HTTPException):
+                reply.update(error=exc.detail, status=exc.status_code)
+            if isinstance(exc, HTTPException) and exc.status_code < 500:
+                logger.info(
+                    "generate/ws request %s refused (%d): %s",
+                    request_id, exc.status_code, exc.detail,
+                )
+            else:
+                logger.exception("generate/ws request failed")
             try:
-                await send({"request_id": request_id, "error": str(exc)}, binary)
+                await send(reply, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:
@@ -1421,7 +1587,9 @@ async def generate(
         request_id: Optional client-supplied request id. When omitted, the
             server generates a fresh uuid4. Pinning this is useful for
             deterministic-noise debugging because the conductor seeds its
-            per-request RNG via ``hash(request_id)``.
+            per-request RNG via ``hash(request_id)``. An id that still has
+            a request in flight is refused with a 409; it is free again once
+            that request finished, failed or was aborted.
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -1501,6 +1669,7 @@ async def generate(
         )
 
     try:
+        await api_server.wait_for_request_id(request_id)
         request_id = api_server.submit_request(
             text=text,
             file_paths=file_paths or None,
@@ -1591,8 +1760,9 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
-        "--socket-path-prefix", type=str, default="/tmp/mstar",
-        help="ZMQ IPC socket path prefix (shared with conductor/workers)",
+        "--socket-path-prefix", type=str, default=None,
+        help="ZMQ IPC socket path prefix (shared with conductor/workers); "
+             "default /tmp/mstar_<user>_<port>/",
     )
     parser.add_argument(
         "--upload-dir", type=str, default="/tmp/mstar_uploads",
@@ -1645,6 +1815,8 @@ def main(argv: list[str] | None = None):
              "$PATH, then rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.socket_path_prefix is None:
+        args.socket_path_prefix = per_port_socket_prefix(args.port)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

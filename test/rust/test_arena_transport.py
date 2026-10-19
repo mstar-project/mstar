@@ -704,3 +704,123 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
         "r1", [GraphEdge(next_node="B", name="tok", tensor_info=infos["tok"])],
     )
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
+
+
+def _is_mapped(ptr: int) -> bool:
+    with open("/proc/self/maps") as f:
+        for line in f:
+            lo, hi = (int(x, 16) for x in line.split()[0].split("-"))
+            if lo <= ptr < hi:
+                return True
+    return False
+
+
+@pytest.fixture
+def fake_pins(monkeypatch):
+    """Stand-in for cudaHostRegister/Unregister on a CPU host: records each
+    unregister and whether the range was still mapped at that moment."""
+    from mstar.communication import arena as arena_mod
+
+    pinned, unpinned = [], []
+
+    def pin(ptr, nbytes):
+        pinned.append(ptr)
+        return True
+
+    def unpin(ptr):
+        unpinned.append((ptr, _is_mapped(ptr)))
+        return True
+
+    monkeypatch.setattr(arena_mod, "_pin", pin)
+    monkeypatch.setattr(arena_mod, "_unpin", unpin)
+    return pinned, unpinned
+
+
+def test_own_pinned_segments_are_unregistered_before_the_arena_unmaps(
+        tmp_path, fake_pins):
+    import gc
+
+    pinned, unpinned = fake_pins
+    prod = _manager("pin_own", tmp_path)
+    prod._pin_segments = True
+    for i in range(2):  # the second tensor grows a pinned segment
+        infos = prod.store_and_return_tensor_info(
+            f"r{i}", {"x": [torch.zeros(700_000, dtype=torch.uint8)]})
+        prod.register_for_send(f"r{i}", list(infos["x"]))
+    assert prod._arena.num_segments == 2 and len(pinned) == 1
+    del prod, infos
+    gc.collect()
+    assert unpinned == [(pinned[0], True)]
+
+
+def test_close_unregisters_own_and_peer_segments_once(tmp_path, fake_pins):
+    import gc
+
+    pinned, unpinned = fake_pins
+    prod = _manager("pin_prod", tmp_path)
+    infos = prod.store_and_return_tensor_info(
+        "r", {"x": [torch.arange(64, dtype=torch.uint8)]})
+    prod.register_for_send("r", list(infos["x"]))
+    cons = _manager("pin_cons", tmp_path)
+    cons._pin_segments = True
+    cons.start_read_tensors(
+        "r", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert len(pinned) == 1 and cons._pinned_bytes > 0
+
+    cons.close()
+    assert unpinned == [(pinned[0], True)]
+    assert cons._pinned_bytes == 0
+    assert all(p == 0 for _, _, p in cons._peer_segments.values())
+    del cons
+    gc.collect()
+    assert len(unpinned) == 1
+
+
+def test_close_during_a_segment_registration_still_unregisters_it(
+        tmp_path, monkeypatch):
+    import threading
+
+    from mstar.communication import arena as arena_mod
+
+    prod = _manager("pin_race", tmp_path)
+    prod._pin_segments = True
+    unpinned, closer = [], []
+
+    def pin(ptr, nbytes):
+        t = threading.Thread(target=prod.close)
+        t.start()
+        t.join(0.2)
+        assert t.is_alive(), "close() did not wait for the registration"
+        closer.append(t)
+        return True
+
+    monkeypatch.setattr(arena_mod, "_pin", pin)
+    monkeypatch.setattr(arena_mod, "_unpin",
+                        lambda ptr: unpinned.append(ptr) or True)
+    infos = prod.store_and_return_tensor_info(
+        "r", {"x": [torch.zeros(1_500_000, dtype=torch.uint8)]})
+    prod.register_for_send("r", list(infos["x"]))
+    closer[0].join(5)
+    assert unpinned == [prod._arena.segment(1).ptr_len()[0]]
+    assert prod._pinned_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_no_host_registration_outlives_a_dropped_arena(tmp_path):
+    import gc
+
+    from mstar.communication.arena import _cudart
+
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    m = ArenaShmCommunicationManager(
+        my_entity_id="pin_gpu", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    (ptr,) = m._own_pinned
+    del m
+    gc.collect()
+    lib = _cudart()
+    rc = lib.cudaHostUnregister(ptr)  # 0 if the registration was left behind
+    lib.cudaGetLastError()
+    assert rc != 0

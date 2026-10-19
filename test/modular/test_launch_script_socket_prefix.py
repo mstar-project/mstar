@@ -1,8 +1,9 @@
 """Every server binds the same IPC names under its ``--socket-path-prefix``, so
 two servers on one host need two prefixes. A launch script whose prefix is
-keyed only on the user, or that leaves the entrypoint's ``/tmp/mstar`` default,
-gives every server it starts the same sockets: the second one takes over the
-first one's API inboxes before the deployment lock refuses it."""
+keyed only on the user, or that relied on the entrypoint's old shared
+``/tmp/mstar`` default, gives every server it starts the same sockets: the
+second one takes over the first one's API inboxes before the deployment lock
+refuses it."""
 
 import re
 from pathlib import Path
@@ -54,7 +55,7 @@ def test_launch_script_passes_a_socket_prefix(script):
     for command in _code(script).splitlines():
         if ENTRYPOINT.search(command):
             assert "--socket-path-prefix" in command, (
-                f"{script.relative_to(REPO)} starts the entrypoint on its shared /tmp/mstar default: {command.strip()}"
+                f"{script.relative_to(REPO)} starts the entrypoint without --socket-path-prefix: {command.strip()}"
             )
 
 

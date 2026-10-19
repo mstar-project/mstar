@@ -13,7 +13,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -221,7 +221,7 @@ def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_
     assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
 
 
-def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
+def test_speech_adapter_refuses_server_paths(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
     uploads = tmp_path / "uploads"
@@ -237,10 +237,10 @@ def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
         )
         return ChatterboxAdapter().speech_to_request(req, uploads)
 
-    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav")):
-        with pytest.raises(ValueError, match="paths on the server are refused"):
+    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav"),
+                str(uploads / "mine.wav")):
+        with pytest.raises(ValueError, match="server file paths are refused"):
             request(ref)
-    assert request(str(uploads / "mine.wav")).file_paths == {"audio": [str(uploads / "mine.wav")]}
 
 
 def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
@@ -257,15 +257,14 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
     assert args.model_kwargs["exaggeration"] == 0.8 and args.model_kwargs["cfg_weight"] == 0.3
     assert args.model_kwargs["temperature"] == 0.7 and args.model_kwargs["seed"] == 3
 
-    clip = tmp_path / "ref.wav"
-    clip.write_bytes(b"RIFF")
     req = SimpleNamespace(
         input="Hi", voice=None, temperature=None, top_p=None, seed=None,
-        model_extra={"ref_audio": str(clip)},
+        model_extra={"ref_audio": "data:audio/wav;base64,UklGRg=="},
     )
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert args.input_modalities == ["text", "audio"]
-    assert args.file_paths == {"audio": [str(clip)]}
+    (path,) = args.file_paths["audio"]
+    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == b"RIFF"
     assert "ref_audio" not in args.model_kwargs
 
 
@@ -796,8 +795,8 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     # the engine passes the batch's input metadata too
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}, per_request_input_metadata={}) is True
 
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
-    batched = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    batched = [c for c in configs if isinstance(c, BatchedAcceleratorGraphConfig)]
     keys = {c.additional_key_info: c for c in batched}
     assert set(keys) == {True, False}
     assert keys[True].total_tokens_multiplier == 2 and keys[False].total_tokens_multiplier == 1
@@ -806,7 +805,10 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert all(c.capture_graph_walk == "decode" for c in batched)
 
     turbo = _t3_submodule("turbo")
-    turbo_cfgs = [c for c in turbo.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, BatchedCudaGraphConfig)]
+    turbo_cfgs = [
+        c for c in turbo.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, BatchedAcceleratorGraphConfig)
+    ]
     assert [c.additional_key_info for c in turbo_cfgs] == [False]
     assert turbo.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}) is False
 
@@ -816,7 +818,10 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
     both prefill walks; the stand-in inputs carry the guidance branch's second
     embedding row set like ``prepare_inputs`` does. The knob turns it off."""
     sub = _t3_submodule()
-    packed = [c for c in sub.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, PackedCudaGraphConfig)]
+    packed = [
+        c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, PackedAcceleratorGraphConfig)
+    ]
     assert {c.additional_key_info for c in packed} == {True, False}
     for cfg in packed:
         assert cfg.capture_graph_walk == "prefill"
@@ -838,11 +843,14 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
         per_request_input_tensors={}, per_request_info={},
     )
     inputs = [sub.prepare_inputs("prefill", _fwd_info("a"), {TEXT_INPUTS: [torch.tensor([255, 0])]})]
-    assert sub.can_use_cuda_graphs(prefill, inputs)
+    assert sub.can_use_accelerator_graphs(prefill, inputs)
 
     sub.config.t3_prefill_graphs = False
-    assert not any(isinstance(c, PackedCudaGraphConfig) for c in sub.get_cuda_graph_configs(torch.device("cpu")))
-    assert not sub.can_use_cuda_graphs(prefill, inputs)
+    assert not any(
+        isinstance(c, PackedAcceleratorGraphConfig)
+        for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+    )
+    assert not sub.can_use_accelerator_graphs(prefill, inputs)
 
 
 def test_sampler_min_p_goes_through_the_resource():

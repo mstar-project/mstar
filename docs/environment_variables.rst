@@ -58,9 +58,9 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
-   * - ``MSTAR_REQUIRE_CUDA_GRAPHS``
+   * - ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS``
      - ``0``
-     - ``1`` makes a worker fail at startup when any CUDA graph bucket
+     - ``1`` makes a worker fail at startup when any accelerator graph bucket
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
@@ -134,6 +134,17 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``NCCL_SOCKET_IFNAME``
+     - ``lo``
+     - NCCL's own variable. Every worker runs on the conductor's host, so
+       the conductor sets ``lo`` for its workers and NCCL's bootstrap
+       sockets listen on loopback only. A value you set, or a set
+       ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``GLOO_SOCKET_IFNAME``
+     - ``lo``
+     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+       Same rule: the conductor sets ``lo`` for its workers unless you set
+       it, so Gloo does not listen on the address the hostname resolves to.
 
 Models
 ------
@@ -155,23 +166,36 @@ model, so they are named for it.
        images produce small bf16 drift, which at greedy ``temperature=0`` can
        flip a downstream LLM argmax. When off, ``prefill_vit`` runs one
        request at a time.
-   * - ``MSTAR_VIT_CUDA_GRAPH``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH``
      - ``0``
-     - BAGEL: CUDA-graph capture of the ViT block loop, over the node's ragged
-       attention resource (see :doc:`adding_models`). Off by default: capture
-       costs one graph per (batch size, token bucket) and the eager
-       flash-attn path is already fast. The win is removing per-layer launch
-       overhead on small images.
-   * - ``MSTAR_VIT_CG_TOKEN_BUCKETS``
+     - BAGEL: accelerator graph capture of the ViT block loop, over the node's
+       ragged attention resource (see :doc:`adding_models`). Requires the
+       deployment option ``model_kwargs.accelerator_graph`` to be true;
+       BAGEL defaults this option to true (see :doc:`models`).
+       Off by default: capture costs one graph per (batch size, token bucket)
+       and the eager flash-attn path is already fast. The win is removing
+       per-layer launch overhead on small images.
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS``
      - ``512,1024,2048,4096,4900``
      - Comma-separated token-count buckets to capture, when
-       ``MSTAR_VIT_CUDA_GRAPH=1``. A batch longer than the largest bucket runs
+       ``MSTAR_VIT_ACCELERATOR_GRAPH=1``. A batch longer than the largest bucket runs
        eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
        preprocess option emits.
-   * - ``MSTAR_VIT_CG_BATCH_SIZES``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables denoise, prefill and reasoner
+       decode capture. The deployment option
+       ``model_kwargs.accelerator_graph: false`` also disables all these
+       captures and cannot be overridden by this variable.
+   * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables only the understanding-tower
+       prefill capture. Denoise and reasoner decode captures remain eligible
+       when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -191,6 +215,12 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit on every route, as in the Rust frontend: a larger
+       body gets a 413, refused on its ``Content-Length`` or, for a chunked
+       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+       512 MiB file cap when this is lower.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -198,6 +228,13 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
+     - ``10``
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
+       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+       ``n`` outside ``1`` to this value is a 400 before anything is
+       submitted. The Rust frontend and the Dynamo bridge apply the same
+       variable and default.
 
 Serving (Rust frontend)
 -----------------------
@@ -321,7 +358,16 @@ Worker scheduling
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
-       other ready work.
+       other ready work. ``0`` turns speculation off. A value that is not an
+       integer is ignored with a warning when the worker starts.
+   * - ``MSTAR_LAUNCH_WAIT_MS``
+     - ``5``
+     - Milliseconds the speculative submitter holds off the GIL waiting for
+       the GPU thread to reach the launch before it carries on. A value that
+       is not a number, is ``nan`` or ``inf``, or is past
+       ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
+       worker starts and ``5`` is used; a negative value is raised to ``0``
+       with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -348,9 +394,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's

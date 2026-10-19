@@ -30,6 +30,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
@@ -96,6 +97,14 @@ def _request_seed(model_kwargs: dict, request_id: str) -> int:
     return seed
 
 
+def _seed_id(body: NewRequestConductor) -> str:
+    """The id a derived seed comes from: the client's, so a pinned request_id
+    reproduces the same noise whatever key the API server ran it under."""
+    if body.client_request_id is None:
+        return body.request_id
+    return body.client_request_id
+
+
 def _pick_free_tcp_port() -> int:
     """Ask the OS for an unused ephemeral TCP port.
 
@@ -108,6 +117,22 @@ def _pick_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def keep_bootstrap_sockets_on_loopback() -> None:
+    """Have NCCL and Gloo open their sockets on loopback, unless the user
+    picked an interface (or, for NCCL, an address family).
+
+    Unset, NCCL listens on a routable interface and Gloo on whatever address
+    the hostname resolves to (a pod or container IP), for as long as the
+    deployment runs. Every rank is spawned by this conductor on this host, so
+    loopback reaches all of them; a launcher that places ranks on other hosts
+    must not call this. Data between GPUs on one host goes over NVLink, PCIe
+    P2P or SHM either way.
+    """
+    if "NCCL_SOCKET_IFNAME" not in os.environ and "NCCL_SOCKET_FAMILY" not in os.environ:
+        os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
 
 def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
@@ -157,6 +182,8 @@ def _worker_process_target(
     tcp_transfer_device="",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    # before anything in this process touches the device runtime
+    apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -546,6 +573,11 @@ class Conductor:
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
+        # Set here too. A spawned child imports the model's modules (and their
+        # kernel libraries) while unpickling its arguments, before the worker
+        # target runs, and it inherits os.environ.
+        apply_process_env_defaults()
+        keep_bootstrap_sockets_on_loopback()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
@@ -881,7 +913,7 @@ class Conductor:
             )
             return
         try:
-            _request_seed(body.model_kwargs or {}, body.request_id)
+            _request_seed(body.model_kwargs or {}, _seed_id(body))
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
@@ -959,7 +991,7 @@ class Conductor:
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
-        seed = _request_seed(model_kwargs, body.request_id)
+        seed = _request_seed(model_kwargs, _seed_id(body))
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -1046,6 +1078,7 @@ class Conductor:
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
@@ -1054,6 +1087,7 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
+                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
             )
 

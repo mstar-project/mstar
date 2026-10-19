@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import os
+import threading
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -168,6 +170,104 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     return modality_hint, str(path)
 
 
+# Telephone band, the lowest rate speech is recorded or coded at. A clip below it
+# is not a voice reference, and resampling it up to the probe's or the model's
+# rate multiplies its decoded size by that ratio (a 64 KB WAV at 1 Hz is 2 GB at
+# 16 kHz).
+MIN_REF_AUDIO_SAMPLE_RATE = 8000
+# Voice cloning needs seconds of speech. Twice the longest reference a model
+# takes (Qwen3-TTS refuses over 30 s, Chatterbox keeps 30 s), so this never
+# refuses a clip a model would use; without it a 66 MB FLAC probe-decodes to
+# about 23 GB.
+MAX_REF_AUDIO_SECONDS = 60.0
+# The probe decode runs in the request thread pool (32 threads); this bounds
+# how many decode at once.
+REF_AUDIO_DECODE_SLOTS = 4
+_REF_AUDIO_PROBE_RATE = 16000
+_ref_audio_decodes = threading.BoundedSemaphore(REF_AUDIO_DECODE_SLOTS)
+
+
+class RefAudioTooLongError(ValueError):
+    """A clip that opens as audio but runs past ``MAX_REF_AUDIO_SECONDS``."""
+
+
+def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
+    """Persist bare base64 that passes :func:`check_ref_audio`; return its path,
+    or None (leaving nothing behind) when it is not base64 or not loadable audio.
+
+    A path such as ``/etc/passwd`` is valid base64 too, so the alphabet cannot
+    tell them apart; the decoder can. A clip that is audio but too long raises
+    :class:`RefAudioTooLongError`.
+    """
+    try:
+        _, path = save_base64(b64, "wav", "audio", upload_dir)
+    except ValueError:
+        return None
+    try:
+        check_ref_audio(path, decoder)
+    except RefAudioTooLongError:
+        raise
+    except ValueError:
+        return None
+    return path
+
+
+def check_ref_audio(path: str, decoder: str) -> None:
+    """Open the reference clip at ``path`` the way the model's ``load_audio``
+    will; on failure delete it and raise ValueError.
+
+    ``decoder`` is the library that ``load_audio`` uses, ``"soundfile"`` or
+    ``"torchcodec"``. torchcodec decodes the clip, not just its header: some
+    FFmpeg builds parse a container header (MAT4, MAT5) they cannot decode. A
+    clip whose header rate is below ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose
+    header duration is over ``MAX_REF_AUDIO_SECONDS``, is refused before any
+    decode; the decode itself stops just past ``MAX_REF_AUDIO_SECONDS``, so a
+    header that hides or understates the length cannot make it unbounded.
+    """
+    try:
+        if decoder == "torchcodec":
+            from torchcodec.decoders import AudioDecoder
+
+            header = AudioDecoder(path).metadata
+            _require_ref_audio_rate(header.sample_rate)
+            _require_ref_audio_seconds(header.duration_seconds_from_header)
+            with _ref_audio_decodes:
+                # Mono at a fixed rate: a small compressed upload can declare many
+                # channels at a high rate, and decoding it natively takes gigabytes.
+                samples = AudioDecoder(
+                    path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
+                ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
+            if samples.duration_seconds == 0:
+                raise ValueError("reference audio has no samples in its first seconds")
+            _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
+        else:
+            import soundfile
+
+            info = soundfile.info(path)
+            _require_ref_audio_rate(info.samplerate)
+            _require_ref_audio_seconds(info.frames / info.samplerate)
+    except RefAudioTooLongError:
+        Path(path).unlink(missing_ok=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 — not loadable here, so the model cannot load it either
+        Path(path).unlink(missing_ok=True)
+        raise ValueError(
+            f"ref_audio must be audio the model can decode, at {MIN_REF_AUDIO_SAMPLE_RATE} Hz or more"
+        ) from exc
+
+
+def _require_ref_audio_rate(rate: int | None) -> None:
+    if not rate or rate < MIN_REF_AUDIO_SAMPLE_RATE:
+        raise ValueError(f"reference audio at {rate} Hz is below {MIN_REF_AUDIO_SAMPLE_RATE} Hz")
+
+
+def _require_ref_audio_seconds(seconds: float | None) -> None:
+    if seconds is not None and seconds > MAX_REF_AUDIO_SECONDS:
+        raise RefAudioTooLongError(
+            f"ref_audio must be {MAX_REF_AUDIO_SECONDS:g} s or shorter; voice cloning needs a few seconds of speech"
+        )
+
+
 def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[str, str]:
     """Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).
 
@@ -188,28 +288,51 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
 
 
 def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False) -> tuple[str, str]:
-    """Resolve a media reference (data URL, http(s) URL, or local path).
+    """Resolve a media reference from a request: a data URL, or an http(s) URL
+    when remote fetch is allowed. Returns ``(modality, path)``.
 
-    Returns ``(modality, path)``. Local paths are passed through unchanged
-    (modality inferred from extension).
+    A request cannot name a file on the server, not even one under
+    ``upload_dir``: plain paths and other URL schemes are refused without
+    accessing client-named server files, so a caller can neither read files nor
+    probe for them.
     """
     if ref.startswith("data:"):
         return save_data_url(ref, upload_dir)
-    scheme = urlparse(ref).scheme.lower()
-    if scheme in ("http", "https"):
+    if urlparse(ref).scheme.lower() in ("http", "https"):
         allow_remote = allow_remote or os.getenv("MSTAR_ALLOW_REMOTE", "0") == "1"
         if not allow_remote:
             raise ValueError("Remote media fetch is disabled on this server")
         return save_remote_url(ref, upload_dir)
-    # Treat as a local filesystem path.
-    suffix = Path(ref).suffix.lower()
-    rev = {v: k for k, v in _MIME_TO_EXT.items()}
-    return modality_from_mime(rev.get(suffix, "")), ref
+    raise ValueError("server file paths are refused; send media as a data URL or a file upload")
 
 
 # ---------------------------------------------------------------------------
 # Outbound: wrap raw model output for client surfaces
 # ---------------------------------------------------------------------------
+
+# torchaudio's resampling kernel holds (target / g) * (rate / g + 2 * width)
+# floats, g = gcd(rate, target), width its filter's half-length (default
+# lowpass_filter_width 6, rolloff 0.99): 3.0M for the 47,952 Hz pull-down rate
+# to 16 kHz, but 1.15G for a 48,001 Hz header resampled to 24 kHz
+MAX_RESAMPLE_KERNEL = 1 << 24
+MAX_SAMPLE_RATE = 768_000
+
+
+def resample_kernel_size(rate: int, target: int) -> int:
+    """Floats in torchaudio's default sinc kernel resampling ``rate`` to ``target``."""
+    g = math.gcd(rate, target)
+    orig, new = rate // g, target // g
+    width = math.ceil(6 * orig / (min(orig, new) * 0.99))
+    return new * (orig + 2 * width)
+
+
+def check_resample_rate(rate: int, target: int) -> None:
+    """Refuse a file rate outside ``1..MAX_SAMPLE_RATE`` Hz or whose
+    resampling to ``target`` would cost more than :data:`MAX_RESAMPLE_KERNEL`
+    (every real rate, pull-down rates included, passes)."""
+    if not 1 <= rate <= MAX_SAMPLE_RATE or resample_kernel_size(rate, target) > MAX_RESAMPLE_KERNEL:
+        raise ValueError(f"unsupported sample rate {rate} Hz; resample the audio to a standard rate")
+
 
 def decode_audio(path: str, sample_rate: int = 16000):
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
@@ -227,6 +350,7 @@ def decode_audio(path: str, sample_rate: int = 16000):
 
         frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
         return frames.data[0].numpy().astype(np.float32)
+    check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         try:
             import torch

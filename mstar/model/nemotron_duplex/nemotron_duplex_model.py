@@ -731,6 +731,7 @@ class NemotronDuplexModel(Model):
         ``TensorAndMetadata`` shape the data worker expects."""
         import soundfile as sf
 
+        from mstar.api_server.media_io import check_resample_rate
         from mstar.model.base import TensorAndMetadata
 
         try:
@@ -740,6 +741,7 @@ class NemotronDuplexModel(Model):
         audio = torch.from_numpy(data)
         if audio.dim() == 2:                       # stereo -> mono
             audio = audio.mean(dim=-1)
+        check_resample_rate(sr, 16000)
         if sr != 16000:
             import torchaudio.functional as AF
             audio = AF.resample(audio, sr, 16000)
