@@ -15,6 +15,10 @@ from pathlib import Path
 
 from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 
+# resource keys. The ViT keeps `qwen3_5`'s key, because the tower we reuse
+# looks itself up by that name; the LLM's attention is ours, so is this.
+LLM_ATTN = "llm_attn"
+
 
 def _read(path: str | Path) -> dict:
     path = Path(path)
