@@ -709,8 +709,9 @@ most of the cost. Same steps in the same order as the per-uuid form.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.close">
 <span class="sig-name descname"><span class="pre">close</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.close"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.close" title="Link to this definition">#</a></dt>
-<dd><p>Stop the wake watcher (segments/pins release with the arena’s
-Drop once the manager is garbage collected).</p>
+<dd><p>Stop the wake watcher and unregister every pinned segment (the
+segments themselves unmap with the arena’s Drop once the manager is
+garbage collected). Segments mapped after this stay unpinned.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>

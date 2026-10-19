@@ -1071,6 +1071,25 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_unpin_live</span><span class="p">(</span><span class="n">own_pinned</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">peers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Unregister every pinned own and peer segment (weakref.finalize</span>
+<span class="sd">    target -- must not reference the manager). Runs before the arena</span>
+<span class="sd">    objects unmap: a mapping torn down while still registered leaves the</span>
+<span class="sd">    registration behind, and a later mapping at the same address then gets</span>
+<span class="sd">    ``cudaHostRegister`` rc 712."""</span>
+    <span class="k">for</span> <span class="n">ptr</span> <span class="ow">in</span> <span class="n">own_pinned</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">_unpin</span><span class="p">(</span><span class="n">ptr</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"ARENA: cudaHostUnregister failed for own "</span>
+                           <span class="s2">"segment </span><span class="si">%#x</span><span class="s2">"</span><span class="p">,</span> <span class="n">ptr</span><span class="p">)</span>
+    <span class="n">own_pinned</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="p">(</span><span class="n">arena</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="n">pinned</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">peers</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+        <span class="k">if</span> <span class="n">pinned</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">_unpin</span><span class="p">(</span><span class="n">arena</span><span class="o">.</span><span class="n">ptr_len</span><span class="p">()[</span><span class="mi">0</span><span class="p">]):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"ARENA: cudaHostUnregister failed for peer "</span>
+                               <span class="s2">"</span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+            <span class="n">peers</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">arena</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_pin</span><span class="p">(</span><span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""cudaHostRegister a mapped segment (idempotent). Returns success.</span>
 <span class="sd">    GIL released for the duration (see ``_cudart``)."""</span>
@@ -1242,6 +1261,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># cannot resolve.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_segments_named_to</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_segments</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># Base pointers of own segments that are registered, for the</span>
+        <span class="c1"># unregister finalizer below.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_own_pinned</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_sync_segments</span><span class="p">()</span>
         <span class="c1"># uuid -&gt; (segment_idx, offset) for sender-side reclaim.</span>
         <span class="c1"># (register_for_send receives the TensorPointerInfos directly and</span>
@@ -1268,6 +1290,12 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># bound on any long-lived consumer.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">memoryview</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_peer_evict_last</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="c1"># Unregister before the arenas unmap (close(), or when the manager</span>
+        <span class="c1"># is collected). Not at interpreter exit: the driver drops every</span>
+        <span class="c1"># registration with the process.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unpin_finalizer</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">finalize</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">_unpin_live</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_own_pinned</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unpin_finalizer</span><span class="o">.</span><span class="n">atexit</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># -- segments --------------------------------------------------------</span>
 
@@ -1297,16 +1325,22 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: cannot sweep </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_pin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Pin within budget; returns the bytes actually pinned (0 if</span>
-<span class="sd">        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so</span>
-<span class="sd">        budget check + register + accounting must be one atomic unit."""</span>
+<span class="w">        </span><span class="sd">"""Pin an own segment within budget; returns the bytes actually</span>
+<span class="sd">        pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases</span>
+<span class="sd">        the GIL, so budget check + register + accounting must be one atomic</span>
+<span class="sd">        unit, and close() must see the segment either unpinned or tracked."""</span>
         <span class="c1"># Oversized dedicated segments ARE pinned (within budget): freed</span>
         <span class="c1"># segments are reused for later large tensors, so the registration</span>
         <span class="c1"># amortizes over the segment's lifetime, not one transfer.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span><span class="p">:</span>
             <span class="k">return</span> <span class="mi">0</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_locked</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span><span class="p">:</span>
+                <span class="k">return</span> <span class="mi">0</span>
+            <span class="n">pinned</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_locked</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">pinned</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_own_pinned</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">pinned</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_pin_locked</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">+</span> <span class="n">nbytes</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span><span class="p">:</span>
@@ -1838,12 +1872,18 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ArenaShmCommunicationManager.close">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.close">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Stop the wake watcher (segments/pins release with the arena's</span>
-<span class="sd">        Drop once the manager is garbage collected)."""</span>
+<span class="w">        </span><span class="sd">"""Stop the wake watcher and unregister every pinned segment (the</span>
+<span class="sd">        segments themselves unmap with the arena's Drop once the manager is</span>
+<span class="sd">        garbage collected). Segments mapped after this stay unpinned."""</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_lock</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="kc">None</span></div>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unpin_finalizer</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_segments</span> <span class="o">=</span> <span class="mi">0</span></div>
 
 
 <div class="viewcode-block" id="ArenaShmCommunicationManager.cleanup_collectable">
