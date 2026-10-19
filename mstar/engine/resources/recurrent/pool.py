@@ -159,8 +159,8 @@ class RecurrentStatePool(Resource):
         eager forward address their slots the same way; padding rows read the
         sink."""
         self._check_addressable(rows)
-        index = rows.slot_indices[: rows.num_rows].long()
-        return self._blocks[name][layer_idx].index_select(0, index)
+        # index_select takes the int32 indices as they are; index_copy_ needs int64
+        return self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows])
 
     def scatter_(
         self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,

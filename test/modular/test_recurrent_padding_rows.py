@@ -200,6 +200,19 @@ def test_gather_scatter_refuse_padding_rows_on_a_pool_without_a_sink():
     assert pool.gather("conv", real).shape == (1, 96, 3)
 
 
+def test_gather_reads_with_the_planned_indices_as_they_are():
+    """A layer loop gathers several blocks a layer, every step: each read is the
+    index_select alone, with no cast of the int32 plan to int64 first."""
+    pool = build_pool(max_slots=4)
+    ctx = StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False)
+    pool.admit(decode_step(["a"]), ctx)
+    rows = pool.plan(decode_step(["a"]), ctx)["main"]
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], acc_events=True) as prof:
+        pool.gather("conv", rows)
+    ops = {event.name for event in prof.events()}
+    assert "aten::index_select" in ops and not ops & {"aten::to", "aten::_to_copy"}, ops
+
+
 def test_narrow_addresses_some_rows_of_the_step():
     """``narrow`` is a run of the step's rows, as views of its plan: a forward
     that runs one row apart reads and writes that row's slot and no other."""
