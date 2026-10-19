@@ -158,6 +158,8 @@ SAMPLER = "sampler"
 # the transformer input is bf16. Windowed rollouts keep their latents in the
 # model dtype.
 LATENT_DTYPE = torch.float32
+# The conditioning encode runs in the VAE checkpoint's dtype, as the reference does.
+ENCODE_DTYPE = torch.bfloat16
 
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
@@ -2523,10 +2525,10 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
 
     def __init__(self, vae, config):
         super().__init__()
-        # Dedicated fp32 instance (not shared with the decoder node): encode
-        # runs fp32 everywhere (reference behavior; TF32 is the fast conv3d
-        # path pre-9.16 cuDNN) while the decode dtype is cuDNN-gated — sharing
-        # would re-cast the full VAE weights every encode/decode interleave.
+        # Dedicated instance (not shared with the decoder node): the encode
+        # runs in ENCODE_DTYPE while the decode dtype is cuDNN-gated, and
+        # sharing would re-cast the full VAE weights every encode/decode
+        # interleave.
         self.vae = vae
         self.config = config
         self._video_processor = None
@@ -2626,18 +2628,18 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
         vae = self.vae
-        # The engine may cast the submodule; re-assert the fp32 encode weights.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
+        # bf16 like the reference pipeline's encode and latent normalization (the
+        # checkpoint is bf16, so the cast is lossless). An fp32 encode moves the
+        # anchor latent enough to move the whole i2v trajectory.
+        if next(vae.parameters()).dtype != ENCODE_DTYPE:
+            vae.to(ENCODE_DTYPE)
         device = vision.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
+        mean = torch.tensor(vae.config.latents_mean, dtype=ENCODE_DTYPE, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=ENCODE_DTYPE, device=device)).view(
             1, -1, 1, 1, 1
         )
-        # fp32 outside autocast; pipeline-side latent normalization; the DiT
-        # consumes the latents in its bf16 checkpoint dtype.
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision).latent_dist.mode()
+            raw_mu = vae.encode(vision.to(ENCODE_DTYPE)).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
