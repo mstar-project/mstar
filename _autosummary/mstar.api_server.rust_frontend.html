@@ -635,19 +635,25 @@
 translation, SSE/NDJSON streaming, uploads, CORS — and speaks a flattened
 msgpack protocol over the Rust ZMQ transport to this bridge, which
 drives the existing Python data plane (<code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code> /
-<code class="docutils literal notranslate"><span class="pre">iter_result_chunks</span></code> / <code class="docutils literal notranslate"><span class="pre">abort_request</span></code>; preprocessing and the conductor
+<code class="docutils literal notranslate"><span class="pre">iter_result_chunks</span></code> / <code class="docutils literal notranslate"><span class="pre">abort_submission</span></code>; preprocessing and the conductor
 protocol are untouched):</p>
 <blockquote>
 <div><dl>
-<dt>frontend -&gt; bridge:  {t:”submit”, rid, text, file_paths,</dt><dd><p>input_modalities, output_modalities, model_kwargs,
-prompt_parts, streaming} | {t:”abort”, rid}</p>
+<dt>frontend -&gt; bridge:  {t:”submit”, rid, sub, text, file_paths,</dt><dd><p>input_modalities, output_modalities, model_kwargs,
+prompt_parts, streaming} | {t:”abort”, rid, sub}</p>
 </dd>
-<dt>bridge -&gt; frontend:  {t:”chunk”, rid, modality, data(bin), metadata}</dt><dd><div class="line-block">
-<div class="line">{t:”err”, rid, msg} | {t:”done”, rid}</div>
+<dt>bridge -&gt; frontend:  {t:”chunk”, rid, sub, modality, data(bin), metadata}</dt><dd><div class="line-block">
+<div class="line">{t:”err”, rid, sub, msg} | {t:”done”, rid, sub}</div>
 </div>
 </dd>
 </dl>
 </div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">sub</span></code> names one submission and is never reused. A client may resubmit its
+<code class="docutils literal notranslate"><span class="pre">rid</span></code> as soon as it drops a stream, and that stream’s <code class="docutils literal notranslate"><span class="pre">done</span></code> or late
+chunks can cross the retry, so everything about a submission is addressed by
+<code class="docutils literal notranslate"><span class="pre">sub</span></code>. The frontend refuses a <code class="docutils literal notranslate"><span class="pre">rid</span></code> still in flight with a 409 itself and
+sends a dropped stream’s abort before it frees the <code class="docutils literal notranslate"><span class="pre">rid</span></code>, so the abort
+arrives here before the retry’s submit.</p>
 <p>The submit shape is <code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code>’s signature verbatim — the
 protocol was designed by flattening it. <code class="docutils literal notranslate"><span class="pre">prompt_parts</span></code> travels for a chat
 only, one map of <code class="docutils literal notranslate"><span class="pre">PromptPart</span></code>’s fields per part. The bridge mesh lives in

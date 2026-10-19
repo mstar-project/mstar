@@ -678,7 +678,10 @@ replaces it.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">request_id</span></code></p></td>
 <td><p><em>(uuid)</em></p></td>
-<td><p>Optional client-supplied id; the server generates one when omitted.</p></td>
+<td><p>Optional client-supplied id; the server generates one when omitted. An id
+that still has a request in flight is refused with <code class="docutils literal notranslate"><span class="pre">409</span></code>; it is free
+again once that request finished, failed or was aborted (a client that
+drops a stream can resubmit its id at once).</p></td>
 </tr>
 </tbody>
 </table>
@@ -723,7 +726,8 @@ as a msgpack binary frame (<code class="docutils literal notranslate"><span clas
 message: one frame per result chunk, <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;modality&quot;,</span> <span class="pre">&quot;data&quot;,</span> <span class="pre">&quot;metadata&quot;}</span></code>,
 then <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;finish&quot;:</span> <span class="pre">true}</span></code>. A rejected message answers
 <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;error&quot;:</span> <span class="pre">...}</span></code> and the socket stays open; a request that fails after it
-was accepted ends the same way, with the HTTP <code class="docutils literal notranslate"><span class="pre">status</span></code> it would have had, and no
+was accepted ends the same way. Both carry the HTTP <code class="docutils literal notranslate"><span class="pre">status</span></code> when there is one
+(<code class="docutils literal notranslate"><span class="pre">409</span></code> for a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> still in flight, as on <code class="docutils literal notranslate"><span class="pre">/generate</span></code>), and no
 <code class="docutils literal notranslate"><span class="pre">finish</span></code> follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 <code class="docutils literal notranslate"><span class="pre">request_id</span></code> tells the replies apart. Closing the socket aborts whatever is still in

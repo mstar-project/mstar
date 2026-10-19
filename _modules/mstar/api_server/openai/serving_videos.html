@@ -964,7 +964,12 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
+    <span class="c1"># Bound to the submission now: the body is iterated later, by Starlette.</span>
+    <span class="k">return</span> <span class="n">_ndjson_lines</span><span class="p">(</span><span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">))</span>
+
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_ndjson_lines</span><span class="p">(</span><span class="n">chunks</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Yield one NDJSON line per result chunk for a ``stream_video`` request.</span>
 
 <span class="sd">    A windowed request emits each window's mp4 as its own ``video`` chunk;</span>
@@ -976,7 +981,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
     <span class="n">index</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">failed</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="k">async</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
+    <span class="k">async</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">:</span>
         <span class="n">metadata</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span>
         <span class="k">if</span> <span class="n">chunk</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"error"</span><span class="p">:</span>
             <span class="n">failed</span> <span class="o">=</span> <span class="kc">True</span>

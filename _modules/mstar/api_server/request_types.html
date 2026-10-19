@@ -1026,7 +1026,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span>
 
     <span class="c1"># Ordered text/attachment sequence, when the entrypoint preserved it.</span>
-    <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The id the client knows the request by; ``request_id`` is the API</span>
+    <span class="c1"># server's key for this one submission.</span>
+    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 </pre></div>
 

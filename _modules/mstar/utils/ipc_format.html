@@ -1200,7 +1200,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">initial_input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">initial_output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">input_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]]</span>
-    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span></div>
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span>
+    <span class="c1"># The client's request_id. ``request_id`` is the API server's key for this</span>
+    <span class="c1"># one submission, never reused; the seed still derives from the client's.</span>
+    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 

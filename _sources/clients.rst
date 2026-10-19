@@ -43,7 +43,10 @@ NDJSON stream.
      - JSON object of model-specific parameters (e.g. ``{"voice": "tara"}``).
    * - ``request_id``
      - *(uuid)*
-     - Optional client-supplied id; the server generates one when omitted.
+     - Optional client-supplied id; the server generates one when omitted. An id
+       that still has a request in flight is refused with ``409``; it is free
+       again once that request finished, failed or was aborted (a client that
+       drops a stream can resubmit its id at once).
 
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
@@ -89,7 +92,8 @@ as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way, with the HTTP ``status`` it would have had, and no
+was accepted ends the same way. Both carry the HTTP ``status`` when there is one
+(``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 ``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
