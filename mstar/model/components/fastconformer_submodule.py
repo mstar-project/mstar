@@ -45,11 +45,11 @@ def _batch_sizes(bucket: int) -> list[int]:
 
 def _replay_cost(rows: int, mel: int) -> float:
     """One replay of a ``(rows, mel)`` capture, in units of the smallest
-    capture's: a fixed part (the encoder's ~1,000 kernels, ~3 ms on an H100)
+    capture's: a fixed part (the encoder's ~700 kernels, ~2.2 ms on an H100)
     plus work linear in rows x mel frames, and in rows x frames^2 for the
-    attention. Fitted to every capture's replay time on an H100 (within 9%);
-    planning needs only the ratios."""
-    return 1.0 + rows * mel / 5070 + rows * mel * mel / 6.64e7
+    attention. Fitted to replay times over 78 (rows, mel) shapes on an H100
+    (within 11%); planning needs only the ratios."""
+    return 1.0 + rows * mel / 6580 + rows * mel * mel / 7.3e7
 
 
 def _part_sizes(count: int, bucket: int) -> list[int]:
@@ -64,7 +64,7 @@ def _plan(num_frames: list[int]) -> list[tuple[int | None, list[int]]]:
     """A batch's rows -> ``(bucket, rows)`` groups, one replay series each.
 
     A group is a run of the rows in length order, padded to its longest row's
-    bucket. A replay costs as much as ~5,000 padded rows x mel frames, so short
+    bucket. A replay costs as much as ~6,600 padded rows x mel frames, so short
     clips ride in a longer clip's replay when that is cheaper than a replay of
     their own; the runs are cut where the total cost is least. Rows past every
     bucket are one group, run eagerly."""
