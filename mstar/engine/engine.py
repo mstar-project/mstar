@@ -470,7 +470,8 @@ class Engine:
         model: "Model | None" = None,
     ):
         self._device = device
-        self._device_capability = self._device_capability or DeviceCapability.of(device)
+        if self._device_capability is None or self._device_capability.device != device:
+            self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype

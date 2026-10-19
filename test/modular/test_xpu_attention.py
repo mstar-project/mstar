@@ -197,6 +197,33 @@ def test_xpu_graph_plan_keeps_addresses_stable_across_replans():
     assert replanned.max_k == _kv_config().max_seq_len
 
 
+def test_xpu_graph_replan_stages_into_existing_buffers(monkeypatch):
+    manager = _manager()
+    lease = SlotLease(
+        slot=0, bucket=BucketKey(graph_walk="decode", bs=1, num_tokens=1),
+    )
+    manager.plan(
+        AttentionStep(causal=True),
+        _ctx([SequenceView(1, "main", [2, 3], length=7, to_compute=1)], lease),
+    )
+    captured = manager._current_plans["main"]
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("replanning must stage directly into the captured buffers")
+
+    monkeypatch.setattr(torch, "tensor", unexpected_allocation)
+    monkeypatch.setattr(torch, "empty", unexpected_allocation)
+    ctx = _ctx([SequenceView(1, "main", [5], length=3, to_compute=1)], lease)
+    ctx.is_preplan = True
+    manager.plan(AttentionStep(causal=True), ctx)
+    manager.plan(AttentionStep(causal=True), _ctx([], lease))
+
+    assert manager._current_plans["main"] is captured
+    assert captured.block_table.tolist() == [[5] + [0] * 15]
+    assert captured.cu_q.tolist() == [0, 1]
+    assert captured.host_kv_lens.tolist() == [3]
+
+
 def test_xpu_graph_plan_supports_context_past_text_sequence_limit():
     config = _kv_config()
     config.max_num_pages = 32
@@ -317,6 +344,67 @@ def test_batched_decode_graph_keeps_single_token_query_bound():
     ]
     manager.plan(AttentionStep(causal=True), _ctx(views, SlotLease(slot=0, bucket=bucket)))
     assert manager._current_plans["main"].max_q == 1
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
+def test_xpu_preplan_uploads_survive_slot_and_host_ring_reuse():
+    device = torch.device("xpu:0")
+    torch.xpu.set_device(device)
+    manager = XPUPagedAttentionManager("kv", device, _kv_config())
+    bucket = BucketKey(graph_walk="decode", bs=1, num_tokens=1)
+    fields = ("block_table", "cu_q", "host_kv_lens")
+    graphs, outputs, addresses = {}, {}, {}
+    for slot in (0, 1):
+        manager.plan(
+            AttentionStep(causal=True),
+            _ctx([SequenceView(1, "main", [1], length=3, to_compute=1)], SlotLease(slot=slot, bucket=bucket)),
+        )
+        plan = manager._current_plans["main"]
+        addresses[slot] = tuple(getattr(plan, name).data_ptr() for name in fields)
+        for name in fields:
+            getattr(plan, name).clone()
+        torch.xpu.synchronize()
+        graphs[slot] = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graphs[slot]):
+            outputs[slot] = tuple(getattr(plan, name).clone() for name in fields)
+
+    execution_stream = torch.xpu.current_stream()
+    plan_stream = torch.xpu.Stream()
+    plan_stream.wait_stream(execution_stream)
+    retired = {}
+    history = []
+    for iteration in range(20):
+        slot = iteration % 2
+        pages = list(range(1, iteration % 3 + 2))
+        length = len(pages) * 4 - 1
+        ctx = _ctx(
+            [SequenceView(1, "main", pages, length=length, to_compute=1)],
+            SlotLease(slot=slot, bucket=bucket),
+        )
+        ctx.is_preplan = True
+        with torch.xpu.stream(plan_stream):
+            if slot in retired:
+                plan_stream.wait_event(retired[slot])
+            manager.plan(AttentionStep(causal=True), ctx)
+            ready = torch.xpu.Event()
+            ready.record(plan_stream)
+        execution_stream.wait_event(ready)
+        ctx.is_preplan = False
+        manager.plan(AttentionStep(causal=True), ctx)
+        plan = manager._current_plans["main"]
+        assert tuple(getattr(plan, name).data_ptr() for name in fields) == addresses[slot]
+        graphs[slot].replay()
+        history.append((
+            tuple(tensor.clone() for tensor in outputs[slot]),
+            ([[*pages, *([0] * (16 - len(pages)))]], [0, 1], [length]),
+        ))
+        retired[slot] = torch.xpu.Event()
+        retired[slot].record(execution_stream)
+
+    torch.xpu.synchronize()
+    for actual, expected in history:
+        for tensor, values in zip(actual, expected, strict=True):
+            assert tensor.cpu().tolist() == values
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")

@@ -3,6 +3,7 @@
 import functools
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
@@ -11,6 +12,7 @@ from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import BucketKey, StepContext
+from mstar.utils.h2d import PinnedStager
 
 
 @functools.cache
@@ -36,17 +38,6 @@ class XPUPagedPlan:
     max_k: int
     causal: bool
 
-    def copy_(self, other: "XPUPagedPlan") -> None:
-        for name in ("block_table", "cu_q", "host_kv_lens"):
-            dst = getattr(self, name)
-            src = getattr(other, name)
-            if dst.shape != src.shape:
-                raise ValueError(
-                    f"XPU graph {name} shape changed from "
-                    f"{tuple(dst.shape)} to {tuple(src.shape)}"
-                )
-            dst.copy_(src)
-
 
 class XPUPagedAttentionManager(AttentionManager):
     """Paged KV attention backed by ``vllm-xpu-kernels`` FlashAttention."""
@@ -65,6 +56,7 @@ class XPUPagedAttentionManager(AttentionManager):
         self._batched_buckets: set[BucketKey] = set()
         self._preplan_states: dict[str, XPUPagedPlan] = {}
         self._preplanned = False
+        self._plan_stagers: dict[str, PinnedStager] = {}
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -115,21 +107,17 @@ class XPUPagedAttentionManager(AttentionManager):
                 if lease is not None and lease.bucket not in self._batched_buckets
                 else None
             )
-            new_plan = self._build_plan(
-                kv_out, step.causal, graph_mode=lease is not None, max_q=max_q,
-            )
             if lease is None:
-                plan = new_plan
+                plan = self._build_plan(kv_out, step.causal, graph_mode=False)
             else:
                 key = CGSlotKey(
                     bucket=lease.bucket, slot=lease.slot, label=label
                 )
-                plan = self._cg_plans.get(key)
-                if plan is None:
-                    self._cg_plans[key] = new_plan
-                    plan = new_plan
-                else:
-                    plan.copy_(new_plan)
+                plan = self._build_plan(
+                    kv_out, step.causal, graph_mode=True, max_q=max_q,
+                    out=self._cg_plans.get(key),
+                )
+                self._cg_plans[key] = plan
             plan_states[label] = plan
         self._preplanned = ctx.is_preplan
 
@@ -144,6 +132,7 @@ class XPUPagedAttentionManager(AttentionManager):
     def _build_plan(
         self, kv_out: KVPlanOutput, causal: bool, graph_mode: bool,
         max_q: int | None = None,
+        out: XPUPagedPlan | None = None,
     ) -> XPUPagedPlan:
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
@@ -161,26 +150,44 @@ class XPUPagedAttentionManager(AttentionManager):
             cu_q.append(cu_q[-1] + view.to_compute)
             kv_lens.append(view.length)
 
+        if graph_mode:
+            metadata = {
+                "block_table": np.asarray(block_table, dtype=np.int32),
+                "cu_q": np.asarray(cu_q, dtype=np.int32),
+                "host_kv_lens": np.asarray(kv_lens, dtype=np.int32),
+            }
+            if out is None:
+                out = XPUPagedPlan(
+                    **{
+                        name: torch.empty(values.shape, dtype=torch.int32, device=self._device)
+                        for name, values in metadata.items()
+                    },
+                    max_q=max_q if max_q is not None else max((view.to_compute for view in views), default=0),
+                    max_k=self._kv_config.max_num_pages * self._kv_config.page_size,
+                    causal=causal,
+                )
+            for name, values in metadata.items():
+                dst = getattr(out, name)
+                if dst.shape != values.shape:
+                    raise ValueError(
+                        f"XPU graph {name} shape changed from "
+                        f"{tuple(dst.shape)} to {values.shape}"
+                    )
+                stager = self._plan_stagers.get(name)
+                if stager is None:
+                    stager = self._plan_stagers[name] = PinnedStager(torch.int32, numel=values.size)
+                # The stager fences its host ring before reusing a copy source.
+                stager.copy_(dst, values.reshape(-1))
+            return out
+
         return XPUPagedPlan(
             block_table=torch.tensor(
                 block_table, dtype=torch.int32, device=self._device,
             ),
             cu_q=torch.tensor(cu_q, dtype=torch.int32, device=self._device),
-            # vllm-xpu-kernels consumes KV lengths from host memory.
-            host_kv_lens=torch.tensor(
-                kv_lens,
-                dtype=torch.int32,
-                device=self._device if graph_mode else None,
-            ),
-            max_q=(
-                max_q if max_q is not None
-                else max((view.to_compute for view in views), default=0)
-            ),
-            max_k=(
-                self._kv_config.max_num_pages * self._kv_config.page_size
-                if graph_mode
-                else max(kv_lens, default=0)
-            ),
+            host_kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
+            max_q=max((view.to_compute for view in views), default=0),
+            max_k=max(kv_lens, default=0),
             causal=causal,
         )
 

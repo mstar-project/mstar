@@ -5,11 +5,37 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.device import DeviceCapability
 from mstar.worker.worker import Worker
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:1", "xpu:1"])
+@pytest.mark.parametrize("capability_source", ["early_query", "matching", "other_device"])
+def test_engine_load_binds_capability_to_loaded_device(device, capability_source):
+    device = torch.device(device)
+    supplied = (
+        DeviceCapability(device if capability_source == "matching" else torch.device("cpu"))
+        if capability_source != "early_query" else None
+    )
+    engine = Engine(graph_runtime=None, device_capability=supplied)
+    if capability_source == "early_query":
+        assert engine.device_capability.device == torch.device("cpu")
+
+    engine.load_model(
+        {}, [], WorkerParallelGroups(num_workers=1, global_rank=0),
+        device, transfer_engine_info=None,
+    )
+
+    assert engine.device_capability.device == device
+    if supplied is not None and supplied.device == device:
+        assert engine.device_capability is supplied
+    else:
+        assert engine.device_capability is DeviceCapability.of(device)
+    assert (engine.device_capability.graph_backend is not None) is (device.type != "cpu")
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
