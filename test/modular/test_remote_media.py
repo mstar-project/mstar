@@ -388,6 +388,36 @@ def test_a_storage_failure_is_a_short_message(upstream, tmp_path, monkeypatch):
     assert str(e.value) == "remote media fetch failed: could not save the file"
 
 
+class _ShortWrites:
+    """An unbuffered file whose writes take at most ``step`` bytes, then none once ``cap`` is reached."""
+
+    def __init__(self, f, step, cap):
+        self.f, self.step, self.cap = f, step, cap
+
+    def write(self, data):
+        n = min(len(data), self.step, self.cap - self.f.tell())
+        return self.f.write(data[:n]) if n > 0 else 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+@pytest.mark.parametrize("cap", [1 << 20, 5], ids=["short-writes", "file-full"])
+def test_a_partial_write_is_finished_or_refused(upstream, uploads, monkeypatch, cap):
+    up = upstream()
+    up.routes["/a.png"] = reply(body=PNG)
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
+    monkeypatch.setattr(media_io, "open", lambda *a, **kw: _ShortWrites(open(*a, **kw), 3, cap), raising=False)
+    if cap > len(PNG):
+        _, path = media_io.save_remote_url(up.url("/a.png"), uploads)
+        assert open(path, "rb").read() == PNG
+    else:
+        refused(up.url("/a.png"), uploads, "could not save the file")
+
+
 @pytest.mark.parametrize("headers", [(), (("Content-Type", "application/octet-stream"),)], ids=["none", "generic"])
 def test_a_missing_or_generic_content_type_falls_back_to_the_url_extension(upstream, uploads, monkeypatch, headers):
     up = upstream()

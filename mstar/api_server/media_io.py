@@ -498,7 +498,12 @@ def _stream_to_upload(resp, conn: _PinnedConnection, url: str, upload_dir: Path,
                 if size > max_bytes:
                     raise _fetch_error(host, too_large, "body exceeded the limit")
                 try:
-                    f.write(chunk)
+                    view = memoryview(chunk)
+                    while view:  # an unbuffered write may take only part of the chunk
+                        written = f.write(view)
+                        if not written:
+                            raise OSError("the file stopped accepting bytes")
+                        view = view[written:]
                 except OSError as e:
                     raise _fetch_error(host, "could not save the file", e) from None
         if resp.length:  # the peer closed before sending all of Content-Length
