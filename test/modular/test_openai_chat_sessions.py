@@ -106,8 +106,9 @@ def test_a_chat_request_can_open_a_session():
     session = submitted["session"]
     assert session.session_id is not None
     assert session.created is True
-    # and the client is told which session it got
+    # and the client is told which session it got: its id, never the key
     assert body["session_id"] == session.session_id
+    assert body["session_id"] != session.key
 
 
 def test_a_chat_request_can_resume_a_session():
@@ -185,8 +186,9 @@ def test_the_stream_names_the_session_on_its_opening_chunk():
     body = "".join(asyncio.run(_drain(stream)))
 
     objects = _sse_objects(body)
-    session_id = api.submitted[0]["session"].session_id
-    assert objects[0]["session_id"] == session_id
+    session = api.submitted[0]["session"]
+    assert objects[0]["session_id"] == session.session_id
+    assert session.key not in body
     # reported once, and the server's own session chunk is not sent as content
     assert [o for o in objects[1:] if "session_id" in o] == []
     assert "ignored" not in body
@@ -217,4 +219,4 @@ def test_a_refused_submit_releases_the_session_it_claimed():
 
     # the failed request took the session with it, rather than leaving it
     # busy forever with a request that never ran
-    assert api.torn_down == ["s"]
+    assert api.torn_down == [api.sessions._sessions["s"].key]

@@ -356,6 +356,26 @@ def test_ingest_binds_the_request_to_its_session():
     assert w._sessions.session_of("Y") == "s"
 
 
+def test_a_stale_teardown_does_not_free_a_reused_id_s_new_session():
+    # the API server sends each session down under its own key, so a client id
+    # reused after an unconfirmed teardown reaches this worker as a new session
+    w = _worker(known_rids=("X",), sessions={"s.k1": {"X"}})
+    Worker._teardown_session(w, TeardownSession(session_id="s.k1"))
+    assert w._sessions.has_pending is True  # X never leaves
+
+    Worker._add_new_request(w, _new_request(rid="Y", session_id="s.k2"))
+    Worker._remove_request(w, RemoveRequest(request_id="Y"))
+    Worker._apply_pending_sessions(w)
+
+    # the new session's turn handed its state back, and nothing freed it
+    assert w.removed == ["Y"]
+    assert w.removed_sessions == [] and _acks(w) == []
+    assert w._sessions.session_of("Y") is None
+    # the old teardown is still held behind X alone
+    assert w._sessions.get_rids("s.k1") == {"X"}
+    assert w._sessions.has_pending is True
+
+
 def test_ingest_fails_a_request_whose_session_went_over_its_budget():
     w = _worker(known_rids=())
     w.session_errors["s"] = "session s exceeded its state budget"

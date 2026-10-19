@@ -363,15 +363,15 @@ class APIServer:
             target=self._process_messages, daemon=True
         )
 
-    def _request_session_teardown(self, session_id: str) -> None:
-        """Ask the conductor to free a session's state. The registry holds the
-        tombstone until ``session_torn_down`` comes back.
+    def _request_session_teardown(self, key: str) -> None:
+        """Ask the conductor to free the state under a session's internal key.
+        The registry holds the tombstone until ``session_torn_down`` comes back.
 
         Routed through the preprocess worker's request queue so it reaches the
         conductor behind the session's requests still being preprocessed;
         sent directly it could overtake one, and the conductor would reopen
         the session after confirming it gone."""
-        self.preprocess_worker.session_teardown(session_id)
+        self.preprocess_worker.session_teardown(key)
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
@@ -526,7 +526,8 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
-            session_id=session.session_id if session else None,
+            # the internal key, not the client's id; see SessionRegistry
+            session_id=session.key if session else None,
             resumed=bool(session and session.resumed),
             end_session=bool(session and session.end_session),
         ))

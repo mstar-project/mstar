@@ -117,6 +117,9 @@ def test_the_session_is_reported_as_the_first_chunk():
     assert chunk.data.decode() == session.session_id
     assert chunk.metadata["session_id"] == session.session_id
     assert chunk.metadata["created"] is True
+    # the client sees its id; downstream gets the internal key
+    assert session.key != session.session_id
+    assert s.preprocessed[0].session_id == session.key
 
 
 def test_the_flags_reach_the_data_worker():
@@ -125,12 +128,14 @@ def test_the_flags_reach_the_data_worker():
         start_session=True, resume_session=False, end_session=False,
         session_id="s", session_timeout_s=None, request_id="r0",
     )
-    session = SessionRequest(session_id="s", resumed=True, end_session=True)
+    session = SessionRequest(
+        session_id="s", key="s.k", resumed=True, end_session=True,
+    )
 
     _submit(s, session)
 
     [preprocess_input] = s.preprocessed
-    assert preprocess_input.session_id == "s"
+    assert preprocess_input.session_id == "s.k"
     assert preprocess_input.resumed is True
     assert preprocess_input.end_session is True
     # end_session holds the tombstone from submit, not from completion
@@ -214,20 +219,21 @@ def test_a_failure_tears_the_session_down():
 
     _one_tick(s)
 
-    assert s.torn_down == ["s"]
+    assert s.torn_down == [s.sessions._sessions["s"].key]
     assert s.sessions.snapshot()[0]["closing"] is True
 
 
 def test_the_conductor_s_ack_lifts_the_tombstone():
     s = _server(_config())
-    s.sessions.resolve(
+    session = s.sessions.resolve(
         start_session=True, resume_session=False, end_session=False,
         session_id="s", session_timeout_s=None, request_id="r0",
     )
     s.sessions.finish_request("r0")
     s.sessions.delete("s")
     s.inbox = [[APIServerMessage(
-        message_type="session_torn_down", body=SessionTornDown(session_id="s"),
+        message_type="session_torn_down",
+        body=SessionTornDown(session_id=session.key),
     )]]
 
     _one_tick(s)
@@ -245,4 +251,4 @@ def test_an_abandoned_request_takes_its_session_with_it():
 
     s.abort_request("r0")
 
-    assert s.torn_down == ["s"]
+    assert s.torn_down == [s.sessions._sessions["s"].key]
