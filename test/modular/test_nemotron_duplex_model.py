@@ -157,6 +157,21 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
         model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_duplex_encoder_state_is_stored_in_the_compute_dtype(dtype, monkeypatch):
+    """The encoder stores each step's layer state for the next; in another
+    dtype than the layers compute it in, live frames drift from one-shot ones.
+    A deployment that computes in another dtype is refused at startup."""
+    model = _make_model()
+    monkeypatch.setattr(model, "get_autocast_dtype", lambda: dtype)
+    (spec,) = [s for s in model.get_node_resources() if s.resource_key == ENCODER_STATE]
+    assert {block.dtype for block in spec.config.blocks.values()} == {dtype}
+    model.validate_config_yaml({"autocast_dtype": str(dtype).removeprefix("torch.")}, "c.yaml")
+    other = "float16"
+    with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
+        model.validate_config_yaml({"autocast_dtype": other}, "c.yaml")
+
+
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs({}, None)
