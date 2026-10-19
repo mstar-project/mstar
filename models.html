@@ -867,7 +867,8 @@ client sends.</p>
 <ul class="simple">
 <li><p>Install the G2P dependencies with <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[kokoro]'</span></code> and fetch the
 spaCy tagger once with <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">spacy</span> <span class="pre">download</span> <span class="pre">en_core_web_sm</span></code> (misaki does
-this itself on first use when it has network access). <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'misaki[en]'</span></code>
+this itself on first use when it has network access). <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> includes the G2P
+dependencies, and the Docker images also install the tagger. <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'misaki[en]'</span></code>
 additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
 out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
 Italian and Portuguese voices; without it those words are skipped and those

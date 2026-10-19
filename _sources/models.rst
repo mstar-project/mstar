@@ -195,7 +195,8 @@ Kokoro notes
 
 - Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
   spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
-  this itself on first use when it has network access). ``pip install 'misaki[en]'``
+  this itself on first use when it has network access). ``.[all]`` includes the G2P
+  dependencies, and the Docker images also install the tagger. ``pip install 'misaki[en]'``
   additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
   out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
   Italian and Portuguese voices; without it those words are skipped and those
