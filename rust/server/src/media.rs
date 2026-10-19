@@ -218,6 +218,10 @@ fn blocked_address(ip: IpAddr) -> bool {
     }
 }
 
+/// Both URL parsers delete these anywhere in a URL, so a host written with them
+/// would match the allowlist as if they were not there; such URLs are refused.
+const URL_DROPPED: [char; 3] = ['\t', '\r', '\n'];
+
 /// The host of `url` as written (lower-cased, without brackets or a trailing
 /// dot), or `None` when the text has no `//` authority.
 fn written_host(url: &str) -> Option<String> {
@@ -302,6 +306,9 @@ fn save_remote_url(
     policy: &RemotePolicy,
 ) -> Result<(String, String), String> {
     let deadline = Instant::now() + policy.timeout;
+    if url.contains(URL_DROPPED) {
+        return Err(fetch_error("", "invalid URL", format!("{url:?}")));
+    }
     let mut written = written_host(url);
     let mut url = url::Url::parse(url).map_err(|e| fetch_error("", "invalid URL", e))?;
     let mut host = String::new();
@@ -328,9 +335,13 @@ fn save_remote_url(
         }
         match fetch_hop(&url, &host, &addrs, upload_dir, policy.max_bytes, deadline)? {
             Hop::Redirect(next, location) => {
-                // a Location without an authority stays on this host, written as before
-                if let Some(w) = written_host(&location) {
-                    written = Some(w);
+                // only a Location with neither a scheme nor an authority (`//`, or
+                // `\\` as the URL parser also reads it) stays on this host as written
+                let first = location.split(['/', '\\', '?', '#']).next().unwrap_or("");
+                let relative = !first.contains(':')
+                    && !matches!(location.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..]);
+                if !relative {
+                    written = written_host(&location);
                 } else if next.host_str() != url.host_str() {
                     written = None;
                 }
@@ -610,6 +621,9 @@ fn fetch_hop(
         301 | 302 | 303 | 307 | 308 => {
             let location = header(&headers, "location")
                 .ok_or_else(|| fetch_error(host, "bad redirect", format!("{code} without Location")))?;
+            if location.contains(URL_DROPPED) {
+                return Err(fetch_error(host, "invalid URL", format!("{location:?}")));
+            }
             return url
                 .join(location)
                 .map(|next| Hop::Redirect(next, location.to_string()))
@@ -888,6 +902,8 @@ mod tests {
             "/loop" => redirect("302 Found", "/loop"),
             "/to-localhost" => redirect("302 Found", &format!("http://localhost:{port}/a.png")),
             "/to-short-form" => redirect("302 Found", &format!("//127.1:{port}/a.png")),
+            "/to-backslash-authority" => redirect("302 Found", &format!("\\\\127.1:{port}/a.png")),
+            "/to-tab" => redirect("302 Found", &format!("http://127.0.0.\t1:{port}/a.png")),
             "/to-file" => redirect("302 Found", "file:///etc/passwd"),
             // a body this size would never finish
             "/big.png" => Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\n".to_vec()),
@@ -1078,7 +1094,12 @@ mod tests {
         let numeric = policy(&["2130706433"], REMOTE_MAX_BYTES, Duration::from_secs(30));
         refused(&format!("http://2130706433:{port}/a.png"), &numeric, "host not allowed");
         refused(&format!("http://127.0.0.1:{port}/to-short-form"), &local(), "host not allowed");
-        assert_eq!(seen.lock().unwrap().len(), 1, "only the redirecting hop reaches the server");
+        refused(&format!("http://127.0.0.1:{port}/to-backslash-authority"), &local(), "host not allowed");
+        // the parsers drop tabs and newlines, which would make `127.0.0.\t1` read as 127.0.0.1
+        refused(&format!("http://127.0.0.\t1:{port}/a.png"), &local(), "invalid URL");
+        refused(&format!("http://127.0.0.1:{port}/to-tab"), &local(), "invalid URL");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|h| h.split(' ').nth(1).unwrap().to_string()).collect();
+        assert_eq!(paths, ["/to-short-form", "/to-backslash-authority", "/to-tab"], "only redirecting hops reach the server");
     }
 
     #[test]

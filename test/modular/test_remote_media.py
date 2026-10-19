@@ -207,9 +207,13 @@ def test_other_spellings_of_an_allowlisted_address_are_refused(upstream, uploads
     for host in ("2130706433", "0x7f000001", "127.1", "127.0.0.01"):
         refused(up.url("/a.png", host=host), uploads, "host not allowed")
     refused(up.url("/r"), uploads, "host not allowed")
+    # urlsplit drops tabs and newlines, which would make 127.0.0.\t1 read as 127.0.0.1
+    up.routes["/to-tab"] = redirect(f"http://127.0.0.\t1:{up.port}/a.png")
+    refused(up.url("/a.png", host="127.0.0.\t1"), uploads, "invalid URL")
+    refused(up.url("/to-tab"), uploads, "invalid URL")
     monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "2130706433")
     refused(up.url("/a.png", host="2130706433"), uploads, "host not allowed")
-    assert [p for p, _ in up.requests] == ["/r"]
+    assert [p for p, _ in up.requests] == ["/r", "/to-tab"]
 
 
 def test_allowlisted_host_is_fetched(upstream, uploads, monkeypatch):

@@ -321,6 +321,9 @@ _BLOCKED_NETS = tuple(ipaddress.ip_network(n) for n in (
 # IPv6 forms that reach the IPv4 address in their low 32 bits: NAT64 and IPv4-compatible.
 _V4_IN_LOW_BITS = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
 _IPV4_NUMBER = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# Both URL parsers delete these anywhere in a URL, so a host written with them
+# would match the allowlist as if they were not there; such URLs are refused.
+_URL_DROPPED = "\t\r\n"
 
 
 class RemoteFetchError(ValueError):
@@ -457,6 +460,8 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
     deadline = time.monotonic() + timeout
     host = ""
     for _ in range(REMOTE_MAX_REDIRECTS + 1):
+        if any(c in url for c in _URL_DROPPED):  # urlsplit would drop them, also from the host
+            raise _fetch_error("", "invalid URL", repr(url))
         try:
             parsed = urlsplit(url)  # not urlparse, which would drop ;params from the path
             host = (parsed.hostname or "").rstrip(".")
@@ -484,6 +489,8 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
                 location = resp.getheader("Location")
                 if not location:
                     raise _fetch_error(host, "bad redirect", f"{resp.status} without Location")
+                if any(c in location for c in _URL_DROPPED):
+                    raise _fetch_error(host, "invalid URL", repr(location))
                 url = urljoin(url, location)
                 continue
             if not 200 <= resp.status < 300:
