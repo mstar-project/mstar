@@ -443,9 +443,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
   ``mamba_state``, ``encoder_state`` and ``encoder_front`` (``max_slots``, one
-  more than the sessions, for the sink) and its pages in ``talker_kv``
-  (``max_num_pages``). The shipped configs set ``max_concurrent_requests: 32``
-  to match; to serve more, raise the cap and all four with it. The server
+  more than the sessions, for the sink) and its pages in ``nano_kv`` and
+  ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
+  nano's from ``max_prompt_tokens`` too). The shipped configs set
+  ``max_concurrent_requests: 32`` to match; to serve more, raise the cap and
+  all five with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker, the encoder and the codec each run at most 32 sessions

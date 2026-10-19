@@ -141,20 +141,34 @@ def test_duplex_shipped_configs_hold_their_session_cap():
         model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
 
 
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV])
+@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV, NANO_KV])
 def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
-    """Every session holds a slot in each recurrent pool and its talker pages
-    from start to end; a session past any of them waits on admit until
+    """Every session holds a slot in each recurrent pool and its nano and talker
+    pages from start to end; a session past any of them waits on admit until
     another ends. Raising the cap means raising them all, and a deployment
     that misses one is refused at startup, naming it."""
     model = _make_model()
-    pages = 48 * (model.talker_kv_pages(128) - 1) // model.DEFAULT_MAMBA_SLOTS + 1
     resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, TALKER_KV: {"max_num_pages": pages}}
+                 ENCODER_FRONT: {"max_slots": 49}, TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
+                 NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
     model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
     del resources[key]
     with pytest.raises(ValueError, match=f"resources.{key}"):
         model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
+
+
+@pytest.mark.parametrize("kwargs", [{"max_session_s": 640.0}, {"max_prompt_tokens": 8192}])
+def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
+    """A session holds its nano pages (prompt and every frame) and its talker
+    pages for life, so both pools are sized from the longest call and prompt
+    served; one sized below the cap is refused at startup."""
+    model = _make_model()
+    for name, value in kwargs.items():
+        setattr(model, name, value)
+    model.validate_config_yaml({"max_concurrent_requests": 32}, "c.yaml")
+    with pytest.raises(ValueError, match=f"resources.{NANO_KV}"):
+        model.validate_config_yaml({"max_concurrent_requests": 32, "resources": {NANO_KV: {"max_num_pages": 2}}},
+                                   "c.yaml")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

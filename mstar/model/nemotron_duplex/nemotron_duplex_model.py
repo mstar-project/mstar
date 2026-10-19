@@ -455,18 +455,25 @@ class NemotronDuplexModel(Model):
 
     def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
         """Pages for ``sessions`` (DEFAULT_MAMBA_SLOTS) sessions of max_session_frames, both CFG streams."""
+        return self._session_kv_pages(self.TALKER_WARMUP_POSITIONS, 2, page_size, sessions)
+
+    def nano_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
+        """Pages for ``sessions`` (DEFAULT_MAMBA_SLOTS) sessions of the longest prompt and max_session_frames."""
+        return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
+
+    def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
         sessions = self.DEFAULT_MAMBA_SLOTS if sessions is None else sessions
-        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
+        positions = prefix + self.max_session_frames + 1
         # + 1 for the pool's sink page
-        return sessions * 2 * -(-positions // page_size) + 1
+        return sessions * streams * -(-positions // page_size) + 1
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse an autocast dtype the encoder's state is not stored in, and a
         session cap that a per-session resource cannot hold.
 
         A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``) and its talker pages from its first
-        step to its last, so a session past any of them waits on admit until
+        ``encoder_state``, ``encoder_front``) and its nano and talker pages from
+        its first step to its last, so a session past any of them waits on admit until
         another ends, and its frames with it. So ``max_concurrent_requests``
         sessions must fit each; the conductor queues the rest.
         """
@@ -490,9 +497,10 @@ class NemotronDuplexModel(Model):
         for spec in specs:
             if isinstance(spec, RecurrentStateSpec):
                 held, knob = spec.config.usable_slots, "max_slots"
-            elif spec.resource_key == TALKER_KV:
+            elif spec.resource_key in (TALKER_KV, NANO_KV):
                 kv = spec.config
-                per_session = self.talker_kv_pages(kv.page_size, sessions=1) - 1
+                pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
+                per_session = pages(kv.page_size, sessions=1) - 1
                 held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
             else:
                 continue
@@ -522,6 +530,8 @@ class NemotronDuplexModel(Model):
             head_dim=nano.head_dim,
             max_seq_len=nano.max_position_embeddings,
             num_qo_heads=nano.num_attention_heads,
+            # a session holds its prompt and every frame for life (no eviction)
+            max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
         )
         return [
             RecurrentStateSpec(
