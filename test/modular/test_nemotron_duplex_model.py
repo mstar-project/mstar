@@ -227,6 +227,31 @@ def test_duplex_builds_every_node_on_meta(monkeypatch, node):
         model.get_submodule(node, device="cpu")
 
 
+def test_duplex_refuses_a_checkpoint_its_resources_were_not_sized_for(monkeypatch):
+    """The resources are declared from the config defaults, before the
+    checkpoint is read: a config.json that sizes one differently (another
+    encoder depth, here) is refused when the checkpoint is read, rather than
+    run against pools of another shape."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.stt.num_layers = 12
+    _stub_checkpoint(monkeypatch, ckpt)
+    with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
+        _make_model()._json_config("/nonexistent")
+
+
+def test_duplex_codec_sizes_its_region_from_the_checkpoint(monkeypatch):
+    """The codec decodes the codes the talker emits, so it takes the checkpoint's
+    config (codebooks per frame, here), as the talker does."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.eartts.num_quantizers = 8
+    _stub_checkpoint(monkeypatch, ckpt)
+    model = _make_model()
+    model.model_path_hf, model.cache_dir = "unused", None
+    monkeypatch.setattr(NemotronDuplexModel, "_build_and_load", lambda self, module, *a: module)
+    codec = model.get_submodule("audio_codec", device="cpu")
+    assert codec.config.eartts.num_quantizers == 8
+
+
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs({}, None)

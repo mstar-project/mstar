@@ -44,6 +44,7 @@ multi-KV, aux sampling, async partitions).
 """
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 
@@ -1223,11 +1224,26 @@ class NemotronDuplexModel(Model):
         """
         if getattr(self, "_json_config_cache", None) is None:
             try:
-                self._json_config_cache = NemotronDuplexConfig.from_pretrained(local_dir)
+                cfg = NemotronDuplexConfig.from_pretrained(local_dir)
             except (FileNotFoundError, KeyError) as e:
                 logger.warning("Could not read config.json (%s); using config defaults.", e)
-                self._json_config_cache = self.config
+                cfg = self.config
+            self._refuse_resources_sized_otherwise(cfg)
+            self._json_config_cache = cfg
         return self._json_config_cache
+
+    def _refuse_resources_sized_otherwise(self, cfg: NemotronDuplexConfig) -> None:
+        """The resources are declared from the dataclass defaults, before the
+        checkpoint is read: refuse a config.json that sizes one otherwise,
+        rather than run its modules against pools of another shape."""
+        loaded = copy.copy(self)
+        loaded.config = cfg
+        for declared, needed in zip(self.get_node_resources(), loaded.get_node_resources(), strict=True):
+            if declared != needed:
+                raise ValueError(
+                    f"the checkpoint's config.json sizes resources.{declared.resource_key} as {needed}, "
+                    f"not as declared ({declared})"
+                )
 
     def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):
         """meta-build -> cast -> materialize -> load the module's checkpoint subtree.
@@ -1307,4 +1323,5 @@ class NemotronDuplexModel(Model):
         with torch.device("meta"):
             codec = AudioCodec(cfg.codec)
         codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
-        return AudioCodecDecoderSubmodule(codec=codec, config=self.config)
+        # the checkpoint's config, as the talker's: the codec decodes the codes it emits
+        return AudioCodecDecoderSubmodule(codec=codec, config=cfg)
