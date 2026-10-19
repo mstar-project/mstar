@@ -16,8 +16,12 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.kv.plan import SINK_PAGE, HostLens
+from mstar.platforms import current_platform
 
-requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer needs a GPU")
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available() or current_platform.is_rocm(),
+    reason="needs an NVIDIA GPU (test/rocm/test_attn_mixed_split_rocm.py covers AMD)",
+)
 
 QO_HEADS, KV_HEADS, DIM, PAGE = 8, 2, 256, 16
 BUCKET_BS, BUCKET_TOKENS, MAX_PROMPTS = 8, 64, 4
