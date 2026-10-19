@@ -344,6 +344,10 @@ def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
         assert occ[0] == {"vram_used_mb": 284.0, "processes": ["py:1"]}
         assert occ[7] == {"vram_used_mb": 9635.0, "processes": ["py:1", "py:2"]}
         assert health.smi_gpus([4, 5]) == [7, 4]
+        numa = {"gpu_data": [{"gpu": 7, "numa": {"node": 1, "affinity": 1}}]}  # amd-smi 26
+        older = [{"gpu": 3, "numa": {"node": 0}}]
+        monkeypatch.setattr(sweep, "amd_smi_json", lambda *a: numa if a[-1] == "7" else older)
+        assert sweep._numa_of(4) == 1 and sweep._numa_of(0) == 0
     finally:
         launch.smi_index_map.cache_clear()
     rows = health.parse_rows("GPU3   FAIL  occupancy   procs=[python3.12:1] vram_used=284/262128 MB gfx_activity=2%\n"
