@@ -183,7 +183,10 @@ class _FakeCA:
     built: list[_FakeCA] = []
 
     def __init__(self, group, device, max_size=1 << 30):
+        import os
+
         self.group, self.device, self.max_size = group, device, max_size
+        self.raw_pool = os.environ.get("AITER_CUSTOM_AR_RAW_INPUT_POOL")
         self.disabled = False
         self.enable_register_for_capturing = True
         self._ptr = 7
@@ -271,6 +274,23 @@ def test_builds_a_workspace_sized_to_the_fused_bound(fake_aiter, monkeypatch):
     assert ca.max_size == 1 << 20
     assert fusion.max_tokens == 25 and fusion.hidden == 5120
     assert len(peers.seen) == 3, "refusal, build and startup check are each agreed"
+
+
+def test_the_input_pool_is_its_own_allocation(fake_aiter, monkeypatch):
+    """AITER exports the pool as if it started its allocation. Built from
+    torch's caching allocator it can sit mid-segment and peers read the wrong
+    memory, so it's built raw. The switch is only set while AITER builds."""
+    import os
+
+    monkeypatch.delenv("AITER_CUSTOM_AR_RAW_INPUT_POOL", raising=False)
+    _create(monkeypatch)
+    assert _FakeCA.built[0].raw_pool == "1"
+    assert "AITER_CUSTOM_AR_RAW_INPUT_POOL" not in os.environ
+
+    monkeypatch.setenv("AITER_CUSTOM_AR_RAW_INPUT_POOL", "0")
+    _create(monkeypatch)
+    assert _FakeCA.built[1].raw_pool == "1"
+    assert os.environ["AITER_CUSTOM_AR_RAW_INPUT_POOL"] == "0", "restored"
 
 
 def test_a_large_bound_rounds_max_size_up_to_whole_mebibytes(fake_aiter, monkeypatch):
