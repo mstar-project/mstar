@@ -650,17 +650,19 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             enc = streamer.front(states, chunks, final, *self._pool(engine_inputs, ENCODER_FRONT))
         if enc is not None:
             runner = runners.get(self.LAYERS_REGION)
-            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(rids)):
-                counts = self._counts([enc.frames, enc.n], device)
-                y = runner.run(static_inputs={"x": enc.x, "frames": counts[0], "n": counts[1]},
-                               request_ids=rids)["y"]
-                y = [row[:n] for row, n in zip(y, enc.n, strict=True)]
+            new = [i for i, n in enumerate(enc.n) if n]
+            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(new)):
+                # only the calls with a frame: the region plans its own rows
+                counts = self._counts([[enc.frames[i] for i in new], [1] * len(new)], device)
+                y = runner.run(static_inputs={"x": torch.stack([enc.x[i] for i in new]),
+                                              "frames": counts[0], "n": counts[1]},
+                               request_ids=[rids[i] for i in new])["y"]
+                y = dict(zip(new, y, strict=True))
             else:
                 y = self._eager_layers(enc, *self._pool(engine_inputs, ENCODER_STATE), device)
             streamer.advance(states, enc)
-            for i, n in enumerate(enc.n):
-                if n:
-                    frames[i] = y[i]
+            for i in new:
+                frames[i] = y[i][: enc.n[i]]
 
         if steady:
             y = step_runner.run(

@@ -706,6 +706,23 @@ def test_encoder_live_steps_replay_the_regions_with_padding_rows():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
+def test_encoder_layer_region_runs_only_the_calls_with_a_frame():
+    """Calls one frame on take the whole-step region; the layer region then runs
+    only the other calls that got a frame, not every call of the step."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
+    layers = enc.regions[ConformerEncoderSubmodule.LAYERS_REGION]
+    rows, run, step = [], layers.run, enc.step
+    layers.run = lambda *a, request_ids, **k: rows.append(len(request_ids)) or run(*a, request_ids=request_ids, **k)
+    enc.step = lambda rids, inputs: rows.append(f"step of {len(rids)}") or step(rids, inputs)
+    wavs = {1: torch.randn(16000) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(16000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
+    # once calls 1 and 2 are one frame on, the layer region runs call 3 alone
+    assert rows[4:10] == ["step of 3", 1, "step of 3", "step of 3", 1, "step of 3"], rows
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
 def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
     """Every read and write of a pool's state, eager or in a region, uses the
     plan the pool holds at that moment, never one held across another plan:
