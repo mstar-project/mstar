@@ -390,6 +390,13 @@ def final_encoder_frames(config: ConformerSTTConfig, mels: int, samples: int, fi
     return (mels - 1) // config.subsampling_factor + 1
 
 
+def device_counts(values, device: torch.device) -> torch.Tensor:
+    """Host counts on the device without a blocking copy, which would wait for
+    every kernel queued ahead of this step."""
+    t = torch.tensor(values, dtype=torch.long)
+    return (t.pin_memory() if device.type == "cuda" else t).to(device, non_blocking=True)
+
+
 class EncoderInputs(NamedTuple):
     """A step's new encoder-input frames, ``x (B, t, D)`` zero-padded to the
     most any call got, and per call its frames before the step and new ones."""
@@ -459,7 +466,7 @@ class ConformerStreamer:
         else:
             # A strided stage reads one frame past a row's end, where a row on its own
             # reads the conv's zero padding: zero each stage's input past each row.
-            n = torch.tensor(lens, pin_memory=out.is_cuda).to(out.device, non_blocking=True).view(-1, 1, 1, 1)
+            n = device_counts(lens, out.device).view(-1, 1, 1, 1)
             for m in self.p.encoder.pre_encode.conv:
                 if isinstance(m, _CausalConv2d):
                     t = torch.arange(out.shape[2], device=out.device).view(1, 1, -1, 1)

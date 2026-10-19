@@ -47,7 +47,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
-from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState
+from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState, device_counts
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     ENCODER_FRONT,
@@ -614,18 +614,26 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         return pool, pool.addressing("main")
 
     @staticmethod
-    def _counts(values, device) -> torch.Tensor:
-        """Host counts on the device without a blocking copy, which would wait
-        for every kernel queued ahead of this step."""
-        t = torch.tensor(values, dtype=torch.long)
-        return (t.pin_memory() if device.type == "cuda" else t).to(device, non_blocking=True)
+    def _to_device(chunks: list, device: torch.device) -> list:
+        """The step's chunks on the device in one copy: a copy per call, from
+        pageable memory, would each wait for its transfer."""
+        host = [i for i, c in enumerate(chunks) if c is not None and c.device != device]
+        moved = list(chunks)
+        if host:
+            flat = torch.cat([chunks[i].reshape(-1) for i in host])
+            if device.type == "cuda":
+                flat = flat.pin_memory()
+            parts = flat.to(device, non_blocking=True).split([chunks[i].numel() for i in host])
+            for i, part in zip(host, parts, strict=True):
+                moved[i] = part
+        return moved
 
     def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, **kwargs):
         rids = list(engine_inputs.request_ids)
         device = self.perception.proj.weight.device
         streamer = self.streamer
         states = [self._stream_state(rid) for rid in rids]
-        chunks = [c.to(device, non_blocking=True) if c is not None else None for c in chunk]
+        chunks = self._to_device(chunk, device)
         final = list(final)
         runners = engine_inputs.piecewise_runners or {}
         frames: list[torch.Tensor | None] = [None] * len(rids)
@@ -666,7 +674,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             new = [i for i, n in enumerate(enc.n) if n]
             if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(new)):
                 # only the calls with a frame: the region plans its own rows
-                counts = self._counts([[enc.frames[i] for i in new], [1] * len(new)], device)
+                counts = device_counts([[enc.frames[i] for i in new], [1] * len(new)], device)
                 y = runner.run(static_inputs={"x": torch.stack([enc.x[i] for i in new]),
                                               "frames": counts[0], "n": counts[1]},
                                request_ids=[rids[i] for i in new])["y"]
@@ -680,7 +688,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         if steady:
             y = step_runner.run(
                 static_inputs={"chunk": torch.stack(steady_chunks),
-                               "frames": self._counts([states[i].frames for i in steady], device)},
+                               "frames": device_counts([states[i].frames for i in steady], device)},
                 request_ids=[rids[i] for i in steady],
             )["y"]
             for row, i in enumerate(steady):
@@ -700,7 +708,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
     def _eager_layers(self, enc, pool, rows, device) -> list[torch.Tensor]:
         """The layer stack eagerly over ``enc`` at ``rows``: each call's new frames."""
-        counts = self._counts([enc.frames, enc.n], device)
+        counts = device_counts([enc.frames, enc.n], device)
         y = self.streamer.layers(enc.x, pool, rows, counts[0], counts[1])
         return [row[:n] for row, n in zip(y, enc.n, strict=True)]
 

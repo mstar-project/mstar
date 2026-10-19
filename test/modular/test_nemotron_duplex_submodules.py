@@ -888,6 +888,20 @@ def test_encoder_decides_a_calls_steadiness_once_per_step(monkeypatch):
     assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls == 2
 
 
+def test_encoder_moves_a_steps_chunks_to_the_device_in_one_copy():
+    """Each call's chunk arrives on the host; one copy per call would each be a
+    blocking transfer from pageable memory, so the step copies them as one."""
+    from torch.profiler import ProfilerActivity, profile
+
+    chunks = [torch.randn(1280), None, torch.randn(640), torch.randn(1280)]
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        moved = ConformerEncoderSubmodule._to_device(chunks, torch.device("meta"))
+    copies = [e for e in prof.events() if e.name == "aten::_to_copy"]
+    assert len(copies) == 1
+    assert [None if c is None else (c.device.type, c.shape) for c in moved] == [
+        ("meta", (1280,)), None, ("meta", (640,)), ("meta", (1280,))]
+
+
 def test_encoder_offers_nothing_to_the_stop_check():
     """The encoder has no check_stop and its stream ends with the client's: its
     frames are not copied to the host every step for one."""
