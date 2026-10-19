@@ -123,8 +123,10 @@ SGLANG_COOKBOOK = "sglang v0.5.22 docs/cookbook/autoregressive/Qwen/Qwen3.5.mdx,
 SGLANG_CI = "sglang v0.5.22 test/registered/amd/accuracy/mi30x/test_qwen35_eval_amd.py (AMD CI launch flags)"
 
 ARMS: dict[str, Arm] = {a.name: a for a in [
+    # GLOO_SOCKET_IFNAME: on these nodes the hostname resolves to an IPv6 link-local address and gloo's connect
+    # between TP ranks times out; a host network setting, not a tuning knob.
     Arm("mstar", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai",
-        env={"MSTAR_SHM_ARENA": "1"},
+        env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="configs/<row>.yaml unchanged; MSTAR_SHM_ARENA=1 as .claude/skills/benchmarking asks for numbers"),
     Arm("vllm", "vllm", ("text",), client="vllm", image="vllm",
         recipe="image defaults (v0.31.0 picks ROCM_ATTN on gfx942, AITER off)"),
