@@ -346,8 +346,8 @@ class Qwen3_5VisionModel(nn.Module):
     def encode(
         self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     ) -> torch.Tensor:
-        """The block loop, ``[patches, hidden]`` in and out -- the part a
-        CUDA graph can hold (see ``VisionEncoderSubmodule``)."""
+        """The block loop, ``[patches, hidden]`` in and out -- the part an
+        accelerator graph can hold (see ``VisionEncoderSubmodule``)."""
         for block in self.blocks:
             hidden = block(hidden, cos, sin)
         return hidden

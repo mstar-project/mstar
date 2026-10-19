@@ -1260,10 +1260,10 @@ argument and returns a dict::
 
    capture_fn(inp: PiecewiseCallInputs) -> dict[str, Tensor]
 
-``PiecewiseCallInputs`` has four fields. ``static_inputs`` holds the buffers owned by the
+``PiecewiseCallInputs`` has three fields. ``static_inputs`` holds the buffers owned by the
 runner. ``engine_inputs`` is the region's view of the batch: request ids and per-request
 info padded to the capture bucket, plus the node's resources. ``kwargs`` is the config's
-``forward_kwargs``, unchanged. ``resources`` is a shortcut for
+``forward_kwargs``, unchanged. The ``resources`` property is a shortcut for
 ``engine_inputs.resources``. Capture and replay both use this same type, so a region
 cannot read a field that exists on only one of the two paths.
 
