@@ -908,6 +908,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">stat</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
@@ -1139,6 +1140,41 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1">#: Mooncake's wheel per CUDA major. All of them install the same ``mooncake``</span>
+<span class="c1">#: package; the default one is built for CUDA 12.</span>
+<span class="n">_MOONCAKE_WHEELS</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"12"</span><span class="p">:</span> <span class="s2">"mooncake-transfer-engine"</span><span class="p">,</span>
+    <span class="s2">"13"</span><span class="p">:</span> <span class="s2">"mooncake-transfer-engine-cuda13"</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_mooncake_install_hint</span><span class="p">(</span><span class="n">err</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">torch_cuda</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Say which Mooncake wheel loads next to this torch build."""</span>
+    <span class="n">major</span> <span class="o">=</span> <span class="n">torch_cuda</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">torch_cuda</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">want</span> <span class="o">=</span> <span class="n">_MOONCAKE_WHEELS</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">major</span><span class="p">)</span> <span class="k">if</span> <span class="n">major</span> <span class="k">else</span> <span class="s2">"mooncake-transfer-engine-non-cuda"</span>
+    <span class="n">missing</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">"libcudart\.so\.(\d+)"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">err</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">want</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">missing</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">want</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">err</span><span class="p">,</span> <span class="ne">ModuleNotFoundError</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span><span class="n">err</span><span class="o">.</span><span class="n">name</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"mooncake"</span><span class="p">):</span>
+            <span class="k">return</span> <span class="sa">f</span><span class="s2">"Install </span><span class="si">{</span><span class="n">want</span><span class="si">}</span><span class="s2"> or use SHM protocol."</span>
+        <span class="k">return</span> <span class="s2">"Install mooncake-transfer-engine or use SHM protocol."</span>
+    <span class="n">needed</span> <span class="o">=</span> <span class="n">missing</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">needed</span> <span class="o">==</span> <span class="n">major</span><span class="p">:</span>
+        <span class="n">fix</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="s2">"`pip install nvidia-cuda-runtime-cu12`"</span>
+            <span class="k">if</span> <span class="n">needed</span> <span class="o">==</span> <span class="s2">"12"</span>
+            <span class="k">else</span> <span class="sa">f</span><span class="s2">"put libcudart.so.</span><span class="si">{</span><span class="n">needed</span><span class="si">}</span><span class="s2"> on the library path"</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"torch is built for CUDA </span><span class="si">{</span><span class="n">torch_cuda</span><span class="si">}</span><span class="s2"> too, so </span><span class="si">{</span><span class="n">fix</span><span class="si">}</span><span class="s2">, or use SHM protocol."</span>
+    <span class="n">torch_desc</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"built for CUDA </span><span class="si">{</span><span class="n">torch_cuda</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">major</span> <span class="k">else</span> <span class="s2">"built without CUDA"</span>
+    <span class="n">have</span> <span class="o">=</span> <span class="n">_MOONCAKE_WHEELS</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">needed</span><span class="p">)</span>
+    <span class="n">uninstall</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"pip uninstall -y </span><span class="si">{</span><span class="n">have</span><span class="si">}</span><span class="s2"> &amp;&amp; "</span> <span class="k">if</span> <span class="n">have</span> <span class="k">else</span> <span class="s2">""</span>
+    <span class="k">return</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">"This Mooncake build needs the CUDA </span><span class="si">{</span><span class="n">needed</span><span class="si">}</span><span class="s2"> runtime, but torch is </span><span class="si">{</span><span class="n">torch_desc</span><span class="si">}</span><span class="s2">. "</span>
+        <span class="sa">f</span><span class="s2">"Switch to </span><span class="si">{</span><span class="n">want</span><span class="si">}</span><span class="s2">: `</span><span class="si">{</span><span class="n">uninstall</span><span class="si">}</span><span class="s2">pip install --force-reinstall --no-deps </span><span class="si">{</span><span class="n">want</span><span class="si">}</span><span class="s2">`, "</span>
+        <span class="s2">"or use SHM protocol."</span>
+    <span class="p">)</span>
+
+
 <div class="viewcode-block" id="MooncakeTransferEngine">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeTransferEngine">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MooncakeTransferEngine</span><span class="p">(</span><span class="n">TensorTransferEngine</span><span class="p">):</span>
@@ -1161,7 +1197,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">"Mooncake TransferEngine is required for RDMA/TCP protocol. "</span>
                 <span class="sa">f</span><span class="s2">"Failed to load mooncake: </span><span class="si">{</span><span class="n">detail</span><span class="si">}</span><span class="s2">. "</span>
-                <span class="s2">"Install mooncake-transfer-engine or use SHM protocol."</span>
+                <span class="o">+</span> <span class="n">_mooncake_install_hint</span><span class="p">(</span><span class="n">MOONCAKE_IMPORT_ERROR</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">cuda</span><span class="p">)</span>
             <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">:</span>

@@ -629,6 +629,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#libcudart-so-12-cannot-open-shared-object-file"><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -1102,6 +1103,25 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> leaves torch in place; pip may print a harmless warning that torch pins
 <code class="docutils literal notranslate"><span class="pre">9.20.0.48</span></code>. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.</p>
+</section>
+<section id="libcudart-so-12-cannot-open-shared-object-file">
+<h3><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code><a class="headerlink" href="#libcudart-so-12-cannot-open-shared-object-file" title="Link to this heading">#</a></h3>
+<p>Symptom: with <code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span> <span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>, startup fails with:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="ne">RuntimeError</span><span class="p">:</span> <span class="n">Mooncake</span> <span class="n">TransferEngine</span> <span class="ow">is</span> <span class="n">required</span> <span class="k">for</span> <span class="n">RDMA</span><span class="o">/</span><span class="n">TCP</span> <span class="n">protocol</span><span class="o">.</span> <span class="n">Failed</span> <span class="n">to</span> <span class="n">load</span>
+<span class="n">mooncake</span><span class="p">:</span> <span class="ne">ImportError</span><span class="p">:</span> <span class="n">libcudart</span><span class="o">.</span><span class="n">so</span><span class="mf">.12</span><span class="p">:</span> <span class="n">cannot</span> <span class="nb">open</span> <span class="n">shared</span> <span class="nb">object</span> <span class="n">file</span><span class="p">:</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p>The extras install <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>, Mooncake’s default wheel, which is built for
+CUDA 12. A CUDA 13 torch (<code class="docutils literal notranslate"><span class="pre">+cu130</span></code> or newer, which <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> picks on a
+CUDA 13 driver) doesn’t bring the CUDA 12 runtime, so the wheel can’t load. <code class="docutils literal notranslate"><span class="pre">SHM</span></code> is not
+affected.</p>
+<p>Fix: swap in Mooncake’s CUDA 13 build, which installs the same <code class="docutils literal notranslate"><span class="pre">mooncake</span></code> package:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>uninstall<span class="w"> </span>mooncake-transfer-engine
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--reinstall<span class="w"> </span>--no-deps<span class="w"> </span>mooncake-transfer-engine-cuda13
+</pre></div>
+</div>
+<p>Both wheels install the same files, so installing an extra again puts the CUDA 12 build back.
+Repeat the swap afterwards.</p>
 <p>Next: <a class="reference internal" href="quickstart.html"><span class="doc">Quickstart</span></a>.</p>
 </section>
 </section>
@@ -1172,6 +1192,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#libcudart-so-12-cannot-open-shared-object-file"><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code></a></li>
 </ul>
 </li>
 </ul>

@@ -505,4 +505,27 @@ Fix — complete the environment's own cuDNN so it never falls back to the syste
 ``--no-deps`` leaves torch in place; pip may print a harmless warning that torch pins
 ``9.20.0.48``. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.
 
+``libcudart.so.12: cannot open shared object file``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Symptom: with ``--tensor-comm-protocol TCP`` or ``RDMA``, startup fails with::
+
+   RuntimeError: Mooncake TransferEngine is required for RDMA/TCP protocol. Failed to load
+   mooncake: ImportError: libcudart.so.12: cannot open shared object file: ...
+
+The extras install ``mooncake-transfer-engine``, Mooncake's default wheel, which is built for
+CUDA 12. A CUDA 13 torch (``+cu130`` or newer, which ``--torch-backend=auto`` picks on a
+CUDA 13 driver) doesn't bring the CUDA 12 runtime, so the wheel can't load. ``SHM`` is not
+affected.
+
+Fix: swap in Mooncake's CUDA 13 build, which installs the same ``mooncake`` package:
+
+.. code-block:: bash
+
+   uv pip uninstall mooncake-transfer-engine
+   uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13
+
+Both wheels install the same files, so installing an extra again puts the CUDA 12 build back.
+Repeat the swap afterwards.
+
 Next: :doc:`quickstart`.
