@@ -20,6 +20,7 @@ pytest.importorskip("diffusers")
 from diffusers import UniPCMultistepScheduler  # noqa: E402
 
 from mstar.engine.engine import Engine  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
     VIDEO_GEN_AR_WALK,
@@ -121,7 +122,9 @@ def test_finished_request_re_queued_fails_alone_instead_of_asserting():
 
     batch = SimpleNamespace(
         node_name="dit", request_ids=[1, 2], graph_walk=VIDEO_GEN_AR_WALK,
-        step_context=SimpleNamespace(graph_walk=VIDEO_GEN_AR_WALK),
+        step_context=StepContext(
+            request_ids=[1, 2], graph_walk=VIDEO_GEN_AR_WALK, slot=0, capture=False,
+        ),
         per_request_info_wrapped={
             r: SimpleNamespace(request_id=f"req-{r}", rid_handle=r, random_seed=0)
             for r in (1, 2)
