@@ -2479,7 +2479,12 @@ def main(argv: list[str] | None = None):
             # uvicorn.run() inlined so the server object is reachable. The
             # message thread stops it when the conductor dies.
             server = uvicorn.Server(
-                uvicorn.Config(app, host=args.host, port=args.port, access_log=False)
+                uvicorn.Config(
+                    app, host=args.host, port=args.port, access_log=False,
+                    # /generate/ws streams PCM, which deflate barely shrinks;
+                    # compressing it cost the event loop ~8% at 32 live calls
+                    ws_per_message_deflate=False,
+                )
             )
 
             def _stop_server():

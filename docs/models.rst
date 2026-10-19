@@ -514,6 +514,10 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (inferred from those frames, not measured on served text); under the served
   bf16 a different chunking can flip a knife-edge frame such as the agent's
   turn start.
+- The encoder keeps each call's layer state (its attention keys / values and
+  conv inputs) in a recurrent-state pool, a slot per session; a live step, one
+  frame per call, replays its layer stack as a CUDA graph, and a step with more
+  frames (a one-shot upload, a large append) runs it eagerly.
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

@@ -28,6 +28,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
 )
 from mstar.engine.resources import (
     AttentionStep,
@@ -43,6 +47,7 @@ from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -429,14 +434,21 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     that a chunk of more than a second (an upload, a large append) runs in a
     pass of its own within the same engine step.
 
+    A call's layer state (attention keys / values, conv inputs) lives in the
+    ``ENCODER_STATE`` recurrent pool; its mel front end in its per-request
+    state. A live step gives every call at most one frame, and its layer stack
+    replays a CUDA graph (``LAYERS_REGION``); a step with more (a one-shot
+    request's whole clip, a large append, the call's end) runs it eagerly.
+
     Holds the perception stack plus the RNN-T decoder/joint (loaded; the
-    user-transcript channel is not emitted yet). Declares no resources: a
-    call's state lives in its per-request state.
+    user-transcript channel is not emitted yet).
     """
 
-    # Variable-length chunks; eager. Revisit (compile, capture) once the
-    # one-frame step dominates.
+    # Variable-length front end, eager; the layer stack is the captured region.
     disable_torch_compile = True
+
+    LAYERS_REGION = "conformer_layers"
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     STATE_KEY = "encoder_stream"         # a call's StreamState
     # Longest chunk batched with other calls': a pass pads every call to its
@@ -488,37 +500,113 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
+    @staticmethod
+    def _declare_layers(request_ids) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+            steps={ENCODER_STATE: RecurrentStep()},
+        )
+
+    def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
+                     **kwargs) -> SubmoduleStep:
+        # Always the eager path's addressing. When the step replays the region
+        # instead, the region admits, plans and commits the same slots under
+        # its own step; for this pool that only re-reads the slot table and
+        # marks the slots written twice, so the two need no coordination.
+        del graph_walk, inputs, slot_lease, piecewise_leases, kwargs
+        return self._declare_layers(request_ids)
+
+    @property
+    def streamer(self) -> ConformerStreamer:
+        if self._streamer is None:
+            self._streamer = ConformerStreamer(self.perception)
+        return self._streamer
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """The layer stack for one frame per call, which is every live step."""
+        del tp_world_size
+        d_model = self.perception.config.d_model
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            return {
+                "x": torch.zeros(shape.bs, 1, d_model, dtype=autocast_dtype, device=device),
+                "frames": torch.zeros(shape.bs, dtype=torch.long, device=device),
+                "n": torch.zeros(shape.bs, dtype=torch.long, device=device),
+            }
+
+        return {
+            self.LAYERS_REGION: PiecewiseBatchedConfig(
+                capture_fn=self._layers_region,
+                make_static_inputs=make_static_inputs,
+                declare_step=lambda request_ids, seq_lens: self._declare_layers(request_ids),
+                seq_len=1,
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
+        }
+
+    def _layers_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        pool = call.resources[ENCODER_STATE]
+        s = call.static_inputs
+        return {"y": self.streamer.layers(s["x"], pool, pool.addressing("main"), s["frames"], s["n"])}
+
     def _stream_state(self, rid, device) -> StreamState:
         state = self.request_state(rid)
         st = state.get(self.STATE_KEY)
         if st is None:
-            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else torch.float32
-            st = StreamState(self.perception.config, self.max_session_samples, device, dtype)
+            st = StreamState(self.perception.config, self.max_session_samples, device)
             state.add(self.STATE_KEY, st)
         return st
 
     def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs):
-        if self._streamer is None:
-            self._streamer = ConformerStreamer(self.perception)
         rids = list(engine_inputs.request_ids)
         device = self.perception.proj.weight.device
         states = [self._stream_state(rid, device) for rid in rids]
         chunks = [c.to(device) if c is not None else None for c in chunk]
+        final = list(final)
         longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
-        alone = [c is not None and c.numel() > longest for c in chunks]
-        shared = [i for i, a in enumerate(alone) if not a]
         frames: list[torch.Tensor | None] = [None] * len(rids)
-        for rows in [[i] for i, a in enumerate(alone) if a] + ([shared] if shared else []):
-            step = self._streamer.step([states[i] for i in rows], [chunks[i] for i in rows], [final[i] for i in rows])
-            for i, f in zip(rows, step, strict=True):
-                frames[i] = f
+        pool = engine_inputs.resources[ENCODER_STATE]
+        # A step pads every call to its longest chunk, so a chunk of more than a
+        # second (an upload, a large append) runs alone, on its own row of the
+        # plan; the batched pass then leaves that call as it is.
+        for i, c in enumerate(chunks):
+            if c is not None and c.numel() > longest:
+                enc = self.streamer.front([states[i]], [c], [final[i]])
+                if enc is not None:
+                    frames[i] = self._eager_layers(enc, pool, pool.addressing("main").narrow(i), device)[0]
+                    self.streamer.advance([states[i]], enc)
+                chunks[i], final[i] = None, False
+        enc = self.streamer.front(states, chunks, final)
+        if enc is not None:
+            runner = (engine_inputs.piecewise_runners or {}).get(self.LAYERS_REGION)
+            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(rids)):
+                counts = torch.tensor([enc.frames, enc.n], dtype=torch.long)
+                y = runner.run(static_inputs={"x": enc.x, "frames": counts[0], "n": counts[1]},
+                               request_ids=rids)["y"]
+                y = [row[:n] for row, n in zip(y, enc.n, strict=True)]
+            else:
+                y = self._eager_layers(enc, pool, pool.addressing("main"), device)
+            self.streamer.advance(states, enc)
+            for i, n in enumerate(enc.n):
+                if n:
+                    frames[i] = y[i]
         # One stream item per frame: a single (T, H) tensor would be ONE item,
         # which the chunk policy could not slice. No check_stop, so nothing to
         # copy to the host for one.
         return BatchedModelOutput(
-            per_rid_outputs={rid: {"audio_frame": list(f)} for rid, f in zip(rids, frames, strict=True)},
+            per_rid_outputs={rid: {"audio_frame": [] if f is None else list(f)}
+                             for rid, f in zip(rids, frames, strict=True)},
             check_stop_buffers={},
         )
+
+    def _eager_layers(self, enc, pool, rows, device) -> list[torch.Tensor]:
+        """The layer stack eagerly over ``enc`` at ``rows``: each call's new frames."""
+        counts = torch.tensor([enc.frames, enc.n], dtype=torch.long).to(device, non_blocking=True)
+        y = self.streamer.layers(enc.x, pool, rows, counts[0], counts[1])
+        return [row[:n] for row, n in zip(y, enc.n, strict=True)]
 
     def forward(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs) -> NameToTensorList:
         # one call's step: preprocess's lists of one row

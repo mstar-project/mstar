@@ -69,8 +69,10 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
+from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -403,7 +405,8 @@ class NemotronDuplexModel(Model):
     # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
     # positions; each session holds two streams (labels ``main`` / ``uncond``)
     # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. The encoder and the codec declare nothing.
+    # passes at call time. conformer_encoder: a recurrent-state pool holding
+    # each call's layer state (one slot per session). The codec declares nothing.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
@@ -470,6 +473,15 @@ class NemotronDuplexModel(Model):
             num_qo_heads=nano.num_attention_heads,
         )
         return [
+            RecurrentStateSpec(
+                resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
+                config=RecurrentStateConfig(
+                    num_layers=self.config.stt.num_layers,
+                    # bf16, the engine's autocast dtype, which the layers compute the state in
+                    blocks=encoder_state_blocks(self.config.stt, torch.bfloat16),
+                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                ),
+            ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(
                 resource_key=NANO_ATTN, nodes={"nano_llm"},

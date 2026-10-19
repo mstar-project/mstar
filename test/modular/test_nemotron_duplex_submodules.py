@@ -11,10 +11,17 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks
 from mstar.model.nemotron_duplex.config import (
+    ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -28,7 +35,7 @@ from mstar.model.nemotron_duplex.submodules import (
     ConformerEncoderSubmodule,
     NemotronHLLMSubmodule,
 )
-from mstar.model.submodule_base import BatchedModelOutput
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
 
 H = 8
 
@@ -470,40 +477,117 @@ def _small_perception():
     return p.eval()
 
 
-def _make_encoder(max_session_samples=16000 * 10) -> ConformerEncoderSubmodule:
-    return ConformerEncoderSubmodule(_small_perception(), nn.Identity(), nn.Identity(),
-                                     config=NemotronDuplexConfig(), max_session_samples=max_session_samples)
+class _Encoder:
+    """The encoder node with its state pool, driven as the engine drives an
+    eager step: declare, admit and plan the pool, preprocess, forward, commit."""
+
+    def __init__(self, max_session_samples=16000 * 10):
+        p = _small_perception()
+        self.node = ConformerEncoderSubmodule(p, nn.Identity(), nn.Identity(), config=NemotronDuplexConfig(),
+                                              max_session_samples=max_session_samples)
+        spec = RecurrentStateSpec(ENCODER_STATE, {"conformer_encoder"}, RecurrentStateConfig(
+            num_layers=p.config.num_layers, blocks=encoder_state_blocks(p.config, torch.float32), max_slots=8))
+        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+        self.runner = StepRunner({ENCODER_STATE: self.pool})
+        self.region = None      # a stand-in for the piecewise runner, when a test sets one
+
+    def prepare(self, handle, chunk, final=False):
+        inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
+        return self.node.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs,
+                                        is_final_stream_chunk=final)
+
+    def step(self, rids, inputs) -> BatchedModelOutput:
+        for rid in rids:
+            self.pool.ingest_request(rid)
+        step = self.node.declare_step("encode", rids, inputs)
+        step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
+        assert self.runner.admit(step).ok
+        self.runner.plan(step)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=list(rids), per_request_info={}, resources={ENCODER_STATE: self.pool},
+            piecewise_runners={} if self.region is None else {ConformerEncoderSubmodule.LAYERS_REGION: self.region},
+        )
+        with torch.no_grad():
+            out = self.node.forward_batched("encode", engine_inputs,
+                                            **self.node.preprocess("encode", engine_inputs, inputs))
+        self.runner.commit(step)
+        return out
+
+    def encode(self, handle, chunk, final=False):
+        """One step for one call: what the stream hands the node, then its frames."""
+        return self.step([handle], [self.prepare(handle, chunk, final)]).per_rid_outputs[handle]["audio_frame"]
+
+    def offline(self, wav):
+        with torch.no_grad():
+            return self.node.perception(wav.unsqueeze(0), torch.tensor([wav.numel()]))[0][0]
 
 
-def _prepare(enc, handle, chunk, final=False):
-    inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
-    return enc.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs, is_final_stream_chunk=final)
+class _EagerRegion:
+    """The engine's piecewise runner on CPU: the same bucket padding, region
+    declaration and admit / plan / commit around the region, with the captured
+    callable run eagerly."""
 
+    def __init__(self, enc: _Encoder, bs: int):
+        self.enc, self.bs, self.calls = enc, bs, 0
+        self.config = enc.node.get_piecewise_accelerator_graph_configs(
+            torch.device("cpu"), torch.float32)[ConformerEncoderSubmodule.LAYERS_REGION]
+        self.dummies = [f"__pad_{i}__" for i in range(bs)]
+        for rid in self.dummies:
+            enc.pool.ingest_request(rid)
 
-def _encode(enc, handle, chunk, final=False):
-    """One encoder step for one call, as the engine runs one unbatched:
-    prepare_inputs, preprocess, forward."""
-    ni = _prepare(enc, handle, chunk, final)
-    eng = SimpleNamespace(request_ids=[handle])
-    with torch.no_grad():
-        out = enc.forward("encode", eng, **enc.preprocess("encode", eng, [ni]))
-    return out["audio_frame"]
+    def can_run(self, batch_size):
+        return batch_size <= self.bs
+
+    def run(self, static_inputs, request_ids):
+        self.calls += 1
+        n = len(request_ids)
+        static = self.config.make_static_inputs(PiecewiseCaptureShape(bs=self.bs, seq_lens=[1] * self.bs,
+                                                                      total_tokens=self.bs))
+        for name, value in static_inputs.items():
+            static[name][:n].copy_(value)
+        ids = [*request_ids, *self.dummies[n:]]
+        step = self.config.declare_step(ids, [1] * self.bs)
+        ctx = StepContext(request_ids=tuple(request_ids), graph_walk="pw", slot=0, capture=False,
+                          slot_lease=SlotLease(slot=0, bucket=BucketKey("pw", self.bs, self.bs)))
+        ctx.set_padded_rids(tuple(ids))
+        step.set_ctx(ctx)
+        assert self.enc.runner.admit(step).ok
+        self.enc.runner.plan(step)
+        out = self.config.capture_fn(PiecewiseCallInputs(
+            static_inputs=static,
+            engine_inputs=ModelInputsFromEngine(request_ids=ids, per_request_info={},
+                                                resources={ENCODER_STATE: self.enc.pool}),
+        ))
+        self.enc.runner.commit(step)
+        return {name: value[:n].clone() for name, value in out.items()}
 
 
 def _encode_batch(enc, steps):
     """One batched encoder step, as the engine runs it: each ``(handle, chunk,
-    final)`` row through prepare_inputs, then one preprocess and forward_batched
-    over all of them. Returns each row's frames by handle."""
-    nis = [_prepare(enc, h, c, f) for h, c, f in steps]
-    eng = SimpleNamespace(request_ids=[h for h, _c, _f in steps])
-    with torch.no_grad():
-        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, nis))
-    return {h: out.per_rid_outputs[h]["audio_frame"] for h, _c, _f in steps}
+    final)`` row through prepare_inputs, then one step over all of them.
+    Returns each row's frames by handle."""
+    out = enc.step([h for h, _c, _f in steps], [enc.prepare(h, c, f) for h, c, f in steps]).per_rid_outputs
+    return {h: out[h]["audio_frame"] for h, _c, _f in steps}
 
 
-def _offline(enc, wav):
-    with torch.no_grad():
-        return enc.perception(wav.unsqueeze(0), torch.tensor([wav.numel()]))[0][0]
+def _stream(enc, wavs, sizes):
+    """Stream each call in its own chunk size, every call with audio left in
+    each step, then end them all; the frames each call got."""
+    got = {h: [] for h in wavs}
+    pos = dict.fromkeys(wavs, 0)
+    while any(pos[h] < wavs[h].numel() for h in wavs):
+        rids, inputs = [], []
+        for h in wavs:
+            if pos[h] < wavs[h].numel():
+                inputs.append(enc.prepare(h, wavs[h][pos[h]:pos[h] + sizes[h]]))
+                pos[h] += sizes[h]
+                rids.append(h)
+        out = enc.step(rids, inputs).per_rid_outputs
+        for h in rids:
+            got[h] += out[h]["audio_frame"]
+    for h in wavs:
+        got[h] += enc.encode(h, None, final=True)
+    return got
 
 
 @pytest.mark.parametrize("end_rides_last_chunk", [False, True])
@@ -514,51 +598,47 @@ def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
     is): the frames emitted in order are the offline encoding of the call, and
     the mel frames the offline featurizer's, the reflected right edge included
     (a length on the hop grid is the one whose last frame reads it)."""
-    enc = _make_encoder()
+    enc = _Encoder()
     wav = torch.randn(n) * 0.1
-    want = _offline(enc, wav)
+    want = enc.offline(wav)
     with torch.no_grad():
-        mel = enc.perception.preprocessor(wav.unsqueeze(0), torch.tensor([n]))[0][0].T
+        mel = enc.node.perception.preprocessor(wav.unsqueeze(0), torch.tensor([n]))[0][0].T
     for handle, size in enumerate((320, 1280, 2560, 9000, 64000)):
         got = []
         for at in range(0, wav.numel(), size):
             last = at + size >= wav.numel()
-            got += _encode(enc, handle, wav[at:at + size], final=last and end_rides_last_chunk)
+            got += enc.encode(handle, wav[at:at + size], final=last and end_rides_last_chunk)
         if not end_rides_last_chunk:
-            got += _encode(enc, handle, None, final=True)
+            got += enc.encode(handle, None, final=True)
         assert len(got) == want.shape[0]
         assert torch.allclose(torch.stack(got), want, atol=1e-5), size
-        st = enc.request_state(handle).get(enc.STATE_KEY)
+        st = enc.node.request_state(handle).get(enc.node.STATE_KEY)
         assert st.mels == mel.shape[0]
         assert torch.allclose(st.mel[:st.mels], mel, atol=1e-5), size
 
 
 def test_encoder_batches_calls_at_different_points():
-    """Two calls in one step, each with its own chunking, each get their own
-    offline frames."""
-    enc = _make_encoder()
-    a, b = torch.randn(16000 * 2) * 0.1, torch.randn(16000 * 3) * 0.1
-    got = {1: [], 2: []}
-    pos = {1: 0, 2: 0}
-    size = {1: 1280, 2: 4000}
-    wav = {1: a, 2: b}
-    while any(pos[h] < wav[h].numel() for h in (1, 2)):
-        rids, chunks, finals = [], [], []
-        for h in (1, 2):
-            if pos[h] < wav[h].numel():
-                ni = _prepare(enc, h, wav[h][pos[h]:pos[h] + size[h]])
-                pos[h] += size[h]
-                rids.append(h)
-                chunks.append(ni.tensor_inputs["chunk"])
-                finals.append(False)
-        with torch.no_grad():
-            out = enc.forward_batched("encode", SimpleNamespace(request_ids=rids), chunk=chunks, final=finals)
-        for h in rids:
-            got[h] += out.per_rid_outputs[h]["audio_frame"]
-    for h in (1, 2):
-        got[h] += _encode(enc, h, None, final=True)
-        want = _offline(enc, wav[h])
-        assert torch.allclose(torch.stack(got[h]), want, atol=1e-5)
+    """Calls in one step, each with its own chunking (one frame a step, several,
+    or none), each get their own offline frames."""
+    enc = _Encoder()
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000 * 3) * 0.1, 3: torch.randn(9000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 4000, 3: 320})
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_live_steps_replay_the_region_with_padding_rows():
+    """One frame a call a step replays the layer region, in a bucket wider than
+    the batch: the calls get their offline frames and the padding rows, which
+    address the pool's sink, leave them alone. A call under a frame a step
+    rides the region with no new frame."""
+    enc = _Encoder()
+    enc.region = _EagerRegion(enc, bs=4)
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
+    assert enc.region.calls >= 25
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
 @pytest.mark.parametrize("b_end_rides", [False, True])
@@ -567,11 +647,11 @@ def test_encoder_batches_calls_at_different_points():
 def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, b_end_rides):
     """Call B ends in the same step as call A's longer chunk, A still mid-call:
     B's last frames, which read past its audio, are still its offline ones."""
-    enc = _make_encoder()
+    enc = _Encoder()
     starts = list(range(0, b_len, 1280))
     steps = len(starts) + (0 if b_end_rides else 1)
     a, b = torch.randn(a_chunk * steps) * 0.1, torch.randn(b_len) * 0.1
-    enc.max_session_samples = a.numel()
+    enc.node.max_session_samples = a.numel()
     got_b = []
     for k, pb in enumerate(starts):
         b_final = b_end_rides and k == len(starts) - 1
@@ -579,39 +659,44 @@ def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, 
         got_b += _encode_batch(enc, rows)[2]
     if not b_end_rides:
         got_b += _encode_batch(enc, [(1, a[-a_chunk:], False), (2, None, True)])[2]
-    want = _offline(enc, b)
+    want = enc.offline(b)
     assert len(got_b) == want.shape[0]
     assert torch.allclose(torch.stack(got_b), want, atol=1e-5)
 
 
 def test_encoder_runs_a_chunk_over_a_second_in_a_pass_of_its_own():
-    """A streamer pass pads every call to its longest chunk: an upload or a large
-    append runs alone, and only the calls with a second or less share a pass."""
-    enc = _make_encoder()
-    enc.forward_batched("encode", SimpleNamespace(request_ids=[]), chunk=[], final=[])   # builds the streamer
-    steps = []
-    step = enc._streamer.step
-    enc._streamer.step = lambda sts, chunks, final: steps.append(
-        sorted(0 if c is None else c.numel() for c in chunks)) or step(sts, chunks, final)
+    """A pass pads every call to its longest chunk: an upload or a large append
+    runs alone, on its own row of the step's plan, and only the calls with a
+    second or less share a pass, whose layers then take at most a second of
+    frames per call."""
+    enc = _Encoder()
+    streamer, fronts, layers = enc.node.streamer, [], []
+    front, layer_stack = streamer.front, streamer.layers
+
+    def spy_front(sts, chunks, final, *rest):
+        fronts.append(sorted(c.numel() for c in chunks if c is not None))
+        return front(sts, chunks, final, *rest)
+
+    def spy_layers(x, pool, rows, *rest):
+        layers.append((x.shape[0], x.shape[1], rows.num_rows))
+        return layer_stack(x, pool, rows, *rest)
+
+    streamer.front, streamer.layers = spy_front, spy_layers
     wav = {1: torch.randn(16000 * 5) * 0.1, 2: torch.randn(1280) * 0.1, 3: torch.randn(16001) * 0.1,
            4: torch.randn(16000) * 0.1}
-    ni = [_prepare(enc, h, w, final=True) for h, w in wav.items()]
-    eng = SimpleNamespace(request_ids=list(wav))
-    with torch.no_grad():
-        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, ni))
-    assert sorted(steps) == [[1280, 16000], [16001], [16000 * 5]]
+    out = _encode_batch(enc, [(h, w, True) for h, w in wav.items()])
+    assert sorted(fronts) == [[1280, 16000], [16001], [16000 * 5]]
+    assert all(b == rows for b, _t, rows in layers)
+    assert max(t for b, t, _rows in layers if b > 1) == len(out[4])     # the widest call of a second or less
     for h, w in wav.items():
-        assert torch.allclose(torch.stack(out.per_rid_outputs[h]["audio_frame"]), _offline(enc, w), atol=1e-5)
+        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
 
 
 def test_encoder_offers_nothing_to_the_stop_check():
     """The encoder has no check_stop and its stream ends with the client's: its
     frames are not copied to the host every step for one."""
-    enc = _make_encoder()
-    ni = _prepare(enc, 1, torch.randn(4000) * 0.1)
-    eng = SimpleNamespace(request_ids=[1])
-    with torch.no_grad():
-        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, [ni]))
+    enc = _Encoder()
+    out = enc.step([1], [enc.prepare(1, torch.randn(4000) * 0.1)])
     assert isinstance(out, BatchedModelOutput) and out.check_stop_buffers == {}
     assert len(out.per_rid_outputs[1]["audio_frame"]) > 0
 
@@ -619,32 +704,32 @@ def test_encoder_offers_nothing_to_the_stop_check():
 def test_encoder_projects_the_relative_positions_once_per_layer():
     """The positions a query can see are fixed, so each layer's projection of
     them is computed once, not every step."""
-    enc = _make_encoder()
+    enc = _Encoder()
     calls = []
-    for layer in enc.perception.encoder.layers:
+    for layer in enc.node.perception.encoder.layers:
         layer.self_attn.linear_pos.register_forward_hook(lambda *a: calls.append(1))
     wav = torch.randn(16000) * 0.1
     for at in range(0, wav.numel(), 1280):
-        _encode(enc, 1, wav[at:at + 1280])
-    assert len(calls) == len(enc.perception.encoder.layers)
+        enc.encode(1, wav[at:at + 1280])
+    assert len(calls) == len(enc.node.perception.encoder.layers)
 
 
 def test_encoder_waits_for_enough_audio_to_featurize():
-    enc = _make_encoder()
-    assert _encode(enc, 1, torch.zeros(10)) == []
+    enc = _Encoder()
+    assert enc.encode(1, torch.zeros(10)) == []
 
 
 @pytest.mark.parametrize("n", [257, 1000, 1279, 1281])
 def test_encoder_a_short_call_gets_the_offline_frames(n):
     """Offline encodes any call longer than n_fft/2 samples, under one frame too."""
-    enc = _make_encoder()
+    enc = _Encoder()
     wav = torch.randn(n) * 0.1
-    want = _offline(enc, wav)
+    want = enc.offline(wav)
     for handle, size in enumerate((100, n)):
         got = []
         for at in range(0, n, size):
-            got += _encode(enc, handle, wav[at:at + size])
-        got += _encode(enc, handle, None, final=True)
+            got += enc.encode(handle, wav[at:at + size])
+        got += enc.encode(handle, None, final=True)
         assert len(got) == want.shape[0]
         assert torch.allclose(torch.stack(got), want, atol=1e-5), size
 
@@ -653,16 +738,20 @@ def test_encoder_a_short_call_gets_the_offline_frames(n):
 def test_encoder_fails_a_call_that_ends_without_enough_audio(chunks):
     """No audio, or no more than n_fft/2 samples (which offline can't featurize):
     the call fails rather than reply to nothing."""
-    enc = _make_encoder()
+    enc = _Encoder()
     for chunk in chunks:
-        _encode(enc, 1, chunk)
+        enc.encode(1, chunk)
     with pytest.raises(ValueError, match="ended with"):
-        _encode(enc, 1, None, final=True)
+        enc.encode(1, None, final=True)
 
 
 def test_encoder_state_is_per_call_and_cleaned_up():
-    enc = _make_encoder()
-    _encode(enc, 1, torch.randn(4000) * 0.1)
-    _encode(enc, 2, torch.randn(4000) * 0.1)
-    enc.cleanup_request(1)
-    assert 1 not in enc.request_states and 2 in enc.request_states
+    enc = _Encoder()
+    free = enc.pool.num_free_slots
+    enc.encode(1, torch.randn(4000) * 0.1)
+    enc.encode(2, torch.randn(4000) * 0.1)
+    assert enc.pool.num_free_slots == free - 2
+    enc.node.cleanup_request(1)
+    enc.pool.remove_request(1)
+    assert 1 not in enc.node.request_states and 2 in enc.node.request_states
+    assert enc.pool.num_free_slots == free - 1

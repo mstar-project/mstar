@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttn
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
 from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
+    ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -71,13 +72,23 @@ def test_duplex_node_resources():
     planned on it (NoPE: no position resource), a recurrent pool holding the 27
     Mamba-2 layers' conv + SSM state with the Mamba-2 resource planned on it,
     and one text sampler; the talker a paged KV over its 28 layers with attention
-    and RoPE positions. The encoder and the codec own no engine resource."""
+    and RoPE positions; the encoder a recurrent pool holding each call's layer
+    state, a slot per session. The codec owns no engine resource."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
+    assert set(by_key) == {ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER,
+                           TALKER_KV, TALKER_ATTN, TALKER_POS}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
-    assert all(spec.nodes == ({"nano_llm"} if spec.resource_key in nano_keys else {"eartts_talker"}) for spec in specs)
+    node = {ENCODER_STATE: {"conformer_encoder"}, **dict.fromkeys(nano_keys, {"nano_llm"})}
+    assert all(spec.nodes == node.get(spec.resource_key, {"eartts_talker"}) for spec in specs)
+
+    stt = model.config.stt
+    enc = by_key[ENCODER_STATE]
+    assert isinstance(enc, RecurrentStateSpec) and enc.config.num_layers == stt.num_layers
+    assert enc.config.blocks["k"].shape == (stt.num_heads, stt.att_context_size[0], stt.head_dim)
+    assert enc.config.blocks["conv"].shape == (stt.d_model, stt.conv_kernel_size - 1)
+    assert enc.config.usable_slots == model.DEFAULT_MAMBA_SLOTS
 
     eartts = model.config.eartts
     tkv = by_key[TALKER_KV]

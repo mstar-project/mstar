@@ -65,6 +65,20 @@ class RecurrentAddressing:
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
 
+    def narrow(self, start: int, length: int = 1) -> RecurrentAddressing:
+        """Rows ``start .. start + length`` of the step, for a forward that runs
+        them apart from the rest (a long row that would pad the others). Views
+        of this plan: valid exactly as long as it is."""
+        end = start + length
+        assert 0 <= start < end <= self.num_rows, f"rows {start}..{end} of a step of {self.num_rows}"
+        return RecurrentAddressing(
+            slot_indices=self.slot_indices[start:end],
+            has_state=self.has_state[start:end],
+            num_rows=length,
+            host_slot_indices=None if self.host_slot_indices is None else self.host_slot_indices[start:end],
+            host_has_state=None if self.host_has_state is None else self.host_has_state[start:end],
+        )
+
 
 class RecurrentStatePool(Resource):
     @classmethod
@@ -137,6 +151,22 @@ class RecurrentStatePool(Resource):
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
+
+    def gather(self, name: str, rows: RecurrentAddressing, layer_idx: int = 0) -> torch.Tensor:
+        """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
+
+        ``rows`` is the step's addressing (``addressing``), so a captured and an
+        eager forward address their slots the same way; padding rows read the
+        sink."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        return self._blocks[name][layer_idx].index_select(0, index)
+
+    def scatter_(
+        self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,
+    ) -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of these rows' slots."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        self._blocks[name][layer_idx].index_copy_(0, index, value)
 
     @property
     def num_free_slots(self) -> int:

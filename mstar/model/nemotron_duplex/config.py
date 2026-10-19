@@ -30,6 +30,7 @@ TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
 TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
 TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
 AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
+ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder layer state
 
 
 def session_too_long(max_session_s: float) -> ValueError:
