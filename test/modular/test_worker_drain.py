@@ -109,7 +109,10 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
         batch=ScheduledBatch(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
-        node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}, cached_rids=set()),
+        node_batch=SimpleNamespace(
+            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            final_stream_rids={7}, stream_partition_done_rids={7},
+        ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
     outputs = BatchedModelOutput(per_rid_outputs={7: {}})
@@ -134,6 +137,8 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert outputs.per_rid_outputs == {}
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
+    assert pending.node_batch.final_stream_rids == set()
+    assert pending.node_batch.stream_partition_done_rids == set()
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])

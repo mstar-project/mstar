@@ -110,3 +110,4 @@ test/modular/test_kokoro_chunk_loop.py
 test/modular/test_transcription_utf8.py
 test/modular/test_admit_refusal_recovery.py
 test/modular/test_qwen3_omni_code2wav_stream.py
+test/modular/test_dropped_row_stream_stop.py

@@ -275,25 +275,25 @@ class ExecutingBatch:
     )
     # rids for which this step ends every finite stream into the node; the
     # consumer flushes what it held back
-    final_stream_rids: set[str] = field(default_factory=set)
+    final_stream_rids: set[int] = field(default_factory=set)
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
-    stream_partition_done_rids: set[str] = field(default_factory=set)
+    stream_partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
-    skipped_rids: set[str] = field(default_factory=set)
+    skipped_rids: set[int] = field(default_factory=set)
     # rids whose whole walk this node's resources already hold. They run no
     # forward, but their node still completes so the request reaches its next walk.
     cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
-    failed_requests: dict[str, str] = field(default_factory=dict)
+    failed_requests: dict[int, str] = field(default_factory=dict)
 
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
@@ -383,14 +383,18 @@ class ExecutingBatch:
         self.outputs_ready.set()
         self.commit_done.set()
 
-    def register_failure(self, rid: str, error: Exception):
+    def register_failure(self, rid: int, error: Exception):
         self.failed_requests[rid] = f"{type(error).__name__}: {error}"
 
-    def drop_rids(self, rids: set[str]):
+    def drop_rids(self, rids: set[int]):
         """Take rids out of the step, leaving the rest of the batch intact."""
         if not rids:
             return
         self.request_ids = [rid for rid in self.request_ids if rid not in rids]
+        # A row that does not run this step must not end its streams on it:
+        # the worker would stop its loop and finalize a row it no longer has.
+        self.final_stream_rids.difference_update(rids)
+        self.stream_partition_done_rids.difference_update(rids)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
