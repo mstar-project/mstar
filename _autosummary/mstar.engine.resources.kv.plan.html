@@ -637,6 +637,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.begin_plan"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing.begin_plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.take"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing.take()</span></code></a></li>
 </ul>
 </li>
@@ -698,7 +699,7 @@ consumer depends on the contract rather than on the cache.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PagedIndptrs</span></code></a>(qo_indptr, paged_kv_indptr, ...)</p></td>
 <td><p>The four int32 index tensors a FlashInfer prefill/decode wrapper's <code class="docutils literal notranslate"><span class="pre">plan</span></code> consumes, built on CPU (so wrapper.plan's <code class="docutils literal notranslate"><span class="pre">.to(&quot;cpu&quot;)</span></code> is a no-op — see <code class="docutils literal notranslate"><span class="pre">FlashInferAttentionManager.plan</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PinnedIndexRing" title="mstar.engine.resources.kv.plan.PinnedIndexRing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PinnedIndexRing</span></code></a>([numel, depth])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PinnedIndexRing" title="mstar.engine.resources.kv.plan.PinnedIndexRing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PinnedIndexRing</span></code></a>([numel, depth, per_plan])</p></td>
 <td><p>A ring of page-locked int32 host buffers for the index arrays a plan hands FlashInfer, so its <code class="docutils literal notranslate"><span class="pre">copy_(non_blocking=True)</span></code> calls are really asynchronous (from pageable memory the driver stages each one).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SequenceView</span></code></a>(request_id, label, page_idxs, ...)</p></td>
@@ -875,25 +876,40 @@ no-op — see <code class="docutils literal notranslate"><span class="pre">Flash
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PinnedIndexRing">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">PinnedIndexRing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">numel</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4096</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">depth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PinnedIndexRing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PinnedIndexRing" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">PinnedIndexRing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">numel</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4096</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">depth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_plan</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PinnedIndexRing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PinnedIndexRing" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A ring of page-locked int32 host buffers for the index arrays a plan
 hands FlashInfer, so its <code class="docutils literal notranslate"><span class="pre">copy_(non_blocking=True)</span></code> calls are really
 asynchronous (from pageable memory the driver stages each one).</p>
-<p><code class="docutils literal notranslate"><span class="pre">take</span></code> fills the next buffer and returns a view of it. A buffer is
-rewritten only after the copies out of it have completed: the stream a
-plan ran on records an event when the next <code class="docutils literal notranslate"><span class="pre">take</span></code> happens on that
-stream (by then the plan’s copies were issued), and a slot waits on its
-event before reuse. Plans do not overlap, so one pending slot suffices.
-Without CUDA the buffers are plain tensors and nothing is recorded.</p>
+<p>The ring holds <code class="docutils literal notranslate"><span class="pre">depth</span></code> buffer sets, one per plan. <code class="docutils literal notranslate"><span class="pre">begin_plan</span></code> moves to
+the next set, and each <code class="docutils literal notranslate"><span class="pre">take</span></code> until the next <code class="docutils literal notranslate"><span class="pre">begin_plan</span></code> fills a buffer
+of that set no other take uses (the set grows if needed), so every label
+of a plan keeps its arrays (four takes each) however many labels there
+are. A set is rewritten only after the copies out of it have completed:
+the next <code class="docutils literal notranslate"><span class="pre">begin_plan</span></code> records an event on the stream the plan ran on (by
+then the plan’s copies, and its consumers’, were issued), and a set waits
+on its event before reuse. Plans do not overlap, so one pending set
+suffices. Without CUDA the buffers are plain tensors and nothing is
+recorded.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>numel</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>depth</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>per_plan</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PinnedIndexRing.begin_plan">
+<span class="sig-name descname"><span class="pre">begin_plan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PinnedIndexRing.begin_plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.begin_plan" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PinnedIndexRing.take">
 <span class="sig-name descname"><span class="pre">take</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PinnedIndexRing.take"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.take" title="Link to this definition">#</a></dt>
@@ -1097,6 +1113,7 @@ will read <cite>plan</cite> output of KV</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.begin_plan"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing.begin_plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PinnedIndexRing.take"><code class="docutils literal notranslate"><span class="pre">PinnedIndexRing.take()</span></code></a></li>
 </ul>
 </li>

@@ -968,7 +968,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="kv_plan_cache">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_plan_cache">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">kv_plan_cache</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager plans a leased</span>
 <span class="sd">    decode step from the previous step's plan when the batch is the same</span>
 <span class="sd">    rows in the same order and nothing but that step's commit touched the</span>
 <span class="sd">    streams: lengths advance by one, pages change only where a row crossed</span>
@@ -983,14 +983,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="kv_pinned_indptrs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_pinned_indptrs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">kv_pinned_indptrs</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_KV_PINNED_INDPTRS`` (default 0): the KV plan writes FlashInfer's</span>
 <span class="sd">    index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a</span>
 <span class="sd">    ring of page-locked host buffers, and the decode wrapper copies the</span>
 <span class="sd">    indices straight into its captured device buffer from there. The copies</span>
 <span class="sd">    are then really asynchronous; from pageable memory the driver stages each</span>
-<span class="sd">    one, and FlashInfer makes the indices copy blocking. Off by default: the</span>
-<span class="sd">    event bookkeeping per take cost about what the staged copies did at</span>
-<span class="sd">    c32-c128 on 0.8B (measured neutral to slightly negative)."""</span>
+<span class="sd">    one, and FlashInfer makes the indices copy blocking. Off by default: no</span>
+<span class="sd">    measurable gain at c32-c128 on 0.8B. The cost is one CUDA event per plan,</span>
+<span class="sd">    which a buffer set waits on before it is rewritten."""</span>
     <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 </pre></div>

@@ -357,9 +357,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's

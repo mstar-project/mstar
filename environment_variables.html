@@ -1060,9 +1060,9 @@ kv_indices, last_page_len) into a ring of page-locked host buffers and
 the decode wrapper copies the indices straight into its captured
 device buffer from there, so the copies FlashInfer’s <code class="docutils literal notranslate"><span class="pre">plan</span></code> issues
 are really asynchronous. From pageable memory the driver stages each
-one and FlashInfer makes the indices copy blocking. Measured neutral
-to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-take costs about what it saves), so it is off by default.</p></td>
+one and FlashInfer makes the indices copy blocking. No measurable gain
+at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+event per plan, which a buffer set waits on before it is rewritten.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
