@@ -20,6 +20,9 @@ does can beat it, and batched decoding cannot be bit-reproducible.
 Requires a GPU + flashinfer.
 """
 
+import importlib.util
+
+import pytest
 import torch
 
 from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
@@ -28,6 +31,11 @@ DEV = "cuda"
 V = 2048
 BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 TOP_K, TOP_P, TEMP = 50, 1.0, 1.0
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or importlib.util.find_spec("flashinfer") is None,
+    reason="needs a GPU and flashinfer",
+)
 
 
 def _mstar_sample(logits_rows, seeds, offsets):

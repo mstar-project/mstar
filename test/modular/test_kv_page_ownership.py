@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 import sys
+from importlib.util import find_spec
 
 sys.path.insert(0, ".")
 
@@ -312,6 +313,7 @@ def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
 
 
 @pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.skipif(find_spec("flashinfer") is None, reason="requires the optional FlashInfer backend")
 def test_kv_lens_match_flashinfer_seq_lens(page_size):
     """The host lengths handed to FlashInfer's decode plan are exactly what it
     would have rebuilt from the indptrs itself."""

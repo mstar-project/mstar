@@ -1545,6 +1545,8 @@ def _tiny_codec_config(**overrides) -> Qwen3TTSCodecConfig:
 def test_qwen3_tts_codec_conv_stack_decodes_only_the_new_frames_tail():
     """The transformer sees the whole window, the conv stack only the new frames
     behind its receptive field: each request's audio matches decoding its whole window."""
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
     from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
 
     decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
@@ -1591,6 +1593,8 @@ def test_qwen3_tts_streamed_codec_audio_matches_each_window_decoded_whole():
     trimming its context gives. The ramp makes a window whose context exceeds
     the conv receptive field while it is no wider than ``conv_frames``: its
     conv stack must still start at ``conv_start`` (a 2-frame repeat otherwise)."""
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
     from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
 
     decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
@@ -1640,6 +1644,8 @@ def test_qwen3_tts_conv_stack_receptive_field_matches_autograd(caplog):
     """The receptive field read off the modules is exactly the span autograd
     finds; without a usable one the codec decodes whole windows."""
     from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
     from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
 
     decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()

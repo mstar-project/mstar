@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
@@ -18,7 +19,6 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
-from test.modular.test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 P = 37   # speaker warm-up positions
 

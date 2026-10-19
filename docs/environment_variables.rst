@@ -220,7 +220,11 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Request body limit on every route, as in the Rust frontend: a larger
        body gets a 413, refused on its ``Content-Length`` or, for a chunked
        upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
-       512 MiB file cap when this is lower.
+       512 MiB file cap when this is lower. A body refused on its
+       ``Content-Length`` is answered before it is read, so a client that
+       writes the whole body before reading the reply can see a connection
+       reset instead of the 413; one that sends ``Expect: 100-continue``
+       gets the 413 before it sends the body.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -235,6 +239,16 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``n`` outside ``1`` to this value is a 400 before anything is
        submitted. The Rust frontend and the Dynamo bridge apply the same
        variable and default.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
+       ``--api-key`` overrides it). When set, every route except
+       ``/health`` needs ``Authorization: Bearer <key>``, WebSocket
+       handshakes included; unset or empty turns the check off. The
+       launcher passes it on to the Rust frontend only (the conductor and
+       workers do not inherit it), and
+       :class:`mstar.client.MStarClient` sends it when not given
+       ``api_key``. See :ref:`api-key`.
 
 Serving (Rust frontend)
 -----------------------
@@ -254,6 +268,12 @@ Read by the ``mstar-server`` binary and its bridge
      - Path to the ``mstar-server`` binary. Fallback order:
        ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
        ``rust/server/target/release`` build.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - Same rule as the Python server (``rust/server/src/auth.rs``, read
+       once at startup): every route except ``/health`` needs
+       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend; on expiry the client gets
@@ -303,6 +323,56 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
+
+Request media
+-------------
+
+Read by the model's media loaders in the data worker's preprocess thread,
+behind either frontend. All four are also checked once when the data worker
+starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
+value stops the server instead of failing every media request. The pixel and
+audio caps hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
+so attaching more files does not multiply them.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels a request's images may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_image_pixels`), checked from each
+       header before decoding; over it, the request gets a 400. PNG, JPEG,
+       WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
+       reads BMP and TIFF); other formats get a 400. A GIF or an animated
+       WebP is read as its first frame.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels a request's videos may decode to (see
+       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+       frames the model's loader decodes, each frame counting as at least
+       64x64; over it, the request gets a 400. At 1080p30 the default refuses
+       clips over about 17 s on Cosmos3, which decodes every frame, and over
+       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
+       frame, as Cosmos3, when the clip's header gives no frame count).
+   * - ``MSTAR_MAX_MEDIA_FILES``
+     - ``16``
+     - Images, audio clips and videos one request may attach, together (see
+       :func:`mstar.model.media_limits.max_media_files`); more get a 400
+       before any is decoded. A model can take fewer of one kind
+       (:meth:`mstar.model.base.Model.max_input_files`; Qwen3-TTS,
+       Chatterbox, Whisper and Higgs-Audio take one audio clip).
+   * - ``MSTAR_MAX_AUDIO_SECONDS``
+     - ``3600``
+     - Seconds a request's audio clips may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_audio_seconds`), checked from each
+       header before the model decodes it and again from the decoded clip (a
+       file whose header gives no length, such as a FLAC with no sample count,
+       is counted as it decodes, or from its size for a WAV with no data
+       length); over it, the request gets a 400.
 
 Worker scheduling
 -----------------

@@ -26,6 +26,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
+from mstar.api_server.auth import (
+    API_KEY_ENV,
+    APIKeyGuard,
+    APIKeyMiddleware,
+    keep_api_key_from_children,
+    resolve_api_key,
+    warn_if_no_api_key,
+)
 from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
@@ -1318,6 +1326,12 @@ app = FastAPI(
 )
 # Added before CORS so CORS stays outermost and a 413 still carries its headers.
 app.add_middleware(BodyLimitMiddleware)
+# Added after the body limit and before CORS, so it runs between them: CORS
+# answers browser preflights (which carry no credentials) and still stamps its
+# headers on a 401, and an unauthenticated request is refused before its body
+# is read.
+api_key_guard = APIKeyGuard(resolve_api_key())
+app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1758,6 +1772,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--api-key", type=str, default=None,
+        help=f"Require 'Authorization: Bearer <key>' on every route except /health "
+             f"(default: {API_KEY_ENV}; unset means no check). Prefer the environment "
+             f"variable: a flag shows in the process list",
+    )
     parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
         "--socket-path-prefix", type=str, default=None,
@@ -1823,6 +1843,10 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    api_key = resolve_api_key(args.api_key)
+    api_key_guard.set(api_key)
+    # The Rust frontend gets the key explicitly.
+    keep_api_key_from_children(api_key)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -1906,13 +1930,15 @@ def main(argv: list[str] | None = None):
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 find_server_binary(args.rust_frontend_bin), model_name,
-                args.port, bridge_dir, args.upload_dir)
+                args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
             api_server.set_on_fatal(bridge.stop)
             bridge.run()
         else:
+            # (mstar-server logs the same warning for the Rust frontend.)
+            warn_if_no_api_key(api_key, args.host, args.port)
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
             # uvicorn.run() inlined so the server object is reachable. The
             # message thread stops it when the conductor dies.

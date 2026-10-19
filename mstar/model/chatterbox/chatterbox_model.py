@@ -535,6 +535,9 @@ class ChatterboxModel(Model):
     # Prompt processing (API data worker)
     # -----------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (the rate S3Gen's
         reference mel needs; the 16 kHz views are derived on the worker)."""

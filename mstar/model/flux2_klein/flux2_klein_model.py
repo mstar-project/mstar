@@ -67,6 +67,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -255,7 +256,8 @@ class Flux2KleinModel(Model):
         token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``."""
         from PIL import Image
 
-        with Image.open(filepath) as raw:
+        check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
+        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
             raw.load()
             image = raw
             width, height = image.size

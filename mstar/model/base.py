@@ -27,6 +27,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
     top_level_entities,
 )
+from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import PromptPart
 
 DECODE = "decode"
@@ -749,11 +750,21 @@ class Model(ABC):
         """
         pass
 
-    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import torchvision
+    def max_input_files(self) -> dict[str, int]:
+        """Most files of each input modality one request may attach, e.g.
+        ``{"audio": 1}``. The data worker refuses a request over it before
+        decoding any file; a modality left out is held only to
+        ``MSTAR_MAX_MEDIA_FILES``."""
+        return {}
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float() / 255.0
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        # RGB whatever the file holds: image processors cannot place the
+        # channel axis of a 4-channel (RGBA or CMYK) image.
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
@@ -768,7 +779,14 @@ class Model(ABC):
         from torchcodec.decoders import VideoDecoder
 
         decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        budget = VideoBudget()
+        frames = []
+        for frame in decoder:
+            budget.add(*frame.shape[-2:])
+            frames.append(frame)
+        video = torch.stack(frames)
+        del frames
+        video = video.float().div_(255.0)
         return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod

@@ -634,6 +634,9 @@ class Qwen3TTSModel(Model):
     # API tensors the RefEncoder consumes (the reference clip).
     REF_ENCODER_INPUTS = ("audio_inputs",)
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""
         import soundfile

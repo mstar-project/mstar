@@ -237,8 +237,10 @@ def test_the_fast_decode_compiles_in_deterministic_mode(monkeypatch, vae) -> Non
     seen = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
     _decoder(monkeypatch, vae, fast=True)
-    expected = {"deterministic": True} if hasattr(inductor_config, "deterministic") else None
-    assert [kw.get("options") for kw in seen] == [expected]
+    expected = {"comprehensive_padding": False} if hasattr(inductor_config, "comprehensive_padding") else {}
+    if hasattr(inductor_config, "deterministic"):
+        expected["deterministic"] = True
+    assert [kw.get("options") for kw in seen] == [expected or None]
 
 
 def test_default_layout_undoes_channels_last_exactly(vae) -> None:

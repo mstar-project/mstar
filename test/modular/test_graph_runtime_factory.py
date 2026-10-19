@@ -123,6 +123,7 @@ def test_rust_refuses_the_pyzmq_communicator(monkeypatch):
     cannot share. Caught on the communicator's TYPE rather than on the flag:
     the flag says what the worker was asked to build, the type says what it
     actually built, and only the second one can be shared."""
+    pytest.importorskip("mstar_rust")
     monkeypatch.setenv("MSTAR_RUST_GRAPH", "1")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
     with pytest.raises(ValueError, match="needs the Rust communicator"):

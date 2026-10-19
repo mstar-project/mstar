@@ -364,6 +364,9 @@ class HiggsAudioModel(Model):
     # Model ABC: prompt processing
     # -------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def process_prompt(
         self,
         prompt: str | None,

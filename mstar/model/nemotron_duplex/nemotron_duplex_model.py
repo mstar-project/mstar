@@ -360,7 +360,10 @@ class NemotronDuplexModel(Model):
     def tokenizer(self):
         # The text tokenizer lives in the Spark repo's ``nano/`` folder (the base
         # repo ships only ``rnnt_tokenizer/``). 131072-token vocab; 256 single-
-        # char tokens -> the talker's char vocab. Loaded lazily.
+        # char tokens -> the talker's char vocab. Loaded lazily. AutoTokenizer
+        # also reads ``nano/config.json`` when the snapshot has it, whose
+        # ``auto_map`` names repo code; transformers' native Nemotron-H config
+        # serves instead.
         if self._tokenizer is None:
             import os
 
@@ -371,7 +374,7 @@ class NemotronDuplexModel(Model):
             local_dir = None
             for f in ("nano/tokenizer.json", "nano/tokenizer_config.json", "nano/special_tokens_map.json"):
                 local_dir = os.path.dirname(hf_hub_download(repo, f, cache_dir=self.cache_dir))
-            self._tokenizer = AutoTokenizer.from_pretrained(local_dir, trust_remote_code=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(local_dir, trust_remote_code=False)
         return self._tokenizer
 
     def _talker_tokenizer(self):

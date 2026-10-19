@@ -56,6 +56,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -80,6 +81,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_POS,
     THINKER_SAMPLER,
 )
+from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
@@ -150,9 +152,10 @@ class Qwen3OmniModel(Model):
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
 
-        # Tokenizer (Thinker uses a Qwen-family tokenizer)
+        # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
+        # in transformers, so no loader here runs code from the checkpoint repo.
         self.tokenizer = AutoTokenizer.from_pretrained(
-            local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            local_dir, cache_dir=cache_dir, trust_remote_code=False,
         )
 
         # Full multimodal processor: combines tokenizer + image_processor +
@@ -162,7 +165,7 @@ class Qwen3OmniModel(Model):
         try:
             from transformers import AutoProcessor
             self._processor = AutoProcessor.from_pretrained(
-                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+                local_dir, cache_dir=cache_dir, trust_remote_code=False,
             )
         except Exception as e:
             logger.warning(
@@ -1020,13 +1023,21 @@ class Qwen3OmniModel(Model):
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
         # TODO: support audio in video
-        from qwen_omni_utils.v2_5.vision_process import fetch_video
-        video_input, video_sample_fps = fetch_video(
-            {"video": filepath},
-            return_video_sample_fps=True,
-            image_patch_size=14,
-            return_video_metadata=False
-        )
+        from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+
+        install_budgeted_readers(VIDEO_READER_BACKENDS)
+        # the sampled readers decode the frames fetch_video samples, at full size before resizing them
+        probe = probe_video(filepath)
+        if probe is not None:
+            total, fps, height, width = probe
+            VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
+        with header_charged(probe is not None):
+            video_input, video_sample_fps = fetch_video(
+                {"video": filepath},
+                return_video_sample_fps=True,
+                image_patch_size=14,
+                return_video_metadata=False
+            )
         return TensorAndMetadata(
             data=video_input.to(device),
             metadata=dict(
@@ -1565,7 +1576,7 @@ class Qwen3OmniModel(Model):
         # Load config only (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # This should be a Qwen3OmniMoeConfig
@@ -1606,7 +1617,7 @@ class Qwen3OmniModel(Model):
         # Load full config (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # Extract the vision sub-config
