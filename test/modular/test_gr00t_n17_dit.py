@@ -25,16 +25,28 @@ to the state encoder, but it is a DT piece and it depends on the sinusoid above,
 tested here. ``CategorySpecificLinear`` itself is pinned in ``test_gr00t_n17_state.py`` and
 not again here.
 
-The last section is the DT block: ``AdaLayerNorm``, which carries one request's denoising
-timestep into all of that request's tokens, and ``BasicTransformerBlock``, which alternates
-cross-attention over the bridge's rows with self-attention over its own. Its attention
-arrives as a caller-supplied callable, so an inline reference can be handed the same one --
-which leaves no kernel in the comparison that this file did not call itself, and makes every
-test there ``torch.equal`` rather than a bar.
+Then the DT block: ``AdaLayerNorm``, which carries one request's denoising timestep into all
+of that request's tokens, and ``BasicTransformerBlock``, which alternates cross-attention
+over the bridge's rows with self-attention over its own. Its attention arrives as a
+caller-supplied callable, so an inline reference can be handed the same one -- which leaves
+no kernel in the comparison that this file did not call itself, and makes every test there
+``torch.equal`` rather than a bar.
+
+The last section is ``DiT`` itself -- the stack of those blocks and the output head on top of
+it -- with ``ActionPositionEmbedding`` and ``_attends_encoder`` beside it. Its tests are the
+details a dump comparison against the reference cannot resolve: that the head chunks
+``shift, scale`` where ``AdaLayerNorm`` chunks ``scale, shift``, that ``norm_out`` normalises
+at 1e-6 where every other norm in the model uses 1e-5, that it is not affine, that the
+position table reaches the action rows and not the state row, that the alternation starts
+with a cross block at every depth, and that ``attend_text_every_n_blocks`` is not the rule
+that decides it. Every value test there runs a **shallow** stack: the real one is 1.12B
+parameters, and only the key-set test builds it, on ``meta``.
 """
 
 import glob
+import inspect
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -45,9 +57,12 @@ from safetensors import safe_open
 from torch import nn
 
 from mstar.model.gr00t_n17.components.dit import (
+    ActionPositionEmbedding,
     AdaLayerNorm,
     BasicTransformerBlock,
+    DiT,
     TimestepEncoder,
+    _attends_encoder,
 )
 from mstar.model.gr00t_n17.components.embodiment import (
     MultiEmbodimentActionEncoder,
@@ -56,6 +71,7 @@ from mstar.model.gr00t_n17.components.embodiment import (
     build_action_encoder,
 )
 from mstar.model.gr00t_n17.config import Gr00tN17Config, Gr00tN17StackConfig
+from mstar.model.gr00t_n17.weight_loader import NODE_PREFIXES
 
 _HUB = Path.home() / ".cache/huggingface/hub"
 _GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -1100,11 +1116,13 @@ def _block_reference(
     and activation are pinned on the same class in ``test_gr00t_n17_bridge.py`` and are not
     this cycle's claim.
     """
-    requests, queries, _ = hidden.shape
+    # the width comes off the tensor, not from `_DT_DIM`: `DiT`'s own section below builds
+    # its blocks at the inner width and hands them to this same reference
+    requests, queries, dim = hidden.shape
     heads = (requests, -1, _DT_HEADS, _DT_HEAD_DIM)
     plain = _adaln_reference(block.norm1, hidden, temb)
     if deviation == _WRONG_NORMS_SWAPPED:
-        plain = F.layer_norm(hidden, (_DT_DIM,), eps=_EPS)
+        plain = F.layer_norm(hidden, (dim,), eps=_EPS)
     source = plain if encoder is None else encoder
     out = _sdpa(
         block.attn1.to_q(plain).view(heads),
@@ -1115,9 +1133,9 @@ def _block_reference(
 
     residual = attended if deviation == _WRONG_NO_ATTN_RESIDUAL else attended + hidden
     if deviation == _WRONG_NORM3_AFTER_FF:
-        return F.layer_norm(block.ff(residual), (_DT_DIM,), eps=_EPS) + residual
+        return F.layer_norm(block.ff(residual), (dim,), eps=_EPS) + residual
     normed = F.layer_norm(
-        hidden if deviation == _WRONG_FF_BEFORE_RESIDUAL else residual, (_DT_DIM,), eps=_EPS,
+        hidden if deviation == _WRONG_FF_BEFORE_RESIDUAL else residual, (dim,), eps=_EPS,
     )
     if deviation == _WRONG_NORMS_SWAPPED:
         normed = _adaln_reference(block.norm1, residual, temb)
@@ -1342,10 +1360,12 @@ def test_the_checkpoints_two_block_variants_name_these_modules_parameters():
     assert sorted(checkpoint) == list(range(config.dit.num_layers))
     # the bridge's rows are as wide as the backbone's, which is why one field sizes both
     assert config.backbone_embedding_dim == config.bridge.inner_dim
-    assert config.attend_text_every_n_blocks == 2  # the block index decides which variant
 
     for index, tensors in checkpoint.items():
-        cross = index % config.attend_text_every_n_blocks == 0
+        # the rule is the parity of the index and nothing else, which is what
+        # `_attends_encoder` says; `attend_text_every_n_blocks` is a different question and
+        # happens to give the same answer at its one value (see its own test below)
+        cross = _attends_encoder(index)
         block = variants[cross]
         assert len(tensors) == 14
         assert set(tensors) == {name for name, _ in block.named_parameters()}
@@ -1353,3 +1373,543 @@ def test_the_checkpoints_two_block_variants_name_these_modules_parameters():
             key, shard = tensors[name]
             with safe_open(str(_GR00T / shard), framework="pt") as shard_file:
                 assert list(parameter.shape) == shard_file.get_slice(key).get_shape()
+
+
+# ----------------------------------------------------------------------------
+# Inline reference: the DT's output head, and the stack it sits on
+# ----------------------------------------------------------------------------
+
+# `DiT`'s own widths, which are not the block section's: there the block is 12 wide and its
+# attention 15 inside, where `DiT` builds every block at `dim = stack.inner_dim` -- as in the
+# real model, where both are 1536. So the numbers that stay distinct here are the stack's
+# width (15), the bridge's rows it cross-attends (7), its output width (6) and the position
+# table's (8 wide, 9 rows).
+_DIT_DIM = _DT_HEADS * _DT_HEAD_DIM
+_DIT_OUT = 6
+_DIT_DEPTH = 2  # one of each kind of block, which is the shortest stack that alternates
+# the position table: `max_seq_len` x `input_embedding_dim`, 1024 x 1536 in the real model,
+# of which only the first `action_horizon` (40) rows are ever read
+_TABLE_ROWS = 9
+_POS_DIM = _HIDDEN
+_ACTION_ROWS = 3
+
+# `norm_out`'s eps. Spelled out, like `_EPS` above, because it is the number this section
+# exists to pin: the reference hardcodes 1e-6 at the output norm (`dit.py:284`) and takes the
+# config's 1e-5 everywhere else, and no weight and no bf16 dump records an eps.
+_OUT_EPS = 1e-6
+
+# The real schedule's four timesteps: `int(t / num_inference_timesteps * num_timestep_buckets)`
+# for t = 0..3, which is what the reference fills `timesteps_tensor` with
+# (`gr00t_n1d7.py:398-404`). A batch holds one per request and not the same one in each row:
+# requests reach the DT at whichever denoising iteration they are on.
+_DENOISE_STEPS = (0.0, 250.0, 500.0, 750.0)
+
+# Deliberate deviations, as in the sections above. Each is a reading of the head's three
+# lines that a reader could expect instead, and each loads the checkpoint and runs.
+_WRONG_HEAD_SCALE_FIRST = "scale first out of the head's chunk"
+_WRONG_HEAD_BLOCK_EPS = "the blocks' 1e-5 at the output norm"
+# `[:, None]` dropped, as in `_WRONG_PER_TOKEN` above: computable only where the request
+# count equals the row count, and a different answer there.
+_WRONG_HEAD_PER_ROW = "the head's pair indexed per row"
+
+
+def _dit_config(depth: int = _DIT_DEPTH) -> Gr00tN17Config:
+    """The fields `DiT` and `ActionPositionEmbedding` read. ``input_embedding_dim`` (8) is a
+    different number from the stack's width (15) on purpose: the table is sized from the one
+    and the blocks from the other, and in the real checkpoint both are 1536.
+    """
+    return Gr00tN17Config(
+        text=None, vision=None, bridge=None,
+        dit=Gr00tN17StackConfig(
+            num_layers=depth, num_attention_heads=_DT_HEADS,
+            attention_head_dim=_DT_HEAD_DIM, output_dim=_DIT_OUT,
+        ),
+        deepstack_visual_indexes=(), backbone_embedding_dim=_BRIDGE_DIM,
+        max_action_dim=_ACTION_DIM, hidden_size=9, input_embedding_dim=_POS_DIM,
+        max_num_embodiments=_CATEGORIES, max_seq_len=_TABLE_ROWS, action_horizon=_ACTION_ROWS,
+    )
+
+
+def _dit(depth: int = _DIT_DEPTH, seed: int = 25) -> DiT:
+    """A **shallow** DT with the CPU stand-in bound to every block.
+
+    Shallow is not a convenience. The real stack is 32 blocks of 1536 x 32 x 48 -- 1.12B
+    parameters, 4.2 GiB in fp32 -- so nothing in this file builds one off ``meta``; the
+    key-set test below is the only place the full stack appears, and it allocates nothing.
+    Filled at ``_BLOCK_SCALE`` for the reason the block section gives.
+    """
+    dit = DiT(_dit_config(depth), attend=_sdpa)
+    _randomize(dit, seed, _BLOCK_SCALE)
+    return dit
+
+
+def _dit_rows(
+    requests: int = _REQUESTS, rows: int = _QUERIES, seed: int = 25, scale: float = 1.0,
+) -> torch.Tensor:
+    """``[B, T, dim]``: the state row and the action rows the node concatenates, which is what
+    the DT takes in -- 41 of them in the real model."""
+    return scale * torch.randn(
+        requests, rows, _DIT_DIM, generator=torch.Generator().manual_seed(seed),
+    )
+
+
+def _pos_rows(requests: int = _REQUESTS, rows: int = _ACTION_ROWS, seed: int = 26) -> torch.Tensor:
+    """``[B, T, input_embedding_dim]``: what the action encoder returns, which is the only
+    thing the position table is added to."""
+    return torch.randn(requests, rows, _POS_DIM, generator=torch.Generator().manual_seed(seed))
+
+
+def _steps(requests: int = _REQUESTS) -> torch.Tensor:
+    """``[B]``: one denoising timestep per request, and a *different* one per request -- the
+    serving case, where a batch holds requests at different iterations of the schedule."""
+    return torch.tensor(_DENOISE_STEPS[:requests])
+
+
+def _position_table(seed: int = 27) -> ActionPositionEmbedding:
+    """Filled, which is not optional: the module allocates its table with ``torch.empty``, so
+    an unfilled one holds whatever the allocator last left there."""
+    table = ActionPositionEmbedding(_dit_config())
+    _randomize(table, seed, _BLOCK_SCALE)
+    return table
+
+
+def _head_reference(
+    dit: DiT, hidden: torch.Tensor, temb: torch.Tensor, deviation: str | None = None,
+) -> torch.Tensor:
+    """``shift, scale = proj_out_1(silu(temb)).chunk(2, dim=1)`` -- **that** order -- then
+    ``norm_out(hidden) * (1 + scale[:, None]) + shift[:, None]``, then ``proj_out_2``.
+
+    The normalisation is written out as ``F.layer_norm`` with no weight, no bias and eps 1e-6
+    rather than read off the module, so the parity test pins all three of ``norm_out``'s
+    settings. Only the two projections are borrowed.
+    """
+    first, second = dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+    shift, scale = (second, first) if deviation == _WRONG_HEAD_SCALE_FIRST else (first, second)
+    eps = _EPS if deviation == _WRONG_HEAD_BLOCK_EPS else _OUT_EPS
+    normed = F.layer_norm(hidden, (hidden.shape[-1],), eps=eps)
+    if deviation == _WRONG_HEAD_PER_ROW:
+        return dit.proj_out_2(normed * (1 + scale) + shift)
+    return dit.proj_out_2(normed * (1 + scale[:, None]) + shift[:, None])
+
+
+def _dit_reference(
+    dit: DiT,
+    hidden: torch.Tensor,
+    encoder: torch.Tensor,
+    timestep: torch.Tensor,
+    deviation: str | None = None,
+) -> torch.Tensor:
+    """The timestep encoder, then every block through this file's own block reference, then
+    the head. The alternation is written out here as ``index % 2 == 0`` rather than taken from
+    ``_attends_encoder``, so the stack's own rule is not borrowed from the module it tests.
+    """
+    temb = dit.timestep_encoder(timestep)
+    for index, block in enumerate(dit.transformer_blocks):
+        hidden = _block_reference(block, hidden, temb, encoder if index % 2 == 0 else None)
+    return _head_reference(dit, hidden, temb, deviation)
+
+
+# ----------------------------------------------------------------------------
+# The whole DT against the reference
+# ----------------------------------------------------------------------------
+
+_DIT_SHAPES = {
+    # the real shape is 41 rows: one state row and `action_horizon` action rows
+    "a batch of requests": (_REQUESTS, _QUERIES),
+    "one request, one row": (1, 1),
+    "as many rows as requests": (3, 3),
+}
+
+
+@pytest.mark.parametrize("shape", list(_DIT_SHAPES.values()), ids=list(_DIT_SHAPES))
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+@torch.no_grad()
+def test_the_dit_is_its_blocks_then_the_output_head(shape, depth):
+    """``[B, T, 1536]`` rows and the bridge's ``[B, S, 2048]`` to ``[B, T, output_dim]``, from
+    one ``[B]`` timestep. ``torch.equal``, for the same reason the block's parity is: the
+    attention is the caller's callable, so the module and the reference reach the same one.
+
+    Four depths, because a stack that alternates cannot be pinned at one. Depth 1 says block
+    0 is a cross block, depth 2 that block 1 is not, and depths 3 and 4 separate ``index % 2``
+    from the readings that agree with it on the first two blocks -- ``index < depth // 2``,
+    ``index % 3``, ``index % 4``.
+
+    The square shape is here for the head's ``[:, None]``, as it is in the AdaLN section: it
+    is the one shape where dropping it raises nothing. One request and one row is the real
+    serving edge, and the only shape where every tensor in the forward is square.
+    """
+    requests, rows = shape
+    dit = _dit(depth)
+    hidden = _dit_rows(requests, rows)
+    encoder = _bridge_rows(True, requests)
+    timestep = _steps(requests)
+    out = dit(hidden, encoder, timestep)
+
+    assert out.shape == (requests, rows, _DIT_OUT)
+    assert torch.equal(out, _dit_reference(dit, hidden, encoder, timestep))
+
+
+@torch.no_grad()
+def test_the_output_heads_chunk_is_shift_then_scale_and_not_adalns_order():
+    """The head chunks ``shift, scale`` where ``AdaLayerNorm`` three classes up chunks
+    ``scale, shift`` (``dit.py:331`` against ``dit.py:201``). One projection, two halves of
+    equal width, both learned and both plausible in magnitude -- here the trained-style fill
+    gives them RMS 1.42 and 1.80 -- so a swap loads every weight, raises nothing, and leaves
+    the output's scale where it was. Nothing but a value comparison sees it.
+
+    So the swap is forced into view rather than measured. ``proj_out_1`` is rebuilt with its
+    first half exactly 0 and its second half exactly -1, which makes the right reading
+    ``norm_out(x) * (1 + -1) + 0`` -- exactly zero on every row, whatever the blocks did --
+    so the DT's output is ``proj_out_2.bias`` and nothing else. Read the other way round the
+    same weights give ``norm_out(x) * 1 - 1``, which is the normalised rows shifted, and
+    4.03 in absolute value against the 0.50 the right reading produces.
+
+    The trained-style fill is checked too, since the constructed one is degenerate: there the
+    swap moves the answer by 1.39 times its own largest element.
+    """
+    dit = _dit()
+    with torch.no_grad():
+        dit.proj_out_1.weight.zero_()
+        dit.proj_out_1.bias[:_DIT_DIM].zero_()  # the first half out of the chunk: `shift`
+        dit.proj_out_1.bias[_DIT_DIM:].fill_(-1.0)  # the second: `scale`, so `1 + scale` is 0
+    hidden = _dit_rows()
+    encoder = _bridge_rows(True)
+    timestep = _steps()
+    out = dit(hidden, encoder, timestep)
+    swapped = _dit_reference(dit, hidden, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
+
+    assert torch.equal(out, dit.proj_out_2.bias.expand(_REQUESTS, _QUERIES, _DIT_OUT))
+    assert not torch.equal(out, swapped)
+    assert swapped.abs().max() > 2.0 * out.abs().max()
+
+    trained = _dit()
+    out = trained(hidden, encoder, timestep)
+    swapped = _dit_reference(trained, hidden, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
+    first, second = trained.proj_out_1(F.silu(trained.timestep_encoder(timestep))).chunk(2, 1)
+    assert first.pow(2).mean().sqrt() == pytest.approx(second.pow(2).mean().sqrt(), rel=0.3)
+    assert not torch.equal(out, swapped)
+    assert (out - swapped).abs().max() > 0.2 * out.abs().max()
+
+
+@torch.no_grad()
+def test_the_output_norm_normalises_at_1e_6_where_every_other_norm_uses_1e_5():
+    """An eps is invisible to parity against a bf16 dump (C05): it moves the answer by far
+    less than bf16's own floor on any ordinary input. So it is pinned on an input chosen to
+    make it visible instead -- rows whose variance across the normalised dim is 8.5e-07, which
+    is the same order as the eps itself, so the eps is most of the denominator rather than a
+    correction to it. ``sqrt(v + 1e-5) / sqrt(v + 1e-6)`` is 2.3 there, and the DT's output
+    moves by 0.45 of its own largest element.
+
+    The stack is built with **no blocks**, which is the only way to hand ``norm_out`` an input
+    this test chooses: a block's own normalisation would wash out any variance set here.
+    """
+    flat = _dit(depth=0)
+    hidden = _dit_rows(scale=1e-3)
+    encoder = _bridge_rows(True)
+    timestep = _steps()
+    out = flat(hidden, encoder, timestep)
+
+    assert hidden.var(-1, unbiased=False).max() < 1e-05  # the input the eps is visible on
+    assert torch.equal(out, _dit_reference(flat, hidden, encoder, timestep))
+    at_1e_5 = _dit_reference(flat, hidden, encoder, timestep, _WRONG_HEAD_BLOCK_EPS)
+    assert not torch.equal(out, at_1e_5)
+    assert (out - at_1e_5).abs().max() > 0.2 * out.abs().max()
+
+    # and the two norms are different numbers in the same model, which is the whole hazard
+    deep = _dit()
+    assert deep.norm_out.eps == _OUT_EPS
+    assert {block.norm3.eps for block in deep.transformer_blocks} == {_EPS}
+    assert {block.norm1.norm.eps for block in deep.transformer_blocks} == {_EPS}
+
+
+def test_the_output_norm_is_not_affine_because_the_checkpoint_has_no_weight_for_it():
+    """``action_head.model.`` holds ``norm_out`` nowhere: the whole stack's tensors are the
+    timestep encoder's four, 14 per block, and the two projections' four. An affine
+    ``norm_out`` would want two more -- and would load and run without them, because
+    ``nn.LayerNorm``'s affine parameters initialise to 1 and 0, so the forward would be right
+    until someone trained it. Parity cannot see that; the key set is the test.
+
+    The parity test above would also catch it, but only as a side effect: ``_randomize`` fills
+    every parameter the module has, so an affine norm would arrive there with a random gain
+    rather than with the identity. This names it directly.
+    """
+    dit = _dit()
+    blocks = {f"transformer_blocks.{index}." for index in range(_DIT_DEPTH)}
+    names = {name for name, _ in dit.named_parameters()}
+
+    assert dit.norm_out.weight is None and dit.norm_out.bias is None
+    assert {name for name in names if not name.startswith(tuple(blocks))} == {
+        "timestep_encoder.timestep_embedder.linear_1.weight",
+        "timestep_encoder.timestep_embedder.linear_1.bias",
+        "timestep_encoder.timestep_embedder.linear_2.weight",
+        "timestep_encoder.timestep_embedder.linear_2.bias",
+        "proj_out_1.weight", "proj_out_1.bias", "proj_out_2.weight", "proj_out_2.bias",
+    }
+    assert dit.proj_out_1.out_features == 2 * _DIT_DIM  # the one projection both halves
+    assert dit.proj_out_2.out_features == _DIT_OUT != _DIT_DIM
+
+
+@torch.no_grad()
+def test_the_heads_pair_is_one_per_request_and_reaches_every_row_of_it():
+    """The head's half of R10. ``scale`` is ``[B, dim]`` and the rows are ``[B, T, dim]``, so
+    dropping the ``[:, None]`` raises at every shape except ``B == T``, where it quietly gives
+    row ``t`` request ``t``'s conditioning -- a 1.17x move on an output whose rows are O(5),
+    and a mistake no 1-row and no non-square test would ever reach.
+
+    Made by comparison with the wrong reading rather than by comparing a request's rows to
+    each other, which cannot be exact: with identical rows in, the GEMMs block their
+    reductions over the row axis and one block's output rows differ in the last ulp (measured
+    2.4e-07). The comparison below is ``torch.equal`` on both sides.
+    """
+    requests = rows = 3
+    dit = _dit()
+    hidden = _dit_rows(requests, rows)
+    encoder = _bridge_rows(True, requests)
+    timestep = _steps(requests)
+    out = dit(hidden, encoder, timestep)
+    per_row = _dit_reference(dit, hidden, encoder, timestep, _WRONG_HEAD_PER_ROW)
+
+    assert torch.equal(out, _dit_reference(dit, hidden, encoder, timestep))
+    assert not torch.equal(out, per_row)
+    assert (out - per_row).abs().max() > 0.2 * out.abs().max()
+
+    # at any other shape the dropped index is a shape error, which is why the square one is
+    # the shape this test runs at
+    with pytest.raises(RuntimeError):
+        _dit_reference(dit, _dit_rows(), _bridge_rows(True), _steps(), _WRONG_HEAD_PER_ROW)
+
+
+@torch.no_grad()
+def test_a_dit_batch_can_hold_requests_at_different_denoising_steps():
+    """The serving case, end to end: the requests in one batch are each at their own iteration
+    of the four-step schedule, so every row's answer must depend on that row's timestep and on
+    no other row's. Moving one request's timestep to the last step of the schedule moves its
+    own rows and leaves its neighbours' bit-identical.
+
+    Bit-identical because the batch shape does not change between the two runs. Permuting the
+    batch is *not* exact through the stack -- the GEMMs reblock and the answer moves by
+    9.5e-07 -- so this asserts isolation, which is the claim, rather than equivariance, which
+    would need a bar and would be about the GEMM.
+    """
+    dit = _dit()
+    hidden = _dit_rows(3, _QUERIES)
+    encoder = _bridge_rows(True, 3)
+    timestep = _steps(3)
+    out = dit(hidden, encoder, timestep)
+
+    moved = timestep.clone()
+    moved[1] = _DENOISE_STEPS[3]
+    after = dit(hidden, encoder, moved)
+
+    # the four steps the reference's loop produces, which is what a batch is drawn from
+    assert _DENOISE_STEPS == tuple(float(int(t / 4 * 1000)) for t in range(4))
+    assert len(set(timestep.tolist())) == 3  # three requests, three different steps
+    assert torch.equal(after[0], out[0])
+    assert torch.equal(after[2], out[2])
+    assert not torch.equal(after[1], out[1])
+
+
+# ----------------------------------------------------------------------------
+# The alternation, and the config field it is not
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+@torch.no_grad()
+def test_the_stack_is_built_and_run_as_cross_then_self_from_block_zero(depth):
+    """``_attends_encoder`` is read twice -- once to size ``to_k``/``to_v`` and once to decide
+    what to hand each block -- and the two readings have to agree. They are checked against
+    each other here, because neither alone is enough: a block handed 1536-wide rows will
+    cross-attend them perfectly happily, so a forward that disagreed with the construction
+    would raise nothing in the real model's self blocks.
+
+    The forward half is read off the key count, not the width: a cross block is handed 6
+    bridge rows and a self block its own 4, so the stand-in reports which source each block
+    got. The construction half is the ``in_features``, which is what the checkpoint's 2048
+    pins (see the block-variant test below).
+
+    Four depths, because an off-by-one in the rule survives a shallower test: ``index % 2``,
+    ``index % 3`` and ``index % 4`` all agree on blocks 0 and 1.
+    """
+    dit = _dit(depth)
+    hidden = _dit_rows()
+    encoder = _bridge_rows(True)
+    seen: list[tuple[int, int]] = []
+
+    for index, block in enumerate(dit.transformer_blocks):
+        def record(q, k, v, index=index):
+            seen.append((index, k.shape[1]))
+            return _sdpa(q, k, v)
+
+        block.attend = record
+    dit(hidden, encoder, _steps())
+
+    cross = [index % 2 == 0 for index in range(depth)]
+    assert [_attends_encoder(index) for index in range(depth)] == cross
+    assert _attends_encoder(0) is True  # the alternation starts with a cross block
+    assert _BRIDGE_ROWS != _QUERIES  # so the key count says where k came from
+    assert seen == [
+        (index, _BRIDGE_ROWS if is_cross else _QUERIES) for index, is_cross in enumerate(cross)
+    ]
+    for kind in ("to_k", "to_v"):
+        assert [
+            getattr(block.attn1, kind).in_features for block in dit.transformer_blocks
+        ] == [_BRIDGE_DIM if is_cross else _DIT_DIM for is_cross in cross]
+    # and q is the block's own rows at every block, cross or self
+    assert {block.attn1.to_q.in_features for block in dit.transformer_blocks} == {_DIT_DIM}
+
+
+def test_attend_text_every_n_blocks_divides_the_cross_blocks_rather_than_choosing_them():
+    """The field that looks like the rule and is not. ``attend_text_every_n_blocks`` is 2 in
+    this checkpoint and the blocks alternate in twos, so ``index % n == 0`` and
+    ``_attends_encoder`` agree at every index -- a coincidence of one value.
+
+    What the field actually governs is which **span** a cross block reads: the reference's
+    ``idx % (2 * n) == 0`` cross blocks attend the text rows and the rest attend the image
+    rows (``dit.py:390-396``). At n = 2 that is ``idx % 4``, which selects half the cross
+    blocks and no self block -- a subdivision of the alternation, not the alternation. This
+    port does not implement the split (it hands every cross block the whole bridge), so the
+    field reaches nothing in this cycle, and ``_attends_encoder`` could not read it if it
+    wanted to: it takes an index and has no config.
+    """
+    config = _dit_config()
+    indexes = range(8)
+    cross = [_attends_encoder(index) for index in indexes]
+    n = config.attend_text_every_n_blocks
+
+    assert n == 2
+    assert cross == [index % 2 == 0 for index in indexes]
+    assert cross == [index % n == 0 for index in indexes]  # the coincidence, stated
+
+    text = [index % (2 * n) == 0 for index in indexes]
+    assert text != cross
+    assert all(cross[index] for index in indexes if text[index])  # every text block is cross
+    assert 2 * sum(text) == sum(cross)  # and half the cross blocks are text blocks
+    # at any other value of the field the two part company, which is what makes reading it as
+    # the rule a bug waiting on a config change
+    for other in (1, 3, 4):
+        assert [index % other == 0 for index in indexes] != cross
+    assert list(inspect.signature(_attends_encoder).parameters) == ["index"]
+
+
+# ----------------------------------------------------------------------------
+# `ActionPositionEmbedding`: the table, and the row it is not added to
+# ----------------------------------------------------------------------------
+
+_POS_ROWS = {
+    "the action horizon": _ACTION_ROWS,  # 40 rows in the real model
+    "one action step": 1,
+    "the whole table": _TABLE_ROWS,
+}
+
+
+@pytest.mark.parametrize("rows", list(_POS_ROWS.values()), ids=list(_POS_ROWS))
+@torch.no_grad()
+def test_the_table_adds_its_own_first_rows_and_reads_nothing_past_them(rows):
+    """Rows ``0:T`` of the table, which is what the reference's
+    ``position_embedding(arange(T))`` gathers -- the same rows in the same order, without the
+    index tensor. The real table is 1024 rows against the 40 that are ever read, so the slice
+    cannot run off the end and an off-by-one in it raises nothing: starting at row 1 instead
+    is the same shape and a plausible tensor, and it is what adding the table after the state
+    row is concatenated amounts to.
+
+    The untouched tail is checked by moving it: the rows past ``T`` are perturbed and the
+    answer has to be bit-identical, which says the slice is a slice and not a broadcast of
+    some reduction over the table.
+    """
+    table = _position_table()
+    features = _pos_rows(rows=rows)
+    out = table(features)
+
+    assert out.shape == features.shape == (_REQUESTS, rows, _POS_DIM)
+    assert torch.equal(out, features + table.weight[:rows])
+    assert torch.equal(out, features + table.weight[torch.arange(rows)])  # the gather, as a slice
+
+    if rows < _TABLE_ROWS:
+        assert not torch.equal(out, features + table.weight[1 : rows + 1])  # the off-by-one
+        with torch.no_grad():
+            table.weight[rows:] += 1.0
+        assert torch.equal(table(features), out)
+
+
+@torch.no_grad()
+def test_the_state_row_carries_no_position_because_the_table_lands_before_the_concat():
+    """The reference adds the table to ``action_features`` and *then* concatenates the state
+    row in front of it (``gr00t_n1d7.py:408-413``), so of the DT's 41 input rows the 40 action
+    rows carry a position and the state row carries none.
+
+    Adding the table after the concatenation instead is the same shape, raises nothing, loads
+    the same weight -- and is wrong twice over: the state row picks up row 0 of a table that
+    was never trained for it, and every action row picks up the row after its own. That moves
+    the rows by 0.28 of the right answer's largest element here, and the bar below is a floor
+    rather than a fitted threshold: over table seeds 20-31 the weakest move was 0.26.
+    """
+    table = _position_table()
+    state = _pos_rows(rows=1, seed=28)
+    actions = _pos_rows(rows=_ACTION_ROWS, seed=29)
+
+    rows = torch.cat([state, table(actions)], dim=1)
+    after = table(torch.cat([state, actions], dim=1))
+
+    assert rows.shape == after.shape == (_REQUESTS, 1 + _ACTION_ROWS, _POS_DIM)
+    assert torch.equal(rows[:, 0], state[:, 0])  # the state row, unpositioned
+    assert torch.equal(rows[:, 1:], actions + table.weight[:_ACTION_ROWS])
+    assert not torch.equal(after, rows)
+    assert (after - rows).abs().max() > 0.2 * rows.abs().max()
+
+
+# ----------------------------------------------------------------------------
+# What the checkpoint says the `denoise_step` node is
+# ----------------------------------------------------------------------------
+
+# The node's four pieces and the tensor count of each. The 456 is 32 blocks x 14, the
+# timestep encoder's 4 and the two output projections' 4 -- so it is also what says the stack
+# has no `norm_out.weight`, no `norm_out.bias` and no 33rd block.
+_DENOISE_PIECES = {"action_encoder": 6, "model": 456, "action_decoder": 4, "position_embedding": 1}
+
+
+@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
+def test_the_checkpoints_denoise_step_tensors_name_this_nodes_parameters():
+    """Every tensor the node owns, named and shaped, against the four modules this file and
+    the section above build. 467 of them, and the node's prefixes come from
+    ``weight_loader`` rather than from a literal here, so a prefix moving there without a
+    module moving with it fails this test.
+
+    Built on ``meta``: the stack alone is 1.12B parameters, 4.2 GiB in fp32, and shapes come
+    off the safetensors header, so nothing is read and nothing is allocated. This is the only
+    place in the file where the full 32 blocks exist.
+    """
+    config = Gr00tN17Config.from_hf(_GR00T, _BACKBONE)
+    root, prefixes = NODE_PREFIXES["denoise_step"]
+    with torch.device("meta"):
+        node = nn.Module()
+        node.action_encoder = build_action_encoder(config)
+        node.model = DiT(config)
+        node.action_decoder = build_action_decoder(config)
+        node.position_embedding = ActionPositionEmbedding(config)
+    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
+    checkpoint = {
+        name[len(root) :]: (name, shard)
+        for name, shard in weight_map.items()
+        if name.startswith(prefixes)
+    }
+
+    assert set(checkpoint) == {name for name, _ in node.named_parameters()}
+    assert Counter(name.partition(".")[0] for name in checkpoint) == _DENOISE_PIECES
+    assert len(checkpoint) == 467
+    for name, parameter in node.named_parameters():
+        key, shard = checkpoint[name]
+        with safe_open(str(_GR00T / shard), framework="pt") as shard_file:
+            assert list(parameter.shape) == shard_file.get_slice(key).get_shape()
+
+    # the alternation in the checkpoint's own widths: 32 blocks, cross first
+    assert (config.backbone_embedding_dim, config.dit.inner_dim) == (2048, 1536)
+    assert [block.attn1.to_k.in_features for block in node.model.transformer_blocks] == [
+        config.backbone_embedding_dim if index % 2 == 0 else config.dit.inner_dim
+        for index in range(config.dit.num_layers)
+    ]
+    assert config.dit.num_layers == 32
+    # 1024 rows for the 40 the DT reads, which is why a slice off the front never raises
+    assert node.position_embedding.weight.shape == (config.max_seq_len, config.input_embedding_dim)
+    assert node.position_embedding.weight.shape == (1024, 1536)
+    assert config.action_horizon + 1 == 41 < config.max_seq_len

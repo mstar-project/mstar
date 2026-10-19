@@ -12,13 +12,22 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
+from mstar.model.gr00t_n17.config import Gr00tN17Config
+
 # Every LayerNorm in the DT is non-affine, and the checkpoint says so: `norm1`
 # carries only its `linear`, and `norm3` carries no tensor at all.
 _NORM_EPS = 1e-5
+
+# The output head's norm is the one exception: the reference hardcodes 1e-6
+# there while the blocks take the config's 1e-5. No weight records an eps and
+# the bf16 dumps cannot resolve one either (C05), so this is a reading of
+# `dit.py:284`, not something parity against the checkpoint would recover.
+_OUT_NORM_EPS = 1e-6
 
 # The sinusoid's width. Not a config field: the checkpoint's
 # `timestep_encoder.timestep_embedder.linear_1` is 1536x256, so 256 is what
@@ -66,6 +75,16 @@ class AdaLayerNorm(nn.Module):
     ``x * sigmoid(x)``. The same function twice in one model, and the two are
     **not** bit-identical, so each has to keep its own spelling (C06 CHK-2
     measured the difference at up to 0.5 in bf16 on a trained slot).
+
+    This is written out rather than imported because **no argument to
+    diffusers' own ``AdaLayerNorm`` reproduces it**: that class chunks
+    ``shift, scale`` along dim 1 when ``chunk_dim=1`` and ``scale, shift``
+    along dim 0 otherwise (its source calls its own inconsistency "a bit
+    weird"). The reference copied the class, kept the ``chunk_dim=0`` *order*
+    and hardcoded the ``dim=1`` *axis* -- a pairing diffusers cannot produce,
+    and its ``chunk_dim`` survives as an attribute nothing reads. Importing
+    with ``chunk_dim=1`` would silently swap a learned gain for a learned
+    offset. ``DiT``'s output head below is the *other* convention.
     """
 
     def __init__(self, embedding_dim: int):
@@ -164,3 +183,113 @@ class _BlockAttention(nn.Module):
                 f"{list(query.shape)} (batch, tokens, heads, head_dim)"
             )
         return self.to_out[0](out.reshape(batch, queries, -1))
+
+
+def _attends_encoder(index: int) -> bool:
+    """Whether block ``index`` cross-attends the bridge's rows.
+
+    The even blocks cross-attend and the odd ones attend their own tokens.
+    The stack reads this once to size ``to_k``/``to_v`` and again to decide
+    what to hand each block, so the two cannot drift apart -- a block given
+    1536-wide rows will cross-attend them perfectly happily, so nothing below
+    this function would catch a mismatch.
+
+    Not to be confused with ``attend_text_every_n_blocks``, which chooses
+    *which* rows a cross block reads (text or image, ``dit.py:391``). That is
+    the caller's business and does not reach this far.
+    """
+    return index % 2 == 0
+
+
+class ActionPositionEmbedding(nn.Module):
+    """The learned table, added to the action rows and to nothing else.
+
+    The reference adds it to ``action_features`` *before* the state token is
+    concatenated (``gr00t_n1d7.py:408-413``), so of the DT's 41 input rows the
+    40 action rows carry a position and the state row carries none. Adding 41
+    rows, or adding the table after the concat, changes no shape and raises
+    nothing.
+
+    Rows ``0:T`` are taken as a slice, which is what the reference's
+    ``self.position_embedding(arange(T))`` gathers -- the same rows in the
+    same order, without the index tensor.
+    """
+
+    def __init__(self, config: Gr00tN17Config):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(config.max_seq_len, config.input_embedding_dim)
+        )
+
+    def forward(self, action_features: torch.Tensor) -> torch.Tensor:
+        """``[B, T, D]`` in, the same with positions added."""
+        return action_features + self.weight[: action_features.shape[1]]
+
+
+class DiT(nn.Module):
+    r"""GR00T's action-head transformer: the ``action_head.model`` tensors.
+
+    32 AdaLN blocks alternating cross-attention over the bridge's rows with
+    self-attention over the DT's own, then a conditioned output norm and two
+    projections down to ``output_dim``.
+
+    ``attend`` is handed to every block, so C07 swaps one constructor argument
+    and nothing else moves.
+    """
+
+    def __init__(
+        self,
+        config: Gr00tN17Config,
+        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    ):
+        super().__init__()
+        stack = config.dit
+        dim = stack.inner_dim
+        self.timestep_encoder = TimestepEncoder(dim)
+        self.transformer_blocks = nn.ModuleList(
+            BasicTransformerBlock(
+                dim,
+                stack.num_attention_heads,
+                stack.attention_head_dim,
+                # a cross block reads the bridge's rows, which are as wide as
+                # the backbone's; `cross_attention_dim` is in no config file,
+                # so this field and the checkpoint's 2048-wide `to_k` are the
+                # only two places the width is written down
+                cross_attention_dim=config.backbone_embedding_dim if _attends_encoder(i) else None,
+                attend=attend,
+            )
+            for i in range(stack.num_layers)
+        )
+        self.norm_out = nn.LayerNorm(dim, _OUT_NORM_EPS, elementwise_affine=False)
+        self.proj_out_1 = nn.Linear(dim, 2 * dim)
+        self.proj_out_2 = nn.Linear(dim, stack.output_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """The DT's ``[B, T, dim]`` rows and the bridge's ``[B, S, 2048]`` to
+        ``[B, T, output_dim]``, conditioned on one ``[B]`` timestep."""
+        temb = self.timestep_encoder(timestep)
+        # the reference makes both contiguous here, and it is load-bearing:
+        # non-contiguous rows take a different GEMM path and move the output by
+        # a whole fp32 floor (1.14e-05, C06 CHK-3 QA). Free when they already
+        # are, which is the usual case.
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        for index, block in enumerate(self.transformer_blocks):
+            hidden_states = block(
+                hidden_states,
+                temb,
+                encoder_hidden_states if _attends_encoder(index) else None,
+            )
+        # `shift` first, where `AdaLayerNorm` takes `scale` first: the same
+        # arithmetic from a differently-ordered linear (`dit.py:331`). Both
+        # halves are learned and both look plausible, so only parity catches a
+        # swap. `F.silu` is the reference's spelling here and `nn.SiLU`'s is
+        # the module calling it, so the two are the same function.
+        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        return self.proj_out_2(hidden_states)
