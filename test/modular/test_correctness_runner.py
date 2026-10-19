@@ -328,3 +328,24 @@ def test_ltx2_5_audio_video_family(tmp_path):
     assert by["same-seed min frame PSNR, two server instances (dB)"].verdict == "PASS"  # same mp4 bytes
     assert by["same-seed min audio SNR, two server instances (dB)"].verdict == "PASS"  # one sample differs
     assert sc.metrics["byte_identical_r1_r2"] == {"mp4": 1, "pcm": 0, "n": 1}
+
+
+def test_gpu_check_uses_hip_indices(monkeypatch, capsys):
+    import subprocess
+
+    from benchmark.correctness import gpus
+
+    seen = []
+
+    def fake_run(cmd, env, **kw):
+        seen.append((env["HIP_VISIBLE_DEVICES"], env["CUDA_VISIBLE_DEVICES"]))
+        if env["HIP_VISIBLE_DEVICES"] == "5":  # a device that doesn't come up
+            return subprocess.CompletedProcess(cmd, 1, "", "no device")
+        out = json.dumps({"name": "AMD Instinct MI325X", "bdf": "0000:15:00.0", "used_gib": 1.5, "total_gib": 256.0})
+        return subprocess.CompletedProcess(cmd, 0, out + "\n", "")
+
+    monkeypatch.setattr(gpus.subprocess, "run", fake_run)
+    assert gpus.main(["2,5"]) == 1
+    assert seen == [("2", "2"), ("5", "5")]
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["GPU 2 (HIP) 0000:15:00.0 AMD Instinct MI325X: 1.5 of 256.0 GiB in use", "GPU 5 (HIP): missing"]
