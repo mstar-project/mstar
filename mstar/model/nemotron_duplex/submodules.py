@@ -1048,7 +1048,8 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         }
 
     def _decode_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        audio, _ = self.codec.decode(call.static_inputs["codes"])
+        # captured: the inverse DFT as a matmul, since the cuFFT plan cache can destroy a captured plan
+        audio, _ = self.codec.decode(call.static_inputs["codes"], by_matmul=True)
         return {"wav": audio.squeeze(1)}
 
     def _window(self, rid: str, codes: torch.Tensor) -> tuple[torch.Tensor, int]:

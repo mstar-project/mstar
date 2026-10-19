@@ -27,6 +27,7 @@ from torch import nn
 
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.nemotron_duplex.components._util import param
+from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
 from mstar.model.nemotron_duplex.config import ConformerSTTConfig
 
 if TYPE_CHECKING:
@@ -442,15 +443,22 @@ class ConformerStreamer:
         pe = ConformerEncoder._rel_pos_emb(self._ctx + 1, self.c.d_model, device, torch.float32)
         self._pe = pe[0, : self._ctx + 1].flip(0)
         self._pos: dict = {}    # each layer's linear_pos(_pe), by layer, dtype and autocast: fixed weights
+        feat = perception.preprocessor.featurizer
+        self._stft_basis = stft_basis(feat.window.detach(), self.c.n_fft)    # steady_step's STFT, as a matmul
 
     # -- front end -----------------------------------------------------------
 
-    def _mel(self, batch: torch.Tensor) -> torch.Tensor:
-        """``(B, samples)`` preemphasized windows -> ``(B, T, n_mels)`` log-mel frames."""
+    def _mel(self, batch: torch.Tensor, by_matmul: bool = False) -> torch.Tensor:
+        """``(B, samples)`` preemphasized windows -> ``(B, T, n_mels)`` log-mel frames.
+        ``by_matmul`` takes the STFT as a matmul, for a captured graph (see ``dft``);
+        otherwise it is the featurizer's ``torch.stft``."""
         c, feat = self.c, self.p.preprocessor.featurizer
-        spec = torch.stft(batch, n_fft=c.n_fft, hop_length=c.hop_length, win_length=c.win_length, center=False,
-                          window=feat.window.to(torch.float32), return_complex=True)
-        spec = torch.view_as_real(spec)
+        if by_matmul:
+            spec = stft_as_real(batch, self._stft_basis, c.n_fft, c.hop_length)
+        else:
+            spec = torch.view_as_real(torch.stft(
+                batch, n_fft=c.n_fft, hop_length=c.hop_length, win_length=c.win_length, center=False,
+                window=feat.window.to(torch.float32), return_complex=True))
         mag = torch.sqrt(spec.pow(2).sum(-1))
         if c.mag_power != 1.0:
             mag = mag.pow(c.mag_power)
@@ -488,6 +496,8 @@ class ConformerStreamer:
                     rows: "RecurrentAddressing") -> torch.Tensor:
         """One frame for each call, from ``chunk (B, frame_samples)``: the new
         mel frames, the subsampling window and the layers, all on the device.
+        It is captured, so its STFT is a matmul: a graph must not hold a cuFFT
+        plan, which the plan cache can destroy (see ``dft``).
 
         A call ``S = (k - 1) fs`` samples in has ``8(k - 1) - 1`` mel frames and
         ``k - 1`` encoder frames. This frame of audio adds mel frames
@@ -501,7 +511,7 @@ class ConformerStreamer:
         win = torch.cat([sig, y], dim=1)                                    # samples S - fs .. S + fs
         hop, pad = c.hop_length, c.n_fft // 2
         # mel frames f(k-1)-1 .. fk-2 span samples [S - hop - pad, S + fs - 2 hop + pad)
-        mel_new = self._mel(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad])
+        mel_new = self._mel(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], by_matmul=True)
         window = torch.cat([mel_tail[:, 1:], mel_new], dim=1)               # (B, 23, n_mels)
         new = self._subsample(window)[:, 2:3]
         front.scatter_("sig", front_rows, y)

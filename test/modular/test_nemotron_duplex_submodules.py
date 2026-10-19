@@ -1026,3 +1026,116 @@ def test_encoder_state_is_per_call_and_cleaned_up():
         pool.remove_request(1)
     assert 1 not in enc.node.request_states and 2 in enc.node.request_states
     assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 1
+
+
+# -- no cuFFT in a captured region ---------------------------------------------
+
+
+def _without_fft(config):
+    """``config`` with its region raising on any FFT op: torch.stft and
+    torch.fft reach the dispatcher as ``aten._fft_*``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _NoFFT(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert not func.__name__.startswith("_fft_"), f"{func} in a captured region"
+            return func(*args, **(kwargs or {}))
+
+    fn = config.capture_fn
+
+    def region(call):
+        with _NoFFT():
+            return fn(call)
+
+    config.capture_fn = region
+    return config
+
+
+def test_encoder_regions_run_no_fft():
+    """A captured cuFFT plan lives in torch's plan cache, whose LRU eviction
+    destroys it under the graph; so the regions take their STFT as a matmul.
+    The eager path, which the guard leaves alone, keeps torch.stft."""
+    enc = _Encoder()
+    configs = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    labels = (ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
+    enc.regions = {label: _captured_on_cpu(_without_fft(configs[label]), label, enc.resources, enc.runner)
+                   for label in labels}
+    wavs = {1: torch.randn(16000) * 0.1, 2: torch.randn(16000 + 640) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 640})
+    assert all(enc.regions[label].calls for label in labels)
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_codec_region_runs_no_fft():
+    """As the encoder's: the decode region's inverse DFT is a matmul, and its
+    stream is still the full-history decode."""
+    from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
+    from mstar.model.nemotron_duplex.config import CodecConfig
+
+    torch.manual_seed(0)
+    ccfg = CodecConfig(base_hidden_size=8, latent_size=16, codebook_size=16, num_quantizers=4)
+    real = AudioCodec(ccfg).eval()
+    for prm in real.parameters():
+        if prm.is_floating_point():
+            prm.data.normal_(0, 0.05)
+    cfg = NemotronDuplexConfig()
+    cfg.eartts.num_quantizers = ccfg.num_quantizers
+    codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
+    label = AudioCodecDecoderSubmodule.DECODE_REGION
+    region = _captured_on_cpu(
+        _without_fft(codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label]),
+        label)
+    codes = torch.randint(0, ccfg.codebook_size, (23, ccfg.num_quantizers))
+    pieces = []
+    with torch.no_grad():
+        starts = list(range(0, 23, 5))
+        for start in starts:
+            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [codes[start:start + 5]]},
+                                       is_final_stream_chunk=start == starts[-1])
+            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None,
+                                  piecewise_runners={label: region})
+            pieces.append(codec.forward_batched("codec_chunk", eng,
+                                                **codec.preprocess("codec_chunk", eng, [inp]))["r"]["audio_chunk"][0])
+        whole, _ = real.decode(codes.unsqueeze(0))
+    assert region.calls >= 3
+    whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
+    torch.testing.assert_close(torch.cat(pieces), whole, atol=1, rtol=0)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize(("n_fft", "win", "samples"), [(512, 400, 1632), (512, 400, 1700), (512, 512, 2000),
+                                                        (256, 101, 900)])
+def test_stft_as_a_matmul_is_torch_stft(n_fft, win, samples, autocast):
+    """The matmul STFT is torch.stft's to fp32 rounding, measured against
+    float64; bf16 autocast leaves it in full precision."""
+    from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
+
+    torch.manual_seed(0)
+    x, window = torch.randn(3, samples), torch.hann_window(win, periodic=False)
+
+    def stft(signal):
+        return torch.view_as_real(torch.stft(signal, n_fft, hop_length=160, win_length=win, center=False,
+                                             window=window.to(signal.dtype), return_complex=True))
+
+    exact = stft(x.double())
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        got = stft_as_real(x, stft_basis(window, n_fft), n_fft, 160)
+    assert got.dtype == torch.float32 and got.shape == exact.shape
+    fp32_fft = (stft(x) - exact).abs().max()
+    assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
+
+
+@pytest.mark.parametrize("n", [16, 15])
+def test_irfft_as_a_matmul_is_torch_irfft(n):
+    """The matmul inverse DFT is torch.fft.irfft's to fp32 rounding, measured
+    against float64, imaginary DC and Nyquist parts ignored as irfft ignores them."""
+    from mstar.model.nemotron_duplex.components.dft import irfft_dim1
+
+    torch.manual_seed(0)
+    spec = torch.randn(4, n // 2 + 1, 50, dtype=torch.complex64)
+    exact = torch.fft.irfft(spec.to(torch.complex128), n=n, dim=-2)
+    got = irfft_dim1(spec, n)
+    assert got.dtype == torch.float32 and got.shape == exact.shape
+    fp32_fft = (torch.fft.irfft(spec, n=n, dim=-2) - exact).abs().max()
+    assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
