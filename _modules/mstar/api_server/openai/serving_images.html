@@ -909,7 +909,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">uuid</span><span class="w"> </span><span class="kn">import</span> <span class="n">uuid4</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span><span class="p">,</span> <span class="n">release_unread</span><span class="p">,</span> <span class="n">rid</span>
 
 
 <div class="viewcode-block" id="create_images">
@@ -929,25 +931,43 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">seed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">model_kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span> <span class="o">+</span> <span class="n">i</span>
         <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"img"</span><span class="p">)</span>
-        <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
-            <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
-            <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
-            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">model_kwargs</span><span class="p">,</span>
-            <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
-        <span class="p">)</span>
+        <span class="c1"># Listed before submitting: submit_request registers the request</span>
+        <span class="c1"># before handing it on, so a failed submit still holds an entry.</span>
         <span class="n">request_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
+                <span class="n">model_kwargs</span><span class="o">=</span><span class="n">model_kwargs</span><span class="p">,</span>
+                <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+            <span class="n">release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="k">raise</span>
 
     <span class="n">data</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="k">for</span> <span class="n">request_id</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
-        <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-        <span class="n">data</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
-            <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
-            <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
-            <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
-        <span class="p">)</span>
+    <span class="n">read</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># images collect_results has released; the rest are released on early exit</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">request_id</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
+            <span class="k">except</span> <span class="n">HTTPException</span><span class="p">:</span>
+                <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>  <span class="c1"># collect_results released it before raising</span>
+                <span class="k">raise</span>
+            <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="n">data</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
+                <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
+                <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
+                <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
+            <span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># One failed, timed-out or cancelled image fails the whole request, so</span>
+        <span class="c1"># nothing will read the others: abort the ones still running and drop</span>
+        <span class="c1"># the finished ones, which would otherwise hold their bytes forever.</span>
+        <span class="n">release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">read</span><span class="p">)</span>
     <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
 
 
