@@ -12,9 +12,11 @@ either depends only on sizes and world size or is agreed across ranks first.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import inspect
 import logging
+import os
 import re
 
 import torch
@@ -200,6 +202,25 @@ def _round_up(n: int, multiple: int) -> int:
     return -(-n // multiple) * multiple
 
 
+@contextlib.contextmanager
+def _raw_input_pool():
+    """AITER sends its input pool's IPC handle with offset 0, as if the pool
+    started its allocation. A pool from torch's caching allocator can sit
+    partway into a segment, and then every peer reads the wrong memory. With
+    AITER_CUSTOM_AR_RAW_INPUT_POOL the pool is its own hipMalloc. AITER only
+    reads the switch from the environment, while it builds the pool."""
+    key = "AITER_CUSTOM_AR_RAW_INPUT_POOL"
+    prev = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
+
+
 def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
                weight_bias: float, eps: float):
     """Expected ``(norm, residual)`` for the stacked per-rank inputs ``xs``,
@@ -333,7 +354,8 @@ class AiterARFusion(ARFusion):
         device = torch.device("cuda", torch.cuda.current_device())
         ca = None
         try:
-            ca = CustomAllreduce(cpu_group, device, max_size=max_size)
+            with _raw_input_pool():
+                ca = CustomAllreduce(cpu_group, device, max_size=max_size)
             built = not ca.disabled
         except Exception:
             logger.exception("AITER CustomAllreduce construction failed")
