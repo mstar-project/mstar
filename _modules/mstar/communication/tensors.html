@@ -1279,6 +1279,21 @@ window.runMermaid = runMermaid;</script>
 <span class="n">SourceAndEdgeToRxInfo</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">RxInfo</span><span class="p">]</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_dense</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether ``tensor`` fills exactly its ``nbytes`` from ``data_ptr()``,</span>
+<span class="sd">    with no gaps or overlaps: contiguous up to a permutation of its dims."""</span>
+    <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="n">expected</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="k">for</span> <span class="n">stride</span><span class="p">,</span> <span class="n">size</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">stride</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)):</span>
+        <span class="k">if</span> <span class="n">size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">stride</span> <span class="o">!=</span> <span class="n">expected</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="n">expected</span> <span class="o">*=</span> <span class="n">size</span>
+    <span class="k">return</span> <span class="kc">True</span>
+
+
 <div class="viewcode-block" id="TensorCommunicationManager">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">TensorCommunicationManager</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
@@ -1335,6 +1350,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># req_id -&gt; {name -&gt; shards}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">BufferedShards</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">needs_cpu_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1343,7 +1360,52 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        False for transports that read device memory (TCP / RDMA)."""</span>
         <span class="k">return</span> <span class="kc">False</span>
 
+    <span class="c1">#: Whether a consumer reads a stored tensor as ``nbytes`` contiguous bytes</span>
+    <span class="c1">#: from its ``address`` (Mooncake RDMA / TCP), so the store must hold a</span>
+    <span class="c1">#: layout that one flat read reproduces. False for transports that</span>
+    <span class="c1">#: serialize a contiguous copy at send time (SHM). An attribute, not a</span>
+    <span class="c1">#: property: every store call reads it.</span>
+    <span class="n">needs_flat_layout</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="c1"># ---- shared: store ----</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_flat_layout</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">sharded</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">ready_event</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``tensor`` if one flat read of its ``nbytes`` from ``data_ptr()``</span>
+<span class="sd">        reproduces it, else a contiguous copy. Only for a non-contiguous</span>
+<span class="sd">        tensor on a ``needs_flat_layout`` transport.</span>
+
+<span class="sd">        A dense permutation (a transpose) is kept as is: the consumer</span>
+<span class="sd">        rebuilds it from the strides. A sharded tensor must be contiguous,</span>
+<span class="sd">        since its slices are byte ranges of rows. A CUDA copy runs on a side</span>
+<span class="sd">        stream so it does not queue behind the next step; the store waits for</span>
+<span class="sd">        it before returning the descriptors.</span>
+
+<span class="sd">        The side stream is ordered after the producer only by ``ready_event``</span>
+<span class="sd">        (the step's completion event). Without one, the producer's writes must</span>
+<span class="sd">        already be complete when the store is called, not just queued ahead on</span>
+<span class="sd">        some stream: the default-stream sync of ``skip_cuda_sync=False``, or</span>
+<span class="sd">        the caller's own wait.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">sharded</span> <span class="ow">and</span> <span class="n">_is_dense</span><span class="p">(</span><span class="n">tensor</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">tensor</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">tensor</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tensor</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_stream</span>
+        <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">tensor</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ready_event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">ready_event</span><span class="p">)</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
+            <span class="n">copy</span> <span class="o">=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="n">copy</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wait_flat_copies</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_host_copies_by_tensor</span><span class="p">(</span>
         <span class="n">tensors</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="p">:</span> <span class="n">NameToTensorList</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
@@ -1441,6 +1503,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_host_copies_by_tensor</span><span class="p">(</span><span class="n">tensors</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">out_cpu</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{}</span>
         <span class="p">)</span>
+        <span class="n">flat</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span>
         <span class="n">tensor_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor_list</span> <span class="ow">in</span> <span class="n">tensors</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">tensor_info</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1453,6 +1516,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># it here unconditionally so TensorPointerInfo dims/strides</span>
                 <span class="c1"># match what receivers will read.</span>
                 <span class="n">canonical</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ensure_leading_shard_dim</span><span class="p">(</span><span class="n">shard_dim</span><span class="p">,</span> <span class="n">tensor</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">flat</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">canonical</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">():</span>
+                    <span class="n">canonical</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_layout</span><span class="p">(</span><span class="n">canonical</span><span class="p">,</span> <span class="n">shard_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
                 <span class="c1"># Built before the put: the store keeps the descriptor so an</span>
                 <span class="c1"># edge can be rebuilt from its uuid alone. This is the same</span>
                 <span class="c1"># object the edge carries, so later in-place edits (the</span>
@@ -1509,7 +1574,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (which waits for *only* the producing step, not the queued next</span>
         <span class="c1"># step), so the unconditional default-stream sync here would</span>
         <span class="c1"># uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from</span>
-        <span class="c1"># those call sites.</span>
+        <span class="c1"># those call sites, and only once the producer's writes are complete:</span>
+        <span class="c1"># a flat-layout copy (``_flat_layout``) reads them during this call.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1526,6 +1592,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor_batch_multi</span><span class="p">(</span>
             <span class="n">request_ids</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">canonicals</span><span class="p">,</span> <span class="n">infos</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="o">=</span><span class="n">cpus</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_wait_flat_copies</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">tensor_info</span></div>
 
 
@@ -1571,6 +1639,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="n">want_cpu</span> <span class="o">=</span> <span class="n">host_rows</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_cpu_tensor</span>
+        <span class="n">flat</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span>
         <span class="c1"># signal -&gt; the row tensor it views, learned from the first request</span>
         <span class="c1"># that has it and checked on every other</span>
         <span class="n">alias</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1621,6 +1690,11 @@ window.runMermaid = runMermaid;</script>
                             <span class="k">return</span> <span class="kc">None</span>
                         <span class="n">alias</span><span class="p">[</span><span class="n">signal</span><span class="p">]</span> <span class="o">=</span> <span class="n">name</span>
                         <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">template</span><span class="p">:</span>
+                            <span class="c1"># rows of one tensor share a layout; one that a</span>
+                            <span class="c1"># flat read cannot reproduce is copied per tensor</span>
+                            <span class="c1"># by the general path</span>
+                            <span class="k">if</span> <span class="n">flat</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">row_views</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">():</span>
+                                <span class="k">return</span> <span class="kc">None</span>
                             <span class="n">template</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_row_template</span><span class="p">(</span>
                                 <span class="n">views</span><span class="p">,</span> <span class="n">columns</span><span class="p">,</span> <span class="n">host_rows</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span>
                             <span class="p">)</span>
@@ -1704,6 +1778,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">cpu_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">ready_event</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StoredOutputs</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Store a whole output batch and return the columns routing needs.</span>
 
@@ -1724,6 +1799,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already</span>
 <span class="sd">        made (e.g. the stop check's), matched as in ``_host_copies_by_tensor``;</span>
 <span class="sd">        kept only if ``needs_cpu_tensor``.</span>
+
+<span class="sd">        ``skip_cuda_sync=True`` as in ``store_and_return_tensor_info``: the</span>
+<span class="sd">        producer's writes must be complete, unless ``ready_event`` (the</span>
+<span class="sd">        producing step's completion event) is given, which a flat-layout copy</span>
+<span class="sd">        waits on before it reads them.</span>
 <span class="sd">        """</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
@@ -1735,6 +1815,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">canonicals</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">want_cpu</span> <span class="o">=</span> <span class="n">cpu_tensors</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_cpu_tensor</span>
         <span class="n">cpus</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">flat</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span>
 
         <span class="n">columnar</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">has_put_tensor_batch_columns</span>
         <span class="n">infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1793,6 +1874,10 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">canonical</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ensure_leading_shard_dim</span><span class="p">(</span>
                             <span class="n">shard_dim</span><span class="p">,</span> <span class="n">tensor</span><span class="p">,</span>
                         <span class="p">)</span>
+                        <span class="k">if</span> <span class="n">flat</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">canonical</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">():</span>
+                            <span class="n">canonical</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_layout</span><span class="p">(</span>
+                                <span class="n">canonical</span><span class="p">,</span> <span class="n">shard_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="n">ready_event</span><span class="p">,</span>
+                            <span class="p">)</span>
                         <span class="n">flat_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensor_uuid</span><span class="p">)</span>
                         <span class="n">flat_rids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
                         <span class="n">signal_idxs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
@@ -1831,6 +1916,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">raise</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_wait_flat_copies</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">StoredOutputs</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">,</span> <span class="n">flat_rids</span><span class="p">,</span> <span class="n">signal_idxs</span><span class="p">,</span> <span class="n">num_tensors</span><span class="p">)</span></div>
 
 
@@ -2428,6 +2515,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">protocol</span>
+        <span class="c1"># the consumer has the engine copy ``nbytes`` from ``address + offset``</span>
+        <span class="c1"># into a buffer it views with the descriptor's strides</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span> <span class="o">=</span> <span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span> <span class="o">=</span> <span class="n">AsyncMooncakeReader</span><span class="p">(</span>
             <span class="n">engine</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
             <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span>
