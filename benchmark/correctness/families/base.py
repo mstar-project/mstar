@@ -82,13 +82,26 @@ class Family:
 class MathSdpaReference:
     """--family-opt ref_sdpa=math builds a second reference with torch's math SDPA. Scoring the
     default reference then also reports how far the reference moves from itself when only its
-    attention kernel changes, which is the spread a served output should be judged against."""
+    attention kernel changes, which is the spread a served output should be judged against.
+
+    For image-to-video, --family-opt ref_anchor=fp32 builds one whose conditioning frame is encoded in
+    fp32. The served encode lands elsewhere inside the bf16 encode error and some videos amplify that,
+    but the math-SDPA arm encodes the frame exactly like the reference and two server instances agree
+    with each other, so neither shows it."""
 
     MATH_SUFFIX = "-sdpa-math"
+    ANCHOR_SUFFIX = "-anchor-fp32"
 
     @property
     def ref_sdpa_math(self) -> bool:
         return self.opt("ref_sdpa") == "math"
+
+    @property
+    def ref_anchor_fp32(self) -> bool:
+        return self.opt("ref_anchor") == "fp32"
+
+    def arm_suffix(self) -> str:
+        return (self.MATH_SUFFIX if self.ref_sdpa_math else "") + (self.ANCHOR_SUFFIX if self.ref_anchor_fp32 else "")
 
     def sdpa_context(self):
         import contextlib
@@ -101,9 +114,10 @@ class MathSdpaReference:
 
     CALIBRATION_DB = 3.0
 
-    def calibrated_verdict(self, sc, spread: list[float], served_median: float | None) -> None:
-        """ROCm verdict next to the raw gate: the served median has to reach the reference's own math-SDPA
-        spread (median) minus CALIBRATION_DB. Recorded as a metric, so the raw verdict stays the CUDA gate."""
+    def calibrated_verdict(self, sc, spread: list[float], served_median: float | None,
+                           basis: str = "math-SDPA spread") -> None:
+        """ROCm verdict next to the raw gate: the served median has to reach the reference's own spread
+        (median) minus CALIBRATION_DB. Recorded as a metric, so the raw verdict stays the CUDA gate."""
         import statistics
 
         if not spread or served_median is None:
@@ -112,16 +126,24 @@ class MathSdpaReference:
         floor = spread_median - self.CALIBRATION_DB
         verdict = "PASS" if served_median >= floor else "FAIL"
         sc.metrics["rocm_calibrated"] = {"spread_median_db": round(spread_median, 2), "floor_db": round(floor, 2),
-                                         "served_median_db": round(served_median, 2), "verdict": verdict}
+                                         "served_median_db": round(served_median, 2), "verdict": verdict,
+                                         "basis": basis}
         sc.notes.append(f"Calibrated ROCm verdict {verdict}: served median {served_median:.2f} dB against a floor of "
-                        f"{floor:.2f} dB ({self.CALIBRATION_DB:g} dB under the reference's math-SDPA spread, median "
+                        f"{floor:.2f} dB ({self.CALIBRATION_DB:g} dB under the reference's {basis}, median "
                         f"{spread_median:.2f} dB). The raw verdict above is the CUDA-derived gate.")
 
     def math_reference_dir(self, ref_dir: Path | None) -> Path | None:
         """The math-SDPA sibling of the default reference, when it was built."""
-        if ref_dir is None or self.ref_sdpa_math:
+        return self._arm_dir(ref_dir, self.MATH_SUFFIX)
+
+    def anchor_reference_dir(self, ref_dir: Path | None) -> Path | None:
+        """The fp32-anchor sibling of the default reference, when it was built."""
+        return self._arm_dir(ref_dir, self.ANCHOR_SUFFIX)
+
+    def _arm_dir(self, ref_dir: Path | None, suffix: str) -> Path | None:
+        if ref_dir is None or self.arm_suffix():
             return None
-        d = ref_dir.parent.parent / (ref_dir.parent.name + self.MATH_SUFFIX) / ref_dir.name
+        d = ref_dir.parent.parent / (ref_dir.parent.name + suffix) / ref_dir.name
         return d if (d / "meta.json").is_file() else None
 
 
