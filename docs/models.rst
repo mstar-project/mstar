@@ -252,7 +252,7 @@ Kokoro notes
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
   fallback even when it is installed, ``chunk_target_phonemes`` and
   ``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
-  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the accelerator
   graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
   skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
   half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk

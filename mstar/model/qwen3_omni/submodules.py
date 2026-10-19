@@ -1102,7 +1102,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, list[torch.Tensor]]:
         """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
 
-        ``forward_batched`` always emits these keys so the captured CUDA
+        ``forward_batched`` always emits these keys so the captured accelerator
         graph's output shape is static.  Here, outside the captured
         region, we gate them on the real request's ``audio_output`` flag
         so the Talker edge stays unrouted for text-only requests (matches
