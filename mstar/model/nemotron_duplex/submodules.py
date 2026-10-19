@@ -497,15 +497,19 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 f"the call ended with {1000 * samples / stt.sample_rate:g} ms of audio; "
                 f"it needs more than {1000 * (stt.n_fft // 2) / stt.sample_rate:g} ms"
             )
+        final = bool(is_final_stream_chunk)
         return NodeInputs(
             tensor_inputs={} if wav is None else {"chunk": wav},
-            kwargs={"final": bool(is_final_stream_chunk)},
+            # whether the whole-step region serves the call: decided here, once,
+            # for the declaration and the forward to share
+            kwargs={"final": final, "steady": st is not None and self.streamer.is_steady(st, wav, final)},
         )
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
         return {
             "chunk": [inp.tensor_inputs.get("chunk") for inp in inputs],
             "final": [inp.kwargs.get("final", False) for inp in inputs],
+            "steady": [inp.kwargs.get("steady", False) for inp in inputs],
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
@@ -530,9 +534,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # over the whole batch, at the bucket its lease names, and the region's
         # own step owns both pools. Each such call already holds its slots, from
         # a first step declared below, so that step's admit reserves nothing.
-        if self.STEP_REGION in (piecewise_leases or {}) and all(
-            self._is_steady(rid, inp) for rid, inp in zip(request_ids, inputs, strict=True)
-        ):
+        if self.STEP_REGION in (piecewise_leases or {}) and all(inp.kwargs["steady"] for inp in inputs):
             return None
         # Otherwise this step reserves and plans every call's slots, and the
         # eager path reads that plan. A region the forward still replays for
@@ -541,11 +543,6 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # names the whole batch's bucket, not the sub-batch's, and its admit
         # can't refuse a call that has no slot yet.
         return self._declare(request_ids, (ENCODER_FRONT, ENCODER_STATE))
-
-    def _is_steady(self, rid, inputs: NodeInputs) -> bool:
-        st = self.request_state(rid).get(self.STATE_KEY)
-        return st is not None and self.streamer.is_steady(st, inputs.tensor_inputs.get("chunk"),
-                                                          inputs.kwargs["final"])
 
     @property
     def streamer(self) -> ConformerStreamer:
@@ -623,7 +620,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         t = torch.tensor(values, dtype=torch.long)
         return (t.pin_memory() if device.type == "cuda" else t).to(device, non_blocking=True)
 
-    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs):
+    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, **kwargs):
         rids = list(engine_inputs.request_ids)
         device = self.perception.proj.weight.device
         streamer = self.streamer
@@ -635,8 +632,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
         # calls one frame of audio further on the frame grid: the whole step as one graph, run last
         step_runner = runners.get(self.STEP_REGION)
-        steady = [i for i, (st, c, f) in enumerate(zip(states, chunks, final, strict=True))
-                  if streamer.is_steady(st, c, f)] if step_runner is not None else []
+        steady = [i for i, s in enumerate(steady) if s] if step_runner is not None else []
         if engine_inputs.step is None:
             # declare_step left both pools to the region (see there)
             assert len(steady) == len(rids), "an encoder step declared nothing but is not all steady"
@@ -708,10 +704,10 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         y = self.streamer.layers(enc.x, pool, rows, counts[0], counts[1])
         return [row[:n] for row, n in zip(y, enc.n, strict=True)]
 
-    def forward(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs) -> NameToTensorList:
+    def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
         # one call's step: preprocess's lists of one row
         rid = engine_inputs.request_ids[0]
-        return self.forward_batched(graph_walk, engine_inputs, chunk=chunk, final=final).per_rid_outputs[rid]
+        return self.forward_batched(graph_walk, engine_inputs, **kwargs).per_rid_outputs[rid]
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):

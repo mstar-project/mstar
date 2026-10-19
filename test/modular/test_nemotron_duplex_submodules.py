@@ -870,6 +870,24 @@ def test_encoder_ends_a_call_with_its_last_frame_when_the_end_adds_no_mel_frame(
     assert torch.allclose(torch.stack(got), want, atol=1e-5)
 
 
+def test_encoder_decides_a_calls_steadiness_once_per_step(monkeypatch):
+    """Whether a call takes the whole-step region is decided once, where its
+    inputs are prepared; the declaration and the forward read that decision."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION)
+    wavs = {h: torch.randn(1280 * 4) * 0.1 for h in (1, 2)}
+
+    def decided_already(*args):
+        raise AssertionError("steadiness decided again after prepare_inputs")
+
+    for at in range(0, 1280 * 4, 1280):
+        inputs = [enc.prepare(h, wavs[h][at:at + 1280]) for h in wavs]
+        with monkeypatch.context() as m:
+            m.setattr(enc.node.streamer, "is_steady", decided_already)
+            enc.step(list(wavs), inputs)
+    assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls == 2
+
+
 def test_encoder_offers_nothing_to_the_stop_check():
     """The encoder has no check_stop and its stream ends with the client's: its
     frames are not copied to the host every step for one."""
