@@ -337,6 +337,8 @@ class Benchmark:
             "completed": len(ok_metrics),
             "failed": len(metrics) - len(ok_metrics),
             "wall_time_s": wall_time,
+            "client_loop_cpu_s": getattr(self, "_client_cpu", (None, None))[0],
+            "client_process_cpu_s": getattr(self, "_client_cpu", (None, None))[1],
             "jct_mean_ms": (sum(jcts_ms) / len(jcts_ms)) if jcts_ms else 0.0,
             "jct_median_ms": jcts_ms[len(jcts_ms) // 2] if jcts_ms else 0.0,
             "jct_p90_ms": _pct(jcts_ms, 90),
@@ -549,6 +551,7 @@ class Benchmark:
             await self._warmup(session, requests)
 
             wall_start = time.monotonic()
+            loop_cpu_start, cpu_start = time.thread_time(), time.process_time()
 
             if self.config.profiling_type == ProfilingType.OFFLINE:
                 metrics = await self._run_concurrent_offline(session, measured)
@@ -558,6 +561,9 @@ class Benchmark:
                 metrics = await self._run_concurrent_online(session, measured)
 
             wall_time = time.monotonic() - wall_start
+            # CPU of the event-loop thread (where every request and stream is handled) and of the whole process
+            # over the timed window: a loop busy for nearly all of wall_time means the client set the pace.
+            self._client_cpu = (time.thread_time() - loop_cpu_start, time.process_time() - cpu_start)
 
         agg = aggregate_metrics(
             metrics,

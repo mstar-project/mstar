@@ -268,9 +268,12 @@ def test_table_render(tmp_path):
                                                 "startup": {"ready_s": 100.0, "first_request_s": 1.5}}))
         summ = {"tok_s": {"median": tok, "min": tok - 5, "max": tok + 5, "n": 3},
                 "out_tokens_per_req": {"median": out_tok, "min": out_tok, "max": out_tok, "n": 3}}
+        # mstar's client-bound comes from the timed-window measure and stays; vllm-aiter's predates it and goes.
+        loop = {"client_loop_frac": 0.95} if arm == "mstar" else {"client_cpu_frac": 1.3}
         (d / "cells/text-chat-256/c8/cell.json").write_text(json.dumps(
             {"arm": arm, "row": "qwen3_5_0.8b", "workload": "text-chat-256", "concurrency": 8, "summary": summ,
-             "flags": ["rerun"] if arm == "mstar" else [], "errors": [], "status": "done"}))
+             "flags": ["client-bound", "rerun"] if arm == "mstar" else ["client-bound"], "errors": [],
+             "status": "done", "attempts": [{"repeats": [loop]}]}))
         # Served arms record co-tenants per repeat, reference arms once per cell.
         rec = d / "cells/text-chat-256/c8" / ("a1r1" if arm == "mstar" else "")
         rec.mkdir(exist_ok=True)
@@ -278,8 +281,12 @@ def test_table_render(tmp_path):
             {"markers": ["ws-j", "ws-j-moe-tune"] if arm == "mstar" else ["ws-j"], "loadavg": [12.4, 9.0, 7.0]}))
     (run / "correctness.json").write_text(json.dumps({"qwen3_5_0.8b/mstar": {"verdict": "PASS",
                                                                              "exact_vs_reference": "30/32"}}))
+    void = run / "qwen3_5_0.8b" / "mstar.health-fail-1"
+    void.mkdir()
+    (void / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_0.8b", "status": "done"}))
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
+    assert "| client-bound rerun |" in md and md.count("client-bound") == 1
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1)" in md and "node health check_resume1: PASS" in md
     assert "  - NODE bare_metal: VM/SR-IOV slice (virt=none" in md
     assert "| ws-j-moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
