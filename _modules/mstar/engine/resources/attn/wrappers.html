@@ -977,7 +977,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        max_total_tokens: required for CUDA graph mode (max total new tokens across batch)</span>
 <span class="sd">        max_num_pages: required for CUDA graph mode (max pages across all requests)</span>
 <span class="sd">        device: torch device</span>
-<span class="sd">        use_cuda_graph: if True, pre-allocate static buffers for graph capture</span>
+<span class="sd">        accelerator_graph: if True, pre-allocate static buffers for graph capture</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -1195,7 +1195,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        batch_size: required for CUDA graph mode (max requests in batch)</span>
 <span class="sd">        max_num_pages: required for CUDA graph mode (max pages across all requests)</span>
 <span class="sd">        device: torch device</span>
-<span class="sd">        use_cuda_graph: if True, pre-allocate static buffers for graph capture</span>
+<span class="sd">        accelerator_graph: if True, pre-allocate static buffers for graph capture</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -1380,13 +1380,13 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span> <span class="o">=</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">(</span>
             <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">decode_workspace</span><span class="p">,</span> <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
-            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">max_num_pages</span><span class="p">,</span> <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kv</span><span class="p">,</span>
+            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">max_num_pages</span><span class="p">,</span> <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kv</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="c1"># one row past the prompt rows takes the step's other tokens (see `plan`)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefill</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span>
             <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">prefill_workspace</span><span class="p">,</span> <span class="n">batch_size</span><span class="o">=</span><span class="n">max_prefill_rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
             <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">max_total_tokens</span><span class="p">,</span> <span class="n">max_num_pages</span><span class="o">=</span><span class="n">max_num_pages</span><span class="p">,</span>
-            <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kv</span><span class="p">,</span>
+            <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kv</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="n">i64</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_perm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">max_total_tokens</span><span class="p">,</span> <span class="o">**</span><span class="n">i64</span><span class="p">)</span>
