@@ -907,6 +907,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">uuid</span><span class="w"> </span><span class="kn">import</span> <span class="n">uuid4</span>
 
@@ -924,7 +925,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># diffusions instead). Seeded requests follow the reference seed contract:</span>
     <span class="c1"># image i uses seed + i, so image 0 is bit-identical to the same request</span>
     <span class="c1"># with n=1; unseeded requests draw independent per-request seeds.</span>
-    <span class="n">n</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"n"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">1</span><span class="p">))</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="n">image_count</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
     <span class="n">seed</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">)</span>
     <span class="n">request_ids</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
@@ -1014,6 +1015,38 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
     <span class="p">]</span>
     <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
+
+
+
+<span class="n">DEFAULT_MAX_IMAGES_PER_REQUEST</span> <span class="o">=</span> <span class="mi">10</span>
+
+
+<div class="viewcode-block" id="max_images_per_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.max_images_per_request">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">max_images_per_request</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Largest ``n`` one image request may ask for: ``MSTAR_MAX_IMAGES_PER_REQUEST``,</span>
+<span class="sd">    default 10 (OpenAI's range for the endpoint), at least 1. The Rust frontend</span>
+<span class="sd">    parses it the same way: an ASCII integer, surrounding whitespace allowed,</span>
+<span class="sd">    anything else the default."""</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_MAX_IMAGES_PER_REQUEST"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">re</span><span class="o">.</span><span class="n">fullmatch</span><span class="p">(</span><span class="sa">r</span><span class="s2">"[+-]?[0-9]+"</span><span class="p">,</span> <span class="n">raw</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">DEFAULT_MAX_IMAGES_PER_REQUEST</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">raw</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="image_count">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.image_count">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">image_count</span><span class="p">(</span><span class="n">req</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The request's ``n``, 1 when omitted. Outside ``1..max_images_per_request()``</span>
+<span class="sd">    it raises ``ValueError`` (a 400), before anything is submitted."""</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"n"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">n</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">1</span>
+    <span class="n">limit</span> <span class="o">=</span> <span class="n">max_images_per_request</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="mi">1</span> <span class="o">&lt;=</span> <span class="n">n</span> <span class="o">&lt;=</span> <span class="n">limit</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"n must be between 1 and </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">n</span></div>
 
 </pre></div>
 

@@ -871,6 +871,14 @@ request reaches the pod (Run:AI serves a workload at
 <code class="docutils literal notranslate"><span class="pre">/&lt;project&gt;/&lt;job-name&gt;/</span></code>, for instance); without it FastAPI 404s
 every route. Empty by default, so a direct deployment is unaffected.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">10</span></code></p></td>
+<td><p>Largest <code class="docutils literal notranslate"><span class="pre">n</span></code> one <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> request may ask for (see
+<a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.max_images_per_request" title="mstar.api_server.openai.serving_images.max_images_per_request"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.openai.serving_images.max_images_per_request()</span></code></a>);
+<code class="docutils literal notranslate"><span class="pre">n</span></code> outside <code class="docutils literal notranslate"><span class="pre">1</span></code> to this value is a 400 before anything is
+submitted. The Rust frontend and the Dynamo bridge apply the same
+variable and default.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

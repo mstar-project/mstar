@@ -198,6 +198,13 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
+     - ``10``
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
+       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+       ``n`` outside ``1`` to this value is a 400 before anything is
+       submitted. The Rust frontend and the Dynamo bridge apply the same
+       variable and default.
 
 Serving (Rust frontend)
 -----------------------

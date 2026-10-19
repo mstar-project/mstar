@@ -612,6 +612,8 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.create_image_edit"><code class="docutils literal notranslate"><span class="pre">create_image_edit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.create_images"><code class="docutils literal notranslate"><span class="pre">create_images()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.image_count"><code class="docutils literal notranslate"><span class="pre">image_count()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.max_images_per_request"><code class="docutils literal notranslate"><span class="pre">max_images_per_request()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -635,6 +637,12 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_images.create_images" title="mstar.api_server.openai.serving_images.create_images"><code class="xref py py-obj docutils literal notranslate"><span class="pre">create_images</span></code></a>(api, model_name, adapter, req)</p></td>
 <td><p></p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_images.image_count" title="mstar.api_server.openai.serving_images.image_count"><code class="xref py py-obj docutils literal notranslate"><span class="pre">image_count</span></code></a>(req)</p></td>
+<td><p>The request's <code class="docutils literal notranslate"><span class="pre">n</span></code>, 1 when omitted.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_images.max_images_per_request" title="mstar.api_server.openai.serving_images.max_images_per_request"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_images_per_request</span></code></a>()</p></td>
+<td><p>Largest <code class="docutils literal notranslate"><span class="pre">n</span></code> one image request may ask for: <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code>, default 10 (OpenAI's range for the endpoint), at least 1.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -647,6 +655,32 @@
 <dt class="sig sig-object py" id="mstar.api_server.openai.serving_images.create_images">
 <span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_images.</span></span><span class="sig-name descname"><span class="pre">create_images</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">api</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">adapter</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_images.html#create_images"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_images.create_images" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_images.image_count">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_images.</span></span><span class="sig-name descname"><span class="pre">image_count</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_images.html#image_count"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_images.image_count" title="Link to this definition">#</a></dt>
+<dd><p>The request’s <code class="docutils literal notranslate"><span class="pre">n</span></code>, 1 when omitted. Outside <code class="docutils literal notranslate"><span class="pre">1..max_images_per_request()</span></code>
+it raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (a 400), before anything is submitted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_images.max_images_per_request">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_images.</span></span><span class="sig-name descname"><span class="pre">max_images_per_request</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_images.html#max_images_per_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_images.max_images_per_request" title="Link to this definition">#</a></dt>
+<dd><p>Largest <code class="docutils literal notranslate"><span class="pre">n</span></code> one image request may ask for: <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code>,
+default 10 (OpenAI’s range for the endpoint), at least 1. The Rust frontend
+parses it the same way: an ASCII integer, surrounding whitespace allowed,
+anything else the default.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 </section>
 
@@ -699,6 +733,8 @@
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.create_image_edit"><code class="docutils literal notranslate"><span class="pre">create_image_edit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.create_images"><code class="docutils literal notranslate"><span class="pre">create_images()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.image_count"><code class="docutils literal notranslate"><span class="pre">image_count()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_images.max_images_per_request"><code class="docutils literal notranslate"><span class="pre">max_images_per_request()</span></code></a></li>
 </ul>
   </nav></div>
 

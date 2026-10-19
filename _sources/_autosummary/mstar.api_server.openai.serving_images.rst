@@ -15,6 +15,8 @@ mstar.api\_server.openai.serving\_images
    
       create_image_edit
       create_images
+      image_count
+      max_images_per_request
    
    
 
