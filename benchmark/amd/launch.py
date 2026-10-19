@@ -173,6 +173,7 @@ class Launch:
     lane: str = ""
     startup_timeout: int = 3600
     force: bool = False
+    config: Path | None = None  # mstar serving config to use instead of configs/<row>.yaml (experiments)
 
     def __post_init__(self):
         self.run_dir = Path(self.run_dir).resolve()
@@ -208,7 +209,7 @@ class Launch:
         return ",".join(str(g) for g in self.server_gpus)
 
     def mstar_config(self) -> Path:
-        cfg = self.worktree / "configs" / f"{self.row.name}.yaml"
+        cfg = Path(self.config) if self.config else self.worktree / "configs" / f"{self.row.name}.yaml"
         if not cfg.is_file():
             raise FileNotFoundError(cfg)
         return cfg
