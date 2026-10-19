@@ -154,3 +154,4 @@ test/modular/test_resource_graph_capability.py
 test/modular/test_xpu_attention.py
 test/modular/test_bagel_graph_switch.py
 test/modular/test_cosmos3_graph_switch.py
+test/modular/test_pi05_model.py

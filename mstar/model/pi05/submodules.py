@@ -46,6 +46,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
+    disable_autocast = True
+
     def __init__(self, encoder: Pi05SiglipEncoder, config: Pi05Config):
         super().__init__()
         self.encoder = encoder
