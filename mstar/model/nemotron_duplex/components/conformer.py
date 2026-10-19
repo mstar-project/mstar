@@ -426,6 +426,10 @@ class ConformerStreamer:
         enc = perception.encoder
         self._ctx = self.c.att_context_size[0]
         self.frame_samples = self.c.hop_length * self.c.subsampling_factor
+        # steady_step's slices take a featurizer whose half window spans more
+        # than one hop and at most two (n_fft 512, hop 160); any other runs
+        # every step through front + layers
+        self.has_steady_step = -(-(self.c.n_fft // 2) // self.c.hop_length) == 2
         # sinusoids of relative positions 0..ctx, row d = position d: all a query can see
         device = enc.layers[0].self_attn.linear_pos.weight.device
         pe = ConformerEncoder._rel_pos_emb(self._ctx + 1, self.c.d_model, device, torch.float32)
@@ -469,7 +473,7 @@ class ConformerStreamer:
         """Whether ``steady_step`` serves this call's step: one frame of audio
         onto a call already two frames in, on the frame grid."""
         fs = self.frame_samples
-        return (not final and chunk is not None and chunk.numel() == fs
+        return (self.has_steady_step and not final and chunk is not None and chunk.numel() == fs
                 and st.samples >= 2 * fs and st.samples % fs == 0)
 
     def steady_step(self, chunk: torch.Tensor, frames: torch.Tensor, front: "RecurrentStatePool",
@@ -540,19 +544,26 @@ class ConformerStreamer:
                 win = torch.cat([win, win[-pad - 1: -1].flip(0)])
             rows.append(win[lo * hop - pad - base: (hi - 1) * hop + pad - base])
             lo_hi.append((i, lo, hi))
+        added = {}
         if rows:
             width = max(r.numel() for r in rows)
             mel = self._mel(torch.stack([F.pad(r, (0, width - r.numel())) for r in rows]))
-            for row, (i, lo, hi) in enumerate(lo_hi):
-                st = sts[i]
-                held = min(st.mels, keep_mel)
-                mels = torch.cat([mel_tail[i, keep_mel - held:], mel[row, : hi - lo]])   # mels[0] is frame lo - held
-                st.mels = hi
+            added = {i: mel[row, : hi - lo] for row, (i, lo, hi) in enumerate(lo_hi)}
+        for i in busy:
+            st = sts[i]
+            if st.samples <= pad:       # no mel frame yet, so no encoder frame
+                continue
+            held = min(st.mels, keep_mel)
+            mels, first = mel_tail[i, keep_mel - held:], st.mels - held      # mels[0] is mel frame ``first``
+            if i in added:
+                mels = torch.cat([mels, added[i]])
+                st.mels += added[i].shape[0]
                 new_mel[i] = F.pad(mels[-keep_mel:], (0, 0, max(0, keep_mel - mels.shape[0]), 0))
-                n[i] = max(0, final_encoder_frames(c, st.mels, st.samples, final[i]) - st.frames)
-                if n[i]:
-                    start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
-                    mel_rows.append((i, mels[start - (lo - held):], (st.frames - start // f, n[i])))
+            # also without a new mel frame: the end of the call can make its last frame final
+            n[i] = max(0, final_encoder_frames(c, st.mels, st.samples, final[i]) - st.frames)
+            if n[i]:
+                start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
+                mel_rows.append((i, mels[start - first:], (st.frames - start // f, n[i])))
         front.scatter_("sig", front_rows, torch.stack(new_sig))
         front.scatter_("last", front_rows, torch.stack(new_last))
         front.scatter_("mel", front_rows, torch.stack(new_mel))

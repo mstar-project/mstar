@@ -583,10 +583,13 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 seq_len=1, capture_batch_sizes=self.CAPTURE_BATCH_SIZES, compile=False, lease_before_step=lease,
             )
 
-        return {
+        regions = {
             self.STEP_REGION: region(self._step_region, step_inputs, (ENCODER_FRONT, ENCODER_STATE), True),
             self.LAYERS_REGION: region(self._layers_region, layers_inputs, (ENCODER_STATE,), False),
         }
+        if not self.streamer.has_steady_step:
+            del regions[self.STEP_REGION]
+        return regions
 
     def _step_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         front, pool = call.resources[ENCODER_FRONT], call.resources[ENCODER_STATE]

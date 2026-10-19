@@ -541,14 +541,14 @@ def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():
     torch.testing.assert_close(pre["input_embeds"], per_request)
 
 
-def _small_perception():
+def _small_perception(**featurizer):
     """A real Perception, shrunk, with random weights: the streamer runs its modules."""
     from mstar.model.nemotron_duplex.components.conformer import Perception
     from mstar.model.nemotron_duplex.config import ConformerSTTConfig
 
     torch.manual_seed(0)
     stt = ConformerSTTConfig(d_model=64, num_heads=4, num_layers=3, n_mels=32, feat_in=32,
-                             subsampling_conv_channels=8, output_dim=48, att_context_size=(6, 0))
+                             subsampling_conv_channels=8, output_dim=48, att_context_size=(6, 0), **featurizer)
     p = Perception(stt)
     with torch.no_grad():
         for t in p.parameters():
@@ -562,8 +562,8 @@ class _Encoder:
     """The encoder node with its state pool, driven as the engine drives an
     eager step: declare, admit and plan the pool, preprocess, forward, commit."""
 
-    def __init__(self, max_session_samples=16000 * 10):
-        p = _small_perception()
+    def __init__(self, max_session_samples=16000 * 10, **featurizer):
+        p = _small_perception(**featurizer)
         self.node = ConformerEncoderSubmodule(p, nn.Identity(), nn.Identity(), config=NemotronDuplexConfig(),
                                               max_session_samples=max_session_samples)
         def pool(key, num_layers, blocks):
@@ -835,6 +835,39 @@ def test_encoder_and_codec_take_no_batch_wider_than_their_graphs():
                           for name, node in nodes.items()}
     for (name, node), walk in zip(nodes.items(), ("encode", "codec_chunk"), strict=True):
         assert engine.get_max_batch_size(name, walk) == max(node.CAPTURE_BATCH_SIZES), name
+
+
+@pytest.mark.parametrize("n_fft", [512, 1024])
+def test_encoder_steady_steps_match_offline_for_the_featurizer_they_get(n_fft):
+    """The whole-step region's slices assume the featurizer's half window spans
+    more than one hop and at most two (512 / 160); with any other the encoder
+    serves every step through the general path, which takes any geometry."""
+    enc = _Encoder(n_fft=n_fft)
+    regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION) if n_fft == 512 else {}
+    assert (ConformerEncoderSubmodule.STEP_REGION in enc.node.get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.float32)) == (n_fft == 512)
+    enc.regions = regions
+    wav = torch.randn(16000 * 2) * 0.1
+    got = torch.stack(_stream(enc, {1: wav}, {1: 1280})[1])
+    assert torch.allclose(got, enc.offline(wav), atol=1e-5)
+    if regions:
+        assert regions[ConformerEncoderSubmodule.STEP_REGION].calls > 0
+
+
+@pytest.mark.parametrize("n_fft", [512, 256])
+@pytest.mark.parametrize("n", [1580, 1728])
+def test_encoder_ends_a_call_with_its_last_frame_when_the_end_adds_no_mel_frame(n_fft, n):
+    """With a half window under a hop, the end of input can make a last encoder
+    frame final without adding a mel frame: the call still gets it."""
+    enc = _Encoder(n_fft=n_fft, window_size=n_fft / 16000)
+    wav = torch.randn(n) * 0.1
+    got = []
+    for at in range(0, n, 320):
+        got += enc.encode(1, wav[at:at + 320])
+    got += enc.encode(1, None, final=True)
+    want = enc.offline(wav)
+    assert len(got) == want.shape[0]
+    assert torch.allclose(torch.stack(got), want, atol=1e-5)
 
 
 def test_encoder_offers_nothing_to_the_stop_check():
