@@ -76,7 +76,9 @@ Build the image using ``docker/Dockerfile.xpu``:
 
    git clone https://github.com/mstar-project/mstar.git
    cd mstar
-   docker build -f docker/Dockerfile.xpu -t mstar:xpu .
+   docker build -t mstar:xpu - < docker/Dockerfile.xpu
+
+This supplies only the Dockerfile, with an empty build context.
 
 The image clones M* into ``/mstar-workspace`` and uses ``uv`` to install
 ``.[bagel_xpu]`` and build ``mstar-rust`` from that source. The clone defaults to

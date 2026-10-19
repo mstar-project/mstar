@@ -1,5 +1,5 @@
-# Build from the repository root:
-# docker build -t mstar:xpu -f docker/Dockerfile.xpu .
+# Build with an empty context:
+# docker build -t mstar:xpu - < docker/Dockerfile.xpu
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
 FROM intel/deep-learning-essentials:2026.1.2-devel-ubuntu24.04
