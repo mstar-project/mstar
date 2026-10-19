@@ -877,7 +877,14 @@ otherwise pull the public weights from the Hub.</p></td>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ROOT_PATH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+<td><p>Request body limit on every route, as in the Rust frontend: a larger
+body gets a 413, refused on its <code class="docutils literal notranslate"><span class="pre">Content-Length</span></code> or, for a chunked
+upload, while it is read. <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> keeps its own
+512 MiB file cap when this is lower.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ROOT_PATH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
 <td><p>Mount the app under a URL sub-path. Set it when an ingress routes the
 deployment at a prefix and does not strip that prefix before the
@@ -885,7 +892,7 @@ request reaches the pod (Run:AI serves a workload at
 <code class="docutils literal notranslate"><span class="pre">/&lt;project&gt;/&lt;job-name&gt;/</span></code>, for instance); without it FastAPI 404s
 every route. Empty by default, so a direct deployment is unaffected.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">10</span></code></p></td>
 <td><p>Largest <code class="docutils literal notranslate"><span class="pre">n</span></code> one <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> request may ask for (see
 <a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.max_images_per_request" title="mstar.api_server.openai.serving_images.max_images_per_request"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.openai.serving_images.max_images_per_request()</span></code></a>);

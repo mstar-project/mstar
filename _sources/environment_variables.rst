@@ -202,6 +202,12 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit on every route, as in the Rust frontend: a larger
+       body gets a 413, refused on its ``Content-Length`` or, for a chunked
+       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+       512 MiB file cap when this is lower.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
