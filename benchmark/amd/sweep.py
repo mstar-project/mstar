@@ -48,6 +48,8 @@ from benchmark.amd.launch import (
 )
 
 WORK = Path("/work1/stephaniewang/atindra")
+# A cell is client-bound when the benchmark client's event loop was busy more than this share of the timed window.
+CLIENT_BOUND_FRAC = 0.9
 DEFAULT_RUN_ROOT = WORK / "amd/results/bench"
 SETS_ROOT = WORK / "amd/results/correctness/data"
 BENCH_PARTITIONS = {"mi3258x": "mi325x", "mi3008x": "mi300x"}
@@ -263,10 +265,14 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             if rc != 0 or not res_path.is_file():
                 reps.append({"error": f"runner rc {rc}", "dir": str(rdir)})
                 continue
-            st = repeat_stats(json.loads(res_path.read_text()), row.family, input_seconds, wl.output_len)
-            # A client that spends most of the run on its own CPU limits what it can measure.
+            res = json.loads(res_path.read_text())
+            st = repeat_stats(res, row.family, input_seconds, wl.output_len)
+            # The runner process's CPU over its whole life (imports, tokenizer, warmup included), and its event
+            # loop's CPU over the timed window alone, which is what says whether the client limited the cell.
+            loop_cpu, timed = res.get("client_loop_cpu_s"), res.get("wall_time_s")
             st.update(dir=str(rdir), client_wall_s=round(wall, 1), client_cpu_s=round(cpu_s, 1),
-                      client_cpu_frac=round(cpu_s / wall, 3) if wall > 0 else None)
+                      client_cpu_frac=round(cpu_s / wall, 3) if wall > 0 else None,
+                      client_loop_frac=round(loop_cpu / timed, 3) if loop_cpu is not None and timed else None)
             if st.get("failed"):
                 st["error"] = f"{st['failed']} failed requests"
             reps.append(st)
@@ -281,7 +287,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
         plan.log(f"  {arm.name} {row.name} {wl.name} c={c}: spread {sp:.1%} > {plan.table.spread_limit:.0%}, re-run")
     last = attempts[-1]
     flags = []
-    if any((r.get("client_cpu_frac") or 0) > 0.9 for r in last["repeats"]):
+    if any((r.get("client_loop_frac") or 0) > CLIENT_BOUND_FRAC for r in last["repeats"]):
         flags.append("client-bound")
     if len(attempts) > 1:
         flags.append("rerun")
@@ -299,9 +305,17 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
 def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: str) -> dict:
     arm_dir = plan.run_dir / row.name / arm.name
     summary_path = arm_dir / "arm.json"
-    if plan.resume and summary_path.is_file() and json.loads(summary_path.read_text()).get("status") == "done":
-        plan.log(f"{row.name}/{arm.name}: done earlier, skipped")
-        return json.loads(summary_path.read_text())
+    if plan.resume and summary_path.is_file():
+        prev = json.loads(summary_path.read_text())
+        if prev.get("status") == "done" and ((prev.get("health") or {}).get("verdict") or {}).get("status") != "FAIL":
+            plan.log(f"{row.name}/{arm.name}: done earlier, skipped")
+            return prev
+        if prev.get("status") == "done":
+            # Its cells are void (thermal throttling or new ECC errors during the arm): measure them again, and
+            # keep the voided run beside the new one.
+            void = arm_dir.with_name(f"{arm.name}.health-fail-{time.strftime('%Y%m%dT%H%M%S')}")
+            arm_dir.rename(void)
+            plan.log(f"{row.name}/{arm.name}: failed its health check earlier, re-run (old run in {void.name})")
     arm_dir.mkdir(parents=True, exist_ok=True)
     info: dict = {"arm": arm.name, "row": row.name, "gpus": gpus, "port": port, "lane": lane, "status": "running",
                   "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cells": []}
