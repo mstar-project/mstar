@@ -97,6 +97,7 @@ one for the encoders and decoder, and two for the LLM.
 
 .. code-block:: bash
 
+   cd /mstar-workspace/mstar
    mstar serve bagel --config configs/bagel_xpu_tp2.yaml
 
 Optional dependencies

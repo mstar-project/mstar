@@ -78,7 +78,7 @@ WORKDIR /mstar-workspace
 
 ARG MSTAR_REPO=https://github.com/mstar-project/mstar.git
 ARG MSTAR_REF=main
-RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" .
+RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" ./mstar
 
 # uv selects the XPU index for PyTorch and TorchCodec in the single install below.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
@@ -88,7 +88,7 @@ ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG TORCHCODEC_VERSION=0.16.0+cpu
 ARG TORCHCODEC_XPU_VERSION=0.16.0
 # Override upstream's torch<2.13 cap for this XPU image without changing metadata.
-RUN uv pip install --no-cache --torch-backend=xpu \
+RUN cd ./mstar && uv pip install --no-cache --torch-backend=xpu \
     --overrides <(printf 'torch==%s\n' "${TORCH_VERSION}") \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
