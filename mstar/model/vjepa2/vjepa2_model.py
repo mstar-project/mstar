@@ -19,8 +19,7 @@ Selected via ``model_kwargs={"skip_predictor": True}`` at request time.
 
 Video preprocessing matches HF ``VJEPA2VideoProcessor`` semantics:
 resize-shortest-edge to ``crop_size * 256 / 224``, center-crop to
-``crop_size``, normalize with ImageNet mean/std.  Implemented inline in
-``process_prompt`` (no external dep).
+``crop_size``, normalize with ImageNet mean/std, in ``process_prompt``.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ import logging
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -135,7 +133,14 @@ def _preprocess_video(
 
     Pipeline: temporal subsample → spatial resize (shortest edge) → center
     crop → normalize.  Sampling first keeps intermediate memory small.
+
+    The resize runs on the uint8 frames through torchvision, as HF's processor
+    does, so its output is rounded the same way. V-JEPA 2's embeddings move a
+    lot with that rounding: resizing the floats instead (one uint8 step at
+    most per pixel) gave a cosine of 0.84-0.94 against HF in fp32.
     """
+    from torchvision.transforms.v2 import functional as tvF
+
     if frames.dim() != 4:
         raise ValueError(f"Expected [T,C,H,W] video; got {tuple(frames.shape)}")
     _, c, h, w = frames.shape
@@ -147,19 +152,22 @@ def _preprocess_video(
 
     resize_short = int(crop_size * 256 / 224)
     if h < w:
-        new_h, new_w = resize_short, int(round(w * resize_short / h))
+        new_h, new_w = resize_short, int(w * resize_short / h)
     else:
-        new_h, new_w = int(round(h * resize_short / w)), resize_short
-    frames = nn.functional.interpolate(frames, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        new_h, new_w = int(h * resize_short / w), resize_short
+    # load_video's frames are uint8 / 255, so this round trip is exact
+    pixels = (frames * 255.0).round().clamp(0, 255).to(torch.uint8)
+    pixels = tvF.resize(pixels, [new_h, new_w], interpolation=tvF.InterpolationMode.BILINEAR, antialias=True)
 
     # Center crop to crop_size x crop_size.
     top = (new_h - crop_size) // 2
     left = (new_w - crop_size) // 2
-    frames = frames[:, :, top : top + crop_size, left : left + crop_size]
+    pixels = pixels[:, :, top : top + crop_size, left : left + crop_size]
 
-    mean = torch.tensor(_IMAGENET_MEAN, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(_IMAGENET_STD, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
-    return (frames - mean) / std
+    # rescale and normalize in one step, like HF
+    mean = torch.tensor(_IMAGENET_MEAN, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    std = torch.tensor(_IMAGENET_STD, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    return (pixels.to(torch.float32) - mean) / std
 
 
 class VJepa2Model(Model):
