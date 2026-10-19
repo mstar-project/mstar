@@ -434,6 +434,17 @@ The spec types are:
        ``high_freq_factor`` and ``old_context_len``. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
+     - A pool of fixed-size per-request state slots (a Mamba or gated-DeltaNet
+       layer's conv window and SSM state, a streaming encoder's caches), one slot per
+       request and label, held until the request ends. ``blocks`` names each tensor of
+       a slot and its shape and dtype; ``max_slots`` (one more than the requests, for
+       the sink that padding rows address) is deployment-tunable. A recurrent kernel
+       reads the step's ``addressing``; plain torch reads and writes a block through
+       ``gather`` / ``scatter_`` with that addressing (or its ``narrow``, for rows a
+       forward runs apart from the rest), so eager and captured forwards
+       address the same slots. Those two need the sink: a pool built with
+       ``disable_sink_slot`` refuses them for a padded step.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
