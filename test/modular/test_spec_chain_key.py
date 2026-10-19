@@ -6,7 +6,7 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
-from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
+from mstar.worker.worker import SpeculationTarget, Worker, _ChainSteps, _SpecFairness
 
 
 class _Span:
@@ -48,7 +48,10 @@ def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():
     target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
     worker, peeked, excluded = _worker(target)
 
-    _, yielded_from = worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
+    _, yielded_from = worker._build_speculation(
+        _pending(), _ChainSteps(consecutive=1, since_other=1),
+        _SpecFairness(peek=True, max_consecutive=8),
+    )
 
     assert peeked == [("LLM", "decode")]
     assert yielded_from == ("LLM", "decode") and excluded == [("LLM", "decode")]
@@ -57,6 +60,9 @@ def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():
 def test_with_no_target_the_chain_keys_on_the_step():
     worker, peeked, _ = _worker(None)
 
-    worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
+    worker._build_speculation(
+        _pending(), _ChainSteps(consecutive=1, since_other=1),
+        _SpecFairness(peek=True, max_consecutive=8),
+    )
 
     assert peeked == [("LLM", "mixed")]
