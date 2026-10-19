@@ -32,6 +32,7 @@ mstar.engine.resources.kv
    cpu_page_pool
    keys
    manager
+   page_copier
    plan
    prefix_index
    ring
