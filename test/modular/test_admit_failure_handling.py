@@ -75,7 +75,7 @@ class _FakeEngine:
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, rows_only=False)
+    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), rows_only=False)
 
 
 @pytest.mark.parametrize(
@@ -132,12 +132,14 @@ class _FakeWorker:
         self.scheduler.hold_requests(list(batch.request_to_worker_graph))
 
 
-def _batches(reason):
+def _batches(reason, prepared=("r0", "r1")):
     batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", admit_error=reason)
+    node_batch = SimpleNamespace(
+        node_name="node", admit_error=reason, request_ids=list(prepared),
+    )
     return batch, node_batch
 
 
@@ -163,6 +165,31 @@ def test_allocation_failure_still_evicts():
     # exactly one push-back per request: the delegation must not double up
     assert sorted(worker.queue.pushed_back) == ["r0", "r1"]
     assert sorted(worker.held) == ["r0", "r1"]
+
+
+class _StoppedLoopRuntime(_Runtime):
+    def __init__(self, stopped):
+        super().__init__()
+        self.stopped = stopped
+
+    def pending_loop_stop_rids(self, graph_walks, loop_name):
+        assert (graph_walks, loop_name) == (["walk"], "loop")
+        return set(self.stopped)
+
+
+@pytest.mark.parametrize("new_iter", [True, False])
+def test_a_refused_new_iteration_does_not_push_back_a_row_whose_loop_stopped(new_iter):
+    """A row on its last token rides speculative N+1; N's postprocess stops its
+    loop and empties its node. Pushed back, it popped with no inputs."""
+    worker = _FakeWorker()
+    worker._graph_runtime = _StoppedLoopRuntime({"r1"})
+    batch, node_batch = _batches(_alloc_failed())
+    pending = SimpleNamespace(batch=batch, speculative_new_iter=new_iter, loop_name="loop")
+
+    Worker._drop_rows_whose_loop_stopped(worker, pending)
+    worker._handle_admit_failure(batch, node_batch)
+
+    assert sorted(worker.queue.pushed_back) == (["r0"] if new_iter else ["r0", "r1"])
 
 
 class _HoldingWorker:
@@ -222,6 +249,36 @@ def test_a_hundred_holds_on_one_node_log_two_lines_and_count_the_rest(monkeypatc
     assert "(49 earlier holds not logged)" in lines[1], (
         f"the second line lost count of the holds it stands for: {lines[1]}"
     )
+
+
+class _RefusedWorker(_HoldingWorker):
+    """Both real handlers, nothing to evict, and the holds recorded."""
+
+    _handle_admit_failure = Worker._handle_admit_failure
+
+    def __init__(self):
+        super().__init__()
+        self.held: list[str] = []
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
+
+
+@pytest.mark.parametrize(
+    "reason", [_alloc_failed("r0"), _offloading("r0")], ids=["allocation", "offloading"]
+)
+def test_a_rid_prepare_dropped_is_not_requeued(reason):
+    """r1 finished its loop; the speculated extra step reached prepare_inputs,
+    which vetoed it, then r0's admit refused the step. Re-queued, r1 came back
+    with its loop-back inputs spent and the Cosmos3 DiT read that as a fresh
+    loop start over its spent scheduler (UniPC ``this_order > 0``, every
+    request in the next batch failed). A step that runs drops r1 the same way."""
+    worker = _RefusedWorker()
+    batch, node_batch = _batches(reason, prepared=["r0"])
+    node_batch.failed_resource = None
+
+    worker._handle_admit_failure(batch, node_batch)
+
+    assert worker._graph_runtime.pushed_back == ["r0"]
+    assert "r1" not in worker.held
 
 
 def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplog):

@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from typing import Any
 
+# combined walk of the LLM's prefill_text and decode
+MIXED_TEXT = "mixed_text"
+
 
 @dataclass
 class BagelAutoEncoderConfig:

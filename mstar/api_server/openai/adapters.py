@@ -76,7 +76,7 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = True
+    messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
@@ -506,10 +506,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
-                ref_audio, upload_dir, allow_remote=True
-            )
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -553,17 +550,14 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
-        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
+        # the server allows it) or bare base64 (vLLM-Omni's field). It becomes the
         # request's audio input for one request; ``ref_text`` and
         # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
         # voices come with the shared voice registry (engine/voice-registry).
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
-                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
-            else:
-                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
             return SubmitArgs(
                 text=req.input,
                 file_paths={"audio": [path]},
@@ -608,17 +602,25 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
-def _refuse_server_path(ref: str, upload_dir: Path) -> None:
-    """A plain path must name a file the server stored itself, under
-    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
+    """A reference voice clip from the request: a data URL, an http(s) URL (only
+    when the server allows remote fetch), or bare base64 that ``decoder`` (the
+    model's audio loader) can open. Returns its path. Every form gets the same
+    ``check_ref_audio``, so a clip the data worker would fail on, or one longer
+    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here."""
     if not isinstance(ref, str):
-        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
+        raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        return
-    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
-        raise ValueError(
-            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
-        )
+        path = media_io.resolve_media_ref(ref, upload_dir)[1]
+        media_io.check_ref_audio(path, decoder)
+        return path
+    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    if path:
+        return path
+    raise ValueError(
+        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+        "or base64 audio the model can decode"
+    )
 
 
 class ChatterboxAdapter(OpenAIAdapter):
@@ -648,9 +650,10 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            _refuse_server_path(ref_audio, upload_dir)
+            if not isinstance(ref_audio, str):
+                raise ValueError(f"ref_audio must be a data URL, got {type(ref_audio).__name__}")
             # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir)
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(
@@ -815,6 +818,41 @@ class Wan22Adapter(OpenAIAdapter):
             text=req.prompt,
             input_modalities=["text"],
             output_modalities=["video"],
+            model_kwargs=mk,
+        )
+
+
+class LTX25Adapter(OpenAIAdapter):
+    """LTX-2.5: text-to-audio+video generation.
+
+    Returns one mp4 with the generated audio muxed in as an AAC track by default;
+    ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
+    the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
+    first-class fields, and any other knobs pass through via
+    ``extra_body``. No image or video conditioning yet.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        if getattr(req, "image", None) or getattr(req, "video", None):
+            raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", True)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '960x544'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames", "fps"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
             model_kwargs=mk,
         )
 
@@ -1054,6 +1092,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_i2v_4step": Cosmos3Adapter(),
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "flux2_klein": DiffusionImageAdapter(),
@@ -1065,6 +1104,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })
+# Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
+ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:

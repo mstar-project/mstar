@@ -1,4 +1,5 @@
 
+import socket
 import sys
 import time
 
@@ -60,10 +61,13 @@ def _exercise_parallel_groups(rank, rendezvous):
     or not dist.is_xccl_available(),
     reason="requires three XPUs and XCCL",
 )
-def test_mixed_parallel_groups_with_nonmember(tmp_path):
+def test_mixed_parallel_groups_with_nonmember():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
     workers = mp.spawn(
         _exercise_parallel_groups,
-        args=((tmp_path / "rendezvous").as_uri(),),
+        args=(f"tcp://127.0.0.1:{port}",),
         nprocs=3,
         join=False,
     )

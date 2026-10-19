@@ -22,8 +22,13 @@ services:
       dockerfile: mstar/integrations/dynamo/docker/Dockerfile
     entrypoint: ["/opt/mstar/venv/bin/python", "-m", "dynamo.frontend"]
     command: ["--http-port", "8000"]
+    # The frontend loads the tokenizer and config from the worker's
+    # --model-path, so it needs the same model mount.
     environment:
       - ETCD_ENDPOINTS=http://etcd:2379
+      - HF_HOME=/models
+    volumes:
+      - ${MODELS_DIR:-~/.cache/huggingface}:/models:ro
     ports:
       - "8000:8000"
     depends_on:

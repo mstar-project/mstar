@@ -573,8 +573,13 @@ def test_state_machine_and_postprocess(voices_dir):
 # --------------------------------------------------------------------------
 
 
+HANDLES = {"r1": 1, "r2": 2}
+
+
 def _fwd_info(rid: str, iteration: int) -> CurrentForwardPassInfo:
-    info = CurrentForwardPassInfo(request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0)
+    info = CurrentForwardPassInfo(
+        request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0, rid_handle=HANDLES[rid]
+    )
     info.dynamic_loop_iter_counts[CHUNK_LOOP] = iteration
     return info
 
@@ -597,9 +602,10 @@ def test_submodule_iterates_chunks_and_stops():
     # iteration 1 exists only for r1; iteration 2 for nobody
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"]).input_seq_len == 5
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r2", 1), requests["r2"]) is None
-    assert submodule.check_stop("r1", _fwd_info("r1", 0), {}) == set()
-    assert submodule.check_stop("r1", _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
-    assert submodule.check_stop("r2", _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
+    # the engine passes the rid handle, not the request id string
+    assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 0), {}) == set()
+    assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
+    assert submodule.check_stop(HANDLES["r2"], _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
 
     engine_inputs = ModelInputsFromEngine(request_ids=["r1", "r2"], per_request_info={})
     batch = submodule.preprocess(SYNTH_WALK, engine_inputs, [prepared["r1"], prepared["r2"]])
@@ -618,8 +624,8 @@ def test_submodule_iterates_chunks_and_stops():
     # the same chunk alone and inside a padded batch agree to rounding
     assert single.shape == out["r2"][AUDIO_CHUNK][0].shape
     assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
-    submodule.cleanup_request("r1")
-    assert "r1" not in submodule.request_states
+    submodule.cleanup_request(HANDLES["r1"])
+    assert HANDLES["r1"] not in submodule.request_states
 
 
 def test_openai_adapter_maps_speech_request():

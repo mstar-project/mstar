@@ -4,14 +4,21 @@
 translation, SSE/NDJSON streaming, uploads, CORS — and speaks a flattened
 msgpack protocol over the Rust ZMQ transport to this bridge, which
 drives the existing Python data plane (``APIServer.submit_request`` /
-``iter_result_chunks`` / ``abort_request``; preprocessing and the conductor
+``iter_result_chunks`` / ``abort_submission``; preprocessing and the conductor
 protocol are untouched):
 
-    frontend -> bridge:  {t:"submit", rid, text, file_paths,
+    frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          prompt_parts, streaming} | {t:"abort", rid}
-    bridge -> frontend:  {t:"chunk", rid, modality, data(bin), metadata}
-                       | {t:"err", rid, msg} | {t:"done", rid}
+                          prompt_parts, streaming} | {t:"abort", rid, sub}
+    bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
+                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
+
+``sub`` names one submission and is never reused. A client may resubmit its
+``rid`` as soon as it drops a stream, and that stream's ``done`` or late
+chunks can cross the retry, so everything about a submission is addressed by
+``sub``. The frontend refuses a ``rid`` still in flight with a 409 itself and
+sends a dropped stream's abort before it frees the ``rid``, so the abort
+arrives here before the retry's submit.
 
 The submit shape is ``APIServer.submit_request``'s signature verbatim — the
 protocol was designed by flattening it. ``prompt_parts`` travels for a chat
@@ -97,24 +104,26 @@ class RustFrontendBridge:
             "bridge", push_ids=["frontend"], protocol=CommProtocol.IPC,
             ipc_socket_path_prefix=bridge_dir, codec=MsgpackCodec)
         self.running = True
+        # sub -> its submission's key, until its relay ends.
+        self._keys: dict[int, str] = {}
 
     # -- outbound ----------------------------------------------------------
 
     def _send(self, msg: dict) -> None:
         self.comm.send("frontend", msg)
 
-    def _err(self, rid: str, detail: str) -> None:
-        self._send({"t": "err", "rid": rid, "msg": detail})
+    def _err(self, rid: str, sub: int | None, detail: str) -> None:
+        self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
 
     # -- request lifecycle ---------------------------------------------------
 
     def _submit(self, msg: dict) -> None:
-        rid = msg["rid"]
+        rid, sub = msg["rid"], msg.get("sub")
         if msg.get("tokens") is not None:
             # The Python preprocess worker owns tokenization; run the
             # frontend without MSTAR_TOKENIZER so it sends text.
-            self._err(rid, "pre-tokenized ingest is not supported by this "
-                           "backend (unset MSTAR_TOKENIZER)")
+            self._err(rid, sub, "pre-tokenized ingest is not supported by this "
+                                "backend (unset MSTAR_TOKENIZER)")
             return
         try:
             parts = msg.get("prompt_parts")
@@ -129,24 +138,52 @@ class RustFrontendBridge:
                 request_id=rid,
             )
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
+            status = getattr(e, "status_code", None)
+            if isinstance(status, int):
+                # An HTTPException (not imported: this bridge runs without
+                # fastapi), e.g. the 409 for a rid still in flight. An in-band
+                # error chunk is the only reply that carries a status; `t="err"`
+                # always surfaces as a 500.
+                detail = getattr(e, "detail", e)
+                logger.warning("submit %s refused (%d): %s", rid, status, detail)
+                self._send({
+                    "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
+                    "data": str(detail).encode(), "metadata": {"status": status},
+                })
+                return
             logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, repr(e))
+            self._err(rid, sub, repr(e))
             return
-        asyncio.get_running_loop().create_task(self._relay(rid))
+        # Bound to this submission now, not when the task first runs: a later
+        # submit in the same receive batch may reuse the rid.
+        self._keys[sub] = self.server.submission_key(rid)
+        chunks = self.server.iter_result_chunks(rid)
+        asyncio.get_running_loop().create_task(self._relay(rid, sub, chunks))
 
-    async def _relay(self, rid: str) -> None:
+    async def _relay(self, rid: str, sub: int | None, chunks) -> None:
         """Forward this request's ResultChunks; terminal err on failure."""
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
+            async for chunk in chunks:
                 self._send({
-                    "t": "chunk", "rid": rid, "modality": chunk.modality,
+                    "t": "chunk", "rid": rid, "sub": sub, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
                 })
-            self._send({"t": "done", "rid": rid})
+            self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
             detail = getattr(e, "detail", None) or repr(e)
             logger.warning("request %s failed: %s", rid, detail)
-            self._err(rid, str(detail))
+            self._err(rid, sub, str(detail))
+        finally:
+            self._keys.pop(sub, None)
+
+    def _abort(self, msg: dict) -> None:
+        """The frontend dropped submission ``sub``; a newer one under its rid
+        (the client's retry) may already be running and is left alone."""
+        sub = msg.get("sub")
+        if sub is None:
+            self.server.abort_request(msg["rid"])
+        else:
+            self.server.abort_submission(self._keys.pop(sub, None))
 
     # -- loop ----------------------------------------------------------------
 
@@ -176,11 +213,11 @@ class RustFrontendBridge:
                     if t == "submit":
                         self._submit(msg)
                     elif t == "abort":
-                        self.server.abort_request(msg["rid"])
+                        self._abort(msg)
                     elif t == "ping":
                         # Deep-health liveness: the frontend's /health goes red
                         # unless this loop answers.
-                        self._send({"t": "pong", "rid": msg["rid"]})
+                        self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
                     else:
                         logger.warning("bridge: unknown message type %r", t)
                 except Exception:  # noqa: BLE001 — one bad message must not kill the loop

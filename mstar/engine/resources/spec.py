@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class CombinedSplit:
+    """A combined walk run on two kernels: decode for one-token rows, prefill
+    for the rows of ``prefill_walks``, captured for as many as
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
+    combined_walk: str
+    prefill_walks: tuple[str, ...]
+
+    def max_prefill_rows(
+        self, max_rows_in_combined: Mapping[str, "int | None"], bucket_rows: int,
+    ) -> int:
+        total = 0
+        for walk in self.prefill_walks:
+            cap = max_rows_in_combined.get(walk)
+            total += bucket_rows if cap is None else cap
+        return min(total, bucket_rows)
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str

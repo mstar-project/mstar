@@ -205,6 +205,29 @@ def test_accelerator_graph_configs_one_bucket_per_shape():
     assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
 
 
+
+def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
+    built = []
+
+    class Layouts(ToyDenoise):
+        def build_layout(self, bucket_key, device):
+            built.append(bucket_key)
+            return object()
+
+    sub = Layouts(capture_buckets=[(WALK, (8, 3))], max_uncaptured_layouts=2)
+    cpu = torch.device("cpu")
+    captured = sub.layout((8, 3), cpu)
+    a, b = sub.layout((1, 3), cpu), sub.layout((2, 3), cpu)
+    assert sub.layout((1, 3), cpu) is a             # a hit refreshes (1, 3)
+    sub.layout((4, 3), cpu)                         # evicts (2, 3), the least recent
+    assert sub.layout((1, 3), cpu) is a
+    assert sub.layout((2, 3), cpu) is not b         # rebuilt
+    for tokens in range(10, 20):
+        sub.layout((tokens, 3), cpu)
+    assert sub.layout((8, 3), cpu) is captured      # never evicted
+    assert built.count((8, 3)) == 1 and built.count((2, 3)) == 2
+
+
 class TwoSpanDenoise(ToyDenoise):
     """A model whose refiner layers attend over the image tokens alone."""
 

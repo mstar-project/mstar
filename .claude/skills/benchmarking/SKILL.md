@@ -69,7 +69,7 @@ pgrep -a -u "$USER" -f 'multiprocessing'
 pgrep -a -u "$USER" -f 'torch/_inductor/compile_worker'
 ```
 
-Then confirm with `nvidia-smi` that the memory actually came back. Tens of GB in use with no server of yours running means orphans. Leftover IPC socket files under `/tmp/mstar_$USER/` (or `--socket-path-prefix`) are harmless and persist between runs — what breaks a new server is a *live* process still holding one.
+Then confirm with `nvidia-smi` that the memory actually came back. Tens of GB in use with no server of yours running means orphans. Leftover IPC socket files under `/tmp/mstar_${USER}_<port>/` (or `--socket-path-prefix`) are harmless and persist between runs — what breaks a new server is a *live* process still holding one.
 
 **`benchmark.worker_phases.server` starts the server in its own process group**, separate from the wrapper's. Signalling the wrapper's group leaves the server running; the next arm's wrapper then refuses to start, and a client that doesn't check keeps benchmarking the previous arm's server. In a scripted A/B, stop both groups, check the port is free before each arm, and log which checkout each arm imported (`python -c 'import mstar; print(mstar.__file__)'` with the arm's environment) so you can verify every number came from the build you think it did.
 
@@ -203,5 +203,5 @@ How many repeats, and how large a delta counts as real, depend on the model and 
 - **Don't pipe a multi-cell sweep through `tail`.** A twelve-cell run piped through `tail -100` lost five of them; they were recoverable only because each cell also tee'd to its own `--output-dir`. Analyze the per-cell files, not the console scrollback.
 - **Size a readiness wait for the slowest model's cold compile, not the one you developed against.** A 15-minute `/health` poll was ample for orpheus and expired midway through qwen3-omni's first Inductor compile, which then left the server running and holding its GPUs after the harness had given up on it.
 - **`--ignore-eos` isn't safe for every model.** It's the right default for plain text output, but Qwen3-Omni's talker has undefined behavior past EOS and crashes on stale SHM reads, which looks like a regression.
-- **Two servers on one machine need distinct `--socket-path-prefix`.** `--port` alone doesn't isolate the ZMQ IPC sockets, and one server's handshake gets taken by the other.
+- **Two servers on one machine need distinct socket prefixes.** The default prefix is keyed on the port (`/tmp/mstar_<user>_<port>/`), so distinct ports are enough when `--socket-path-prefix` is left unset. Two servers given the same explicit prefix share the ZMQ IPC sockets, and one server's handshake gets taken by the other.
 - **A stale Rust extension** starts up healthy and fails every request with unexpected-keyword `TypeError`s. Rebuild after merging or rebasing onto a `main` that touched `rust/`.

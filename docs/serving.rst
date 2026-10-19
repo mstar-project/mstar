@@ -48,8 +48,9 @@ mstar serve
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar_<user>/``
-     - ZMQ IPC socket prefix.
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix; one per server, so servers on other ports do
+       not share sockets.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads_<user>/``
      - Temp directory for uploaded media.
@@ -123,8 +124,10 @@ mstar-serve
      - HF default
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar``
-     - ZMQ IPC socket prefix (shared with conductor/workers).
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
+       worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
+       it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.
@@ -175,7 +178,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
+       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. Each node of a
+       walk must be placed by exactly one entry for that walk.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -184,6 +188,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``speculation_mixes_walks``
+     - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
+       walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
+       chain on it merges ready rows of the other walks of its combined walk, so
+       decode steps take in new prompts as they arrive. Off (the default), a chain
+       keeps to its own walk and yields to the others, and a step mixes walks only
+       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       walk outside its combined walks, fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -318,6 +330,15 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``TCP`` — works anywhere; used for some multi-node setups.
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
+
+``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers.
+Each worker's engine picks its handshake and data ports at startup, so restrict by host: only
+the deployment's own hosts should reach the workers. The model extras require
+``mooncake-transfer-engine`` 0.3.13.post1
+or newer: earlier than 0.3.12.post1, any host that reaches the TCP data port can read or
+write the worker's memory (CVE-2026-103764), and a worker warns at startup if it finds such a
+version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
+CVE-2026-103761) are still open in 0.3.13.post1.
 
 .. _request-profiling:
 

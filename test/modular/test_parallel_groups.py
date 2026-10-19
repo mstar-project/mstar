@@ -200,6 +200,14 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     calls = []
     handles = {}
     devices = []
+    store = object()
+    store_calls = []
+
+    def create_store(init_method, rank, world_size, timeout):
+        store_calls.append((init_method, rank, world_size, timeout))
+        return store
+
+    monkeypatch.setattr(communication, "rendezvous_store", create_store)
     monkeypatch.setattr(torch.accelerator, "set_device_index", devices.append)
     monkeypatch.setattr(
         communication.dist, "get_default_backend_for_device", lambda device: device_backend,
@@ -217,6 +225,8 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     monkeypatch.setattr(communication.dist, "new_group", new_group)
     device = torch.device(device_type, 0) if device_type != "cpu" else torch.device("cpu")
     groups.init_dist(init_method="test://world", device=device)
+    timeout = communication.default_group_timeout(expected_backend)
+    assert store_calls == [("test://world", 0, 4, timeout)]
 
     expected_group_calls = []
     for ranks in ((0, 1), (2, 3)):
@@ -227,7 +237,7 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
             ))
     assert calls == [
         {
-            "backend": expected_backend, "init_method": "test://world",
+            "backend": expected_backend, "store": store, "timeout": timeout,
             "world_size": 4, "rank": 0,
             "device_id": device,
         },

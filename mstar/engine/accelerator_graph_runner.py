@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
@@ -191,6 +192,10 @@ def fail_if_graphs_required(missing: list[str]) -> None:
         "accelerator graph capture failed for " + ", ".join(missing)
         + " and accelerator graphs are required"
     )
+
+
+def _is_packed(config: AcceleratorGraphConfig) -> bool:
+    return config.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
 
 class DummyRowPool:
@@ -604,6 +609,7 @@ class AcceleratorGraphRunner:
                 slot=spec.slot,
                 capture=True,
                 slot_lease=lease,
+                force_prefill=_is_packed(config),
             ))
 
         engine_inputs.step = step
@@ -686,6 +692,10 @@ class AcceleratorGraphRunner:
         compiled code by shape, so every bucket of a config shares a cache and
         the second slot's identical shapes are free. A wrapper per capture
         would recompile — and re-autotune — all of them.
+
+        The platform's inductor overrides wrap that shared callable per bucket,
+        so each bucket compiles on its first call under the overrides for its
+        own token count.
         """
         forward = getattr(self._submodule, spec.config.capture_forward_method)
         if not spec.config.compile:
@@ -697,7 +707,9 @@ class AcceleratorGraphRunner:
                 fullgraph=False,
                 dynamic=False,
             )
-        return self._compiled_forwards[spec.config_idx]
+        return with_inductor_overrides(
+            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+        )
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -867,6 +879,10 @@ class AcceleratorGraphRunner:
         return self.select_bucket(
             graph_walk, bs, num_tokens, cg_key_info
         ) is not None
+
+    def is_packed(self, lease: SlotLease) -> bool:
+        """Whether ``lease`` replays a packed capture."""
+        return _is_packed(self._buckets[lease.bucket].config)
 
     def lease_slot(
         self, graph_walk: str, bs: int,
@@ -1336,8 +1352,11 @@ class PiecewiseAcceleratorGraphRunner:
 
         fn = self._config.capture_fn
         if self._config.compile:
-            fn = torch.compile(
-                fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
+            fn = with_inductor_overrides(
+                torch.compile(
+                    fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
+                ),
+                shape.total_tokens,
             )
 
         def run_fn():
@@ -1427,6 +1446,7 @@ class PiecewiseAcceleratorGraphRunner:
             slot=slot,
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
+            force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)

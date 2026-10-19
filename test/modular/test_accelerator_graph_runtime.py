@@ -77,6 +77,7 @@ def test_engine_compile_checks_its_own_device(monkeypatch, device_type, availabl
     )
     submodule = SimpleNamespace(forward=Mock(), forward_batched=Mock())
     engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
+    engine._item_encoders = set()
     compile_fn = Mock(side_effect=lambda fn, **kwargs: fn)
     monkeypatch.setattr(torch, "compile", compile_fn)
 

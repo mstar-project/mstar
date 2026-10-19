@@ -97,7 +97,9 @@ def test_enabled_capture_keeps_existing_recipes(monkeypatch, device_type):
     ]
     assert [config.additional_key_info for config in configs] == [False, True, False]
     assert all(config.compile for config in configs)
-    assert [config.capture_batch_sizes for config in configs] == [None, None, [1, 2, 4]]
+    assert [config.capture_batch_sizes for config in configs] == [
+        None, None, [1, 2, 4, 8, 16, 32, 64],
+    ]
     assert configs[2].capture_token_lengths == [128, 256, 512, 1024, 2048]
 
 

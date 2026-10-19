@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import mstar
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
@@ -54,6 +55,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
+    "ltx2_5": "ltx2_5.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
 }
@@ -66,6 +68,8 @@ DEFAULT_CONFIGS.update({
 })
 # 27B has no single-GPU form
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
+# Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
+DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:
@@ -131,6 +135,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
+    if model == "ltx2_5":
+        lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
+        lines.append("                          output_modalities=(\"video\", \"audio\"),")
+        lines.append("                          height=544, width=960, num_frames=121)")
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
@@ -171,7 +179,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
@@ -187,6 +195,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
+        if model == "ltx2_5":
+            lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")
+            lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"960x544\"})")
     lines.append("")
     return "\n".join(lines)
 
@@ -197,7 +208,7 @@ def _serve(args: argparse.Namespace) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
-    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}/"
+    socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
     upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
 
     argv = [

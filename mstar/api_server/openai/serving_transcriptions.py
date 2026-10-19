@@ -48,6 +48,7 @@ Response formats
 from __future__ import annotations
 
 import asyncio
+import codecs
 import math
 import os
 import uuid
@@ -167,6 +168,12 @@ class WindowPlanner:
 
     def whole(self) -> Window:
         return Window(path=self.audio_path, offset=0.0, duration=self.duration or 0.0)
+
+    def prepare(self) -> None:
+        """Decode an upload that will be windowed, so a file the decoder
+        refuses (e.g. an unsupported sample rate) fails before any window runs."""
+        if not self.single:
+            self._decoded()
 
     def done(self, offset: float) -> bool:
         return self.single or offset >= (self.duration or 0.0) - 1e-3
@@ -295,16 +302,17 @@ def _release(api, inflight: set[str]) -> None:
 
 
 def _text_of(chunks) -> str:
-    parts: list[str] = []
+    # a byte-level BPE token can end mid-character, so decode the joined bytes
+    data = bytearray()
     for c in chunks:
         if c.modality == "text":
-            parts.append(c.data.decode("utf-8", "replace"))
+            data += c.data
         elif c.modality == "error":
             raise HTTPException(
                 status_code=int((c.metadata or {}).get("status") or 500),
                 detail=c.data.decode("utf-8", "replace"),
             )
-    return "".join(parts)
+    return data.decode("utf-8", "replace")
 
 
 def _carry_over(texts: list[str]) -> str:
@@ -414,6 +422,14 @@ async def create_transcription(
             status_code=413,
             detail=f"audio is {planner.duration:.0f} s; the limit is {MAX_DURATION_SECONDS} s",
         )
+    try:
+        planner.prepare()
+    except ValueError as exc:
+        planner.cleanup()
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except BaseException:
+        planner.cleanup()
+        raise
 
     if req.stream:
         # the stream owns the files and windows from here
@@ -550,6 +566,8 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
                 raw, emitted = "", ""
+                # holds back a character split across tokens until its last byte
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
                 async for c in api.iter_result_chunks(window.request_id):
                     if c.modality == "error":
                         yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
@@ -557,7 +575,13 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                         return
                     if c.modality != "text" or not c.data:
                         continue
-                    raw += c.data.decode("utf-8", "replace")
+                    raw += decoder.decode(c.data)
+                    delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
+                    if delta:
+                        yield sse({"type": "transcript.text.delta", "delta": delta})
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    raw += tail
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
                         yield sse({"type": "transcript.text.delta", "delta": delta})

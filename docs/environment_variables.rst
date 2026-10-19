@@ -134,6 +134,17 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``NCCL_SOCKET_IFNAME``
+     - ``lo``
+     - NCCL's own variable. Every worker runs on the conductor's host, so
+       the conductor sets ``lo`` for its workers and NCCL's bootstrap
+       sockets listen on loopback only. A value you set, or a set
+       ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``GLOO_SOCKET_IFNAME``
+     - ``lo``
+     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+       Same rule: the conductor sets ``lo`` for its workers unless you set
+       it, so Gloo does not listen on the address the hostname resolves to.
 
 Models
 ------
@@ -204,6 +215,12 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit on every route, as in the Rust frontend: a larger
+       body gets a 413, refused on its ``Content-Length`` or, for a chunked
+       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+       512 MiB file cap when this is lower.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -211,6 +228,13 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
+     - ``10``
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
+       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+       ``n`` outside ``1`` to this value is a 400 before anything is
+       submitted. The Rust frontend and the Dynamo bridge apply the same
+       variable and default.
 
 Serving (Rust frontend)
 -----------------------
@@ -334,7 +358,16 @@ Worker scheduling
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
-       other ready work.
+       other ready work. ``0`` turns speculation off. A value that is not an
+       integer is ignored with a warning when the worker starts.
+   * - ``MSTAR_LAUNCH_WAIT_MS``
+     - ``5``
+     - Milliseconds the speculative submitter holds off the GIL waiting for
+       the GPU thread to reach the launch before it carries on. A value that
+       is not a number, is ``nan`` or ``inf``, or is past
+       ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
+       worker starts and ``5`` is used; a negative value is raised to ``0``
+       with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -361,9 +394,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's

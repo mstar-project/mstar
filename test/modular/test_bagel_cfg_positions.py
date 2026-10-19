@@ -27,7 +27,7 @@ from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, S
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.bagel.submodules import LLMSubmodule, active_labels
+from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
 pytestmark = pytest.mark.skipif(
@@ -224,6 +224,47 @@ def _llm_stub():
             object()
         ),
     )
+
+
+def _segments_by_label(step):
+    out: dict[str, set[str]] = {}
+    for segment in step.steps["kv"].segments:
+        out.setdefault(segment.label, set()).add(segment.request_id)
+    return out
+
+
+def test_a_mixed_step_forks_only_its_prompt_rows():
+    """cfg_text forks off main before a guided prompt writes; a decode row
+    sharing the step keeps its own cfg_text."""
+    submodule = _llm_stub()
+    guided = ARNodeInputs(
+        input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
+    )
+    decoding = ARNodeInputs(
+        input_seq_len=1, graph_walk="decode", resource_step_info={"cfg": True},
+    )
+
+    step = LLMSubmodule.declare_step(
+        submodule, MIXED_TEXT, ["guided", "decoding"], [guided, decoding],
+    )
+
+    kv = step.steps["kv"]
+    assert kv.pre_forks == (("main", "cfg_text"),)
+    assert kv.fork_rids == {"guided"}
+
+
+def test_a_mixed_step_of_unguided_rows_declares_no_branch():
+    """The other direction: nothing to scope, so the step is plain."""
+    submodule = _llm_stub()
+    rows = [
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", resource_step_info=None),
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=None),
+    ]
+
+    step = LLMSubmodule.declare_step(submodule, MIXED_TEXT, ["a", "b"], rows)
+
+    assert set(_segments_by_label(step)) == {"main"}
+    assert step.cg_key_info is False
 
 
 @pytest.mark.parametrize("cfg_on", [False, True], ids=["cfg_off", "cfg_on"])

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 SSE_DONE = "data: [DONE]\n\n"
 
@@ -15,6 +18,20 @@ def now() -> int:
 
 def rid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def release_unread(api, request_ids: list[str], read: int) -> None:
+    """Release every submitted request from ``request_ids[read]`` on (not yet read).
+
+    Runs while the caller's own exception is propagating, so a release that
+    raises is logged and skipped: it must neither stop the others nor replace
+    that exception.
+    """
+    for request_id in request_ids[read:]:
+        try:
+            api.release_request(request_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to release request %s: %r", request_id, exc)
 
 
 def sse(obj: dict) -> str:

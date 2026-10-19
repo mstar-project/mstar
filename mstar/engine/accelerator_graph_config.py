@@ -125,6 +125,15 @@ def distribute_tokens(total_tokens: int, bs: int) -> list[int]:
     return seq_lens
 
 
+def decode_rows_then_prompt(total_tokens: int, bs: int) -> list[int]:
+    """``bs - 1`` one-token rows and a prompt row of the rest: a mixed step's
+    layout, for kernels that split rows by span. `distribute_tokens` when
+    there are fewer tokens than rows."""
+    if total_tokens < bs:
+        return distribute_tokens(total_tokens, bs)
+    return [1] * (bs - 1) + [total_tokens - (bs - 1)]
+
+
 class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
     def __init__(
         self,
@@ -144,6 +153,10 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         # the resources size their per-bucket buffers for the whole plan.
         total_tokens_multiplier: int = 1,
         input_seq_dims: dict[str, int] | None = None,
+        # (input tokens, bs) -> each capture row's span; `distribute_tokens`
+        # by default. A walk whose kernels split rows by span (a mixed step's
+        # one-token rows beside a prompt) captures a layout it will replay.
+        token_layout: Callable[[int, int], list[int]] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -160,16 +173,22 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         self.make_node_input = make_node_input
         self.capture_token_lengths = capture_token_lengths
         self.total_tokens_multiplier = total_tokens_multiplier
+        self.token_layout = token_layout or distribute_tokens
 
     def get_config_type(self) -> AcceleratorGraphConfigType:
         return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths]
+        # every real row carries a token, so a bucket with fewer tokens than
+        # rows could never serve a step; capturing it would give rows of none
+        return [
+            n * self.total_tokens_multiplier for n in self.capture_token_lengths
+            if n >= bs
+        ]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens
-        seq_lens = distribute_tokens(num_tokens // self.total_tokens_multiplier, bs)
+        seq_lens = self.token_layout(num_tokens // self.total_tokens_multiplier, bs)
         return [
             self.make_node_input(n) for n in seq_lens
         ]

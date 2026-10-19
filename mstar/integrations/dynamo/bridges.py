@@ -49,6 +49,7 @@ from mstar.api_server.openai.protocol import (
     SpeechRequest,
     VideoGenerationRequest,
 )
+from mstar.api_server.openai.serving_images import image_count
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -269,9 +270,13 @@ class RequestBridge:
             # seeded seed + i — the native create_images contract, so image 0
             # is bit-identical to the same request with n=1.
             args = self.adapter.image_to_request(req, self.server.upload_dir)
+            try:
+                n = image_count(req)
+            except ValueError as exc:
+                raise _BadRequestError(str(exc)) from exc
             submits = [args]
             seed = args.model_kwargs.get("seed")
-            for i in range(1, max(1, int(req.n or 1))):
+            for i in range(1, n):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
                     kwargs["seed"] = int(seed) + i

@@ -8,6 +8,7 @@ reads freed memory.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
@@ -499,3 +500,220 @@ class GDNDecodeWrapper(GDNWrapper):
             use_qk_l2norm=self._qk_l2norm,
         )
         return out.squeeze(1)
+
+
+class _PinnedIndexStage:
+    """Host index arrays a plan uploads, through page-locked staging buffers
+    the wrapper owns. A packed step plans inline on the gpu thread behind the
+    step still in flight, where a copy out of pageable memory would wait for
+    that step to finish. ``done`` is recorded once the copies are issued; the
+    next stage waits on it before rewriting the buffers."""
+
+    def __init__(self):
+        self._bufs: dict[str, torch.Tensor] = {}
+        self._done = None
+
+    def begin(self) -> None:
+        if self._done is None:
+            self._done = torch.cuda.Event() if torch.cuda.is_available() else None
+        elif self._done is not None:
+            self._done.synchronize()
+
+    def upload(self, name: str, values: np.ndarray, dst: torch.Tensor) -> None:
+        n = len(values)
+        buf = self._bufs.get(name)
+        if buf is None or buf.shape[0] < n or buf.dtype != dst.dtype:
+            buf = self._bufs[name] = torch.empty(
+                max(n, 64), dtype=dst.dtype, pin_memory=torch.cuda.is_available(),
+            )
+        buf.numpy()[:n] = values
+        dst[:n].copy_(buf[:n], non_blocking=True)
+
+    def end(self) -> None:
+        if self._done is not None:
+            self._done.record()
+
+
+class GDNMixedWrapper(GDNWrapper):
+    """A step mixing one-token rows that carry state (decode) with prompt rows.
+
+    The chunked path over every row gathers and scatters each row's whole
+    recurrent state (~1 MB a row at 16 heads x 128 x 128 fp32) and runs the
+    chunked kernel on rows that need one recurrent update. Here the decode
+    kernel takes every row, updating the decode rows' state in place by slot
+    (the others point at the null slot, which it skips), and the chunked path
+    takes at most ``max_prefill_rows`` prompt rows, its tokens moved to the
+    front by a planned permutation. Both run over static shapes: the bucket's
+    rows and tokens, and ``max_prefill_rows`` sequences.
+
+    A one-token row without state (a one-token prompt) is a prompt row: the
+    decode kernel reads the slot as it is, and a fresh slot is not cleared.
+    """
+
+    # the chunked half needs q/k normalised by the caller; the decode half is
+    # built not to normalise again
+    qk_l2norm_in_kernel: bool = False
+    takes_strided_inputs: bool = False
+
+    def __init__(
+        self,
+        device: torch.device,
+        pad_slot_id: int,
+        sm_scale: float | None = None,
+        qk_l2norm: bool = True,
+        prefill_dtype: torch.dtype = torch.float32,
+        num_tokens: int | None = None,
+        bs: int | None = None,
+        has_sink_state: bool = True,
+        accelerator_graph: bool = False,
+        null_slot_id: int = 0,
+        # the chunked half's rows under capture; eagerly, the step's own
+        max_prefill_rows: int | None = None,
+    ):
+        super().__init__(
+            device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
+            qk_l2norm=qk_l2norm, num_tokens=num_tokens, bs=bs,
+            accelerator_graph=accelerator_graph, null_slot_id=null_slot_id,
+        )
+        if accelerator_graph and max_prefill_rows is None:
+            raise ValueError("GDNMixedWrapper: a captured split needs max_prefill_rows")
+        self._max_prefill_rows = max_prefill_rows
+        self._prefill = GDNPrefillWrapper(
+            device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
+            qk_l2norm=qk_l2norm, prefill_dtype=prefill_dtype,
+            num_tokens=num_tokens, bs=max_prefill_rows if accelerator_graph else None,
+            has_sink_state=has_sink_state, accelerator_graph=accelerator_graph,
+            null_slot_id=null_slot_id,
+        )
+        self._decode = GDNDecodeWrapper(
+            device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
+            qk_l2norm=False, bs=bs, accelerator_graph=accelerator_graph,
+            null_slot_id=null_slot_id,
+        )
+        self._stage = _PinnedIndexStage()
+        self._idx: dict[str, torch.Tensor] = {}
+        self._num_tokens = 0
+        self._num_rows = 0
+        self._front_len: int | None = None
+
+    def _buf(self, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
+        """A device index buffer, sized once to the bucket under capture."""
+        buf = self._idx.get(name)
+        if buf is None or buf.shape[0] < n:
+            if buf is not None and self._accelerator_graph:
+                raise RuntimeError(
+                    f"GDNMixedWrapper: {name} needs {n} rows past its captured "
+                    f"{buf.shape[0]}; a captured graph holds the old buffer"
+                )
+            buf = self._idx[name] = torch.zeros(n, dtype=dtype, device=self._device)
+        return buf
+
+    def plan(
+        self,
+        spans: list[int],
+        host_slots: tuple[int, ...],
+        host_has_state: tuple[bool, ...],
+    ):
+        null = self._null_slot_id
+        span = np.asarray(spans, dtype=np.int64)
+        slot = np.asarray(host_slots, dtype=np.int64)
+        has = np.asarray(host_has_state, dtype=bool)
+        rows = len(span)
+        tokens = max(self._max_num_tokens or 0, int(span.sum()))
+        bs = max(self._bs or 0, rows)
+
+        start = np.zeros(rows, dtype=np.int64)
+        np.cumsum(span[:-1], out=start[1:])
+        decode = (span == 1) & (has | (slot == null))
+        prefill_rows = np.flatnonzero((span > 0) & ~decode)
+        cap = self._max_prefill_rows if self._accelerator_graph else max(len(prefill_rows), 1)
+        if len(prefill_rows) > cap:
+            raise RuntimeError(
+                f"GDNMixedWrapper: {len(prefill_rows)} prompt rows in a step "
+                f"captured for {cap}; the scheduler caps a mixed step's prompt rows"
+            )
+
+        # prompt tokens first, in row order; every other position after them
+        front = np.concatenate(
+            [np.arange(start[i], start[i] + span[i]) for i in prefill_rows]
+            or [np.zeros(0, dtype=np.int64)]
+        )
+        rest = np.ones(tokens, dtype=bool)
+        rest[front] = False
+        perm = np.concatenate([front, np.flatnonzero(rest)])
+        dec_src = np.zeros(bs, dtype=np.int64)
+        dec_dst = np.full(bs, tokens, dtype=np.int64)  # the scratch row past the step's tokens
+        dec_slots = np.full(bs, null, dtype=np.int64)
+        dec_src[:rows] = np.where(decode, start, 0)
+        dec_dst[:rows] = np.where(decode, start, tokens)
+        dec_slots[:rows] = np.where(decode, slot, null)
+        pad = cap - len(prefill_rows)
+        pre_spans = span[prefill_rows].tolist() + [0] * pad
+        pre_slots = np.concatenate([slot[prefill_rows], np.full(pad, null)])
+        pre_has = np.concatenate([has[prefill_rows], np.zeros(pad, dtype=bool)])
+
+        perm_buf = self._buf("perm", tokens, torch.int64)
+        src_buf = self._buf("dec_src", bs, torch.int64)
+        dst_buf = self._buf("dec_dst", bs, torch.int64)
+        dslot_buf = self._buf("dec_slots", bs, torch.int32)
+        pslot_buf = self._buf("pre_slots", cap, torch.int32)
+        phas_buf = self._buf("pre_has", cap, torch.bool)
+        self._stage.begin()
+        self._stage.upload("perm", perm, perm_buf)
+        self._stage.upload("dec_src", dec_src, src_buf)
+        self._stage.upload("dec_dst", dec_dst, dst_buf)
+        self._stage.upload("dec_slots", dec_slots, dslot_buf)
+        self._stage.upload("pre_slots", pre_slots, pslot_buf)
+        self._stage.upload("pre_has", pre_has, phas_buf)
+        self._stage.end()
+
+        self._num_tokens = tokens
+        self._num_rows = bs
+        # Under capture the chunked half takes the whole static token range
+        # (its tail masked off); an eager one is sized to its prompt tokens,
+        # and every other token of an eager step is a decode row's.
+        self._front_len = None if self._accelerator_graph else len(front)
+        self._prefill.plan(pre_spans, pslot_buf[:cap], phas_buf[:cap])
+        self._decode.plan([1] * bs, dslot_buf[:bs])
+
+    def _split(self, x: torch.Tensor):
+        """``x`` with its prompt tokens first, and each row's decode token."""
+        n = x.shape[0] if self._front_len is None else self._front_len
+        return (
+            x.index_select(0, self._idx["perm"][:n]),
+            x.index_select(0, self._idx["dec_src"][: self._num_rows]),
+        )
+
+    def _merge(self, front: torch.Tensor, decode: torch.Tensor, n: int) -> torch.Tensor:
+        """Back to token order: the chunked half's outputs by the permutation,
+        then the decode rows' over theirs (the others land on a scratch row)."""
+        out = front.new_empty((n + 1, *front.shape[1:]))
+        m = n if self._front_len is None else self._front_len
+        out.index_copy_(0, self._idx["perm"][:m], front[:m])
+        out.index_copy_(0, self._idx["dec_dst"][: self._num_rows], decode.to(front.dtype))
+        return out[:n]
+
+    def run_conv(
+        self,
+        x: torch.Tensor,
+        conv_layer: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = "silu",
+    ):
+        n = x.shape[0]
+        front, rows = self._split(x)
+        front_out = self._prefill.run_conv(front, conv_layer, weight, bias, activation)
+        rows_out = self._decode.run_conv(rows, conv_layer, weight, bias, activation)
+        return self._merge(front_out, rows_out, n)
+
+    def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        n = q.shape[0]
+        qf, qd = self._split(q)
+        kf, kd = self._split(k)
+        vf, vd = self._split(v)
+        af, ad = self._split(a)
+        bf, bd = self._split(b)
+        front_out = self._prefill.run(qf, kf, vf, af, bf, state, a_log, dt_bias)
+        rows_out = self._decode.run(qd, kd, vd, ad, bd, state, a_log, dt_bias)
+        return self._merge(front_out, rows_out, n)

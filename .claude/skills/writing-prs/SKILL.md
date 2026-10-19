@@ -20,6 +20,7 @@ A PR description is for a reviewer who has not seen the branch's history, the pl
 - **Evidence for every correctness or performance claim**: the harness, the hardware, and the number (invariant 10). Label an unverified mechanism as a hypothesis. For parity, give the yardstick (the reference against itself) next to the result.
 - **What the PR does not do**, as follow-ups, so a reviewer doesn't ask.
 - **New dependencies and environment variables**, with the reason (AGENTS.md "Also", invariant 9).
+- **AI assistance**, in one line, as [CONTRIBUTING.md](../../../CONTRIBUTING.md) requires: say that AI assistance was used; the tests and their results are already in the description.
 
 ## What stays out
 

@@ -37,6 +37,7 @@ from typing import Any
 
 import torch
 
+from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -569,6 +570,7 @@ class ChatterboxModel(Model):
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")
+        check_resample_rate(sr, S3GEN_SR)
         if sr != S3GEN_SR:
             wav = resample(wav, sr, S3GEN_SR)
         return wav

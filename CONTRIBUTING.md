@@ -20,7 +20,7 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 
 ### Automated review
 
-A bot posts an advisory review when a contributor (the team, or anyone who has had a PR merged here) opens a non-draft PR, from a fork or not. It checks the invariants in [AGENTS.md](AGENTS.md) — the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables — and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't rerun on every push: someone with write access to the repo can comment `/review` for a re-review, or `/review thorough` for the thorough mode. Reply to disagree; apply the `skip-ai-review` label to turn the automatic review off for a PR. Details in [.github/review/](.github/review/).
+A bot posts an advisory review when a contributor (the team, or anyone who has had a PR merged here) opens a non-draft PR, from a fork or not. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't rerun on every push: a contributor can comment `/review` on their own PR for a re-review, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. Reply to disagree; apply the `skip-ai-review` label to turn the automatic review off for a PR. Details in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 
@@ -80,9 +80,9 @@ The first three invoke compiled FlexAttention, which requires AVX2 with the
 pinned PyTorch 2.9.1 CPU implementation. The video test hits an illegal
 instruction in PyAV 19.0.1 encoding in the tested Apple VM; this also reproduces
 without mstar. The entire modules are excluded,
-including their portable structural cases. Currently the Mac subset selects
-49 of the 53 core modules. It prints the exclusions and saves the exact
-selection in `cpu-smoke-tests.txt` with the reports. New core modules are
+including their portable structural cases. The runner prints the exclusions
+and selected module count, and saves the exact selection in
+`cpu-smoke-tests.txt` with the reports. New core modules are
 included automatically unless explicitly excluded; invalid or stale exclusions
 fail the check. Existing GPU/optional-feature skips are reported by pytest.
 No test assertions are changed for the Mac runner.

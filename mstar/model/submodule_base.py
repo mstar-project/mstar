@@ -92,6 +92,9 @@ class BatchedModelOutput:
     # No per-rid entries were built: every output signal of the step stays on
     # the device (see ``ExecutingBatch.rows_only``). Readers use the rows.
     rows_only: bool = False
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device (see ``ExecutingBatch.loopback_rids``)
+    loopback_rids: frozenset = frozenset()
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -213,6 +216,9 @@ class NodeInputs:
     # capture bucket and to size padding, and a step declares its spans from
     # it. 0 for a submodule whose inputs aren't sequence-shaped.
     input_seq_len: int = 0
+
+    # The request's real walk, stamped by the engine; None on capture templates
+    graph_walk: str | None = None
 
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
@@ -774,6 +780,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        """How many rows of this real walk a step mixing it with another walk
+        of its combined walk may hold; None is uncapped. For a backend whose
+        mixed step runs the walk's rows on a path sized to a few of them."""
+        del graph_walk
+        return None
+
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses
@@ -936,12 +949,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
         Optional. Returns rid -> loops to stop (rids with none left out), and
         must agree with ``check_stop`` for every rid. None, or a raise, falls
-        back to the per-request path.
+        back to the per-request path. ``step_walk`` is the walk every row ran,
+        or None when the step mixes walks (each row's is on its info).
         """
         return None
 
