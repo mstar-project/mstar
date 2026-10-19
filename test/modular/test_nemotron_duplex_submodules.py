@@ -459,6 +459,37 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, r
     torch.testing.assert_close(stream, whole, atol=1, rtol=0)   # int16: one quantization step
 
 
+def _live_tensors() -> int:
+    import gc
+
+    gc.collect()
+    return sum(type(o) is torch.Tensor for o in gc.get_objects())
+
+
+def test_codec_inverse_stft_keeps_nothing_per_length():
+    """The standalone stream re-decodes the whole code history every frame, so
+    each frame is a new length: the inverse STFT must hold nothing per length."""
+    from mstar.model.nemotron_duplex.components.audio_codec import _spec_to_wav
+
+    n_fft, hop = 16, 4
+    _spec_to_wav(torch.randn(1, n_fft // 2 + 1, 3, dtype=torch.complex64), n_fft, hop, n_fft)
+    before = _live_tensors()
+    for frames in range(4, 40):
+        _spec_to_wav(torch.randn(1, n_fft // 2 + 1, frames, dtype=torch.complex64), n_fft, hop, n_fft)
+    assert _live_tensors() == before
+
+
+def test_codec_refuses_a_window_whose_overlap_add_has_a_gap():
+    """The inverse STFT divides by the overlap-added squared window and zeroes
+    it where that is ~0; a window and hop that leave a gap are refused when the
+    codec is built, not met as silence mid-call."""
+    from mstar.model.nemotron_duplex.components.audio_codec import check_window_envelope
+
+    check_window_envelope(torch.hann_window(16), 4)
+    with pytest.raises(ValueError, match="overlap-add"):
+        check_window_envelope(torch.tensor([0.0, 0, 0, 1, 1, 0, 0, 0]), 4)
+
+
 def test_codec_requests_are_isolated():
     codec = _make_codec()
     _run_codec(codec, "a", 5)

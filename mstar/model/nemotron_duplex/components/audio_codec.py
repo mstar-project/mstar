@@ -179,28 +179,38 @@ def _spec_to_wav(
             ifft, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
         )[..., 0, 0, pad:-pad]
 
-        wav = wav / _window_envelope(window, T, hop_length, win_length, output_size, pad)
-        return wav
+        # The envelope is ~0 only where the window and hop leave a gap, which
+        # check_window_envelope refuses when the codec is built; a device-side
+        # guard keeps the decode free of host syncs, for CUDA-graph capture.
+        env = _window_envelope(window, T, hop_length, win_length)
+        return torch.where(env > _ENVELOPE_FLOOR, wav / env, torch.zeros_like(wav))
 
 
-_ENVELOPES: dict[tuple, torch.Tensor] = {}
+_ENVELOPE_FLOOR = 1e-11
 
 
-def _window_envelope(window: torch.Tensor, T: int, hop_length: int, win_length: int, output_size: int,
-                     pad: int) -> torch.Tensor:
-    """The overlap-added squared window ``_spec_to_wav`` divides by. It depends only
-    on the frame count, so it is built and checked (a host sync) once per shape,
-    which also keeps the decode free of syncs for CUDA-graph capture."""
-    key = (T, hop_length, win_length, window.device)
-    env = _ENVELOPES.get(key)
-    if env is None:
-        window_sq = window.square().expand(T, -1).transpose(0, 1)
-        env = F.fold(
-            window_sq, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
-        ).squeeze()[pad:-pad]
-        assert (env > 1e-11).all(), "Window envelope has zero values, cannot normalize."
-        _ENVELOPES[key] = env
-    return env
+def _window_envelope(window: torch.Tensor, T: int, hop_length: int, win_length: int) -> torch.Tensor:
+    """The overlap-added squared window of ``T`` frames, trimmed as ``_spec_to_wav``
+    trims the signal."""
+    pad = (win_length - hop_length) // 2
+    output_size = (T - 1) * hop_length + win_length
+    return F.fold(
+        window.square().expand(T, -1).transpose(0, 1), output_size=(1, output_size),
+        kernel_size=(1, win_length), stride=(1, hop_length),
+    ).squeeze()[pad:-pad]
+
+
+def check_window_envelope(window: torch.Tensor, hop_length: int) -> None:
+    """Refuse a window and hop whose overlap-add has a gap at any frame count.
+    A sample within one window of either end sees the same frames for every
+    count of at least ``ceil(win / hop)``, and an interior one the full periodic
+    overlap, so the counts up to twice that and one more cover them all."""
+    win_length = window.numel()
+    k = -(-win_length // hop_length)
+    for T in range(1, 2 * k + 2):
+        if not (_window_envelope(window, T, hop_length, win_length) > _ENVELOPE_FLOOR).all():
+            raise ValueError(f"the codec's window overlap-adds to ~0 at hop {hop_length} ({T} frames): "
+                             "its inverse STFT cannot normalize")
 
 
 class AudioCodec(nn.Module):
@@ -215,6 +225,7 @@ class AudioCodec(nn.Module):
         self.hop_length = cfg.hop_length
         self.wav_to_token_ratio = cfg.wav_to_token_ratio
         self.max_magnitude = cfg.max_magnitude
+        check_window_envelope(torch.hann_window(cfg.n_fft), cfg.hop_length)
 
     # ---- autoencoder halves -------------------------------------------------
     def ae_encode(self, x: torch.Tensor) -> torch.Tensor:
