@@ -359,7 +359,7 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     assert seen and not any(seen)
     with torch.no_grad():
         ref = vae.decode(sub._vae_input(stream)).sample
-    assert torch.equal(video, (ref / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+    assert torch.equal(video, (ref.float() / 2 + 0.5).clamp(0, 1).mul(255).round().to(torch.uint8))
 
 
 def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
