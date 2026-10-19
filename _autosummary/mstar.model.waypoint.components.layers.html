@@ -644,6 +644,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.ada_gate"><code class="docutils literal notranslate"><span class="pre">ada_gate()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.ada_rmsnorm"><code class="docutils literal notranslate"><span class="pre">ada_rmsnorm()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.bf16_roundtrip"><code class="docutils literal notranslate"><span class="pre">bf16_roundtrip()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.fp32_matmul_highest"><code class="docutils literal notranslate"><span class="pre">fp32_matmul_highest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.rms_norm"><code class="docutils literal notranslate"><span class="pre">rms_norm()</span></code></a></li>
 </ul>
             </nav>
@@ -675,7 +676,10 @@ mstar’s usual <code class="docutils literal notranslate"><span class="pre">com
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.waypoint.components.layers.bf16_roundtrip" title="mstar.model.waypoint.components.layers.bf16_roundtrip"><code class="xref py py-obj docutils literal notranslate"><span class="pre">bf16_roundtrip</span></code></a>(table)</p></td>
 <td><p>Quantize an fp32 derived table the way <code class="docutils literal notranslate"><span class="pre">NoCastModule._apply</span></code> does.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.waypoint.components.layers.rms_norm" title="mstar.model.waypoint.components.layers.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a>(x)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.waypoint.components.layers.fp32_matmul_highest" title="mstar.model.waypoint.components.layers.fp32_matmul_highest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp32_matmul_highest</span></code></a>()</p></td>
+<td><p>Run fp32 GEMMs as IEEE fp32, whatever the process-wide <code class="docutils literal notranslate"><span class="pre">float32_matmul_precision</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar.engine</span></code> sets <code class="docutils literal notranslate"><span class="pre">'high'</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.waypoint.components.layers.rms_norm" title="mstar.model.waypoint.components.layers.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a>(x)</p></td>
 <td><p>Unweighted RMS norm over the last dim (reference <code class="docutils literal notranslate"><span class="pre">nn.rms_norm</span></code>).</p></td>
 </tr>
 </tbody>
@@ -955,7 +959,11 @@ loader’s concat into <code class="docutils literal notranslate"><span class="p
 <p>sigma -&gt; Fourier features -&gt; MLP, the DiT’s only noise-level input.</p>
 <p>fp32 island: <code class="docutils literal notranslate"><span class="pre">FP32_MODULE_PATHS</span></code> pins <code class="docutils literal notranslate"><span class="pre">self.mlp</span></code> back to fp32 after the
 serving bf16 cast, and the body runs under <code class="docutils literal notranslate"><span class="pre">autocast(enabled=False)</span></code> on a
-<code class="docutils literal notranslate"><span class="pre">.float()</span></code> sigma. <code class="docutils literal notranslate"><span class="pre">*</span> <span class="pre">1000</span></code> scales [0, 1] into the Fourier basis’s
+<code class="docutils literal notranslate"><span class="pre">.float()</span></code> sigma and, eagerly, under <code class="docutils literal notranslate"><span class="pre">fp32_matmul_highest</span></code> (a batched
+call rounds through TF32 at <code class="docutils literal notranslate"><span class="pre">'high'</span></code>, and cuBLAS 13 on a B200 rounds
+even the served <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">512]</span> <span class="pre">&#64;</span> <span class="pre">[512,</span> <span class="pre">8192]</span></code> GEMV). Compiled regions read
+the rows <code class="docutils literal notranslate"><span class="pre">WaypointDiT</span></code> builds eagerly instead of running the island.
+<code class="docutils literal notranslate"><span class="pre">*</span> <span class="pre">1000</span></code> scales [0, 1] into the Fourier basis’s
 rotating range; <code class="docutils literal notranslate"><span class="pre">*</span> <span class="pre">2**0.5</span></code> restores unit variance after the sin/cos concat.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1052,6 +1060,14 @@ Only reachable under <code class="docutils literal notranslate"><span class="pre
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.waypoint.components.layers.fp32_matmul_highest">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.waypoint.components.layers.</span></span><span class="sig-name descname"><span class="pre">fp32_matmul_highest</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/waypoint/components/layers.html#fp32_matmul_highest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.waypoint.components.layers.fp32_matmul_highest" title="Link to this definition">#</a></dt>
+<dd><p>Run fp32 GEMMs as IEEE fp32, whatever the process-wide
+<code class="docutils literal notranslate"><span class="pre">float32_matmul_precision</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar.engine</span></code> sets <code class="docutils literal notranslate"><span class="pre">'high'</span></code>). Eager
+only: the setting is global, so dynamo cannot trace a switch of it.</p>
 </dd></dl>
 
 <dl class="py function">
@@ -1153,6 +1169,7 @@ bare normalization (Q/K norm, the two <code class="docutils literal notranslate"
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.ada_gate"><code class="docutils literal notranslate"><span class="pre">ada_gate()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.ada_rmsnorm"><code class="docutils literal notranslate"><span class="pre">ada_rmsnorm()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.bf16_roundtrip"><code class="docutils literal notranslate"><span class="pre">bf16_roundtrip()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.fp32_matmul_highest"><code class="docutils literal notranslate"><span class="pre">fp32_matmul_highest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.waypoint.components.layers.rms_norm"><code class="docutils literal notranslate"><span class="pre">rms_norm()</span></code></a></li>
 </ul>
   </nav></div>

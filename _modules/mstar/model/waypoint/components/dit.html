@@ -1068,6 +1068,9 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="c1"># Per (device, dtype) sigma schedule; see _sigma_schedule.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_sigma_cache</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">],</span> <span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># [S, 1, D] noise embedding per scheduled sigma, built eagerly by</span>
+        <span class="c1"># materialize_runtime_tables; forward reads its row instead of the island</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cond_rows</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_regions_compiled</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="c1"># Tie now so a plain (non-meta) build is already correct; retie after</span>
@@ -1154,13 +1157,16 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Each cond is built at M=1, exactly as ``forward`` receives it, so</span>
 <span class="sd">        cached rows are bit-identical to the live projection they replace.</span>
-<span class="sd">        Runs after weight load, before ``compile_regions``.</span>
+<span class="sd">        Runs after weight load, before ``compile_regions``. The conds are kept</span>
+<span class="sd">        too: built eagerly they get the island's IEEE fp32, which a compiled</span>
+<span class="sd">        region cannot pin.</span>
 <span class="sd">        """</span>
         <span class="n">sigmas</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sigma_schedule</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
             <span class="n">conds</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
                 <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">denoise_step_emb</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sigmas</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span>
             <span class="p">)</span>  <span class="c1"># [S, 1, D], one M=1 embedding per scheduled sigma</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cond_rows</span> <span class="o">=</span> <span class="n">conds</span>
         <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
             <span class="n">block</span><span class="o">.</span><span class="n">cond_head</span><span class="o">.</span><span class="n">build_cache</span><span class="p">(</span><span class="n">conds</span><span class="p">)</span>
 
@@ -1227,7 +1233,10 @@ window.runMermaid = runMermaid;</script>
             <span class="n">x_pos</span><span class="o">=</span><span class="n">pos_ids</span><span class="o">.</span><span class="n">x_pos</span><span class="p">,</span> <span class="n">y_pos</span><span class="o">=</span><span class="n">pos_ids</span><span class="o">.</span><span class="n">y_pos</span><span class="p">,</span> <span class="n">t_pos</span><span class="o">=</span><span class="n">pos_ids</span><span class="o">.</span><span class="n">t_pos</span>
         <span class="p">)</span>
 
-        <span class="n">cond</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">denoise_step_emb</span><span class="p">(</span><span class="n">sigma</span><span class="p">)</span>  <span class="c1"># [B, N, D], fp32 island</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cond_rows</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cond</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cond_rows</span><span class="p">[</span><span class="n">cond_idx</span><span class="p">]</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">N</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># the island's row for this sigma</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">cond</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">denoise_step_emb</span><span class="p">(</span><span class="n">sigma</span><span class="p">)</span>  <span class="c1"># [B, N, D], fp32 island</span>
         <span class="c1"># Positional, and in this order — see ControllerInputEmbedding.</span>
         <span class="n">ctrl_emb</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ctrl_emb</span><span class="p">(</span><span class="n">mouse</span><span class="p">,</span> <span class="n">button</span><span class="p">,</span> <span class="n">scroll</span><span class="p">)</span>  <span class="c1"># [B, N, D]</span>
 

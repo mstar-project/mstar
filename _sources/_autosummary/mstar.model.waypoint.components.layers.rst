@@ -16,6 +16,7 @@ mstar.model.waypoint.components.layers
       ada_gate
       ada_rmsnorm
       bf16_roundtrip
+      fp32_matmul_highest
       rms_norm
    
    
