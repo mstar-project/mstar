@@ -705,6 +705,15 @@ only with a measured win. CUDA's (``NCCL_GRAPH_REGISTER``,
        the Wan VAE's tiled decode). Costs about 1% on MI300X: a Wan
        480x832x33 decode 1.030 to 1.039 s, the TAEHV conv it changes 72 to
        76 us. Set by ``RocmPlatform.process_env_defaults``.
+   * - ``MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_BWD_GTC_XDLOPS_NHWC``
+     - ROCm
+     - ``0``
+     - The same split-K solver for backward-data convs, which is what a
+       ``ConvTranspose1d`` runs. On MI300X MIOpen's find picks it for
+       LTX-2.5's first vocoder upsampler, and the same latents then give
+       different audio on every call. That conv goes from 139 to 145 us; the
+       whole vocoder stays at 136 ms. Set by
+       ``RocmPlatform.process_env_defaults``.
 
 The ROCm libraries read their own variables (``AITER_JIT_DIR``,
 ``AITER_ROOT_DIR``, ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLASHINFER_WORKSPACE_BASE``,
