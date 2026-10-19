@@ -11,6 +11,8 @@ tensors, through ``load_gr00t_n17_weights`` -- so the fusing rules are part of w
 numeric test below covers.
 """
 
+import itertools
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -323,6 +325,191 @@ def test_the_fused_projection_holds_q_then_k_then_v_one_block_per_head(tmp_path)
     for offset, part in ((0, "q"), (q_dim, "k"), (q_dim + kv_dim, "v")):
         checkpoint = weights[f"{_LLM}layers.0.self_attn.{part}_proj.weight"]
         assert torch.equal(fused[offset:offset + checkpoint.shape[0]], checkpoint)
+
+
+# ----------------------------------------------------------------------------
+# DeepStack injection
+# ----------------------------------------------------------------------------
+
+# Two image blocks with text between them. A single contiguous block still lines up with
+# itself over most of its length after a roll or a reversal, so it hides a row-ordering
+# mistake; two blocks do not.
+_IMAGE_ROWS = torch.tensor([5, 6, 7, 8, 30, 31, 32, 33])
+# Fewer features than layers, as the real stack has (three vision taps, `select_layer`
+# layers), which also leaves the off-by-one deviations below a layer to land on.
+_FEATURES = 3
+_DEEPSTACK_LAYERS = 4
+_PERMUTATIONS = [p for p in itertools.permutations(range(_FEATURES)) if p != tuple(range(_FEATURES))]
+
+
+@torch.no_grad()
+def _ref_forward(
+    layers: list[RefDecoderLayer], hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    deepstack: list[torch.Tensor], rows, shift: int = 0, order=None,
+) -> torch.Tensor:
+    """The reference stack with ``Qwen3VLTextModel``'s DeepStack injection: after layer
+    ``i + shift``, feature ``order[i]`` is added to ``rows`` the way ``_deepstack_process``
+    does it, ``hidden_states[visual_pos_masks, :] += visual_embeds``.
+
+    ``shift`` and ``order`` are the deviations, and default to the real thing. Injection
+    "after layer -1" is reachable only at ``shift=-1``, which is one of them.
+    """
+    order = tuple(range(len(deepstack))) if order is None else order
+
+    def inject(hidden: torch.Tensor, after_layer: int) -> torch.Tensor:
+        for i in range(len(deepstack)):
+            if i + shift == after_layer:
+                hidden = hidden.clone()
+                hidden[rows] += deepstack[order[i]]
+        return hidden
+
+    hidden = inject(hidden, -1)
+    for i, layer in enumerate(layers):
+        hidden = inject(layer(hidden, cos, sin), i)
+    return hidden
+
+
+class _Case(NamedTuple):
+    """One DeepStack forward: our module, the reference stack, and the step both run on."""
+
+    model: Gr00tN17LanguageModel
+    layers: list[RefDecoderLayer]
+    hidden: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    deepstack: list[torch.Tensor]
+    rows: torch.Tensor
+    # `visual_pos_masks`: the reference names the image rows with a boolean mask, we pass
+    # indices. The two agree because the indices are unique and ascending, which is how the
+    # vision encoder packs them; a deviation below passes indices the mask cannot express.
+    mask: torch.Tensor
+
+    def ours(self) -> torch.Tensor:
+        return self.model(self.hidden, self.cos, self.sin, self.deepstack, self.rows)
+
+    def theirs(self, rows=None, shift: int = 0, order=None) -> torch.Tensor:
+        rows = self.mask if rows is None else rows
+        return _ref_forward(self.layers, self.hidden, self.cos, self.sin, self.deepstack, rows, shift, order)
+
+
+@torch.no_grad()
+def _case(tmp_path, num_layers: int = _DEEPSTACK_LAYERS, features: int = _FEATURES, tokens: int = 64) -> _Case:
+    config = _config(num_layers=num_layers)
+    weights = _checkpoint(config.text, seed=0)
+    model = _loaded_model(config, weights, tmp_path)
+    hidden, cos, sin = _prepare(model, tokens, seed=1)
+    generator = torch.Generator().manual_seed(10)
+    # at the scale of the hidden states, and distinct, so permuting them is a real change
+    deepstack = [
+        torch.randn(len(_IMAGE_ROWS), config.text.hidden_size, generator=generator) * 0.5
+        for _ in range(features)
+    ]
+    mask = torch.zeros(tokens, dtype=torch.bool)
+    mask[_IMAGE_ROWS] = True
+    return _Case(model, _reference_stack(config.text, weights), hidden, cos, sin, deepstack, _IMAGE_ROWS, mask)
+
+
+def test_deepstack_features_land_on_the_image_rows_after_their_layer(tmp_path):
+    """The same bar as the layer parity above, and the same reason for it: our fused q/k/v
+    and gate/up GEMMs round differently from the reference's separate ones. The injection
+    itself adds the same fp32 numbers in both. Worst measured gap over 6 weight seeds x 3
+    feature seeds was 1.3e-06 -- above the 3-layer sweep that set ``_MEASURED_GAP``, since
+    there is a fourth layer here for the rounding to travel through, still under a third of the bar.
+    """
+    case = _case(tmp_path)
+    ours = case.ours()
+    assert ours.shape == case.hidden.shape
+    assert _relative_gap(ours, case.theirs()) <= _BAR
+
+
+@pytest.mark.parametrize("shift", [-1, 1], ids=["a layer early", "a layer late"])
+def test_a_feature_added_after_the_wrong_layer_misses_by_orders_of_magnitude(tmp_path, shift):
+    """The parity test above pins the composition as a whole; this is what says its bar is
+    tight enough that moving an injection one layer could not slip under it. Measured gaps
+    against that bar of 4.1e-06: a layer early 6.8e-01, a layer late 4.9e-02, the smaller of
+    them 1.2e+04 times the bar.
+    """
+    case = _case(tmp_path)
+    assert _relative_gap(case.ours(), case.theirs(shift=shift)) > 1000 * _BAR
+
+
+@pytest.mark.parametrize("order", _PERMUTATIONS)
+def test_features_applied_in_the_wrong_order_miss_by_orders_of_magnitude(tmp_path, order):
+    """Each feature belongs to one layer. Three equal features would permute to themselves
+    and make this control vacuous, so their distinctness is asserted rather than assumed.
+    The closest of the five permutations missed by 1.5e-02, 3.8e+03 times the bar.
+    """
+    case = _case(tmp_path)
+    for first, second in itertools.combinations(case.deepstack, 2):
+        assert not torch.equal(first, second)
+    assert _relative_gap(case.ours(), case.theirs(order=order)) > 1000 * _BAR
+
+
+@pytest.mark.parametrize(
+    "permute", [lambda rows: rows.flip(0), lambda rows: rows.roll(1)], ids=["reversed", "rolled by one"],
+)
+def test_row_k_of_a_feature_lands_on_image_row_k(tmp_path, permute):
+    """The vision encoder packs its rows in image-token order and we hand the LLM that order
+    as indices, so the mapping is ours to get right. Measured 6.4e-02 reversed and 8.4e-02
+    rolled, both over 1.5e+04 times the bar.
+    """
+    case = _case(tmp_path)
+    assert _relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
+
+
+def test_only_the_image_rows_move(tmp_path):
+    """``index_add`` writes the named rows and copies the rest, so an untouched row is
+    bit-identical and not merely close -- ``torch.equal``, no tolerance.
+
+    One layer and one feature, so the injection is the last thing that happens. With a layer
+    after it, attention mixes the moved rows into the others and no row stays equal, which
+    would say nothing about which rows the add wrote.
+    """
+    case = _case(tmp_path, num_layers=1, features=1)
+    base = case.model(case.hidden, case.cos, case.sin)
+    moved = case.ours()
+    assert torch.equal(base[~case.mask], moved[~case.mask])
+    assert (base[case.mask] != moved[case.mask]).any(dim=1).all()
+
+
+def test_no_features_is_the_forward_without_the_argument(tmp_path):
+    """The DT and the bridge call this with no DeepStack at all; that path must not have
+    picked up a clone, a reordering or any other arithmetic."""
+    case = _case(tmp_path)
+    plain = case.model(case.hidden, case.cos, case.sin)
+    assert torch.equal(case.model(case.hidden, case.cos, case.sin, ()), plain)
+    assert torch.equal(case.model(case.hidden, case.cos, case.sin, (), case.rows), plain)
+
+
+def test_the_guards_say_which_call_was_wrong():
+    """Both are caller mistakes that would otherwise be silent: features with nowhere to go
+    would be dropped, and a fourth feature for a three-layer stack would never be added."""
+    model = Gr00tN17LanguageModel(_config(num_layers=_LAYERS))
+    hidden = torch.zeros(64, model.config.hidden_size)
+    cos, sin = model.build_cos_sin(torch.zeros(3, 64))
+    feature = torch.zeros(len(_IMAGE_ROWS), model.config.hidden_size)
+
+    with pytest.raises(ValueError, match="no image rows"):
+        model(hidden, cos, sin, [feature])
+    with pytest.raises(ValueError, match=rf"4 DeepStack feature\(s\) for {_LAYERS} layers"):
+        model(hidden, cos, sin, [feature] * 4, _IMAGE_ROWS)
+
+
+def test_the_call_leaves_the_callers_tensors_alone(tmp_path):
+    """``index_add``, not ``index_add_``. The hidden states are the engine's buffer and the
+    features are the vision encoder's output; both may still be read after this node runs.
+
+    As the forward stands, the layer loop rebinds ``hidden_states`` to a layer's output before
+    the first injection, so an in-place add here would pass anyway. This holds the contract for
+    a forward that injects before a layer instead, where in place would corrupt the caller.
+    """
+    case = _case(tmp_path)
+    hidden_before = case.hidden.clone()
+    features_before = [feature.clone() for feature in case.deepstack]
+    case.ours()
+    assert torch.equal(case.hidden, hidden_before)
+    for feature, before in zip(case.deepstack, features_before, strict=True):
+        assert torch.equal(feature, before)
 
 
 # ----------------------------------------------------------------------------

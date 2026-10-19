@@ -15,6 +15,8 @@ on its own reports the *normed* state at ``[-1]`` instead (C04 CHK-2).
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -152,11 +154,37 @@ class Gr00tN17LanguageModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def forward(
-        self, hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        deepstack: Sequence[torch.Tensor] = (),
+        image_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``deepstack`` feature ``i`` is added to the image rows after layer
+        ``i``, which is where the reference adds it (``_deepstack_process``,
+        called for ``layer_idx in range(len(deepstack_visual_embeds))``).
+
+        ``image_rows`` indexes the ``<|image_pad|>`` rows, in the order the
+        vision encoder packed them, so row ``k`` of a feature lands on the
+        ``k``-th image token.
+        """
+        if deepstack and image_rows is None:
+            raise ValueError("DeepStack features given with no image rows to add them to")
+        if len(deepstack) > len(self.layers):
+            raise ValueError(
+                f"{len(deepstack)} DeepStack feature(s) for {len(self.layers)} layers"
+            )
         # one rotation for the whole step, as `qwen3_5` does, because
         # `DecoderLayer.forward` passes its attention nothing but the rows
         self.rope_cache.set(cos, sin)
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states)
+            if i < len(deepstack):
+                # Out of place, though the target is always a layer's own
+                # fresh output today, so `index_add_` would be identical: the
+                # engine double-buffers rows across the async worker, and an
+                # in-place write into a buffer it still owns is the hazard
+                # that costs most to find. transformers 5.19 clones here too.
+                hidden_states = hidden_states.index_add(0, image_rows, deepstack[i])
         return hidden_states
