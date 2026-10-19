@@ -144,6 +144,11 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                 # The first piece released itself; release the ones submitted ahead.
                 release_unread(api, pending, 1)
                 raise
+            if raw_request is not None and await raw_request.is_disconnected():
+                # The client left before the first audio and no response has
+                # started, so nothing else would release the pieces submitted ahead.
+                release_unread(api, pending, 0)
+                return Response(status_code=499)
 
             def release_unstarted() -> None:
                 # What _stream_pcm's finally does, for a body that never ran it.
