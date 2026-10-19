@@ -2481,8 +2481,10 @@ def main(argv: list[str] | None = None):
             server = uvicorn.Server(
                 uvicorn.Config(
                     app, host=args.host, port=args.port, access_log=False,
-                    # /generate/ws streams PCM, which deflate barely shrinks;
-                    # compressing it cost the event loop ~8% at 32 live calls
+                    # Server-wide (uvicorn negotiates it for every WebSocket
+                    # route): /generate/ws and /v1/realtime stream audio, which
+                    # deflate barely shrinks, and compressing it cost the event
+                    # loop ~8% at 32 live calls on /generate/ws
                     ws_per_message_deflate=False,
                 )
             )
