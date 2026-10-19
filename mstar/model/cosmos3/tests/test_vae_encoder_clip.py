@@ -37,7 +37,8 @@ class _StubVAE(torch.nn.Module):
     def encode(self, x):
         b, c, t, h, w = x.shape
         lt = 1 if t == 1 else 1 + (t - 1) // 4
-        pooled = torch.nn.functional.avg_pool3d(x, kernel_size=(1, 16, 16))  # [1, 3, t, h/16, w/16]
+        # CPU avg_pool3d has no bf16 kernel
+        pooled = torch.nn.functional.avg_pool3d(x.float(), kernel_size=(1, 16, 16)).to(x.dtype)  # [1, 3, t, h/16, w/16]
         frames = [pooled[:, :, 0]] + [pooled[:, :, 1 + 4 * i] for i in range(lt - 1)]
         z = torch.stack(frames, dim=2).repeat(1, self.channels // 3 + 1, 1, 1, 1)[:, : self.channels]
         return type("out", (), {"latent_dist": _Dist(z)})()
@@ -78,8 +79,8 @@ def test_one_frame_encode_matches_frame0_of_the_repeated_clip():
     image = torch.rand(3, 64, 96)
     md = {"height": 32, "width": 48, "num_frames": 33, "action_mode": "policy", "action_chunk_size": 32}
     _, lat = _run(enc, md, {"image_inputs": [image]})
-    # What the reference pipelines encode: the frame repeated over the clip.
-    frame = enc._video_processor.preprocess(image, height=32, width=48).unsqueeze(2).float()
+    # What the reference pipelines encode: the frame repeated over the clip, in the VAE dtype.
+    frame = enc._video_processor.preprocess(image, height=32, width=48).unsqueeze(2).to(torch.bfloat16)
     repeated = enc.vae.encode(frame.expand(-1, -1, 33, -1, -1)).latent_dist.mode().to(lat.dtype)
     torch.testing.assert_close(lat[:, :, 0], repeated[:, :, 0])
 
