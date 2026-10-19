@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 
 from benchmark.amd import catalog, sweep, tables
-from benchmark.amd.launch import REPO, Launch, gpu_list
+from benchmark.amd.launch import REPO, Launch, collect_versions, gpu_list
 from benchmark.worker_phases.phases import parse_log, render, segment
 
 SHORT_TOKENS = 400  # body tokens; with the chat template the prompt stays under the 512-token bound
@@ -115,13 +115,15 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--worktree", default=str(REPO))
     ap.add_argument("--period", type=int, default=20, help="MSTAR_PHASE_TIMING iterations per record")
+    ap.add_argument("--config", default=None, help="serving config instead of the row's (e.g. a resources override)")
     args = ap.parse_args(argv)
 
     row, arm = catalog.ROWS[args.row], catalog.ARMS["mstar"]
     gpus = gpu_list(args.gpus)
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    launch = Launch(arm=arm, row=row, gpus=gpus, port=args.port, run_dir=out / "server", worktree=Path(args.worktree))
+    launch = Launch(arm=arm, row=row, gpus=gpus, port=args.port, run_dir=out / "server", worktree=Path(args.worktree),
+                    config=Path(args.config).resolve() if args.config else None)
     launch.run_dir.mkdir(parents=True, exist_ok=True)
     short = make_short_prompts(REPO / tables.LONG_PROMPTS, out / "prompts_400.txt", row.hf_id)
     launch._take_locks()
@@ -135,6 +137,10 @@ def main(argv=None) -> int:
                    "--period", str(args.period), "--server-log", str(out / "server.log"),
                    "--out", str(out / "phases_live.txt"), "--skip-warmup", "1"]
         (out / "command.txt").write_text(shlex.join(wrapper) + "\n")
+        versions = collect_versions(launch, launch.command(), launch.environment())
+        versions["config_text"] = launch.mstar_config().read_text()
+        (launch.run_dir / "versions.json").write_text(json.dumps(versions, indent=1, default=str))
+        t_start = time.monotonic()
         with open(out / "wrapper.log", "w") as log:
             proc = subprocess.Popen(wrapper, cwd=REPO, env=launch.environment(), stdout=log, stderr=subprocess.STDOUT,
                                     start_new_session=True)
@@ -143,6 +149,7 @@ def main(argv=None) -> int:
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError(f"server did not come up; see {out / 'wrapper.log'}")
             time.sleep(5)
+        startup_s = round(time.monotonic() - t_start, 1)
         for wl, c in cells(short):
             rdir = out / wl.name
             rdir.mkdir(exist_ok=True)
@@ -164,7 +171,8 @@ def main(argv=None) -> int:
     cut = cut_by_window(log_text, windows)
     refusals = sum(1 for ln in log_text.splitlines() if "runs eagerly" in ln)
     (out / "phases.txt").write_text("\n\n".join(f"### {k}\n{v['table']}" for k, v in cut.items()) + "\n")
-    summary = {"row": row.name, "gpus": gpus, "windows": windows, "readout": readout(cut, refusals),
+    summary = {"row": row.name, "gpus": gpus, "config": str(launch.mstar_config()), "startup_s": startup_s,
+               "windows": windows, "readout": readout(cut, refusals),
                "cells": {k: {kk: vv for kk, vv in v.items() if kk != "table"} for k, v in cut.items()}}
     for wl, _ in cells(short):
         res = out / wl.name / "results.json"
