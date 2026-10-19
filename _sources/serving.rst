@@ -48,8 +48,9 @@ mstar serve
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar_<user>/``
-     - ZMQ IPC socket prefix.
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix; one per server, so servers on other ports do
+       not share sockets.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads_<user>/``
      - Temp directory for uploaded media.
@@ -123,8 +124,10 @@ mstar-serve
      - HF default
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar``
-     - ZMQ IPC socket prefix (shared with conductor/workers).
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
+       worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
+       it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.

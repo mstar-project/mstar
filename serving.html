@@ -378,6 +378,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
@@ -683,8 +684,9 @@ cache), and then delegates to it.</p>
 <td><p>Tensor transport: <code class="docutils literal notranslate"><span class="pre">SHM</span></code> (safe single-node default), <code class="docutils literal notranslate"><span class="pre">TCP</span></code>, or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;/</span></code></p></td>
-<td><p>ZMQ IPC socket prefix.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;_&lt;port&gt;/</span></code></p></td>
+<td><p>ZMQ IPC socket prefix; one per server, so servers on other ports do
+not share sockets.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_uploads_&lt;user&gt;/</span></code></p></td>
@@ -788,8 +790,10 @@ cache), and then delegates to it.</p>
 <td><p>HuggingFace weight cache directory.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar</span></code></p></td>
-<td><p>ZMQ IPC socket prefix (shared with conductor/workers).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;_&lt;port&gt;/</span></code></p></td>
+<td><p>ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
+worker (<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.integrations.dynamo</span></code>) has no HTTP port, so
+it defaults to a new directory per launch and removes it at exit.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_uploads</span></code></p></td>

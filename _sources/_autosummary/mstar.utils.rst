@@ -43,5 +43,6 @@
    logging_config
    orphan
    profiler
+   socket_prefix
    streams
 
