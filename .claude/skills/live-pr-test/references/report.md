@@ -53,8 +53,10 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 - Any mark that rests on a measurement that varies run to run (throughput, latency, output identity, a fault-injection outcome) needs repeats, a ✅ included: at least two per arm, three by default. A ⚠️ or ❌ especially: before reporting one, rerun until each arm has at least three, since a negative on one or two runs is the result most often overturned. A deterministic result (a refusal, a crash with a traceback, a test, a token count) needs no repeats; say which it is. A rate that still doesn't separate after the repeats is "not separable", not ❌.
 - ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
 - ➖ inconclusive, too, when an output changes by no more than base's own run-to-run variation and there is no reference to say which side is right. Better: add a reference arm when one is cheap (fp32, `'highest'` matmul precision, or the reference implementation).
-- Before marking a description claim ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
+- Before marking a parity claim ❌ that the author reports passing, rerun it in the author's library versions, or diff the defaults that changed between them (transformers 5 loads UMT5 with SDPA, 4.x eager). Before any ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
 - A case the description hands to another open PR is "owned by #N" with a link, not a ⚠️ here. Test it on that PR, or on both merged, if it matters to the verdict.
+- The same goes for a failure that matches a known open issue or another PR's fix, even when the description doesn't hand it over: search the issues for the error text before marking ⚠️, and write "owned by #N".
+- For quality metrics on sampled or generative output, the repeats are different seeds (rerunning one seed is bit-identical): three to five seeds before a ⚠️, a ❌ or a margin claimed with ✅.
 
 ## Rules
 
@@ -68,6 +70,10 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 - Every compared number has at least two repeats per arm, three by default (server restarts for perf; runs or samples for fault-injection, quality and output checks). Two are enough only when they agree very closely. A cell with one run per arm is "1 run, not a comparison", never a delta or a verdict.
 - "Within noise" names its rule in one clause, e.g. "inside the spread across restarts of either arm".
 - An output diff between arms needs a same-code control (two processes of one arm). If the same prompts differ in every PR process, suspect a changed input; if a different prompt differs in each process, it is a near-tie fork, so say which pattern you saw.
+- Before writing "Not tested" or calling a row indirect, read the description's own evidence table and check the route can reach the case at all (`/v1/images/edits` drops `n`). Cite the description's direct measurement where it exists.
+- Say on the row when a served probe never reached the changed code (it died upstream, or the conductor dropped it before ingest); count hits at the changed code, as a probe on the receive cache did for #623.
+- A gap against the description's number (TTFA, throughput) is only "worth a look on the author's side" after running the description's own client and inputs too. When your absolute speed is several times the author's, find the stack difference (compile, config) before comparing anything else.
+- No suggested fixes built on a mechanism you haven't checked; check a timing claim ("the window re-arms on each refusal") against log timestamps before writing it.
 - Report what was run, including what failed or was skipped. A suite that could not run is a "Not tested" line, never silently dropped.
 - Length-sensitive metrics (req/s, audio-sec/s, RTF tails) only compare when output volume matches; check `Output bytes` first (benchmarking skill, trap 3).
 - No debugging narrative. State what happened and the evidence.
