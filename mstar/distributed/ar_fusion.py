@@ -203,8 +203,8 @@ def _round_up(n: int, multiple: int) -> int:
 def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
                weight_bias: float, eps: float):
     """Expected ``(norm, residual)`` for the stacked per-rank inputs ``xs``,
-    plus a tolerance for each. AITER truncates to bf16 on gfx942, so each
-    rounding step can be off by about one ulp of the value it rounds."""
+    plus a tolerance for each. Allows about one ulp per rounding step, enough
+    for a build that truncates (the harness measures those too)."""
     dtype = xs.dtype
     a = xs.float().sum(0)
     r = (a.to(dtype).float() + res.float()).to(dtype)
@@ -226,6 +226,10 @@ class AiterARFusion(ARFusion):
     packs per row, and under 256 KiB on 4 GPUs or 128 KiB on 8. Everything else
     stays on RCCL + norm. The two-stage fused kernel is slower than that and
     is never used.
+
+    Builds that truncate to bf16 (the release wheels on gfx942) fail the startup
+    check, since they bias the residual toward zero. A build with
+    ``OPUS_FP32_to_BF16_DEFAULT=0`` rounds to nearest and passes.
 
     Outside capture AITER copies the input into its pre-registered IPC pool.
     Inside ``graph_capture`` it records the input's own address instead, and
@@ -387,6 +391,14 @@ class AiterARFusion(ARFusion):
                         if (err > bound).any():
                             return (f"{name} at tokens={tokens} gemma={gemma}: "
                                     f"max |err| {err.max().item():.3g}")
+                    # AITER's release builds truncate to bf16 on gfx942, which shrinks
+                    # the residual stream a bit more every layer (~15% over 64 layers).
+                    got_r, ref_r = r.float().cpu().abs(), want[1].float().abs()
+                    toward_zero = int((got_r < ref_r).sum()) - int((got_r > ref_r).sum())
+                    if toward_zero > 0.05 * ref_r.numel():
+                        return (f"residual rounds toward zero ({toward_zero} of "
+                                f"{ref_r.numel()} values), needs an AITER build with "
+                                f"OPUS_FP32_to_BF16_DEFAULT=0")
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}"
         return None
