@@ -76,19 +76,15 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /opt/mstar
 
-# Install PyTorch from the XPU index before resolving the model dependencies.
+# uv selects the XPU index for PyTorch and TorchCodec in the single install below.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
 ARG TORCH_VERSION=2.13.0+xpu
 ARG TORCHVISION_VERSION=0.28.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG TORCHCODEC_VERSION=0.16.0+cpu
 ARG TORCHCODEC_XPU_VERSION=0.16.0
-RUN uv pip install --no-cache --index-url https://download.pytorch.org/whl/xpu \
-    "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}"
-
 COPY . .
-RUN uv pip install --no-cache \
+RUN uv pip install --no-cache --torch-backend=xpu \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
     "torchcodec-xpu==${TORCHCODEC_XPU_VERSION}" \
