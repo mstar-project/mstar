@@ -77,8 +77,7 @@ class VideoFamily(MathSdpaReference, Family):
 
     def reference_id(self) -> str:
         return (f"diffusers-{self.hf_id.replace('/', '--')}-{self.height}x{self.width}x{self.num_frames}"
-                f"-s{self.steps}" + ("-i2v" if self.image_to_video else "")
-                + (self.MATH_SUFFIX if self.ref_sdpa_math else ""))
+                f"-s{self.steps}" + ("-i2v" if self.image_to_video else "") + self.arm_suffix())
 
     def reference_description(self) -> str:
         return (f"diffusers pipeline for {self.hf_id}, bf16, {self.generator_device}-generator seed, "
@@ -97,6 +96,11 @@ class VideoFamily(MathSdpaReference, Family):
 
         pipe = self.load_pipeline(device)
         pipe.set_progress_bar_config(disable=True)
+        anchor_moves = []
+        if self.ref_anchor_fp32:
+            if not self.image_to_video:
+                raise ValueError("ref_anchor=fp32 only applies to image-to-video references")
+            self.fp32_anchor(pipe, anchor_moves)
         for it in sset.items:
             kw = {"height": self.height, "width": self.width, "num_frames": self.num_frames,
                   "num_inference_steps": self.steps, "output_type": "np"}
@@ -115,8 +119,14 @@ class VideoFamily(MathSdpaReference, Family):
             np.save(ref_dir / "outputs" / f"{it.id}.npy", frames)
             write_video(frames, ref_dir / "outputs" / f"{it.id}.mp4", self.fps)
             print(f"  ref {it.id}: {frames.shape}", flush=True)
+        extra = {"anchor_rel_change_vs_bf16": [round(m, 6) for m in anchor_moves]} if anchor_moves else {}
         write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
-                   pipeline=type(pipe).__name__)
+                   pipeline=type(pipe).__name__, **extra)
+
+    def fp32_anchor(self, pipe, moves: list[float]) -> None:
+        """Make the pipeline encode the conditioning frame in fp32 and append, per encode, how far that
+        moves the anchor latent from the bf16 encode (relative L2)."""
+        raise NotImplementedError(f"{type(self).__name__} has no fp32-anchor arm")
 
     @staticmethod
     def reference_frames(out) -> np.ndarray:
@@ -161,19 +171,37 @@ class VideoFamily(MathSdpaReference, Family):
                 else:
                     sheet.append([frames[0], frames[len(frames) // 2], frames[-1]])
                 labels += [f"{tag} {it.id} first", "mid", "last"]
-        math_dir = self.math_reference_dir(ref_dir)
-        if ref_out and math_dir:
-            spread = []
+        # Per video, how far the reference moves from itself: with math SDPA, and for i2v with the conditioning
+        # frame encoded in fp32. The floor takes the larger move per video, then the median over videos.
+        arms = {"math": (self.math_reference_dir(ref_dir), "reference_vs_math_sdpa_reference_psnr_db",
+                         "with math SDPA"),
+                "anchor": (self.anchor_reference_dir(ref_dir) if self.image_to_video else None,
+                           "reference_vs_fp32_anchor_reference_psnr_db", "with the conditioning frame encoded in fp32")}
+        moves: dict[str, list[float]] = {}
+        for arm, (arm_dir, metric, how) in arms.items():
+            if not (ref_out and arm_dir):
+                continue
             for r in sc.rows:
-                a, b = ref_out / f"{r['id']}.npy", math_dir / "outputs" / f"{r['id']}.npy"
+                a, b = ref_out / f"{r['id']}.npy", arm_dir / "outputs" / f"{r['id']}.npy"
                 if a.is_file() and b.is_file():
-                    ps = M.frame_psnrs(np.load(a), np.load(b))
-                    r["ref_vs_math_ref_psnr_median"] = round(statistics.median(ps), 2)
-                    spread.append(r["ref_vs_math_ref_psnr_median"])
-            sc.metrics["reference_vs_math_sdpa_reference_psnr_db"] = M.distribution(spread)
-            sc.notes.append("The reference against itself with math SDPA, per-video median frame PSNR: median "
-                            f"{sc.metrics['reference_vs_math_sdpa_reference_psnr_db'].get('median')} dB.")
-            self.calibrated_verdict(sc, spread, statistics.median(medians) if medians else None)
+                    psnr = round(statistics.median(M.frame_psnrs(np.load(a), np.load(b))), 2)
+                    r[f"ref_vs_{arm}_ref_psnr_median"] = psnr
+                    moves.setdefault(r["id"], []).append(psnr)
+            sc.metrics[metric] = M.distribution([r[f"ref_vs_{arm}_ref_psnr_median"] for r in sc.rows
+                                                 if f"ref_vs_{arm}_ref_psnr_median" in r])
+            sc.notes.append(f"The reference against itself {how}, per-video median frame PSNR: median "
+                            f"{sc.metrics[metric].get('median')} dB.")
+            anchor_moves = json.loads((arm_dir / "meta.json").read_text()).get("anchor_rel_change_vs_bf16")
+            if arm == "anchor" and anchor_moves:
+                sc.metrics["fp32_anchor_rel_change_vs_bf16"] = M.distribution(anchor_moves)
+                sc.notes.append(f"The fp32 encode moved the anchor latent by a relative {max(anchor_moves):.1e} at "
+                                "most from the bf16 encode.")
+        if moves:
+            used = [arm for arm in arms if any(f"ref_vs_{arm}_ref_psnr_median" in r for r in sc.rows)]
+            basis = {("math",): "math-SDPA spread", ("anchor",): "fp32-anchor spread"}.get(
+                tuple(used), "math-SDPA and fp32-anchor spreads (per video the larger move)")
+            served = statistics.median(medians) if medians else None
+            self.calibrated_verdict(sc, [min(v) for v in moves.values()], served, basis)
         if medians:
             med = statistics.median(medians)
             sc.metrics["per_video_median_frame_psnr_db"] = M.distribution(medians)
