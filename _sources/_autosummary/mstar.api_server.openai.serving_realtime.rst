@@ -31,6 +31,12 @@ mstar.api\_server.openai.serving\_realtime
 
    
    
+   .. rubric:: Exceptions
+
+   .. autosummary::
+   
+      StepError
+   
    
 
 

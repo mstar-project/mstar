@@ -917,8 +917,15 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not</span>
 <span class="sd">pass the item cap, and the unfixed counts are non-negative integers; numeric</span>
-<span class="sd">strings count as numbers. Any other value is an ``error`` and the update</span>
-<span class="sd">changes nothing.</span>
+<span class="sd">strings count as numbers. ``language`` and ``prompt`` are strings (or null),</span>
+<span class="sd">``language`` at most ``MAX_LANGUAGE_CHARS`` characters. Any other value is an</span>
+<span class="sd">``error`` and the update changes nothing.</span>
+
+<span class="sd">A failed step is an ``error`` too. A request error (a 4xx from the engine,</span>
+<span class="sd">such as a model refusing the language) quotes its message, with server paths</span>
+<span class="sd">reduced to their base names and cut to ``MAX_ERROR_CHARS``; any other failure</span>
+<span class="sd">says only that the step failed, with an error id that the server log carries</span>
+<span class="sd">the details under.</span>
 
 <span class="sd">Server events</span>
 <span class="sd">    ``transcription_session.created`` / ``.updated``</span>
@@ -951,13 +958,14 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">reprlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">WebSocket</span><span class="p">,</span> <span class="n">WebSocketDisconnect</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span><span class="p">,</span> <span class="n">WebSocket</span><span class="p">,</span> <span class="n">WebSocketDisconnect</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span>
@@ -977,6 +985,10 @@ window.runMermaid = runMermaid;</script>
 <span class="n">MAX_ITEM_SECONDS</span> <span class="o">=</span> <span class="mf">300.0</span>
 <span class="c1"># Longest excerpt of a client value quoted in an error.</span>
 <span class="n">EXCERPT_CHARS</span> <span class="o">=</span> <span class="mi">100</span>
+<span class="c1"># Longest language a session accepts: a code ("en", "zh-Hant") or a name.</span>
+<span class="n">MAX_LANGUAGE_CHARS</span> <span class="o">=</span> <span class="mi">32</span>
+<span class="c1"># Longest message a failed step sends.</span>
+<span class="n">MAX_ERROR_CHARS</span> <span class="o">=</span> <span class="mi">300</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">_ExcerptRepr</span><span class="p">(</span><span class="n">reprlib</span><span class="o">.</span><span class="n">Repr</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""``reprlib.Repr`` that reads the first items of a dict or set instead</span>
 <span class="sd">    of sorting all of them, so the work does not grow with the input."""</span>
@@ -1024,6 +1036,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">raw_hypothesis</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>   <span class="c1"># the model's raw output for the audio so far</span>
     <span class="n">emitted</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>          <span class="c1"># clean text already sent as deltas</span>
     <span class="n">item_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"item_</span><span class="si">{</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="p">[:</span><span class="mi">12</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="c1"># error ids of this item's distinct step failures (at most</span>
+    <span class="c1"># MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item</span>
+    <span class="n">failures</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="s2">""</span><span class="p">,</span> <span class="p">{})</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">chunk_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1098,6 +1113,42 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The repr of a client-supplied value, at most ``EXCERPT_CHARS`` long."""</span>
     <span class="n">text</span> <span class="o">=</span> <span class="n">_EXCERPT_REPR</span><span class="o">.</span><span class="n">repr</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">text</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">text</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">EXCERPT_CHARS</span> <span class="k">else</span> <span class="n">text</span><span class="p">[:</span> <span class="n">EXCERPT_CHARS</span> <span class="o">-</span> <span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="s2">"..."</span>
+
+
+<span class="c1"># distinct step failures remembered per item; past this each new one is</span>
+<span class="c1"># logged, so alternating failures cannot grow the session's memory</span>
+<span class="n">MAX_FAILURES_PER_ITEM</span> <span class="o">=</span> <span class="mi">8</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_clip</span><span class="p">(</span><span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MAX_ERROR_CHARS</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">message</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">message</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">limit</span> <span class="k">else</span> <span class="n">message</span><span class="p">[:</span> <span class="n">limit</span> <span class="o">-</span> <span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="s2">"..."</span>
+
+
+<span class="c1"># An absolute path with at least one directory, not inside a word; a URL's</span>
+<span class="c1"># "//" never matches, so a path right after a ":" is still one.</span>
+<span class="n">_ABS_PATH</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"(?&lt;![\w./&lt;&gt;])/(?:[^\s/'</span><span class="se">\"</span><span class="s2">]+/)+([^\s/'</span><span class="se">\"</span><span class="s2">]+)"</span><span class="p">)</span>
+<span class="c1"># A quoted one, taken whole: its directories may hold spaces.</span>
+<span class="n">_QUOTED_PATH</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"(['</span><span class="se">\"</span><span class="s2">])/(?:[^'</span><span class="se">\"</span><span class="s2">\n/]*/)+([^'</span><span class="se">\"</span><span class="s2">\n/]+)\1"</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_scrub_paths</span><span class="p">(</span><span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``message`` with the upload directory as ``&lt;upload&gt;`` and any other</span>
+<span class="sd">    absolute path cut to its base name, so a kept error does not show the</span>
+<span class="sd">    server's layout (#592)."""</span>
+    <span class="n">message</span> <span class="o">=</span> <span class="n">_QUOTED_PATH</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="sa">r</span><span class="s2">"\1\2\1"</span><span class="p">,</span> <span class="n">message</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">upload_dir</span><span class="p">),</span> <span class="s2">"&lt;upload&gt;"</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">_ABS_PATH</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="sa">r</span><span class="s2">"\1"</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="StepError">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.StepError">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StepError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The engine's error for a step, with the HTTP status it carried: a 4xx</span>
+<span class="sd">    is the request's fault (a model's ValueError), anything else the server's."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="n">status</span></div>
+
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_object</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
@@ -1191,12 +1242,17 @@ window.runMermaid = runMermaid;</script>
         <span class="k">except</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">CancelledError</span><span class="p">:</span>
             <span class="n">api</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
             <span class="k">raise</span>
+        <span class="k">except</span> <span class="n">HTTPException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="c1"># a request the engine failed: the status says whose fault it was</span>
+            <span class="k">raise</span> <span class="n">StepError</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">finally</span><span class="p">:</span>
         <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">missing_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="n">text</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">)</span>
     <span class="n">errors</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"error"</span><span class="p">]</span>
     <span class="k">if</span> <span class="n">errors</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">errors</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">))</span>
+        <span class="k">raise</span> <span class="n">StepError</span><span class="p">(</span>
+            <span class="n">errors</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">),</span> <span class="nb">int</span><span class="p">((</span><span class="n">errors</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"status"</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">500</span><span class="p">),</span>
+        <span class="p">)</span>
     <span class="k">return</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">text</span>
 
 
@@ -1341,8 +1397,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="n">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">,</span> <span class="s2">"unfixed_tokens"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">integer</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="n">transcription</span> <span class="o">=</span> <span class="n">_object</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_transcription"</span><span class="p">),</span> <span class="s2">"input_audio_transcription"</span><span class="p">)</span>
         <span class="n">fields</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">transcription</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"language"</span><span class="p">,</span> <span class="s2">"prompt"</span><span class="p">)}</span>
-        <span class="k">if</span> <span class="n">fields</span><span class="p">:</span>
-            <span class="n">s</span><span class="o">.</span><span class="n">request</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span><span class="n">update</span><span class="o">=</span><span class="n">fields</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">fields</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"input_audio_transcription.</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be a string; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">language</span> <span class="o">=</span> <span class="n">fields</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"language"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">language</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">language</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">MAX_LANGUAGE_CHARS</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"input_audio_transcription.language must be at most </span><span class="si">{</span><span class="n">MAX_LANGUAGE_CHARS</span><span class="si">}</span><span class="s2"> characters; "</span>
+                <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">language</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="n">request</span> <span class="o">=</span> <span class="n">TranscriptionRequest</span><span class="o">.</span><span class="n">model_validate</span><span class="p">({</span><span class="o">**</span><span class="n">s</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(),</span> <span class="o">**</span><span class="n">fields</span><span class="p">})</span> <span class="k">if</span> <span class="n">fields</span> <span class="k">else</span> <span class="n">s</span><span class="o">.</span><span class="n">request</span>
+        <span class="n">s</span><span class="o">.</span><span class="n">request</span> <span class="o">=</span> <span class="n">request</span>
         <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">unfixed_tokens</span></div>
 
 
@@ -1367,8 +1432,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">try</span><span class="p">:</span>
             <span class="n">s</span><span class="o">.</span><span class="n">raw_hypothesis</span> <span class="o">=</span> <span class="k">await</span> <span class="n">_run_step</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">api</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">prefix</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — report it as an event, keep the session</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"realtime step failed"</span><span class="p">)</span>
-            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">),</span> <span class="n">kind</span><span class="o">=</span><span class="s2">"server_error"</span><span class="p">))</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step_failed</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="c1"># a coalesced step counts every chunk it heard, so the prefix that keeps</span>
         <span class="c1"># sent text fixed starts after the same audio as with one step per chunk</span>
@@ -1388,6 +1452,38 @@ window.runMermaid = runMermaid;</script>
             <span class="n">audio_seconds</span><span class="o">=</span><span class="nb">sum</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">size</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">s</span><span class="o">.</span><span class="n">heard</span><span class="p">)</span> <span class="o">/</span> <span class="n">SAMPLE_RATE</span><span class="p">,</span> <span class="n">created</span><span class="o">=</span><span class="n">now</span><span class="p">(),</span>
         <span class="p">))</span></div>
 
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_step_failed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc</span><span class="p">:</span> <span class="ne">Exception</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Report a failed step. A request error (a ValueError or TypeError</span>
+<span class="sd">        here, a 4xx from the engine) keeps its message, cut to</span>
+<span class="sd">        ``MAX_ERROR_CHARS`` and without server paths; anything else is</span>
+<span class="sd">        a generic message with an error id, and the full error is logged under</span>
+<span class="sd">        that id. Each distinct failure is logged once per item, not once per</span>
+<span class="sd">        step."""</span>
+        <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
+        <span class="n">detail</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span>
+        <span class="n">client_error</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="ow">or</span> <span class="p">(</span>
+            <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">StepError</span><span class="p">)</span> <span class="ow">and</span> <span class="mi">400</span> <span class="o">&lt;=</span> <span class="n">exc</span><span class="o">.</span><span class="n">status</span> <span class="o">&lt;</span> <span class="mi">500</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">failures</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="n">s</span><span class="o">.</span><span class="n">item_id</span><span class="p">:</span>
+            <span class="n">s</span><span class="o">.</span><span class="n">failures</span> <span class="o">=</span> <span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">item_id</span><span class="p">,</span> <span class="p">{})</span>
+        <span class="n">seen</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">failures</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="n">failure</span> <span class="o">=</span> <span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">detail</span><span class="p">)</span>
+        <span class="n">error_id</span> <span class="o">=</span> <span class="n">seen</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">failure</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">error_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">error_id</span> <span class="o">=</span> <span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="p">[:</span><span class="mi">12</span><span class="p">]</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">seen</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">MAX_FAILURES_PER_ITEM</span><span class="p">:</span>
+                <span class="n">seen</span><span class="p">[</span><span class="n">failure</span><span class="p">]</span> <span class="o">=</span> <span class="n">error_id</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span>
+                <span class="n">logging</span><span class="o">.</span><span class="n">INFO</span> <span class="k">if</span> <span class="n">client_error</span> <span class="k">else</span> <span class="n">logging</span><span class="o">.</span><span class="n">ERROR</span><span class="p">,</span>
+                <span class="s2">"realtime step failed (error id </span><span class="si">%s</span><span class="s2">, session </span><span class="si">%s</span><span class="s2">, </span><span class="si">%s</span><span class="s2">); repeats in this item are not logged"</span><span class="p">,</span>
+                <span class="n">error_id</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">session_id</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">item_id</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="n">exc</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">client_error</span><span class="p">:</span>
+            <span class="n">message</span> <span class="o">=</span> <span class="n">_clip</span><span class="p">(</span><span class="n">_scrub_paths</span><span class="p">(</span><span class="n">detail</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">))</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="n">message</span><span class="p">))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"realtime step failed (error id </span><span class="si">{</span><span class="n">error_id</span><span class="si">}</span><span class="s2">)"</span><span class="p">,</span> <span class="n">kind</span><span class="o">=</span><span class="s2">"server_error"</span><span class="p">))</span>
 
 <div class="viewcode-block" id="RealtimeTranscription.emit">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeTranscription.emit">[docs]</a>
