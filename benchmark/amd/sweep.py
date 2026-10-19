@@ -384,8 +384,10 @@ def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> Non
     arms = catalog.arms_for(row, plan.arms)
     # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
     k = index % len(arms) if arms else 0
-    for arm in arms[k:] + arms[:k]:
-        run_arm(plan, row, arm, gpus, port, "")
+    # Each arm gets its own port: right after a server stops, its port can sit in TIME_WAIT, and a server that
+    # binds without SO_REUSEADDR (sglang-omni) then refuses it.
+    for j, arm in enumerate(arms[k:] + arms[:k]):
+        run_arm(plan, row, arm, gpus, port + j, "")
 
 
 def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_base: int) -> None:

@@ -77,7 +77,8 @@ def _moe_status(a: dict) -> tuple[str, bool]:
     tuned, default = st["moe_configs"].get("tuned") or [], st["moe_configs"].get("default") or []
     row = catalog.ROWS.get(a.get("row"))
     parts, untuned = [], bool(default)
-    if a.get("arm") == "mstar" and row and row.moe_shapes:
+    spec = catalog.ARMS.get(a.get("arm"))
+    if spec and spec.engine == "mstar" and row and row.moe_shapes:
         for shape in row.moe_shapes:
             hit = [t for t in tuned if t.startswith(shape + ",")]
             parts.append(f"MoE {shape}: {hit[0].rsplit('device_name=', 1)[-1].removesuffix('.json')} table" if hit
@@ -220,7 +221,8 @@ def render(data: dict) -> str:
         st = a.get("startup") or {}
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
-        backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if a["arm"] == "mstar" else "")
+        engine = getattr(catalog.ARMS.get(a["arm"]), "engine", None)
+        backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if engine == "mstar" else "")
         moe_txt = _moe_status(a)[0]
         ar = st.get("allreduce") or {}
         ar_txt = "" if not ar else (f"fused all-reduce: {ar.get('backend')}" if ar.get("fused")
