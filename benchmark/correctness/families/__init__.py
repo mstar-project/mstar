@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from benchmark.correctness.families.asr_models import HiggsAsr, WhisperAsr
+from benchmark.correctness.families.av import AudioVideoFamily
 from benchmark.correctness.families.base import Family
 from benchmark.correctness.families.duplex import NemotronDuplex
 from benchmark.correctness.families.image import ImageFamily, NoReferenceImage
@@ -183,11 +184,11 @@ FAMILIES: dict[str, type[Family]] = {
     "vjepa2_ac": Vjepa2AcLatents,
     "waypoint": WaypointWorld,
     "nemotron_duplex": NemotronDuplex,
+    "ltx2_5": AudioVideoFamily,
 }
 
 UNSUPPORTED: dict[str, str] = {
     "test_text_session": "test-only config (session plumbing), no model output to verify",
-    "ltx2_5": "no family yet, its joint audio+video output needs its own reference and scoring",
 }
 
 
