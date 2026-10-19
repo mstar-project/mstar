@@ -80,9 +80,11 @@ configs:
    docker build -f docker/Dockerfile.xpu -t mstar:xpu .
 
 The image uses ``uv`` to install M* with ``.[bagel_xpu]`` and build ``mstar-rust``
-from the same checkout. The Dockerfile pins XPU PyTorch 2.14.0, torchvision
-0.29.0, torchaudio 2.11.0 (the latest XPU wheel), and CPU torchcodec 0.15.0. The build
-checks these imports and the XPU kernel extensions without requiring GPU access.
+from the same checkout. The Dockerfile pins XPU PyTorch 2.13.0, torchvision
+0.28.0, torchaudio 2.11.0 (the latest XPU wheel), and TorchCodec 0.16.0 with the
+Intel ``torchcodec-xpu`` 0.16.0 plugin. The CPU TorchCodec base wheel avoids CUDA
+dependencies; the plugin provides XPU video acceleration through FFmpeg VAAPI.
+The build checks these imports and the XPU kernel extensions without requiring GPU access.
 Other model families may need additional dependencies and XPU kernel support.
 
 The host must have a working Intel GPU driver and expose ``/dev/dri``. Run an
@@ -91,10 +93,22 @@ interactive shell and check GPU access:
 .. code-block:: bash
 
    docker run --rm -it --device=/dev/dri --ipc=host \
+     -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+To use the Intel media engines, pass an XPU device to the TorchCodec decoder:
+
+.. code-block:: python
+
+   from torchcodec.decoders import VideoDecoder
+
+   decoder = VideoDecoder("input.mp4", device="xpu:0")
+
+Acceleration requires a GPU with media engines; Intel Data Center GPU Max
+(Ponte Vecchio) uses the plugin's CPU fallback.
 
 Inside the container, serve BAGEL using the seven-XPU CFG TP2 deployment:
 

@@ -78,10 +78,11 @@ WORKDIR /opt/mstar
 
 # Install PyTorch from the XPU index before resolving the model dependencies.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
-ARG TORCH_VERSION=2.14.0+xpu
-ARG TORCHVISION_VERSION=0.29.0+xpu
+ARG TORCH_VERSION=2.13.0+xpu
+ARG TORCHVISION_VERSION=0.28.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
-ARG TORCHCODEC_VERSION=0.15.0+cpu
+ARG TORCHCODEC_VERSION=0.16.0+cpu
+ARG TORCHCODEC_XPU_VERSION=0.16.0
 RUN uv pip install --no-cache --index-url https://download.pytorch.org/whl/xpu \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}"
@@ -90,6 +91,7 @@ COPY . .
 RUN uv pip install --no-cache \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
+    "torchcodec-xpu==${TORCHCODEC_XPU_VERSION}" \
     ".[bagel_xpu]" ./rust \
     msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser tabulate && \
     uv pip check && \
@@ -97,6 +99,7 @@ RUN uv pip install --no-cache \
         import vllm_xpu_kernels._C; import vllm_xpu_kernels._xpu_C; \
         from mstar.model.bagel import bagel_model; \
         from mstar.api_server import entrypoint; \
+        import torchcodec_xpu; \
         assert torch.version.xpu is not None; \
         print('M* XPU imports OK:', torch.__version__)" && \
     mstar serve --help && \

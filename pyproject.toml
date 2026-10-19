@@ -31,8 +31,8 @@ dependencies = [
     "msgpack",
     "python-multipart",
     "requests",
-    # The XPU image uses torch 2.14 to match the vllm-xpu-kernels wheel.
-    "torch>=2.9.1,<2.15.0",
+    # Allow the torch 2.13 XPU wheels used by the Intel media codec plugin.
+    "torch>=2.9.1,<2.14.0",
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
     "uvicorn",
