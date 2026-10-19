@@ -212,6 +212,52 @@ def test_duplex_questions_get_trailing_silence(tmp_path):
     assert req.files[0].parent == tmp_path / "derived" / "omni_v1-trailing2s"
 
 
+
+def test_duplex_json_keeps_whole_replies(tmp_path, monkeypatch):
+    from benchmark.correctness.families import duplex
+
+    root = tmp_path / "sets" / "omni_v1"
+    (root / "audio").mkdir(parents=True)
+    M.write_wav(root / "audio" / "00.wav", np.full(16000, 0.1, np.float32), 16000)
+    sset = sets.SampleSet("omni_v1", root, {}, [
+        sets.Item(id="aud_00", prompt="q", files={"audio": "audio/00.wav"}, params={"modality": "audio"})])
+    out = tmp_path / "run" / "r1" / "outputs"
+    out.mkdir(parents=True)
+    text = " ".join(f"word{i}" for i in range(60))
+    (out / "aud_00.txt").write_text(text)
+    M.write_wav(out / "aud_00.wav", (0.3 * np.sin(np.arange(16000) / 4)).astype(np.float32), 16000)
+    heard = " ".join(f"word{i}" for i in range(40))
+    monkeypatch.setattr(duplex.asr_judge, "transcribe", lambda paths, device, model_id=None: [heard for _ in paths])
+    fam = family_for_config("nemotron_duplex", "nemotron_duplex", {}, {})
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, [out.parent], None, work, "cpu")
+    (row,) = json.loads((work / "duplex.json").read_text())
+    assert row["text"] == text and row["heard"] == heard and len(text) > 160
+    assert row["wer_vs_own_text"] == pytest.approx(1 / 3, abs=1e-3)  # 20 of 60 words never spoken
+    assert sc.rows[0]["text"] == text[:160]  # the report table stays short
+
+
+def test_make_reference_builds_in_a_child_process(monkeypatch):
+    import subprocess
+    import sys
+
+    from benchmark.correctness import run as runner
+
+    calls = []
+
+    def fake_run(cmd, check):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, len(calls) - 1)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    argv = ["--config", "flux2_klein", "--make-reference", "--device", "cuda:3"]
+    assert runner._build_reference_in_child(argv) is None
+    assert "exited with 1" in runner._build_reference_in_child(argv)
+    cmd = calls[0]
+    assert cmd[0] == sys.executable and cmd[1].endswith("benchmark/correctness/run.py")
+    assert cmd[2:] == [*argv, "--reference-only"]
+
 def test_cosmos3_modes_and_image_size_override(tmp_path):
     from benchmark.correctness.families import Cosmos3I2V, Cosmos3T2I, Cosmos3Video
 
