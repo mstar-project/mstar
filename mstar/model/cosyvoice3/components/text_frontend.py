@@ -25,7 +25,9 @@ read by ``english_normalizer``'s rules when it is not loaded, or after it for
 what it leaves. Text with Chinese keeps its digits without ``wetext``, as the
 reference's fallback does. Either way the text ends on a sentence stop, as the
 reference's sentence splitter leaves it. Text carrying a ``<|...|>`` tag is
-left alone.
+left alone. The reference decides Chinese or English once for the whole text,
+so the pieces of a request with Chinese in it all take the Chinese rules (an
+English piece keeps its digits), which ``normalize(chinese=True)`` follows.
 
 Differences from the reference: ``wetext`` grammars are read from the local
 ModelScope cache when present (``wetext`` itself asks ModelScope on every
@@ -166,13 +168,16 @@ class CosyVoice3TextFrontend:
             logger.debug("wetext failed on a text; the rules read it", exc_info=True)
             return text
 
-    def normalize(self, text: str) -> str:
+    def normalize(self, text: str, chinese: bool = False) -> str:
+        """The text the reference would tokenize. ``chinese`` says the whole
+        request has Chinese in it, so a piece without any still takes the
+        Chinese rules: the reference decides once per text, not per piece."""
         if "<|" in text and "|>" in text:
             return text
         stripped = text.strip()
         if not stripped:
             return text
-        if contains_chinese(stripped):
+        if chinese or contains_chinese(stripped):
             out = self._wetext_normalize(stripped, "zh")
             out = out.replace("\n", "")
             out = replace_blank(out)

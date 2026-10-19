@@ -283,6 +283,7 @@ class CosyVoice3Model(Model):
             "ras_tau": _number("ras_tau", mk.get("ras_tau", s.ras_tau), low=0.0, high=1.0),
             "ignore_eos": _flag("ignore_eos", mk.get("ignore_eos", False)),
             "text_frontend": _flag("text_frontend", mk.get("text_frontend", True)),
+            "text_has_chinese": _flag("text_has_chinese", mk.get("text_has_chinese", False)),
             "n_cfm_timesteps": _integer(
                 "n_cfm_timesteps",
                 mk.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps),
@@ -548,7 +549,12 @@ class CosyVoice3Model(Model):
         mode, transcript = self.resolve_mode(kwargs, uploaded=bool(uploaded))
         # the transcript and instruction stay as written: the reference's callers
         # write <|endofprompt|> into them, which turns its frontend off
-        text = self.text_frontend.normalize(prompt) if knobs["text_frontend"] else prompt
+        # the API server splits long text into pieces and says when the whole text has Chinese
+        text = (
+            self.text_frontend.normalize(prompt, chinese=knobs["text_has_chinese"])
+            if knobs["text_frontend"]
+            else prompt
+        )
         prompt_ids = self.tokenizer(self.prompt_text(mode, transcript, kwargs.get("instruct"), text))
         text_ids = self.tokenizer(text)
         ids = torch.cat([prompt_ids, text_ids])

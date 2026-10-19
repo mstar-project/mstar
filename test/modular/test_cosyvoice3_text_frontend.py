@@ -82,6 +82,37 @@ REFERENCE = [
 ]
 
 
+# What the same reference, same install, returns for text mixing English and
+# Chinese: it decides Chinese for the whole text, so no digit is spelled out and
+# the English pieces take the Chinese rules (a "." becomes "。", blanks go).
+# Each text with its pieces, as the reference's own splitter cuts them.
+MIXED = [
+    ("我今天买了3本书，一共花了$12。", ["我今天买了3本书，一共花了$12。"]),
+    (
+        "The meeting starts at 4:05 pm in room 101.我们在会议室见面，大概需要20分钟。",
+        ["The meeting starts at 4:05 pm in room 101。我们在会议室见面，大概需要20分钟。"],
+    ),
+    (
+        "2024年的销量是 1,000,000 件，Flight 247 leaves from gate 12 at 7:30. 请提前到达。",
+        ["2024年的销量是1,000,000件，Flight 247 leaves from gate 12 at 7:30。请提前到达。"],
+    ),
+    (
+        "Call 555-867-5309 now. 然后我们去吃饭，He was born in 1987 and she finished 21st.",
+        ["Call 555-867-5309 now。然后我们去吃饭，He was born in 1987 and she finished 21st。"],
+    ),
+    ("Hello world 123 你好", ["Hello world 123你好。"]),
+    (
+        "Tickets cost $85 each. Growth hit 12% last year. 今天天气很好，我们一起去公园玩，然后回家做饭，"
+        "晚上看电影，明天还要上班，所以要早点睡觉。 The 19th century saw 3 wars and 1,200 treaties; "
+        "the year 2008 saw 5 more. 谢谢大家。",
+        [
+            "Tickets cost $85 each。 Growth hit 12% last year。今天天气很好，我们一起去公园玩，然后回家做饭，"
+            "晚上看电影，明天还要上班，所以要早点睡觉。",
+            "The 19th century saw 3 wars and 1,200 treaties; the year 2008 saw 5 more。谢谢大家。",
+        ],
+    ),
+]
+
 SPOKEN = [
     ("thousands", "The prize was 1,000,000 dollars.", "The prize was one million dollars."),
     (
@@ -545,3 +576,84 @@ def test_text_frontend_false_sends_the_text_as_written(model):
         model.process_prompt(
             "Flight 247", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]}, text_frontend="no"
         )
+
+
+# -- text with English and Chinese ----------------------------------------------------
+
+
+def _speech_request(text: str, **extra) -> SimpleNamespace:
+    return SimpleNamespace(input=text, voice="zero_shot", model_extra=dict(extra))
+
+
+def _served_pieces(text: str, **extra) -> tuple[list[str], dict]:
+    """The pieces the API server submits for ``text`` and the kwargs each carries."""
+    adapter = adapters.CosyVoice3Adapter()
+    req = _speech_request(text, **extra)
+    return adapter.split_speech_text(text, req), adapter.speech_to_request(req, None).model_kwargs
+
+
+def _squeeze(text: str) -> str:
+    return "".join(text.split())
+
+
+@pytest.mark.parametrize("text, reference", MIXED, ids=[t[:24] for t, _ in MIXED])
+def test_mixed_text_reads_as_the_reference_reads_it(text, reference):
+    pieces, kwargs = _served_pieces(text)
+    assert kwargs["text_has_chinese"] is True
+    frontend = CosyVoice3TextFrontend()
+    spoken = [frontend.normalize(p, chinese=kwargs["text_has_chinese"]) for p in pieces]
+    # the pieces are cut apart the same way only when the text is short; what is said is the same
+    assert _squeeze("".join(spoken)) == _squeeze("".join(reference))
+    assert not re.search(r"\b(one|two|three|four|five|hundred|thousand|million|eleven|seven)\b", " ".join(spoken))
+
+
+@pytest.mark.parametrize("text, reference", MIXED[:5], ids=[t[:24] for t, _ in MIXED[:5]])
+def test_mixed_text_through_process_prompt_tokenizes_the_reference_text(model, text, reference):
+    (piece,), kwargs = _served_pieces(text)
+    out = model.process_prompt(
+        piece, ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]}, **kwargs
+    )
+    assert torch.equal(_text_ids(out, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), _Tokenizer()(reference[0]))
+
+
+def test_an_english_piece_of_mixed_text_keeps_its_digits_where_alone_it_is_spelled_out():
+    frontend = CosyVoice3TextFrontend()
+    piece = "Flight 247 leaves at 7:30."
+    assert frontend.normalize(piece) == "Flight two hundred and forty seven leaves at seven thirty."
+    assert frontend.normalize(piece, chinese=True) == "Flight 247 leaves at 7:30。"
+
+
+def test_pure_english_text_carries_no_flag_and_pure_chinese_text_reads_as_before():
+    frontend = CosyVoice3TextFrontend()
+    pieces, kwargs = _served_pieces("Flight 247 leaves at 7:30. Call 555-867-5309 now.")
+    assert "text_has_chinese" not in kwargs
+    assert frontend.normalize(pieces[0]) == (
+        "Flight two hundred and forty seven leaves at seven thirty. "
+        "Call five five five, eight six seven, five three zero nine now."
+    )
+    for text in ("航班247次在7:30起飞。", "面积是10m²，长度是3米、", "今天是 hello world 的 第 2 天，"):
+        pieces, kwargs = _served_pieces(text)
+        assert kwargs["text_has_chinese"] is True  # every piece has Chinese: the flag changes nothing
+        assert [frontend.normalize(p, chinese=True) for p in pieces] == [frontend.normalize(p) for p in pieces]
+
+
+def test_the_client_cannot_set_text_has_chinese():
+    _, kwargs = _served_pieces("Flight 247 leaves at 7:30.", text_has_chinese=True)
+    assert "text_has_chinese" not in kwargs
+    _, kwargs = _served_pieces("Flight 247 在7:30起飞。", text_has_chinese=False)
+    assert kwargs["text_has_chinese"] is True
+
+
+def test_text_has_chinese_must_be_a_flag(model):
+    with pytest.raises(ValueError, match="text_has_chinese must be true or false"):
+        model.process_prompt(
+            "Flight 247", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]}, text_has_chinese="yes"
+        )
+
+
+def test_text_has_chinese_does_not_touch_text_sent_as_written(model):
+    out = model.process_prompt(
+        "Flight 247", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]},
+        text_frontend=False, text_has_chinese=True,
+    )
+    assert torch.equal(_text_ids(out, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), _Tokenizer()("Flight 247"))

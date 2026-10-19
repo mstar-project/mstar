@@ -813,6 +813,9 @@ class FishS2ProAdapter(OpenAIAdapter):
         )
 
 
+_CHINESE = re.compile(r"[\u4e00-\u9fff]")  # the reference's ``contains_chinese``
+
+
 class CosyVoice3Adapter(OpenAIAdapter):
     """Fun-CosyVoice3: TTS that always clones a voice.
 
@@ -836,6 +839,9 @@ class CosyVoice3Adapter(OpenAIAdapter):
     Cyrillic pieces stay near 80 tokens as English ones do. The estimate is
     taken on the text with its digits spelled out, the text the model
     tokenizes, as the reference splits after normalizing.
+    The reference decides Chinese or English once for the whole text, so a
+    request with Chinese in it tells the model so (``text_has_chinese``) and
+    its English pieces keep their digits, as the reference's do.
     """
 
     supports_speech = True
@@ -858,7 +864,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
     _ZH_MAX_PIECE_CHARS = 300
 
     def split_speech_text(self, text: str, req=None) -> list[str]:
-        if re.search(r"[\u4e00-\u9fff]", text):  # the reference's ``contains_chinese``
+        if _CHINESE.search(text):
             return self._split_chinese(text)
         # The reference counts real tokens here; characters per token differ
         # by script (Hangul or kana about 1.5, Cyrillic about 2.7, English about 4.7).
@@ -950,6 +956,10 @@ class CosyVoice3Adapter(OpenAIAdapter):
         instructions = mk.pop("instructions", None)
         if instructions:
             mk.setdefault("instruct", instructions)
+        # set from the whole input, never taken from the client
+        mk.pop("text_has_chinese", None)
+        if _CHINESE.search(req.input):
+            mk["text_has_chinese"] = True
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         file_paths = None
         input_modalities = ["text"]
