@@ -399,7 +399,7 @@ def test_stub_matches_released_checkpoint(messages):
     from transformers import AutoProcessor
 
     real = AutoProcessor.from_pretrained(
-        os.environ["MSTAR_QWEN3_OMNI_PATH"], trust_remote_code=True,
+        os.environ["MSTAR_QWEN3_OMNI_PATH"], trust_remote_code=False,
     )
     assert real.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,

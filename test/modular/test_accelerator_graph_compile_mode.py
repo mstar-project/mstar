@@ -1,5 +1,5 @@
 """``compile_mode`` on a capture config: checked when the config is built, and
-turned into ``torch.compile``'s arguments by ``cuda_graph_runner.compile_kwargs``."""
+turned into ``torch.compile``'s arguments by ``accelerator_graph_runner.compile_kwargs``."""
 
 import sys
 
@@ -7,17 +7,17 @@ import pytest
 
 sys.path.insert(0, ".")
 
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
 )
-from mstar.engine.cuda_graph_runner import compile_kwargs
+from mstar.engine.accelerator_graph_runner import compile_kwargs
 from mstar.model.submodule_base import NodeInputs
 
 
 def _batched(mode):
-    return BatchedCudaGraphConfig(
+    return BatchedAcceleratorGraphConfig(
         capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
         compile_mode=mode,
     )
@@ -61,7 +61,7 @@ def test_an_invalid_mode_is_refused_at_build(build, mode, match):
 def test_configs_carry_the_field():
     assert _batched("default").compile_mode == "default"
     assert _batched(None).compile_mode is None
-    packed = PackedCudaGraphConfig(
+    packed = PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill", capture_token_lengths=[8],
         make_node_input=lambda n: NodeInputs(input_seq_len=n), compile_mode="default",
     )

@@ -59,7 +59,12 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
     return {"created": now(), "data": data}
 
 
-async def _stream_ndjson(api, request_id):
+def _stream_ndjson(api, request_id):
+    # Bound to the submission now: the body is iterated later, by Starlette.
+    return _ndjson_lines(api.iter_result_chunks(request_id))
+
+
+async def _ndjson_lines(chunks):
     """Yield one NDJSON line per result chunk for a ``stream_video`` request.
 
     A windowed request emits each window's mp4 as its own ``video`` chunk;
@@ -71,7 +76,7 @@ async def _stream_ndjson(api, request_id):
     """
     index = 0
     failed = False
-    async for chunk in api.iter_result_chunks(request_id):
+    async for chunk in chunks:
         metadata = dict(chunk.metadata or {})
         if chunk.modality == "error":
             failed = True

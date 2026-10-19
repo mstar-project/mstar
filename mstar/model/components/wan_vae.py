@@ -177,6 +177,31 @@ def _has_deterministic_mode() -> bool:
     return hasattr(inductor_config, "deterministic")
 
 
+def compile_decode(fn, deterministic: bool = False):
+    """``torch.compile`` a Wan VAE decode callable; every compiled Wan VAE
+    decode goes through here.
+
+    Comprehensive padding is off. With it, Inductor on torch 2.13 pads the
+    strides it picks for ``up_blocks[1]``'s shortcut ``x.clone()`` as if
+    channels-first, while the upsample conv that the clone is fused into
+    writes it channels-last: a Wan 2.2 (``is_residual``) decode then reads
+    wrong values past the buffer's end (wrong frames, NaNs or an illegal
+    memory access). On torch 2.12.1 the decoder graph-breaks before that
+    graph forms, and the option costs nothing measurable.
+
+    ``deterministic`` turns on Inductor's deterministic mode where this
+    torch has it (2.9.1 does not); see ``DecoderStep``.
+    """
+    import torch._inductor.config as inductor_config
+
+    options = {}
+    if hasattr(inductor_config, "comprehensive_padding"):
+        options["comprehensive_padding"] = False
+    if deterministic and _has_deterministic_mode():
+        options["deterministic"] = True
+    return torch.compile(fn, fullgraph=False, dynamic=False, options=options or None)
+
+
 def _cache_signature(feat_cache: list) -> tuple:
     return tuple(t if t is None or isinstance(t, str) else tuple(t.shape) for t in feat_cache)
 
@@ -210,11 +235,7 @@ class DecoderStep:
     def __init__(self, vae: nn.Module, compile: bool, deterministic: bool = False):
         self.compiled = compile
         self._decoder = vae.decoder
-        options = {"deterministic": True} if deterministic and _has_deterministic_mode() else None
-        self._fn = (
-            torch.compile(self._decoder.forward, fullgraph=False, dynamic=False, options=options)
-            if compile else None
-        )
+        self._fn = compile_decode(self._decoder.forward, deterministic=deterministic) if compile else None
         self._warmed: set[tuple] = set()
 
     def __call__(self, x: torch.Tensor, feat_cache: list, first_chunk: bool = False) -> torch.Tensor:

@@ -34,7 +34,7 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -438,6 +438,120 @@ def test_conductor_driven_walk_of_a_consumer_partition_is_accepted(tmp_path, mon
         c.node_walk_to_wg[("mix", "finish")].worker_graph_id,
         c.node_walk_to_wg[("post", "finish")].worker_graph_id,
     }
+
+
+# -- loops feeding a successor ------------------------------------------------
+
+ITERS = 3
+
+
+def _loop_feeding_post(accumulate):
+    """``step`` runs ITERS times on the conductor input ``x`` and sends ``y`` to
+    ``post``: from inside the Loop on every iteration, or once, through
+    ``Loop.accumulated_outputs``, when the Loop finishes."""
+    if accumulate:
+        loop = Loop(name="loop", max_iters=ITERS, outputs=[], section=GraphNode(
+            name="step", input_names={"x"}, outputs=[GraphEdge(next_node="step", name="y")]),
+            accumulated_outputs=[GraphEdge(next_node="post", name="y")])
+    else:
+        loop = Loop(name="loop", max_iters=ITERS, outputs=[], section=GraphNode(
+            name="step", input_names={"x"}, outputs=[GraphEdge(next_node="post", name="y")]))
+    return Sequential([loop, GraphNode(name="post", input_names={"y"}, outputs=[
+        GraphEdge(next_node=EMIT_TO_CLIENT, name="out", output_modality="text")])])
+
+
+def test_loop_member_feeding_a_successor_in_its_worker_graph_is_rejected(tmp_path):
+    """``post`` completes once per iteration, so the worker graph's count of
+    top-level completions reaches 2 while the Loop is still running, and the
+    pass-end reset drops the Loop's state and post's later inputs (#567)."""
+    model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=False)})
+    cfg = _config(tmp_path, [{"node_names": ["step", "post"], "ranks": [0]}])
+    with pytest.raises(ValueError, match=(
+        r"graph walk 'w': node 'step' of Loop 'loop' sends 'y' to 'post', outside the Loop "
+        r"in the same worker graph.*Loop.accumulated_outputs"
+    )):
+        model.get_worker_graphs(cfg)
+
+
+class _LoopWorker:
+    """worker_0 hosting walk 'w' as one worker graph, driven as the worker drives it."""
+
+    def __init__(self, runtime, tmp_path):
+        model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=True)})
+        wg, = model.get_worker_graphs(_config(tmp_path, [{"node_names": ["step", "post"], "ranks": [0]}]))
+        wg.worker_graph_id = 0
+        args = dict(
+            my_worker_id="worker_0", my_worker_graphs=[wg],
+            all_wg_ids_to_graph_walks={0: {"w"}}, all_wg_ids_to_dyn_loops={0: set()},
+            all_wg_ids_to_nodes={0: {"step", "post"}},
+            node_to_partition={"step": "default", "post": "default"}, sharding_config=_sharding_config(),
+        )
+        self.runtime = runtime
+        if runtime == "python":
+            tm = StubTensorManager()
+            # the manager's real signature: the accumulated cache holds its uuids
+            tm.increment_ref = lambda uuid, n=1: tm.tensor_store.increment_ref(uuid, n=n)
+            self.rt = PythonGraphRuntime(tensor_manager=tm, **args)
+            self.rt._communicator = _RecordingCommunicator()
+        else:
+            pytest.importorskip("mstar_rust")
+            from mstar.communication.tensor_store import RustTensorBookkeeping
+            from mstar.graph.runtime.rust import RustGraphRuntime
+            self.book = RustTensorBookkeeping()
+            self.rt = RustGraphRuntime(bookkeeping=self.book, **args)
+        self.rid = self.rt.add_request(
+            request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
+            worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        )
+        self.minter = TensorUuidMinter("worker_0")
+        _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
+
+    def _put(self, sig):
+        if self.runtime == "python":
+            return _store_outputs(self.rt._tensor_store, self.minter, self.rid, {s: [torch.ones(1)] for s in sig})
+        uuids = {}
+        for s in sig:
+            u = self.minter.mint()
+            self.book.put_tensor(u, TensorPointerInfo(
+                dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=(1,), uuid=u,
+                source_session_id="s", source_entity="worker_0"))
+            self.book.increment_ref(u, 1)  # the safety hold
+            uuids[s] = [u]
+        return uuids
+
+    def step_once(self):
+        """Run the first ready node; returns (node, reported_done) or None."""
+        node = next((n for n in ("post", "step") if self.rt.pop_rids(n, "w", [self.rid], check_ready=True)), None)
+        if node is None:
+            return None
+        rt, rid = self.rt, self.rid
+        sig = rt.get_output_signals(node, "w")
+        uuids = self._put(sig)
+        out = rt.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk="w", node_name=node, output_signals=sig,
+            wg_ids=ParallelList([rid], [0]), tensors=[u for s in sig for u in uuids[s]],
+            num_tensors=[1] * len(sig),
+        ))
+        if self.runtime == "rust":
+            plan = rt._rust.take_send_plan(out.completion_id)
+            return node, any(r == rid and wgs for r, wgs, _ in plan.completed)
+        done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
+        rt.send_outputs(SendInput(
+            completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
+            per_request_info=ParallelList([rid], [_fwd_info("w")]),
+        ))
+        return node, done
+
+
+@pytest.mark.parametrize("runtime", ["python", "rust"])
+def test_accumulated_outputs_feed_the_successor_once_after_the_loop(runtime, tmp_path):
+    """The shape the refusal points to passes startup, and in both runtimes
+    runs ``step`` ITERS times, then ``post`` once, reporting done once."""
+    w = _LoopWorker(runtime, tmp_path)
+    trace = []
+    while len(trace) < 4 * ITERS and (r := w.step_once()):
+        trace.append(r)
+    assert trace == [("step", False)] * ITERS + [("post", True)], trace
 
 
 # -- every shipped config -----------------------------------------------------

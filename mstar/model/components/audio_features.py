@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from mstar.api_server.media_io import check_resample_rate
+
 
 def _hertz_to_mel(freq: np.ndarray | float) -> np.ndarray | float:
     """Slaney mel scale (linear below 1 kHz, logarithmic above), as in
@@ -158,6 +160,7 @@ def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
 
         frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
         return frames.data[0].to(torch.float32)
+    check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         import torchaudio
 

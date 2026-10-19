@@ -494,8 +494,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
-        from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1):
+        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
@@ -507,7 +507,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             single = NodeInputs(
                 tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
             )
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=walk,
                 replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
                 single_request_inputs=single,

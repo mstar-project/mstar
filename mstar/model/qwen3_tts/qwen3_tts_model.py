@@ -183,6 +183,11 @@ def _adapt_tokenizer_module(module) -> None:
         setattr(module, name, adapted)
 
 
+#: qwen-tts pins transformers==4.57.3, which most environments with other
+#: extras cannot satisfy; only its source files are used, so its pins are skipped.
+QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+
 @lru_cache(maxsize=1)
 def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
     """Load only qwen-tts' 12 Hz speech-tokenizer modules.
@@ -202,8 +207,9 @@ def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
         distribution = importlib.metadata.distribution("qwen-tts")
     except importlib.metadata.PackageNotFoundError as exc:
         raise ImportError(
-            "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-            "M* with the qwen3_tts optional dependency"
+            "Qwen3-TTS Codec requires the 'qwen-tts' package, installed "
+            f"without its dependencies: {QWEN_TTS_INSTALL} (see "
+            "docs/installation.rst)"
         ) from exc
 
     source_root = Path(distribution.locate_file(
@@ -628,17 +634,23 @@ class Qwen3TTSModel(Model):
     # API tensors the RefEncoder consumes (the reference clip).
     REF_ENCODER_INPUTS = ("audio_inputs",)
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""
         import soundfile
         import torchaudio.functional as audio_functional
 
+        from mstar.api_server.media_io import check_resample_rate
+
         # Bound the clip before decoding it: a small compressed file can hold hours of audio.
         info = soundfile.info(filepath)
-        self._check_reference_duration(info.frames / info.samplerate if info.samplerate else 0.0)
+        target_rate = self.config.codec.input_sample_rate
+        check_resample_rate(info.samplerate, target_rate)
+        self._check_reference_duration(info.frames / info.samplerate)
         waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
         audio = torch.from_numpy(waveform).mean(dim=1)
-        target_rate = self.config.codec.input_sample_rate
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)
         return TensorAndMetadata(
@@ -1185,8 +1197,7 @@ class Qwen3TTSModel(Model):
             decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
         except ImportError as exc:
             raise ImportError(
-                "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-                "M* with the qwen3_tts optional dependency"
+                f"Qwen3-TTS Codec could not load qwen-tts' speech tokenizer: {exc}"
             ) from exc
 
         from mstar.model.loader import load_hf_weights

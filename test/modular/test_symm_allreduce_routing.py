@@ -15,6 +15,7 @@ import torch.distributed as dist
 sys.path.insert(0, ".")
 
 import mstar.distributed.all_reduce as ar
+import mstar.distributed.communication as comm_mod
 from mstar.distributed.all_reduce import (
     AllReduce,
     MultimemAllReduce,
@@ -156,6 +157,7 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
         return pg
 
     monkeypatch.setattr(dist, "init_process_group", lambda **kw: None)
+    monkeypatch.setattr(comm_mod, "rendezvous_store", lambda *args: object())
     monkeypatch.setattr(dist, "new_group", new_group)
     monkeypatch.setattr(dist, "get_default_backend_for_device", lambda _t: "gloo")
 
@@ -204,6 +206,7 @@ def test_an_unknown_config_mode_is_refused(fake_cuda):
 
 def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
     monkeypatch.setattr(dist, "init_process_group", lambda **kw: None)
+    monkeypatch.setattr(comm_mod, "rendezvous_store", lambda *args: object())
     monkeypatch.setattr(dist, "new_group", lambda **kw: object())
     monkeypatch.setattr(dist, "get_default_backend_for_device", lambda _t: "gloo")
     groups = WorkerParallelGroups(

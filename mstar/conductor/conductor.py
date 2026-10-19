@@ -97,6 +97,14 @@ def _request_seed(model_kwargs: dict, request_id: str) -> int:
     return seed
 
 
+def _seed_id(body: NewRequestConductor) -> str:
+    """The id a derived seed comes from: the client's, so a pinned request_id
+    reproduces the same noise whatever key the API server ran it under."""
+    if body.client_request_id is None:
+        return body.request_id
+    return body.client_request_id
+
+
 def _pick_free_tcp_port() -> int:
     """Ask the OS for an unused ephemeral TCP port.
 
@@ -109,6 +117,22 @@ def _pick_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def keep_bootstrap_sockets_on_loopback() -> None:
+    """Have NCCL and Gloo open their sockets on loopback, unless the user
+    picked an interface (or, for NCCL, an address family).
+
+    Unset, NCCL listens on a routable interface and Gloo on whatever address
+    the hostname resolves to (a pod or container IP), for as long as the
+    deployment runs. Every rank is spawned by this conductor on this host, so
+    loopback reaches all of them; a launcher that places ranks on other hosts
+    must not call this. Data between GPUs on one host goes over NVLink, PCIe
+    P2P or SHM either way.
+    """
+    if "NCCL_SOCKET_IFNAME" not in os.environ and "NCCL_SOCKET_FAMILY" not in os.environ:
+        os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
 
 def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
@@ -556,6 +580,7 @@ class Conductor:
         # kernel libraries) while unpickling its arguments, before the worker
         # target runs, and it inherits os.environ.
         apply_process_env_defaults()
+        keep_bootstrap_sockets_on_loopback()
         # JIT-build the fused-MoE CUDA op once here, for a model that asks: its
         # workers then find it cached instead of racing on the same build lock
         if getattr(self.model, "prebuild_fused_moe", False):
@@ -897,7 +922,7 @@ class Conductor:
             )
             return
         try:
-            _request_seed(body.model_kwargs or {}, body.request_id)
+            _request_seed(body.model_kwargs or {}, _seed_id(body))
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
@@ -975,7 +1000,7 @@ class Conductor:
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
-        seed = _request_seed(model_kwargs, body.request_id)
+        seed = _request_seed(model_kwargs, _seed_id(body))
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()

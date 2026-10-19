@@ -77,7 +77,13 @@ class _Engine:
     def get_max_batch_size(self, node_name, graph_walk):
         return self.max_bs.get(graph_walk) if isinstance(self.max_bs, dict) else self.max_bs
 
-    def capture_group(self, node_name, graph_walk, rid, fwd_info):
+    def get_max_rows_in_combined(self, node_name, graph_walk):
+        return None
+
+    def splits_by_capture_key(self, node_name, graph_walk):
+        return False
+
+    def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
         return None
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):

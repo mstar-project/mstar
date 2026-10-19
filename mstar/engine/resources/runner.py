@@ -8,7 +8,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from time import perf_counter
 from typing import Any
 
@@ -170,21 +170,29 @@ class StepRunner:
             )
 
     def extend_prefix_chains_batch(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows, outputs, keys: list[str],
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str] | str, host_rows, outputs, keys: list[str],
     ) -> None:
         """``extend_prefix_chains`` for a step: a resource with a batch form
-        takes the host rows; the others are offered each request's host copy."""
+        takes the host rows; the others are offered each request's host copy.
+
+        ``walk_of`` rather than one walk for the step, so a combined walk comes
+        through here too instead of falling back to a call per row; a step of
+        one walk passes that walk itself.
+        """
         for key in keys:
             resource = self._resources[key]
             batched = getattr(resource, "extend_prefix_chains_batch", None)
             if batched is not None:
-                batched(request_ids, node_name, graph_walk, host_rows)
+                batched(request_ids, node_name, walk_of, host_rows)
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
                 if isinstance(per_rid, dict):
-                    resource.extend_prefix_chain(rid, node_name, graph_walk, per_rid)
+                    resource.extend_prefix_chain(
+                        rid, node_name,
+                        walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
+                    )
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""
@@ -529,6 +537,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -545,7 +554,8 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_for_step(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info
@@ -557,31 +567,41 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """``publish``, deferred: per rid the snapshot each publisher took.
 
         Finished by ``publish_from_snapshots`` for the rids that need it. A rid
-        with nothing to publish has no entry."""
+        with nothing to publish has no entry. Under a combined walk each rid
+        is snapshotted under its own walk (``request_walks``), as ``publish``
+        does: a publisher may key what it publishes on the walk."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
         if not order:
             return {}
-        # one call per publisher for the whole batch, then one dict per
-        # request that has anything to publish
-        columns = [
-            (key, self._resources[key].publish_snapshot_batch(
-                request_ids, node_name=node_name, graph_walk=graph_walk,
-            ))
-            for key in order
-        ]
+        if request_walks:
+            groups: dict[str, list[str]] = {}
+            for rid in request_ids:
+                groups.setdefault(request_walks.get(rid, graph_walk), []).append(rid)
+        else:
+            groups = {graph_walk: request_ids}
         out: dict[str, dict[str, Any]] = {}
-        for i, rid in enumerate(request_ids):
-            per_key: dict[str, Any] = {}
-            for key, snaps in columns:
-                snap = snaps[i]
-                if snap is not None:
-                    per_key[key] = snap
-            if per_key:
-                out[rid] = per_key
+        for walk, rids in groups.items():
+            # one call per publisher for the walk's rows, then one dict per
+            # request that has anything to publish
+            columns = [
+                (key, self._resources[key].publish_snapshot_batch(
+                    rids, node_name=node_name, graph_walk=walk,
+                ))
+                for key in order
+            ]
+            for i, rid in enumerate(rids):
+                per_key: dict[str, Any] = {}
+                for key, snaps in columns:
+                    snap = snaps[i]
+                    if snap is not None:
+                        per_key[key] = snap
+                if per_key:
+                    out[rid] = per_key
         return out
 
     def publish_from_snapshots(
@@ -590,17 +610,20 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
-        """The published info of ``request_ids`` from their snapshots."""
+        """The published info of ``request_ids`` from their snapshots, each
+        under its own walk (see ``publish_snapshot``)."""
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             snaps = snapshots.get(rid)
             if not snaps:
                 continue
+            walk = request_walks.get(rid, graph_walk) if request_walks else graph_walk
             per_key: dict[str, PublishedInfo] = {}
             for key, snap in snaps.items():
                 info = self._resources[key].publish_from_snapshot(
-                    rid, snap, node_name=node_name, graph_walk=graph_walk,
+                    rid, snap, node_name=node_name, graph_walk=walk,
                 )
                 if info is not None:
                     per_key[key] = info
@@ -612,6 +635,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """Publish resources configured for the end of a dynamic loop."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
@@ -623,14 +647,15 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_after_stop(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
         return out
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
         node_name: str | None = None,
     ) -> None:
@@ -640,6 +665,6 @@ class StepRunner:
         batch size say nothing about a resource this node's graphs never touch.
         """
         for key in self._sweep(self._node_order, self._order, node_name):
-            self._resources[key].build_cuda_graph_buffers(
+            self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )

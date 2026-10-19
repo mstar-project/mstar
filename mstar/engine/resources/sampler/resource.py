@@ -12,14 +12,18 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.device import DeviceCapability
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+
+    def can_capture(self) -> bool:
+        return DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
@@ -68,9 +72,9 @@ class SamplerResource(Resource):
         self._cg_slots = 1
 
         # This is set during plan in the cuda graph case
-        self._cg_sampler: CudaGraphableSampler | None = None
+        self._cg_sampler: AcceleratorGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
-        self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplan_cg_sampler: AcceleratorGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
         # (cg slot, padded bs) of the step planned last, for the last-token
@@ -109,7 +113,7 @@ class SamplerResource(Resource):
             enable_min_p=spec.enable_min_p,
         )
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
     ):
         del max_seq_len
@@ -373,6 +377,8 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
+    # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
+    @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):

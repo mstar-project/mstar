@@ -142,13 +142,7 @@ impl ShmArena {
             path: path.clone(),
             source,
         };
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(io)?;
+        let file = create_exclusive(&path, our_uid()).map_err(io)?;
         file.set_len(size as u64).map_err(io)?;
         let mmap = unsafe { MmapOptions::new().len(size).map_mut(&file) }.map_err(io)?;
         Ok(Self {
@@ -167,11 +161,7 @@ impl ShmArena {
             path: path.clone(),
             source,
         };
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io)?;
+        let file = open_ours(&path, our_uid()).map_err(io)?;
         let size = file.metadata().map_err(io)?.len() as usize;
         let mmap = unsafe { MmapOptions::new().len(size).map_mut(&file) }.map_err(io)?;
         Ok(Self {
@@ -239,6 +229,74 @@ impl Drop for ShmArena {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+fn our_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// Segment names are predictable and live in a world-writable directory, so
+/// only a regular file we own is ever reused or mapped, the rule
+/// `_create_shm_file` in `mstar/communication/tensors.py` applies to tensor
+/// files. `meta` must come from `lstat` or from the opened fd.
+fn check_ours(meta: &std::fs::Metadata, our_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.is_file() && meta.uid() == our_uid {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "not a regular file we own (owner uid {}, ours {our_uid}, symlink {})",
+            meta.uid(),
+            meta.file_type().is_symlink()
+        ),
+    ))
+}
+
+/// Create `path` 0600, never through a symlink. A file already there is
+/// replaced only if [`check_ours`] passes (a dead run's residue): unlinked,
+/// then created exclusively again, as `_create_shm_file` does.
+fn create_exclusive(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let create = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        created => return created,
+    }
+    check_ours(&std::fs::symlink_metadata(path)?, our_uid)?;
+    std::fs::remove_file(path)?;
+    create().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(
+                e.kind(),
+                "recreated while reclaiming our own stale copy; another process is creating this segment",
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Open an existing segment read/write. The checks run on the opened fd, so
+/// nothing can be swapped in between them and the mapping.
+fn open_ours(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    check_ours(&file.metadata()?, our_uid)?;
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +484,95 @@ mod tests {
             ShmArena::create(&name("z"), 0),
             Err(ShmError::ZeroSize)
         ));
+    }
+
+    // ---- segment file creation and ownership --------------------------------
+
+    fn mode_of(path: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn new_segments_are_0600_whatever_the_umask() {
+        for mask in [0o022, 0o002] {
+            let old = unsafe { libc::umask(mask) };
+            let n = name(&format!("mode{mask:o}"));
+            let arena = ShmArena::create(&n, 4096);
+            let grown = SegmentedShmArena::create(&n, 512, 2).and_then(|a| {
+                a.reserve(500)?;
+                a.reserve(500)?;
+                Ok(a)
+            });
+            unsafe { libc::umask(old) };
+            assert_eq!(mode_of(&shm_path(&n)), 0o600, "umask {mask:o}");
+            let grown = grown.unwrap();
+            assert_eq!(grown.num_segments(), 2);
+            assert_eq!(mode_of(&shm_path(&grown.segment_name(1))), 0o600, "umask {mask:o}");
+            drop(arena);
+        }
+    }
+
+    #[test]
+    fn create_refuses_a_symlink_at_the_name() {
+        let n = name("symlink");
+        let path = shm_path(&n);
+        let target = format!("{path}.target");
+        std::fs::write(&target, b"not a segment").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = ShmArena::create(&n, 4096).err().expect("followed a symlink");
+        assert!(err.to_string().contains("symlink true"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a segment");
+        std::fs::remove_file(&path).unwrap();
+
+        let dangling = format!("{target}.missing");
+        std::os::unix::fs::symlink(&dangling, &path).unwrap();
+        assert!(ShmArena::create(&n, 4096).is_err());
+        assert!(!Path::new(&dangling).exists(), "created through a symlink");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn create_refuses_a_file_another_uid_owns() {
+        let path = shm_path(&name("foreign"));
+        std::fs::write(&path, b"someone else's").unwrap();
+        let other = our_uid() + 1;
+        let err = create_exclusive(&path, other).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("owner uid {}, ours {other}", our_uid())), "{msg}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+        assert!(open_ours(&path, other).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn create_replaces_our_own_stale_file_with_a_fresh_one() {
+        use std::os::unix::fs::MetadataExt;
+        let n = name("stale");
+        let path = shm_path(&n);
+        std::fs::write(&path, b"stale bytes").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        let stale_ino = std::fs::metadata(&path).unwrap().ino();
+        let arena = ShmArena::create(&n, 1024).unwrap();
+        assert_eq!(arena.size(), 1024);
+        assert_eq!(arena.bytes(0, 5), &[0u8; 5]);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), stale_ino);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn open_refuses_a_symlink() {
+        let n = name("opensym");
+        let prod = ShmArena::create(&n, 4096).unwrap();
+        let link = name("opensym_link");
+        std::os::unix::fs::symlink(shm_path(&n), shm_path(&link)).unwrap();
+        assert!(ShmArena::open(&link).is_err());
+        assert!(ShmArena::open(&n).is_ok());
+        std::fs::remove_file(shm_path(&link)).unwrap();
+        drop(prod);
     }
 
     // ---- segmented arena (grow-by-segments + uuid reclaim) ----------------

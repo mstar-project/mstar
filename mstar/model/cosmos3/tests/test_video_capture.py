@@ -30,12 +30,12 @@ def _fake_transformer():
 def _dit_with_buckets(monkeypatch):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
-    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH", "1")
-    monkeypatch.delenv("COSMOS3_DISABLE_CUDA_GRAPH", raising=False)
+    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
     sub = Cosmos3DiTSubmodule(
         transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
     )
-    configs = sub.get_cuda_graph_configs("cpu")
+    configs = sub.get_accelerator_graph_configs("cpu")
     return sub, configs
 
 
@@ -86,7 +86,7 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
         list(range(7)), list(range(9)), 64, 64, 3, 24.0,
         has_image_condition=False, cond_units=1, device="cpu", first_window=False,
     )
-    sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0, 100.0]))
+    sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0, 100.0]), step_index=None)
     st = sub.request_state("r")
     st.add_all(
         cond=cond, uncond=uncond, gs=6.0, guidance_interval=None, scheduler=sched,

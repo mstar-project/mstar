@@ -72,7 +72,7 @@ from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
-from mstar.model.bagel.config import load_bagel_config
+from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
     IMAGE_ADVANCE,
     IMAGE_SENTINELS,
@@ -266,8 +266,11 @@ class BagelModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        accelerator_graph: bool | None = None,
         **kwargs
     ):
+        if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
+            raise ValueError("accelerator_graph must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -276,6 +279,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        if accelerator_graph is not None:
+            self.config.accelerator_graph = accelerator_graph
 
         self.model_path_hf = model_path_hf
 
@@ -460,7 +465,8 @@ class BagelModel(Model):
                 connector=self.connector,
                 vit_pos_embed=self.vit_pos_embed,
                 vit_patch_size=self.config.vit_config.patch_size,
-                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
+                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side,
+                accelerator_graph=self.config.accelerator_graph,
             )
         elif node_name == "vae_encoder":
             self._init_vae_components(device, autocast_dtype=autocast_dtype)
@@ -969,6 +975,9 @@ class BagelModel(Model):
             and image_ranks.isdisjoint(llm_ranks("decode"))
         )
         return super().get_worker_graphs(config_path)
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

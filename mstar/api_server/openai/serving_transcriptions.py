@@ -169,6 +169,12 @@ class WindowPlanner:
     def whole(self) -> Window:
         return Window(path=self.audio_path, offset=0.0, duration=self.duration or 0.0)
 
+    def prepare(self) -> None:
+        """Decode an upload that will be windowed, so a file the decoder
+        refuses (e.g. an unsupported sample rate) fails before any window runs."""
+        if not self.single:
+            self._decoded()
+
     def done(self, offset: float) -> bool:
         return self.single or offset >= (self.duration or 0.0) - 1e-3
 
@@ -416,6 +422,14 @@ async def create_transcription(
             status_code=413,
             detail=f"audio is {planner.duration:.0f} s; the limit is {MAX_DURATION_SECONDS} s",
         )
+    try:
+        planner.prepare()
+    except ValueError as exc:
+        planner.cleanup()
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except BaseException:
+        planner.cleanup()
+        raise
 
     if req.stream:
         # the stream owns the files and windows from here

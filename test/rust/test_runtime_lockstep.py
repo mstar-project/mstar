@@ -492,7 +492,7 @@ def _spec(rt, node, rid):
     return sorted(
         (s.node_name, s.graph_walk, s.is_new_loop_iter, s.loop_name,
          tuple(s.output_signals))
-        for s in rt.speculate_node(node, WALK, rid)
+        for s in rt.speculate_node(node, [WALK], [rid])
     )
 
 
@@ -632,8 +632,7 @@ def test_speculative_flag_survives_completion(lock):
     assert lock._both("is_in_flight before", flag) is False
 
     lock._both("set_in_flight(ar_decode, True)",
-               lambda rt, b, s: rt.set_in_flight(
-                   "ar_decode", WG_ID, [rid], True))
+               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], True))
     assert lock._both("is_in_flight after set", flag) is True
 
     # Step N completes. The flag must not be cleared by it.
@@ -646,8 +645,7 @@ def test_speculative_flag_survives_completion(lock):
 
     # Only the worker clearing it explicitly ends the speculation.
     lock._both("set_in_flight(ar_decode, False)",
-               lambda rt, b, s: rt.set_in_flight(
-                   "ar_decode", WG_ID, [rid], False))
+               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], False))
     assert lock._both("is_in_flight after clear", flag) is False
 
 

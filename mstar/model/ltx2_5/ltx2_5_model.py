@@ -99,7 +99,7 @@ class LTX25Model(Model):
         attention_backend: str = "flashinfer",
         compile: bool = True,
         compile_eager_rounding: bool = True,
-        cuda_graph: bool = True,
+        accelerator_graph: bool = True,
         capture_shapes: list[list[float]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 4,
@@ -117,7 +117,7 @@ class LTX25Model(Model):
         self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
-        self.cuda_graph = bool(cuda_graph)
+        self.accelerator_graph = bool(accelerator_graph)
         # (height, width, num_frames, fps) request shapes the denoise step is captured for;
         # other shapes run the compiled eager path.
         self.capture_shapes = [
@@ -436,7 +436,7 @@ class LTX25Model(Model):
         return None
 
     def capture_buckets(self) -> list[tuple[str, LTXShape]]:
-        if not self.cuda_graph:
+        if not self.accelerator_graph:
             return []
         return [
             (GENERATE_AV_WALK, shape_from_metadata(

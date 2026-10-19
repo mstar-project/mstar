@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import mstar
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
@@ -114,15 +115,18 @@ def _client_host(host: str) -> str:
     return "localhost" if host in ("0.0.0.0", "") else host
 
 
-def _next_steps(model: str, host: str, port: int) -> str:
+def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> str:
     base = f"http://{_client_host(host)}:{port}"
+    # Never echo the key itself; the SDK reads MSTAR_API_KEY when not passed one.
+    sdk_key = ", api_key=\"<your key>\"" if api_key_set else ""
+    oai_key = "<your key>" if api_key_set else "none"
     lines = [
         "",
         f"  ✓ mstar serving '{model}' on {base}",
         "",
         "  Python SDK:",
         "    from mstar import MStarClient",
-        f"    client = MStarClient(\"{base}\")",
+        f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
     if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni"):
         lines.append("    print(client.chat(\"Hello!\").text)")
@@ -181,7 +185,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
-                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
+                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
         if model in ("bagel", "qwen3_omni"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
@@ -207,7 +211,7 @@ def _serve(args: argparse.Namespace) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
-    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}/"
+    socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
     upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
 
     argv = [
@@ -221,6 +225,8 @@ def _serve(args: argparse.Namespace) -> None:
     ]
     if args.cache_dir:
         argv += ["--cache-dir", args.cache_dir]
+    if args.api_key is not None:
+        argv += ["--api-key", args.api_key]
     if args.log_stats:
         argv += ["--log-stats"]
     if args.log_stats_file:
@@ -232,7 +238,10 @@ def _serve(args: argparse.Namespace) -> None:
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
-    print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
+    from mstar.api_server.auth import resolve_api_key
+
+    print(_next_steps(args.model, args.host, args.port,
+                      api_key_set=resolve_api_key(args.api_key) is not None), file=sys.stderr)
 
     from mstar.api_server.entrypoint import main as serve_main
 
@@ -247,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("model", help=f"model name ({', '.join(sorted(DEFAULT_CONFIGS))}) or use --config")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--api-key", default=None,
+        help="require 'Authorization: Bearer <key>' on every route except /health "
+             "(default: MSTAR_API_KEY; unset means no check)",
+    )
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")

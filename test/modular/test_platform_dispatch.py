@@ -13,7 +13,7 @@ import torch
 import torch._inductor.config as inductor_config
 
 from mstar import platforms
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
 from mstar.platforms.compile import with_inductor_overrides
@@ -223,7 +223,7 @@ def fake_compile(monkeypatch):
 
 
 class _GraphRunner:
-    _forward_for = CudaGraphRunner._forward_for
+    _forward_for = AcceleratorGraphRunner._forward_for
 
     def __init__(self):
         self._submodule = _Submodule()
@@ -260,23 +260,16 @@ def test_each_capture_runs_under_its_buckets_overrides(on_platform, fake_compile
     assert len(fake_compile) == 1, "buckets share one compiled forward"
 
 
-class _Engine:
-    _compile_submodules = Engine._compile_submodules
-
-    def __init__(self):
-        self._submodules = {
-            "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
-        }
-        self._item_encoders = set()
-
-
 @pytest.mark.parametrize("overrides", [False, True])
 def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
     monkeypatch, on_platform, fake_compile, overrides,
 ):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
-    engine = _Engine()
+    engine = Engine(graph_runtime=None, device_capability=SimpleNamespace(is_available=True))
+    engine._submodules = {
+        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+    }
+    engine._item_encoders = set()
     engine._compile_submodules()
     mgmt = engine._submodules["node"]
     expected = "ATEN" if overrides else inductor_config.max_autotune_gemm_backends

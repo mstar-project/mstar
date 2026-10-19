@@ -22,6 +22,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
@@ -98,13 +99,21 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     """A speculative step may finish after its request's decode loop stopped."""
     w = _worker()
     w.enable_nvtx = enable_nvtx
+    w.device = torch.device("cpu")
     collected = []
     w.tensor_manager.cleanup_collectable = lambda *args: collected.append(args)
     w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     pending = SimpleNamespace(
-        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
-        node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}, cached_rids=set()),
+        # the real batch: postprocess groups its rids by walk and discards
+        # through it, which a namespace cannot answer for
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
+        ),
+        node_batch=SimpleNamespace(
+            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            final_stream_rids={7}, stream_partition_done_rids={7},
+        ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
     outputs = BatchedModelOutput(per_rid_outputs={7: {}})
@@ -129,9 +138,42 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert outputs.per_rid_outputs == {}
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
+    assert pending.node_batch.final_stream_rids == set()
+    assert pending.node_batch.stream_partition_done_rids == set()
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
+
+
+@pytest.mark.parametrize("has_event", [True, False])
+def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has_event):
+    """No output of the step leaves, but a later step reuses its slot while
+    its kernels may still run, so postprocess waits for them anyway."""
+    w = _worker()
+    w.enable_nvtx = False
+    w.device = SimpleNamespace(type="cuda")
+    w._graph_runtime.cleanup_consumed_inputs = lambda *args: FreedTensors.none()
+    w.tensor_manager.cleanup_collectable = lambda *args: None
+    w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
+    waits = []
+    event = SimpleNamespace(synchronize=lambda: waits.append("event")) if has_event else None
+    pending = SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
+        ),
+        node_batch=SimpleNamespace(
+            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            final_stream_rids=set(), stream_partition_done_rids=set(),
+            completion_event=event,
+        ),
+        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
+
+    Worker._postprocess_batch(w, pending, BatchedModelOutput(per_rid_outputs={7: {}}))
+
+    assert waits == ["event" if has_event else "device"]
+    assert pending.batch.request_to_worker_graph == {}
 
 
 def test_a_walk_the_cache_served_whole_is_still_routed():
@@ -166,7 +208,10 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     w.enable_nvtx = w.enable_prof = False
     w._innermost_loop_by_node = {}
     pending = SimpleNamespace(
-        batch=SimpleNamespace(request_to_worker_graph={7: 0}, node_name="LLM", output_signals=["new_token"]),
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="prefill", request_to_worker_graph={7: 0},
+            output_signals=["new_token"],
+        ),
         node_batch=ExecutingBatch(
             node_name="LLM", per_request_info={}, cached_rids={7},
             step_context=StepContext(request_ids=(), graph_walk="prefill", slot=0, capture=False),
@@ -399,6 +444,7 @@ def _preprocess(inflight_reads=False):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt._draining_rids = set()
     wt._reads_done_sent = set()
+    wt._live_requests = {"X": 1}
     wt.sent = []
     wt.forced = []
     wt.communicator = SimpleNamespace(send=lambda e, m: wt.sent.append((e, m)))

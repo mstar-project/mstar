@@ -40,8 +40,13 @@ def test_non_positive_config_raises(bad):
 
 
 def _capture_process_group_calls(monkeypatch):
-    """Stub the two collectives ``init_dist`` issues and record their kwargs."""
-    calls: dict[str, list[dict]] = {"init": [], "new_group": []}
+    """Stub the two collectives ``init_dist`` issues and record their kwargs,
+    and the rendezvous store's timeout."""
+    calls: dict[str, list] = {"init": [], "new_group": [], "store": []}
+    monkeypatch.setattr(
+        comm_mod, "rendezvous_store",
+        lambda init_method, rank, world_size, timeout: calls["store"].append(timeout),
+    )
     monkeypatch.setattr(dist, "init_process_group", lambda **kw: calls["init"].append(kw))
     monkeypatch.setattr(
         dist, "new_group", lambda **kw: calls["new_group"].append(kw) or object()
@@ -66,6 +71,7 @@ def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     groups.init_dist(device=torch.device("cpu"))
 
     expected = timedelta(seconds=3600)
+    assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
     # ``new_group`` runs once per rank tuple on every rank, members or not,
     # for the device group and its gloo twin.
@@ -76,7 +82,10 @@ def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):
     calls = _capture_process_group_calls(monkeypatch)
     _two_tp_groups().init_dist(device=torch.device("cpu"))
 
-    assert all("timeout" not in c for c in calls["init"] + calls["new_group"])
+    # the world group and its store get torch's default, which init_dist now names
+    assert calls["store"] == [default_pg_timeout]
+    assert [c["timeout"] for c in calls["init"]] == [default_pg_timeout]
+    assert all("timeout" not in c for c in calls["new_group"])
 
 
 @pytest.fixture

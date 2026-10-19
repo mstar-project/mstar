@@ -82,6 +82,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
     # every node keys WALK, as a declaration would name it
     engine._keyed_walks = {node: {WALK} for node in node_resources}
     engine._prefix_model = "_Model"
+    engine._loopback_steps = {}
     return engine
 
 
@@ -93,6 +94,7 @@ def _batch(node_name: str = NODE):
             request_ids=(RID,), graph_walk=WALK, slot=0, capture=False,
         ),
         per_request_info={RID: None},
+        per_request_info_wrapped={RID: None},
     )
 
 

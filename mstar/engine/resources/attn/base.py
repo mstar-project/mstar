@@ -124,6 +124,8 @@ class AttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                splits=spec.config.splits,
+                max_rows_in_combined=info.max_rows_in_combined,
             )
 
         if backend == AttnBackend.FLEX:
@@ -156,6 +158,7 @@ class AttentionManager(AttentionResource):
             return XPUPagedAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown attention backend {backend!r}")
 

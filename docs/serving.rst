@@ -35,6 +35,10 @@ mstar serve
    * - ``--port``
      - ``8000``
      - HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -48,8 +52,9 @@ mstar serve
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar_<user>/``
-     - ZMQ IPC socket prefix.
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix; one per server, so servers on other ports do
+       not share sockets.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads_<user>/``
      - Temp directory for uploaded media.
@@ -116,6 +121,10 @@ mstar-serve
    * - ``--host`` / ``--port``
      - ``0.0.0.0`` / ``8000``
      - Bind address / HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       (see :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -123,8 +132,10 @@ mstar-serve
      - HF default
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar``
-     - ZMQ IPC socket prefix (shared with conductor/workers).
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
+       worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
+       it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.
@@ -158,6 +169,41 @@ mstar-serve
    whereas ``mstar-serve`` defaults to ``RDMA``. On a single node without RDMA, pass
    ``--tensor-comm-protocol SHM`` to ``mstar-serve``.
 
+.. _api-key:
+
+API key
+-------
+
+Both commands listen on all interfaces by default and accept requests from anyone who
+can reach the port. If no gateway in front of the server authenticates clients, set a
+key or bind ``--host 127.0.0.1``; the server logs a warning at startup while no key is
+set.
+
+.. code-block:: bash
+
+   export MSTAR_API_KEY="$(openssl rand -hex 32)"
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+
+With a key set, every HTTP route except ``/health`` answers ``401`` unless the request
+carries ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
+``/generate/ws``) refuse the handshake without it. The check is one middleware over the
+whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+however much of the key matches. CORS preflights still get their answer, since browsers
+send them without credentials. ``--api-key`` overrides the environment variable, but
+prefer the variable: a command-line flag is visible to every local user in the process
+list. An empty value turns the check off, so ``--api-key ""`` disables a key set in the
+environment, and so does a variable that expands to nothing (``--api-key "$UNSET_VAR"``).
+
+Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
+``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
+:doc:`clients`. The standalone Nemotron realtime server
+(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
+variable.
+
+Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
+``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
+Dynamo's frontend or a gateway in front of it.
+
 Config files
 ------------
 
@@ -185,6 +231,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``speculation_mixes_walks``
+     - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
+       walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
+       chain on it merges ready rows of the other walks of its combined walk, so
+       decode steps take in new prompts as they arrive. Off (the default), a chain
+       keeps to its own walk and yields to the others, and a step mixes walks only
+       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       walk outside its combined walks, fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -345,6 +399,15 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``TCP`` — works anywhere; used for some multi-node setups.
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
+
+``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers.
+Each worker's engine picks its handshake and data ports at startup, so restrict by host: only
+the deployment's own hosts should reach the workers. The model extras require
+``mooncake-transfer-engine`` 0.3.13.post1
+or newer: earlier than 0.3.12.post1, any host that reaches the TCP data port can read or
+write the worker's memory (CVE-2026-103764), and a worker warns at startup if it finds such a
+version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
+CVE-2026-103761) are still open in 0.3.13.post1.
 
 .. _request-profiling:
 

@@ -1,5 +1,8 @@
+import socket
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
@@ -8,6 +11,37 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from mstar.distributed.all_reduce import AllReduce
 from mstar.distributed.utils import resolve_dist_timeout
+
+
+def default_group_timeout(backend: str) -> timedelta:
+    """The timeout ``init_process_group`` gives ``backend``'s group when none is passed.
+
+    With ``init_method`` it also sets the store to it; with ``store=`` it
+    leaves the store alone, so the caller passes this to both.
+    """
+    if dist.Backend(backend) == dist.Backend.NCCL and default_pg_nccl_timeout is not None:
+        return default_pg_nccl_timeout
+    return default_pg_timeout
+
+
+def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: timedelta) -> dist.TCPStore:
+    """The ``tcp://host:port`` store every rank meets at, listening on ``host`` only.
+
+    ``init_process_group(init_method="tcp://...")`` has rank 0 serve its
+    TCPStore on every interface whatever the host, so rank 0 binds the
+    listener itself and hands it over.
+    """
+    url = urlparse(init_method)
+    if url.scheme != "tcp" or not url.hostname or not url.port:
+        raise ValueError(f"init_method must be tcp://host:port; got {init_method!r}")
+    if rank != 0:
+        return dist.TCPStore(url.hostname, url.port, world_size, is_master=False, timeout=timeout)
+    listener = socket.create_server((url.hostname, url.port), backlog=max(world_size, 128))
+    # the store owns the descriptor from here
+    return dist.TCPStore(
+        url.hostname, url.port, world_size, is_master=True, timeout=timeout,
+        wait_for_workers=False, master_listen_fd=listener.detach(),
+    )
 
 
 class CommGroup:
@@ -357,15 +391,19 @@ class WorkerParallelGroups:
         backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        if device.type == "xpu":
+            backend = f"cpu:gloo,xpu:{backend}"
 
         timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
+        # a configured dist_timeout_s covers the rendezvous store too
+        timeout = timeout_kwargs.get("timeout", default_group_timeout(backend))
         dist.init_process_group(
             backend=backend,
-            init_method=init_method,
+            store=rendezvous_store(init_method, self.global_rank, self.num_workers, timeout),
             world_size=self.num_workers,
             rank=self.global_rank,
             device_id=device,
-            **timeout_kwargs,
+            timeout=timeout,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -379,13 +417,16 @@ class WorkerParallelGroups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), **timeout_kwargs
             )
-            # Members only: with the default group bound to a device, a
-            # non-member's subgroup creation joins an ncclCommSplit that
-            # members never call for a gloo group, and blocks forever.
-            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                ranks=list(rank_tuple), backend="gloo",
-                use_local_synchronization=True, **timeout_kwargs,
-            )
+            if device.type == "xpu":
+                rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
+            else:
+                # Members only: with the default group bound to a device, a
+                # non-member's subgroup creation joins an ncclCommSplit that
+                # members never call for a gloo group, and blocks forever.
+                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                    ranks=list(rank_tuple), backend="gloo",
+                    use_local_synchronization=True, **timeout_kwargs,
+                )
 
         seen: set[int] = set()
         for comm_group in (

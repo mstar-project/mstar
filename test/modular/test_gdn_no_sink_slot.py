@@ -115,14 +115,14 @@ def make_inputs(total_tokens: int, device) -> dict:
     )
 
 
-def make_wrapper(device, has_sink: bool, cuda_graph: bool = False):
+def make_wrapper(device, has_sink: bool, accelerator_graph: bool = False):
     return GDNPrefillWrapper(
         device=device,
         pad_slot_id=PAD_SLOT_ID,
         has_sink_state=has_sink,
-        num_tokens=BUCKET_TOKENS if cuda_graph else None,
-        bs=4 if cuda_graph else None,
-        cuda_graph=cuda_graph,
+        num_tokens=BUCKET_TOKENS if accelerator_graph else None,
+        bs=4 if accelerator_graph else None,
+        accelerator_graph=accelerator_graph,
     )
 
 
@@ -215,7 +215,7 @@ def test_replay_takes_a_padding_pattern_the_capture_never_saw():
     """The case this is all for: a bucket captured on live rows and replayed
     on a layout whose trailing rows have gone to -1."""
     device = torch.device("cuda")
-    wrapper = make_wrapper(device, has_sink=False, cuda_graph=True)
+    wrapper = make_wrapper(device, has_sink=False, accelerator_graph=True)
     spans = [8, 8, 8, 8]
     inputs = make_inputs(BUCKET_TOKENS, device)
     state = make_state(device)

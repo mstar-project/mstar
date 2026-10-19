@@ -14,9 +14,9 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.cuda_graph_config import (
-        CudaGraphConfig,
-        PiecewiseCudaGraphConfig,
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
@@ -26,7 +26,7 @@ class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
-    config: CudaGraphConfig | PiecewiseCudaGraphConfig
+    config: AcceleratorGraphConfig | PiecewiseAcceleratorGraphConfig
     config_idx: int | None = None
 
     @property
@@ -66,6 +66,11 @@ class EngineResourceInfo:
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
     )
+    # walk -> rows of it a step of its combined walk may hold (None uncapped),
+    # for every walk of this resource's local nodes
+    max_rows_in_combined: "Mapping[str, int | None]" = field(
+        default_factory=dict
+    )
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -98,6 +103,9 @@ class Resource(ABC):
 
     def depends_on(self) -> set[str]:
         return set()
+
+    def can_capture(self) -> bool:
+        return True
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
@@ -365,7 +373,7 @@ class Resource(ABC):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:

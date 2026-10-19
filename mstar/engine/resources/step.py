@@ -75,6 +75,14 @@ class StepContext:
     # set: the per-row tests below run for every row of every resource on two
     # threads, and a list scan made each of them linear in the batch.
     _real_rids: frozenset | None = field(default=None, repr=False)
+    # rid -> real walk under a combined ``graph_walk``; empty otherwise
+    request_walks: Mapping[int, str] = field(default_factory=dict)
+    # plan prefill attention even when every row is one token: a packed
+    # capture's forward reads per-row token offsets
+    force_prefill: bool = False
+
+    def walk_of(self, rid: int) -> str:
+        return self.request_walks.get(rid, self.graph_walk)
 
     @property
     def padded_request_ids(self) -> Sequence[int]:

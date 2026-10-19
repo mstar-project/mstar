@@ -109,7 +109,7 @@ def test_capture_shapes_cover_sizes_times_caption_buckets():
     model = _make_model(capture_sizes=[[1024, 1024]], capture_caption_lengths=[32, 64])
     assert [s.cap_len for _, s in model.capture_buckets()] == [32, 64]
     assert all(s.grid == (64, 64) for _, s in model.capture_buckets())
-    assert _make_model(cuda_graph=False).capture_buckets() == []
+    assert _make_model(accelerator_graph=False).capture_buckets() == []
 
 
 def test_postprocess_png_and_adapter():

@@ -247,10 +247,12 @@ class OmniVoiceModel(Model):
         """Pull the checkpoint's config without loading any weights."""
         from transformers import AutoConfig
 
+        # ``omnivoice`` resolves to the class the installed package registers
+        # with AutoConfig; the checkpoint repo ships no code.
         try:
             config = AutoConfig.from_pretrained(
                 self.model_path_hf, cache_dir=self.cache_dir,
-                trust_remote_code=True,
+                trust_remote_code=False,
             )
         except Exception as exc:  # noqa: BLE001
             # A config this loader cannot parse is not fatal on the data

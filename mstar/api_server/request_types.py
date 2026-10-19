@@ -102,3 +102,6 @@ class PreprocessInput:
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
+    # The id the client knows the request by; ``request_id`` is the API
+    # server's key for this one submission.
+    client_request_id: str | None = None

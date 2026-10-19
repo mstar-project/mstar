@@ -167,6 +167,25 @@ def _unpin(ptr: int) -> bool:
     return rc == 0
 
 
+def _unpin_live(own_pinned: list, peers: dict) -> None:
+    """Unregister every pinned own and peer segment (weakref.finalize
+    target -- must not reference the manager). Runs before the arena
+    objects unmap: a mapping torn down while still registered leaves the
+    registration behind, and a later mapping at the same address then gets
+    ``cudaHostRegister`` rc 712."""
+    for ptr in own_pinned:
+        if not _unpin(ptr):
+            logger.warning("ARENA: cudaHostUnregister failed for own "
+                           "segment %#x", ptr)
+    own_pinned.clear()
+    for name, (arena, view, pinned) in list(peers.items()):
+        if pinned:
+            if not _unpin(arena.ptr_len()[0]):
+                logger.warning("ARENA: cudaHostUnregister failed for peer "
+                               "%s", name)
+            peers[name] = (arena, view, 0)
+
+
 def _pin(ptr: int, nbytes: int) -> bool:
     """cudaHostRegister a mapped segment (idempotent). Returns success.
     GIL released for the duration (see ``_cudart``)."""
@@ -336,6 +355,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # cannot resolve.
         self._segments_named_to = None
         self._pinned_segments = 0
+        # Base pointers of own segments that are registered, for the
+        # unregister finalizer below.
+        self._own_pinned: list[int] = []
         self._sync_segments()
         # uuid -> (segment_idx, offset) for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
@@ -362,6 +384,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # bound on any long-lived consumer.
         self._peer_segments: dict[str, tuple[object, memoryview, int]] = {}
         self._peer_evict_last = 0.0
+        # Unregister before the arenas unmap (close(), or when the manager
+        # is collected). Not at interpreter exit: the driver drops every
+        # registration with the process.
+        self._unpin_finalizer = weakref.finalize(
+            self, _unpin_live, self._own_pinned, self._peer_segments)
+        self._unpin_finalizer.atexit = False
 
     # -- segments --------------------------------------------------------
 
@@ -391,16 +419,22 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> int:
-        """Pin within budget; returns the bytes actually pinned (0 if
-        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so
-        budget check + register + accounting must be one atomic unit."""
+        """Pin an own segment within budget; returns the bytes actually
+        pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases
+        the GIL, so budget check + register + accounting must be one atomic
+        unit, and close() must see the segment either unpinned or tracked."""
         # Oversized dedicated segments ARE pinned (within budget): freed
         # segments are reused for later large tensors, so the registration
         # amortizes over the segment's lifetime, not one transfer.
         if not self._pin_segments:
             return 0
         with self._pin_lock:
-            return self._pin_locked(ptr, nbytes)
+            if not self._pin_segments:
+                return 0
+            pinned = self._pin_locked(ptr, nbytes)
+            if pinned:
+                self._own_pinned.append(ptr)
+            return pinned
 
     def _pin_locked(self, ptr: int, nbytes: int) -> int:
         if self._pinned_bytes + nbytes > self._pin_budget:
@@ -918,12 +952,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     # -- reclaim ----------------------------------------------------------
 
     def close(self) -> None:
-        """Stop the wake watcher (segments/pins release with the arena's
-        Drop once the manager is garbage collected)."""
+        """Stop the wake watcher and unregister every pinned segment (the
+        segments themselves unmap with the arena's Drop once the manager is
+        garbage collected). Segments mapped after this stay unpinned."""
         with self._wake_lock:
             if self._wake_q is not None:
                 self._wake_q.put(None)
                 self._wake_q = None
+        with self._pin_lock:
+            self._pin_segments = False
+            self._unpin_finalizer()
+            self._pinned_bytes = 0
+            self._pinned_segments = 0
 
     def cleanup_collectable(
         self, collectable: list[int], registered: list[bool],

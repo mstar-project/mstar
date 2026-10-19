@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -36,6 +36,10 @@ class AttentionConfig:
     # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
     # backend reads it; the others refuse it at build
     sm_scale: float | None = None
+    # FlashInfer only: combined walks whose captured steps plan their
+    # one-token rows on the decode wrapper and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass
