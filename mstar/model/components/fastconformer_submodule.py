@@ -2,6 +2,7 @@
 over a batch of clips, for every FastConformer ASR model."""
 from __future__ import annotations
 
+import math
 from functools import partial
 from typing import Any
 
@@ -40,6 +41,48 @@ def _bucket_for(num_frames: int) -> int | None:
 
 def _batch_sizes(bucket: int) -> list[int]:
     return [bs for bs in CAPTURE_BATCH_SIZES if bs * bucket <= MAX_BATCH_FRAMES] or [1]
+
+
+def _replay_cost(rows: int, mel: int) -> float:
+    """One replay of a ``(rows, mel)`` capture, in units of the smallest
+    capture's: a fixed part (the encoder's ~1,000 kernels, ~3 ms on an H100)
+    plus work linear in rows x mel frames, and in rows x frames^2 for the
+    attention. Fitted to every capture's replay time on an H100 (within 9%);
+    planning needs only the ratios."""
+    return 1.0 + rows * mel / 5070 + rows * mel * mel / 6.64e7
+
+
+def _part_sizes(count: int, bucket: int) -> list[int]:
+    """The captures ``count`` rows of one group replay as: the widest while
+    it fills, then the narrowest that holds the rest."""
+    sizes = _batch_sizes(bucket)
+    full, rest = divmod(count, sizes[-1])
+    return [sizes[-1]] * full + ([next(s for s in sizes if s >= rest)] if rest else [])
+
+
+def _plan(num_frames: list[int]) -> list[tuple[int | None, list[int]]]:
+    """A batch's rows -> ``(bucket, rows)`` groups, one replay series each.
+
+    A group is a run of the rows in length order, padded to its longest row's
+    bucket. A replay costs as much as ~5,000 padded rows x mel frames, so short
+    clips ride in a longer clip's replay when that is cheaper than a replay of
+    their own; the runs are cut where the total cost is least. Rows past every
+    bucket are one group, run eagerly."""
+    order = sorted(range(len(num_frames)), key=lambda r: num_frames[r])
+    bucketed = [r for r in order if _bucket_for(num_frames[r]) is not None]
+    best, cut = [0.0] + [math.inf] * len(bucketed), [0] * (len(bucketed) + 1)
+    for i in range(1, len(bucketed) + 1):
+        bucket = _bucket_for(num_frames[bucketed[i - 1]])
+        for j in range(i):
+            cost = best[j] + sum(_replay_cost(bs, bucket) for bs in _part_sizes(i - j, bucket))
+            if cost < best[i]:
+                best[i], cut[i] = cost, j
+    groups, i = [], len(bucketed)
+    while i > 0:
+        groups.append((_bucket_for(num_frames[bucketed[i - 1]]), bucketed[cut[i]:i]))
+        i = cut[i]
+    eager = [r for r in order if _bucket_for(num_frames[r]) is None]
+    return groups[::-1] + ([(None, eager)] if eager else [])
 
 
 class FastConformerEncoderSubmodule(NodeSubmodule):
@@ -137,11 +180,8 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
     def _encode(
         self, features: list[torch.Tensor], out_lengths: list[int], runners: dict[str, Any],
     ) -> list[torch.Tensor]:
-        groups: dict[int | None, list[int]] = {}
-        for row, feats in enumerate(features):
-            groups.setdefault(_bucket_for(feats.shape[0]), []).append(row)
         states: list[torch.Tensor | None] = [None] * len(features)
-        for bucket, rows in groups.items():
+        for bucket, rows in _plan([feats.shape[0] for feats in features]):
             runner = runners.get(_region(bucket)) if bucket is not None else None
             step = max(_batch_sizes(bucket)) if bucket is not None else 1
             for part in (rows[i:i + step] for i in range(0, len(rows), step)):

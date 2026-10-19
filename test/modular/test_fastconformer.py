@@ -234,9 +234,9 @@ class _PaddedReplay:
 @pytest.mark.parametrize("causal", [False, True], ids=["offline", "causal"])
 @pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
 def test_encoder_node_batches_like_single_requests(causal, captured):
-    """The node groups a batch by mel bucket, pads each group to its bucket (or
-    to the longest row when eager) and runs a clip past every bucket alone;
-    every row gets what it would alone."""
+    """The node groups a batch into replays (``_plan``), pads each group to its
+    bucket (or to the longest row when eager) and runs a clip past every bucket
+    alone; every row gets what it would alone."""
     from mstar.model.components.fastconformer_submodule import (
         MEL_BUCKETS,
         FastConformerEncoderSubmodule,
@@ -261,6 +261,28 @@ def test_encoder_node_batches_like_single_requests(causal, captured):
             assert states[i].shape == single[0].shape
             assert torch.allclose(states[i], single[0], atol=1e-5), (i, (states[i] - single[0]).abs().max())
 
+
+
+def test_replay_plan_covers_every_row_and_merges_short_clips():
+    """``_plan`` gives each row one group; short clips ride in a longer clip's
+    replay when a replay of their own costs more than the padding, rows of one
+    long bucket keep their own, and a clip past every bucket runs eagerly."""
+    from mstar.model.components.fastconformer_submodule import MEL_BUCKETS, _part_sizes, _plan, _replay_cost
+
+    def cost(groups):
+        return sum(sum(_replay_cost(bs, b) for bs in _part_sizes(len(rows), b)) for b, rows in groups if b)
+
+    lens = [200, 3000, 600, 300, 900, 1500]
+    groups = _plan(lens)
+    assert sorted(r for _, rows in groups for r in rows) == list(range(len(lens)))
+    assert all(max(lens[r] for r in rows) <= b for b, rows in groups)
+    per_bucket = {}
+    for r, n in enumerate(lens):
+        per_bucket.setdefault(next(b for b in MEL_BUCKETS if n <= b), []).append(r)
+    assert len(groups) < len(per_bucket) and cost(groups) < cost(per_bucket.items())
+    # eight full-length clips and four short ones: padding the short ones to 4096 costs more
+    assert [(b, len(rows)) for b, rows in _plan([3000] * 8 + [200] * 4)] == [(256, 4), (4096, 8)]
+    assert _plan([MEL_BUCKETS[-1] + 1, 300]) == [(512, [1]), (None, [0])]
 
 def test_reproduces_the_duplex_encoder():
     """``nemotron_duplex`` keeps its own encoder: a causal, bias-free
