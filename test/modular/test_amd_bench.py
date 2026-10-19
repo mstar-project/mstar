@@ -309,6 +309,67 @@ def test_moe_configs_reach_the_table(tmp_path):
     assert "MoE E=128,N=384,K=1024,topk=6: NO tuned table, default launch config" in md and "moe-untuned" in md
 
 
+def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
+    from benchmark.amd import launch
+
+    # k002-001: HIP counts GPUs in KFD node order, amd-smi by PCI address.
+    nodes = {0: 3, 1: 5, 2: 4, 3: 2, 4: 7, 5: 9, 6: 8, 7: 6}  # amd-smi gpu -> KFD node
+    small = {"memory_usage": {"vram_mem": {"value": 68000}}}
+
+    def fake(*args):
+        if args[0] == "list":
+            return [{"gpu": g, "node_id": n} for g, n in nodes.items()]
+        if args[0] == "metric":
+            return {"gpu_data": [{"gpu": g, "mem_usage": {"used_vram": {"value": 9635 if g == 5 else 284}}}
+                                 for g in nodes]}
+        procs = lambda g: [{"process_info": {"name": "py", "pid": 1, **small}}] + (  # noqa: E731
+            [{"process_info": {"name": "py", "pid": 2, "memory_usage": {"vram_mem": {"value": 9 << 30}}}}]
+            if g == 5 else [])
+        return {"gpu_data": [{"gpu": g, "process_list": procs(g)} for g in nodes]}
+
+    monkeypatch.setattr(launch, "amd_smi_json", fake)
+    launch.smi_index_map.cache_clear()
+    try:
+        assert launch.smi_index_map() == {0: 3, 1: 0, 2: 2, 3: 1, 4: 7, 5: 4, 6: 6, 7: 5}
+        occ = launch.gpu_occupancy([0, 7])
+        # A process that only opened the GPU is not a tenant; HIP 7 is amd-smi 5, where pid 2 holds 9 GiB.
+        assert occ[0] == {"vram_used_mb": 284.0, "processes": []}
+        assert occ[7] == {"vram_used_mb": 9635.0, "processes": ["py:2"]}
+        assert health.smi_gpus([4, 5]) == [7, 4]
+    finally:
+        launch.smi_index_map.cache_clear()
+    rows = health.parse_rows("GPU3   FAIL  occupancy   procs=[python3.12:1] vram_used=284/262128 MB gfx_activity=0%\n"
+                             "GPU5   FAIL  occupancy   procs=[python3.12:2] vram_used=9635/262128 MB gfx_activity=0%\n")
+    assert health.interpret_check(rows, [3, 0]).status == "PASS"
+    assert health.interpret_check(rows, [3, 5]).status == "FAIL"
+
+
+def test_allreduce_fallback_marks_the_row(tmp_path):
+    from benchmark.amd.launch import allreduce_in_log
+
+    log = tmp_path / "server.log"
+    line = ("AITER fused all-reduce + RMSNorm failed its startup check (tp=2 hidden=4096 torch.bfloat16, residual "
+            "rounds toward zero (900 of 4096 values), needs an AITER build with OPUS_FP32_to_BF16_DEFAULT=0), "
+            "using RCCL + separate norm")
+    log.write_text(f"2026-10-19 01:30:00,000 ERROR [worker_0] mstar.distributed.ar_fusion: {line}\n")
+    assert allreduce_in_log(log) == {"fused": False, "line": line}
+    log.write_text("INFO all-reduce fusion workspace: AITER CustomAllreduce, up to 80 tokens x 4096, max_size 8 MiB\n")
+    assert allreduce_in_log(log) == {"fused": True, "backend": "AITER CustomAllreduce, up to 80 tokens x 4096"}
+    run = tmp_path / "run"
+    d = run / "qwen3_5_9b_tp2" / "mstar"
+    (d / "cells/text-chat-256/c1").mkdir(parents=True)
+    (run / "sweep.json").write_text(json.dumps({"table": "qwen35-dense", "rows": ["qwen3_5_9b_tp2"], "arms": ["mstar"],
+                                                "workloads": ["text-chat-256"]}))
+    (d / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_9b_tp2", "status": "done",
+                                            "startup": {"allreduce": {"fused": False, "line": line}}}))
+    (d / "cells/text-chat-256/c1/cell.json").write_text(json.dumps(
+        {"arm": "mstar", "row": "qwen3_5_9b_tp2", "workload": "text-chat-256", "concurrency": 1, "summary": {},
+         "flags": [], "errors": [], "status": "done"}))
+    md = table.write(run).read_text()
+    assert f"fused all-reduce: RCCL fallback ({line})" in md
+    assert md.count("fused all-reduce: RCCL fallback") == 2  # the arm's line and its cell
+
+
 def test_sample_set_dataset(tmp_path):
     from benchmark.base import RequestType
     from benchmark.dataset import SampleSetDataset
