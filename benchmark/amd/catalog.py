@@ -107,6 +107,7 @@ class Arm:
     differs: str = ""
     differs_for: dict = field(default_factory=dict)
     models: tuple[str, ...] = ()  # rows (by runner model) this arm serves; empty means any row of its families
+    rows: tuple[str, ...] = ()  # rows (by name) this arm serves, where one runner model covers several rows
     # The server takes the first ``server_gpus`` of the row's GPUs; the client gets the next one (or the
     # first if none is left) for work it does on a GPU, such as decoding audio.
     server_gpus: int | None = None
@@ -128,6 +129,11 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     Arm("mstar", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai",
         env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="configs/<row>.yaml unchanged; MSTAR_SHM_ARENA=1 as .claude/skills/benchmarking asks for numbers"),
+    # TP rows only: the worker's async scheduling for lockstep TP nodes, which defaults to off
+    # (MSTAR_TP_ASYNC_SCHED, mstar/worker/worker.py).
+    Arm("mstar-tpasync", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_9b_tp2",),
+        env={"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
+        recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
     Arm("vllm", "vllm", ("text",), client="vllm", image="vllm",
         recipe="image defaults (v0.31.0 picks ROCM_ATTN on gfx942, AITER off)"),
     Arm("vllm-aiter", "vllm", ("text",), client="vllm", image="vllm", env={"VLLM_ROCM_USE_AITER": "1"},
@@ -204,7 +210,8 @@ def arms_for(row: Row, names: list[str]) -> list[Arm]:
         if n not in ARMS:
             raise KeyError(f"unknown arm {n!r}; known: {', '.join(ARMS)}")
         a = ARMS[n]
-        if row.family in a.families and (not a.models or row.runner_model in a.models):
+        if (row.family in a.families and (not a.models or row.runner_model in a.models)
+                and (not a.rows or row.name in a.rows)):
             out.append(a)
     return out
 
