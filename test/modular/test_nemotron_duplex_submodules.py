@@ -11,14 +11,13 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.resources.step import StepContext
 from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
 from mstar.model.nemotron_duplex.config import (
     ENCODER_FRONT,
@@ -390,27 +389,43 @@ def test_codec_cleanup_clears_per_request_context():
     assert "r" not in codec.request_states
 
 
-class _EagerDecodeRegion:
-    """The engine's piecewise runner on CPU for the codec's decode region: the
-    batch padded to its bucket with zero codes, the captured callable run eagerly."""
+def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 4)):
+    """The engine's piecewise runner for ``config``, captured on CPU: the real
+    runner (bucket padding, its own static buffers per bucket, the region's
+    admit / plan / commit), with a "graph" whose replay re-runs the region
+    eagerly. ``calls`` counts its replays."""
+    from unittest import mock
 
-    def __init__(self, codec, bs: int = 4):
-        self.bs, self.calls = bs, 0
-        self.config = codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
-            AudioCodecDecoderSubmodule.DECODE_REGION]
+    from mstar.engine import accelerator_graph_runner as cgr
+    from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 
-    def can_run(self, batch_size):
-        return batch_size <= self.bs
+    class _Replay:
+        def __init__(self, fn):
+            self.fn = fn
 
-    def run(self, static_inputs, real_bs):
-        self.calls += 1
-        static = self.config.make_static_inputs(PiecewiseCaptureShape(bs=self.bs, seq_lens=[1] * self.bs,
-                                                                      total_tokens=self.bs))
-        for name, value in static_inputs.items():
-            static[name][:real_bs].copy_(value)
-        out = self.config.capture_fn(PiecewiseCallInputs(
-            static_inputs=static, engine_inputs=ModelInputsFromEngine(request_ids=[], per_request_info={})))
-        return {name: value[:real_bs].clone() for name, value in out.items()}
+        def replay(self):
+            self.fn()
+
+    config.capture_batch_sizes = list(bs)
+    backend = SimpleNamespace(is_available=lambda: True, set_device=lambda: None, synchronize=lambda: None)
+    runner = cgr.PiecewiseAcceleratorGraphRunner(
+        label=label, config=config, resources=resources or {}, step_runner=step_runner or StepRunner({}),
+        device=torch.device("cpu"), autocast_dtype=None, num_slots=1, node_name=label,
+        memory_pool=AcceleratorGraphPool("cpu"), device_capability=SimpleNamespace(graph_backend=backend),
+    )
+    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a: (_Replay(fn), fn())):
+        runner.prepare_for_capture()
+        runner.warmup_and_capture()
+    assert runner.any_graphs and not runner.dropped_shapes
+    runner.calls = 0
+    run = runner.run
+
+    def counted(*args, **kwargs):
+        runner.calls += 1
+        return run(*args, **kwargs)
+
+    runner.run = counted
+    return runner
 
 
 @pytest.mark.parametrize("region", [False, True])
@@ -436,7 +451,9 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, r
     runners = {}
     if region:
         cfg.eartts.num_quantizers = ccfg.num_quantizers
-        runners[AudioCodecDecoderSubmodule.DECODE_REGION] = _EagerDecodeRegion(codec)
+        label = AudioCodecDecoderSubmodule.DECODE_REGION
+        runners[label] = _captured_on_cpu(
+            codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label], label)
     chunk = 5
     codes = torch.randint(0, ccfg.codebook_size, (frames, ccfg.num_quantizers))
     with torch.no_grad():
@@ -592,44 +609,10 @@ class _Encoder:
             return self.node.perception(wav.unsqueeze(0), torch.tensor([wav.numel()]))[0][0]
 
 
-class _EagerRegion:
-    """The engine's piecewise runner on CPU: the same bucket padding, region
-    declaration and admit / plan / commit around the region, with the captured
-    callable run eagerly."""
-
-    def __init__(self, enc: _Encoder, bs: int, label: str):
-        self.enc, self.bs, self.calls = enc, bs, 0
-        self.config = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label]
-        self.dummies = [f"__pad_{label}_{i}__" for i in range(bs)]
-        for rid in self.dummies:
-            for pool in enc.resources.values():
-                pool.ingest_request(rid)
-
-    def can_run(self, batch_size):
-        return batch_size <= self.bs
-
-    def run(self, static_inputs, request_ids):
-        self.calls += 1
-        n = len(request_ids)
-        static = self.config.make_static_inputs(PiecewiseCaptureShape(bs=self.bs, seq_lens=[1] * self.bs,
-                                                                      total_tokens=self.bs))
-        for name, value in static_inputs.items():
-            static[name][:n].copy_(value)
-        ids = [*request_ids, *self.dummies[n:]]
-        step = self.config.declare_step(ids, [1] * self.bs)
-        ctx = StepContext(request_ids=tuple(request_ids), graph_walk="pw", slot=0, capture=False,
-                          slot_lease=SlotLease(slot=0, bucket=BucketKey("pw", self.bs, self.bs)))
-        ctx.set_padded_rids(tuple(ids))
-        step.set_ctx(ctx)
-        assert self.enc.runner.admit(step).ok
-        self.enc.runner.plan(step)
-        out = self.config.capture_fn(PiecewiseCallInputs(
-            static_inputs=static,
-            engine_inputs=ModelInputsFromEngine(request_ids=ids, per_request_info={},
-                                                resources=dict(self.enc.resources)),
-        ))
-        self.enc.runner.commit(step)
-        return {name: value[:n].clone() for name, value in out.items()}
+def _encoder_regions(enc: _Encoder, *labels) -> dict:
+    """The encoder's piecewise regions as the engine runs them, captured on CPU."""
+    configs = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    return {label: _captured_on_cpu(configs[label], label, enc.resources, enc.runner) for label in labels}
 
 
 def _encode_batch(enc, steps):
@@ -706,9 +689,8 @@ def test_encoder_live_steps_replay_the_regions_with_padding_rows():
     batch. Every call gets its offline frames: the padding rows, which address
     the pools' sinks, and the rows another path served leave them alone."""
     enc = _Encoder()
-    step = _EagerRegion(enc, bs=4, label=ConformerEncoderSubmodule.STEP_REGION)
-    layers = _EagerRegion(enc, bs=4, label=ConformerEncoderSubmodule.LAYERS_REGION)
-    enc.regions = {ConformerEncoderSubmodule.STEP_REGION: step, ConformerEncoderSubmodule.LAYERS_REGION: layers}
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
+    step, layers = enc.regions.values()
     wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1}
     got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
     assert step.calls >= 20 and layers.calls >= 5
