@@ -1,7 +1,8 @@
 """KV offload/reload copy microbenchmark, through ``CPUPagePool`` itself.
 
-For each path (one ``cudaMemcpy2DAsync`` per page, and the per-page ``copy_``
-that is the fallback and was the only path before), direction and page count:
+For each copier that loads here (``cudaMemcpy2DAsync`` per page through
+``cuda.bindings`` or through torch's libcudart, and the per-page ``copy_`` that
+is the fallback and was the only path before), direction and page count:
 
 - host: wall time from issuing the copies to ``sync()`` returning, with a
   ``--queued-ms`` kernel already queued on the compute stream. A path that
@@ -21,7 +22,7 @@ import time
 
 import torch
 
-from mstar.engine.resources.kv import cpu_page_pool
+from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import PagedKVConfig
 
@@ -101,17 +102,23 @@ def main():
     print(f"{torch.cuda.get_device_name()}, torch {torch.__version__}, "
           f"page {page_bytes / 1e6:.2f} MB ({args.layers} layers), "
           f"{args.queued_ms:g} ms queued ahead")
-    paths = (["memcpy_2d"] if cpu_page_pool.cudart is not None else []) + ["copy_"]
-    print(f"{'path':10s} {'dir':7s} {'pages':>5s} {'host ms':>8s} {'copy ms':>8s} {'GB/s':>6s}")
-    for path in paths:
-        pool._memcpy_2d = path == "memcpy_2d"
+    copiers = []
+    for cls in (page_copier.CudaBindingsCopier, page_copier.CudartCopier,
+                page_copier.TorchCopier):
+        try:
+            copiers.append(cls())
+        except (ImportError, OSError, AttributeError, RuntimeError) as e:
+            print(f"{cls.name}: unavailable ({e})")
+    print(f"{'copier':14s} {'dir':7s} {'pages':>5s} {'host ms':>8s} {'copy ms':>8s} {'GB/s':>6s}")
+    for copier in copiers:
+        pool._copier = copier
         for direction in ("offload", "reload"):
             measure(pool, kv, counts[0], direction, 0)  # warm up
             for n in counts:
                 runs = [measure(pool, kv, n, direction, queued) for _ in range(args.repeats)]
                 host = statistics.median(r[0] for r in runs)
                 copy = statistics.median(r[1] for r in runs)
-                print(f"{path:10s} {direction:7s} {n:5d} {host:8.2f} {copy:8.2f} "
+                print(f"{copier.name:14s} {direction:7s} {n:5d} {host:8.2f} {copy:8.2f} "
                       f"{n * page_bytes / copy / 1e6:6.1f}")
 
 

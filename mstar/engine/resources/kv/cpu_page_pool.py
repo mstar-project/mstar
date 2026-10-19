@@ -8,7 +8,6 @@ The pool stores pages and the stream metadata that has to survive the round
 trip; which request to evict, and when, is the worker's decision.
 """
 
-import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -16,27 +15,12 @@ from dataclasses import dataclass
 import torch
 
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator, PagedKVConfig
-from mstar.platforms import current_platform
-
-try:
-    from cuda.bindings import runtime as cudart
-except ImportError:  # torch 2.9, and torch's ROCm, XPU and CPU builds
-    cudart = None
+from mstar.engine.resources.kv.page_copier import make_page_copier
 
 logger = logging.getLogger(__name__)
 
 # a full pool refuses every eviction attempt, which can be thousands a second
 _EXHAUSTED_LOG_INTERVAL = 5.0
-
-
-@functools.cache
-def _warn_slow_copies() -> None:
-    logger.warning(
-        "cuda.bindings is not installed, so KV offload and reload copies block "
-        "the host and run several times slower. torch 2.10+ installs it; with "
-        "an older torch, install cuda-bindings for your CUDA major version "
-        "(see docs/installation.rst)."
-    )
 
 
 @dataclass
@@ -79,9 +63,7 @@ class CPUPagePool:
 
         # copies run here so they don't serialize with compute
         self._stream: torch.cuda.Stream | None = None
-        self._memcpy_2d = cudart is not None and current_platform.is_cuda()
-        if cudart is None and current_platform.is_cuda():
-            _warn_slow_copies()
+        self._copier = make_page_copier()
 
         self._refused_logged_at: float | None = None
         self._refused_unlogged = 0
@@ -124,7 +106,7 @@ class CPUPagePool:
         # these pages (a commit hands pages on right after the launch). Queue
         # the copies behind it, or they could read a page mid-write.
         stream.wait_stream(torch.cuda.current_stream())
-        self._copy_pages(
+        self._copier.copy(
             self.cpu_kv_cache, cpu_pages, gpu_kv_cache, gpu_page_indices, stream
         )
 
@@ -173,52 +155,13 @@ class CPUPagePool:
         # Same ordering as the offload: the device pages we write may have
         # been released by a commit whose kernels are still reading them.
         stream.wait_stream(torch.cuda.current_stream())
-        self._copy_pages(
+        self._copier.copy(
             gpu_kv_cache, gpu_page_indices,
             self.cpu_kv_cache, state.cpu_page_indices, stream,
         )
 
         self.page_allocator.free(state.cpu_page_indices)
         return state
-
-    def _copy_pages(
-        self,
-        dst: torch.Tensor,
-        dst_pages: list[int],
-        src: torch.Tensor,
-        src_pages: list[int],
-        stream: torch.cuda.Stream,
-    ) -> None:
-        """Copy every layer of ``src_pages[i]`` onto ``dst_pages[i]``, on ``stream``.
-
-        A page is one contiguous block per layer, ``stride(0)`` apart. ``copy_``
-        of that strided view blocks the host until the copy stream drains and
-        reaches a fraction of the link's bandwidth, so on CUDA each page is a
-        single ``cudaMemcpy2DAsync`` with the layer stride as its pitch: async,
-        and run on the copy engines.
-        """
-        if not self._memcpy_2d:
-            with torch.cuda.stream(stream):
-                for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
-                    dst[:, dst_idx].copy_(src[:, src_idx], non_blocking=True)
-            return
-        assert dst[0, 0].is_contiguous() and src[0, 0].is_contiguous()
-        assert dst.dtype == src.dtype and dst.shape[0] == src.shape[0]
-        assert dst.shape[2:] == src.shape[2:]
-        elt = dst.element_size()
-        width = dst[0, 0].numel() * elt
-        dst_pitch, dst_page = dst.stride(0) * elt, dst.stride(1) * elt
-        src_pitch, src_page = src.stride(0) * elt, src.stride(1) * elt
-        dst_ptr, src_ptr = dst.data_ptr(), src.data_ptr()
-        kind = cudart.cudaMemcpyKind.cudaMemcpyDefault
-        for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
-            (err,) = cudart.cudaMemcpy2DAsync(
-                dst_ptr + dst_idx * dst_page, dst_pitch,
-                src_ptr + src_idx * src_page, src_pitch,
-                width, dst.shape[0], kind, stream.cuda_stream,
-            )
-            if err != cudart.cudaError_t.cudaSuccess:
-                raise RuntimeError(f"cudaMemcpy2DAsync failed: {err}")
 
     def discard(self, rid: str, label: str) -> None:
         """Drop a stream that was copied here but never committed to.
