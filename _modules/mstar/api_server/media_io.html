@@ -924,6 +924,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">io</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">wave</span>
@@ -1243,6 +1244,36 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># Outbound: wrap raw model output for client surfaces</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 
+<span class="c1"># torchaudio's resampling kernel holds (target / g) * (rate / g + 2 * width)</span>
+<span class="c1"># floats, g = gcd(rate, target), width its filter's half-length (default</span>
+<span class="c1"># lowpass_filter_width 6, rolloff 0.99): 3.0M for the 47,952 Hz pull-down rate</span>
+<span class="c1"># to 16 kHz, but 1.15G for a 48,001 Hz header resampled to 24 kHz</span>
+<span class="n">MAX_RESAMPLE_KERNEL</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">24</span>
+<span class="n">MAX_SAMPLE_RATE</span> <span class="o">=</span> <span class="mi">768_000</span>
+
+
+<div class="viewcode-block" id="resample_kernel_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resample_kernel_size">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">resample_kernel_size</span><span class="p">(</span><span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">target</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Floats in torchaudio's default sinc kernel resampling ``rate`` to ``target``."""</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">gcd</span><span class="p">(</span><span class="n">rate</span><span class="p">,</span> <span class="n">target</span><span class="p">)</span>
+    <span class="n">orig</span><span class="p">,</span> <span class="n">new</span> <span class="o">=</span> <span class="n">rate</span> <span class="o">//</span> <span class="n">g</span><span class="p">,</span> <span class="n">target</span> <span class="o">//</span> <span class="n">g</span>
+    <span class="n">width</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="mi">6</span> <span class="o">*</span> <span class="n">orig</span> <span class="o">/</span> <span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">orig</span><span class="p">,</span> <span class="n">new</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.99</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">new</span> <span class="o">*</span> <span class="p">(</span><span class="n">orig</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">width</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="check_resample_rate">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.check_resample_rate">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_resample_rate</span><span class="p">(</span><span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">target</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse a file rate outside ``1..MAX_SAMPLE_RATE`` Hz or whose</span>
+<span class="sd">    resampling to ``target`` would cost more than :data:`MAX_RESAMPLE_KERNEL`</span>
+<span class="sd">    (every real rate, pull-down rates included, passes)."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="mi">1</span> <span class="o">&lt;=</span> <span class="n">rate</span> <span class="o">&lt;=</span> <span class="n">MAX_SAMPLE_RATE</span> <span class="ow">or</span> <span class="n">resample_kernel_size</span><span class="p">(</span><span class="n">rate</span><span class="p">,</span> <span class="n">target</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">MAX_RESAMPLE_KERNEL</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unsupported sample rate </span><span class="si">{</span><span class="n">rate</span><span class="si">}</span><span class="s2"> Hz; resample the audio to a standard rate"</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="decode_audio">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.decode_audio">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">decode_audio</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16000</span><span class="p">):</span>
@@ -1261,6 +1292,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">frames</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="o">=</span><span class="n">sample_rate</span><span class="p">,</span> <span class="n">num_channels</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">get_all_samples</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">frames</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="n">check_resample_rate</span><span class="p">(</span><span class="n">sr</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">sr</span> <span class="o">!=</span> <span class="n">sample_rate</span><span class="p">:</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
