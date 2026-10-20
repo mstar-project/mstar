@@ -448,8 +448,8 @@ def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
 def test_a_replys_image_comes_back_in_the_next_user_turn(bagel, tmp_path):
     """A client appends the assistant message a chat response carries and goes on."""
     reply = _build_response("bagel", "chatcmpl-0", [
-        SimpleNamespace(modality="text", data=b"Here it is."),
-        SimpleNamespace(modality="image", data=b"\x89PNG"),
+        SimpleNamespace(modality="text", data=b"Here it is.", metadata={}),
+        SimpleNamespace(modality="image", data=b"\x89PNG", metadata={}),
     ], 24000)["choices"][0]["message"]
     messages = [
         {"role": "user", "content": "Draw a red cube."},

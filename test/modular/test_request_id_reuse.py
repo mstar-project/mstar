@@ -56,6 +56,9 @@ class _Model:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
+    def stop_token_ids(self):
+        return None
+
 
 class _Socket:
     """The data worker's socket to the conductor; each loop pass polls it once."""
