@@ -26,6 +26,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
+from mstar.api_server.auth import (
+    API_KEY_ENV,
+    APIKeyGuard,
+    APIKeyMiddleware,
+    keep_api_key_from_children,
+    resolve_api_key,
+    warn_if_no_api_key,
+)
 from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
@@ -189,6 +197,15 @@ def _client_text(text: str, key: str, request_id: str | None) -> str:
     as the client's ``request_id``: engine and data-worker errors can name
     the key, which the client never sent."""
     return text if request_id is None else text.replace(key, request_id)
+
+
+def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
+    """``chunks`` up to and including the first error chunk, which ends the
+    response, and whether there was one."""
+    for i, chunk in enumerate(chunks):
+        if chunk.modality == "error":
+            return chunks[:i + 1], True
+    return list(chunks), False
 
 
 def request_id_in_use(request_id: str) -> str:
@@ -907,6 +924,11 @@ class APIServer:
     ):
         start = time.time()
         finished = False
+        # An error chunk ends the response: whatever follows it for this
+        # request (a second error, a late output) is not part of the answer.
+        # The message thread sets req.event in the same request_lock block
+        # that appends an error chunk, so a read that sees one is also done.
+        errored = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
@@ -936,6 +958,7 @@ class APIServer:
                         done = True
 
                 if new_chunks:
+                    new_chunks, errored = _until_error(new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -949,19 +972,25 @@ class APIServer:
                     with self.request_lock:
                         req = self.pending_requests.get(key)
                         if req:
-                            remaining = req.chunks[req.consumed_chunks:]
+                            if not errored:
+                                remaining = req.chunks[req.consumed_chunks:]
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
-                    tail = list(remaining)
+                    tail, tail_errored = _until_error(remaining)
+                    errored = errored or tail_errored
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
-                    # in-band as the final chunk.
-                    if finished_req is not None and finished_req.error is not None:
+                    # in-band as the final chunk, once.
+                    if (
+                        not errored
+                        and finished_req is not None
+                        and finished_req.error is not None
+                    ):
                         tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
@@ -1318,6 +1347,12 @@ app = FastAPI(
 )
 # Added before CORS so CORS stays outermost and a 413 still carries its headers.
 app.add_middleware(BodyLimitMiddleware)
+# Added after the body limit and before CORS, so it runs between them: CORS
+# answers browser preflights (which carry no credentials) and still stamps its
+# headers on a 401, and an unauthenticated request is refused before its body
+# is read.
+api_key_guard = APIKeyGuard(resolve_api_key())
+app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1594,6 +1629,11 @@ async def generate(
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
+    # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
+    # HTML checkbox) instead of its declared default, for Optional[bool] too.
+    if "streaming" not in await request.form():
+        streaming = True
+
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
     streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
     if streaming_only and not streaming:
@@ -1758,6 +1798,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--api-key", type=str, default=None,
+        help=f"Require 'Authorization: Bearer <key>' on every route except /health "
+             f"(default: {API_KEY_ENV}; unset means no check). Prefer the environment "
+             f"variable: a flag shows in the process list",
+    )
     parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
         "--socket-path-prefix", type=str, default=None,
@@ -1823,6 +1869,10 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    api_key = resolve_api_key(args.api_key)
+    api_key_guard.set(api_key)
+    # The Rust frontend gets the key explicitly.
+    keep_api_key_from_children(api_key)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -1906,13 +1956,15 @@ def main(argv: list[str] | None = None):
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 find_server_binary(args.rust_frontend_bin), model_name,
-                args.port, bridge_dir, args.upload_dir)
+                args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
             api_server.set_on_fatal(bridge.stop)
             bridge.run()
         else:
+            # (mstar-server logs the same warning for the Rust frontend.)
+            warn_if_no_api_key(api_key, args.host, args.port)
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
             # uvicorn.run() inlined so the server object is reachable. The
             # message thread stops it when the conductor dies.

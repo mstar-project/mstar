@@ -170,13 +170,28 @@ def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
     assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
 
 
+def _require_torchcodec_decode():
+    """Skip unless torchcodec can decode audio here. Newer torchcodec imports
+    without FFmpeg and raises only on the first decode, which the server reports
+    as an undecodable clip."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(bytes(3200))
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        AudioDecoder(buf.getvalue()).get_all_samples()
+    except Exception as exc:  # noqa: BLE001 — RuntimeError at import or decode without FFmpeg
+        pytest.skip(f"torchcodec cannot decode here: {exc}")
+
+
 @pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
 def test_voice_clone_refuses_a_1_hz_data_url_with_400(client_and_stub, model):
     if model == "omnivoice":
-        try:
-            from torchcodec.decoders import AudioDecoder  # noqa: F401
-        except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError without FFmpeg
-            pytest.skip(f"torchcodec cannot load here: {exc}")
+        _require_torchcodec_decode()
     else:
         pytest.importorskip("soundfile")
     client, stub = client_and_stub
@@ -198,10 +213,7 @@ def test_voice_clone_refuses_a_1_hz_data_url_with_400(client_and_stub, model):
 @pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
 def test_voice_clone_refuses_a_61_s_clip_with_400(client_and_stub, model, form):
     if model == "omnivoice":
-        try:
-            from torchcodec.decoders import AudioDecoder  # noqa: F401
-        except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError without FFmpeg
-            pytest.skip(f"torchcodec cannot load here: {exc}")
+        _require_torchcodec_decode()
     else:
         pytest.importorskip("soundfile")
     client, stub = client_and_stub

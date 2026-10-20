@@ -458,6 +458,7 @@ def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_load(node, model, mes
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):
     engine = Engine.__new__(Engine)
     engine._resources = {}
+    engine._device = torch.device("cuda")
     engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=_kv().config)}, _laid_out())
     # "vae" is an encoder that no layout walk runs, like an edit's.
     engine._submodules = {

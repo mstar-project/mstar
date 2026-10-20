@@ -104,6 +104,9 @@ def test_mixed_split_attends_as_the_packed_prefill_does():
     assert torch.equal(mixed.run(q, cache)[:real], out[:real])
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="plan() records a CUDA event before the row check",
+)
 def test_too_many_prompt_rows_for_the_bucket_is_refused():
     plan, _ = _layout()
     mixed = FlashInferMixedWrapper.__new__(FlashInferMixedWrapper)

@@ -17,11 +17,15 @@
 //!   POST /generate                 (native multipart -> NDJSON)
 //!   GET  /health
 //!
+//! With `MSTAR_API_KEY` set, every route but `/health` needs
+//! `Authorization: Bearer <key>` (`auth.rs`).
+//!
 //! Two result sources, selected at startup by whether a conductor socket dir is
 //! passed: **real** (bridge to the Python conductor) or **mock** (self-contained
 //! generator that proves the HTTP/adapter/media/streaming layer standalone).
 
 mod adapters;
+mod auth;
 mod bridge;
 mod media;
 mod protocol;
@@ -144,11 +148,21 @@ async fn main() {
         .route("/generate", post(generate))
         .route_layer(axum::middleware::from_fn_with_state(permits, admission));
 
+    let api_key = auth::ApiKey::from_env();
+    let key_enabled = api_key.enabled();
+
+    // The key check sits inside CORS: CORS answers browser preflights (which
+    // carry no credentials) and still stamps its headers on a 401. It is
+    // outside admission, so an unauthenticated request never takes a permit.
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
+        .layer(axum::middleware::from_fn_with_state(
+            api_key,
+            auth::require_api_key,
+        ))
         .layer(cors)
         .with_state(state);
 
@@ -157,6 +171,14 @@ async fn main() {
     let host = std::env::var("MSTAR_SERVER_HOST")
         .unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr = format!("{host}:{port}");
+    if !key_enabled {
+        eprintln!(
+            "WARNING: no API key set (--api-key or {}): any client that can reach {addr} \
+             can run requests. Set a key, or bind --host 127.0.0.1, unless a gateway in \
+             front of this server authenticates clients.",
+            auth::API_KEY_ENV
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, app)

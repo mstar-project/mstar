@@ -526,7 +526,8 @@ def test_missing_language_backend_is_reported_once(monkeypatch):
     assert frontend.available("j") is False  # cached: not retried
     with pytest.raises(ImportError, match="misaki\\[ja\\]"):
         frontend.backend("j")
-    assert frontend.available("a") is (importlib.util.find_spec("misaki.en") is not None)
+    has_misaki_en = importlib.util.find_spec("misaki") is not None and importlib.util.find_spec("misaki.en") is not None
+    assert frontend.available("a") is has_misaki_en
 
 
 def test_warmup_builds_the_default_language_backend(voices_dir):

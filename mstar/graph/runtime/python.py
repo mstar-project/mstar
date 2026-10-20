@@ -107,7 +107,7 @@ class GraphRuntimeRequestInfo:
     # Buffered between send_outputs calls and flushed onto WORKER_GRAPHS_DONE,
     # so a persist signal cannot race the message that announces it.
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
-    pending_new_token_counts: dict[str, int] = field(default_factory=dict)
+    pending_new_token_counts: dict[str, dict[str, int]] = field(default_factory=dict)  # by partition
     current_output_chunks: list[str] = field(default_factory=list)
     output_loop_indices: dict[str, NestedLoopIndices] = field(
         default_factory=dict
@@ -1495,10 +1495,9 @@ class PythonGraphRuntime(GraphRuntime):
 
             counts = new_token_counts.get(rid)
             if counts and info is not None:
+                pending = info.pending_new_token_counts.setdefault(partition, {})
                 for name, count in counts.items():
-                    info.pending_new_token_counts[name] = (
-                        info.pending_new_token_counts.get(name, 0) + count
-                    )
+                    pending[name] = pending.get(name, 0) + count
 
             if routing.emit_to_client and info is not None:
                 # As in _send_input_signals: the api server reads these
@@ -1598,8 +1597,7 @@ class PythonGraphRuntime(GraphRuntime):
                     seen.add((edge.name, i.uuid))
                     infos.append(i)
         info.pending_persist_signals = []
-        new_token_counts = info.pending_new_token_counts
-        info.pending_new_token_counts = {}
+        new_token_counts = info.pending_new_token_counts.pop(partition, {})
         output_signal_names = list(info.current_output_chunks)
         info.current_output_chunks.clear()
 

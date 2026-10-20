@@ -28,7 +28,9 @@ never collide with the conductor/worker mesh.
 
 Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the
 ``mstar-server`` binary + this loop. Everything else in the process
-(preprocess worker, conductor spawn, tensor transport) is identical.
+(preprocess worker, conductor spawn, tensor transport) is identical. The
+frontend enforces the API key (``--api-key`` / ``MSTAR_API_KEY``) itself; the
+bridge socket is private to the pair.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from mstar.api_server.auth import API_KEY_ENV
 from mstar.communication.communicator import CommProtocol
 from mstar.communication.rust_communicator import (
     MsgpackCodec,
@@ -77,9 +80,16 @@ def find_server_binary(explicit: str | None = None) -> str:
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
-                       bridge_dir: str, upload_dir: str) -> subprocess.Popen:
+                       bridge_dir: str, upload_dir: str,
+                       api_key: str | None = None) -> subprocess.Popen:
+    # The key goes through the environment, not argv, which any local user
+    # can read from the process list. ``api_key`` is the resolved setting, so
+    # an inherited MSTAR_API_KEY must not override it.
+    env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
+    if api_key:
+        env[API_KEY_ENV] = api_key
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
-                             upload_dir])
+                             upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)
     return proc
 

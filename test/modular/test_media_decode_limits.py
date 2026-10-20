@@ -164,14 +164,16 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     wt.device = "cpu"
     wt._prefix_streams = {}
     wt._live_requests = {}
-    wt.model = types.SimpleNamespace(load_image=lambda p, device: Model.load_image(None, p, device))
+    wt.model = types.SimpleNamespace(
+        load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
+    )
     request = PreprocessInput(
         request_id="r1", text="describe it", file_paths={"image": [path]},
         input_modalities=["image", "text"], output_modalities=["text"], model_kwargs={},
     )
     with pytest.raises(ValueError) as info:
         wt._process_input(request)
-    wt._fail_request("r1", info.value, "preprocessing")
+    wt._fail_request("r1", info.value, "preprocessing", abort=False)
     chunk = wt.out_queue.get_nowait()
     assert chunk.modality == "error"
     assert chunk.metadata["status"] == 400
@@ -546,11 +548,13 @@ def test_images_in_one_request_share_the_image_limit(tmp_path, decoded):
     """Eight 9000x9000 images each fit the default limit; together they are
     refused at the second, before it is decoded."""
     paths = [_png(tmp_path / f"copy{i}.png", 9_000, 9_000, rows=0) for i in range(8)]
-    wt = _preprocess_thread(types.SimpleNamespace(load_image=lambda p, device: Model.load_image(None, p, device)))
+    wt = _preprocess_thread(types.SimpleNamespace(
+        load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
+    ))
     with pytest.raises(ValueError, match="images decode to more than .* together") as info:
         wt._process_input(_image_request(paths))
     assert decoded == paths[:1]
-    wt._fail_request("r1", info.value, "preprocessing")
+    wt._fail_request("r1", info.value, "preprocessing", abort=False)
     assert wt.out_queue.get_nowait().metadata["status"] == 400
 
 
@@ -567,7 +571,7 @@ def test_images_up_to_the_limit_together_all_load(tmp_path, decoded, monkeypatch
 def test_too_many_files_are_refused_before_any_is_loaded(tmp_path, monkeypatch):
     monkeypatch.setenv("MSTAR_MAX_MEDIA_FILES", "2")
     loaded = []
-    wt = _preprocess_thread(types.SimpleNamespace(load_image=lambda p, device: loaded.append(p)))
+    wt = _preprocess_thread(types.SimpleNamespace(load_image=lambda p, device: loaded.append(p), max_input_files=dict))
     paths = [_png(tmp_path / f"img{i}.png", 8, 8) for i in range(3)]
     with pytest.raises(ValueError, match="attaches 3 media files; the limit is 2"):
         wt._process_input(_image_request(paths))

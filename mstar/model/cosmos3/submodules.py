@@ -2697,7 +2697,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
         ):
-            self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
+            self._decode = _wan_vae().compile_decode(vae.decode)
             self._decode_compiled = True
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the

@@ -115,6 +115,7 @@ def test_float32_check_rejects_nan_wrong_size_and_partial_values():
 
 
 def test_generate_response_requires_the_expected_modality():
+    pytest.importorskip("av")
     image = _png("red", square=False)
     assert check_generate_response(_generate_body("image", image), Expect("image", modality="image")).passed
     missing = check_generate_response(_generate_body("image", image), Expect("video", modality="video"))

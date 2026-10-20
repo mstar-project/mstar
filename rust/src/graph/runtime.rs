@@ -345,10 +345,11 @@ pub struct GraphRuntime {
                 .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
                 .unwrap_or(false);
 
+        let partition = self.interner.get(partition_name);
         let (persist, new_tokens, output_signals, loop_indices) =
             match self.requests[rid as usize].as_mut() {
                 Some(info) => {
-                    let (p, n, o) = info.pending.take_for_send();
+                    let (p, n, o) = info.pending.take_for_send(partition);
                     (p, n, o, info.pending.output_loop_indices.clone())
                 }
                 None => (vec![], vec![], vec![], vec![]),
@@ -3368,9 +3369,10 @@ impl GraphRuntime {
                     info.pending.add_persist(sig, uuids);
                 }
             }
+            let partition_sym = self.interner.intern(&partition);
             for (rid, counts) in &new_token_counts {
                 if let Some(info) = self.requests[*rid as usize].as_mut() {
-                    info.pending.add_new_tokens(counts);
+                    info.pending.add_new_tokens(partition_sym, counts);
                 }
             }
 

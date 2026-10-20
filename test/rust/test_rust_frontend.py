@@ -93,13 +93,13 @@ def _wait_healthy(port, timeout=15):
     return False
 
 
-@pytest.fixture()
-def stack():
+@contextlib.contextmanager
+def _running_stack(api_key=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_test_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_up_")
     proc = launch_rust_server(BINARY, "qwen3_omni", port, bridge_dir,
-                              upload_dir)
+                              upload_dir, api_key=api_key)
     stub = _StubAPIServer()
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
@@ -108,11 +108,19 @@ def stack():
     if not _wait_healthy(port):
         proc.terminate()
         raise RuntimeError("server never became healthy")
-    yield port, stub, bridge, proc
-    bridge.stop()
-    if proc.poll() is None:
-        proc.terminate()
-        proc.wait(timeout=10)
+    try:
+        yield port, stub, bridge, proc
+    finally:
+        bridge.stop()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+
+@pytest.fixture()
+def stack():
+    with _running_stack() as s:
+        yield s
 
 
 def _chat(port, content, timeout=30):
@@ -294,6 +302,53 @@ def test_admission_permit_is_held_through_streaming_body():
         bridge.stop()
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def _status(port, method, path, headers=None, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", method=method, data=body,
+        headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers  # case-insensitive lookups
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers
+
+
+def test_api_key_guards_every_route_but_health(monkeypatch):
+    """The launcher hands the key to mstar-server, which then refuses every
+    route but /health (passing ``_wait_healthy`` keyless proves that one)
+    without ``Authorization: Bearer <key>``."""
+    key = "s3cret-key"
+    # The launcher passes the resolved key, not whatever the parent inherited.
+    monkeypatch.setenv("MSTAR_API_KEY", "inherited-and-ignored")
+    chat = json.dumps({"model": "qwen3_omni",
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    with _running_stack(api_key=key) as (port, stub, _bridge, _proc):
+        for headers in ({}, {"Authorization": "Bearer wrong"},
+                        {"Authorization": "Bearer inherited-and-ignored"},
+                        {"Authorization": f"Basic {key}"}):
+            assert _status(port, "GET", "/v1/models", headers)[0] == 401
+            status, resp_headers = _status(port, "POST", "/v1/chat/completions", headers, chat)
+            assert status == 401
+            assert resp_headers.get("www-authenticate") == "Bearer"
+        assert not stub.submitted, "a request without the key reached the backend"
+        good = {"Authorization": f"Bearer {key}"}
+        assert _status(port, "GET", "/v1/models", good)[0] == 200
+        assert _status(port, "POST", "/v1/chat/completions", good, chat)[0] == 200
+        assert len(stub.submitted) == 1
+        # CORS answers a browser preflight, which carries no credentials.
+        status, resp_headers = _status(port, "OPTIONS", "/v1/chat/completions", {
+            "Origin": "https://app.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type"})
+        assert status == 200 and "access-control-allow-origin" in resp_headers
+
+
+def test_no_api_key_ignores_an_inherited_env_key(monkeypatch):
+    monkeypatch.setenv("MSTAR_API_KEY", "inherited")
+    with _running_stack(api_key=None) as (port, _stub, _bridge, _proc):
+        assert _status(port, "GET", "/v1/models")[0] == 200
 
 
 def test_tokenizer_env_fails_fast(tmp_path, monkeypatch):

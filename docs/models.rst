@@ -105,6 +105,11 @@ and sampling kernels determine which devices it can capture on; see
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.
+   * - ``omnilingual_asr_ctc_{300m,1b,3b,7b}``
+     - ``facebook/omniASR-CTC-300M`` (v1); v2 from Meta's CDN (default)
+     - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
+       in 1,600+ languages with no language code. Not autoregressive; batched across
+       requests. Apache-2.0.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -112,6 +117,15 @@ and sampling kernels determine which devices it can capture on; see
      - ``Overworld/Waypoint-1.5-1B``
      - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
        frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
+   * - ``lingbot_world_1_3b``
+     - ``robbyant/lingbot-world-v2-1.3b-causal-fast``
+     - LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
+       chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
+       A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
+       server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
+       rows for up to the 4,077-frame maximum. Needs ``flash-attn``; one rollout per GPU.
+       The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
+       before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
      - ``black-forest-labs/FLUX.2-klein-4B``
      - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
@@ -191,6 +205,47 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
+
+Omnilingual ASR notes
+~~~~~~~~~~~~~~~~~~~~~
+
+- Serve with ``mstar serve omnilingual_asr_ctc_300m`` (or ``_1b``, ``_3b``, ``_7b``) and
+  transcribe through ``POST /v1/audio/transcriptions``. No extra is needed;
+  ``pip install -e '.[audio]'`` adds non-WAV containers (mp3, flac, ...).
+- The model is a port of Meta's `Omnilingual ASR <https://github.com/facebookresearch/omnilingual-asr>`_
+  CTC checkpoints (code and weights Apache-2.0) that loads Meta's own ``.pt`` files without
+  fairseq2. ``weights_version`` in the YAML ``model_kwargs`` picks the release: ``v2``
+  (default; lower CER per Meta; its vocabulary adds capitals and punctuation, though on our
+  FLEURS clips it still wrote lowercase, unpunctuated text) is only on Meta's
+  CDN (``dl.fbaipublicfiles.com/mms/``), which publishes no checksums, so the files are
+  checked against sha256 values pinned in ``mstar/model/omnilingual_asr/config.py``
+  (computed from our downloads); ``v1`` comes from the ``facebook/omniASR-CTC-*`` Hub repos
+  at pinned revisions. ``checkpoint_path`` / ``tokenizer_path`` take local files instead.
+- Preprocessing follows the reference exactly: decode at the file's rate, resample each
+  channel to 16 kHz (torchaudio), average the channels, normalize the utterance to zero
+  mean and unit variance. ``/v1/audio/transcriptions`` transcribes a clip of up to 20 s
+  whole and cuts a longer upload into the fewest windows of at most 16 s, of about equal
+  length, each ending at the quietest 0.1 s within 5 s of its boundary, transcribed in
+  parallel. The model hears up to 40 s (the reference's limit, and the cap for
+  ``window_seconds`` in ``extra_body``, which sets both lengths for one request), but on
+  FLEURS concatenations 40 s windows give more than twice the character error rate of
+  this policy. ``/generate`` refuses a clip over 40 s with a 400 rather than truncating it.
+- The CTC head covers every language at once: ``language``, ``prompt`` and ``temperature``
+  have no effect (the reference ignores a language code for CTC models too), and
+  decoding is a per-frame argmax. There are no timestamps: ``srt`` / ``vtt`` get one cue
+  spanning the file and ``verbose_json`` an empty segment list. Nothing detects the
+  language either: ``verbose_json``'s ``language`` is the request's ``language`` as given,
+  or null. ``/v1/realtime`` is not supported.
+- ``dtype`` defaults to ``bfloat16``, the reference's inference dtype; ``float32`` also
+  turns off TF32 for the node's matmuls. ``max_batch_size`` (16) caps the requests in one
+  step; the step sorts them by length and splits them so that each forward's padded audio
+  (rows times the longest clip) stays within ``max_batch_seconds`` (320). In bf16 a
+  request batched with others can differ from the same request run alone where two
+  characters nearly tie, as the reference's own batched ``transcribe`` does;
+  ``max_batch_size: 1`` or ``dtype: float32`` give batch-invariant transcripts.
+- Parity scripts against Meta's pipeline live in ``test/omnilingual_asr/``
+  (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
+  fairseq2).
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
@@ -337,6 +392,26 @@ Qwen3-TTS notes
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML halves its GPU time when throughput matters more than
   bit-exactness (the Talker is bf16 either way).
+- Opt-in AudioSeal watermark on the codec's output (off by default; install
+  ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
+
+     model_kwargs:
+       audio_watermark:
+         enabled: true      # default false
+         message: 0xBEEF    # 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)
+         alpha: 1.0         # strength, in (0, 4] (default 1.0)
+         generator: audioseal_wm_streaming   # AudioSeal card name or checkpoint path (default)
+
+  Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
+  without the package. Each request's PCM is marked chunk by chunk with its own
+  streaming state, so a streamed utterance carries the same mark as a whole one.
+  Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
+  (``--message``, the deployment's payload: without it the verdict is the
+  score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
+  ``--threshold``, default 0.5; ``--device``; needs ``.[audio]`` for
+  ``soundfile``); a file at another rate than 24 kHz is resampled to 24 kHz
+  first, since the mark is found only at the rate it was added at. Detect on
+  whole utterances: a clip under a few seconds can miss the mark. The helper lives in ``mstar/model/audio_watermark.py``.
 - Weight loading checks coverage in both directions: a parameter the checkpoint
   does not fill, or a checkpoint tensor the port does not load, fails startup.
 - The 12 Hz codec does not require the system SoX executable. M* imports only

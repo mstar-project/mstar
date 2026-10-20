@@ -335,6 +335,11 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # Keys only this model's process_prompt sets (prompt layouts, stream
+    # leads) for the conductor to read back from model_kwargs. The data
+    # worker drops a client's values for them before process_prompt.
+    INTERNAL_KWARGS: tuple[str, ...] = ()
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's
@@ -750,17 +755,31 @@ class Model(ABC):
         """
         pass
 
+    def max_input_files(self) -> dict[str, int]:
+        """Most files of each input modality one request may attach, e.g.
+        ``{"audio": 1}``. The data worker refuses a request over it before
+        decoding any file; a modality left out is held only to
+        ``MSTAR_MAX_MEDIA_FILES``."""
+        return {}
+
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        img = read_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float().div_(255.0)
+        # RGB whatever the file holds: image processors cannot place the
+        # channel axis of a 4-channel (RGBA or CMYK) image.
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
+        # FFmpeg build torchcodec happens to load (some base images ship a
+        # video-only one); torchcodec for the other containers.
+        from mstar.model.components.audio_features import load_audio_file
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):

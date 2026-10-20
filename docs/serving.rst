@@ -35,6 +35,10 @@ mstar serve
    * - ``--port``
      - ``8000``
      - HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -117,6 +121,10 @@ mstar-serve
    * - ``--host`` / ``--port``
      - ``0.0.0.0`` / ``8000``
      - Bind address / HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       (see :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -161,6 +169,41 @@ mstar-serve
    whereas ``mstar-serve`` defaults to ``RDMA``. On a single node without RDMA, pass
    ``--tensor-comm-protocol SHM`` to ``mstar-serve``.
 
+.. _api-key:
+
+API key
+-------
+
+Both commands listen on all interfaces by default and accept requests from anyone who
+can reach the port. If no gateway in front of the server authenticates clients, set a
+key or bind ``--host 127.0.0.1``; the server logs a warning at startup while no key is
+set.
+
+.. code-block:: bash
+
+   export MSTAR_API_KEY="$(openssl rand -hex 32)"
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+
+With a key set, every HTTP route except ``/health`` answers ``401`` unless the request
+carries ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
+``/generate/ws``) refuse the handshake without it. The check is one middleware over the
+whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+however much of the key matches. CORS preflights still get their answer, since browsers
+send them without credentials. ``--api-key`` overrides the environment variable, but
+prefer the variable: a command-line flag is visible to every local user in the process
+list. An empty value turns the check off, so ``--api-key ""`` disables a key set in the
+environment, and so does a variable that expands to nothing (``--api-key "$UNSET_VAR"``).
+
+Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
+``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
+:doc:`clients`. The standalone Nemotron realtime server
+(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
+variable.
+
+Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
+``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
+Dynamo's frontend or a gateway in front of it.
+
 Config files
 ------------
 
@@ -186,6 +229,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue.
+   * - ``gpu_memory_fraction``
+     - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
+       done, for workers that share a GPU (see below). Unset, capture plans against
+       whatever is free.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``speculation_mixes_walks``
@@ -268,6 +315,13 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Talker], ranks: [0]}
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
+
+At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws
+away, then captures the cheapest buckets across all of them while its largest eager step
+still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
+other's memory only as used, so the first to capture can take the other's room. Set
+``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
+counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:

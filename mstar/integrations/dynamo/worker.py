@@ -56,8 +56,13 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     """Start conductor + GPU workers and the API-server core (no HTTP)."""
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
+    from mstar.api_server.auth import keep_api_key_from_children
     from mstar.api_server.entrypoint import APIServer, _conductor_process_target
     from mstar.communication.communicator import CommProtocol
+
+    # Dynamo's frontend serves HTTP here; this worker never checks a key, so
+    # an exported one must not reach the conductor and workers either.
+    keep_api_key_from_children(None)
     from mstar.model.registry import get_model_class, model_init_kwargs
 
     with open(args.config) as f:

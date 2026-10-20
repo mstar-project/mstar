@@ -449,13 +449,13 @@ class FlashInferMixedWrapper:
         )
         self._decode = FlashInferDecodeWrapper(
             workspace_buffer=decode_workspace, batch_size=batch_size,
-            max_num_pages=max_num_pages, use_cuda_graph=True, **kv,
+            max_num_pages=max_num_pages, accelerator_graph=True, **kv,
         )
         # one row past the prompt rows takes the step's other tokens (see `plan`)
         self._prefill = FlashInferPrefillWrapper(
             workspace_buffer=prefill_workspace, batch_size=max_prefill_rows + 1,
             max_total_tokens=max_total_tokens, max_num_pages=max_num_pages,
-            use_cuda_graph=True, **kv,
+            accelerator_graph=True, **kv,
         )
         i64 = dict(dtype=torch.int64, device=device)
         self._perm = torch.zeros(max_total_tokens, **i64)

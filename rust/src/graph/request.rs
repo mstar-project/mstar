@@ -104,7 +104,8 @@ pub struct PendingOutputs {
     /// signal -> uuids. Uuids, not descriptors: the bookkeeper is shared, so
     /// resolving at send time cannot go stale against it.
     pub persist: Vec<(Sym, Vec<u64>)>,
-    pub new_tokens: Vec<(String, i64)>,
+    /// partition -> signal -> count; each report carries its own partition's.
+    pub new_tokens: Vec<(PartitionId, Vec<(String, i64)>)>,
     /// Emitted signal names, in emission order.
     pub output_signals: Vec<Sym>,
     /// signal -> the loop context it was emitted at.
@@ -114,10 +115,16 @@ pub struct PendingOutputs {
 impl PendingOutputs {
     /// Everything but `output_loop_indices`, which the conductor keeps for the
     /// life of the request -- Python re-sends it on every WGD.
-    pub fn take_for_send(&mut self) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+    pub fn take_for_send(
+        &mut self, partition: Option<PartitionId>,
+    ) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+        let new_tokens = match self.new_tokens.iter().position(|(p, _)| Some(*p) == partition) {
+            Some(i) => self.new_tokens.swap_remove(i).1,
+            None => Vec::new(),
+        };
         (
             std::mem::take(&mut self.persist),
-            std::mem::take(&mut self.new_tokens),
+            new_tokens,
             std::mem::take(&mut self.output_signals),
         )
     }
@@ -142,11 +149,19 @@ impl PendingOutputs {
 
     /// Accumulate, matching Python: a repeated signal's count adds up, and a
     /// repeated loop index overwrites.
-    pub fn add_new_tokens(&mut self, counts: &[(String, i64)]) {
+    pub fn add_new_tokens(&mut self, partition: PartitionId, counts: &[(String, i64)]) {
+        let i = match self.new_tokens.iter().position(|(p, _)| *p == partition) {
+            Some(i) => i,
+            None => {
+                self.new_tokens.push((partition, Vec::new()));
+                self.new_tokens.len() - 1
+            }
+        };
+        let pending = &mut self.new_tokens[i].1;
         for (name, n) in counts {
-            match self.new_tokens.iter_mut().find(|(k, _)| k == name) {
+            match pending.iter_mut().find(|(k, _)| k == name) {
                 Some((_, v)) => *v += n,
-                None => self.new_tokens.push((name.clone(), *n)),
+                None => pending.push((name.clone(), *n)),
             }
         }
     }
@@ -227,6 +242,21 @@ mod tests {
             loop_indices: idx,
             wg_fwd_pass_idx: fwd,
         }
+    }
+
+    #[test]
+    fn new_tokens_drain_only_for_the_reporting_partition() {
+        let mut p = PendingOutputs::default();
+        p.add_new_tokens(1, &[("tok".to_string(), 1)]);
+        p.add_new_tokens(1, &[("tok".to_string(), 2)]);
+        p.add_new_tokens(2, &[("audio".to_string(), 4)]);
+        let (_, n, _) = p.take_for_send(Some(2));
+        assert_eq!(n, vec![("audio".to_string(), 4)]);
+        let (_, n, _) = p.take_for_send(None);
+        assert!(n.is_empty());
+        let (_, n, _) = p.take_for_send(Some(1));
+        assert_eq!(n, vec![("tok".to_string(), 3)]);
+        assert!(p.new_tokens.is_empty());
     }
 
     #[test]

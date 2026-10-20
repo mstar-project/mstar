@@ -16,6 +16,9 @@ import pytest
 import mstar.model
 from mstar.model.submodule_base import NodeSubmodule
 
+# The package walk below imports every model, and some import flashinfer.
+pytest.importorskip("flashinfer")
+
 
 def _all_subclasses(cls: type) -> set[type]:
     subs = set(cls.__subclasses__())

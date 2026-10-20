@@ -152,9 +152,10 @@ class Qwen3OmniModel(Model):
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
 
-        # Tokenizer (Thinker uses a Qwen-family tokenizer)
+        # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
+        # in transformers, so no loader here runs code from the checkpoint repo.
         self.tokenizer = AutoTokenizer.from_pretrained(
-            local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            local_dir, cache_dir=cache_dir, trust_remote_code=False,
         )
 
         # Full multimodal processor: combines tokenizer + image_processor +
@@ -164,7 +165,7 @@ class Qwen3OmniModel(Model):
         try:
             from transformers import AutoProcessor
             self._processor = AutoProcessor.from_pretrained(
-                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+                local_dir, cache_dir=cache_dir, trust_remote_code=False,
             )
         except Exception as e:
             logger.warning(
@@ -1575,7 +1576,7 @@ class Qwen3OmniModel(Model):
         # Load config only (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # This should be a Qwen3OmniMoeConfig
@@ -1616,7 +1617,7 @@ class Qwen3OmniModel(Model):
         # Load full config (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # Extract the vision sub-config
