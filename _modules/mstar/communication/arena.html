@@ -1789,7 +1789,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_start_read_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_evict_dead_peers</span><span class="p">()</span>
         <span class="n">h2d_did_work</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="n">read_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span>
+        <span class="c1"># one per edge read; the future is filled in once every copy is queued</span>
+        <span class="n">reads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">FutureAndPointers</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
@@ -1800,6 +1802,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                     <span class="k">continue</span>
                 <span class="n">rx_t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+                <span class="n">fp</span> <span class="o">=</span> <span class="n">FutureAndPointers</span><span class="p">(</span>
+                    <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
+                <span class="p">)</span>
                 <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">_slice_existing_tensor</span><span class="p">(</span>
@@ -1830,8 +1835,10 @@ window.runMermaid = runMermaid;</script>
                     <span class="c1"># +1 transit (released by get_ready_tensors), +1 usage</span>
                     <span class="c1"># (released by _cleanup_consumed_inputs).</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
-                <span class="n">read_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                    <span class="p">(</span><span class="n">graph_edge</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span><span class="p">))</span>
+                    <span class="k">if</span> <span class="n">stats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">fp</span><span class="o">.</span><span class="n">count_read</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+                <span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span>
+                <span class="n">reads</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
         <span class="n">future</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">h2d_did_work</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># Downstream kernels see the data (device-side ordering only).</span>
@@ -1844,13 +1851,9 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># queued on the h2d stream in program order. get_ready_tensors</span>
             <span class="c1"># polls it — no host block here.</span>
             <span class="n">future</span> <span class="o">=</span> <span class="n">_CudaEventFuture</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
-        <span class="k">for</span> <span class="n">graph_edge</span><span class="p">,</span> <span class="n">rx_time</span> <span class="ow">in</span> <span class="n">read_edges</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="n">FutureAndPointers</span><span class="p">(</span>
-                    <span class="n">future</span><span class="o">=</span><span class="n">future</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span>
-                    <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span> <span class="n">rx_time</span><span class="o">=</span><span class="n">rx_time</span><span class="p">,</span>
-                <span class="p">)</span>
-            <span class="p">)</span>
+        <span class="k">for</span> <span class="n">fp</span> <span class="ow">in</span> <span class="n">reads</span><span class="p">:</span>
+            <span class="n">fp</span><span class="o">.</span><span class="n">future</span> <span class="o">=</span> <span class="n">future</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">reads</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">[]</span>
         <span class="c1"># A real Future for the worker's eventfd (EventWakeup.register_</span>

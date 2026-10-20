@@ -24,6 +24,7 @@ mstar.observability.recorders
    .. autosummary::
    
       Counter
+      EdgeTransfers
       Gauge
       Histogram
       MetricSnapshot

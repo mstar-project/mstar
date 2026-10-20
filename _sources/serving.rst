@@ -599,6 +599,38 @@ them with ``rate()`` or ``increase()``.
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.
 
+Tensor transfers between graph nodes (:ref:`tensor transport <tensor-transport>`) are
+counted by the reader, once per edge read: the tensors of one graph edge that one worker
+read from one producer. The workers send them with the engine metrics above, and the
+API server adds the results its data worker read:
+
+- ``mstar_transfer_bytes_total{model_name, src, dst, transport}``: counter, tensor bytes
+  read over the edge.
+- ``mstar_transfers_total{model_name, src, dst, transport}``: counter, tensors read over
+  the edge.
+- ``mstar_transfer_seconds{model_name, src, dst, transport}``: histogram, one observation
+  per edge read: the reader's time to read that edge's tensors, which is the SHM file
+  read and copy, the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of
+  the arena only issues its host-to-device copies in that time; they finish
+  asynchronously. The producer's own work (serializing, staging into the arena,
+  registering memory) is not included; it is the ``tx`` time of
+  :ref:`request profiling <request-profiling>`.
+
+``src`` is the graph node that produced the tensors and ``dst`` the node that reads them.
+An edge the conductor joined from several producers (one input name produced in several
+walks or nodes) is one read per producing node, with its read time split between them by
+bytes.
+``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
+which the API server's data worker sends and reads. ``transport`` is the protocol:
+``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
+Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
+report the same series. A tensor already on the reader (one it made, or one it read once
+for two of its nodes) moves nothing and is not counted. With tensor parallelism every
+rank counts its own read, of its slice or of the whole tensor when the edge is
+replicated, so an edge two ranks read is two reads. As above, the workers' counts include
+the warmup requests (the data worker counts from when metrics are enabled), so read them
+with ``rate()`` or ``increase()``.
+
 Where a successful request's time went, from the timestamps every request already
 carries (same ``model_name`` and ``output_modalities`` labels; the conductor's
 timestamps are compared with the API server's, which assumes both run on one host, as

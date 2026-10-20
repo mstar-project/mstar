@@ -1314,8 +1314,8 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">WorkerStatus</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""A worker's engine metrics, sent once per status interval only while</span>
-<span class="sd">    metrics are on: cumulative or current values per graph node, never</span>
-<span class="sd">    per-request data."""</span>
+<span class="sd">    metrics are on: cumulative or current values per graph node or tensor</span>
+<span class="sd">    edge, never per-request data."""</span>
     <span class="n">worker_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">metrics</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]</span></div>
 

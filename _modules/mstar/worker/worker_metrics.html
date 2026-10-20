@@ -930,13 +930,15 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""The engine worker's metrics, built only while metrics are on.</span>
 
 <span class="sd">Steps are recorded on the main thread as they finish (two histogram bumps, no</span>
-<span class="sd">per-request work). Everything else is sampled at most once per status</span>
+<span class="sd">per-request work), and the tensor manager records each edge it reads</span>
+<span class="sd">(``EdgeTransfers``). Everything else is sampled at most once per status</span>
 <span class="sd">interval, when the worker sends the conductor one ``WorkerStatus`` with</span>
 <span class="sd">cumulative snapshots; the conductor forwards them to the API server.</span>
 
-<span class="sd">Only nodes this rank leads are reported (``components``): the other ranks of a</span>
-<span class="sd">lockstep instance run the same steps over the same page counts, and recording</span>
-<span class="sd">never changes what any rank runs.</span>
+<span class="sd">Engine families cover only the nodes this rank leads (``components``): the</span>
+<span class="sd">other ranks of a lockstep instance run the same steps over the same page</span>
+<span class="sd">counts. Transfers are every rank's own reads (each reads its slice).</span>
+<span class="sd">Recording never changes what any rank runs.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -947,7 +949,13 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability</span><span class="w"> </span><span class="kn">import</span> <span class="n">catalog</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">Counter</span><span class="p">,</span> <span class="n">Gauge</span><span class="p">,</span> <span class="n">Histogram</span><span class="p">,</span> <span class="n">MetricSnapshot</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">Counter</span><span class="p">,</span>
+    <span class="n">EdgeTransfers</span><span class="p">,</span>
+    <span class="n">Gauge</span><span class="p">,</span>
+    <span class="n">Histogram</span><span class="p">,</span>
+    <span class="n">MetricSnapshot</span><span class="p">,</span>
+<span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.ipc_format</span><span class="w"> </span><span class="kn">import</span> <span class="n">WorkerStatus</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
@@ -969,6 +977,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">engine</span><span class="p">:</span> <span class="n">Engine</span><span class="p">,</span>
         <span class="n">scheduler</span><span class="p">:</span> <span class="n">MicroScheduler</span><span class="p">,</span>
         <span class="n">send</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">WorkerStatus</span><span class="p">],</span> <span class="kc">None</span><span class="p">],</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">transfers</span><span class="p">:</span> <span class="n">EdgeTransfers</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">worker_id</span> <span class="o">=</span> <span class="n">worker_id</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">components</span> <span class="o">=</span> <span class="n">components</span>
@@ -977,6 +987,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_report_failed</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_scheduler</span> <span class="o">=</span> <span class="n">scheduler</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span> <span class="o">=</span> <span class="n">send</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_transfers</span> <span class="o">=</span> <span class="n">transfers</span>
         <span class="c1"># (resource key, its reported nodes, cache); a cache only follower</span>
         <span class="c1"># nodes use is left to their lead rank</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv</span> <span class="o">=</span> <span class="p">[</span>
@@ -1054,14 +1065,15 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># the caches keep cumulative totals, so these are set, not added</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_query</span><span class="o">.</span><span class="n">set</span><span class="p">((</span><span class="n">node</span><span class="p">,),</span> <span class="n">queried</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_hit</span><span class="o">.</span><span class="n">set</span><span class="p">((</span><span class="n">node</span><span class="p">,),</span> <span class="n">hit</span><span class="p">)</span>
-        <span class="n">pending</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_scheduler</span><span class="o">.</span><span class="n">pending_rows</span><span class="p">()</span>
+        <span class="c1"># a rank leading no node reports only its transfers</span>
+        <span class="n">pending</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_scheduler</span><span class="o">.</span><span class="n">pending_rows</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">components</span> <span class="k">else</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">components</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="o">.</span><span class="n">set</span><span class="p">((</span><span class="n">node</span><span class="p">,),</span> <span class="n">pending</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_kv_used</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_total</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cached</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_step_seconds</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_batch_size</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_query</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_hit</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_transfers</span><span class="o">.</span><span class="n">snapshot</span><span class="p">(),</span>
         <span class="p">]</span></div>
 </div>
 

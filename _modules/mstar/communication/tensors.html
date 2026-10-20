@@ -952,6 +952,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">TensorStore</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ShardingConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.catalog</span><span class="w"> </span><span class="kn">import</span> <span class="n">TRANSFER_API_SERVER</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">EdgeTransfers</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.format</span><span class="w"> </span><span class="kn">import</span> <span class="n">RxInfo</span><span class="p">,</span> <span class="n">TxInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.containers</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelList</span>
 
@@ -969,6 +971,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">BaseCommunicator</span><span class="p">,</span>
     <span class="n">CommProtocol</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensor_uuid</span><span class="w"> </span><span class="kn">import</span> <span class="n">_DATA_WORKER</span> <span class="k">as</span> <span class="n">_DATA_WORKER_ENTITY</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensor_uuid</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorUuidMinter</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">NodeAndGraphWalk</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.ipc_format</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorReceived</span><span class="p">,</span> <span class="n">WorkerMessage</span><span class="p">,</span> <span class="n">WorkerMessageType</span>
@@ -1004,7 +1007,41 @@ window.runMermaid = runMermaid;</script>
     <span class="n">future</span><span class="p">:</span> <span class="n">Future</span> <span class="o">|</span> <span class="kc">None</span>
     <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span> <span class="o">=</span> <span class="s2">""</span>
-    <span class="n">rx_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># seconds</span></div>
+    <span class="n">rx_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># seconds</span>
+    <span class="c1"># What the read moved over the transport (see count_read), set only while</span>
+    <span class="c1"># transfer metrics are on and cleared once counted. Unannotated, so class</span>
+    <span class="c1"># attributes rather than fields: a read with them off stores nothing more.</span>
+    <span class="n">read_src</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">read_bytes</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">read_tensors</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># src -&gt; [bytes, tensors] for producers after the first: the conductor</span>
+    <span class="c1"># joins one name produced in several walks or nodes into one edge</span>
+    <span class="n">read_more</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="FutureAndPointers.count_read">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.FutureAndPointers.count_read">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">count_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Count one tensor this read moved over the transport."""</span>
+        <span class="n">src</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">_source_node_name</span>
+        <span class="k">if</span> <span class="n">src</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># The data worker mints the request's inputs outside any node.</span>
+            <span class="c1"># Every worker output carries its node; the entity id is a</span>
+            <span class="c1"># bounded fallback should one ever arrive without.</span>
+            <span class="n">src</span> <span class="o">=</span> <span class="p">(</span><span class="n">TRANSFER_API_SERVER</span> <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="n">_DATA_WORKER_ENTITY</span>
+                   <span class="k">else</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">src</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_src</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">read_bytes</span> <span class="o">+=</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">read_tensors</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_src</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">read_src</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_tensors</span> <span class="o">=</span> <span class="n">src</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="mi">1</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">more</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_more</span>
+            <span class="k">if</span> <span class="n">more</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">more</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_more</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="n">row</span> <span class="o">=</span> <span class="n">more</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span>
+            <span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+=</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span>
+            <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span></div>
+</div>
 
 
 
@@ -1186,10 +1223,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">engine</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span>
         <span class="n">max_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span>
         <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">500</span><span class="p">,</span>
-        <span class="n">enable_prof</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span> <span class="o">=</span> <span class="n">engine</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span> <span class="o">=</span> <span class="n">enable_prof</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="n">ThreadPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="n">max_workers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Future</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1241,10 +1276,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">if</span> <span class="n">status</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mooncake read failed. Status: </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+        <span class="c1"># The caller points every read of one edge at its FutureAndPointers</span>
+        <span class="c1"># only when it wants the time (--log-stats or transfer metrics).</span>
+        <span class="k">if</span> <span class="n">read_info</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">fp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">fp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="n">info</span><span class="o">.</span><span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="p">(</span><span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span><span class="p">)</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="p">(</span><span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span><span class="p">)</span>
 
 <div class="viewcode-block" id="AsyncMooncakeReader.wait_all">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncMooncakeReader.wait_all">[docs]</a>
@@ -1475,6 +1511,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    key -- only ``rid_to_str`` cares, and its default (``str``) is the</span>
 <span class="sd">    identity on strings.</span>
 <span class="sd">    """</span>
+
+    <span class="c1"># Transfer metrics, off until enable_transfer_metrics(); class-level so a</span>
+    <span class="c1"># manager built without __init__ reads them as off too.</span>
+    <span class="n">transfer_stats</span><span class="p">:</span> <span class="n">EdgeTransfers</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_transfer_dst</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1">#: The ``transport`` label: the protocol the bytes move over.</span>
+    <span class="n">transport_label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">SHM</span><span class="o">.</span><span class="n">value</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -2334,12 +2377,44 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="TensorCommunicationManager.enable_transfer_metrics">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.enable_transfer_metrics">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_transfer_metrics</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">EdgeTransfers</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Count what this manager reads from now on (see ``EdgeTransfers``).</span>
+<span class="sd">        Called once, before or while reads run on the reading thread."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span> <span class="o">==</span> <span class="n">_DATA_WORKER_ENTITY</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_dst</span> <span class="o">=</span> <span class="n">TRANSFER_API_SERVER</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span> <span class="o">=</span> <span class="n">EdgeTransfers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">transport_label</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_record_transfer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stats</span><span class="p">:</span> <span class="n">EdgeTransfers</span><span class="p">,</span> <span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One delivered edge read: one transfer per producing node. The edge</span>
+<span class="sd">        is read as a whole, so an edge joined from several producers splits</span>
+<span class="sd">        its read time between them by bytes (by tensors if it moved none)."""</span>
+        <span class="n">src</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span>
+        <span class="c1"># Counted once: a later future that raises leaves this entry pending</span>
+        <span class="c1"># for the next poll.</span>
+        <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">dst</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_dst</span> <span class="ow">or</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">next_node</span>
+        <span class="n">seconds</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">rx_time</span> <span class="ow">or</span> <span class="mf">0.0</span>
+        <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_more</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">stats</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_tensors</span><span class="p">,</span> <span class="n">seconds</span><span class="p">)</span>
+            <span class="k">return</span>
+        <span class="n">rows</span> <span class="o">=</span> <span class="p">{</span><span class="n">src</span><span class="p">:</span> <span class="p">[</span><span class="n">ep</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_tensors</span><span class="p">],</span> <span class="o">**</span><span class="n">ep</span><span class="o">.</span><span class="n">read_more</span><span class="p">}</span>
+        <span class="n">total</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+        <span class="n">col</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">total</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="n">total</span> <span class="o">=</span> <span class="n">total</span> <span class="ow">or</span> <span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+        <span class="k">for</span> <span class="n">src</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">rows</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">stats</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">seconds</span> <span class="o">*</span> <span class="n">row</span><span class="p">[</span><span class="n">col</span><span class="p">]</span> <span class="o">/</span> <span class="n">total</span><span class="p">)</span>
+
 <div class="viewcode-block" id="TensorCommunicationManager.get_ready_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_ready_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]:</span>
         <span class="n">ready</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">still_pending</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">uuid_to_time</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span>
         <span class="c1"># the async reader finishes a request's reads in any order, so a read</span>
         <span class="c1"># that is done waits for the ones started before it: a streamed token</span>
         <span class="c1"># must not reach the client ahead of the one before it</span>
@@ -2349,6 +2424,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">done</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">waiting</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">stats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_transfer</span><span class="p">(</span><span class="n">stats</span><span class="p">,</span> <span class="n">ep</span><span class="p">)</span>
                 <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">:</span>
                     <span class="n">ready</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
@@ -2692,10 +2769,11 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the consumer has the engine copy ``nbytes`` from ``address + offset``</span>
         <span class="c1"># into a buffer it views with the descriptor's strides</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span> <span class="o">=</span> <span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span> <span class="o">=</span> <span class="n">AsyncMooncakeReader</span><span class="p">(</span>
-            <span class="n">engine</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
-            <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span>
-        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span> <span class="o">=</span> <span class="n">AsyncMooncakeReader</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">transport_label</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span><span class="o">.</span><span class="n">value</span>
 
 <div class="viewcode-block" id="MooncakeCommunicationManager.register_for_send">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send">[docs]</a>
@@ -2782,6 +2860,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Future</span><span class="p">]:</span>
         <span class="n">futures</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span>
         <span class="k">for</span> <span class="n">graph_edge</span> <span class="ow">in</span> <span class="n">graph_edges</span><span class="p">:</span>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">continue</span>
@@ -2792,6 +2871,13 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
             <span class="n">read_info</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="c1"># Created before the reads and pointed at by each of them, so the</span>
+            <span class="c1"># async reader can stamp ``rx_time`` on it when the read completes</span>
+            <span class="c1"># (the reader runs on another thread; the object identity is</span>
+            <span class="c1"># stable, only ``.future`` is filled in after submit).</span>
+            <span class="n">fp</span> <span class="o">=</span> <span class="n">FutureAndPointers</span><span class="p">(</span>
+                <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span>
+            <span class="p">)</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_slice_existing_tensor</span><span class="p">(</span>
@@ -2816,6 +2902,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># +1 for graph-node usage (released by _cleanup_consumed_inputs)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span>
                 <span class="p">)</span>
+                <span class="k">if</span> <span class="n">stats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">fp</span><span class="o">.</span><span class="n">count_read</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
                 <span class="c1"># Nothing to read, and Mooncake rejects a 0-byte region: the</span>
                 <span class="c1"># empty buffer is the whole tensor. With no reads, the edge</span>
                 <span class="c1"># gets no future and is ready once earlier reads are.</span>
@@ -2832,14 +2920,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">nbytes</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span>
                 <span class="p">))</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Started transfer read for uuid </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
-            <span class="c1"># Create the FutureAndPointers before submit and point each read at</span>
-            <span class="c1"># it, so the async reader can stamp ``rx_time`` on it when the read</span>
-            <span class="c1"># completes (the reader runs on another thread; the object identity</span>
-            <span class="c1"># is stable, only ``.future`` is filled in after submit).</span>
-            <span class="n">fp</span> <span class="o">=</span> <span class="n">FutureAndPointers</span><span class="p">(</span>
-                <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span>
-            <span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span> <span class="ow">or</span> <span class="n">fp</span><span class="o">.</span><span class="n">read_src</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">ri</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
                     <span class="n">ri</span><span class="o">.</span><span class="n">fp</span> <span class="o">=</span> <span class="n">fp</span>
             <span class="n">fut</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">read_info</span><span class="p">)</span>
@@ -3127,6 +3208,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># consumer's in-flight default-stream work. We make default wait</span>
         <span class="c1"># for the H2D stream at the end so downstream kernels see the data.</span>
         <span class="n">h2d_did_work</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_stats</span>
         <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
@@ -3141,6 +3223,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="nb">len</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">),</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">,</span>
                 <span class="p">)</span>
                 <span class="n">rx_t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+                <span class="n">fp</span> <span class="o">=</span> <span class="n">FutureAndPointers</span><span class="p">(</span>
+                    <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
+                <span class="p">)</span>
                 <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">_slice_existing_tensor</span><span class="p">(</span>
@@ -3170,14 +3255,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="c1"># +1 for transit (released by get_ready_tensors)</span>
                     <span class="c1"># +1 for graph-node usage (released by _cleanup_consumed_inputs)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">stats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">fp</span><span class="o">.</span><span class="n">count_read</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"SHM: read tensor </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                    <span class="n">FutureAndPointers</span><span class="p">(</span>
-                        <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span>
-                        <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
-                        <span class="n">rx_time</span><span class="o">=</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span><span class="p">,</span>
-                    <span class="p">)</span>
-                <span class="p">)</span>
+                <span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">h2d_did_work</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[]</span></div>

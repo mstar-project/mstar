@@ -640,6 +640,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Counter.inc"><code class="docutils literal notranslate"><span class="pre">Counter.inc()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.publish"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.record"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.record()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.snapshot"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.snapshot()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Gauge"><code class="docutils literal notranslate"><span class="pre">Gauge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Gauge.set"><code class="docutils literal notranslate"><span class="pre">Gauge.set()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Gauge.snapshot"><code class="docutils literal notranslate"><span class="pre">Gauge.snapshot()</span></code></a></li>
@@ -677,7 +683,8 @@
 <code class="docutils literal notranslate"><span class="pre">snapshot()</span></code> on a message the API server already receives; the API server
 exports the latest snapshot of each family. Snapshots are cumulative, never
 deltas, so a lost or reordered message cannot corrupt a counter.</p>
-<p>Not thread-safe: update and snapshot a recorder from one thread.</p>
+<p>Not thread-safe: update and snapshot a recorder from one thread (an
+<code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code> hands <code class="docutils literal notranslate"><span class="pre">latest</span></code> to another thread whole).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -693,13 +700,16 @@ deltas, so a lost or reordered message cannot corrupt a counter.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.recorders.Counter" title="mstar.observability.recorders.Counter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Counter</span></code></a>(family)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.recorders.Gauge" title="mstar.observability.recorders.Gauge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Gauge</span></code></a>(family)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EdgeTransfers</span></code></a>(transport)</p></td>
+<td><p>One tensor manager's transfer families (<code class="docutils literal notranslate"><span class="pre">TRANSFER_BYTES</span></code>, <code class="docutils literal notranslate"><span class="pre">TRANSFERS</span></code>, <code class="docutils literal notranslate"><span class="pre">TRANSFER_SECONDS</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.recorders.Gauge" title="mstar.observability.recorders.Gauge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Gauge</span></code></a>(family)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.recorders.Histogram" title="mstar.observability.recorders.Histogram"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Histogram</span></code></a>(family)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.recorders.Histogram" title="mstar.observability.recorders.Histogram"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Histogram</span></code></a>(family)</p></td>
 <td><p>Fixed buckets from the family.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MetricSnapshot</span></code></a>(name, label_values[, values, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MetricSnapshot</span></code></a>(name, label_values[, values, ...])</p></td>
 <td><p>One family's series, columnar so the wire codec encodes it typed.</p></td>
 </tr>
 </tbody>
@@ -726,6 +736,64 @@ deltas, so a lost or reordered message cannot corrupt a counter.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.observability.recorders.EdgeTransfers">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.observability.recorders.</span></span><span class="sig-name descname"><span class="pre">EdgeTransfers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transport</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/recorders.html#EdgeTransfers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.recorders.EdgeTransfers" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>One tensor manager’s transfer families (<code class="docutils literal notranslate"><span class="pre">TRANSFER_BYTES</span></code>,
+<code class="docutils literal notranslate"><span class="pre">TRANSFERS</span></code>, <code class="docutils literal notranslate"><span class="pre">TRANSFER_SECONDS</span></code>). <code class="docutils literal notranslate"><span class="pre">transport</span></code> is the manager’s
+protocol.</p>
+<p><code class="docutils literal notranslate"><span class="pre">record</span></code> only appends to five columns; <code class="docutils literal notranslate"><span class="pre">snapshot</span></code> folds them into one
+row per (src, dst) once per status interval, so an edge read creates no
+object and touches no per-edge state.</p>
+<p><code class="docutils literal notranslate"><span class="pre">latest</span></code> is the last <code class="docutils literal notranslate"><span class="pre">publish()</span></code>: the data worker publishes from its
+own thread and the API server reads it from another, swapping whole lists.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>transport</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.observability.recorders.EdgeTransfers.publish">
+<span class="sig-name descname"><span class="pre">publish</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/recorders.html#EdgeTransfers.publish"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.recorders.EdgeTransfers.publish" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.observability.recorders.EdgeTransfers.record">
+<span class="sig-name descname"><span class="pre">record</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dst</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nbytes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensors</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seconds</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/recorders.html#EdgeTransfers.record"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.recorders.EdgeTransfers.record" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>src</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>dst</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nbytes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>tensors</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.observability.recorders.EdgeTransfers.snapshot">
+<span class="sig-name descname"><span class="pre">snapshot</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/recorders.html#EdgeTransfers.snapshot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.recorders.EdgeTransfers.snapshot" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><em>MetricSnapshot</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -935,6 +1003,12 @@ replicas of a graph node on different workers, say).</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Counter"><code class="docutils literal notranslate"><span class="pre">Counter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Counter.inc"><code class="docutils literal notranslate"><span class="pre">Counter.inc()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.publish"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.record"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.record()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.EdgeTransfers.snapshot"><code class="docutils literal notranslate"><span class="pre">EdgeTransfers.snapshot()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.Gauge"><code class="docutils literal notranslate"><span class="pre">Gauge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

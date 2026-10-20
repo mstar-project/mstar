@@ -1281,6 +1281,37 @@ Orpheus) count; the cache is off under tensor parallelism.</p></li>
 step on the node is ready (its inputs arrived) and not running: waiting for room in a
 step or for the worker to pick the node.</p></li>
 </ul>
+<p>Tensor transfers between graph nodes (<a class="reference internal" href="#tensor-transport"><span class="std std-ref">tensor transport</span></a>) are
+counted by the reader, once per edge read: the tensors of one graph edge that one worker
+read from one producer. The workers send them with the engine metrics above, and the
+API server adds the results its data worker read:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_transfer_bytes_total{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code>: counter, tensor bytes
+read over the edge.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_transfers_total{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code>: counter, tensors read over
+the edge.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_transfer_seconds{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code>: histogram, one observation
+per edge read: the reader’s time to read that edge’s tensors, which is the SHM file
+read and copy, the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of
+the arena only issues its host-to-device copies in that time; they finish
+asynchronously. The producer’s own work (serializing, staging into the arena,
+registering memory) is not included; it is the <code class="docutils literal notranslate"><span class="pre">tx</span></code> time of
+<a class="reference internal" href="#request-profiling"><span class="std std-ref">request profiling</span></a>.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">src</span></code> is the graph node that produced the tensors and <code class="docutils literal notranslate"><span class="pre">dst</span></code> the node that reads them.
+An edge the conductor joined from several producers (one input name produced in several
+walks or nodes) is one read per producing node, with its read time split between them by
+bytes.
+<code class="docutils literal notranslate"><span class="pre">api_server</span></code> stands for the request’s inputs (as <code class="docutils literal notranslate"><span class="pre">src</span></code>) and its results (as <code class="docutils literal notranslate"><span class="pre">dst</span></code>),
+which the API server’s data worker sends and reads. <code class="docutils literal notranslate"><span class="pre">transport</span></code> is the protocol:
+<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. The
+Python and Rust runtimes and communicators (<code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code>, <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>)
+report the same series. A tensor already on the reader (one it made, or one it read once
+for two of its nodes) moves nothing and is not counted. With tensor parallelism every
+rank counts its own read, of its slice or of the whole tensor when the edge is
+replicated, so an edge two ranks read is two reads. As above, the workers’ counts include
+the warmup requests (the data worker counts from when metrics are enabled), so read them
+with <code class="docutils literal notranslate"><span class="pre">rate()</span></code> or <code class="docutils literal notranslate"><span class="pre">increase()</span></code>.</p>
 <p>Where a successful request’s time went, from the timestamps every request already
 carries (same <code class="docutils literal notranslate"><span class="pre">model_name</span></code> and <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> labels; the conductor’s
 timestamps are compared with the API server’s, which assumes both run on one host, as

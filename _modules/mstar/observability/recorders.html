@@ -934,7 +934,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">exports the latest snapshot of each family. Snapshots are cumulative, never</span>
 <span class="sd">deltas, so a lost or reordered message cannot corrupt a counter.</span>
 
-<span class="sd">Not thread-safe: update and snapshot a recorder from one thread.</span>
+<span class="sd">Not thread-safe: update and snapshot a recorder from one thread (an</span>
+<span class="sd">``EdgeTransfers`` hands ``latest`` to another thread whole).</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -944,7 +945,13 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">accumulate</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.catalog</span><span class="w"> </span><span class="kn">import</span> <span class="n">HISTOGRAM</span><span class="p">,</span> <span class="n">Family</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.catalog</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">HISTOGRAM</span><span class="p">,</span>
+    <span class="n">TRANSFER_BYTES</span><span class="p">,</span>
+    <span class="n">TRANSFER_SECONDS</span><span class="p">,</span>
+    <span class="n">TRANSFERS</span><span class="p">,</span>
+    <span class="n">Family</span><span class="p">,</span>
+<span class="p">)</span>
 
 <span class="n">Labels</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
 
@@ -1033,6 +1040,90 @@ window.runMermaid = runMermaid;</script>
             <span class="n">bucket_counts</span><span class="o">=</span><span class="p">[</span><span class="nb">list</span><span class="p">(</span><span class="n">accumulate</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_counts</span><span class="o">.</span><span class="n">values</span><span class="p">()],</span>
             <span class="n">sums</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_sums</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span>
         <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="EdgeTransfers">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">EdgeTransfers</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One tensor manager's transfer families (``TRANSFER_BYTES``,</span>
+<span class="sd">    ``TRANSFERS``, ``TRANSFER_SECONDS``). ``transport`` is the manager's</span>
+<span class="sd">    protocol.</span>
+
+<span class="sd">    ``record`` only appends to five columns; ``snapshot`` folds them into one</span>
+<span class="sd">    row per (src, dst) once per status interval, so an edge read creates no</span>
+<span class="sd">    object and touches no per-edge state.</span>
+
+<span class="sd">    ``latest`` is the last ``publish()``: the data worker publishes from its</span>
+<span class="sd">    own thread and the API server reads it from another, swapping whole lists.</span>
+<span class="sd">    """</span>
+
+    <span class="c1"># row layout: bytes, tensors, seconds sum, then one count per bucket</span>
+    <span class="n">_BUCKETS0</span> <span class="o">=</span> <span class="mi">3</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">transport</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transport</span> <span class="o">=</span> <span class="n">transport</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_bounds</span> <span class="o">=</span> <span class="n">TRANSFER_SECONDS</span><span class="o">.</span><span class="n">buckets</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_BUCKETS0</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_bounds</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_srcs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_dsts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_bytes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_seconds</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">latest</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snapshot</span><span class="p">()</span>
+
+<div class="viewcode-block" id="EdgeTransfers.record">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers.record">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">record</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">dst</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">tensors</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">seconds</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_srcs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">src</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_dsts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">dst</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_bytes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensors</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_seconds</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seconds</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_fold</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">rows</span><span class="p">,</span> <span class="n">bounds</span><span class="p">,</span> <span class="n">b0</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bounds</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_BUCKETS0</span>
+        <span class="k">for</span> <span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">seconds</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_srcs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dsts</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bytes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seconds</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="n">row</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">))</span>
+            <span class="k">if</span> <span class="n">row</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">row</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">)]</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_width</span> <span class="o">-</span> <span class="n">b0</span><span class="p">)</span>
+            <span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+=</span> <span class="n">nbytes</span>
+            <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="n">tensors</span>
+            <span class="n">row</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">+=</span> <span class="n">seconds</span>
+            <span class="c1"># le is inclusive: a value equal to a bound falls in that bucket.</span>
+            <span class="n">row</span><span class="p">[</span><span class="n">b0</span> <span class="o">+</span> <span class="n">bisect_left</span><span class="p">(</span><span class="n">bounds</span><span class="p">,</span> <span class="n">seconds</span><span class="p">)]</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">for</span> <span class="n">column</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_srcs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dsts</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bytes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seconds</span><span class="p">):</span>
+            <span class="n">column</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+
+<div class="viewcode-block" id="EdgeTransfers.snapshot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers.snapshot">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">snapshot</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_fold</span><span class="p">()</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">labels</span><span class="p">():</span>
+            <span class="k">return</span> <span class="p">[[</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">transport</span><span class="p">]</span> <span class="k">for</span> <span class="n">src</span><span class="p">,</span> <span class="n">dst</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span><span class="p">]</span>
+
+        <span class="n">rows</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rows</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+        <span class="n">b0</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_BUCKETS0</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="n">MetricSnapshot</span><span class="p">(</span><span class="n">TRANSFER_BYTES</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">labels</span><span class="p">(),</span> <span class="p">[</span><span class="nb">float</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">]),</span>
+            <span class="n">MetricSnapshot</span><span class="p">(</span><span class="n">TRANSFERS</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">labels</span><span class="p">(),</span> <span class="p">[</span><span class="nb">float</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">]),</span>
+            <span class="n">MetricSnapshot</span><span class="p">(</span>
+                <span class="n">TRANSFER_SECONDS</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">labels</span><span class="p">(),</span>
+                <span class="n">bucket_counts</span><span class="o">=</span><span class="p">[</span><span class="nb">list</span><span class="p">(</span><span class="n">accumulate</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="n">b0</span><span class="p">:]))</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">],</span>
+                <span class="n">sums</span><span class="o">=</span><span class="p">[</span><span class="n">r</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">],</span>
+            <span class="p">),</span>
+        <span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="EdgeTransfers.publish">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers.publish">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">latest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snapshot</span><span class="p">()</span></div>
 </div>
 
 

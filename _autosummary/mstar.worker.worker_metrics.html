@@ -657,12 +657,14 @@
 <span id="mstar-worker-worker-metrics"></span><h1>mstar.worker.worker_metrics<a class="headerlink" href="#module-mstar.worker.worker_metrics" title="Link to this heading">#</a></h1>
 <p>The engine worker’s metrics, built only while metrics are on.</p>
 <p>Steps are recorded on the main thread as they finish (two histogram bumps, no
-per-request work). Everything else is sampled at most once per status
+per-request work), and the tensor manager records each edge it reads
+(<code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code>). Everything else is sampled at most once per status
 interval, when the worker sends the conductor one <code class="docutils literal notranslate"><span class="pre">WorkerStatus</span></code> with
 cumulative snapshots; the conductor forwards them to the API server.</p>
-<p>Only nodes this rank leads are reported (<code class="docutils literal notranslate"><span class="pre">components</span></code>): the other ranks of a
-lockstep instance run the same steps over the same page counts, and recording
-never changes what any rank runs.</p>
+<p>Engine families cover only the nodes this rank leads (<code class="docutils literal notranslate"><span class="pre">components</span></code>): the
+other ranks of a lockstep instance run the same steps over the same page
+counts. Transfers are every rank’s own reads (each reads its slice).
+Recording never changes what any rank runs.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -674,7 +676,7 @@ never changes what any rank runs.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.WorkerMetrics">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -685,6 +687,7 @@ never changes what any rank runs.</p>
 <li><p><strong>engine</strong> (<em>Engine</em>)</p></li>
 <li><p><strong>scheduler</strong> (<em>MicroScheduler</em>)</p></li>
 <li><p><strong>send</strong> (<em>Callable</em><em>[</em><em>[</em><a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><em>WorkerStatus</em></a><em>]</em><em>, </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>transfers</strong> (<a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><em>EdgeTransfers</em></a>)</p></li>
 </ul>
 </dd>
 </dl>

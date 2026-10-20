@@ -898,7 +898,7 @@
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
-<td><p>A worker's engine metrics, sent once per status interval only while metrics are on: cumulative or current values per graph node, never per-request data.</p></td>
+<td><p>A worker's engine metrics, sent once per status interval only while metrics are on: cumulative or current values per graph node or tensor edge, never per-request data.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1799,8 +1799,8 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">WorkerStatus</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metrics</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#WorkerStatus"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.WorkerStatus" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
 <p>A worker’s engine metrics, sent once per status interval only while
-metrics are on: cumulative or current values per graph node, never
-per-request data.</p>
+metrics are on: cumulative or current values per graph node or tensor
+edge, never per-request data.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

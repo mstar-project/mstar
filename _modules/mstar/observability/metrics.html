@@ -981,7 +981,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">MISSING_DEPENDENCY</span> <span class="o">=</span> <span class="kc">None</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability</span><span class="w"> </span><span class="kn">import</span> <span class="n">catalog</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricSnapshot</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricSnapshot</span><span class="p">,</span> <span class="n">merge</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.entrypoint</span><span class="w"> </span><span class="kn">import</span> <span class="n">PendingRequest</span>
@@ -1085,12 +1085,17 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The families in the conductor's latest status message</span>
 <span class="sd">    (``catalog.STATUS_FAMILIES``), and ``mstar_conductor_status_age_seconds``.</span>
 
+<span class="sd">    ``local`` returns the snapshots this process records itself (the data</span>
+<span class="sd">    worker's transfers), summed into the same families at each scrape.</span>
+
 <span class="sd">    The message thread swaps in each message's snapshots whole and a scrape</span>
 <span class="sd">    reads them whole, so neither needs a lock.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">local</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">model_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_local</span> <span class="o">=</span> <span class="n">local</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_snapshots</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">MetricSnapshot</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># Until the first message, the age counts from enabling metrics, so a</span>
         <span class="c1"># conductor that never reports shows a growing age, not a missing one.</span>
@@ -1127,9 +1132,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">age</span><span class="o">.</span><span class="n">add_metric</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">],</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_received</span><span class="p">)</span>
         <span class="k">yield</span> <span class="n">age</span>
         <span class="n">snapshots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_snapshots</span>
+        <span class="n">local</span> <span class="o">=</span> <span class="p">{</span><span class="n">s</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_local</span><span class="p">()}</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_local</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">family</span> <span class="ow">in</span> <span class="n">catalog</span><span class="o">.</span><span class="n">STATUS_FAMILIES</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
             <span class="n">labels</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="o">*</span><span class="n">family</span><span class="o">.</span><span class="n">labels</span><span class="p">]</span>
             <span class="n">snap</span> <span class="o">=</span> <span class="n">snapshots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">family</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="ow">or</span> <span class="n">MetricSnapshot</span><span class="p">(</span><span class="n">family</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
+            <span class="k">if</span> <span class="n">family</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">local</span><span class="p">:</span>
+                <span class="n">snap</span> <span class="o">=</span> <span class="n">merge</span><span class="p">(</span><span class="n">family</span><span class="p">,</span> <span class="p">[</span><span class="n">snap</span><span class="p">,</span> <span class="n">local</span><span class="p">[</span><span class="n">family</span><span class="o">.</span><span class="n">name</span><span class="p">]])</span>
             <span class="k">if</span> <span class="n">family</span><span class="o">.</span><span class="n">kind</span> <span class="o">==</span> <span class="n">catalog</span><span class="o">.</span><span class="n">HISTOGRAM</span><span class="p">:</span>
                 <span class="n">out</span> <span class="o">=</span> <span class="n">HistogramMetricFamily</span><span class="p">(</span><span class="n">family</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">family</span><span class="o">.</span><span class="n">help</span><span class="p">,</span> <span class="n">labels</span><span class="o">=</span><span class="n">labels</span><span class="p">)</span>
                 <span class="n">le</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_le</span><span class="p">[</span><span class="n">family</span><span class="o">.</span><span class="n">name</span><span class="p">]</span>
@@ -1301,7 +1309,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">in_flight</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">int</span><span class="p">],</span>
         <span class="n">data_worker_queue_depth</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">int</span><span class="p">],</span>
+        <span class="n">local_status</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""``local_status``: status-family snapshots this process records</span>
+<span class="sd">        itself, summed with the conductor's (see ``_ConductorStatus``)."""</span>
         <span class="n">require_prometheus_client</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">model_name</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">content_type</span> <span class="o">=</span> <span class="n">CONTENT_TYPE_LATEST</span>
@@ -1340,7 +1351,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">refusals</span> <span class="o">=</span> <span class="n">_Refusals</span><span class="p">(</span><span class="n">model_name</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">refusals</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_conductor</span> <span class="o">=</span> <span class="n">_ConductorStatus</span><span class="p">(</span><span class="n">model_name</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_conductor</span> <span class="o">=</span> <span class="n">_ConductorStatus</span><span class="p">(</span><span class="n">model_name</span><span class="p">,</span> <span class="n">local_status</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_conductor</span><span class="p">)</span>
 
         <span class="c1"># Where a successful request's time went, from the timestamps it</span>

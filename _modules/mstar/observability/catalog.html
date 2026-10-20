@@ -1039,12 +1039,45 @@ window.runMermaid = runMermaid;</script>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 
+<span class="c1">#: ``src`` / ``dst`` of a tensor edge into or out of the graph: the data</span>
+<span class="c1">#: worker (a thread of the API server) sends the request's inputs and reads</span>
+<span class="c1">#: its results. Every other endpoint is a graph node name.</span>
+<span class="n">TRANSFER_API_SERVER</span> <span class="o">=</span> <span class="s2">"api_server"</span>
+
+<span class="n">_TRANSFER_LABELS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"src"</span><span class="p">,</span> <span class="s2">"dst"</span><span class="p">,</span> <span class="s2">"transport"</span><span class="p">)</span>
+
+<span class="c1"># Counted by the consumer, once per edge read: the tensors of one graph edge it</span>
+<span class="c1"># read from one producer, over the transport (not a tensor already in its own</span>
+<span class="c1"># store). ``transport`` is the protocol: SHM, TCP or RDMA.</span>
+<span class="n">TRANSFER_BYTES</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_transfer_bytes_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Tensor bytes the consumer read from the producer over this edge."</span><span class="p">,</span>
+    <span class="n">_TRANSFER_LABELS</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">TRANSFERS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_transfers_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Tensors the consumer read from the producer over this edge."</span><span class="p">,</span>
+    <span class="n">_TRANSFER_LABELS</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">TRANSFER_SECONDS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_transfer_seconds"</span><span class="p">,</span> <span class="n">HISTOGRAM</span><span class="p">,</span>
+    <span class="s2">"Consumer-side time to read one edge's tensors from the producer (one "</span>
+    <span class="s2">"observation per edge read; the producer's own write or registration is "</span>
+    <span class="s2">"not included)."</span><span class="p">,</span>
+    <span class="n">_TRANSFER_LABELS</span><span class="p">,</span>
+    <span class="n">buckets</span><span class="o">=</span><span class="p">(</span>
+        <span class="mf">0.00001</span><span class="p">,</span> <span class="mf">0.000025</span><span class="p">,</span> <span class="mf">0.00005</span><span class="p">,</span> <span class="mf">0.0001</span><span class="p">,</span> <span class="mf">0.00025</span><span class="p">,</span> <span class="mf">0.0005</span><span class="p">,</span> <span class="mf">0.001</span><span class="p">,</span> <span class="mf">0.0025</span><span class="p">,</span>
+        <span class="mf">0.005</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">,</span> <span class="mf">0.025</span><span class="p">,</span> <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.25</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.5</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">,</span> <span class="mf">10.0</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+
 <span class="c1">#: Families the engine workers report to the conductor (``WorkerStatus``); the</span>
 <span class="c1">#: conductor sums the workers' series and forwards them in its status message.</span>
 <span class="n">WORKER_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
         <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
+        <span class="n">TRANSFER_BYTES</span><span class="p">,</span> <span class="n">TRANSFERS</span><span class="p">,</span> <span class="n">TRANSFER_SECONDS</span><span class="p">,</span>
     <span class="p">)</span>
 <span class="p">}</span>
 
