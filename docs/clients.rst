@@ -89,7 +89,8 @@ that cannot afford an HTTP round trip per step (robot policies, streaming world 
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
-as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
+as a msgpack binary frame (``data`` raw bytes); a field sent as ``null`` counts as
+absent. Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
@@ -122,6 +123,35 @@ flight.
 
 ``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+
+**Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
+request's input open after the opening message, so the opening message may carry no media
+at all. ``{"request_id", "append": [{"name", "data"}]}`` feeds more files to the running
+request, in order, while its output keeps streaming back; ``{"request_id", "end_input":
+true}`` ends the input, alone or on an append (or on the opening message, for a one-shot
+request). The request then finishes as usual. A live call needs a ``request_id``; only the
+socket that opened it can append to it, and closing the socket aborts it. A message with
+``append``, or with ``end_input: true`` and no ``text`` or ``files``, is an append; one that
+opens a request under the call's id gets a 409 and the call goes on. Input resets the
+request timeout. A rejected append (an unknown file type, say) ends the call with its error
+(``status`` 400), and no finish follows, since the audio it carried is lost. So does an
+append the server then fails to load or process (a corrupt file, say), with that failure's
+status, as for a request's own files. An append after ``end_input``, or after the model has
+ended the call, or to a request this socket has no live call under, gets
+``{"request_id", "append": true, "error"}``: a reply to that append, not the end of a request,
+and the call goes on. A call still waiting for a slot (``max_concurrent_requests``) holds
+at most 256 messages of input meanwhile, one per append plus one each for the opening
+message's media and the end of input; the next ends the call with ``status`` 503.
+Other models ignore ``end_input``, and an append to them is rejected. Live input needs the
+Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
+
+.. code-block:: python
+
+   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"]}))
+   for chunk in microphone_chunks():  # e.g. 80 ms WAV files
+       ws.send(msgpack.packb({"request_id": "call",
+                              "append": [{"name": "chunk.wav", "data": chunk}]}))
+   ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
 
 Python SDK
 ----------

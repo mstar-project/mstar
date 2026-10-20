@@ -1090,7 +1090,21 @@ class Worker:
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
-        streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
+        buffers = req_info.stream_buffers if req_info else {}
+        streaming_with_tensors = []
+        unbuffered = []
+        for edge in body.inputs:
+            if edge.is_streaming and edge.tensor_info:
+                (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
+        if unbuffered:
+            # Nothing here will consume it: ack it unread so the producer frees
+            # it. Expected when the request's ingest failed on this worker.
+            if request_id not in self.scheduler.failed_rids:
+                logger.warning(
+                    "Worker %s: no stream buffer for %s of request %s; dropping it",
+                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
+                )
+            self.tensor_manager.ack_unread_tensors(request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another

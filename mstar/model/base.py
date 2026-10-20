@@ -762,6 +762,27 @@ class Model(ABC):
         ``MSTAR_MAX_MEDIA_FILES``."""
         return {}
 
+    def process_stream_chunk(
+        self,
+        tensors: NameToTensorList,
+        input_metadata: dict[str, list[dict]],
+        **kwargs,
+    ) -> NameToTensorList:
+        """Turn one chunk the client appends to a running request into items of
+        the model's client streams (``Connection(from_partition=CLIENT, ...)``).
+
+        Called by the API server data worker for each append, after it has
+        loaded the chunk's files the way it loads a request's
+        (``audio_inputs``, ``image_inputs``, ``video_inputs``). ``kwargs`` are
+        the request's ``model_kwargs``. Returns items by client edge name; each
+        list entry is one item of that stream.
+
+        Keep it stateless: the consuming node folds items into its own state.
+        Tensors ``process_prompt`` returns under a client edge's name are the
+        stream's first chunk, so a one-shot request needs no append.
+        """
+        raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
+
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.

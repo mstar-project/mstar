@@ -6,6 +6,7 @@ import collections
 import itertools
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -35,8 +36,13 @@ from mstar.api_server.auth import (
     warn_if_no_api_key,
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
-from mstar.api_server.data_worker import PreprocessWorker
-from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    ClientAppend,
+    PreprocessInput,
+    ResultChunk,
+)
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
@@ -242,11 +248,21 @@ class PendingRequest:
     output_modalities: list[str]
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
+    # A streaming handler takes the chunks as it delivers them (a live call
+    # can stream for hours); a non-streaming request keeps all of them.
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
-    consumed_chunks: int = 0
+    # per modality, the chunks a streaming handler has taken (--log-stats)
+    delivered: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
+    # Whether the client may still append to the request's client streams, and
+    # when it last did; the request timeout runs from the later of that and
+    # the request's start. input_bytes: the file bytes a live call has sent so
+    # far, opening included, against max_call_input_bytes.
+    input_open: bool = False
+    last_input_time: float = 0.0
+    input_bytes: int = 0
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
@@ -324,6 +340,27 @@ def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
     return header.encode("utf-8") + b"\n", chunk.data
 
 
+def _count_outputs(by_modality: dict[str, OutputInfo], chunks: list[ResultChunk]) -> None:
+    for chunk in chunks:
+        info = by_modality.get(chunk.modality)
+        if info is None:
+            info = by_modality[chunk.modality] = OutputInfo(chunk.modality, count=0, total_bytes=0)
+        info.count += 1
+        info.total_bytes += len(chunk.data)
+
+
+def _call_input_limit(model_config: dict | None) -> int:
+    """The config's ``max_call_input_mb``, in bytes."""
+    mb = (model_config or {}).get("max_call_input_mb", 512)
+    if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
+        raise ValueError(f"max_call_input_mb must be a positive number of MiB, not {mb!r}")
+    return int(mb * (1 << 20))
+
+
+def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
+    return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -371,6 +408,15 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # Requests to a model with client streams keep their input open until
+        # the client ends it (see ``stream_input``).
+        self.takes_stream_input = bool(
+            model is not None and model.get_partition_topology().client_connections()
+        )
+        # The most file bytes one live call may send over its life. A cap on a
+        # call's input, not on memory: decoded input is larger than its files,
+        # and how much waits in buffers depends on how fast the model reads.
+        self.max_call_input_bytes = _call_input_limit(model_config)
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
@@ -381,6 +427,7 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
+            is_pending=self.is_pending,
         )
 
         self._init_request_state()
@@ -542,6 +589,7 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        end_input: bool = True,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -557,6 +605,10 @@ class APIServer:
         A submission under an id whose previous request is still running is
         refused with a 409 and the running one is untouched; once that one has
         finished, failed or been aborted the id is free.
+
+        For a model with client streams, ``end_input=False`` keeps the
+        request's input open for :meth:`stream_input`, which takes the
+        submission's key (:meth:`submission_key`). Other models ignore it.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -577,6 +629,12 @@ class APIServer:
                 "chunks cannot be returned as an aggregated response."
             )
 
+        input_open = not end_input and self.takes_stream_input
+        input_bytes = 0
+        if input_open:
+            input_bytes = _file_bytes(file_paths)
+            self._check_call_input(input_bytes)
+
         # Register pending request
         with self.request_lock:
             if self.fatal_error is not None:
@@ -595,6 +653,8 @@ class APIServer:
                     timing=RequestTiming(recv_time=time.perf_counter()),
                 ),
                 request_id=request_id,
+                input_open=input_open,
+                input_bytes=input_bytes,
             )
         if self.metrics is not None:
             mark_submitted()
@@ -609,6 +669,8 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
         ))
+        if self.takes_stream_input and end_input:
+            self.preprocess_worker.stream_input(ClientAppend(key, done=True))
 
         logger.info(
             "Request %s submitted as %s  in=%s  out=%s",
@@ -657,6 +719,80 @@ class APIServer:
         request_id = self._client_ids.pop(key, None)
         if request_id is not None and self._live.get(request_id) == key:
             del self._live[request_id]
+
+    def stream_input(
+        self,
+        key: str,
+        file_paths: dict[str, list[str]] | None = None,
+        end_input: bool = False,
+    ) -> bool:
+        """Append files to a running request's client streams, then end them
+        if ``end_input``. The preprocess worker deletes the files once loaded.
+
+        Takes the submission's key (:meth:`submission_key`), not its
+        request_id: once a call has finished, its id may already name a newer
+        submission, which its late appends must not reach.
+
+        False, changing nothing, if the request is not taking input (unknown,
+        finished, or already ended); raises ``ValueError`` for input past the
+        call's budget (``max_call_input_mb``).
+        """
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is None or not req.input_open or req.event.is_set():
+                return False
+            size = req.input_bytes + _file_bytes(file_paths)
+            self._check_call_input(size)
+            req.input_bytes = size
+            req.last_input_time = time.time()
+            if end_input:
+                req.input_open = False
+            # under the lock: an append can't land behind its call's end
+            self.preprocess_worker.stream_input(
+                ClientAppend(key, file_paths=file_paths, done=end_input)
+            )
+        return True
+
+    def _check_call_input(self, size: int) -> None:
+        if size > self.max_call_input_bytes:
+            raise ValueError(
+                f"the call's input passed {self.max_call_input_bytes / (1 << 20):g} MiB, "
+                "this server's limit (max_call_input_mb)"
+            )
+
+    def is_pending(self, key: str) -> bool:
+        """Whether the submission ``key`` is still waited on: not yet finished,
+        failed or aborted. The preprocess thread drops queued input for one
+        that is not, rather than send it on."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            return req is not None and not req.event.is_set()
+
+    def taking_input(self, key: str) -> bool:
+        """Whether the submission ``key`` still takes :meth:`stream_input`."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            return req is not None and req.input_open and not req.event.is_set()
+
+    def reject_input(self, key: str, error: str, status: int) -> bool:
+        """End a live call whose append was refused: its stream answers with
+        ``error`` and ``status`` in-band, as any failed request's does, and the
+        engine request is aborted. False, changing nothing, if the call no
+        longer takes input: then the append was merely late."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is None or not req.input_open or req.event.is_set():
+                return False
+            req.input_open = False
+            req.error, req.error_status = error, status
+            req.event.set()
+            # Released as a failed request is, once its handler lets go of
+            # it; the result thread reads the data worker's bookkeeping for
+            # it until then.
+            self.recently_completed[key] = time.time()
+        req.notify()
+        self.preprocess_worker.forward_abort(key)
+        return True
 
     # ----------------------------------------------------------
     # Result collection (background thread)
@@ -804,6 +940,7 @@ class APIServer:
                                 # Release the waiting client immediately: no
                                 # result is coming, so the alternative is the
                                 # blanket request timeout.
+                                req.input_open = False
                                 req.event.set()
                                 req.notify()
                                 # The conductor has already dropped this rid,
@@ -823,6 +960,9 @@ class APIServer:
                                         "until the cleanup TTL", rid,
                                     )
                                 req = self.pending_requests[rid]
+                                # the model ended the call: later appends are
+                                # late, not rejected
+                                req.input_open = False
                                 req.output_chunk_counts = message.body.output_chunk_counts
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
@@ -992,6 +1132,7 @@ class APIServer:
         self, request_id: str, key: str | None, own: PendingRequest | None,
     ):
         start = time.time()
+        last_activity = start
         finished = False
         # An error chunk ends the response: whatever follows it for this
         # request (a second error, a late output) is not part of the answer.
@@ -1008,7 +1149,7 @@ class APIServer:
                 own.wake = wake
         try:
             while True:
-                if time.time() - start > self.timeout_seconds:
+                if time.time() - last_activity > self.timeout_seconds:
                     timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
@@ -1020,16 +1161,16 @@ class APIServer:
                 with self.request_lock:
                     req = self.pending_requests.get(key)
                     if req:
-                        avail = len(req.chunks)
-                        consumed = req.consumed_chunks
-                        new_chunks = req.chunks[consumed:avail]
-                        req.consumed_chunks = avail
+                        last_activity = max(start, req.last_input_time)
+                        new_chunks, req.chunks = req.chunks, []
                         done = req.event.is_set()
                     else:
                         done = True
 
                 if new_chunks:
                     new_chunks, errored = _until_error(new_chunks)
+                    if self.log_stats:
+                        _count_outputs(req.delivered, new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -1044,7 +1185,7 @@ class APIServer:
                         req = self.pending_requests.get(key)
                         if req:
                             if not errored:
-                                remaining = req.chunks[req.consumed_chunks:]
+                                remaining = req.chunks
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
@@ -1219,15 +1360,10 @@ class APIServer:
 
         req.profile.timing.finish_time = time.perf_counter()
 
-        # Aggregate the collected chunks into per-modality output info.
-        by_modality: dict[str, OutputInfo] = {}
-        for chunk in req.chunks:
-            info = by_modality.get(chunk.modality)
-            if info is None:
-                info = OutputInfo(modality=chunk.modality, count=0, total_bytes=0)
-                by_modality[chunk.modality] = info
-            info.count += 1
-            info.total_bytes += len(chunk.data)
+        # Per-modality output info: what a streaming handler delivered, and
+        # the chunks still held (all of a non-streaming request's).
+        by_modality = req.delivered
+        _count_outputs(by_modality, req.chunks)
         req.profile.outputs = list(by_modality.values())
 
         try:
@@ -1562,6 +1698,19 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+# A message's input. An end of input without any is no request: none
+# could run without input.
+_WS_INPUT_FIELDS = frozenset({"text", "files"})
+
+
+def _ws_is_append(message: dict) -> bool:
+    """Whether a ``/generate/ws`` message feeds a live call rather than opening
+    a request: it carries ``append``, or ends the input and carries none."""
+    return "append" in message or (
+        message.get("end_input") is True and not _WS_INPUT_FIELDS & message.keys()
+    )
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
@@ -1580,12 +1729,31 @@ async def generate_ws(websocket: WebSocket):
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
     whatever is still in flight.
+
+    A request to a model with client streams keeps its input open until the
+    client ends it: ``{"request_id", "append": [{"name", "data"}]}`` feeds the
+    files to the request's streams, and ``{"request_id", "end_input": true}``
+    (alone or on an append, or on the opening message) ends them. A live call
+    needs a ``request_id``, and only the socket that opened it can append to
+    it. A message with ``append``, or with ``end_input: true`` and no ``text``
+    or ``files``, is an append; one that opens a request under a live call's
+    id is refused with a 409. A null field counts as absent. A rejected
+    append ends the call with its error (``status`` 400) and no finish; an
+    append after the input or the call ended is answered with
+    ``{"request_id", "append": true, "error"}`` and the call goes on.
     """
     if api_server is None:
         await websocket.close(code=1013, reason="Server not ready")
         return
     await websocket.accept()
     tasks: set[asyncio.Task] = set()
+    # live calls this socket opened, by request_id: resolves to the call's
+    # submission key once it is submitted, None if it never was. The task
+    # serving a call is handed its entry and removes it when the call ends.
+    live: dict[str, asyncio.Future] = {}
+    # keys of requests this socket submitted that haven't finished: aborted if
+    # it closes
+    submitted: set[str] = set()
     # Pipelined requests reply from separate tasks; one frame at a time.
     send_lock = asyncio.Lock()
 
@@ -1598,17 +1766,38 @@ async def generate_ws(websocket: WebSocket):
                     payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
                 await websocket.send_text(json.dumps(payload))
 
-    async def serve_one(message: dict, binary: bool) -> None:
+    def reply(payload: dict, binary: bool) -> None:
+        """Send the receive loop's reply to a message from a task: awaited
+        there it would hold up reading behind the calls' output, and a client
+        that writes before it reads would stall on its own writes."""
+        async def send_reply() -> None:
+            try:
+                await send(payload, binary)
+            except Exception:  # noqa: BLE001 — the socket closed; the receive loop ends on it
+                pass
+        task = asyncio.create_task(send_reply())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _flag(message: dict, key: str) -> bool:
+        value = message.get(key)
+        if value is None:  # absent, or null
+            return False
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be true or false")
+        return value
+
+    async def serve_one(message: dict, binary: bool, call: asyncio.Future | None) -> None:
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
+        key: str | None = None
         try:
-            if request_id is not None and not isinstance(request_id, str):
-                raise ValueError("request_id must be a string")
             out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
-            if not text and not message.get("files"):
+            end_input = _flag(message, "end_input")
+            if not text and not message.get("files") and (end_input or not api_server.takes_stream_input):
                 raise ValueError("message carries neither text nor files")
             file_paths, parts = await run_in_threadpool(
                 _decode_ws_files, message.get("files"), api_server.upload_dir,
@@ -1631,9 +1820,14 @@ async def generate_ws(websocket: WebSocket):
                 prompt_parts=parts or None,
                 streaming=True,
                 request_id=request_id,
+                end_input=end_input,
             )
-            # Cancelling this task (socket closed mid-stream) tears the
-            # iterator down, and its ``finally`` aborts the engine request.
+            key = api_server.submission_key(request_id)
+            submitted.add(key)
+            if call is not None:
+                call.set_result(key)
+            # Closing the socket cancels this task; the receive loop's
+            # ``finally`` then aborts what the socket submitted.
             failed = False
             async for chunk in api_server.iter_result_chunks(request_id):
                 if chunk.modality == "error":
@@ -1656,9 +1850,13 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            reply = {"request_id": request_id, "error": str(exc)}
+            if call is not None and not call.done():
+                # before the send, which can wait on the socket: the call's
+                # appends wait on this in the receive loop
+                call.set_result(None)
+            payload = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
-                reply.update(error=exc.detail, status=exc.status_code)
+                payload.update(error=exc.detail, status=exc.status_code)
             if isinstance(exc, HTTPException) and exc.status_code < 500:
                 logger.info(
                     "generate/ws request %s refused (%d): %s",
@@ -1667,12 +1865,54 @@ async def generate_ws(websocket: WebSocket):
             else:
                 logger.exception("generate/ws request failed")
             try:
-                await send(reply, binary)
+                await send(payload, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:
+            submitted.discard(key)
+            if call is not None:
+                if not call.done():
+                    call.set_result(None)
+                del live[request_id]
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
+
+    async def append_one(message: dict, binary: bool) -> None:
+        """Feed an append to a call's client streams, in arrival order. A bad
+        append ends the call: the audio it carried is lost to it."""
+        request_id = message["request_id"]
+        file_paths: dict[str, list[str]] | None = None
+        late = {"request_id": request_id, "append": True,
+                "error": f"request {request_id!r} is not taking input"}
+        # in order behind the call's own submission, which may still be running
+        key = await live[request_id]
+        # checked before decoding, so a bad append to a call that has ended is
+        # answered as late rather than ending anything
+        if key is None or not api_server.taking_input(key):
+            reply(late, binary)
+            return
+        try:
+            if "files" in message:
+                raise ValueError("an append carries its files under 'append', not 'files'")
+            end_input = _flag(message, "end_input")
+            file_paths, _ = await run_in_threadpool(
+                _decode_ws_files, message.get("append"), api_server.upload_dir,
+            )
+            if not file_paths and not end_input:
+                raise ValueError("an append needs files or end_input")
+            if api_server.stream_input(key, file_paths or None, end_input=end_input):
+                file_paths = None  # the preprocess worker deletes them once loaded
+            else:
+                reply(late, binary)  # the call ended meanwhile: leave it be
+        except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
+            logger.warning("generate/ws append for %s failed: %s", request_id, exc)
+            error, status = f"append rejected: {exc}", 400 if isinstance(exc, ValueError) else 500
+            # the call's stream sends the error and no finish; False if the
+            # call ended meanwhile, and then the append was late
+            if not api_server.reject_input(key, error, status):
+                reply(late, binary)
+        finally:
+            unlink_files(file_paths)
 
     try:
         while True:
@@ -1686,12 +1926,37 @@ async def generate_ws(websocket: WebSocket):
                 else:
                     message = json.loads(frame.get("text") or "")
             except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
-                await send({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                reply({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
                 continue
             if not isinstance(message, dict):
-                await send({"request_id": None, "error": "message must be an object"}, binary)
+                reply({"request_id": None, "error": "message must be an object"}, binary)
                 continue
-            task = asyncio.create_task(serve_one(message, binary))
+            # a null field is an absent one, to routing and validation alike
+            message = {k: v for k, v in message.items() if v is not None}
+            request_id = message.get("request_id")
+            if request_id is not None and not isinstance(request_id, str):
+                reply({"request_id": None, "error": "request_id must be a string"}, binary)
+                continue
+            if _ws_is_append(message):
+                if request_id not in live:
+                    reply({"request_id": request_id, "append": True,
+                           "error": f"request {request_id!r} is not taking input on this socket"}, binary)
+                    continue
+                await append_one(message, binary)
+                continue
+            if request_id in live:
+                # refused as any id in flight is, and the call goes on
+                reply({"request_id": request_id, "error": request_id_in_use(request_id),
+                       "status": 409}, binary)
+                continue
+            call = None
+            if api_server.takes_stream_input and message.get("end_input") is not True:
+                # a live call: appends find it by id, from the moment it is read
+                if request_id is None:
+                    reply({"request_id": None, "error": "a live call needs a request_id"}, binary)
+                    continue
+                call = live[request_id] = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(serve_one(message, binary, call))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     except WebSocketDisconnect:
@@ -1699,6 +1964,11 @@ async def generate_ws(websocket: WebSocket):
     finally:
         for task in list(tasks):
             task.cancel()
+        # A task cancelled mid-send leaves its stream's generator suspended,
+        # and the generator's finally (the usual abort) runs only once it is
+        # garbage collected: abort now what this socket submitted.
+        for key in list(submitted):
+            api_server.abort_submission(key)
 
 
 @app.post("/generate")

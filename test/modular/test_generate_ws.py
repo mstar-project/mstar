@@ -22,6 +22,8 @@ from mstar.api_server.request_types import ResultChunk
 
 
 class _FakeServer:
+    takes_stream_input = False
+
     def __init__(self, upload_dir, chunks_per_request=2):
         self.upload_dir = upload_dir
         self.submitted = []
@@ -32,6 +34,12 @@ class _FakeServer:
 
     async def wait_for_request_id(self, request_id):
         pass
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key):
+        self.aborted = [*getattr(self, "aborted", []), key]
 
     def submit_request(self, **kwargs):
         rid = kwargs.get("request_id") or f"req-{len(self.submitted)}"
@@ -124,6 +132,16 @@ def test_rejected_message_keeps_the_socket(monkeypatch, tmp_path):
         msgs = _recv_until_finish(ws, binary=False)
     assert msgs[-1] == {"request_id": "ok", "finish": True}
     assert fake.submitted[-1]["request_id"] == "ok"
+
+
+def test_a_null_field_counts_as_absent(monkeypatch, tmp_path):
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "hi", "request_id": "r", "append": None, "files": None}))
+        msgs = _recv_until_finish(ws, binary=False)
+    assert msgs[-1] == {"request_id": "r", "finish": True}
+    assert [s["request_id"] for s in fake.submitted] == ["r"]
 
 
 def test_not_ready_closes(monkeypatch):

@@ -220,6 +220,7 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
+    CLIENT_STREAM_INPUT = "client_stream_input"
 
 
 @dataclass
@@ -233,6 +234,16 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
+
+
+@dataclass
+class ClientStreamInput(MessageBody):
+    """The next chunk of a running request's client streams (see
+    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
+    whether the client's input has ended. An ended stream takes no more chunks."""
+    request_id: str
+    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    done: bool = False
 
 
 @dataclass

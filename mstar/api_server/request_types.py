@@ -130,3 +130,13 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+
+
+@dataclass
+class ClientAppend:
+    """One append to a running request's client streams, queued behind the
+    request's own ``PreprocessInput`` so its chunks stay in order. ``done``
+    ends the streams after this chunk. Stays inside the API server process."""
+    request_id: str
+    file_paths: dict[str, list[str]] | None = None
+    done: bool = False

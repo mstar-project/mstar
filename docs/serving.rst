@@ -242,6 +242,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``max_call_input_mb``
+     - *(optional, default 512)* For a model that takes live client input: how many MiB
+       of files one call may send over its whole life, its opening message's included.
+       A live call's opening message past it is refused, and an append that would pass
+       it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
+       decoded input is larger than its files, and how much of it waits in buffers
+       depends on how fast the model consumes it.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``speculation_mixes_walks``

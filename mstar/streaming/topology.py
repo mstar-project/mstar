@@ -20,9 +20,17 @@ class StreamingGraphEdge(GraphEdge):
         self.is_streaming = True
 
 
+# The producer of a stream the client feeds into a running request:
+# ``Connection(from_partition=CLIENT, ...)``. It names no partition, so it has
+# no walks, worker or partition state; the API server appends its chunks and
+# ends it when the client's input ends.
+CLIENT = "client"
+
+
 @dataclass
 class Connection:
-    """Defines a streaming connection between two partitions."""
+    """Defines a streaming connection between two partitions, or from the
+    client (``from_partition=CLIENT``) into one."""
     from_partition: str
     to_partition: str
     edge_name: str
@@ -38,3 +46,14 @@ class PartitionTopology:
     """
     partitions: list[str]
     connections: list[Connection] = field(default_factory=list)
+
+    def __post_init__(self):
+        if CLIENT in self.partitions:
+            raise ValueError(f"{CLIENT!r} is reserved for client streams; rename the partition")
+        for conn in self.connections:
+            if conn.to_partition == CLIENT:
+                raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
+
+    def client_connections(self) -> list[Connection]:
+        """The streams the client feeds."""
+        return [conn for conn in self.connections if conn.from_partition == CLIENT]

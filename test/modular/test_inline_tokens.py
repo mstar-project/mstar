@@ -47,6 +47,10 @@ def test_result_tokens_round_trips_through_the_codec():
 
 
 class _Model:
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()
