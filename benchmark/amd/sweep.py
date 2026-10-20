@@ -193,6 +193,7 @@ class Plan:
     numa: bool = False
     resume: bool = False
     expect_gpus: int | None = None
+    measured: list[str] = field(default_factory=list)  # row/arm of every arm this invocation ran
     log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str) -> None:
@@ -316,6 +317,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
             void = arm_dir.with_name(f"{arm.name}.health-fail-{time.strftime('%Y%m%dT%H%M%S')}")
             arm_dir.rename(void)
             plan.log(f"{row.name}/{arm.name}: failed its health check earlier, re-run (old run in {void.name})")
+    plan.measured.append(f"{row.name}/{arm.name}")
     arm_dir.mkdir(parents=True, exist_ok=True)
     info: dict = {"arm": arm.name, "row": row.name, "gpus": gpus, "port": port, "lane": lane, "status": "running",
                   "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cells": []}
@@ -426,6 +428,33 @@ def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_b
         t.join()
 
 
+def _merged(order, *lists) -> list:
+    """Every name in ``lists`` once, in ``order`` where it has one."""
+    names = [x for lst in lists for x in lst]
+    out = [x for x in order if x in names]
+    for x in names:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def resumed_meta(meta: dict, prev: dict, table: tables.Table) -> dict:
+    """sweep.json for a resume of ``prev``. The header keeps the first placement and every row and arm of the
+    table, whatever part this resume runs; the resume records its own placement (and, at the end, what it
+    measured)."""
+    out = dict(meta, started=prev.get("started", meta["started"]))
+    resume = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": meta["node"].get("host"), "job": meta["job"],
+              "gpus": meta["gpus"], "lanes": meta["lanes"], "numa": meta["numa"], "driver": meta["driver"]}
+    out["resumed"] = [*prev.get("resumed", []), resume]
+    for k in ("gpus", "lanes", "numa"):
+        out[k] = prev.get(k, meta[k])
+    out["rows"] = _merged(table.rows, prev.get("rows", []), meta["rows"])
+    out["arms"] = _merged(table.arms, prev.get("arms", []), meta["arms"])
+    out["workloads"] = _merged(table.workloads, prev.get("workloads", []), meta["workloads"])
+    out["concurrency"] = {**prev.get("concurrency", {}), **meta["concurrency"]}
+    return out
+
+
 def wait_for_free_vram(gpus: list[int], log, timeout_s: float = 180) -> None:
     """Before the health gate: a server the previous table or prewarm just stopped takes a few seconds
     to hand its memory back, and the gate would count that as an occupied GPU."""
@@ -529,9 +558,7 @@ def main(argv=None) -> int:
             "correctness_src": str(plan.correctness_src) if plan.correctness_src else None,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     if prev:
-        meta["started"] = prev.get("started", meta["started"])
-        meta["resumed"] = [*prev.get("resumed", []), {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                                       "host": node.get("host"), "job": job}]
+        meta = resumed_meta(meta, prev, table)
     (run_dir / "sweep.json").write_text(json.dumps(meta, indent=1, default=str))
     plan.log(f"table {table.name} -> {run_dir}")
 
@@ -555,6 +582,8 @@ def main(argv=None) -> int:
         health.snapshot(run_dir / "health" / "snapshot_table_after.txt")
         health.check(run_dir / "health", args.expect_gpus, gpus, name="check_after")
     meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    if meta.get("resumed"):
+        meta["resumed"][-1].update(finished=meta["finished"], measured=plan.measured)
     (run_dir / "sweep.json").write_text(json.dumps(meta, indent=1, default=str))
     if plan.correctness:
         from benchmark.amd import correctness
