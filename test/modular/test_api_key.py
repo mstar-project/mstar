@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import types
 
 import pytest
 
@@ -95,6 +96,79 @@ def test_websocket_with_the_key_is_accepted(keyed, monkeypatch, tmp_path):
     with keyed.websocket_connect("/generate/ws", headers=GOOD) as ws:
         ws.send_text("not json")
         assert "undecodable" in json.loads(ws.receive_text())["error"]
+
+
+class _GlmServer:
+    """Enough of the API server for a GLM-5.2 chat: every request gets one
+    whole reply, and the prompt counts 3 tokens."""
+
+    model_name = "glm52"
+
+    def __init__(self, upload_dir):
+        self.upload_dir = upload_dir
+        self.model = types.SimpleNamespace(
+            get_output_sample_rate=lambda modality="audio": 24000,
+            process_prompt=lambda *a, **kw: {"text_inputs": [types.SimpleNamespace(numel=lambda: 3)]})
+
+    def submit_request(self, **kw):
+        return kw["request_id"]
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        pass
+
+    async def iter_result_chunk_batches(self, request_id):
+        yield [types.SimpleNamespace(modality="text", data=b"Hm.</think>Hi.", metadata={"tokens": 3})]
+
+
+_MESSAGES = {"model": "glm52", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+_CHAT = {"model": "glm52", "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.fixture
+def glm(keyed, monkeypatch, tmp_path):
+    monkeypatch.setattr(entrypoint, "api_server", _GlmServer(tmp_path))
+    return keyed
+
+
+@pytest.mark.parametrize("headers", [
+    {"x-api-key": KEY},
+    GOOD,
+    {"x-api-key": f" {KEY} ", "Authorization": "Bearer stale"},
+], ids=["x-api-key", "bearer", "either"])
+def test_anthropic_routes_take_the_key_as_x_api_key_or_bearer(glm, headers):
+    """What Anthropic's SDKs and Claude Code send: ``x-api-key`` for an API
+    key, ``Authorization: Bearer`` for an auth token."""
+    r = glm.post("/v1/messages", json=_MESSAGES, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["content"][-1] == {"type": "text", "text": "Hi."}
+    r = glm.post("/v1/messages/count_tokens", json={"messages": _MESSAGES["messages"]}, headers=headers)
+    assert r.json() == {"input_tokens": 3}
+
+
+def test_openai_routes_take_the_key_as_bearer_only(glm):
+    r = glm.post("/v1/chat/completions", json=_CHAT, headers={"x-api-key": KEY})
+    assert r.status_code == 401 and r.json()["error"]["code"] == 401
+    r = glm.post("/v1/chat/completions", json=_CHAT, headers=GOOD)
+    assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "Hi."
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.parametrize("headers", [
+    *BAD_HEADERS,
+    {"x-api-key": "wrong"},
+    {"x-api-key": f"{KEY}x"},
+    {"x-api-key": f"Bearer {KEY}"},
+    {"x-api-key": "wrong", "Authorization": "Bearer wrong"},
+])
+def test_anthropic_routes_refuse_a_wrong_key_in_anthropic_s_shape(glm, path, headers):
+    r = glm.post(path, json=_MESSAGES, headers=headers)
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    body = r.json()
+    assert body["type"] == "error" and body["error"]["type"] == "authentication_error"
+    assert "x-api-key" in body["error"]["message"]
 
 
 def test_cors_preflight_needs_no_key_and_a_401_keeps_cors_headers(keyed):
