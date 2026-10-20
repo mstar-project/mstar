@@ -50,12 +50,23 @@ def _skinny_gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | Non
 
 _LIB = torch.library.Library("mstar", "FRAGMENT")
 _LIB.define("skinny_gemm(Tensor x, Tensor weight, Tensor? bias) -> Tensor")
-_LIB.impl("skinny_gemm", _skinny_gemm, "CUDA")
+# The same op with any input layout allowed (it makes x contiguous itself), so
+# inductor can finish the norm feeding a one-row GEMM in one kernel. Not for
+# two rows: there inductor may pick a strided layout and pay for the copy.
+_LIB.define(
+    "skinny_gemm_any(Tensor x, Tensor weight, Tensor? bias) -> Tensor",
+    tags=(torch.Tag.flexible_layout,),
+)
+for _name in ("skinny_gemm", "skinny_gemm_any"):
+    _LIB.impl(_name, _skinny_gemm, "CUDA")
 
 
-@torch.library.register_fake("mstar::skinny_gemm", lib=_LIB)
 def _skinny_gemm_fake(x, weight, bias):
     return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+for _name in ("skinny_gemm", "skinny_gemm_any"):
+    torch.library.register_fake(f"mstar::{_name}", _skinny_gemm_fake, lib=_LIB)
 
 
 def _val(node):
@@ -105,8 +116,9 @@ def fits(x, weight, bias) -> bool:
 
 
 def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node, x, weight, bias) -> None:
+    op = torch.ops.mstar.skinny_gemm_any if _val(x).shape[0] == 1 else torch.ops.mstar.skinny_gemm
     with graph.inserting_before(node):
-        new = graph.call_function(torch.ops.mstar.skinny_gemm.default, (x, weight, bias))
+        new = graph.call_function(op.default, (x, weight, bias))
     new.meta.update(node.meta)
     shape = (*_val(x).shape, _val(weight).shape[0], bias is not None)
     if shape not in _logged:
