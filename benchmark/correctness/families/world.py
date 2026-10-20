@@ -15,7 +15,7 @@ import numpy as np
 
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
-from benchmark.correctness.families.base import Family, failed_items, self_consistency_check
+from benchmark.correctness.families.base import Family, failed_items, frame_identity, self_consistency_check
 from benchmark.correctness.report import FamilyScore
 from benchmark.correctness.sets import SampleSet
 
@@ -83,6 +83,7 @@ class WaypointWorld(Family):
             row["consecutive_psnr_median"] = round(statistics.median(cont), 2) if cont else None
             if len(runs) > 1 and (runs[1] / "outputs" / f"{it.id}.npy").is_file():
                 g = np.load(runs[1] / "outputs" / f"{it.id}.npy")
+                row["frames_identical_r1_r2"] = M.frames_equal(f, g)
                 if g.shape == f.shape:
                     ps = M.frame_psnrs(f, g)
                     row["r1_r2_psnr_min"] = min(ps)
@@ -97,6 +98,7 @@ class WaypointWorld(Family):
         self_consistency_check(sc, repro, "same-seed min frame PSNR, two server instances (dB)", len(runs),
                                lambda v: v >= 40, lambda v: v >= 25,
                                ">=40 PASS (inf = byte-identical), >=25 WARN (provisional)")
+        frame_identity(sc, rows, encoded=False)
         if sheet:
             M.contact_sheet(sheet, labels, work / "contact_sheet.png")
             sc.artifacts.append(str(work / "contact_sheet.png"))
