@@ -861,6 +861,13 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
+- ``configs/qwen3tts_1p7b_split_bf16.yaml`` is the same split with the codec in
+  bf16, the recommended deployment on AMD GPUs (HIP runs the two workers'
+  kernels side by side without MPS). On an MI300X, in audio s/s with TTFA p50:
+  9.4 / 51.3 / 111.0 / 127.2 at c=1 / 8 / 32 / 64 (24 / 42 / 160 / 390 ms),
+  against 9.0 / 38.7 / 69.1 / 74.0 (23 / 64 / 156 / 203 ms) for
+  ``configs/qwen3tts_1p7b.yaml``; Whisper WER 1.1-1.3% against the
+  reference's 0.9%.
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.
