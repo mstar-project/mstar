@@ -1206,7 +1206,7 @@ class AcceleratorGraphRunner:
                 dynamic=False,
             )
         return with_inductor_overrides(
-            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+            self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
         )
 
     def _dummy_engine_inputs(
@@ -2029,7 +2029,7 @@ class PiecewiseAcceleratorGraphRunner:
                 torch.compile(
                     fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
                 ),
-                shape.total_tokens,
+                shape.total_tokens, shape.bs,
             )
 
         def run_fn():
