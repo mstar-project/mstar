@@ -209,7 +209,8 @@ class Launch:
         return ",".join(str(g) for g in self.server_gpus)
 
     def mstar_config(self) -> Path:
-        cfg = Path(self.config) if self.config else self.worktree / "configs" / f"{self.row.name}.yaml"
+        name = catalog.mstar_config_name(self.row, self.arm.name)
+        cfg = Path(self.config) if self.config else self.worktree / "configs" / f"{name}.yaml"
         if not cfg.is_file():
             raise FileNotFoundError(cfg)
         return cfg
@@ -602,6 +603,7 @@ def collect_versions(launch: Launch, cmd: list[str], env: dict) -> dict:
                       "branch": git("rev-parse", "--abbrev-ref", "HEAD"), "subject": git("log", "-1", "--format=%s"),
                       "dirty": [ln for ln in git("status", "--porcelain").splitlines() if ln][:40]}
         rec["config"] = str(launch.mstar_config())
+        rec["config_text"] = launch.mstar_config().read_text()
         p = _run([sys.executable, "-c", _MSTAR_VERSIONS], timeout=600, env=env, cwd=launch.worktree)
         rec["stack"] = _last_json_line(p.stdout + p.stderr)
         mfile = rec["stack"].get("mstar_file", "")
