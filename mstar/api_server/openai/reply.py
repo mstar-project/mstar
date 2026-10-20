@@ -1,5 +1,6 @@
-"""A chat reply as protocol-neutral events, which each API's encoder writes in
-its own shape (chat completions here and in ``serving_chat``).
+"""A chat reply as protocol-neutral events, which each API writes in its own
+shape: chat completions (``serving_chat``) and Anthropic messages
+(``serving_messages``).
 
 ``reply_events`` reads a request's result chunks and yields, per batch the
 server hands out, a list of events:
@@ -142,7 +143,8 @@ def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
     return "stop" if stop_string is not None or usage.stopped else "length"
 
 
-def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None):
+def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
+                 usage: Usage | None = None):
     """The events of a request's reply, one list per batch of result chunks.
     Bound to the submission when called: a stream's body is iterated later,
     by Starlette.
@@ -155,12 +157,14 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     with the stop's last (up to k under MTP, k drafts a step), and those read
     while the parser held the stop's end, when it may start a tag, or is the
     answer's trailing whitespace (held until text follows it).
+    ``usage``, when given, is filled as the chunks arrive (a stream that opens
+    with the prompt's count reads it from there).
     """
-    return _events(api.iter_result_chunk_batches(request_id), parser, stops)
+    return _events(api.iter_result_chunk_batches(request_id), parser, stops,
+                   Usage() if usage is None else usage)
 
 
-async def _events(batches, parser, stops):
-    usage = Usage()
+async def _events(batches, parser, stops, usage):
     matcher = StopMatcher(stops) if stops else None
     stop: str | None = None
     # a byte-level BPE token's bytes can end inside a character: hold them

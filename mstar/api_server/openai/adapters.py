@@ -241,6 +241,10 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
     supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
+    # POST /v1/messages (Anthropic) and /v1/responses, translated onto chat: a
+    # text-only chat that serves roles and tools
+    supports_messages: bool = False
+    supports_responses: bool = False
     # Longest clip the model transcribes in one request. Longer uploads are cut
     # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None
@@ -1156,6 +1160,8 @@ class GlmChatAdapter(TextChatAdapter):
     """GLM-5.2 / GLM-5.3: the messages with their roles, and ``tools``, go to
     the checkpoint's chat template; the reply comes back with
     ``reasoning_content`` and ``tool_calls`` split out (see ``glm_chat``).
+    Anthropic's ``/v1/messages`` and OpenAI's ``/v1/responses`` are translated
+    onto this chat.
 
     ``tool_choice`` is ``"auto"`` (default), ``"none"``, which leaves the tools
     out of the prompt, ``"required"`` or a named function. With no grammar, a
@@ -1174,6 +1180,9 @@ class GlmChatAdapter(TextChatAdapter):
     template, flat in ``extra_body`` or under ``chat_template_kwargs``; other
     template keys are dropped, as vLLM drops the ones a template does not read.
     """
+
+    supports_messages = True
+    supports_responses = True
 
     def __init__(self, *, always_thinks: bool):
         self.always_thinks = always_thinks
