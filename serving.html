@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Using a Server" href="clients.html" />
+    <link rel="next" title="Metrics reference" href="metrics.html" />
     <link rel="prev" title="Quickstart" href="quickstart.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -200,6 +200,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="metrics.html">Metrics reference</a></li>
 <li class="toctree-l1"><a class="reference internal" href="clients.html">Using a Server</a></li>
 <li class="toctree-l1"><a class="reference internal" href="evaluation.html">Evaluation and Benchmarks</a></li>
 </ul>
@@ -1194,6 +1195,7 @@ matters for a deployment, keep the port on an internal network. With
 <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves the same text: it asks the API server for
 it over the bridge, so both frontends show the same names, and it answers <code class="docutils literal notranslate"><span class="pre">503</span></code> if the
 bridge does not reply within two seconds, as <code class="docutils literal notranslate"><span class="pre">/health</span></code> does.</p>
+<p><a class="reference internal" href="metrics.html"><span class="doc">Metrics reference</span></a> documents every family in one place, with a Prometheus and Grafana setup.</p>
 <p>Requests are counted when they leave the API server, from the first request after the
 warmup requests. Every family has a <code class="docutils literal notranslate"><span class="pre">model_name</span></code> label (the config’s <code class="docutils literal notranslate"><span class="pre">model</span></code>);
 <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> is the request’s output modalities, sorted and comma-joined
@@ -1320,8 +1322,8 @@ they do today):</p>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds</span></code>: histogram, from submission to the data worker
 handing the preprocessed request to the conductor, including its wait in the data
 worker’s queue.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_engine_seconds</span></code>: histogram, from the conductor taking the request in
-to the conductor finishing it.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_engine_seconds</span></code>: histogram, from the conductor dispatching the
+request to the workers (after any admission wait) to the conductor finishing it.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_delivery_seconds</span></code>: histogram, from the conductor finishing the
 request to the result leaving the API server (the last chunks’ postprocessing and
 transfer, and the client handler picking it up).</p></li>
@@ -1398,11 +1400,11 @@ curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<spa
       </div>
     </a>
     <a class="right-next"
-       href="clients.html"
+       href="metrics.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Using a Server</p>
+        <p class="prev-next-title">Metrics reference</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

@@ -512,6 +512,8 @@ matters for a deployment, keep the port on an internal network. With
 it over the bridge, so both frontends show the same names, and it answers ``503`` if the
 bridge does not reply within two seconds, as ``/health`` does.
 
+:doc:`metrics` documents every family in one place, with a Prometheus and Grafana setup.
+
 Requests are counted when they leave the API server, from the first request after the
 warmup requests. Every family has a ``model_name`` label (the config's ``model``);
 ``output_modalities`` is the request's output modalities, sorted and comma-joined
@@ -639,8 +641,8 @@ they do today):
 - ``mstar_request_preprocess_seconds``: histogram, from submission to the data worker
   handing the preprocessed request to the conductor, including its wait in the data
   worker's queue.
-- ``mstar_request_engine_seconds``: histogram, from the conductor taking the request in
-  to the conductor finishing it.
+- ``mstar_request_engine_seconds``: histogram, from the conductor dispatching the
+  request to the workers (after any admission wait) to the conductor finishing it.
 - ``mstar_request_delivery_seconds``: histogram, from the conductor finishing the
   request to the result leaving the API server (the last chunks' postprocessing and
   transfer, and the client handler picking it up).

@@ -1,0 +1,1142 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Metrics reference &#8212; M* v0.2.1 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="_static/documentation_options.js?v=c480a563"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=ccdb6887"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'metrics';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Using a Server" href="clients.html" />
+    <link rel="prev" title="Serving" href="serving.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.1" />
+    <meta name="docbuild:last-update" content="Oct 20, 2026"/>
+  
+    
+    <script src="_static/searchtools.js"></script>
+    <script src="_static/language_data.js"></script>
+    <script src="searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.1 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="serving.html">Serving</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Metrics reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="clients.html">Using a Server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="evaluation.html">Evaluation and Benchmarks</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.html">mstar.model.lingbot_world</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.components.html">mstar.model.lingbot_world.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.config.html">mstar.model.lingbot_world.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.audio.html">mstar.model.omnilingual_asr.audio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.components.html">mstar.model.omnilingual_asr.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.config.html">mstar.model.omnilingual_asr.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.tokenizer.html">mstar.model.omnilingual_asr.tokenizer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.weight_loader.html">mstar.model.omnilingual_asr.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.catalog.html">mstar.observability.catalog</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.recorders.html">mstar.observability.recorders</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/metrics.rst?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2Fmetrics.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/metrics.rst" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.rst</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Metrics reference</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#where-the-numbers-come-from">Where the numbers come from</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conventions">Conventions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-counted-from-when">What is counted from when</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requests">Requests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-stages">Request stages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#output">Output</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-worker">Data worker</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#http-refusals">HTTP refusals</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conductor">Conductor</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#engine-workers">Engine workers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#histogram-buckets">Histogram buckets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-queries">Example queries</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prometheus-and-grafana">Prometheus and Grafana</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="metrics-reference">
+<span id="id1"></span><h1>Metrics reference<a class="headerlink" href="#metrics-reference" title="Link to this heading">#</a></h1>
+<p>Every Prometheus metric family M* serves at <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>, what moves it, and which
+process measures it. How to turn metrics on is in <a class="reference internal" href="serving.html#serving-metrics"><span class="std std-ref">Metrics</span></a>; a ready-to-run
+Prometheus and Grafana setup is in <a class="reference internal" href="#metrics-setup"><span class="std std-ref">Prometheus and Grafana</span></a>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>kokoro<span class="w"> </span>--enable-metrics
+curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s1">'^mstar_'</span>
+</pre></div>
+</div>
+<p>Metrics are off by default. With <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> off, <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> answers <code class="docutils literal notranslate"><span class="pre">404</span></code>,
+the conductor sends no status message and the workers record nothing. Like <code class="docutils literal notranslate"><span class="pre">/health</span></code>,
+<code class="docutils literal notranslate"><span class="pre">/metrics</span></code> needs no API key; it exposes counts, latencies and the names of the model,
+its graph nodes and routes, never prompts or outputs.</p>
+<section id="where-the-numbers-come-from">
+<h2>Where the numbers come from<a class="headerlink" href="#where-the-numbers-come-from" title="Link to this heading">#</a></h2>
+<p>Only the API server process renders <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>, from one registry. The other
+processes send it plain numbers on messages they already exchange, so the time a value
+reflects depends on where it was measured:</p>
+<ul class="simple">
+<li><p><strong>API server.</strong> Request counts, request latencies, output volume and HTTP refusals
+are recorded as requests pass through it. The data worker is a thread of the API
+server, so its families are recorded in the same process. These are current at every
+scrape.</p></li>
+<li><p><strong>Conductor.</strong> While metrics are on, the conductor sends the API server a status
+message every second. Its gauges show the latest message, so they can be up to a
+second old; <code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds</span></code> says how old.</p></li>
+<li><p><strong>Engine workers.</strong> Each worker sends the conductor its cumulative numbers every
+second, and the conductor adds them to its next status message, so worker families
+can be up to two seconds old. A lost or reordered message cannot corrupt a counter:
+every message carries totals, not increments, and the API server keeps the latest.</p></li>
+<li><p><strong>Rust frontend.</strong> With <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> by
+asking the API server for the rendered text over the bridge, so both frontends show
+the same families. It answers <code class="docutils literal notranslate"><span class="pre">503</span></code> if the bridge does not reply within two
+seconds. <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> counts its own HTTP refusals and sends the totals with each
+<code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request, and the API server exports them in
+<code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code>.</p></li>
+</ul>
+<p>The registry holds only <code class="docutils literal notranslate"><span class="pre">mstar_</span></code> families: no <code class="docutils literal notranslate"><span class="pre">process_</span></code> or <code class="docutils literal notranslate"><span class="pre">python_</span></code> metrics.
+Every value starts from zero when the server starts.</p>
+</section>
+<section id="conventions">
+<h2>Conventions<a class="headerlink" href="#conventions" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Names use Prometheus base units (<code class="docutils literal notranslate"><span class="pre">_seconds</span></code>, <code class="docutils literal notranslate"><span class="pre">_bytes</span></code>), and counters end in
+<code class="docutils literal notranslate"><span class="pre">_total</span></code>. Read counters and histograms with <code class="docutils literal notranslate"><span class="pre">rate()</span></code> or <code class="docutils literal notranslate"><span class="pre">increase()</span></code>.</p></li>
+<li><p>Every family has a <code class="docutils literal notranslate"><span class="pre">model_name</span></code> label: the config’s <code class="docutils literal notranslate"><span class="pre">model</span></code> key (the registry
+name, e.g. <code class="docutils literal notranslate"><span class="pre">kokoro</span></code> or <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code>).</p></li>
+<li><p>Label values come from fixed sets or from the model and its config, never from
+requests, so the number of series is bounded:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">outcome</span></code>: <code class="docutils literal notranslate"><span class="pre">success</span></code>, <code class="docutils literal notranslate"><span class="pre">error</span></code>, <code class="docutils literal notranslate"><span class="pre">abort</span></code>, <code class="docutils literal notranslate"><span class="pre">timeout</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> and <code class="docutils literal notranslate"><span class="pre">input_modalities</span></code>: the request’s modalities, sorted
+and comma-joined (<code class="docutils literal notranslate"><span class="pre">audio,text</span></code>), from <code class="docutils literal notranslate"><span class="pre">text</span></code>, <code class="docutils literal notranslate"><span class="pre">image</span></code>, <code class="docutils literal notranslate"><span class="pre">audio</span></code>, <code class="docutils literal notranslate"><span class="pre">video</span></code>,
+<code class="docutils literal notranslate"><span class="pre">video_frame</span></code>, <code class="docutils literal notranslate"><span class="pre">action</span></code>, <code class="docutils literal notranslate"><span class="pre">scalar</span></code>, <code class="docutils literal notranslate"><span class="pre">tensor</span></code>. In practice a model has a few
+combinations.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">modality</span></code>: one of those modality names.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">state</span></code>: <code class="docutils literal notranslate"><span class="pre">waiting</span></code>, <code class="docutils literal notranslate"><span class="pre">running</span></code>, <code class="docutils literal notranslate"><span class="pre">draining</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">component</span></code>: a graph node name from the config’s <code class="docutils literal notranslate"><span class="pre">node_groups</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">graph_walk</span></code>: a graph walk name of the model.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">resource</span></code>: the key of a paged KV cache in the model.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">src</span></code> and <code class="docutils literal notranslate"><span class="pre">dst</span></code>: a graph node name, or <code class="docutils literal notranslate"><span class="pre">api_server</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">transport</span></code>: <code class="docutils literal notranslate"><span class="pre">SHM</span></code>, <code class="docutils literal notranslate"><span class="pre">TCP</span></code>, <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">route</span></code>: a route path as declared (<code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code>), or <code class="docutils literal notranslate"><span class="pre">unmatched</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">status</span></code>: an HTTP status code the frontend sent (a <code class="docutils literal notranslate"><span class="pre">4xx</span></code>, or <code class="docutils literal notranslate"><span class="pre">503</span></code>).</p></li>
+</ul>
+</li>
+<li><p>A labeled series appears the first time it is used. For a new set of output
+modalities, <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> exports all four outcomes at zero from that
+request on, and the data worker’s two families start together, so a later first
+error shows in <code class="docutils literal notranslate"><span class="pre">rate()</span></code>. <code class="docutils literal notranslate"><span class="pre">rate()</span></code> and <code class="docutils literal notranslate"><span class="pre">increase()</span></code> miss what was counted before
+the first scrape that saw a series: if a set’s first request fails, its error series
+starts at 1.</p></li>
+</ul>
+</section>
+<section id="what-is-counted-from-when">
+<h2>What is counted from when<a class="headerlink" href="#what-is-counted-from-when" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>API server families count from the first request after warmup.</strong> The server
+enables metrics after its warmup requests, so first-shape compile times stay out of
+the request latency histograms.</p></li>
+<li><p><strong>Engine worker families, and the transfers workers read, count from worker start,
+warmup included.</strong> Their histograms and counters are cumulative from process start,
+so read them with <code class="docutils literal notranslate"><span class="pre">rate()</span></code> or <code class="docutils literal notranslate"><span class="pre">increase()</span></code> rather than as absolute values.</p></li>
+<li><p><strong>Requests refused before submission</strong> (a bad form, a missing API key, a body over
+the limit, a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> already in flight) are counted only in
+<code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code>. A request that was submitted and then failed is
+counted once, as <code class="docutils literal notranslate"><span class="pre">outcome=&quot;error&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code>.</p></li>
+</ul>
+</section>
+<section id="requests">
+<h2>Requests<a class="headerlink" href="#requests" title="Link to this heading">#</a></h2>
+<p>Exported by the API server, recorded where a request leaves it, the same way for
+<code class="docutils literal notranslate"><span class="pre">/generate</span></code>, <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, the OpenAI routes and both frontends.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_requests_total{model_name,</span> <span class="pre">output_modalities,</span> <span class="pre">outcome}</span></code></dt><dd><p>Counter. Requests that left the API server. <code class="docutils literal notranslate"><span class="pre">success</span></code>: the result went to the
+HTTP layer. <code class="docutils literal notranslate"><span class="pre">error</span></code>: the request failed in the engine, preprocessing or result
+delivery, or the conductor went away. <code class="docutils literal notranslate"><span class="pre">abort</span></code>: the client went away, or its
+finished result was dropped unread. <code class="docutils literal notranslate"><span class="pre">timeout</span></code>: <code class="docutils literal notranslate"><span class="pre">--timeout</span></code> expired.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_requests_in_flight{model_name}</span></code></dt><dd><p>Gauge, read at scrape time. Requests the API server holds: submitted and not yet
+returned, failed or aborted.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_e2e_request_latency_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds, successful requests. From submission (after the request body was
+read) to the result leaving the API server. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">E2E</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_output_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds, successful requests. From submission to the first result chunk
+of any modality reaching the API server. Measured on the server: it leaves out the
+network to the client, and a non-streaming client sees nothing until the end.
+Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">first output</span></a>.</p>
+</dd>
+</dl>
+</section>
+<section id="request-stages">
+<h2>Request stages<a class="headerlink" href="#request-stages" title="Link to this heading">#</a></h2>
+<p>Exported by the API server, for successful requests, from the timestamps every request
+carries. The conductor’s timestamps are compared with the API server’s, which assumes
+both run on one host.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds. From submission to the data worker handing the preprocessed
+request to the conductor, including the wait in the data worker’s queue. Buckets:
+<a class="reference internal" href="#metrics-buckets"><span class="std std-ref">stage</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_request_queue_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds. From the conductor taking the request in to admitting it for
+dispatch: zero unless the request queued at <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>. The
+conductor sends it with the request’s completion. Buckets:
+<a class="reference internal" href="#metrics-buckets"><span class="std std-ref">queue</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_request_engine_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds. From the conductor dispatching the request to the workers (after
+any wait in <code class="docutils literal notranslate"><span class="pre">mstar_request_queue_seconds</span></code>) to the conductor finishing it. Buckets:
+<a class="reference internal" href="#metrics-buckets"><span class="std std-ref">E2E</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_request_delivery_seconds{model_name,</span> <span class="pre">output_modalities}</span></code></dt><dd><p>Histogram, seconds. From the conductor finishing the request to the result leaving
+the API server: the last chunks’ postprocessing and transfer, and the client handler
+picking the result up. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">stage</span></a>.</p>
+</dd>
+</dl>
+</section>
+<section id="output">
+<h2>Output<a class="headerlink" href="#output" title="Link to this heading">#</a></h2>
+<p>Exported by the API server, counted per result chunk as it reaches the API server.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_output_chunks_total{model_name,</span> <span class="pre">modality}</span></code></dt><dd><p>Counter. Result chunks, for every request whatever its outcome. Error chunks are not
+counted.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_output_bytes_total{model_name,</span> <span class="pre">modality}</span></code></dt><dd><p>Counter. Bytes of those chunks.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_output_audio_seconds_total{model_name}</span></code></dt><dd><p>Counter, seconds. Audio in those chunks, from their byte length as 16-bit PCM at the
+chunk’s sample rate and channel count. Audio chunks that carry no sample rate are
+not counted.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_chunk_seconds{model_name,</span> <span class="pre">modality}</span></code></dt><dd><p>Histogram, seconds, successful requests. From submission to the first chunk of each
+output modality reaching the API server: time to first audio, first image, first
+video frame. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">first output</span></a>.</p>
+</dd>
+</dl>
+</section>
+<section id="data-worker">
+<h2>Data worker<a class="headerlink" href="#data-worker" title="Link to this heading">#</a></h2>
+<p>Exported by the API server. The data worker is the API server thread that loads each
+request’s media and runs the model’s prompt processing, one request at a time.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_preprocess_seconds{model_name,</span> <span class="pre">input_modalities}</span></code></dt><dd><p>Histogram, seconds. From the data worker taking a request off its queue to handing
+it to the conductor, for every request whose preprocessing finished, whatever its
+outcome later. Unlike <code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds</span></code>, it leaves out the wait in
+the queue. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">stage</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_preprocess_failures_total{model_name,</span> <span class="pre">input_modalities}</span></code></dt><dd><p>Counter. Requests whose preprocessing failed in the data worker, each once: a file
+count or media length over its limit, a file that cannot be decoded, the model’s
+prompt processing, or handing the inputs on. Such a request also ends as
+<code class="docutils literal notranslate"><span class="pre">outcome=&quot;error&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> unless its client had already gone.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_upload_size_bytes{model_name,</span> <span class="pre">modality}</span></code></dt><dd><p>Histogram, bytes. Size on disk of each <code class="docutils literal notranslate"><span class="pre">image</span></code>, <code class="docutils literal notranslate"><span class="pre">audio</span></code> or <code class="docutils literal notranslate"><span class="pre">video</span></code> file a
+request carried to the data worker, whether the request succeeded or failed: an
+upload as received, inline media (a <code class="docutils literal notranslate"><span class="pre">data:</span></code> URL, base64 files on
+<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>) after decoding. The realtime route and long transcriptions count
+the WAV files they write from the decoded audio. Buckets:
+<a class="reference internal" href="#metrics-buckets"><span class="std std-ref">upload size</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_queue_depth{model_name}</span></code></dt><dd><p>Gauge, read at scrape time. Requests submitted and not yet taken up by the data
+worker; the one it is working on is not counted. A request whose client went away
+counts until the data worker takes it up.</p>
+</dd>
+</dl>
+</section>
+<section id="http-refusals">
+<h2>HTTP refusals<a class="headerlink" href="#http-refusals" title="Link to this heading">#</a></h2>
+<p>Exported by the API server, counted by whichever frontend serves the deployment.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total{model_name,</span> <span class="pre">route,</span> <span class="pre">status}</span></code></dt><dd><p>Counter. HTTP requests the frontend answered with an error without submitting them
+to the API server: <code class="docutils literal notranslate"><span class="pre">401</span></code> (missing or wrong API key), <code class="docutils literal notranslate"><span class="pre">413</span></code> (body over
+<code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>), <code class="docutils literal notranslate"><span class="pre">422</span></code> (body that fails validation), <code class="docutils literal notranslate"><span class="pre">400</span></code> (a bad form
+field or request), <code class="docutils literal notranslate"><span class="pre">409</span></code> (a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight), <code class="docutils literal notranslate"><span class="pre">404</span></code> (unknown route, or
+a model without the endpoint), <code class="docutils literal notranslate"><span class="pre">405</span></code> (wrong method), and <code class="docutils literal notranslate"><span class="pre">503</span></code> when the Rust
+frontend’s <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code> cap turns a request away. WebSocket
+handshakes are not counted. With <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, the values are the totals
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> sent with the latest <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request.</p>
+</dd>
+</dl>
+</section>
+<section id="conductor">
+<h2>Conductor<a class="headerlink" href="#conductor" title="Link to this heading">#</a></h2>
+<p>From the conductor’s status message, sent every second while metrics are on.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_conductor_requests{model_name,</span> <span class="pre">state}</span></code></dt><dd><p>Gauge, up to a second old. Requests the conductor holds. <code class="docutils literal notranslate"><span class="pre">waiting</span></code>: queued at
+<code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>, not dispatched yet. <code class="docutils literal notranslate"><span class="pre">running</span></code>: dispatched to workers,
+not finished. <code class="docutils literal notranslate"><span class="pre">draining</span></code>: completed, aborted or failed, and waiting for every
+reader to release its outputs before the workers free its state; it still counts
+toward <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_component_in_flight{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Gauge, up to a second old. Running requests with a pass on the graph node that the
+conductor dispatched and has not heard back from. The conductor sees whole passes,
+so a node running a request’s decode loop counts it once for the loop.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds{model_name}</span></code></dt><dd><p>Gauge, seconds, computed at scrape time. Time since the API server received the
+conductor’s last status message, or since metrics were enabled if none arrived yet.
+More than a few seconds means the conductor stopped reporting, and the conductor,
+worker and transport values its message carries are stale.</p>
+</dd>
+</dl>
+</section>
+<section id="engine-workers">
+<h2>Engine workers<a class="headerlink" href="#engine-workers" title="Link to this heading">#</a></h2>
+<p>From the workers’ numbers, forwarded in the conductor’s status message, so up to two
+seconds old. A node with replicas on several workers shows their sum. The ranks of a
+tensor or sequence parallel instance count once: the instance’s first rank reports.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_used{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code></dt><dd><p>Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
+the prefix cache. A node can have several caches (e.g. a decoder’s self and cross
+attention), told apart by <code class="docutils literal notranslate"><span class="pre">resource</span></code>. A cache two nodes of one worker share shows
+under each node, so summing over <code class="docutils literal notranslate"><span class="pre">component</span></code> counts it twice.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_total{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code></dt><dd><p>Gauge. Pages of the cache that requests can hold.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_cached{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code></dt><dd><p>Gauge. Pages the prefix cache names. Running requests may also hold some of them;
+the cache frees the others when a request needs the room.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_step_seconds{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code></dt><dd><p>Histogram, seconds, engine steps that ran a forward. From when the worker hands the
+step to its GPU thread, or from the end of the previous step if that was later, to
+the end of the step’s postprocess (outputs on the host, stop check, routing).
+Overlapping steps are not counted twice: in steady state this is the interval
+between step completions, and <code class="docutils literal notranslate"><span class="pre">rate(mstar_step_seconds_sum[1m])</span></code> is the share of
+time the worker had a step running. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">step</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_batch_size{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code></dt><dd><p>Histogram, rows the step’s forward ran. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">batch</span></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_query_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
+keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
+Orpheus); the cache is off under tensor parallelism.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Tokens the prefix cache already held at that lookup. The hit rate is
+<code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_hit_tokens_total[5m])</span></code> divided by
+<code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_query_tokens_total[5m])</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
+running: waiting for room in a step, or for the worker to pick the node.</p>
+</dd>
+</dl>
+</section>
+<section id="tensor-transport">
+<h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
+<p>Tensor transfers between graph nodes (<a class="reference internal" href="serving.html#tensor-transport"><span class="std std-ref">Tensor transport</span></a>), counted by the reader,
+once per edge read: the tensors of one graph edge that one worker read from one
+producer. Workers report through the conductor (up to two seconds old); the API server
+adds what its data worker read since metrics were enabled, which the data worker
+publishes once a second. <code class="docutils literal notranslate"><span class="pre">src</span></code> is the node that produced the tensors, <code class="docutils literal notranslate"><span class="pre">dst</span></code>
+the node that reads them, and <code class="docutils literal notranslate"><span class="pre">api_server</span></code> stands for the request’s inputs (as
+<code class="docutils literal notranslate"><span class="pre">src</span></code>) and its results (as <code class="docutils literal notranslate"><span class="pre">dst</span></code>). The Python and Rust runtimes report the same
+series.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_transfer_bytes_total{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code></dt><dd><p>Counter, bytes. Tensor bytes read over the edge.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_transfers_total{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code></dt><dd><p>Counter. Tensors read over the edge.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_transfer_seconds{model_name,</span> <span class="pre">src,</span> <span class="pre">dst,</span> <span class="pre">transport}</span></code></dt><dd><p>Histogram, seconds, one observation per edge read. The reader’s time to read the
+edge’s tensors: the SHM file read and copy, the copy out of the SHM arena, or the
+RDMA or TCP read. A GPU reader of the arena only issues its host-to-device copies in
+that time. The producer’s own work (serializing, staging, registering memory) is not
+included; it is the <code class="docutils literal notranslate"><span class="pre">tx</span></code> time of <a class="reference internal" href="serving.html#request-profiling"><span class="std std-ref">Request profiling</span></a>. Buckets:
+<a class="reference internal" href="#metrics-buckets"><span class="std std-ref">transfer</span></a>.</p>
+</dd>
+</dl>
+<p>A tensor already on the reader moves nothing and is not counted. An edge the conductor
+joined from several producers is one read per producing node, with its read time split
+between them by bytes. Under tensor parallelism every rank counts its own read, so an
+edge two ranks read is two reads.</p>
+</section>
+<section id="histogram-buckets">
+<span id="metrics-buckets"></span><h2>Histogram buckets<a class="headerlink" href="#histogram-buckets" title="Link to this heading">#</a></h2>
+<p>Upper bounds, without <code class="docutils literal notranslate"><span class="pre">+Inf</span></code>:</p>
+<ul class="simple">
+<li><p><strong>E2E</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_e2e_request_latency_seconds</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar_request_engine_seconds</span></code>):
+0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 30, 60, 120, 300, 600,
+1200 s.</p></li>
+<li><p><strong>First output</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_output_seconds</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_chunk_seconds</span></code>): 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2,
+0.3, 0.5, 0.75, 1, 1.5, 2, 3, 5, 7.5, 10, 20, 30, 60, 120, 300, 600 s.</p></li>
+<li><p><strong>Stage</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar_request_delivery_seconds</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar_data_worker_preprocess_seconds</span></code>): 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
+0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600 s.</p></li>
+<li><p><strong>Queue</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_request_queue_seconds</span></code>): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600 s.</p></li>
+<li><p><strong>Upload size</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_upload_size_bytes</span></code>): 1, 4, 16, 32, 64, 128, 256, 512 KiB,
+then 1, 2, 4, 8, 16, 32, 64, 128, 256, 1024 MiB.</p></li>
+<li><p><strong>Step</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_step_seconds</span></code>): 0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01,
+0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30 s.</p></li>
+<li><p><strong>Batch</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_batch_size</span></code>): 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 rows.</p></li>
+<li><p><strong>Transfer</strong> (<code class="docutils literal notranslate"><span class="pre">mstar_transfer_seconds</span></code>): 10, 25, 50, 100, 250, 500 µs, then 1, 2.5,
+5, 10, 25, 50, 100, 250, 500 ms, then 1, 2.5, 5, 10 s.</p></li>
+</ul>
+</section>
+<section id="example-queries">
+<h2>Example queries<a class="headerlink" href="#example-queries" title="Link to this heading">#</a></h2>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span># Requests per second by outcome
+sum by (outcome) (rate(mstar_requests_total[1m]))
+
+# Share of requests that did not succeed
+sum(rate(mstar_requests_total{outcome!="success"}[5m]))
+  / sum(rate(mstar_requests_total[5m]))
+
+# p95 end-to-end latency and time to first output
+histogram_quantile(0.95, sum by (le) (rate(mstar_e2e_request_latency_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(mstar_time_to_first_output_seconds_bucket[5m])))
+
+# KV cache use per node and cache
+mstar_kv_pages_used / mstar_kv_pages_total
+
+# The conductor stopped reporting (alert)
+mstar_conductor_status_age_seconds &gt; 10
+</pre></div>
+</div>
+</section>
+<section id="prometheus-and-grafana">
+<span id="metrics-setup"></span><h2>Prometheus and Grafana<a class="headerlink" href="#prometheus-and-grafana" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">examples/observability/</span></code> runs Prometheus and Grafana in Docker Compose against an
+M* server on the host:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>kokoro<span class="w"> </span>--enable-metrics<span class="w">          </span><span class="c1"># on the host, port 8000</span>
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>examples/observability/docker-compose.yml<span class="w"> </span>up<span class="w"> </span>-d
+</pre></div>
+</div>
+<p>Prometheus (<code class="docutils literal notranslate"><span class="pre">localhost:9090</span></code>) scrapes <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> every 5 seconds; Grafana
+(<code class="docutils literal notranslate"><span class="pre">localhost:3000</span></code>) has Prometheus as its default data source and loads any dashboard
+JSON placed in <code class="docutils literal notranslate"><span class="pre">examples/observability/grafana/dashboards/</span></code>. Its README covers how
+the containers reach the host on Linux, a server on another port, and the optional
+anonymous viewer.</p>
+<p>To scrape from an existing Prometheus, add a job for the server’s address:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">scrape_configs</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mstar</span>
+<span class="w">    </span><span class="nt">metrics_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/metrics</span>
+<span class="w">    </span><span class="nt">scrape_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5s</span>
+<span class="w">    </span><span class="nt">static_configs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">targets</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"localhost:8000"</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>The conductor and workers report once a second, so a scrape interval under a second
+only repeats values. Keep the scrape timeout above two seconds with
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, which waits that long for the bridge before answering <code class="docutils literal notranslate"><span class="pre">503</span></code>.</p>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="serving.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Serving</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="clients.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Using a Server</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#where-the-numbers-come-from">Where the numbers come from</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conventions">Conventions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-counted-from-when">What is counted from when</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requests">Requests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-stages">Request stages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#output">Output</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-worker">Data worker</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#http-refusals">HTTP refusals</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conductor">Conductor</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#engine-workers">Engine workers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#histogram-buckets">Histogram buckets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-queries">Example queries</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prometheus-and-grafana">Prometheus and Grafana</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Oct 20, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
