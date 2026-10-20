@@ -519,13 +519,18 @@ def test_batching_two_requests_of_one_shape_costs_only_the_gemm_re_blocking(
     (trap 2 in the banner).
 
     The floor is measured **per row**, from each request's own duplicate batch, because the
-    two rows do not share a floor: measured 1.15e-03 and 1.17e-03 mean, and 2.34e-02 against
-    3.12e-02 at the per-element max, which is one bf16 ulp apart at those magnitudes. Against
-    one row's floor applied to the whole batch -- how C08's QA first measured it -- the gap is
-    mean 1.01x and max 1.33x; per row it is 1.00x and 1.00x, because a row's bits turn out not
-    to depend on its neighbour's contents at all. That exactness is a kernel's choice today
-    and is not what is asserted here; ``test_perturbing_one_rows_conditioning_...`` is where
-    row isolation is pinned.
+    two rows do not share one: 1.15e-03 and 1.17e-03 mean. Per row the ratio is 1.00x, because
+    a row's bits do not depend on its neighbour's contents at all --
+    ``test_a_rows_result_does_not_depend_on_who_shares_its_batch`` asserts that directly, and
+    it is the evidence for isolation; this test only bounds what batching costs.
+
+    Two numbers C08's dossier first reported here were artifacts, recorded so nobody
+    reconstructs them. Applying *one* row's floor to the whole batch gave "mean 1.01x, max
+    1.33x", and the 1.33x is **4/3 exactly** -- 3.125e-02 over 2.3438e-02, which is 4/128 over
+    3/128, two adjacent bf16 spacings. A per-element max of bf16 differences moves in whole
+    ulps, so a ratio of two of them is quantisation, not a residual effect. And 2.34e-02 was
+    req_00's own figure quoted as "the floor": across the 20 the duplicate-batch max reaches
+    **4.6875e-02** (req_16), twice that.
 
     If this fails, batching changes the policy and the engine has to serve this node one
     request at a time.
@@ -538,6 +543,46 @@ def test_batching_two_requests_of_one_shape_costs_only_the_gemm_re_blocking(
             _reblocking_floor(loop, request),
             f"req {request.index} batched with req {pair[1 - row].index}",
         )
+
+
+def test_a_rows_result_does_not_depend_on_who_shares_its_batch(
+    loop: _Loop, requests: list[_Request],
+):
+    """R4(b)'s real isolation evidence, and it needs no tolerance: **bitwise**.
+
+    The test above bounds what batching costs by a ratio to a floor measured from a *duplicate*
+    batch -- the same request twice. That is an honest scale, because cuBLAS picks a kernel from
+    shapes and dtypes rather than values, so a duplicate batch re-blocks exactly as a mixed one
+    does. But it is **blind by construction to the failure it would be cited for**: if row 0
+    read row 1's conditioning, two identical rows would make the leak a no-op and the floor
+    would come back clean for a broken implementation. The companion observation that a
+    duplicate batch's two rows match each other is near-vacuous for the same reason -- equal
+    inputs at symmetric positions.
+
+    So isolation is pinned the other way round: hold one request fixed, vary **who** it is
+    batched with and **where** it sits, and demand the same bits. A cross-row leak cannot
+    survive that, and no floor has to be chosen. Values do not reach a GEMM's blocking
+    decision, so this is a property of the implementation and not of the kernel's mood --
+    unlike the exact equality between a batched row and the same row run *alone*, which really
+    is a blocking artifact and is deliberately not asserted anywhere.
+
+    One request per bucket, against four partners each (itself included) in both positions.
+    """
+    for anchor in (0, 8):  # one per bucket; `requests` is ordered by index
+        fixed = requests[anchor]
+        partners = requests[anchor:anchor + 4]
+        baseline = None
+        for partner in partners:
+            first = _run(loop, [fixed, partner])[0]
+            if baseline is None:
+                baseline = first
+            assert torch.equal(first, baseline), (
+                f"req {fixed.index} changed when batched with req {partner.index}"
+            )
+            second = _run(loop, [partner, fixed])[1]
+            assert torch.equal(first, second), (
+                f"req {fixed.index} changed when moved to row 1 beside req {partner.index}"
+            )
 
 
 def test_giving_the_text_blocks_the_image_rows_dwarfs_the_batching_gap(
@@ -625,12 +670,19 @@ def test_perturbing_one_rows_conditioning_leaves_the_other_row_bit_identical(
 
     Row 0 is asserted to have *moved*, by the same margin the span-assignment control is held
     to, or the test would pass just as well on a perturbation that reached nothing. That check
-    is why the image rows are what is perturbed and not the state row: ``state_features`` has
-    rms 0.0335, and shifting all 1536 of its values by 1.0 -- a 30x change in the signal --
-    moves the chunk by only 1.2x the re-blocking floor, because the state is 1 of the DT's 41
-    rows and reaches the action rows through attention alone. A control that small would not
-    distinguish "row 1 is isolated" from "nothing was perturbed". Zeroing the image rows moves
-    row 0 by 24x the floor at one step and 33x over the loop.
+    is why the image rows are what is perturbed, and the reason is not the one C08 first wrote
+    down. Shifting all 1536 values of ``state_features`` by 1.0 moves the chunk by only 1.2x
+    the re-blocking floor, and the dossier blamed the tensor's small rms (0.0335) and its being
+    1 of 41 rows. **Magnitude is not the explanation**: per-element noise at that same rms
+    moves the row 8x further than the DC shift does. Every *affine* perturbation is nearly
+    vacuous whatever its size, because each block's first act on the hidden state is a per-row
+    ``nn.LayerNorm`` over the feature dim (``components/dit.py``'s ``AdaLayerNorm``), which
+    removes a shift and a rescale; only the residual stream carries any of it. Blind QA
+    measured the family: ``state += 1.0`` 1.1x the floor, ``state += 1x-rms DC`` 0.9x,
+    ``state *= 2`` 1.0x -- against ``state += 1x-rms noise`` 8.4x, ``state = 0`` 13x,
+    ``vl_text = 0`` 9.3x and ``vl_image = 0`` 17x. So the rule for choosing one of these is
+    "not affine", not "big": zeroing the image rows moves row 0 by 24x the floor at one step
+    and 33x over the loop.
 
     Both the mixed single step and the full four-step loop are checked, because they fail
     separately: one step catches a reduction over the batch dimension inside the step, and four

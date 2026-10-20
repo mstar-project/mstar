@@ -42,14 +42,28 @@ def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     NaN action is worse than a refused one, so the norms are checked.
     """
     rows = rot6d.reshape(2, 3)
+    if not np.all(np.isfinite(rows)):
+        # The reference reaches scipy and dies on a bare `LinAlgError: SVD did not
+        # converge`, which names nothing. Same rejection, with the cause.
+        raise ValueError(
+            "GR00T action decode: the rotation has a non-finite component, so no "
+            "frame can be built from it"
+        )
     row1, row2 = rows[0], rows[1]
     n1 = np.linalg.norm(row1)
-    if n1 == 0.0:
-        raise ValueError("GR00T action decode: the rotation's first row is zero")
+    # `> 0` rather than `!= 0`, and finite: in float32 a row near 1e20 overflows the
+    # norm to `inf`, the division then gives exactly zero, and a `== 0` test on the
+    # *raw* row would pass it through to a silent identity rotation. The reference
+    # rejects that case (scipy: "null coordinate frame"), so we have to as well.
+    if not (np.isfinite(n1) and n1 > 0.0):
+        raise ValueError(
+            "GR00T action decode: the rotation's first row has norm "
+            f"{float(n1)!r}, so it does not define a direction"
+        )
     row1 = row1 / n1
     row2 = row2 - np.dot(row1, row2) * row1
     n2 = np.linalg.norm(row2)
-    if n2 == 0.0:
+    if not (np.isfinite(n2) and n2 > 0.0):
         raise ValueError(
             "GR00T action decode: the rotation's two rows are parallel, so they "
             "do not span a plane"
@@ -300,7 +314,10 @@ class Gr00tN17Preprocessor:
         Against the 20 recorded DROID requests (``docs-local/c08/chk3_parity.py``)
         this is **bit-exact** for ``gripper_position`` (absolute) and
         ``joint_position`` (relative, additive), and for the SE(3) group
-        ``eef_9d`` it is min 4.7e-16 / median 8.3e-16 / max 3.3e-09. The single
+        ``eef_9d`` it is min 4.7e-16 / median 8.3e-16 / max 3.3e-09 -- a bound of
+        **one float32 ulp of the reference frame**, which 96 of 300 random frames
+        realise across the two numpy builds; one in twenty is this checkpoint's
+        luck. The single
         outlier is not ours: ``np.dot`` on two float32 3-vectors returns exactly
         ``0.0`` under the reference venv's numpy 1.26.4 and ``3.7e-09`` under
         M\\*'s 2.5.4, which moves that request's Gram-Schmidt by one float32 ulp.
