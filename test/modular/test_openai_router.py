@@ -783,8 +783,11 @@ def test_glm_chat_streams_reasoning_then_the_call(client_and_stub):
     assert deltas[0] == {"role": "assistant", "reasoning_content": "Need the "}
     assert "".join(d.get("reasoning_content", "") for d in deltas) == "Need the weather."
     assert not any(d.get("content") for d in deltas)
-    (call,) = [c for d in deltas for c in d.get("tool_calls", [])]
-    assert call["index"] == 0 and call["function"]["arguments"] == '{"city": "Paris"}'
+    first, *rest = [c for d in deltas for c in d.get("tool_calls", [])]
+    assert first["index"] == 0 and first["function"]["name"] == "get_weather" and first["id"].startswith("call_")
+    # the arguments stream after the name
+    assert first["function"]["arguments"] + "".join(c["function"]["arguments"] for c in rest) == '{"city": "Paris"}'
+    assert all(c["index"] == 0 and "id" not in c for c in rest)
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 

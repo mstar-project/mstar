@@ -60,7 +60,7 @@ class Failure:
 @dataclass
 class Finish:
     """``reason`` is ``stop`` (a stop token or ``stop_string``), ``length``
-    (the token budget) or ``tool_calls`` (the reply made calls)."""
+    (the token budget) or ``tool_calls`` (the reply made calls, all whole)."""
 
     reason: str
     usage: Usage

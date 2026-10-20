@@ -24,6 +24,18 @@ def _parser(thinking=True, tools=TOOLS):
     return glm_chat.GlmReplyParser(thinking=thinking, tools=tools)
 
 
+def _calls(deltas):
+    """The calls the deltas stream, put together: index, id, name and arguments."""
+    calls = {}
+    for d in deltas:
+        for c in d.get("tool_calls", []):
+            if "id" in c:
+                calls[c["index"]] = {"index": c["index"], "id": c["id"], "function": dict(c["function"])}
+            else:
+                calls[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
+    return list(calls.values())
+
+
 def _streamed(text, pieces, **kw):
     """The deltas of ``text`` fed in ``pieces``-character chunks, merged back."""
     p = _parser(**kw)
@@ -33,8 +45,7 @@ def _streamed(text, pieces, **kw):
     deltas += p.finish()
     reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
     content = "".join(d.get("content", "") for d in deltas)
-    calls = [c for d in deltas for c in d.get("tool_calls", [])]
-    return reasoning, content, calls, p.finish_reason
+    return reasoning, content, _calls(deltas), p.finish_reason
 
 
 def test_reasoning_then_answer():
@@ -69,6 +80,58 @@ def test_streaming_in_any_chunks_matches_the_whole_reply(text):
         assert [c["function"] for c in got[2]] == [c["function"] for c in whole[2]]
 
 
+def _whole_call_arguments(body, tools):
+    """A call's arguments as the parser read them whole, before they streamed."""
+    import re
+
+    props = tools[body.partition("<arg_key>")[0].strip()]
+    pairs = re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", body, re.DOTALL)
+    return json.dumps({k.strip(): glm_chat._arg_value(v, props.get(k.strip())) for k, v in pairs}, ensure_ascii=False)
+
+
+EDIT = glm_chat.tool_parameters([{"type": "function", "function": {"name": "edit", "parameters": {
+    "type": "object", "properties": {
+        "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": ["string", "null"]},
+        "line": {"type": "integer"}, "opts": {"type": "object"}, "tags": {"type": "array"}, "any": {}}}}}])
+
+
+@pytest.mark.parametrize("body", [
+    "edit<arg_key>path</arg_key><arg_value>src/a.py</arg_value>",
+    'edit<arg_key>old</arg_key><arg_value>if a < b and "q" in s:\n\treturn \\x</arg_value>'
+    "<arg_key>new</arg_key><arg_value>é√ 😀 </arg_valu </arg_value>",
+    'edit<arg_key>line</arg_key><arg_value>3.0</arg_value><arg_key>opts</arg_key><arg_value>{"a": [1, "<"]}'
+    '</arg_value><arg_key>tags</arg_key><arg_value>["x"]</arg_value><arg_key>any</arg_key><arg_value>nope'
+    "</arg_value>",
+    "edit\n<arg_key> path </arg_key>\n<arg_value>a</arg_value>\n<arg_key>line</arg_key> <arg_value>7</arg_value>\n",
+    "edit",
+    "edit<arg_key>unknown</arg_key><arg_value>NaN</arg_value><arg_key>old</arg_key><arg_value></arg_value>",
+])
+def test_streamed_arguments_add_up_to_the_whole_calls_json_in_any_chunking(body):
+    text = "plan</think>Sure. <tool_call>" + body + "</tool_call>"
+    want = _whole_call_arguments(body, EDIT)
+    for pieces in (1, 2, 3, 5, 7, 11, len(text)):
+        p, deltas = _parser(tools=EDIT), []
+        for i in range(0, len(text), pieces):
+            deltas += p.feed(text[i:i + pieces])
+        deltas += p.finish()
+        (call,) = _calls(deltas)
+        assert call["function"] == {"name": "edit", "arguments": want}
+        assert "".join(d.get("content", "") for d in deltas) == "Sure."
+    # the id and name go out before the arguments are read
+    p = _parser(tools=EDIT)
+    first = p.feed("x</think><tool_call>edit<arg_key>pa")
+    assert first[-1]["tool_calls"][0]["function"] == {"name": "edit", "arguments": ""}
+    assert p.feed("th</arg_key><arg_value>src/") == [{"tool_calls": [{"index": 0, "function": {
+        "arguments": '{"path": "src/'}}]}]
+
+
+def test_a_string_value_streams_with_a_partial_tag_held():
+    p = _parser(tools=EDIT)
+    p.feed("x</think><tool_call>edit<arg_key>old</arg_key><arg_value>a <")
+    assert p.feed("b> </arg_v") == [{"tool_calls": [{"index": 0, "function": {"arguments": "<b> "}}]}]
+    assert p.feed("alue></tool_call>") == [{"tool_calls": [{"index": 0, "function": {"arguments": '"}'}}]}]
+
+
 def test_two_calls_take_indices_and_drop_the_space_between():
     reasoning, content, calls, finish = _streamed("Plan</think>\n" + CALL + "\n" + CALL + "\n", 5)
     assert [c["index"] for c in calls] == [0, 1] and content == "" and finish == "tool_calls"
@@ -90,9 +153,23 @@ def test_without_tools_a_call_tag_is_text():
     assert calls == [] and content == CALL
 
 
-def test_a_cut_off_call_is_returned_as_text():
-    _, content, calls, finish = _streamed("ok</think>" + CALL[:50], 6)
-    assert calls == [] and content == CALL[:50] and finish == "stop"
+def test_a_call_cut_off_before_its_name_ends_is_text():
+    _, content, calls, finish = _streamed("ok</think>" + CALL[:20], 6)
+    assert calls == [] and content == CALL[:20] and finish == "stop"
+
+
+@pytest.mark.parametrize("cut, arguments", [
+    (len("<tool_call>get_weather<arg_key>"), ""),
+    (len("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par"), '{"city": "Par'),
+    (len("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key>"
+         "<arg_value>3"), '{"city": "Paris", "days": '),
+])
+def test_a_call_cut_off_after_its_name_stays_a_call_as_far_as_it_got(cut, arguments):
+    for pieces in (1, 4, cut):
+        _, content, calls, finish = _streamed("ok</think>" + CALL[:cut], pieces)
+        assert content == "" and [c["function"] for c in calls] == [{"name": "get_weather", "arguments": arguments}]
+        # not tool_calls: the arguments are not whole
+        assert finish == "stop"
 
 
 def test_thinking_off_reads_the_reply_as_the_answer():
@@ -438,7 +515,7 @@ def test_a_long_call_is_read_once_and_parses_as_whole():
     deltas += p.finish()
     # what is still searched for the end tag stays a feed long, whatever the call's length
     assert longest < len(glm_chat.CALL_END) + 4
-    [call] = [c for d in deltas for c in d.get("tool_calls", [])]
+    [call] = _calls(deltas)
     assert json.loads(call["function"]["arguments"]) == {"path": "a.py", "content": body}
     assert _parser(tools=write).message(text)["tool_calls"][0]["function"] == call["function"]
 
@@ -491,3 +568,37 @@ def test_a_stop_string_holds_back_only_what_may_start_it():
     assert m.feed("plain text") == ("plain text", None)
     assert m.feed(" and </ans") == (" and ", None)
     assert m.feed("wer") == ("", None) and m.feed(">!") == ("", "</answer>")
+
+
+def test_any_reply_parses_alike_in_any_chunking_and_whole_calls_are_json():
+    """Seeded fuzz over tags, partial tags and text: chunking never changes the
+    reply, and a reply whose calls all closed has JSON arguments."""
+    import random
+
+    tools = glm_chat.tool_parameters([
+        {"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {
+            "s": {"type": "string"}, "n": {"type": "integer"}, "o": {}}}}},
+        {"type": "function", "function": {"name": "g", "parameters": {}}}])
+    frags = ["<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
+             "</arg_value>", "f", "g", "h", "s", "n", "o", " ", "\n", "<", "</", "x", "1", '"q"', "é", "[1]",
+             "</arg_v", "<tool"]
+
+    def run(text, size, **kw):
+        p, deltas = glm_chat.GlmReplyParser(tools=tools, **kw), []
+        for i in range(0, len(text), size):
+            deltas += p.feed(text[i:i + size])
+        deltas += p.finish()
+        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+        content = "".join(d.get("content", "") for d in deltas)
+        return reasoning, content, [c["function"] for c in _calls(deltas)], p.finish_reason
+
+    rng = random.Random(0)
+    for _ in range(1500):
+        text = "".join(rng.choice(frags) for _ in range(rng.randint(0, 40)))
+        kw = {"thinking": rng.random() < 0.5, "forced_call": rng.choice([None, None, "", "f", "h"])}
+        whole = run(text, max(1, len(text)), **kw)
+        for size in (1, 2, 3, 7):
+            assert run(text, size, **kw) == whole, (text, size, kw)
+        if whole[3] == "tool_calls":
+            for fn in whole[2]:
+                json.loads(fn["arguments"])
