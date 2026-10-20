@@ -1396,18 +1396,20 @@ window.runMermaid = runMermaid;</script>
     <span class="n">max_new_tokens_limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># S3Gen streaming: the first waveform chunk is synthesised once</span>
-    <span class="c1"># ``stream_first_chunk_tokens`` speech tokens exist (about 0.23 s on an</span>
-    <span class="c1"># H100); later chunks start at ``stream_chunk_tokens`` and grow by</span>
-    <span class="c1"># ``stream_chunk_growth`` up to ``stream_max_chunk_tokens`` (15, 50, 100,</span>
-    <span class="c1"># 200, 200 ...): each chunk buys the playback time to produce a bigger one,</span>
-    <span class="c1"># so an utterance costs three or four flow solves instead of one per 25</span>
-    <span class="c1"># tokens (+40 % throughput at concurrency 8-32, playback still continuous</span>
-    <span class="c1"># at concurrency 1). ``stream_chunk_tokens = 0`` = one chunk per utterance,</span>
-    <span class="c1"># the reference's offline behaviour. Each chunk re-runs the flow decoder</span>
-    <span class="c1"># over the prompt and the recent tokens with a fixed per-request noise</span>
-    <span class="c1"># field and withholds the encoder's look-ahead tokens; the vocoder keeps</span>
-    <span class="c1"># ``stream_mel_cache_frames`` mel frames of context and crossfades the</span>
-    <span class="c1"># re-synthesised tail (CosyVoice 2's token2wav scheme).</span>
+    <span class="c1"># ``stream_first_chunk_tokens`` speech tokens exist (15 here, which the</span>
+    <span class="c1"># multilingual model keeps; the English model starts at 35, see</span>
+    <span class="c1"># ``chatterbox()``); later chunks start at ``stream_chunk_tokens`` and grow</span>
+    <span class="c1"># by ``stream_chunk_growth`` up to ``stream_max_chunk_tokens`` (35, 50,</span>
+    <span class="c1"># 100, 200, 200 ... for English): each chunk buys the playback time to</span>
+    <span class="c1"># produce a bigger one, so an utterance costs three or four flow solves</span>
+    <span class="c1"># instead of one per 25 tokens (+40 % throughput at concurrency 8-32,</span>
+    <span class="c1"># playback still continuous at concurrency 1). ``stream_chunk_tokens = 0``</span>
+    <span class="c1"># = one chunk per utterance, the reference's offline behaviour. Each chunk</span>
+    <span class="c1"># re-runs the flow decoder over the prompt and the recent tokens with a</span>
+    <span class="c1"># fixed per-request noise field and withholds the encoder's look-ahead</span>
+    <span class="c1"># tokens; the vocoder keeps ``stream_mel_cache_frames`` mel frames of</span>
+    <span class="c1"># context and crossfades the re-synthesised tail (CosyVoice 2's token2wav</span>
+    <span class="c1"># scheme).</span>
     <span class="n">stream_first_chunk_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">15</span>
     <span class="n">stream_chunk_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span>
     <span class="n">stream_chunk_growth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">2.0</span>
@@ -1476,7 +1478,10 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.chatterbox">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">chatterbox</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"ChatterboxConfig"</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">()</span></div>
+        <span class="c1"># A 15-token first chunk carries 0.32 s of audio, and at 4 to 8</span>
+        <span class="c1"># streams the next chunk takes longer than that to arrive, so playback</span>
+        <span class="c1"># stalls right after it; 35 tokens carry 1.12 s.</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">stream_first_chunk_tokens</span><span class="o">=</span><span class="mi">35</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="ChatterboxConfig.multilingual">

@@ -547,8 +547,9 @@ Chatterbox notes
   routine resamples on the CPU); it decodes with the package's detector like
   the package's output, from which it differs by the resampler only.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
-  the first after 15 tokens (about 0.12 s on an H100), then 50, 100 and 200
-  tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
+  the first after 35 tokens on Chatterbox (1.12 s of audio, enough to
+  cover the wait for the next chunk at 4 to 8 streams) and after 15 on
+  Multilingual and Turbo, then 50, 100 and 200 tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
   / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
   the playback time to produce a bigger one, so a stream costs three or four
   flow solves instead of one per 25 tokens. Each chunk re-runs
