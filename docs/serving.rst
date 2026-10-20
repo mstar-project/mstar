@@ -38,7 +38,7 @@ mstar serve
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
      - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       (see :ref:`api-key`).
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -69,6 +69,10 @@ mstar serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
 
 Each model maps to a default config (override with ``--config``):
 
@@ -124,7 +128,7 @@ mstar-serve
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
      - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       (see :ref:`api-key`).
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -159,6 +163,10 @@ mstar-serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -184,8 +192,9 @@ set.
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
    mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
 
-With a key set, every HTTP route except ``/health`` answers ``401`` unless the request
-carries ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
+With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
+:ref:`serving-metrics`) answers ``401`` unless the request carries
+``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
 ``/generate/ws``) refuse the handshake without it. The check is one middleware over the
 whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
@@ -266,7 +275,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
-       Larger messages stay on NCCL. Both are CUDA-graph capturable. Reduction order
+       Larger messages stay on NCCL, and so does one-shot inside a
+       ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
        differs from NCCL's, so bf16 results can differ at the last bit. Falls back
        to NCCL, with a warning, where symmetric memory cannot be set up on every
        rank of the group.
@@ -512,3 +522,203 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
    Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
    conductor, and data worker skip the timing/transfer bookkeeping entirely.
+
+.. _serving-metrics:
+
+Metrics
+-------
+
+Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
+Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
+(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
+hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
+API key even when one is set, the usual convention for scrape endpoints. It exposes
+request counts, latencies and the model name (never prompts or outputs); if that
+matters for a deployment, keep the port on an internal network. With
+``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
+it over the bridge, so both frontends show the same names, and it answers ``503`` if the
+bridge does not reply within two seconds, as ``/health`` does.
+
+:doc:`metrics` documents every family in one place, with a Prometheus and Grafana setup.
+
+Requests are counted when they leave the API server, from the first request after the
+warmup requests. Every family has a ``model_name`` label (the config's ``model``);
+``output_modalities`` is the request's output modalities, sorted and comma-joined
+(e.g. ``audio,text``).
+
+- ``mstar_requests_total{model_name, output_modalities, outcome}``: counter.
+  ``outcome`` is ``success`` (the result went to the HTTP layer), ``error`` (the
+  request failed in the engine, preprocessing or result delivery), ``abort`` (the client
+  went away, or its finished result was dropped unread) or ``timeout`` (``--timeout``
+  expired). Requests refused before they were submitted (a 400 for a bad form, a 409
+  for a ``request_id`` in flight) are not counted here but in
+  ``mstar_http_refusals_total``.
+- ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds
+  (submitted and not yet returned, failed or aborted).
+- ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission (after the request body was read) to the result
+  leaving the API server.
+- ``mstar_time_to_first_output_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission to the first result chunk of any modality
+  reaching the API server. It is measured on the server, so it does not include the
+  network to the client, and a non-streaming client sees nothing until the end.
+- ``mstar_http_refusals_total{model_name, route, status}``: counter, HTTP requests the
+  frontend answered with a 4xx status without submitting them to the API server: ``401``
+  (missing or wrong API key), ``413`` (body over ``MSTAR_MAX_BODY_MB``), ``422`` (body
+  that fails validation), ``400`` (a bad form field or request), ``409`` (a
+  ``request_id`` in flight), ``404`` (unknown route, or a model without the endpoint),
+  ``405`` (wrong method), plus ``503`` when the Rust frontend's
+  ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
+  path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
+  A request that was submitted and then failed counts once, as an ``error`` in
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
+  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+  ``/metrics`` request, so the API server exports them under the same name.
+- ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from the conductor taking the request in to admitting it for
+  dispatch. Zero unless the request queued at ``max_concurrent_requests``.
+
+While metrics are on, the conductor sends the API server a status message every second
+(nothing when they are off). These gauges show its latest one, so they can be up to a
+second old:
+
+- ``mstar_conductor_requests{model_name, state}``: requests the conductor holds.
+  ``state`` is ``waiting`` (queued at ``max_concurrent_requests``, not dispatched yet),
+  ``running`` (dispatched to workers, not finished) or ``draining`` (completed, aborted
+  or failed, and waiting for every reader to release its outputs before the workers free
+  its state; it still counts toward ``max_concurrent_requests``).
+- ``mstar_component_in_flight{model_name, component}``: per graph node (the
+  ``node_names`` of the config's ``node_groups``), running requests with a pass on that
+  node that the conductor dispatched and has not heard back from. The conductor sees
+  whole passes, so a node running a request's decode loop counts it once for the loop.
+- ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server
+  received the last status message, or since metrics were enabled before the first one.
+  More than a few seconds means the conductor stopped reporting.
+
+The engine workers also send the conductor their own metrics every second, which it
+adds to its status message, so these can be up to two seconds old. ``component`` is the
+graph node; a node with replicas on several workers shows their sum, and the ranks of a
+tensor or sequence parallel instance count once (the instance's first rank reports).
+The histograms and counters count from the first request after the warmup requests, as
+the API server's do (the gauges show the current state), so read them with ``rate()``
+or ``increase()``.
+
+- ``mstar_kv_pages_used{model_name, component, resource}``,
+  ``mstar_kv_pages_total{model_name, component, resource}``: pages of each paged KV
+  cache (``resource`` is its key in the model, since a node can have several, e.g.
+  Whisper's decoder self and cross attention caches). Used counts every page off the
+  free list, including the pages the prefix cache keeps; a cache two nodes of one
+  worker share shows under each node.
+- ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
+  names. Some may also be in use by running requests; the cache frees the others when a
+  request needs the room.
+- ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
+  steps that ran a forward. A step counts from when the worker hands it to its GPU
+  thread, or from the end of the previous step if that was later, to the end of its
+  postprocess (outputs on the host, stop check, routing). Overlapping steps are not
+  counted twice: in steady state this is the interval between step completions, and
+  ``rate(..._sum)`` is the share of time the worker had a step running.
+- ``mstar_batch_size{model_name, component, graph_walk}``: histogram, rows the step's
+  forward ran.
+- ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
+  ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
+  tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
+  tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
+  Orpheus) count; the cache is off under tensor parallelism.
+- ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
+  step on the node is ready (its inputs arrived) and not running: waiting for room in a
+  step or for the worker to pick the node.
+
+Tensor transfers between graph nodes (:ref:`tensor transport <tensor-transport>`) are
+counted by the reader, once per edge read: the tensors of one graph edge that one worker
+read from one producer. The workers send them with the engine metrics above, and the
+API server adds the results its data worker read:
+
+- ``mstar_transfer_bytes_total{model_name, src, dst, transport}``: counter, tensor bytes
+  read over the edge.
+- ``mstar_transfers_total{model_name, src, dst, transport}``: counter, tensors read over
+  the edge.
+- ``mstar_transfer_seconds{model_name, src, dst, transport}``: histogram, one observation
+  per edge read: the reader's time to read that edge's tensors, which is the SHM file
+  read and copy, the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of
+  the arena only issues its host-to-device copies in that time; they finish
+  asynchronously. The producer's own work (serializing, staging into the arena,
+  registering memory) is not included; it is the ``tx`` time of
+  :ref:`request profiling <request-profiling>`.
+
+``src`` is the graph node that produced the tensors and ``dst`` the node that reads them.
+An edge the conductor joined from several producers (one input name produced in several
+walks or nodes) is one read per producing node, with its read time split between them by
+bytes.
+``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
+which the API server's data worker sends and reads. ``transport`` is the protocol:
+``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
+Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
+report the same series. A tensor already on the reader (one it made, or one it read once
+for two of its nodes) moves nothing and is not counted. With tensor parallelism every
+rank counts its own read, of its slice or of the whole tensor when the edge is
+replicated, so an edge two ranks read is two reads. Like the data worker, the workers
+count from the first request after the warmup requests.
+
+Where a successful request's time went, from the timestamps every request already
+carries (same ``model_name`` and ``output_modalities`` labels; the conductor's
+timestamps are compared with the API server's, which assumes both run on one host, as
+they do today):
+
+- ``mstar_request_preprocess_seconds``: histogram, from submission to the data worker
+  handing the preprocessed request to the conductor, including its wait in the data
+  worker's queue.
+- ``mstar_request_engine_seconds``: histogram, from the conductor dispatching the
+  request to the workers (after any admission wait) to the conductor finishing it.
+- ``mstar_request_delivery_seconds``: histogram, from the conductor finishing the
+  request to the result leaving the API server (the last chunks' postprocessing and
+  transfer, and the client handler picking it up).
+
+Output, per output modality (``modality`` is the chunk's modality, e.g. ``audio``):
+
+- ``mstar_output_chunks_total{model_name, modality}`` and
+  ``mstar_output_bytes_total{model_name, modality}``: counters of the result chunks (and
+  their bytes) that reached the API server, for every request whatever its outcome;
+  error chunks are not counted.
+- ``mstar_output_audio_seconds_total{model_name}``: counter, seconds of audio in those
+  chunks (16-bit PCM at the chunk's sample rate and channel count).
+- ``mstar_time_to_first_chunk_seconds{model_name, modality}``: histogram over
+  successful requests, from submission to the first chunk of each output modality
+  reaching the API server (time to first audio, first image, first video frame).
+
+The data worker (a thread in the API server that loads each request's media and runs
+the model's prompt processing, preprocessing one request at a time) reports its own
+work.
+``input_modalities`` is the request's input modalities, sorted and comma-joined like
+``output_modalities``:
+
+- ``mstar_data_worker_preprocess_seconds{model_name, input_modalities}``: histogram over
+  requests whose preprocessing finished, from the data worker taking the request off its
+  queue to handing it to the conductor. Unlike ``mstar_request_preprocess_seconds`` it
+  leaves out the wait in the queue, and it counts requests whatever their outcome later.
+- ``mstar_data_worker_preprocess_failures_total{model_name, input_modalities}``:
+  counter, requests whose preprocessing failed in the data worker, each once, whatever
+  raised: a file count or media length over its limit, a file that cannot be decoded,
+  the model's prompt processing, or handing the inputs on. The client gets the error
+  (a 400 for a bad input), so the request also ends as ``outcome="error"`` in
+  ``mstar_requests_total`` unless its client had already gone. That counter counts
+  failures from every stage by output modalities; this one only the data worker's
+  preprocessing, by input modalities (failures turning results into output chunks are
+  not counted here).
+- ``mstar_upload_size_bytes{model_name, modality}``: histogram, the size on disk of
+  each image, audio or video file a request carried to the data worker (``modality`` is
+  ``image``, ``audio`` or ``video``), whether the request succeeded or failed. Every
+  route writes its media to a file first: an upload as received, inline media (a
+  ``data:`` URL, base64 files on ``/generate/ws``) after base64 decoding. The realtime
+  route and long transcriptions send WAV files they write from the decoded audio, so
+  those count the WAV sizes. Requests refused before they were submitted (an oversized
+  body, a bad form) are not counted.
+- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests
+  submitted and not yet taken up by the data worker (the one it is working on is not
+  counted). A request whose client went away still counts until the data worker takes
+  it up.
+
+.. code-block:: bash
+
+   mstar serve kokoro --enable-metrics
+   curl -s localhost:8000/metrics | grep '^mstar_'

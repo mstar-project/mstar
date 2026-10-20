@@ -105,7 +105,7 @@ def test_shipped_manifest():
     assert {c.kind for x in m.models.values() for c in x.cases} >= {"tts", "asr", "duplex", *mf.CLIENT_KINDS}
     assert {c.check["kind"] for x in m.models.values() for c in x.cases} == set(mf.CHECKS)
     mc = m.select("tag:mooncake")
-    assert {x.name for x in mc} == {"qwen3_omni_mooncake", "orpheus_mooncake"}
+    assert {x.name for x in mc} == {"qwen3_omni_mooncake", "orpheus_mooncake"}   # not the 2- and 3-GPU w2w entries
     assert all(x.optional and x.serve_args[:2] == ["--tensor-comm-protocol", "TCP"] for x in mc)
     for x in m.models.values():
         for c in x.cases:
@@ -1444,8 +1444,12 @@ def test_requires_can_call_the_servers_own_loader(tmp_path, monkeypatch):
                            (["loader:nope"], "loader:nope: AttributeError")):
         monkeypatch.setattr(arm, "job", {"python": sys.executable, "model": {"requires": requires}})
         assert arm.requirements_problem({"src": str(tmp_path)}) == want
-    qwen = mf.load().models["qwen3_tts"].requires
+    models = mf.load().models
+    qwen = models["qwen3_tts"].requires
     assert qwen == ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes"]
+    for m in models.values():   # the split and transport entries serve the same model through the same loader
+        if m.serve.startswith("qwen3_tts"):
+            assert qwen[0] in m.requires and "qwen_tts" not in m.requires, m.name
     module, fn = qwen[0].split(":")
     assert f"def {fn}(" in Path(module.replace(".", "/") + ".py").read_text()
 

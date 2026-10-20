@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -234,6 +235,9 @@ class CacheStream:
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
+    # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
+    # miss (a refused admit prepares the step again) is not counted twice
+    prefix_counted: bool = False
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -257,6 +261,13 @@ class CacheStream:
         same tokens back, so the chain that describes them has to survive it.
         """
         self.chain = None
+
+
+class KVPageCounts(NamedTuple):
+    used: int
+    total: int
+    # pages the prefix index names; some may also be in ``used`` by a request
+    cached: int
 
 
 @dataclass
@@ -475,6 +486,9 @@ class KVManager(AttentionResource):
         )
         self._prefix_root: bytes | None = None
         self._index: PrefixIndex | None = None
+        # node -> (prompt tokens looked up in the index, tokens it held), one
+        # lookup per request stream; read by the worker's metrics
+        self.prefix_tokens: dict[str, tuple[int, int]] = {}
         # label -> the walks its keys describe; a label not here is not gated
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
@@ -588,6 +602,16 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def page_counts(self) -> KVPageCounts:
+        """The pool's pages right now, without the manager lock: each count is
+        read whole, though the three may straddle an allocation."""
+        total = self._arena.allocator.max_num_pages - 1  # without SINK_PAGE
+        index = self._index
+        return KVPageCounts(
+            used=total - self._arena.num_free, total=total,
+            cached=0 if index is None else index.num_pages(),
+        )
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
     ) -> CachedPrefix | None:
@@ -658,6 +682,11 @@ class KVManager(AttentionResource):
                         else:
                             matched, held = matched + cached + own, end
                     break
+                if not stream.prefix_counted:
+                    stream.prefix_counted = True
+                    # one assignment, so a reader on another thread never sees half of it
+                    queried, hit = self.prefix_tokens.get(node_name, (0, 0))
+                    self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if not matched:
                     return None
                 stream.lease, stream.lease_len = matched, held

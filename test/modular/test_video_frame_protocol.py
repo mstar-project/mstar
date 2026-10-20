@@ -392,6 +392,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
+    worker.timing_requested = threading.Event()
     worker._prefix_streams = {}
     worker._live_requests = {}
     worker.communicator = SimpleNamespace(send=lambda *args: None)
