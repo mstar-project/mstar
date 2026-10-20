@@ -838,11 +838,15 @@ ahead of its new items, reported as <code class="docutils literal notranslate"><
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.signal_done">
-<span class="sig-name descname"><span class="pre">signal_done</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer.signal_done"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.signal_done" title="Link to this definition">#</a></dt>
-<dd><p>Producer signals no more items will arrive.</p>
+<span class="sig-name descname"><span class="pre">signal_done</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_items</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer.signal_done"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.signal_done" title="Link to this definition">#</a></dt>
+<dd><p>Producer signals no more items will arrive after the <code class="docutils literal notranslate"><span class="pre">num_items</span></code>
+it sent in total.</p>
 <dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>num_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>

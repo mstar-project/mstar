@@ -1012,6 +1012,10 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">_num_tensors_registered</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_num_buffer_writes</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># Items the producer sent this worker in total, as the done signal reports</span>
+    <span class="c1"># it. The signal comes through the conductor and the items come straight</span>
+    <span class="c1"># from the producer, so the signal can arrive first.</span>
+    <span class="n">_num_items_expected</span> <span class="o">=</span> <span class="mi">0</span>
 
 <div class="viewcode-block" id="StreamBuffer.prime_context">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.prime_context">[docs]</a>
@@ -1049,13 +1053,19 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="StreamBuffer.signal_done">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.signal_done">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">signal_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Producer signals no more items will arrive."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">producer_done</span> <span class="o">=</span> <span class="kc">True</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">signal_done</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_items</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Producer signals no more items will arrive after the ``num_items``</span>
+<span class="sd">        it sent in total."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">producer_done</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_items_expected</span> <span class="o">=</span> <span class="n">num_items</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_producer_done_and_all_read</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">producer_done</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_tensors_registered</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">producer_done</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_tensors_registered</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_items_expected</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_tensors_registered</span>
+        <span class="p">)</span>
 
 <div class="viewcode-block" id="StreamBuffer.pop_waiting_edge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge">[docs]</a>
