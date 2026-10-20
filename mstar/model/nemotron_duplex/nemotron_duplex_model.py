@@ -73,9 +73,11 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
+from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    CODEC_STATE,
     ENCODER_FRONT,
     ENCODER_STATE,
     MAMBA,
@@ -361,15 +363,10 @@ class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
-                 max_session_s: float | None = None, max_prompt_tokens: int | None = None,
-                 codec_chunk_frames: int | None = None, **kwargs):
+                 max_session_s: float | None = None, max_prompt_tokens: int | None = None, **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
-        if codec_chunk_frames is not None:
-            if codec_chunk_frames < 1:
-                raise ValueError(f"codec_chunk_frames must be at least 1, got {codec_chunk_frames}")
-            self.config.eartts.codec_chunk_frames = codec_chunk_frames
         if max_session_s:
             self.max_session_s = max_session_s
         if max_prompt_tokens:
@@ -416,12 +413,13 @@ class NemotronDuplexModel(Model):
     # and RoPE runs over the full head dim with a per-layer theta the layer
     # passes at call time. conformer_encoder: two recurrent-state pools, each
     # call's layer state and its front end's audio / mel tails (one slot per
-    # session each). The codec declares nothing.
+    # session each). audio_codec: a recurrent-state pool of each call's decoder
+    # stream state (one slot per session).
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front; pages in nano_kv and
-    # talker_kv). A deployment raising it raises all five (see
+    # Nemotron-H, and in encoder_state / encoder_front / codec_state; pages in
+    # nano_kv and talker_kv). A deployment raising it raises all six (see
     # validate_config_yaml). 32 is the most that keep up with real time on one
     # H100: a tick takes ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
     DEFAULT_SESSIONS = 32           # padding rows take no slot (#258)
@@ -475,7 +473,7 @@ class NemotronDuplexModel(Model):
         """Refuse a session cap that a per-session resource cannot hold.
 
         A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``) and its nano and talker pages from
+        ``encoder_state``, ``encoder_front``, ``codec_state``) and its nano and talker pages from
         its first step to its last, so a session past any of them waits on admit until
         another ends, and its frames with it. So ``max_concurrent_requests``
         sessions must fit each; the conductor queues the rest.
@@ -579,6 +577,13 @@ class NemotronDuplexModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
+            RecurrentStateSpec(
+                resource_key=CODEC_STATE, nodes={"audio_codec"},
+                config=RecurrentStateConfig(
+                    num_layers=1, blocks=codec_state_blocks(self.config.codec),
+                    max_slots=self.DEFAULT_SESSIONS + 1,
+                ),
+            ),
             KVSpec(
                 resource_key=TALKER_KV, nodes={"eartts_talker"},
                 config=PagedKVConfig(
@@ -632,7 +637,7 @@ class NemotronDuplexModel(Model):
             client  --[audio_in,    FixedChunk(1)]--> Encoder
             Encoder --[audio_frame, FixedChunk(1)]--> LLM
             LLM     --[new_token,   FixedChunk(1)]--> Talker
-            Talker  --[codec_tokens, LeftContext ]--> Codec
+            Talker  --[codec_tokens, FixedChunk(1)]--> Codec
 
         The LLM (nano) is a frame-driven decode loop: each iteration fuses one
         streamed audio frame with the fed-back previous agent-text/function tokens
@@ -730,7 +735,6 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        eartts = self.config.eartts
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
             # the user's audio, one item per uploaded file or append, at most a
             # session's samples: past them the talker KV and the decode loops run out
@@ -753,13 +757,10 @@ class NemotronDuplexModel(Model):
             # whose talker outlives the thinker and self-stops on codec EOS).
             Connection(from_partition="LLM", to_partition="Talker", edge_name="new_token",
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=False)),
-            # Non-overlapping chunks of NEW codec frames; the codec keeps its
-            # own left-context (AudioCodecDecoderSubmodule), so the stream must
-            # NOT re-deliver overlap (a LeftContextChunkPolicy here re-emits the
-            # overlap every chunk and balloons the audio, and is anyway
-            # ill-defined when chunk < left_context).
+            # one RVQ frame per codec step: the codec keeps each call's stream
+            # state (codec_state), so a frame's audio leaves the step after it
             Connection(from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=eartts.codec_chunk_frames)),
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
         ])
 
     # -------------------------------------------------------------------

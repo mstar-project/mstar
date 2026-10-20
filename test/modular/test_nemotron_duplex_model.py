@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttn
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
 from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
+    CODEC_STATE,
     ENCODER_FRONT,
     ENCODER_STATE,
     MAMBA,
@@ -40,7 +41,6 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
-from mstar.model.nemotron_duplex.submodules import AudioCodecDecoderSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
@@ -75,15 +75,15 @@ def test_duplex_node_resources():
     Mamba-2 layers' conv + SSM state with the Mamba-2 resource planned on it,
     and one text sampler; the talker a paged KV over its 28 layers with attention
     and RoPE positions; the encoder two recurrent pools, each call's layer state
-    and its front end's audio / mel tails, a slot per session each. The codec
-    owns no engine resource."""
+    and its front end's audio / mel tails, a slot per session each; the codec
+    one, each call's decoder stream state."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {ENCODER_FRONT, ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER,
-                           TALKER_KV, TALKER_ATTN, TALKER_POS}
+    assert set(by_key) == {CODEC_STATE, ENCODER_FRONT, ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA,
+                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
-    node = {ENCODER_STATE: {"conformer_encoder"}, ENCODER_FRONT: {"conformer_encoder"},
+    node = {ENCODER_STATE: {"conformer_encoder"}, ENCODER_FRONT: {"conformer_encoder"}, CODEC_STATE: {"audio_codec"},
             **dict.fromkeys(nano_keys, {"nano_llm"})}
     assert all(spec.nodes == node.get(spec.resource_key, {"eartts_talker"}) for spec in specs)
 
@@ -93,6 +93,10 @@ def test_duplex_node_resources():
     assert enc.config.blocks["k"].shape == (stt.num_heads, stt.att_context_size[0], stt.head_dim)
     assert enc.config.blocks["conv"].shape == (stt.d_model, stt.conv_kernel_size - 1)
     assert enc.config.usable_slots == model.DEFAULT_SESSIONS
+    codec = by_key[CODEC_STATE]
+    assert isinstance(codec, RecurrentStateSpec) and codec.config.usable_slots == model.DEFAULT_SESSIONS
+    assert codec.config.blocks["stage0"].shape == (3, 1536, 6) and codec.config.blocks["stage2"].shape == (3, 384, 6)
+    assert codec.config.blocks["overlap"].shape == (2, 12) and codec.config.blocks["overlap"].dtype == torch.float32
 
     eartts = model.config.eartts
     tkv = by_key[TALKER_KV]
@@ -151,7 +155,7 @@ def test_duplex_shipped_configs_turn_websocket_deflate_off():
         assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
 
 
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV, NANO_KV])
+@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, TALKER_KV, NANO_KV])
 def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     """Every session holds a slot in each recurrent pool and its nano and talker
     pages from start to end; a session past any of them waits on admit until
@@ -159,7 +163,8 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     that misses one is refused at startup, naming it."""
     model = _make_model()
     resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
+                 ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49},
+                 TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
                  NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
     model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
     del resources[key]
@@ -348,9 +353,8 @@ def test_duplex_stream_connection_policies():
     """The duplex loops are 1:1 stream-driven and terminate on stream end:
     client→Encoder, Encoder→LLM and LLM→Talker release one item per step with
     continue_after_done=False (else the loops would spin past their input);
-    Talker→Codec releases NON-overlapping chunks of ``codec_chunk_frames`` (the
-    codec keeps its own left-context, so re-delivering overlap balloons the
-    audio ~window/chunk×)."""
+    Talker→Codec releases one frame per step too, since the codec keeps each
+    call's stream state."""
     model = _make_model()
     topology = model.get_partition_topology()
     conns = {c.edge_name: c.chunk_policy_factory() for c in topology.connections}
@@ -365,24 +369,8 @@ def test_duplex_stream_connection_policies():
 
     codec = conns["codec_tokens"]
     assert isinstance(codec, FixedChunkPolicy)
-    assert codec.next_chunk_size(100) == model.config.eartts.codec_chunk_frames
+    assert codec.next_chunk_size(100) == 1
     assert codec.continue_after_producer_done() is False
-
-
-@pytest.mark.parametrize("chunk", [None, 5])
-def test_duplex_codec_chunk_is_a_model_kwarg(chunk):
-    """One frame per codec chunk by default; ``model_kwargs: {codec_chunk_frames}``
-    trades latency for fewer codec steps, through the stream's chunk and the
-    codec's captured window alike."""
-    kwargs = {} if chunk is None else {"codec_chunk_frames": chunk}
-    model = NemotronDuplexModel(model_path_hf=HF_MODELS["nemotron_duplex"]["model_path_hf"], **kwargs)
-    want = chunk or 1
-    (conn,) = [c for c in model.get_partition_topology().connections if c.edge_name == "codec_tokens"]
-    assert conn.chunk_policy_factory().next_chunk_size(100) == want
-    assert model.config.eartts.codec_left_context_frames + want == \
-        AudioCodecDecoderSubmodule(codec=None, config=model.config)._steady_window
-    with pytest.raises(ValueError, match="codec_chunk_frames"):
-        NemotronDuplexModel(model_path_hf="x", codec_chunk_frames=0)
 
 
 def test_duplex_process_prompt_seeds_frame0_feedback():

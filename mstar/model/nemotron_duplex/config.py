@@ -32,6 +32,7 @@ TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one p
 AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
 ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder layer state
 ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
+CODEC_STATE = "codec_state"         # recurrent-state pool: each call's streaming codec decoder state
 
 # Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
 # a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).
@@ -191,20 +192,6 @@ class EarTTSConfig:
     # generation) so audio is reproducible AND does not land on rare collapse-to-
     # constant-code RNG states that an uncontrolled global RNG occasionally hits.
     inference_seed: int = 0
-
-    # Streaming codec chunking (engine Talker->Codec connection): decode `chunk` new
-    # code frames with `left_context` prior frames so the causal codec has enough
-    # receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).
-    # One frame per chunk: a larger chunk holds a frame's audio back until the
-    # chunk fills, up to (chunk - 1) * 80 ms, and so delays the whole output stream.
-    codec_chunk_frames: int = 1
-    # The first sample a window emits (its held 12 samples) reaches back through
-    # the iSTFT and the three causal k=7 blocks of each of the 441-, 63- and
-    # 9-positions-per-frame stages to 2.44 code frames before the new frames
-    # (the upsampling convs have kernel == stride, so they add nothing). 3
-    # frames of context therefore give the full-history decode's samples at any
-    # chunk size, and 2 do not.
-    codec_left_context_frames: int = 3
 
     sample_rate: int = 22050
 

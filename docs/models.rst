@@ -426,14 +426,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
-  PCM, one 80 ms frame per step: each frame is decoded with the previous 3
-  frames as left context, which covers the decoder's receptive field, and a
-  window's last 12 samples, the inverse-STFT overlap, are held back and emitted
-  with the next frame, so the stream equals the full-history decode sample for
-  sample; that steady window of 4 frames replays a CUDA graph, a call's first
-  three frames decode eagerly). A larger ``codec_chunk_frames`` (a
-  ``model_kwargs`` entry) runs fewer codec steps but holds a frame's audio back
-  up to ``(chunk - 1) x 80`` ms, and the whole output stream with it.
+  PCM, one 80 ms frame per step: the decoder is causal, so each call keeps its
+  stream state in a recurrent-state pool, ``codec_state``: each ConvNeXt
+  block's last 6 inputs and the inverse STFT's 12-sample overlap, ~95 KiB a
+  slot. A step decodes only the call's new frame against that state, and a
+  fresh, zeroed slot is the decoder's causal padding, so the stream equals the
+  full decode of the call's frames from its first frame; steps replay a CUDA
+  graph at batch sizes 1 to 32).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -445,12 +444,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
-  ``mamba_state``, ``encoder_state`` and ``encoder_front`` (``max_slots``, one
+  ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
   more than the sessions, for the sink) and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
   nano's from ``max_prompt_tokens`` too). The shipped configs set
   ``max_concurrent_requests: 32`` to match; to serve more, raise the cap and
-  all five with it. The server
+  all six with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker, the encoder and the codec each run at most 32 sessions
