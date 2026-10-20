@@ -976,10 +976,10 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">RequestComplete</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Signals that a request has finished processing."""</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="c1"># Maps output signal name to its final forward pass number.</span>
-    <span class="c1"># The API server waits until all entries are received before</span>
-    <span class="c1"># completing the request.</span>
-    <span class="n">final_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NestedLoopIndices</span><span class="p">]</span>
+    <span class="c1"># Output signal name -&gt; chunks the workers emitted to the client. The API</span>
+    <span class="c1"># server waits until it has received that many of each before completing</span>
+    <span class="c1"># the request: completion can overtake the last chunks on the wire.</span>
+    <span class="n">output_chunk_counts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
     <span class="n">conductor_ingest_time</span><span class="p">:</span> <span class="nb">float</span>
     <span class="n">conductor_finish_time</span><span class="p">:</span> <span class="nb">float</span>
     <span class="n">graph_timings</span><span class="p">:</span> <span class="n">GraphTimings</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
