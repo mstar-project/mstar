@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import http.client
 import logging
+import math
 import re
 import ssl
 import urllib.error
@@ -880,7 +881,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
         for i, piece in enumerate(pieces):
             if len(fitted) > self.speech_chunk_max_pieces:
                 return fitted + pieces[i:]
-            fitted += self._fit_spoken(piece, max_chars)
+            fitted += self._fit_spoken(piece)
         return fitted
 
     @classmethod
@@ -929,25 +930,41 @@ class CosyVoice3Adapter(OpenAIAdapter):
             1 / cls._CHARS_PER_TOKEN if ord(ch) < 0x80 else 0.5 if ord(ch) < 0x800 else 1.0 for ch in text
         )
 
-    def _fit_spoken(self, piece: str, cap: int) -> list[str]:
-        """Re-split ``piece`` until each part's spelled-out text is estimated at 80 tokens or fewer.
-
-        The cap never drops below the piece's longest word, so a number is
-        never cut; a single word that spells out longer stays one piece.
-        """
-        if not any(c.isdecimal() for c in piece):
-            return [piece]
+    def _spoken_tokens(self, text: str) -> float:
+        """The token estimate of ``text`` with its digits spelled out, as the model reads it."""
         if CosyVoice3Adapter._frontend is None:
             from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend
 
             CosyVoice3Adapter._frontend = CosyVoice3TextFrontend()
-        spoken = self._estimated_tokens(CosyVoice3Adapter._frontend.normalize(piece))
-        floor = max(map(len, piece.split()))
-        if spoken <= 80 or cap <= floor:
+        return self._estimated_tokens(CosyVoice3Adapter._frontend.normalize(text))
+
+    def _fit_spoken(self, piece: str) -> list[str]:
+        """``piece`` in few, even parts whose spelled-out text is estimated at 80
+        tokens or fewer.
+
+        No cap drops below the piece's longest word, so a word is never cut;
+        words that spell out longer than that stay as cut at that cap.
+        """
+        if not any(c.isdecimal() for c in piece):
             return [piece]
-        cap = max(floor, min(cap - 1, int(cap * self._estimated_tokens(piece) / spoken)))
-        parts = split_sentences(piece, max_chars=cap, min_chars=0)
-        return [p for part in parts for p in self._fit_spoken(part, cap)]
+        spoken = self._spoken_tokens(piece)
+        if spoken <= 80:
+            return [piece]
+        floor = max(map(len, piece.split()))
+        n = math.ceil(spoken / 80)
+        while True:
+            # the smallest cap that still cuts ``piece`` into at most n parts evens them out
+            lo, hi = floor, max(floor, len(piece) - 1)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if len(split_sentences(piece, max_chars=mid, min_chars=0)) <= n:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            parts = split_sentences(piece, max_chars=lo, min_chars=0)
+            if lo == floor or all(self._spoken_tokens(p) <= 80 for p in parts):
+                return parts
+            n = max(n, len(parts)) + 1
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
