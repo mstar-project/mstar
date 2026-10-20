@@ -120,7 +120,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     specs = _kv_specs(model)
     cross = _manager(specs[CROSS_KV_CACHE].config, CROSS_KV_CACHE)
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
-    batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
+    batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
             request_id=f"r{i}", model_kwargs={}, client_request_id=None))
@@ -161,9 +161,10 @@ def test_default_caches_hold_the_request_cap():
     model = _make_model()
     specs = _kv_specs(model)
     cap = WhisperModel.MAX_CONCURRENT_REQUESTS
-    # 1500 encoder tokens and 448 decoder tokens in 128-token pages, plus the sink
+    # 1500 encoder tokens and 448 decoder tokens in 128-token pages, plus the sink,
+    # plus the decode captures' padding rows in the self-attention cache
     assert specs[CROSS_KV_CACHE].config.max_num_pages == 1 + 12 * cap
-    assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap
+    assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap + 2 * cap
 
 
 @pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2"])
@@ -239,7 +240,7 @@ def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
     model = _make_model()
     config = dataclasses.replace(_kv_specs(model)[CROSS_KV_CACHE].config, max_num_pages=192)
     cross = _manager(config, CROSS_KV_CACHE)
-    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_BATCH_SIZE)]
+    batch = [f"r{i}" for i in range(16)]  # the old decoder's prefill batch cap
     for rid in batch:
         cross.ingest_request(rid)
     span = model.config.max_source_positions

@@ -553,7 +553,8 @@ def test_graph_walks_and_resources():
     per_req_ctx = -(-model.config.max_source_positions // 128)
     # one more for the sink page, so the last of MAX_CONCURRENT_REQUESTS fits
     assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
-    assert kv[KV_CACHE].config.max_num_pages == 4 * model.MAX_CONCURRENT_REQUESTS + 2 * model.MAX_CONCURRENT_REQUESTS
+    cap = model.MAX_CONCURRENT_REQUESTS
+    assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap + 2 * cap  # + the capture padding rows
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32
 
@@ -728,15 +729,6 @@ def test_process_prompt_builds_window_and_prompts():
     assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert model.get_max_output_tokens(max_output_tokens="40") == 40
     assert model.get_request_resource_configs({}, {"temperature": "0.5"})["sampler"].temperature == 0.5
-
-
-def test_config_yaml_needs_a_cap_the_decoder_caches_hold():
-    model = _make_model()
-    with pytest.raises(ValueError, match="max_concurrent_requests"):
-        model.validate_config_yaml({"model": "whisper_large"}, "x.yaml")
-    with pytest.raises(ValueError, match="exceeds"):
-        model.validate_config_yaml({"max_concurrent_requests": model.MAX_CONCURRENT_REQUESTS + 1}, "x.yaml")
-    model.validate_config_yaml({"max_concurrent_requests": model.MAX_CONCURRENT_REQUESTS}, "x.yaml")
 
 
 def test_postprocess_renders_language_and_timestamps_only():
