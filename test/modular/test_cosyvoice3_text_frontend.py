@@ -516,6 +516,27 @@ def test_digit_heavy_pieces_fit_the_model(monkeypatch):
     assert " ".join(pieces).split() == _IDS.split()
 
 
+@pytest.mark.parametrize(
+    "sentences",
+    [
+        "회의는 2024년 3월 15일 오후 7시 30분에 시작합니다. 참석자는 125명이고 예산은 4,500,000원입니다. ",
+        "かいぎは 2024ねん 3がつ 15にち ごご 7じ 30ぷんに はじまります。さんかしゃは 125にんです。",
+        "Встреча начнётся 15 марта 2024 года в 19:30. Участников 125, бюджет 4 500 000 рублей. ",
+    ],
+    ids=["hangul", "kana", "cyrillic"],
+)
+def test_pieces_of_other_scripts_are_sized_on_their_spelled_out_tokens(monkeypatch, sentences):
+    """Spelled-out digits are English words among Hangul, kana or Cyrillic, so a
+    piece sized for 80 tokens as written runs past 80 once read out."""
+    monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", None)
+    frontend = CosyVoice3TextFrontend()
+    text = sentences * 6
+    assert _tokens(frontend.normalize(text)) > 1.3 * _tokens(text), "the example no longer grows when spelled out"
+    pieces = adapters.CosyVoice3Adapter().split_speech_text(text)
+    assert all(_tokens(frontend.normalize(p)) <= 80 for p in pieces)
+    assert re.sub(r"\s", "", "".join(pieces)) == re.sub(r"\s", "", text)
+
+
 # -- through process_prompt ----------------------------------------------------------
 
 
