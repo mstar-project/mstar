@@ -585,9 +585,9 @@ def test_a_relative_group_without_a_usable_state_is_refused(state, match):
 
 
 @pytest.mark.parametrize("rot6d, frame, match", [
-    ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0] * 9, "first row is zero"),
+    ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0] * 9, "does not define a direction"),
     ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0], "two rows are parallel"),
-    ([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], _TURNED_POSE, "first row is zero"),
+    ([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], _TURNED_POSE, "does not define a direction"),
     ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], _TURNED_POSE, "two rows are parallel"),
 ])
 def test_a_degenerate_rotation_is_refused_rather_than_decoded_to_nan(rot6d, frame, match):
@@ -627,6 +627,18 @@ def test_the_decode_matches_the_reference_on_the_twenty_recorded_droid_requests(
     which is what the median pins: a change that regresses the *typical* request
     cannot hide behind the outlier's headroom. Upcasting the Gram-Schmidt to
     float64 to dodge it is worse everywhere -- median 6.0e-09, max 2.2e-08.
+
+    **One request in twenty is this checkpoint's luck, not the bound.** Blind QA
+    swept 300 random float32 frames and found the numpy disagreement survives into
+    the matrix on roughly a third of them; run here across the two venvs on 300
+    frames, **96** differ and the largest difference is **1.00 float32 ulp**
+    exactly. So the honest statement of this divergence is not "one outlier at
+    3.3e-09" but "bounded by one float32 ulp of the reference frame, because that
+    is the granularity at which two numpy builds can disagree about a float32 dot
+    product" -- and ``postprocess`` emits float32, so what a client receives is
+    within one ulp of its own representation. The 3.3e-09 asserted below is this
+    checkpoint's realisation of that bound, kept because a *regression* would have
+    to clear it; it is not a promise about other data.
     """
     pre = Gr00tN17Preprocessor.from_pretrained(_GR00T, max_state_dim=132, max_action_horizon=40)
     eef = []
