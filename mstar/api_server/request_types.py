@@ -43,10 +43,10 @@ class ResultTokens:
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
-    # Maps output signal name to its final forward pass number.
-    # The API server waits until all entries are received before
-    # completing the request.
-    final_outputs: dict[str, NestedLoopIndices]
+    # Output signal name -> chunks the workers emitted to the client. The API
+    # server waits until it has received that many of each before completing
+    # the request: completion can overtake the last chunks on the wire.
+    output_chunk_counts: dict[str, int]
     conductor_ingest_time: float
     conductor_finish_time: float
     graph_timings: GraphTimings = field(default_factory=dict)
@@ -102,3 +102,6 @@ class PreprocessInput:
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
+    # The id the client knows the request by; ``request_id`` is the API
+    # server's key for this one submission.
+    client_request_id: str | None = None

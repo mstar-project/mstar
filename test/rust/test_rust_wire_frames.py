@@ -30,7 +30,8 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode, encode, encode_field, encode_fields
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.utils.ipc_format import (
@@ -55,13 +56,13 @@ ME = "worker_0"
 PEER = "worker_1"
 
 
-def _node(name, inputs, outs, modality=""):
+def _node(name, inputs, outs, modality="", streaming=False):
     return {
         "name": name, "async_enabled": True, "inputs": sorted(inputs),
         "streaming_inputs": [],
         "outputs": [
             {"name": sig, "dest": dest, "persist": persist,
-             "new_token": False, "streaming": False, "modality": modality}
+             "new_token": False, "streaming": streaming, "modality": modality}
             for sig, dest, persist in outs
         ],
     }
@@ -70,7 +71,7 @@ def _node(name, inputs, outs, modality=""):
 class _Mesh:
     """A runtime wired to a real transport, plus every peer's inbox."""
 
-    def __init__(self, tmp_path, outs, remote=()):
+    def __init__(self, tmp_path, outs, remote=(), streaming=False):
         self.dir = str(tmp_path)
         self.book = RustTensorBookkeeping()
         self.comm = ZmqCommunicator(ME, self.dir)
@@ -79,7 +80,8 @@ class _Mesh:
             for peer in ("conductor", "api_server", PEER)
         }
         wg = {"wg_id": WG_ID, "graph_walks": [WALK],
-              "nodes": [_node("only", ["prompt"], outs)], "loops": []}
+              "nodes": [_node("only", ["prompt"], outs, streaming=streaming)],
+              "loops": []}
         self.rt = GraphRuntime(
             worker_graphs=[wg],
             remote_worker_graphs=list(remote),
@@ -102,7 +104,7 @@ class _Mesh:
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
         out = self.rt.complete_and_route_batch({
-            "partition": "default", "graph_walk": WALK, "node_name": "only",
+            "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
             "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
             "tensors": list(uuids),
             "num_tensors": [
@@ -226,10 +228,9 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
             loop_indices=idx, metadata={},
         ),
     ))]
-    # The WGD reports what was emitted, and at which loop index.
+    # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
-    assert wgd.output_loop_indices == {"out": idx}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
@@ -399,6 +400,43 @@ def test_a_uuid_whose_descriptor_is_gone_is_skipped(tmp_path):
     assert got["conductor"][0].body.persist_signals == {"out": []}
 
 
+def _stream_mesh(tmp_path):
+    return _Mesh(
+        tmp_path, outs=[("out", "remote", False)], streaming=True,
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+
+
+def test_stream_items_sent_ride_the_worker_graphs_done(tmp_path):
+    """Per destination worker, and accumulated until a WGD drains them: the
+    conductor forwards the total with producer_done, and the consumer ends
+    the stream only once that many items have arrived."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    _put(mesh, 2)
+    got = mesh.run(rid, uuids=[1, 2])
+    assert got[PEER][0].body.inputs[0].is_streaming
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 2}}
+    _put(mesh, 3)
+    got = mesh.run(rid, uuids=[3])
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
+
+
+def test_a_stream_item_whose_descriptor_is_gone_is_not_counted(tmp_path):
+    """The count is what the consumer will register, so it follows the
+    descriptors that go out; one more would hold its stream open forever."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    _put(mesh, 2)
+    mesh.book.forget_tensor(1)
+    got = mesh.run(rid, uuids=[1, 2])
+    assert got[PEER][0].body.inputs[0].tensor_info == [_info(2)]
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
+
+
 # --- stop loops ---------------------------------------------------------------
 
 def _loop_mesh(tmp_path):
@@ -489,7 +527,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -534,7 +572,7 @@ def _persist_mesh(tmp_path, tp_rank):
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -586,7 +624,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
 
     # mesh.rt is the raw PyO3 GraphRuntime, not the RustGraphRuntime wrapper.
-    mesh.rt.set_in_flight("only", WG_ID, [rid], True)
+    mesh.rt.set_in_flight("only", [rid], [WG_ID], True)
     body = mesh.run(rid, uuids=[])["conductor"][0].body
     assert not body.partition_done, "a speculative pass reported done"
 
@@ -596,7 +634,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
 P2 = "worker_2"
 
 
-def _fanout_mesh(tmp_path, shard_dim=None):
+def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
     """A tp1 source feeding a tp2 destination group on two peers.
 
     The case the same-group edges never exercise: source and destination in
@@ -625,14 +663,17 @@ def _fanout_mesh(tmp_path, shard_dim=None):
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER, P2], [1, 2])
-    # 4 rows of 6 bytes.
-    book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
+    # By default 4 rows of 6 bytes.
+    book.put_tensor(1, _info(
+        1, dims=list(dims), nbytes=nbytes,
+        stride=[1] * len(dims) if stride is None else stride,
+    ))
     book.increment_ref(1, 1)
 
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -659,6 +700,53 @@ def test_each_destination_rank_gets_its_own_slice(tmp_path):
     # 4 rows split two ways: 2 rows each, the second starting 12 bytes in.
     assert (lo.dims[0], lo.nbytes, lo.offset) == (2, 12, 0)
     assert (hi.dims[0], hi.nbytes, hi.offset) == (2, 12, 12)
+
+
+def _python_fanout(shard_dim, dims, nbytes):
+    """The same tp1 -> tp2 edge through Python's ShardingConfig fanout, as
+    (dims, nbytes, offset) per destination worker."""
+    src = ShardingGroup(nodes={"src"}, tp_size=1)
+    sink = ShardingGroup(nodes={"sink"}, tp_size=2)
+    cfg = ShardingConfig(
+        groups=[src, sink], tp_enabled_nodes={"sink"},
+        shard_dim={} if shard_dim is None else {"out": shard_dim},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("src", WALK): [ME],
+        NodeAndGraphWalk("sink", WALK): [PEER, P2],
+    })
+    src._tp_rank = 0
+    info = _info(1, dims=list(dims), nbytes=nbytes, stride=[1] * len(dims))
+    edge = GraphEdge(next_node="sink", name="out", tensor_info=[info])
+    out = cfg.fanout_graph_edges(
+        edge, source_node="src", source_graph_walk=WALK, dest_graph_walk=WALK,
+    )
+    return {
+        w: [(list(i.dims), i.nbytes, i.offset) for i in e.tensor_info]
+        for w, e in out.items()
+    }
+
+
+@pytest.mark.parametrize("shard_dim,dims,nbytes", [
+    (None, (), 2),          # a replicated 0-dim tensor
+    (None, (0,), 0),        # a replicated empty tensor
+    (0, (4, 0), 0),         # sharded rows of zero bytes
+    (0, (4, 3), 24),        # the ordinary case, as a control
+    (0, (2, 2, 3), 24),     # several trailing dims
+])
+def test_python_and_rust_fan_out_awkward_shapes_alike(tmp_path, shard_dim, dims, nbytes):
+    """Python's fanout read dims[0] of every tensor, sharded or not, and took
+    the row size as nbytes // prod(dims): a 0-dim replicated tensor raised
+    IndexError and a [4, 0] sharded one ZeroDivisionError, where the Rust
+    fanout routes both. Each destination must see the same slice either way."""
+    python = _python_fanout(shard_dim, dims, nbytes)
+    _book, got = _fanout_mesh(tmp_path, shard_dim=shard_dim, dims=dims, nbytes=nbytes)
+    rust = {
+        w: [(list(i.dims), i.nbytes, i.offset)
+            for i in msgs[0].body.inputs[0].tensor_info]
+        for w, msgs in got.items() if msgs
+    }
+    assert python == rust
 
 
 def test_the_hold_settles_to_the_number_of_readers(tmp_path):
@@ -714,7 +802,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -818,7 +906,7 @@ def _iterate(rt, book, rid, uuid, stop_first=False):
     if stop_first:
         rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["ar_loop"]])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "ar_decode",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "ar_decode",
         "output_signals": ["out", "token"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [uuid], "num_tensors": [1, 0],
     })
@@ -885,7 +973,7 @@ def test_an_output_nobody_runs_is_an_error(tmp_path):
     mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [rid])
     out = mesh.rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -916,7 +1004,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
         mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [keep, doomed])
     out = mesh.rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["kv"], "rids": [keep, doomed],
         "wg_ids": [WG_ID, WG_ID], "tensors": [1, 2], "num_tensors": [1, 1],
     })
@@ -944,3 +1032,40 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
         "only the surviving request reports done"
     )
     assert [i.uuid for i in wgds[0].persist_signals["kv"]] == [1]
+
+
+def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
+    """A mixed step routes rows of two walks in one call; each request's
+    worker-graphs-done names its own walk's graph, not the call's first."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {"wg_id": wg_id, "graph_walks": [walk],
+         "nodes": [_node("only", ["prompt"], [("out", "", False)])], "loops": []}
+        for wg_id, walk in ((0, "prefill"), (1, "decode"))
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rids = [
+        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1])
+        for name, walk in (("r_prefill", "prefill"), ("r_decode", "decode"))
+    ]
+    for rid in rids:
+        rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
+    rt.pop_walk_rids("only", ["prefill", "decode"], rids, [0, 1])
+
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": "prefill", "node_name": "only",
+        "output_signals": ["out"], "rids": rids, "tensors": [], "num_tensors": [0, 0],
+        "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1],
+    })
+    _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
+          new_token_counts=[], stream_tokens_consumed=[], profiling=[])
+
+    done = {m.body.request_id: m.body.worker_graph_ids for m in _collect(conductor)}
+    assert done == {"r_prefill": [0], "r_decode": [1]}

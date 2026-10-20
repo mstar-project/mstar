@@ -23,7 +23,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.base import CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.ring.manager import RingPlan
@@ -295,7 +295,7 @@ class FlexAttentionManager(AttentionManager):
         if mask is None:
             raise RuntimeError(
                 f"FlexAttention mask for slot={slot}, geometry={geometry}, "
-                f"batch={batch} was not allocated before CUDA graph capture"
+                f"batch={batch} was not allocated before accelerator graph capture"
             )
         return mask
 
@@ -344,7 +344,7 @@ class FlexAttentionManager(AttentionManager):
         self._visibility_tables[geometry] = table
         return table
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del max_bs, max_seq_len
@@ -395,6 +395,7 @@ class FlexAttentionManager(AttentionManager):
 
     def plan(self, step: AttentionStep, ctx: StepContext) -> None:
         """Stage one local/global visibility mask for this frame and slot."""
+        refuse_context_only(step, type(self).__name__)
         del step
         self.reset_default_cursors()
         ring_plan = ctx.plan_results.get(self._kv_cache_name)

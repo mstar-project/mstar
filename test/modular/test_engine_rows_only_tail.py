@@ -36,7 +36,7 @@ def _engine(sub):
 
 def _batch(rows_only):
     return SimpleNamespace(
-        node_name="llm", admit_error=None, rows_only=rows_only,
+        node_name="llm", admit_error=None, rows_only=rows_only, cached_rids=set(),
         per_request_info_wrapped={1: object()}, inputs=[object()],
     )
 

@@ -248,7 +248,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
           "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
     fwd = CurrentForwardPassInfo(
-        request_id=rid, graph_walk="prefill",
+        request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     text_inputs = [
@@ -285,7 +285,10 @@ def _sound_scenario():
     from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe, model = base["device"], base["dtype"], base["mpipe"], base["model"]
-    cond_ids, uncond_ids = tokenize_prompt(model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W)
+    cond_ids, uncond_ids = tokenize_prompt(
+        model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W,
+        use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
+    )
     lat_t = 1 + (FRAMES - 1) // mpipe.vae_scale_temporal
     _, t_s = model.get_submodule("dit")._resolve_sound_frames({"num_frames": FRAMES, "fps": 24.0})
     gen = torch.Generator(device=device).manual_seed(SEED)
