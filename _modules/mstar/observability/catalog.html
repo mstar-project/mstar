@@ -763,6 +763,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -986,11 +987,72 @@ window.runMermaid = runMermaid;</script>
     <span class="p">),</span>
 <span class="p">)</span>
 
+<span class="n">KV_PAGES_USED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_pages_used"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Pages of a paged KV cache not on its free list: held by requests, or kept "</span>
+    <span class="s2">"by the prefix cache (see mstar_kv_pages_cached)."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"resource"</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">KV_PAGES_TOTAL</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_pages_total"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Pages of a paged KV cache that requests can hold."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"resource"</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">KV_PAGES_CACHED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_pages_cached"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Pages of a paged KV cache its prefix cache names, including pages "</span>
+    <span class="s2">"running requests also hold; the cache frees the others on demand."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"resource"</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">STEP_SECONDS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_step_seconds"</span><span class="p">,</span> <span class="n">HISTOGRAM</span><span class="p">,</span>
+    <span class="s2">"Engine steps: from the later of the step's hand-off to the GPU thread and "</span>
+    <span class="s2">"the end of the worker's previous step, to the end of this step's "</span>
+    <span class="s2">"postprocess. In steady state, the interval between step completions."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"graph_walk"</span><span class="p">),</span>
+    <span class="n">buckets</span><span class="o">=</span><span class="p">(</span>
+        <span class="mf">0.0005</span><span class="p">,</span> <span class="mf">0.001</span><span class="p">,</span> <span class="mf">0.002</span><span class="p">,</span> <span class="mf">0.003</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">,</span> <span class="mf">0.0075</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">,</span> <span class="mf">0.015</span><span class="p">,</span> <span class="mf">0.02</span><span class="p">,</span> <span class="mf">0.03</span><span class="p">,</span>
+        <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.075</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.25</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.5</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">,</span> <span class="mf">10.0</span><span class="p">,</span> <span class="mf">30.0</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+<span class="n">BATCH_SIZE</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_batch_size"</span><span class="p">,</span> <span class="n">HISTOGRAM</span><span class="p">,</span>
+    <span class="s2">"Engine steps: rows the step's forward ran."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"graph_walk"</span><span class="p">),</span>
+    <span class="n">buckets</span><span class="o">=</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">,</span> <span class="mf">4.0</span><span class="p">,</span> <span class="mf">8.0</span><span class="p">,</span> <span class="mf">16.0</span><span class="p">,</span> <span class="mf">32.0</span><span class="p">,</span> <span class="mf">64.0</span><span class="p">,</span> <span class="mf">128.0</span><span class="p">,</span> <span class="mf">256.0</span><span class="p">,</span> <span class="mf">512.0</span><span class="p">,</span> <span class="mf">1024.0</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">PREFIX_CACHE_QUERY_TOKENS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_prefix_cache_query_tokens_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Prompt tokens looked up in the prefix cache, once per request."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">PREFIX_CACHE_HIT_TOKENS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_prefix_cache_hit_tokens_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Prompt tokens the prefix cache already held at that lookup."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">COMPONENT_PENDING_STEPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_component_pending_steps"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Requests whose next step on this graph node is ready (its inputs arrived) "</span>
+    <span class="s2">"but not in a running step: waiting for a batch slot, or for the worker to "</span>
+    <span class="s2">"schedule the node."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+
+<span class="c1">#: Families the engine workers report to the conductor (``WorkerStatus``); the</span>
+<span class="c1">#: conductor sums the workers' series and forwards them in its status message.</span>
+<span class="n">WORKER_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span>
+        <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
+        <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
+    <span class="p">)</span>
+<span class="p">}</span>
+
 <span class="c1">#: Families the conductor's status message carries, exported from the latest</span>
 <span class="c1">#: message.</span>
 <span class="n">STATUS_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CONDUCTOR_REQUESTS</span><span class="p">,</span> <span class="n">COMPONENT_IN_FLIGHT</span><span class="p">)</span>
-<span class="p">}</span>
+<span class="p">}</span> <span class="o">|</span> <span class="n">WORKER_FAMILIES</span>
 </pre></div>
 
                 </article>

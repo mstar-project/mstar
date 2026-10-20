@@ -11,6 +11,7 @@ mstar.observability.catalog
    
       STATUS_INTERVAL_S
       CONDUCTOR_REQUEST_STATES
+      WORKER_FAMILIES
       STATUS_FAMILIES
    
    

@@ -410,6 +410,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -657,6 +658,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.MetricSnapshot.values"><code class="docutils literal notranslate"><span class="pre">MetricSnapshot.values</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -676,6 +678,15 @@
 exports the latest snapshot of each family. Snapshots are cumulative, never
 deltas, so a lost or reordered message cannot corrupt a counter.</p>
 <p>Not thread-safe: update and snapshot a recorder from one thread.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.recorders.merge" title="mstar.observability.recorders.merge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">merge</span></code></a>(family, snapshots)</p></td>
+<td><p>One snapshot of <code class="docutils literal notranslate"><span class="pre">family</span></code> summing the series of <code class="docutils literal notranslate"><span class="pre">snapshots</span></code> that share label values: several processes' views of one deployment (the replicas of a graph node on different workers, say).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -854,6 +865,25 @@ cumulative counts Prometheus wants are built at <code class="docutils literal no
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.observability.recorders.merge">
+<span class="sig-prename descclassname"><span class="pre">mstar.observability.recorders.</span></span><span class="sig-name descname"><span class="pre">merge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">family</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">snapshots</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/recorders.html#merge"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.recorders.merge" title="Link to this definition">#</a></dt>
+<dd><p>One snapshot of <code class="docutils literal notranslate"><span class="pre">family</span></code> summing the series of <code class="docutils literal notranslate"><span class="pre">snapshots</span></code> that
+share label values: several processes’ views of one deployment (the
+replicas of a graph node on different workers, say).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>family</strong> (<a class="reference internal" href="mstar.observability.catalog.html#mstar.observability.catalog.Family" title="mstar.observability.catalog.Family"><em>Family</em></a>)</p></li>
+<li><p><strong>snapshots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference internal" href="#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><em>MetricSnapshot</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><em>MetricSnapshot</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -925,6 +955,7 @@ cumulative counts Prometheus wants are built at <code class="docutils literal no
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.MetricSnapshot.values"><code class="docutils literal notranslate"><span class="pre">MetricSnapshot.values</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.recorders.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -33,4 +33,5 @@
    node_manager_utils
    rid_table
    worker
+   worker_metrics
 

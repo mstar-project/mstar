@@ -410,6 +410,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -1246,6 +1247,39 @@ whole passes, so a node running a request’s decode loop counts it once for the
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds{model_name}</span></code>: seconds since the API server
 received the last status message, or since metrics were enabled before the first one.
 More than a few seconds means the conductor stopped reporting.</p></li>
+</ul>
+<p>The engine workers also send the conductor their own metrics every second, which it
+adds to its status message, so these can be up to two seconds old. <code class="docutils literal notranslate"><span class="pre">component</span></code> is the
+graph node; a node with replicas on several workers shows their sum, and the ranks of a
+tensor or sequence parallel instance count once (the instance’s first rank reports).
+The histograms and counters count from worker start, warmup requests included, so read
+them with <code class="docutils literal notranslate"><span class="pre">rate()</span></code> or <code class="docutils literal notranslate"><span class="pre">increase()</span></code>.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_used{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_total{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code>: pages of each paged KV
+cache (<code class="docutils literal notranslate"><span class="pre">resource</span></code> is its key in the model, since a node can have several, e.g.
+Whisper’s decoder self and cross attention caches). Used counts every page off the
+free list, including the pages the prefix cache keeps; a cache two nodes of one
+worker share shows under each node.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_cached{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code>: pages the prefix cache
+names. Some may also be in use by running requests; the cache frees the others when a
+request needs the room.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_step_seconds{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code>: histogram over engine
+steps that ran a forward. A step counts from when the worker hands it to its GPU
+thread, or from the end of the previous step if that was later, to the end of its
+postprocess (outputs on the host, stop check, routing). Overlapping steps are not
+counted twice: in steady state this is the interval between step completions, and
+<code class="docutils literal notranslate"><span class="pre">rate(..._sum)</span></code> is the share of time the worker had a step running.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_batch_size{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code>: histogram, rows the step’s
+forward ran.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_query_tokens_total{model_name,</span> <span class="pre">component}</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code>: counters, prompt
+tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
+tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
+Orpheus) count; the cache is off under tensor parallelism.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code>: gauge, requests whose next
+step on the node is ready (its inputs arrived) and not running: waiting for room in a
+step or for the worker to pick the node.</p></li>
 </ul>
 <p>Where a successful request’s time went, from the timestamps every request already
 carries (same <code class="docutils literal notranslate"><span class="pre">model_name</span></code> and <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> labels; the conductor’s

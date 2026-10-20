@@ -410,6 +410,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -639,6 +640,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>
@@ -733,6 +735,17 @@ Returns how many pages reached the free list.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages">
+<span class="sig-name descname"><span class="pre">num_pages</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.num_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages" title="Link to this definition">#</a></dt>
+<dd><p>How many pages the index holds a reference to (<code class="docutils literal notranslate"><span class="pre">len(pages())</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned">
 <span class="sig-name descname"><span class="pre">num_sole_owned</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.num_sole_owned"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned" title="Link to this definition">#</a></dt>
 <dd><p>Indexed pages nothing else holds: an upper bound on what <code class="docutils literal notranslate"><span class="pre">evict</span></code> can free.</p>
@@ -822,6 +835,7 @@ Returns how many pages reached the free list.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>

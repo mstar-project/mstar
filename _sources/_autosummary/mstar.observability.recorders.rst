@@ -9,6 +9,12 @@ mstar.observability.recorders
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      merge
+   
    
 
    

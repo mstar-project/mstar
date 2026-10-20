@@ -763,6 +763,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -933,6 +934,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">PublishedInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.loop_indices</span><span class="w"> </span><span class="kn">import</span> <span class="n">NestedLoopIndices</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricSnapshot</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.format</span><span class="w"> </span><span class="kn">import</span> <span class="n">RxInfo</span><span class="p">,</span> <span class="n">TxInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphTimings</span>
 
@@ -1220,7 +1222,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SETUP_DONE</span> <span class="o">=</span> <span class="s2">"setup_done"</span>
     <span class="n">ABORT_REQUEST</span> <span class="o">=</span> <span class="s2">"abort_request"</span>
     <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
-    <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span></div>
+    <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span>
+    <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span></div>
 
 
 
@@ -1303,6 +1306,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    step can fail several of them for different reasons.</span>
 <span class="sd">    """</span>
     <span class="n">errors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="WorkerStatus">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">WorkerStatus</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A worker's engine metrics, sent once per status interval only while</span>
+<span class="sd">    metrics are on: cumulative or current values per graph node, never</span>
+<span class="sd">    per-request data."""</span>
+    <span class="n">worker_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">metrics</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]</span></div>
 
 
 

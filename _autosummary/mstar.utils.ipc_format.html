@@ -410,6 +410,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
 </ul>
@@ -651,6 +652,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_STATUS</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest"><code class="docutils literal notranslate"><span class="pre">DrainRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -805,6 +807,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus"><code class="docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus.metrics"><code class="docutils literal notranslate"><span class="pre">WorkerStatus.metrics</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus.worker_id"><code class="docutils literal notranslate"><span class="pre">WorkerStatus.worker_id</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -890,6 +897,9 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
+<td><p>A worker's engine metrics, sent once per status interval only while metrics are on: cumulative or current values per graph node, never per-request data.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -965,6 +975,11 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE">
 <span class="sig-name descname"><span class="pre">WORKER_GRAPHS_DONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'worker_graphs_done'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS">
+<span class="sig-name descname"><span class="pre">WORKER_STATUS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'worker_status'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1779,6 +1794,33 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerStatus">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">WorkerStatus</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metrics</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#WorkerStatus"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.WorkerStatus" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>A worker’s engine metrics, sent once per status interval only while
+metrics are on: cumulative or current values per graph node, never
+per-request data.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>worker_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>metrics</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><em>MetricSnapshot</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerStatus.metrics">
+<span class="sig-name descname"><span class="pre">metrics</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><span class="pre">MetricSnapshot</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerStatus.metrics" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerStatus.worker_id">
+<span class="sig-name descname"><span class="pre">worker_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerStatus.worker_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -1844,6 +1886,7 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_STATUS</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest"><code class="docutils literal notranslate"><span class="pre">DrainRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1996,6 +2039,11 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TENSOR_RECEIVED"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TENSOR_RECEIVED</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TP_NO_SPEC</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus"><code class="docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus.metrics"><code class="docutils literal notranslate"><span class="pre">WorkerStatus.metrics</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerStatus.worker_id"><code class="docutils literal notranslate"><span class="pre">WorkerStatus.worker_id</span></code></a></li>
 </ul>
 </li>
 </ul>

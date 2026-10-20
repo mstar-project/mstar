@@ -566,6 +566,39 @@ second old:
   received the last status message, or since metrics were enabled before the first one.
   More than a few seconds means the conductor stopped reporting.
 
+The engine workers also send the conductor their own metrics every second, which it
+adds to its status message, so these can be up to two seconds old. ``component`` is the
+graph node; a node with replicas on several workers shows their sum, and the ranks of a
+tensor or sequence parallel instance count once (the instance's first rank reports).
+The histograms and counters count from worker start, warmup requests included, so read
+them with ``rate()`` or ``increase()``.
+
+- ``mstar_kv_pages_used{model_name, component, resource}``,
+  ``mstar_kv_pages_total{model_name, component, resource}``: pages of each paged KV
+  cache (``resource`` is its key in the model, since a node can have several, e.g.
+  Whisper's decoder self and cross attention caches). Used counts every page off the
+  free list, including the pages the prefix cache keeps; a cache two nodes of one
+  worker share shows under each node.
+- ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
+  names. Some may also be in use by running requests; the cache frees the others when a
+  request needs the room.
+- ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
+  steps that ran a forward. A step counts from when the worker hands it to its GPU
+  thread, or from the end of the previous step if that was later, to the end of its
+  postprocess (outputs on the host, stop check, routing). Overlapping steps are not
+  counted twice: in steady state this is the interval between step completions, and
+  ``rate(..._sum)`` is the share of time the worker had a step running.
+- ``mstar_batch_size{model_name, component, graph_walk}``: histogram, rows the step's
+  forward ran.
+- ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
+  ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
+  tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
+  tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
+  Orpheus) count; the cache is off under tensor parallelism.
+- ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
+  step on the node is ready (its inputs arrived) and not running: waiting for room in a
+  step or for the worker to pick the node.
+
 Where a successful request's time went, from the timestamps every request already
 carries (same ``model_name`` and ``output_modalities`` labels; the conductor's
 timestamps are compared with the API server's, which assumes both run on one host, as
