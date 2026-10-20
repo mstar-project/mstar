@@ -214,6 +214,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.realtime_vad.html">mstar.api_server.openai.realtime_vad</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
@@ -961,6 +962,15 @@ launcher passes it on to the Rust frontend only (the conductor and
 workers do not inherit it), and
 <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.client.MStarClient</span></code> sends it when not given
 <code class="docutils literal notranslate"><span class="pre">api_key</span></code>. See <a class="reference internal" href="serving.html#api-key"><span class="std std-ref">API key</span></a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Silero VAD ONNX file (<code class="docutils literal notranslate"><span class="pre">silero_vad.onnx</span></code>) for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>
+<code class="docutils literal notranslate"><span class="pre">server_vad</span></code> turn detection, read by
+<code class="docutils literal notranslate"><span class="pre">realtime_vad.silero_weights</span></code>. Unset, the copy bundled with the
+<code class="docutils literal notranslate"><span class="pre">silero-vad</span></code> package (<code class="docutils literal notranslate"><span class="pre">mstar[vad]</span></code>) is used; with neither, or
+with a file whose inputs or outputs differ (the package’s other
+exports), <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> sessions are refused. Never downloaded.</p></td>
 </tr>
 </tbody>
 </table>

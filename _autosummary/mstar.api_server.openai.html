@@ -210,6 +210,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 current active has-children"><a class="current reference internal" href="#">mstar.api_server.openai</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.realtime_vad.html">mstar.api_server.openai.realtime_vad</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
@@ -648,22 +649,25 @@ endpoints in <code class="xref py py-mod docutils literal notranslate"><span cla
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.protocol.html#module-mstar.api_server.openai.protocol" title="mstar.api_server.openai.protocol"><code class="xref py py-obj docutils literal notranslate"><span class="pre">protocol</span></code></a></p></td>
 <td><p>Pydantic request models for the OpenAI-compatible endpoints.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_chat.html#module-mstar.api_server.openai.serving_chat" title="mstar.api_server.openai.serving_chat"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_chat</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.realtime_vad.html#module-mstar.api_server.openai.realtime_vad" title="mstar.api_server.openai.realtime_vad"><code class="xref py py-obj docutils literal notranslate"><span class="pre">realtime_vad</span></code></a></p></td>
+<td><p>Server turn detection for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (OpenAI's <code class="docutils literal notranslate"><span class="pre">server_vad</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_chat.html#module-mstar.api_server.openai.serving_chat" title="mstar.api_server.openai.serving_chat"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_chat</span></code></a></p></td>
 <td><p>/v1/chat/completions handler (streaming + non-streaming).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images" title="mstar.api_server.openai.serving_images"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_images</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images" title="mstar.api_server.openai.serving_images"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_images</span></code></a></p></td>
 <td><p>/v1/images/generations (text-to-image) and /v1/images/edits (image-to-image) handlers.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html#module-mstar.api_server.openai.serving_realtime" title="mstar.api_server.openai.serving_realtime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_realtime</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html#module-mstar.api_server.openai.serving_realtime" title="mstar.api_server.openai.serving_realtime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_realtime</span></code></a></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (transcription intent): streaming speech-to-text over a WebSocket.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_speech.html#module-mstar.api_server.openai.serving_speech" title="mstar.api_server.openai.serving_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_speech</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_speech.html#module-mstar.api_server.openai.serving_speech" title="mstar.api_server.openai.serving_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_speech</span></code></a></p></td>
 <td><p>/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_videos.html#module-mstar.api_server.openai.serving_videos" title="mstar.api_server.openai.serving_videos"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_videos</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.serving_videos.html#module-mstar.api_server.openai.serving_videos" title="mstar.api_server.openai.serving_videos"><code class="xref py py-obj docutils literal notranslate"><span class="pre">serving_videos</span></code></a></p></td>
 <td><p>/v1/videos/generations (text-to-video and image-to-video) handler.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html#module-mstar.api_server.openai.speech_chunking" title="mstar.api_server.openai.speech_chunking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">speech_chunking</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html#module-mstar.api_server.openai.speech_chunking" title="mstar.api_server.openai.speech_chunking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">speech_chunking</span></code></a></p></td>
 <td><p>Sentence chunking for <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>.</p></td>
 </tr>
 </tbody>

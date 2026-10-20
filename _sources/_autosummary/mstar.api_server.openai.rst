@@ -29,6 +29,7 @@ mstar.api\_server.openai
 
    adapters
    protocol
+   realtime_vad
    router
    serving_chat
    serving_images

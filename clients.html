@@ -214,6 +214,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.realtime_vad.html">mstar.api_server.openai.realtime_vad</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
@@ -922,8 +923,8 @@ that key, which the client sends as <code class="docutils literal notranslate"><
 <code class="docutils literal notranslate"><span class="pre">conversation.item.input_audio_transcription.delta</span></code> (append-only) and
 <code class="docutils literal notranslate"><span class="pre">mstar.transcription.partial</span></code> (whole current hypothesis) out; <code class="docutils literal notranslate"><span class="pre">commit</span></code>
 finishes the utterance. Input is <code class="docutils literal notranslate"><span class="pre">pcm16</span></code> at 16 kHz (the default) or
-<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>, resampled to 16 kHz. There is
-no server turn detection: <code class="docutils literal notranslate"><span class="pre">turn_detection</span></code> must be null.</p></td>
+<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>, resampled to 16 kHz. Turn
+detection is null (client commits) or <code class="docutils literal notranslate"><span class="pre">server_vad</span></code>; see below.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
@@ -1008,6 +1009,34 @@ Tune <code class="docutils literal notranslate"><span class="pre">chunk_seconds<
 in <code class="docutils literal notranslate"><span class="pre">transcription_session.update</span></code>; a smaller <code class="docutils literal notranslate"><span class="pre">chunk_seconds</span></code> is raised to 0.5. An item holds
 at most 300 s of audio (<code class="docutils literal notranslate"><span class="pre">max_item_seconds</span></code> in the session, lower if the model hears
 less): commit before then, since an append past it is refused with an <code class="docutils literal notranslate"><span class="pre">error</span></code>.</p></li>
+<li><p><strong>Realtime turn detection</strong> — by default the client ends each utterance with
+<code class="docutils literal notranslate"><span class="pre">input_audio_buffer.commit</span></code>. With <code class="docutils literal notranslate"><span class="pre">&quot;turn_detection&quot;:</span> <span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;server_vad&quot;}</span></code> the
+server does it, as OpenAI’s server VAD does: <code class="docutils literal notranslate"><span class="pre">threshold</span></code> (default 0.5),
+<code class="docutils literal notranslate"><span class="pre">prefix_padding_ms</span></code> (300) and <code class="docutils literal notranslate"><span class="pre">silence_duration_ms</span></code> (500). Silero VAD scores each
+32 ms frame; a turn starts on a frame at or above <code class="docutils literal notranslate"><span class="pre">threshold</span></code> with up to
+<code class="docutils literal notranslate"><span class="pre">prefix_padding_ms</span></code> of the audio before it. Silence starts on a frame below
+<code class="docutils literal notranslate"><span class="pre">threshold</span></code> minus 0.15, and a frame at or above <code class="docutils literal notranslate"><span class="pre">threshold</span></code> cancels it; the turn
+ends on whichever frame completes <code class="docutils literal notranslate"><span class="pre">silence_duration_ms</span></code> of whole frames counted from
+that first silent frame, borderline frames included. The hysteresis is that of
+Silero’s own <code class="docutils literal notranslate"><span class="pre">VADIterator</span></code>, but <code class="docutils literal notranslate"><span class="pre">VADIterator</span></code> counts from the frame after the first
+silent one and ends only on a frame below <code class="docutils literal notranslate"><span class="pre">threshold</span></code> minus 0.15, so with a nonzero
+<code class="docutils literal notranslate"><span class="pre">silence_duration_ms</span></code> it ends a turn one frame or more later. The server then sends
+<code class="docutils literal notranslate"><span class="pre">input_audio_buffer.speech_started</span></code> (<code class="docutils literal notranslate"><span class="pre">audio_start_ms</span></code>),
+<code class="docutils literal notranslate"><span class="pre">input_audio_buffer.speech_stopped</span></code> (<code class="docutils literal notranslate"><span class="pre">audio_end_ms</span></code>) and <code class="docutils literal notranslate"><span class="pre">committed</span></code>, and the
+transcription completes. Times are milliseconds of audio since the session started,
+cleared audio included. A commit takes exactly the turn’s audio; what follows, even
+in the same append, goes to the next turn. A turn never passes the item cap: it is
+committed before the frame that would pass it, and speech goes on in a new turn that
+starts with that frame. A client <code class="docutils literal notranslate"><span class="pre">commit</span></code> ends an open turn; between turns it
+drops what the VAD has not put in a turn yet. <code class="docutils literal notranslate"><span class="pre">create_response</span></code> and
+<code class="docutils literal notranslate"><span class="pre">interrupt_response</span></code> are accepted and echoed but do nothing in a transcription
+session; <code class="docutils literal notranslate"><span class="pre">idle_timeout_ms</span></code> and other types are refused. With 24 kHz input each
+decision waits 3 ms more for the resampler. Install <code class="docutils literal notranslate"><span class="pre">mstar[vad]</span></code> (Silero VAD, MIT,
+bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
+<code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code> at the ONNX file (<code class="docutils literal notranslate"><span class="pre">silero_vad.onnx</span></code>; the package’s other
+exports take other inputs, and with one of them <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> is refused); weights are
+never downloaded. The Dynamo bridge has no turn detection yet and
+refuses it.</p></li>
 <li><p><strong>Kokoro</strong> — <code class="docutils literal notranslate"><span class="pre">voice</span></code> is one of the 54 bundled voices (default <code class="docutils literal notranslate"><span class="pre">af_heart</span></code>) or a
 blend such as <code class="docutils literal notranslate"><span class="pre">af_bella+af_sky</span></code> or <code class="docutils literal notranslate"><span class="pre">af_bella(2)+af_sky(1)</span></code>; <code class="docutils literal notranslate"><span class="pre">speed</span></code> scales the
 speaking rate (0.25-4.0). <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> and <code class="docutils literal notranslate"><span class="pre">phonemes</span></code> go through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.
