@@ -41,6 +41,12 @@ mstar.api\_server.media\_io
 
    
    
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      StreamResampler
+   
    
 
    

@@ -935,11 +935,18 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Client events</span>
 <span class="sd">    ``transcription_session.update``  ``{"session": {"input_audio_transcription":</span>
-<span class="sd">    {"model", "language", "prompt"}, "input_audio_format": "pcm16", "mstar":</span>
-<span class="sd">    {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``</span>
-<span class="sd">    ``input_audio_buffer.append``      ``{"audio": &lt;base64 PCM16 mono 16 kHz&gt;}``</span>
+<span class="sd">    {"model", "language", "prompt"}, "input_audio_format", "turn_detection": null,</span>
+<span class="sd">    "mstar": {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``</span>
+<span class="sd">    ``input_audio_buffer.append``      ``{"audio": &lt;base64 PCM16 mono&gt;}``</span>
 <span class="sd">    ``input_audio_buffer.commit``      end of the utterance: flush and finish</span>
 <span class="sd">    ``input_audio_buffer.clear``       drop buffered audio and start over</span>
+
+<span class="sd">``input_audio_format`` is ``"pcm16"`` (16 kHz, the default) or OpenAI's</span>
+<span class="sd">``{"type": "audio/pcm", "rate": 24000}``; 24 kHz audio is resampled to the</span>
+<span class="sd">model's 16 kHz as it arrives, so partial ``audio_seconds`` stay on the</span>
+<span class="sd">client's timeline. The rate changes only with an empty buffer. The server</span>
+<span class="sd">has no turn detection: ``turn_detection`` must be null (the session echoes</span>
+<span class="sd">null), and the client ends each utterance with a commit.</span>
 
 <span class="sd">``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not</span>
 <span class="sd">pass the item cap, and the unfixed counts are non-negative integers; numeric</span>
@@ -1000,6 +1007,11 @@ window.runMermaid = runMermaid;</script>
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="n">SAMPLE_RATE</span> <span class="o">=</span> <span class="mi">16000</span>
+<span class="c1"># Input rates a session accepts; 24 kHz (OpenAI's pcm rate) is resampled to SAMPLE_RATE.</span>
+<span class="n">INPUT_SAMPLE_RATES</span> <span class="o">=</span> <span class="p">(</span><span class="mi">16000</span><span class="p">,</span> <span class="mi">24000</span><span class="p">)</span>
+<span class="c1"># Appends up to this many input samples (4 ms at 24 kHz) cost less to resample</span>
+<span class="c1"># than a thread hop, so they resample on the event loop; longer ones go to a thread.</span>
+<span class="n">INLINE_RESAMPLE_SAMPLES</span> <span class="o">=</span> <span class="mi">96</span>
 <span class="n">DEFAULT_CHUNK_SECONDS</span> <span class="o">=</span> <span class="mf">2.0</span>
 <span class="n">DEFAULT_UNFIXED_CHUNKS</span> <span class="o">=</span> <span class="mi">2</span>
 <span class="n">DEFAULT_UNFIXED_TOKENS</span> <span class="o">=</span> <span class="mi">5</span>
@@ -1068,14 +1080,28 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the first byte of a sample whose second byte is in the next append;</span>
     <span class="c1"># kept across commit (the byte stream goes on), dropped by clear</span>
     <span class="n">odd_byte</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span>
+    <span class="c1"># the client's audio rate; anything but SAMPLE_RATE goes through resampler</span>
+    <span class="n">input_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">SAMPLE_RATE</span>
+    <span class="n">resampler</span><span class="p">:</span> <span class="n">media_io</span><span class="o">.</span><span class="n">StreamResampler</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># samples the last chunk was short of its boundary (see take_chunk)</span>
+    <span class="n">short</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">chunk_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">chunk_seconds</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span><span class="p">))</span>
 
+<div class="viewcode-block" id="RealtimeSession.set_input_rate">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_rate">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_input_rate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_rate</span> <span class="o">=</span> <span class="n">rate</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">rate</span> <span class="o">==</span> <span class="n">SAMPLE_RATE</span> <span class="k">else</span> <span class="n">media_io</span><span class="o">.</span><span class="n">StreamResampler</span><span class="p">(</span><span class="n">rate</span><span class="p">,</span> <span class="n">SAMPLE_RATE</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="RealtimeSession.append">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.append">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">append</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">audio</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">audio</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span><span class="o">.</span><span class="n">push</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+=</span> <span class="nb">int</span><span class="p">(</span><span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">)</span></div>
@@ -1083,19 +1109,29 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="RealtimeSession.item_samples">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.item_samples">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">item_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">size</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">heard</span><span class="p">)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">item_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">extra</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""SAMPLE_RATE samples in the item once ``extra`` more input samples</span>
+<span class="sd">        arrive, rounded once over the whole item (not per append), so the cap</span>
+<span class="sd">        does not depend on how the audio was split."""</span>
+        <span class="n">held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span><span class="o">.</span><span class="n">held</span><span class="p">(</span><span class="n">extra</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">extra</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+</span> <span class="n">held</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">size</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">heard</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="RealtimeSession.take_chunk">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.take_chunk">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">take_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Every full chunk of pending audio as one array, or None until</span>
-<span class="sd">        enough arrived."""</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">:</span>
+<span class="sd">        enough arrived. Output the resampler still holds for its lookahead</span>
+<span class="sd">        counts toward the chunk, so a chunk of 24 kHz input is decoded on the</span>
+<span class="sd">        append that completes it, not the one after; the chunk is then short</span>
+<span class="sd">        by those samples (``short``), which go with the next one."""</span>
+        <span class="n">held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span><span class="o">.</span><span class="n">held</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="n">k</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+</span> <span class="n">held</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">short</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span>
+        <span class="k">if</span> <span class="n">k</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span><span class="p">,</span> <span class="n">k</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">short</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">short</span> <span class="o">=</span> <span class="n">k</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">short</span> <span class="o">-</span> <span class="n">n</span>
         <span class="n">buf</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">)</span>
-        <span class="n">n</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_samples</span>
         <span class="n">chunk</span><span class="p">,</span> <span class="n">rest</span> <span class="o">=</span> <span class="n">buf</span><span class="p">[:</span><span class="n">n</span><span class="p">],</span> <span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">:]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">rest</span><span class="p">]</span> <span class="k">if</span> <span class="n">rest</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">rest</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
@@ -1105,6 +1141,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RealtimeSession.flush">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.flush">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">flush</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">tail</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">tail</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tail</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span> <span class="o">+=</span> <span class="nb">int</span><span class="p">(</span><span class="n">tail</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">buf</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">)</span>
@@ -1121,7 +1162,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RealtimeSession.clear">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.clear">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">heard</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span><span class="p">,</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">resampler</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_samples</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">heard</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">short</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span><span class="p">,</span> <span class="p">[],</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">chunk_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">raw_hypothesis</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">emitted</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">item_id</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"item_</span><span class="si">{</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="p">[:</span><span class="mi">12</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span></div>
 </div>
@@ -1192,6 +1235,28 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be an object"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">value</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_input_rate</span><span class="p">(</span><span class="n">fmt</span><span class="p">,</span> <span class="n">current</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The input rate an ``input_audio_format`` declares (``current`` when</span>
+<span class="sd">    absent): ``"pcm16"`` is 16 kHz, as this endpoint has always read it;</span>
+<span class="sd">    OpenAI's ``{"type": "audio/pcm", "rate": N}`` names its rate (24 kHz when</span>
+<span class="sd">    left out, OpenAI's only one)."""</span>
+    <span class="k">if</span> <span class="n">fmt</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">current</span>
+    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm16"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">SAMPLE_RATE</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">fmt</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="n">fmt</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"audio/pcm"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">extra</span> <span class="o">:=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">fmt</span><span class="p">)</span> <span class="o">-</span> <span class="p">{</span><span class="s2">"type"</span><span class="p">,</span> <span class="s2">"rate"</span><span class="p">}):</span>
+            <span class="c1"># channels, encoding and the like would change how the bytes read</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"input_audio_format takes only type and rate; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">extra</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">rate</span> <span class="o">=</span> <span class="n">fmt</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rate"</span><span class="p">,</span> <span class="mi">24000</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rate</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">and</span> <span class="n">rate</span> <span class="ow">in</span> <span class="n">INPUT_SAMPLE_RATES</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">rate</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"input_audio_format.rate must be 16000 or 24000; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">rate</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s1">'input_audio_format must be "pcm16" or </span><span class="se">{{</span><span class="s1">"type": "audio/pcm", "rate": 24000</span><span class="se">}}</span><span class="s1">; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">fmt</span><span class="p">)</span><span class="si">}</span><span class="s1">'</span>
+    <span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="p">,</span> <span class="n">lo</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">hi</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">inf</span><span class="p">,</span> <span class="n">integer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
@@ -1326,7 +1391,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">{</span>
             <span class="s2">"id"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">session_id</span><span class="p">,</span>
             <span class="s2">"object"</span><span class="p">:</span> <span class="s2">"realtime.transcription_session"</span><span class="p">,</span>
-            <span class="s2">"input_audio_format"</span><span class="p">:</span> <span class="s2">"pcm16"</span><span class="p">,</span>
+            <span class="s2">"input_audio_format"</span><span class="p">:</span> <span class="p">(</span>
+                <span class="s2">"pcm16"</span> <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span> <span class="o">==</span> <span class="n">SAMPLE_RATE</span> <span class="k">else</span> <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"audio/pcm"</span><span class="p">,</span> <span class="s2">"rate"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span><span class="p">}</span>
+            <span class="p">),</span>
+            <span class="s2">"turn_detection"</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
             <span class="s2">"input_audio_transcription"</span><span class="p">:</span> <span class="p">{</span>
                 <span class="s2">"model"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
                 <span class="s2">"language"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">language</span><span class="p">,</span>
@@ -1337,7 +1405,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"unfixed_chunks"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span>
                 <span class="s2">"unfixed_tokens"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span><span class="p">,</span>
                 <span class="s2">"max_item_seconds"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="p">,</span>
-                <span class="s2">"sample_rate"</span><span class="p">:</span> <span class="n">SAMPLE_RATE</span><span class="p">,</span>
+                <span class="s2">"sample_rate"</span><span class="p">:</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span><span class="p">,</span>
             <span class="p">},</span>
         <span class="p">}</span>
 
@@ -1388,14 +1456,21 @@ window.runMermaid = runMermaid;</script>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — bad base64</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"audio is not base64"</span><span class="p">))</span>
                 <span class="k">return</span>
-            <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">item_samples</span><span class="p">()</span> <span class="o">+</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">item_samples</span><span class="p">(</span><span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"the item would pass </span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s of audio; "</span>
                     <span class="s2">"commit or clear the input audio buffer first"</span><span class="p">,</span>
                 <span class="p">))</span>
                 <span class="k">return</span>
             <span class="n">s</span><span class="o">.</span><span class="n">odd_byte</span> <span class="o">=</span> <span class="n">odd_byte</span>
-            <span class="n">s</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">resampler</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span> <span class="o">&lt;=</span> <span class="n">INLINE_RESAMPLE_SAMPLES</span><span class="p">:</span>
+                <span class="n">s</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># off the event loop: resampling a long append takes long enough</span>
+                <span class="c1"># to stall every other session on this server</span>
+                <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">append</span><span class="p">,</span> <span class="n">audio</span><span class="p">)</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">chunk</span> <span class="o">:=</span> <span class="n">s</span><span class="o">.</span><span class="n">take_chunk</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"input_audio_buffer.commit"</span><span class="p">:</span>
@@ -1424,9 +1499,20 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">session</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Apply a session update, all or nothing."""</span>
         <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
-        <span class="n">fmt</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_format"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">fmt</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="s2">"pcm16"</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"only pcm16 input is supported; got </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">fmt</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">rate</span> <span class="o">=</span> <span class="n">_input_rate</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio_format"</span><span class="p">),</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">rate</span> <span class="o">!=</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span> <span class="ow">and</span> <span class="n">s</span><span class="o">.</span><span class="n">item_samples</span><span class="p">():</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"commit or clear the input audio buffer before changing the input sample rate"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">rate</span> <span class="o">!=</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span> <span class="ow">and</span> <span class="n">s</span><span class="o">.</span><span class="n">odd_byte</span><span class="p">:</span>
+            <span class="c1"># a commit keeps the half sample, so only clear helps</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"half a sample is pending; clear the input audio buffer before changing "</span>
+                             <span class="s2">"the input sample rate"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"turn_detection"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">td</span> <span class="o">=</span> <span class="n">session</span><span class="p">[</span><span class="s2">"turn_detection"</span><span class="p">]</span>
+            <span class="n">kind</span> <span class="o">=</span> <span class="n">td</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">td</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"turn_detection </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">kind</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">isinstance</span><span class="p">(</span><span class="n">kind</span><span class="p">,</span><span class="w"> </span><span class="nb">str</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="n">td</span><span class="p">)</span><span class="si">}</span><span class="s2"> is not supported; "</span>
+                <span class="s2">"set turn_detection to null and end each utterance with input_audio_buffer.commit"</span>
+            <span class="p">)</span>
         <span class="n">knobs</span> <span class="o">=</span> <span class="n">_object</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"mstar"</span><span class="p">),</span> <span class="s2">"mstar"</span><span class="p">)</span>
         <span class="n">chunk_seconds</span> <span class="o">=</span> <span class="n">_number</span><span class="p">(</span><span class="n">knobs</span><span class="p">,</span> <span class="s2">"chunk_seconds"</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">MIN_CHUNK_SECONDS</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="p">,</span>
                                 <span class="n">clamp_low</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1445,7 +1531,9 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="n">request</span> <span class="o">=</span> <span class="n">TranscriptionRequest</span><span class="o">.</span><span class="n">model_validate</span><span class="p">({</span><span class="o">**</span><span class="n">s</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(),</span> <span class="o">**</span><span class="n">fields</span><span class="p">})</span> <span class="k">if</span> <span class="n">fields</span> <span class="k">else</span> <span class="n">s</span><span class="o">.</span><span class="n">request</span>
         <span class="n">s</span><span class="o">.</span><span class="n">request</span> <span class="o">=</span> <span class="n">request</span>
-        <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">unfixed_tokens</span></div>
+        <span class="n">s</span><span class="o">.</span><span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">unfixed_tokens</span> <span class="o">=</span> <span class="n">chunk_seconds</span><span class="p">,</span> <span class="n">unfixed_chunks</span><span class="p">,</span> <span class="n">unfixed_tokens</span>
+        <span class="k">if</span> <span class="n">rate</span> <span class="o">!=</span> <span class="n">s</span><span class="o">.</span><span class="n">input_rate</span><span class="p">:</span>
+            <span class="n">s</span><span class="o">.</span><span class="n">set_input_rate</span><span class="p">(</span><span class="n">rate</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="RealtimeTranscription.current_text">
@@ -1473,7 +1561,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span>
         <span class="c1"># a coalesced step counts every chunk it heard, so the prefix that keeps</span>
         <span class="c1"># sent text fixed starts after the same audio as with one step per chunk</span>
-        <span class="n">s</span><span class="o">.</span><span class="n">chunk_id</span> <span class="o">+=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">chunk</span><span class="o">.</span><span class="n">size</span> <span class="o">//</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">)</span>
+        <span class="c1"># (rounded: at 24 kHz a chunk can be short by the resampler's lookahead)</span>
+        <span class="n">s</span><span class="o">.</span><span class="n">chunk_id</span> <span class="o">+=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">round</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">size</span> <span class="o">/</span> <span class="n">s</span><span class="o">.</span><span class="n">chunk_samples</span><span class="p">))</span>
         <span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_text</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">final</span> <span class="ow">or</span> <span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">hold</span> <span class="o">=</span> <span class="mi">0</span>

@@ -643,6 +643,13 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.flush"><code class="docutils literal notranslate"><span class="pre">StreamResampler.flush()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.held"><code class="docutils literal notranslate"><span class="pre">StreamResampler.held()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.push"><code class="docutils literal notranslate"><span class="pre">StreamResampler.push()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.reset"><code class="docutils literal notranslate"><span class="pre">StreamResampler.reset()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.audio_formats"><code class="docutils literal notranslate"><span class="pre">audio_formats()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_audio_format"><code class="docutils literal notranslate"><span class="pre">check_audio_format()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a></li>
@@ -769,6 +776,15 @@ the base install stays slim.</p>
 </tbody>
 </table>
 </div>
+<p class="rubric">Classes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.StreamResampler" title="mstar.api_server.media_io.StreamResampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamResampler</span></code></a>(rate_in, rate_out[, ...])</p></td>
+<td><p>Resample a stream that arrives in pieces of any size (<code class="docutils literal notranslate"><span class="pre">push</span></code>), with the same output however it was split.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Exceptions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -814,6 +830,84 @@ callers re-raise it rather than fall back to another decoder.</p>
 <span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">RefAudioTooLongError</span></span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#RefAudioTooLongError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.RefAudioTooLongError" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#ValueError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ValueError</span></code></a></p>
 <p>A clip that opens as audio but runs past <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.StreamResampler">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">StreamResampler</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rate_in</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rate_out</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">half_width</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">48</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">10.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rolloff</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.95</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#StreamResampler"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.StreamResampler" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Resample a stream that arrives in pieces of any size (<code class="docutils literal notranslate"><span class="pre">push</span></code>), with
+the same output however it was split. A Kaiser-windowed sinc lowpass at
+the lower Nyquist, applied polyphase: output <code class="docutils literal notranslate"><span class="pre">k</span></code> is centered on input
+time <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">*</span> <span class="pre">rate_in</span> <span class="pre">/</span> <span class="pre">rate_out</span></code>, so timing is kept exactly. The passband
+is flat to 0.1 dB up to 0.9 of the lower Nyquist and 3 dB down at 0.94
+(7.2 and 7.5 kHz at 24 to 16 kHz), close to what a 16 kHz recording
+holds; anything above that Nyquist, which would fold back, is down 46 dB
+or more, and 100 dB from 1.06 of it on. Each output waits for half a
+kernel of input past its center (72 samples, 3 ms, at 24 to 16 kHz); <code class="docutils literal notranslate"><span class="pre">flush</span></code>
+emits the rest as if the input went on as
+silence, <code class="docutils literal notranslate"><span class="pre">ceil(n_in</span> <span class="pre">*</span> <span class="pre">rate_out</span> <span class="pre">/</span> <span class="pre">rate_in)</span></code> samples in all, and starts
+over. The kernel has <code class="docutils literal notranslate"><span class="pre">2</span> <span class="pre">*</span> <span class="pre">half_width</span> <span class="pre">*</span> <span class="pre">max(up,</span> <span class="pre">down)</span> <span class="pre">+</span> <span class="pre">1</span></code> taps for the
+reduced ratio <code class="docutils literal notranslate"><span class="pre">up/down</span></code>, so callers bound the rates.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rate_in</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>rate_out</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>half_width</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>beta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>rolloff</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.StreamResampler.flush">
+<span class="sig-name descname"><span class="pre">flush</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#StreamResampler.flush"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.StreamResampler.flush" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>ndarray</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.StreamResampler.held">
+<span class="sig-name descname"><span class="pre">held</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">extra</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#StreamResampler.held"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.StreamResampler.held" title="Link to this definition">#</a></dt>
+<dd><p>Output samples <code class="docutils literal notranslate"><span class="pre">flush</span></code> would still emit, after <code class="docutils literal notranslate"><span class="pre">extra</span></code> more
+input samples.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>extra</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.StreamResampler.push">
+<span class="sig-name descname"><span class="pre">push</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#StreamResampler.push"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.StreamResampler.push" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>x</strong> (<em>ndarray</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>ndarray</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.StreamResampler.reset">
+<span class="sig-name descname"><span class="pre">reset</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#StreamResampler.reset"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.StreamResampler.reset" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py function">
@@ -1330,6 +1424,13 @@ sample.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.flush"><code class="docutils literal notranslate"><span class="pre">StreamResampler.flush()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.held"><code class="docutils literal notranslate"><span class="pre">StreamResampler.held()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.push"><code class="docutils literal notranslate"><span class="pre">StreamResampler.push()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.reset"><code class="docutils literal notranslate"><span class="pre">StreamResampler.reset()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.audio_formats"><code class="docutils literal notranslate"><span class="pre">audio_formats()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_audio_format"><code class="docutils literal notranslate"><span class="pre">check_audio_format()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a></li>

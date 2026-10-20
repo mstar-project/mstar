@@ -246,7 +246,9 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance.
+       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
+       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. There is
+       no server turn detection: ``turn_detection`` must be null.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.

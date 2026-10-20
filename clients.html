@@ -921,7 +921,9 @@ that key, which the client sends as <code class="docutils literal notranslate"><
 <td><p>Streaming speech-to-text: <code class="docutils literal notranslate"><span class="pre">input_audio_buffer.append</span></code> PCM16 chunks in,
 <code class="docutils literal notranslate"><span class="pre">conversation.item.input_audio_transcription.delta</span></code> (append-only) and
 <code class="docutils literal notranslate"><span class="pre">mstar.transcription.partial</span></code> (whole current hypothesis) out; <code class="docutils literal notranslate"><span class="pre">commit</span></code>
-finishes the utterance.</p></td>
+finishes the utterance. Input is <code class="docutils literal notranslate"><span class="pre">pcm16</span></code> at 16 kHz (the default) or
+<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>, resampled to 16 kHz. There is
+no server turn detection: <code class="docutils literal notranslate"><span class="pre">turn_detection</span></code> must be null.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
