@@ -865,6 +865,14 @@ lists <code class="docutils literal notranslate"><span class="pre">robot_state</
 <code class="docutils literal notranslate"><span class="pre">action_shape</span></code> metadata). A tensor left in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> fails at send
 with an error that names the kwarg.</p>
 </div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The metadata <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns is laid over the request’s own
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, so a key the model reads back there (a prompt layout, a
+stream lead) must be set in every mode and listed in <code class="docutils literal notranslate"><span class="pre">INTERNAL_KWARGS</span></code>: the
+data worker drops a client’s value for it before <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>. Qwen3-TTS
+lists its prompt layout, speaker, language, clip digest and codec stream lead.</p>
+</div>
 <p>The following methods have defaults and are optional to override:
 <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> (described below), <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code>,
 <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code>, <code class="docutils literal notranslate"><span class="pre">load_audio</span></code>,
