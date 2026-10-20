@@ -108,7 +108,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3-ASR-1.7B``
      - Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)
        + dense Qwen3 decoder; up to 20 min of audio per request, 30 languages
-       (detected or forced), ``/v1/audio/transcriptions``.
+       (detected or forced), ``/v1/audio/transcriptions``. A repetition loop
+       in the transcript is collapsed as the reference SDK does.
    * - ``qwen3_asr_realtime``
      - ``Qwen/Qwen3-ASR-0.6B``
      - The 0.6B Qwen3-ASR checkpoint trained for chunked streaming; same class.

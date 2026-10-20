@@ -414,6 +414,9 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.parse_transcript("language Klingon<asr_text> x", free).language == "Klingon"
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
+    # a repetition loop is collapsed as the reference SDK does
+    looped = ad.parse_transcript("language English<asr_text>yes" + " no" * 40, free)
+    assert looped.text == "yes no" and looped.language == "en"
     assert ad.parse_transcript(" plain words ", req).language == "en"
     # the stream shows nothing until the language line has closed, then only the text after the tag
     assert ad.stream_text("language") == "" and ad.stream_text("language English") == ""

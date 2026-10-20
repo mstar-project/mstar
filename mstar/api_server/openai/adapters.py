@@ -1109,7 +1109,10 @@ class Qwen3ASRAdapter(OpenAIAdapter):
         return raw
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
-        raw = text.strip()
+        from mstar.model.qwen3_asr.repetition import fix_repetitions
+
+        # what the reference SDK does to every raw transcript before parsing it
+        raw = fix_repetitions(text.strip())
         if ASR_TEXT_TAG not in raw:
             return Transcript(text=raw, language=req.language)
         meta, body = raw.split(ASR_TEXT_TAG, 1)
