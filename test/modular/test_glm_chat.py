@@ -392,3 +392,35 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     assert {"messages", "tools", "chat_template_kwargs"} <= set(mk) and not {"messages", "tools"} & set(sent)
     body = NewRequestConductor("r", {}, ["text"], ["text"], {}, sent)
     wire.encode(ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST, body=body))
+
+
+@pytest.mark.parametrize("stops, text, want, stop", [
+    (["END"], "abcENDdef", "abc", "END"),
+    (["END"], "abcENdef", "abcENdef", None),
+    (["xyz", "y"], "axyz", "ax", "y"),  # the stop that completes first wins
+    (["bc", "abc"], "zabcd", "z", "abc"),  # of two ending together, the longer
+    (["\n\n"], "a\nb\n\nc", "a\nb", "\n\n"),
+    (["ab", "b"], "aab", "a", "ab"),
+])
+def test_a_stop_string_ends_the_text_in_any_chunking(stops, text, want, stop):
+    from mstar.api_server.openai.reply import StopMatcher
+
+    for pieces in (1, 2, 3, len(text)):
+        m, out, got = StopMatcher(stops), "", None
+        for i in range(0, len(text), pieces):
+            emitted, got = m.feed(text[i:i + pieces])
+            out += emitted
+            if got is not None:
+                break
+        if got is None:
+            out += m.flush()
+        assert (out, got) == (want, stop)
+
+
+def test_a_stop_string_holds_back_only_what_may_start_it():
+    from mstar.api_server.openai.reply import StopMatcher
+
+    m = StopMatcher(["</answer>"])
+    assert m.feed("plain text") == ("plain text", None)
+    assert m.feed(" and </ans") == (" and ", None)
+    assert m.feed("wer") == ("", None) and m.feed(">!") == ("", "</answer>")

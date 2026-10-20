@@ -868,3 +868,72 @@ def test_a_parsed_reply_stops_when_its_client_disconnects():
     with pytest.raises(HTTPException) as exc:
         asyncio.run(_collect())
     assert exc.value.status_code == 499 and aborted == ["r1"]
+
+
+def _glm_events(text):
+    return [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_glm_chat_ends_at_a_stop_string_and_stops_the_request(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    # the stop spans two tokens; what follows it is never read
+    stub.next_chunks = _usage_chunks((b"Plan. STOP</think>", 3), (b"Done: 4", 2), (b"2. ST", 2), (b"OP more", 2),
+                                     (b" text", 1), stop=False)
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": ["STOP"], "stream": stream,
+        "stream_options": {"include_usage": True} if stream else None,
+    })
+    if stream:
+        events = _glm_events(r.text)
+        deltas = [e["choices"][0]["delta"] for e in events if e["choices"]]
+        content = "".join(d.get("content", "") for d in deltas)
+        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+        finish = events[-2]["choices"][0]["finish_reason"]
+        usage = events[-1]["usage"]
+    else:
+        choice = r.json()["choices"][0]
+        content, reasoning = choice["message"]["content"], choice["message"]["reasoning_content"]
+        finish, usage = choice["finish_reason"], r.json()["usage"]
+    # stops match the answer only: the reasoning's STOP went out
+    assert reasoning == "Plan. STOP" and content == "Done: 42. " and finish == "stop"
+    # the tokens read through the one that completed the stop
+    assert usage["completion_tokens"] == 9
+    assert stub.aborted == [stub.last_submit["request_id"]]
+
+
+def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = [_Chunk("text", b) for b in _GLM_REPLY]
+    body = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+        "stop": ["Paris", "weather"],
+    }).json()
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls" and choice["message"]["reasoning_content"] == "Need the weather."
+    assert choice["message"]["tool_calls"][0]["function"]["arguments"] == '{"city": "Paris"}'
+    assert stub.aborted == []
+
+
+def test_glm_chat_refuses_a_fifth_stop_string_before_running(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": list("abcde")})
+    assert r.status_code == 400 and "at most 4" in r.json()["error"]["message"] and stub.last_submit is None
+
+
+def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
+    """The answer's trailing whitespace is held until text follows it, so a
+    stop that ends in whitespace ends the reply one chunk later, and that
+    chunk's tokens count."""
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Line one.", 3), (b"\n\n", 1), (b"Line", 1),
+                                     (b" two", 1), stop=False)
+    body = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": "\n\n"}).json()
+    assert body["choices"][0]["message"]["content"] == "Line one."
+    assert body["choices"][0]["finish_reason"] == "stop" and body["usage"]["completion_tokens"] == 7

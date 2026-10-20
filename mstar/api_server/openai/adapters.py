@@ -298,6 +298,11 @@ class OpenAIAdapter:
         tool calls), or None to return the text as ``content``."""
         return None
 
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:  # noqa: ARG002
+        """The strings the chat handler ends the reply at (``stop``). An adapter
+        that does not serve them returns none."""
+        return []
+
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/speech is not supported by this model")
 
@@ -1111,8 +1116,7 @@ class TextChatAdapter(OpenAIAdapter):
         # what the model cannot serve is refused, not dropped: off, a field passes
         if req.n not in (None, 1):
             raise ValueError(f"n={req.n}: this model returns one choice")
-        if req.stop:
-            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
+        self.stop_strings(req)
         mk = _passthrough(req)
         for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
                      "stop_token_ids"):
@@ -1136,6 +1140,16 @@ class TextChatAdapter(OpenAIAdapter):
             model_kwargs=mk,
             prompt_parts=parts,
         )
+
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:
+        """``stop``, as OpenAI takes it: a string or up to 4. The serving layer
+        matches them on the decoded answer and ends the request at the first."""
+        stops = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
+        if len(stops) > 4:
+            raise ValueError(f"stop takes at most 4 strings, got {len(stops)}")
+        if "" in stops:
+            raise ValueError("a stop string cannot be empty")
+        return stops
 
 
 class GlmChatAdapter(TextChatAdapter):

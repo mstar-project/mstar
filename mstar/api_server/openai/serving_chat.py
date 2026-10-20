@@ -6,8 +6,10 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 ``image_url`` data-URL content parts. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 
-A streamed reply, and a parsed one whole, is read as ``reply`` events, which
-this module writes as chat completion chunks or one chat completion.
+A streamed reply, and a whole one that is parsed or has stop strings, is read
+as ``reply`` events, which this module writes as chat completion chunks or one
+chat completion. Stop strings match the answer (``content``) only, not the
+reasoning or a tool call's arguments (see ``reply``).
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
     # checked before the request runs: a raise after submit leaves it running with no reader
     stream_options = getattr(req, "stream_options", None) or {}
     if not isinstance(stream_options, dict):
@@ -42,10 +45,11 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     )
 
     if req.stream:
-        return _stream(api, model_name, request_id, sample_rate, parser, include_usage)
-    if parser is not None:
-        events = await reply.collect(reply.reply_events(api, request_id, parser), raw_request)
-        return _parsed_response(model_name, request_id, events)
+        return _stream(api, model_name, request_id, sample_rate, parser, include_usage, stops)
+    if parser is not None or stops:
+        # read chunk by chunk, so a stop string ends the request as it appears
+        events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
+        return _text_response(model_name, request_id, events)
     chunks = await api.collect_results(request_id, raw_request)
     return _build_response(model_name, request_id, chunks, sample_rate, parser)
 
@@ -55,8 +59,8 @@ def _usage(usage: reply.Usage) -> dict:
             "total_tokens": usage.prompt + usage.completion}
 
 
-def _parsed_response(model_name, request_id, events) -> dict:
-    """A text reply an output parser split, from its events."""
+def _text_response(model_name, request_id, events) -> dict:
+    """A text reply, from its events."""
     finish = events[-1]
     content, reasoning, calls = "", "", []
     for run in reply.runs(events):
@@ -128,9 +132,9 @@ def _build_response(model_name, request_id, chunks, sample_rate, parser=None) ->
     }
 
 
-def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False):
+def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False, stops=None):
     # Bound to the submission now: the body is iterated later, by Starlette.
-    batches = reply.reply_events(api, request_id, parser)
+    batches = reply.reply_events(api, request_id, parser, stops)
     return _stream_events(batches, model_name, request_id, include_usage)
 
 

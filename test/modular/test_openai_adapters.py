@@ -283,7 +283,7 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
 
 
 @pytest.mark.parametrize("field", [
-    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
+    {"n": 2}, {"stop": ["a", "b", "c", "d", "e"]}, {"stop": ["END", ""]}, {"logprobs": True}, {"top_logprobs": 5},
     {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
     {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
 ])
@@ -291,6 +291,13 @@ def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)
     with pytest.raises(ValueError, match=next(iter(field))):
         adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+
+
+def test_text_chat_takes_up_to_four_stop_strings():
+    adapter = adapters.TextChatAdapter()
+    for stop, want in (("\n", ["\n"]), (["END", "</answer>"], ["END", "</answer>"]), (None, []), ([], [])):
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], stop=stop)
+        assert adapter.stop_strings(req) == want
 
 
 def test_text_chat_passes_those_fields_off(tmp_path):
