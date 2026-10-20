@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -464,10 +465,34 @@ class Gr00tN17Model(Model):
         return [self.PREFILL_WALK, self.ACTION_GEN_WALK]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        raise NotImplementedError(
-            "the decode -- slice this embodiment's dims, unnormalize, relative "
-            "to absolute -- is C08 CHK-3"
-        )
+        """The decoded action chunk as flat float32.
+
+        GR00T decodes **server-side**, unlike pi05, which returns its normalised
+        chunk raw: the inverse needs the checkpoint's action statistics and the
+        request's own raw state, neither of which a client has ([[D06]]). The
+        groups are concatenated in the embodiment's `modality_keys` order, which
+        is the same promise pi05's flat bytes make -- the client chose the
+        embodiment tag, so the group names and widths follow from it.
+
+        The two kwargs this reads are why they are in `PREPROCESS_ONLY_KWARGS`:
+        stripping them from the conductor's copy leaves the data worker's
+        (`data_worker.py:586`), which is the one handed back here.
+        """
+        if modality != "action":
+            raise ValueError(f"gr00t_n17 emits actions, not {modality!r}")
+        kwargs = request_kwargs or {}
+        tag = kwargs.get("embodiment_tag")
+        if tag is None:
+            raise ValueError(
+                "gr00t_n17 cannot decode without the request's `embodiment_tag`: "
+                "it selects the action statistics and the joint groups"
+            )
+        chunk = output.detach().to(torch.float32).cpu().numpy()
+        if chunk.ndim == 2:  # one request, as the engine hands it back
+            chunk = chunk[None]
+        groups = self.processor.unapply(tag, chunk, kwargs.get("state"))
+        decoded = np.concatenate(list(groups.values()), axis=-1)
+        return decoded.astype(np.float32).tobytes()
 
     # -------------------------------------------------------- forward passes
     def get_initial_forward_pass_args(
