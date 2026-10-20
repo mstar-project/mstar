@@ -1216,6 +1216,69 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="sound_file_seconds">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.sound_file_seconds">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">sound_file_seconds</span><span class="p">(</span><span class="n">frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The length a libsndfile header declares, or None when it declares none</span>
+<span class="sd">    (a sample count of 0 or libsndfile's "unknown" value)."""</span>
+    <span class="k">return</span> <span class="n">frames</span> <span class="o">/</span> <span class="n">rate</span> <span class="k">if</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="n">frames</span> <span class="o">&lt;</span> <span class="n">UNKNOWN_FRAMES</span> <span class="ow">and</span> <span class="n">rate</span> <span class="k">else</span> <span class="kc">None</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_sound_file_blocks</span><span class="p">(</span><span class="n">sound</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Blocks of an open ``soundfile.SoundFile`` until its end or just past</span>
+<span class="sd">    ``max_seconds``, for a header that gives no sample count.</span>
+
+<span class="sd">    A header-less FLAC cannot seek past its last block, so libsndfile raises on</span>
+<span class="sd">    the read that reaches it; that read ends the clip, which loses its last</span>
+<span class="sd">    FLAC frame (4096 samples from libsndfile's own encoder).</span>
+<span class="sd">    """</span>
+    <span class="n">limit</span> <span class="o">=</span> <span class="n">max_seconds</span> <span class="o">*</span> <span class="n">sound</span><span class="o">.</span><span class="n">samplerate</span>
+    <span class="n">frames</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">while</span> <span class="n">frames</span> <span class="o">&lt;=</span> <span class="n">limit</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">block</span> <span class="o">=</span> <span class="n">sound</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">_COUNT_BLOCK_FRAMES</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">always_2d</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>  <span class="c1"># soundfile.LibsndfileError</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">):</span>
+            <span class="k">yield</span> <span class="n">block</span>
+        <span class="n">frames</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">_COUNT_BLOCK_FRAMES</span><span class="p">:</span>
+            <span class="k">return</span>
+
+
+<div class="viewcode-block" id="count_sound_file_seconds">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.count_sound_file_seconds">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">count_sound_file_seconds</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The length of a libsndfile file whose header gives none, counted as it</span>
+<span class="sd">    decodes and keeping no samples; stops just past ``max_seconds``, so the</span>
+<span class="sd">    caller's limit check refuses a longer clip without decoding all of it."""</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+    <span class="k">with</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">SoundFile</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">sound</span><span class="p">:</span>
+        <span class="n">frames</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span> <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">_sound_file_blocks</span><span class="p">(</span><span class="n">sound</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">,</span> <span class="s2">"int16"</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">frames</span> <span class="o">/</span> <span class="n">sound</span><span class="o">.</span><span class="n">samplerate</span></div>
+
+
+
+<div class="viewcode-block" id="read_sound_file">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.read_sound_file">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_sound_file</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``soundfile.read(filepath, dtype="float32", always_2d=True)`` for a</span>
+<span class="sd">    header that gives no sample count, where ``soundfile.read`` would size its</span>
+<span class="sd">    buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes</span>
+<span class="sd">    block by block and stops just past ``max_seconds``, so the caller's length</span>
+<span class="sd">    check refuses a longer clip."""</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+    <span class="k">with</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">SoundFile</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">sound</span><span class="p">:</span>
+        <span class="n">blocks</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">_sound_file_blocks</span><span class="p">(</span><span class="n">sound</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">,</span> <span class="s2">"float32"</span><span class="p">))</span>
+        <span class="n">empty</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">0</span><span class="p">,</span> <span class="n">sound</span><span class="o">.</span><span class="n">channels</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="n">blocks</span><span class="p">)</span> <span class="k">if</span> <span class="n">blocks</span> <span class="k">else</span> <span class="n">empty</span><span class="p">),</span> <span class="n">sound</span><span class="o">.</span><span class="n">samplerate</span></div>
+
+
+
 <div class="viewcode-block" id="check_image_size">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.check_image_size">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">check_image_size</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">formats</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">IMAGE_FORMATS</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>

@@ -18,6 +18,7 @@ mstar.model.media\_limits
       check_file_counts
       check_image_size
       check_media_limits
+      count_sound_file_seconds
       max_audio_seconds
       max_image_pixels
       max_media_files
@@ -25,6 +26,8 @@ mstar.model.media\_limits
       probe_audio_seconds
       probe_video
       read_image
+      read_sound_file
+      sound_file_seconds
    
    
 
