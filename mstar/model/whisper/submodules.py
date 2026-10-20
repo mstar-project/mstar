@@ -18,7 +18,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.position.manager import PositionManager
@@ -58,7 +62,7 @@ from mstar.model.whisper.config import (
 logger = logging.getLogger(__name__)
 
 
-class _PromptPackedConfig(PackedCudaGraphConfig):
+class _PromptPackedConfig(PackedAcceleratorGraphConfig):
     """Packed prompt buckets, kept only where a bucket gives every row 3 to 8
     tokens: Whisper prompts are 3 or 4 tokens a request, so a sparser or denser
     bucket would never be chosen, and fewer than one token a row can't be
@@ -88,7 +92,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     ``encoder_states`` of shape ``(max_source_positions, d_model)`` for the
     decoder's cross-attention. Every window is the same shape, so a batch is
     a dense ``[bs, num_mel_bins, 3000]`` tensor and the forward is captured
-    once per batch size (``BatchedCudaGraphConfig``): the runner pads a
+    once per batch size (``BatchedAcceleratorGraphConfig``): the runner pads a
     smaller batch with zero windows and replays the nearest bucket. The node
     holds no resources, so ``declare_step`` stays at the base class's
     ``None``.
@@ -136,13 +140,13 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv1.weight.dtype
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         window = torch.zeros(self.config.n_samples, dtype=torch.float32, device=device)
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(ENCODER_WALKS),
                 # one window of samples per row, and the token count is a row
@@ -314,11 +318,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
     # -- capture ------------------------------------------------------------
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=DECODE_WALK,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),

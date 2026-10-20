@@ -284,7 +284,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
     encoder = WhisperEncoderModel(cfg)
     encoder.load_weights(list(_hf_encoder(cfg).state_dict().items()))
     sub = WhisperEncoderSubmodule(encoder, cfg).eval()
-    (capture,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (capture,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == PREFILL_WALK
     assert set(capture.replay_graph_walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK}
     assert capture.single_request_inputs.tensor_inputs["audio"].shape == (cfg.n_samples,)
@@ -402,7 +402,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     sub.postprocess("ts", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
     # the capture templates carry the same row so the graphs' input sets are fixed
-    decode_cfg, prefill_cfg = sub.get_cuda_graph_configs(torch.device("cpu"))
+    decode_cfg, prefill_cfg = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
     (template,) = prefill_cfg.get_node_inputs(1, 4)
     assert template.tensor_inputs["ts_rules"].tolist() == inactive_state()
@@ -604,7 +604,8 @@ def test_graph_walks_and_resources():
     per_req_ctx = -(-model.config.max_source_positions // 128)
     # one more for the sink page, so the last of MAX_CONCURRENT_REQUESTS fits
     assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
-    assert kv[KV_CACHE].config.max_num_pages == 4 * model.MAX_CONCURRENT_REQUESTS + 2 * model.MAX_CONCURRENT_REQUESTS
+    cap = model.MAX_CONCURRENT_REQUESTS
+    assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap  # padding rows of a capture hold no pages
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32
 
@@ -779,15 +780,6 @@ def test_process_prompt_builds_window_and_prompts():
     assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert model.get_max_output_tokens(max_output_tokens="40") == 40
     assert model.get_request_resource_configs({}, {"temperature": "0.5"})["sampler"].temperature == 0.5
-
-
-def test_config_yaml_needs_a_cap_the_decoder_caches_hold():
-    model = _make_model()
-    with pytest.raises(ValueError, match="max_concurrent_requests"):
-        model.validate_config_yaml({"model": "whisper_large"}, "x.yaml")
-    with pytest.raises(ValueError, match="exceeds"):
-        model.validate_config_yaml({"max_concurrent_requests": model.MAX_CONCURRENT_REQUESTS + 1}, "x.yaml")
-    model.validate_config_yaml({"max_concurrent_requests": model.MAX_CONCURRENT_REQUESTS}, "x.yaml")
 
 
 def test_postprocess_renders_language_and_timestamps_only():

@@ -307,7 +307,7 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
         ar_schedule=schedule, ar_steps=4, ar_iters_per_window=5, ar_total_iters=15,
         ar_kv_mode=True, ar_rid="r", ar_tokens_per_unit=stride, ar_size=(64, 64),
         ar_generator=torch.Generator().manual_seed(0),
-        cond=cond0, uncond=uncond0, scheduler=SimpleNamespace(timesteps=torch.arange(4)),
+        cond=cond0, uncond=uncond0, scheduler=SimpleNamespace(timesteps=torch.arange(4), step_index=None),
         latent_shape=sub._window_latent_shape(64, 64, 4), gs=6.0, guidance_interval=None,
     )
     x0 = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1).expand(
@@ -712,7 +712,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     assert torch.all(st["cond_video_latents"][:, :, :2] == 3.0)
     # "c" is pinned for this request until it stores its own last window
     assert sub._sessions.ids() == ["b", "c"] and sub._sessions.live("c") == "r"
-    st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3)))
+    st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3), step_index=None))
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"cond_latents": []})
     lat = ni.tensor_inputs["latents"]
     assert torch.all(lat[:, :, :2] == 3.0) and not torch.all(lat[:, :, 2:] == 3.0)

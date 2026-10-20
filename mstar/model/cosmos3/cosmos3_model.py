@@ -114,6 +114,7 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VAEEncoderSubmodule,
     Cosmos3VisionEncoderSubmodule,
 )
+from mstar.model.media_limits import VideoBudget
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -320,7 +321,7 @@ class Cosmos3Model(Model):
                 resource_key=ATTN,
                 nodes=kv_nodes,
                 config=AttentionConfig(
-                    kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
+                    kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
                 ),
             ),
         ]
@@ -987,16 +988,18 @@ class Cosmos3Model(Model):
             logger.warning("torchcodec video decode unavailable (%s); decoding %s with PyAV.", reason, filepath)
         import av
 
+        budget = VideoBudget()
         frames = []
         with av.open(filepath) as container:
             stream = container.streams.video[0]
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             fps = float(rate) if rate else None
             for frame in container.decode(stream):
+                budget.add(frame.height, frame.width)
                 frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
         if not frames:
             raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float() / 255.0
+        video = torch.stack(frames).to(device).float().div_(255.0)
         metadata = {
             "num_frames": len(frames), "average_fps": fps,
             "duration_seconds": (len(frames) / fps) if fps else None,

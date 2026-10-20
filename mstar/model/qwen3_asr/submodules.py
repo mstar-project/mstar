@@ -20,13 +20,13 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -165,10 +165,10 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         ])
         return {"audio_features": padded, "feature_lens": lens}
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """The encoder's 24-layer stack and projector, by batch size and packed
         token count. At ASR clip lengths (13 tokens a second) its GEMMs are a
         few dozen rows, so eager it is launch-bound: a 7 s clip's stack is
@@ -309,13 +309,13 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         self.model = llm
         self.config = config
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         hidden = self.config.text.hidden_size
         dtype = self.model.embed_tokens.weight.dtype
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=DECODE_WALK,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
@@ -323,7 +323,7 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,

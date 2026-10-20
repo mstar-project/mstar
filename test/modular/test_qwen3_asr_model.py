@@ -298,7 +298,7 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     assert sub.preprocess(DECODE_WALK, _engine_inputs("r"), [decode_row])["input_ids"].tolist() == [42]
     step = sub.declare_step(PREFILL_WALK, ["r"], [row])
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
-    (decode, prefill) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
     assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
     assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)
@@ -447,6 +447,15 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.parse_transcript("language Klingon<asr_text> x", free).language == "Klingon"
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
+    # a repetition loop is collapsed in the finished transcript, as the
+    # reference SDK does; the partial parse a realtime step holds text back by
+    # is left as it is, so a longer hypothesis still parses to a longer text
+    looped = "language English<asr_text>yes" + " no" * 40
+    assert ad.parse_transcript(looped, free).text == "yes" + " no" * 40
+    from mstar.api_server.openai.serving_transcriptions import Window, merge_windows
+
+    merged = merge_windows([Window(path="w.wav", offset=0.0, duration=5.0, raw_text=looped)], ad, free)
+    assert merged.text == "yes no" and merged.language == "en"
     assert ad.parse_transcript(" plain words ", req).language == "en"
     # the stream shows nothing until the language line has closed, then only the text after the tag
     assert ad.stream_text("language") == "" and ad.stream_text("language English") == ""

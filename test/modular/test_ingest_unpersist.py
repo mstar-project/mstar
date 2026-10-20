@@ -47,7 +47,6 @@ class _StubComm:
         return self.batches.popleft() if self.batches else []
 
     def poll_for_messages(self, timeout_ms):
-        del timeout_ms
         return bool(self.batches)
 
 

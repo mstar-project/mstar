@@ -112,10 +112,13 @@ place during several unexplained request hangs in our runs.
 
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
-and the model refuses a config that admits more. Requests past the cap wait
-in the conductor. Qwen3-ASR's cap is checked against ``kv_cache.max_num_pages``,
-and since a 20 minute file takes about 122 pages the page count is what bounds
-how many long files decode at once.
+and the model refuses at startup a cap they cannot hold. Requests past the cap
+wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
+file holds about 122 pages for its prompt and up to 32 more for its transcript,
+so ``kv_cache.max_num_pages: 2048`` decodes about 13 of them at once. More
+concurrent long files than the pool holds offload to the host pool and, once
+that is full too, wait on each other until they time out: serve many long files
+with a lower ``max_concurrent_requests`` or more pages.
 
 Both decode loops hand a window's tokens to the client in one message when
 the loop ends (``Loop.accumulated_outputs``) rather than one message per
