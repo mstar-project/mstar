@@ -14,18 +14,22 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
 def _pending(rids, failed):
     return SimpleNamespace(
-        batch=SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name="n", graph_walk="w",
             request_to_worker_graph=dict.fromkeys(rids, "wg0"),
         ),
         node_batch=SimpleNamespace(
             request_ids=list(rids),
             per_request_info={rid: object() for rid in rids},
             failed_requests=dict(failed),
+            final_stream_rids=set(rids),
+            stream_partition_done_rids=set(rids),
         ),
     )
 
@@ -45,6 +49,8 @@ def test_a_handled_failure_leaves_the_batch():
     assert "r0" not in outputs
     assert "r0" not in pending.batch.request_to_worker_graph
     assert "r0" not in pending.node_batch.per_request_info
+    assert pending.node_batch.final_stream_rids == {"r1"}
+    assert pending.node_batch.stream_partition_done_rids == {"r1"}
 
 
 def test_a_handled_failure_is_cleared_so_it_is_not_reported_again():

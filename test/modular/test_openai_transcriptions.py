@@ -101,6 +101,20 @@ def _wav_bytes(seconds: float, sample_rate: int = 16_000) -> bytes:
     return buf.getvalue()
 
 
+def _can_read_audio_duration() -> bool:
+    with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+        f.write(_wav_bytes(1))
+        f.flush()
+        return serving_transcriptions.audio_duration_seconds(f.name) is not None
+
+
+# Long-form windowing reads the upload's duration with soundfile or torchcodec;
+# without a working one, every upload is one window.
+requires_audio_duration = pytest.mark.skipif(
+    not _can_read_audio_duration(), reason="long-form windowing needs soundfile or torchcodec"
+)
+
+
 def _post(client, data=None, filename="speech.wav", content=b"RIFFfake"):
     files = {"file": (filename, content, "audio/wav")} if filename else None
     return client.post("/v1/audio/transcriptions", data=data or {"model": "whisper_large"}, files=files)
@@ -364,6 +378,7 @@ def test_plan_windows_cuts_only_bounded_models(tmp_path):
     assert len(short) == 1
 
 
+@requires_audio_duration
 def test_sequential_long_form_carries_language_and_text(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [
@@ -389,6 +404,7 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
     assert len({s["file_paths"]["audio"][0] for s in stub.submits}) == 3
 
 
+@requires_audio_duration
 def test_parallel_long_form_submits_everything_up_front(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text(" one"), _text(" two"), _text(" three")]
@@ -413,6 +429,7 @@ def test_short_upload_is_a_single_request(client_and_stub):
     assert r.json() == {"text": "short"} and len(stub.submits) == 1
 
 
+@requires_audio_duration
 def test_streaming_long_form_emits_every_window_in_order(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text("<|en|>", " one"), _text(" two")]
@@ -431,6 +448,7 @@ def test_streaming_long_form_emits_every_window_in_order(client_and_stub):
     assert stub.submits[1]["model_kwargs"]["language"] == "en"
 
 
+@requires_audio_duration
 def test_streaming_parallel_windows_stream_token_by_token(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text("<|en|>", " one", " two"), _text(" three")]
@@ -453,6 +471,7 @@ def _wav_seconds(path: str) -> float:
         return wf.getnframes() / wf.getframerate()
 
 
+@requires_audio_duration
 def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [
@@ -475,6 +494,7 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
     assert [round(t, 2) for t in stub.wav_seconds] == [30.0, 30.0, 15.0]
 
 
+@requires_audio_duration
 def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " one", "<|29.50|>"), _text("<|0.00|>", " two", "<|15.00|>")]
@@ -483,6 +503,7 @@ def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
     assert all(s["model_kwargs"]["timestamps"] == "segment" for s in stub.submits)
 
 
+@requires_audio_duration
 def test_short_seek_or_no_closed_segment_takes_the_whole_window(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [
@@ -495,6 +516,7 @@ def test_short_seek_or_no_closed_segment_takes_the_whole_window(client_and_stub)
     assert [round(t, 2) for t in stub.wav_seconds] == [30.0, 30.0, 5.0]
 
 
+@requires_audio_duration
 def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub):
     client, stub = client_and_stub
     loop = " the apostle and" * 60
@@ -518,6 +540,7 @@ def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub)
     assert body["segments"][1]["temperature"] == 0.2 and body["segments"][1]["compression_ratio"] < 2.4
 
 
+@requires_audio_duration
 def test_window_accepted_hot_stops_conditioning_the_next(client_and_stub):
     client, stub = client_and_stub
     loop = " the apostle and" * 60
@@ -531,6 +554,7 @@ def test_window_accepted_hot_stops_conditioning_the_next(client_and_stub):
     assert "initial_prompt" not in stub.submits[7]["model_kwargs"]
 
 
+@requires_audio_duration
 def test_pinned_temperature_is_not_escalated(client_and_stub):
     client, stub = client_and_stub
     loop = " the apostle and" * 60
@@ -602,6 +626,7 @@ def test_streamed_upload_files_are_deleted(client_and_stub):
     assert not list(stub.upload_dir.iterdir())
 
 
+@requires_audio_duration
 def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
     client, stub = client_and_stub
     monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 2)
@@ -649,6 +674,7 @@ def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
     assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
 
 
+@requires_audio_duration
 def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
     client, stub = client_and_stub
     monkeypatch.setattr(serving_transcriptions, "MAX_DURATION_SECONDS", 60)

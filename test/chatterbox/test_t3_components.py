@@ -12,7 +12,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("chatterbox")
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 
 from chatterbox.models.t3 import T3  # noqa: E402
 from chatterbox.models.t3.modules.cond_enc import T3Cond  # noqa: E402

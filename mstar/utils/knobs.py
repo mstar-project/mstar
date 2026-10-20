@@ -49,7 +49,7 @@ def kv_chain_lazy_steps() -> int:
 
 
 def kv_plan_cache() -> int:
-    """``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased
+    """``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager plans a leased
     decode step from the previous step's plan when the batch is the same
     rows in the same order and nothing but that step's commit touched the
     streams: lengths advance by one, pages change only where a row crossed
@@ -61,12 +61,12 @@ def kv_plan_cache() -> int:
 
 
 def kv_pinned_indptrs() -> bool:
-    """``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's
+    """``MSTAR_KV_PINNED_INDPTRS`` (default 0): the KV plan writes FlashInfer's
     index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a
     ring of page-locked host buffers, and the decode wrapper copies the
     indices straight into its captured device buffer from there. The copies
     are then really asynchronous; from pageable memory the driver stages each
-    one, and FlashInfer makes the indices copy blocking. Off by default: the
-    event bookkeeping per take cost about what the staged copies did at
-    c32-c128 on 0.8B (measured neutral to slightly negative)."""
+    one, and FlashInfer makes the indices copy blocking. Off by default: no
+    measurable gain at c32-c128 on 0.8B. The cost is one CUDA event per plan,
+    which a buffer set waits on before it is rewritten."""
     return os.environ.get("MSTAR_KV_PINNED_INDPTRS", "0") == "1"

@@ -45,6 +45,7 @@ Conventions the base fixes:
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from typing import Any, NamedTuple
 
@@ -116,6 +117,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         capture_buckets: Sequence[tuple[str, Hashable]] = (),
         capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
         replay_walks: Mapping[str, Sequence[str]] | None = None,
+        max_uncaptured_layouts: int = 4,
     ):
         super().__init__()
         self.loop_name = loop_name
@@ -124,11 +126,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # (graph_walk, bucket_key) pairs to capture; the same key on another walk
         # replays only if ``replay_walks`` says so.
         self.capture_buckets = list(capture_buckets)
+        self._captured_keys = frozenset(key for _, key in self.capture_buckets)
         self.capture_batch_sizes = sorted(int(b) for b in capture_batch_sizes)
         self.replay_walks = dict(replay_walks or {})
-        # Per-key derived tensors (rotary tables, ...) built on first use and never
-        # evicted: a captured graph reads them at fixed addresses.
+        # Per-key derived tensors (rotary tables, ...) built on first use. A captured
+        # key's are kept for good, since its graphs read them at fixed addresses; the
+        # rest are LRU-bounded, as a stream of distinct request shapes (any fps a
+        # client asks for, say) would otherwise grow them without limit.
         self._layouts: dict[Hashable, Any] = {}
+        self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
+        self.max_uncaptured_layouts = int(max_uncaptured_layouts)
         # Pinned staging rings for the seeded noise, one per dtype, built on first
         # use (a stager allocates nothing until it stages something).
         self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
@@ -253,8 +260,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     # --------------------------------------------------------------- helpers
     def layout(self, bucket_key: Hashable, device: torch.device) -> Any:
         entry = self._layouts.get(bucket_key)
-        if entry is None:
+        if entry is not None:
+            return entry
+        if bucket_key in self._captured_keys:
             entry = self._layouts[bucket_key] = self.build_layout(bucket_key, device)
+            return entry
+        cache = self._uncaptured_layouts
+        entry = cache.get(bucket_key)
+        if entry is None:
+            entry = cache[bucket_key] = self.build_layout(bucket_key, device)
+            while len(cache) > self.max_uncaptured_layouts:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(bucket_key)
         return entry
 
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
@@ -476,8 +494,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
-        from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1):
+        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
@@ -489,7 +507,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             single = NodeInputs(
                 tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
             )
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=walk,
                 replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
                 single_request_inputs=single,

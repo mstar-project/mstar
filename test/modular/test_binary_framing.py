@@ -226,6 +226,9 @@ class _ChunkServer:
     def __init__(self, chunks):
         self._chunks = chunks
 
+    async def wait_for_request_id(self, request_id):
+        pass
+
     def submit_request(self, **kwargs):
         return None
 
