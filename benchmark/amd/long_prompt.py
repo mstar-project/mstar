@@ -32,6 +32,7 @@ phases.txt has one table per cell; summary.json has the numbers below. Reading t
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
@@ -107,6 +108,43 @@ def readout(cut: dict[str, dict], refusals: int) -> dict:
     return res
 
 
+@contextlib.contextmanager
+def phase_server(launch: Launch, out: Path, period: int, timeout_s: float = 3600):
+    """The launch's server under benchmark.worker_phases.server (MSTAR_PHASE_TIMING every ``period``
+    iterations, records in out/server.log). Yields its seconds to SERVER READY; stops it on exit."""
+    launch.run_dir.mkdir(parents=True, exist_ok=True)
+    launch._take_locks()
+    proc = None
+    try:
+        launch.check_free()
+        for d in (launch.ipc_dir, launch.upload_dir):
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        wrapper = [sys.executable, "-m", "benchmark.worker_phases.server", "--command", shlex.join(launch.command()),
+                   "--period", str(period), "--server-log", str(out / "server.log"),
+                   "--out", str(out / "phases_live.txt"), "--skip-warmup", "1"]
+        (out / "command.txt").write_text(shlex.join(wrapper) + "\n")
+        versions = collect_versions(launch, launch.command(), launch.environment())
+        (launch.run_dir / "versions.json").write_text(json.dumps(versions, indent=1, default=str))
+        t_start = time.monotonic()
+        with open(out / "wrapper.log", "w") as log:
+            proc = subprocess.Popen(wrapper, cwd=REPO, env=launch.environment(), stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        deadline = time.monotonic() + timeout_s
+        while "SERVER READY" not in (out / "wrapper.log").read_text(errors="replace"):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError(f"server did not come up; see {out / 'wrapper.log'}")
+            time.sleep(5)
+        yield round(time.monotonic() - t_start, 1)
+    finally:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)  # the wrapper stops the server's whole group
+            try:
+                proc.wait(180)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+        launch.stop()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--row", default="qwen3_5_0.8b", choices=[r for r, v in catalog.ROWS.items() if v.family == "text"])
@@ -126,30 +164,8 @@ def main(argv=None) -> int:
                     config=Path(args.config).resolve() if args.config else None)
     launch.run_dir.mkdir(parents=True, exist_ok=True)
     short = make_short_prompts(REPO / tables.LONG_PROMPTS, out / "prompts_400.txt", row.hf_id)
-    launch._take_locks()
-    proc = None
     windows: dict[str, tuple[float, float]] = {}
-    try:
-        launch.check_free()
-        for d in (launch.ipc_dir, launch.upload_dir):
-            d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        wrapper = [sys.executable, "-m", "benchmark.worker_phases.server", "--command", shlex.join(launch.command()),
-                   "--period", str(args.period), "--server-log", str(out / "server.log"),
-                   "--out", str(out / "phases_live.txt"), "--skip-warmup", "1"]
-        (out / "command.txt").write_text(shlex.join(wrapper) + "\n")
-        versions = collect_versions(launch, launch.command(), launch.environment())
-        versions["config_text"] = launch.mstar_config().read_text()
-        (launch.run_dir / "versions.json").write_text(json.dumps(versions, indent=1, default=str))
-        t_start = time.monotonic()
-        with open(out / "wrapper.log", "w") as log:
-            proc = subprocess.Popen(wrapper, cwd=REPO, env=launch.environment(), stdout=log, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-        deadline = time.monotonic() + 3600
-        while "SERVER READY" not in (out / "wrapper.log").read_text(errors="replace"):
-            if proc.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError(f"server did not come up; see {out / 'wrapper.log'}")
-            time.sleep(5)
-        startup_s = round(time.monotonic() - t_start, 1)
+    with phase_server(launch, out, args.period) as startup_s:
         for wl, c in cells(short):
             rdir = out / wl.name
             rdir.mkdir(exist_ok=True)
@@ -159,14 +175,6 @@ def main(argv=None) -> int:
             windows[wl.name] = (t0, time.time())
             print(f"{wl.name}: runner rc {rc}", flush=True)
             time.sleep(5)  # a gap between windows, so no record straddles two cells
-    finally:
-        if proc is not None and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)  # the wrapper stops the server's whole group
-            try:
-                proc.wait(180)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-        launch.stop()
     log_text = (out / "server.log").read_text(errors="replace")
     cut = cut_by_window(log_text, windows)
     refusals = sum(1 for ln in log_text.splitlines() if "runs eagerly" in ln)

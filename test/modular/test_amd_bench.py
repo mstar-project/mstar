@@ -771,3 +771,51 @@ def test_long_prompt_cuts_phase_records_by_cell_window():
     assert out["exec_ratio_long_over_short"] == 8.0 and out["prefill_buckets_running_eagerly"] == 3
     names = [wl.name for wl, _ in long_prompt.cells(Path("/tmp/p400.txt"))]
     assert names == ["prefill-long", "prefill-short", "burst-long", "burst-short"]
+
+
+def test_phase_cells_cuts_one_window_per_concurrency(tmp_path, monkeypatch):
+    import contextlib
+    import datetime
+    import time
+
+    from benchmark.amd import long_prompt, phase_cells
+
+    wt, out = tmp_path / "wt", tmp_path / "out"
+    (wt / "configs").mkdir(parents=True)
+    (wt / "configs" / "whisper_large.yaml").write_text("model: whisper\n")
+
+    @contextlib.contextmanager
+    def fake_server(launch, out_dir, period):
+        (out_dir / "server.log").write_text("")
+        yield 12.5
+
+    def fake_client(cmd, env, log_path):
+        # Phase records inside this run's window, with event_sync growing with the concurrency.
+        c = int(cmd[cmd.index("--max-concurrency") + 1])
+        t = time.time()
+        time.sleep(0.02)
+        ts = datetime.datetime.fromtimestamp(t + 0.01).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        with open(out / "server.log", "a") as f:
+            for k in range(3):
+                f.write(f"{ts} INFO [worker_0] mstar.worker.worker: Worker worker_0 phase-timing iter={k} bs={c}: "
+                        f"iter_total: p50=10.0ms p95=10.0ms mean=10.0ms n=20 | "
+                        f"worker.postprocess.event_sync: p50={c / 8}ms p95={c / 8}ms mean={c / 8}ms n=20\n")
+        rdir = Path(cmd[cmd.index("--output-dir") + 1])
+        (rdir / "results.json").write_text(json.dumps({"completed": 5, "failed": 0, "wall_time_s": 2.0}))
+        return 0, 0.1
+
+    monkeypatch.setattr(long_prompt, "phase_server", fake_server)
+    monkeypatch.setattr(phase_cells.sweep, "run_client", fake_client)
+    monkeypatch.setattr(phase_cells, "GAP_S", 0)
+    monkeypatch.setattr(phase_cells.sweep, "input_seconds_of", lambda row, wl: [1.0])
+    assert phase_cells.main(["--row", "whisper_large", "--workload", "asr-libri", "--concurrency", "8,32",
+                             "--gpus", "0", "--out", str(out), "--worktree", str(wt)]) == 0
+    summary = json.loads((out / "summary.json").read_text())
+    assert list(summary["windows"]) == ["c8", "c32"] and summary["startup_s"] == 12.5
+    assert summary["cells"]["c8"]["phases"]["worker.postprocess.event_sync"]["mean_ms"] == 1.0
+    assert summary["cells"]["c32"]["phases"]["worker.postprocess.event_sync"]["mean_ms"] == 4.0
+    assert summary["cells"]["c32"]["client"]["completed"] == 5
+    assert "### c8" in (out / "phases.txt").read_text()
+    with pytest.raises(SystemExit):
+        phase_cells.main(["--row", "whisper_large", "--workload", "text-chat-256", "--concurrency", "1",
+                          "--gpus", "0", "--out", str(out), "--worktree", str(wt)])
