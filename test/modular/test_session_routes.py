@@ -26,9 +26,13 @@ class _FakeServer:
 
     def __init__(self, config=None, teardown=None):
         self.submitted: list[dict] = []
+        # teardown is asked by internal key; record the client id it belongs to
         self.torn_down: list[str] = []
         self.sessions = SessionRegistry(
-            config, teardown=teardown or self.torn_down.append,
+            config,
+            teardown=teardown or (
+                lambda key: self.torn_down.append(key.split(".")[0])
+            ),
         )
 
     async def wait_for_request_id(self, request_id):

@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
+def _mint_key(session_id: str) -> str:
+    """The key a session goes by below the API server; unique per session, so
+    a stale teardown for an earlier session under the same id cannot free this
+    one's state. The '.' keeps it apart from any id a client may choose."""
+    return f"{session_id}.{uuid.uuid4().hex[:12]}"
+
+
 class SessionError(Exception):
     """A session request the server refuses, with the status to answer with.
 
@@ -49,6 +56,8 @@ class SessionError(Exception):
 @dataclass
 class SessionRecord:
     session_id: str
+    # What the conductor and workers know this session by; see _mint_key.
+    key: str
     timeout_s: float
     created_at: float
     last_activity: float
@@ -77,6 +86,8 @@ class SessionRequest:
     """What ``/generate``'s session flags resolved to."""
 
     session_id: str | None = None
+    # The internal key sent downstream in place of the client's id.
+    key: str | None = None
     # Set when the server minted the id, so it is reported back to the client.
     created: bool = False
     end_session: bool = False
@@ -96,6 +107,7 @@ class SessionRegistry:
     def __init__(
         self,
         config: SessionsConfig | None,
+        # called with a session's internal key, never its client id
         teardown: Callable[[str], None],
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -104,6 +116,8 @@ class SessionRegistry:
         self._clock = clock
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionRecord] = {}
+        # internal key -> client id, for the conductor's teardown ACKs
+        self._by_key: dict[str, str] = {}
         self._request_to_session: dict[str, str] = {}
         # How long a tombstone may stand before the sweep chases it; above the
         # conductor's own barrier TTL, which force-finalizes at 120s.
@@ -195,14 +209,15 @@ class SessionRegistry:
             "started" if start_session else "resumed", resolved,
         )
         return SessionRequest(
-            session_id=resolved, created=created, end_session=end_session,
-            resumed=resume_session,
+            session_id=resolved, key=record.key, created=created,
+            end_session=end_session, resumed=resume_session,
         )
 
     def _start_locked(
         self, session_id: str | None, timeout_s: float, now: float,
     ) -> tuple[str, str | None]:
-        """Open a session, returning it and whatever was evicted for it."""
+        """Open a session, returning its id and the key of whatever was
+        evicted for it."""
         config = self.config
         if session_id is not None:
             existing = self._sessions.get(session_id)
@@ -228,14 +243,17 @@ class SessionRegistry:
                 )
             self._mark_closing_locked(victim, "evicted to make room")
             victim.teardown_asked = True
-            evicted = victim.session_id
+            evicted = victim.key
         resolved = session_id or str(uuid.uuid4())
+        key = _mint_key(resolved)
         self._sessions[resolved] = SessionRecord(
             session_id=resolved,
+            key=key,
             timeout_s=timeout_s,
             created_at=now,
             last_activity=now,
         )
+        self._by_key[key] = resolved
         return resolved, evicted
 
     def _lru_idle_locked(self) -> SessionRecord | None:
@@ -300,8 +318,9 @@ class SessionRegistry:
             if record.teardown_asked:
                 return
             record.teardown_asked = True
-        logger.warning("Tearing session %s down: %s", session_id, reason)
-        self._teardown(session_id)
+            key = record.key
+        logger.warning("Tearing session %s down: %s", key, reason)
+        self._teardown(key)
 
     def rebind_request(self, request_id: str, key: str) -> None:
         """Re-key a request bound by ``resolve`` under the submission key it
@@ -359,7 +378,7 @@ class SessionRegistry:
                 )
             self._mark_closing_locked(record, "deleted by the client")
             record.teardown_asked = True
-        self._teardown(session_id)
+        self._teardown(record.key)
 
     def sweep(self) -> list[str]:
         """Close every session whose TTL has passed. Returns what was closed.
@@ -375,7 +394,7 @@ class SessionRegistry:
             return []
         now = self._clock()
         ttl_mode = self.config.ttl_mode
-        expired: list[str] = []
+        expired: list[SessionRecord] = []
         stalled: list[str] = []
         abandoned: list[str] = []
         with self._lock:
@@ -387,11 +406,11 @@ class SessionRegistry:
                     if not record.teardown_asked:
                         record.teardown_asked = True
                         record.closing_since = now
-                        stalled.append(record.session_id)
+                        stalled.append(record.key)
                     else:
                         # the conductor force-finalizes its own barrier well
                         # inside this window, so nothing is coming
-                        abandoned.append(record.session_id)
+                        abandoned.append(record.key)
                     continue
                 if record.active_request_ids:
                     continue
@@ -400,43 +419,37 @@ class SessionRegistry:
                         record, f"idle past its {record.timeout_s:.0f}s timeout"
                     )
                     record.teardown_asked = True
-                    expired.append(record.session_id)
-        for session_id in expired:
-            logger.info("Session %s expired; freeing its state", session_id)
-            self._teardown(session_id)
-        for session_id in stalled:
+                    expired.append(record)
+        for record in expired:
+            logger.info("Session %s expired; freeing its state", record.key)
+            self._teardown(record.key)
+        for key in stalled:
             logger.warning(
                 "Session %s has been closing for %.0fs with no teardown under "
-                "way; asking for one now", session_id, self._tombstone_grace_s,
+                "way; asking for one now", key, self._tombstone_grace_s,
             )
-            self._teardown(session_id)
-        for session_id in abandoned:
+            self._teardown(key)
+        for key in abandoned:
             logger.error(
                 "Session %s was never confirmed torn down within %.0fs; "
                 "releasing its id. A worker may still hold its state.",
-                session_id, self._tombstone_grace_s,
+                key, self._tombstone_grace_s,
             )
-            self.torn_down(session_id)
-        return expired
+            self.torn_down(key)
+        return [record.session_id for record in expired]
 
-    def torn_down(self, session_id: str) -> None:
-        """The conductor confirmed the state is gone; lift the tombstone."""
+    def torn_down(self, key: str) -> None:
+        """The conductor confirmed the state under ``key`` is gone; lift the
+        tombstone. A key that is not a live record's (a late ACK for an earlier
+        session under the same client id) changes nothing."""
         with self._lock:
-            record = self._sessions.get(session_id)
-            if record is None:
+            session_id = self._by_key.pop(key, None)
+            if session_id is None:
                 return
-            if not record.closing:
-                # a late ACK for an earlier session under the same id (a
-                # forced finalize of an old barrier); this one is live
-                logger.warning(
-                    "Ignoring teardown confirmation for live session %s",
-                    session_id,
-                )
-                return
-            del self._sessions[session_id]
+            record = self._sessions.pop(session_id)
             for request_id in record.active_request_ids:
                 self._request_to_session.pop(request_id, None)
-        logger.info("Session %s released", session_id)
+        logger.info("Session %s released", key)
 
     def _mark_closing_locked(self, record: SessionRecord, reason: str) -> None:
         if not record.closing:
@@ -494,5 +507,6 @@ class SessionRegistry:
         """Forget every session, for a deployment that is going down."""
         with self._lock:
             self._sessions.clear()
+            self._by_key.clear()
             self._request_to_session.clear()
         logger.info("Dropped all session state: %s", reason)

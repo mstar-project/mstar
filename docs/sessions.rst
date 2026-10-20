@@ -86,6 +86,12 @@ the request's initial forward-pass args, and rides on every
 what the server validated, and it arrives as a property of the request rather
 than among the client's ``model_kwargs``.
 
+Its ``session_id`` is not the client's id but an opaque key the API server mints
+per session (``<client id>.<suffix>``), and every layer below the API server
+keys the session by it. A client that reuses an id after its session is torn
+down gets a new key, so a teardown still pending for the old session cannot
+free the new one's state. Treat it as a label; do not parse it.
+
 A model that instead reads a session id out of ``model_kwargs`` (cosmos3 does
 today, with a session store of its own) is not going through any of this: no
 registry, no TTL, no teardown barrier. Porting such a model means reading the

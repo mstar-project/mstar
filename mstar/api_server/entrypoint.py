@@ -39,11 +39,6 @@ from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
-from mstar.utils.ipc_format import (
-    ConductorMessage,
-    ConductorMessageType,
-    TeardownSession,
-)
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
@@ -358,9 +353,6 @@ class APIServer:
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
-        # Teardowns are sent from both the result-drain thread and the HTTP
-        # thread, and a ZMQ socket is single-threaded by contract.
-        self._send_lock = threading.Lock()
 
         # Session tracking. The registry decides what a request may name and
         # when a session is collected; the conductor carries it out.
@@ -382,17 +374,15 @@ class APIServer:
             target=self._process_messages, daemon=True
         )
 
-    def _request_session_teardown(self, session_id: str) -> None:
-        """Ask the conductor to free a session's state. The registry holds the
-        tombstone until ``session_torn_down`` comes back."""
-        with self._send_lock:
-            self.communicator.send(
-                "conductor",
-                ConductorMessage(
-                    message_type=ConductorMessageType.TEARDOWN_SESSION,
-                    body=TeardownSession(session_id=session_id),
-                ),
-            )
+    def _request_session_teardown(self, key: str) -> None:
+        """Ask the conductor to free the state under a session's internal key.
+        The registry holds the tombstone until ``session_torn_down`` comes back.
+
+        Routed through the preprocess worker's request queue so it reaches the
+        conductor behind the session's requests still being preprocessed;
+        sent directly it could overtake one, and the conductor would reopen
+        the session after confirming it gone."""
+        self.preprocess_worker.session_teardown(key)
 
     def _init_request_state(self) -> None:
         """Set the in-memory request bookkeeping. It must stay free of
@@ -598,7 +588,8 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
-            session_id=session.session_id if session else None,
+            # the internal key, not the client's id; see SessionRegistry
+            session_id=session.key if session else None,
             resumed=bool(session and session.resumed),
             end_session=bool(session and session.end_session),
         ))

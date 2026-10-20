@@ -35,9 +35,17 @@ def _registry(**kwargs):
         **kwargs,
     )
     clock = _Clock()
+    # teardown is asked by internal key; record the client id it belongs to
     torn_down: list[str] = []
-    reg = SessionRegistry(config, teardown=torn_down.append, clock=clock)
+    reg = SessionRegistry(
+        config, teardown=lambda key: torn_down.append(key.split(".")[0]),
+        clock=clock,
+    )
     return reg, clock, torn_down
+
+
+def _key(reg, session_id):
+    return reg._sessions[session_id].key
 
 
 def _start(reg, request_id="r0", session_id=None, **kwargs):
@@ -354,7 +362,7 @@ def test_the_id_is_usable_again_only_after_the_conductor_acks():
     with pytest.raises(SessionError):
         _start(reg, request_id="r1", session_id="s")
 
-    reg.torn_down("s")
+    reg.torn_down(_key(reg, "s"))
 
     assert _start(reg, request_id="r2", session_id="s").session_id == "s"
     assert len(reg.snapshot()) == 1
@@ -362,17 +370,39 @@ def test_the_id_is_usable_again_only_after_the_conductor_acks():
 
 def test_a_late_ack_does_not_release_a_live_session_that_reused_the_id():
     reg, _, _ = _registry()
-    _start(reg, request_id="r0", session_id="s")
+    first = _start(reg, request_id="r0", session_id="s")
     reg.finish_request("r0")
     reg.delete("s")
-    reg.torn_down("s")
+    reg.torn_down(first.key)
     _start(reg, request_id="r1", session_id="s")
 
     # the first session's teardown confirmed a second time
-    reg.torn_down("s")
+    reg.torn_down(first.key)
 
     assert [e["session_id"] for e in reg.snapshot()] == ["s"]
     assert reg.session_of("r1") == "s"
+
+
+def test_a_reused_id_goes_downstream_under_a_new_key():
+    # a teardown still held for the first session names its key, so it cannot
+    # free the second session's state on a worker
+    reg, clock, _ = _registry()
+    first = _start(reg, request_id="r0", session_id="s")
+    reg.finish_request("r0")
+    reg.delete("s")
+    clock.advance(reg._tombstone_grace_s + 1)
+    reg.sweep()  # never ACKed: the id is released anyway
+    second = _start(reg, request_id="r1", session_id="s")
+
+    assert first.key != second.key
+
+    # the stale ACK leaves the new session live; its own ACK releases it
+    reg.torn_down(first.key)
+    assert reg.describe("s")["closing"] is False
+    reg.finish_request("r1")
+    reg.delete("s")
+    reg.torn_down(second.key)
+    assert reg.snapshot() == []
 
 
 def test_a_failed_request_takes_its_session_down():

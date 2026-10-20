@@ -47,6 +47,7 @@ class RequestSession:
     the session from the request rather than from the client's knobs.
     """
 
+    # An opaque per-session key minted by the API server, not the client's id.
     session_id: str
     # Continuing a session that already holds state, rather than opening one.
     resumed: bool = False

@@ -11,7 +11,6 @@ Import it by module name (``from api_server_helpers import ...``): on CI the
 stdlib ``test`` package shadows the repo's ``test/`` directory.
 """
 import tempfile
-import threading
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
@@ -36,7 +35,6 @@ def make_test_api_server(**overrides) -> APIServer:
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None
-    server._send_lock = threading.Lock()
     server.sessions = SessionRegistry(None, teardown=lambda _sid: None)
     server._next_session_sweep = 0.0
     server._session_sweep_interval_s = 1.0
