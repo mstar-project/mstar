@@ -426,12 +426,10 @@ class Conductor:
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing.
-        mps = self.model_config.get("mps", False)
-        if not isinstance(mps, bool):
-            raise ValueError(f"{model_config_file}: mps must be true or false, got {mps!r}")
-        if mps and self.device_type != "cuda":
-            raise ValueError(f"{model_config_file}: mps: true needs CUDA, not {self.device_type}")
-        self._mps = MpsDaemon() if mps else None
+        self._mps_requested = self.model_config.get("mps", False)
+        if not isinstance(self._mps_requested, bool):
+            raise ValueError(f"{model_config_file}: mps must be true or false, got {self._mps_requested!r}")
+        self._mps: MpsDaemon | None = None
         model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
@@ -649,7 +647,10 @@ class Conductor:
         keep_bootstrap_sockets_on_loopback()
         ctx = mp.get_context("spawn")
         atexit.register(self.shutdown)
-        if self._mps is not None:
+        if self._mps_requested:
+            if self.device_type != "cuda":
+                raise ValueError(f"mps: true needs CUDA, not {self.device_type}")
+            self._mps = MpsDaemon()
             self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
