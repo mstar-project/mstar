@@ -75,6 +75,22 @@ def gpu_list(text: str) -> list[int]:
     return gpus
 
 
+def tree_list(items: list[str]) -> dict[str, Path]:
+    """--tree NAME=PATH options as {name: resolved path}."""
+    trees = {}
+    for item in items:
+        name, sep, path = item.partition("=")
+        if not (name and sep and path) or not Path(path).is_dir():
+            raise ValueError(f"bad --tree {item!r}: NAME=PATH of an mstar checkout")
+        trees[name] = Path(path).resolve()
+    return trees
+
+
+def arm_worktree(arm: catalog.Arm, worktree: Path, trees: dict[str, Path]) -> Path | None:
+    """The mstar tree an arm serves: its named tree or the run's own, None when its named tree wasn't given."""
+    return trees.get(arm.tree) if arm.tree else worktree
+
+
 def port_is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
