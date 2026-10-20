@@ -95,6 +95,9 @@ def collect(run_dir: Path) -> dict:
     meta = _load(run_dir / "sweep.json") or {}
     corr = _load(run_dir / "correctness.json") or {}
     data = {"meta": meta, "health": {}, "arms": {}, "cells": [], "correctness": corr}
+    # Operator notes about the run (e.g. a GPU that runs hot), one per line; resumes and re-renders keep them.
+    notes = run_dir / "notes.txt"
+    data["notes"] = [ln.strip() for ln in notes.read_text().splitlines() if ln.strip()] if notes.is_file() else []
     resumes = sorted((p.stem for p in (run_dir / "health").glob("check_resume*.json")
                       if re.fullmatch(r"check_resume\d+", p.stem)), key=lambda n: int(n[len("check_resume"):]))
     for name in ("check_before", *resumes, "check_after"):
@@ -190,6 +193,7 @@ def render(data: dict) -> str:
               "output length per request."]
     if meta.get("note"):
         lines.append(f"- {meta['note']}")
+    lines += [f"- note: {n}" for n in data.get("notes") or []]
     for r in meta.get("resumed") or []:
         where = f", GPUs {r['gpus']}, lanes {r.get('lanes')}" if r.get("gpus") else ""
         ran = f"; measured {', '.join(r['measured'])}" if r.get("measured") else ""
