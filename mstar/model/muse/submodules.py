@@ -11,10 +11,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    PiecewiseAcceleratorGraphConfig,
-)
+from mstar.engine.accelerator_graph_config import PiecewiseAcceleratorGraphConfig
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import ResourceStep
@@ -34,6 +31,8 @@ from mstar.model.submodule_base import NodeInputs
 class LLMSubmodule(SampledTokenDecoder):
     # either attention resource's plan picks each prefill row's last token
     ATTN_KEY = ATTN_FULL
+    # max-autotune until the default compile level (mstar serve -O) is measured on this model
+    CAPTURE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         # one KV cache, read through a windowed and an unwindowed resource
@@ -42,12 +41,6 @@ class LLMSubmodule(SampledTokenDecoder):
             ATTN_SLIDING: AttentionStep(causal=True),
             ATTN_FULL: AttentionStep(causal=True),
         }
-
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        # eager for now
-        return []
 
 
 class VisionEncoderSubmodule(PackedBlockLoopEncoder):

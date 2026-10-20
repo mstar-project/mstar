@@ -24,6 +24,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.multimodal import PromptPart, messages_from_parts, vision_encoder
 from mstar.model.multimodal_decoder import (
+    MIXED_SPLIT,
     SAMPLING_KEYS,
     MediaIntake,
     MultimodalDecoderModel,
@@ -151,11 +152,14 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 resource_key=ATTN_SLIDING, nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, sliding_window=cfg.sliding_window, sm_scale=cfg.attn_scale,
+                    splits=(MIXED_SPLIT,),
                 ),
             ),
             AttentionSpec(
                 resource_key=ATTN_FULL, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE, sm_scale=cfg.attn_scale),
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, sm_scale=cfg.attn_scale, splits=(MIXED_SPLIT,),
+                ),
             ),
             PositionSpec(
                 resource_key=ROPE, nodes={"LLM"},
@@ -176,14 +180,6 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 ),
             ),
         ]
-
-    # -----------------------------------------------------------------------
-    # Graph
-    # -----------------------------------------------------------------------
-
-    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        # eager for now: no mixed prefill/decode step
-        return {}
 
     # -----------------------------------------------------------------------
     # I/O
