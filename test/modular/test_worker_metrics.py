@@ -328,7 +328,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched = False
     w._in_flight_rids = set()
-    w.parallel_groups = SimpleNamespace(barrier_all=stub)
+    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
     w.wakeup_event = SimpleNamespace(register_future=stub)
