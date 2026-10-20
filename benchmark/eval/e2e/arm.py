@@ -9,7 +9,12 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
   status.json                     phase, arm, case (polled by compare)
   <arm>/s<k>/startup.json         healthy, startup_s, peak VRAM, which checkout the server imported
   <arm>/s<k>/server.log
-  <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log
+  <arm>/s<k>/server-timeout<N>.log  the server of the cases with ``server_timeout_s: N``, started after the others
+  <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log, and
+                                  stacks.txt when the case hung (ran past the model's case_timeout_s)
+  <arm>/s<k>/stress/run<r>.json   ``--stress`` instead of the cases: one record per run (stress.run_session)
+  <arm>/s<k>/<case>/quality.json  perceptual scores of the saved outputs (quality.py), after every server stopped
+  quality.log
   compare.json                    checks.compare_model
   done.json                       written last: done | skipped | error | interrupted
 """
@@ -17,27 +22,32 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from benchmark.eval.e2e import checks
+from benchmark.eval.e2e import checks, stress
 from benchmark.eval.server import ManagedServer, ServerError, is_healthy
 
 CASE_TIMEOUT_S = 3600
+QUALITY_TIMEOUT_S = 1800
 IDLE_MB = 2000
 # Each arm's first server start may compile from cold caches (whichever arm goes first pays the shared compiles,
 # and a head that changed kernels compiles those even second), so it gets this many times startup_timeout_s.
 COLD_START_FACTOR = 2.0
 
 job: dict = {}
+job_path = Path(".")
 out = Path(".")
 stop_reason = ""
 
@@ -66,18 +76,26 @@ def done(state: str, **kw) -> None:
     _publish("done.json", {"status": state, "t": now(), **kw})
 
 
-def gpu_mem_mb() -> int:
+def job_gpus() -> list[int]:
+    """The job's GPUs: every one a multi-GPU model is served on, else the slot's own."""
+    return list(job.get("gpus") or ([job["gpu"]] if job.get("gpu") is not None else []))
+
+
+def gpu_mem_mb() -> list[int]:
+    """Used memory of each of the job's GPUs (all GPUs for a whole-machine slot); [-1] when unreadable."""
     cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
-    if job.get("gpu") is not None:
-        cmd += ["-i", str(job["gpu"])]
+    if job_gpus():
+        cmd += ["-i", ",".join(map(str, job_gpus()))]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        return max(int(x) for x in r.stdout.split())
+        return [int(x) for x in r.stdout.split()] or [-1]
     except (OSError, ValueError, subprocess.SubprocessError):
-        return -1
+        return [-1]
 
 
 class VramSampler(threading.Thread):
+    """Peak of the job's GPU memory, summed over its GPUs."""
+
     def __init__(self):
         super().__init__(daemon=True)
         self.peak = 0
@@ -85,23 +103,160 @@ class VramSampler(threading.Thread):
 
     def run(self):
         while not self.stop_ev.wait(2.0):
-            self.peak = max(self.peak, gpu_mem_mb())
+            self.peak = max(self.peak, sum(m for m in gpu_mem_mb() if m > 0))
 
 
 def wait_gpu_idle(limit_s: float = 180) -> int:
-    t0, mem = time.time(), gpu_mem_mb()
+    """Waits until every GPU of the job is under IDLE_MB (or ``limit_s``); returns the busiest one's MB."""
+    t0, mem = time.time(), max(gpu_mem_mb())
     while mem > IDLE_MB and time.time() - t0 < limit_s:
         time.sleep(5)
-        mem = gpu_mem_mb()
+        mem = max(gpu_mem_mb())
     return mem
 
 
 def base_env() -> dict[str, str]:
     # As if the environment were activated: JIT builds (FlashInfer's ninja, Triton) look for tools on PATH.
     env = {"PYTHONUNBUFFERED": "1", "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
-    if job.get("gpu") is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(job["gpu"])
+    if job_gpus():
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, job_gpus()))
     return env
+
+
+HEALTH_PATTERNS = {   # server log lines that mean a worker crashed or a transfer failed
+    "segfault": re.compile(r"SIGSEGV|Segmentation fault|core dumped|Fatal Python error"),
+    "mooncake read failed": re.compile(r"Mooncake read failed|mooncake.*(read|transfer).*fail", re.I),
+    "transfer timeout": re.compile(r"transfer.*timed? ?out|timed out waiting for (tensor|transfer)", re.I),
+    "worker died": re.compile(r"\bworker\b.{0,80}\bexited with\b|\bworker\S* (died|crashed)", re.I),
+}
+SHM = Path("/dev/shm")
+SHM_SETTLE_S = 10.0
+MIN_AGE_S = 5.0   # a server process younger than this at the case's start may be a short-lived helper
+
+
+def _group_pids(sid: int, min_age_s: float = 0.0) -> set[int]:
+    """Live processes of the server's session (``ManagedServer`` starts it as a session leader); a worker that
+    died and was not reaped yet (a zombie) does not count."""
+    r = subprocess.run(["ps", "-o", "pid=,stat=,etimes=", "-g", str(sid)], capture_output=True, text=True,
+                       check=False)
+    return {int(f[0]) for f in (ln.split() for ln in r.stdout.splitlines()) if len(f) == 3 and f[0].isdigit()
+            and not f[1].startswith("Z") and f[2].isdigit() and int(f[2]) >= min_age_s}
+
+
+def _namespaces(server: ManagedServer) -> set[str]:
+    """This server's deployment token in its tensor file names (``mstar_<token>_<entity>_<uuid>``): the SHA-1 of
+    its conductor's IPC endpoint (``tensors._deployment_namespace``), found under its ``--socket-path-prefix``.
+    Empty when there is no such socket (another layout): its tensor files then go unchecked, never misattributed."""
+    try:
+        cmd = server.command()
+        prefix = Path(cmd[cmd.index("--socket-path-prefix") + 1])
+    except (AttributeError, AssertionError, ValueError, IndexError):
+        return set()
+    return {hashlib.sha1(f"ipc://{os.path.realpath(p)}".encode()).hexdigest()[:12]
+            for p in prefix.rglob("conductor.ipc")}
+
+
+def _shm_owner(name: str) -> int | None:
+    """The pid in mstar's per-process names (``mstar_arena_<entity>_<pid>_<token>``, ``mstar_kv_<uid>_<pid>_<hash>``);
+    None for a tensor file (``mstar_<deployment>_<entity>_<uuid>``), which goes once its request is done."""
+    if not name.startswith(("mstar_arena_", "mstar_kv_")):
+        return None
+    parts = name.split(".", maxsplit=1)[0].rsplit("_", 2)
+    return int(parts[1]) if len(parts) == 3 and parts[1].isdigit() else -1
+
+
+def _alive(pid: int) -> bool:
+    """Running, or a zombie no longer is."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _shm_names() -> set[str]:
+    try:
+        return {p.name for p in SHM.iterdir() if p.name.startswith("mstar_")}
+    except OSError:
+        return set()
+
+
+def _new_shm(before: set[str], ours: set[int], namespaces: set[str]) -> set[str]:
+    """mstar /dev/shm entries made since ``before`` that this server should have given back: its tensor files, and
+    segments of one of its processes that is gone. The host's other servers (other GPU slots) make entries too:
+    theirs carry another deployment token or owner pid, and a live process's segments are its working memory."""
+    out = set()
+    for n in _shm_names() - before:
+        pid = _shm_owner(n)
+        if pid is None:
+            if any(n.startswith(f"mstar_{ns}_") for ns in namespaces):
+                out.add(n)
+        elif pid in ours and not _alive(pid):
+            out.add(n)
+    return out
+
+
+def health_before(server: ManagedServer, log_path: Path) -> dict:
+    """What a worker-to-worker case is checked against afterwards: the server's processes, mstar's /dev/shm
+    entries, and where its log ends."""
+    return {"pids": sorted(_group_pids(server.pid, MIN_AGE_S)), "all_pids": sorted(_group_pids(server.pid)),
+            "shm": sorted(_shm_names()), "ns": sorted(_namespaces(server)),
+            "log_at": log_path.stat().st_size if log_path.exists() else 0}
+
+
+def health_after(before: dict, server: ManagedServer, log_path: Path) -> list[str]:
+    """Findings since ``before``: server processes that exited, /dev/shm entries still there after SHM_SETTLE_S,
+    and crash or transfer-failure lines in the server log."""
+    found = []
+    now = _group_pids(server.pid)
+    gone = set(before["pids"]) - now
+    if gone:
+        found.append(f"{len(gone)} server process(es) exited")
+    ours, ns, t0 = set(before["all_pids"]) | now, set(before["ns"]), time.monotonic()
+    left = _new_shm(set(before["shm"]), ours, ns)
+    while left and time.monotonic() - t0 < SHM_SETTLE_S:
+        time.sleep(1)
+        left &= _new_shm(set(before["shm"]), ours, ns)   # an entry counts only if it stayed the whole wait
+    if left:
+        found.append(f"/dev/shm +{len(left)} entries")
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(before["log_at"])
+            new = f.read().decode("utf-8", "replace")
+    except OSError:
+        new = ""
+    found += [f"log: {name}" for name, pat in HEALTH_PATTERNS.items() if pat.search(new)]
+    return found
+
+
+def dump_stacks(pgid: int, path: Path) -> None:
+    """Every Python thread's stack in the server's process group (``py-spy dump``), for a case that hung; without
+    py-spy, the process list and why there are no stacks. Threads only: a hang at an ``await`` shows an idle event
+    loop. Retries with ``sudo -n`` only when the job asks (``compare --stacks-sudo``): on a shared cluster a refused
+    ``sudo`` is logged, and often mailed to the admins."""
+    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(pgid)], capture_output=True, text=True, check=False)
+    procs = [ln.strip().split(None, 1) for ln in r.stdout.splitlines() if ln.strip()]
+    spy = shutil.which("py-spy", path=base_env()["PATH"])
+    lines = [f"# process group {pgid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
+    if spy and not job.get("stacks_sudo"):
+        lines[0] += " (no sudo retry; compare --stacks-sudo adds one where ptrace is restricted)"
+    for pid, *args in procs:
+        lines.append(f"\n## pid {pid}: {(args or [''])[0][:300]}")
+        if not spy:
+            continue
+        out = ""
+        cmds = [[spy, "dump", "--pid", pid]] + ([["sudo", "-n", spy, "dump", "--pid", pid]]
+                                                 if job.get("stacks_sudo") else [])
+        for cmd in cmds:
+            try:
+                d = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                out = f"{cmd[0]}: {e}"
+                continue
+            out = d.stdout if d.returncode == 0 else (d.stdout + d.stderr).strip()[-500:]
+            if d.returncode == 0:
+                break
+        lines.append(out)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def server_env(arm: dict) -> dict[str, str]:
@@ -171,25 +326,32 @@ def build_rust_server(arm: dict) -> str | None:
     return None
 
 
+RDMA_SYSFS = Path("/sys/class/infiniband")
+
+
 def requirements_problem(arm: dict) -> str:
-    """What the arm's environment lacks of the model's ``requires``: a module to import, or ``module:function`` to
-    call with no arguments (the server's own loader, when it loads a package without importing it)."""
-    mods = job["model"].get("requires", [])
+    """What the arm's environment lacks of the model's ``requires``: a module to import, ``module:function`` to
+    call with no arguments (the server's own loader, when it loads a package without importing it), or
+    ``rdma_nic``: an RDMA device on the host."""
+    mods = [m for m in job["model"].get("requires", []) if m != "rdma_nic"]
+    nic = "" if "rdma_nic" not in job["model"].get("requires", []) or (
+        RDMA_SYSFS.is_dir() and any(RDMA_SYSFS.iterdir())) else "rdma_nic: no RDMA device"
     if not mods:
-        return ""
+        return nic
     code = ("import importlib, sys\nbad = []\nfor m in sys.argv[1:]:\n    mod, _, fn = m.partition(':')\n"
             "    try:\n        x = importlib.import_module(mod)\n        if fn:\n            getattr(x, fn)()\n"
             "    except Exception as e:\n        bad.append(f'{m}: {type(e).__name__}')\nprint('; '.join(bad))")
     r = subprocess.run([job["python"], "-c", code, *mods], env={**os.environ, **server_env(arm)}, cwd=arm["src"],
                        capture_output=True, text=True, timeout=600, check=False)
-    return r.stdout.strip() or (r.stderr.strip()[-300:] if r.returncode else "")
+    bad = r.stdout.strip() or (r.stderr.strip()[-300:] if r.returncode else "")
+    return "; ".join(x for x in (bad, nic) if x)
 
 
 def case_cmds(case: dict, url: str, label: str, d: Path) -> list[list[str]]:
     py, data = job["python"], Path(job["data"])
     if case["driver"] in ("rp", "invariants"):
         return [[py, "-m", "benchmark.eval.e2e.request_path", "--url", url, "--suite", case["kind"],
-                 "--inputs", str(data / "rp"), "--out", str(d / "rp.json")]]
+                 "--inputs", str(data / "rp"), "--out", str(d / "rp.json"), *case["args"]]]
     suite = case["kind"] if case["driver"] == "suite" else "e2e"
     # e2e: one point per call, so warmup counts waves at that point's concurrency. Speech suites: one call for
     # every point, so their judges (Whisper, WavLM) load once, with the largest point's waves as warmup.
@@ -213,6 +375,61 @@ def serve_args(arm: dict) -> list[str]:
     return [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
 
 
+def timeout_server(arm: dict, d: Path, timeout_s: float, scratch: str) -> ManagedServer:
+    """The model's config and transport with a per-request ``--timeout``, which ``mstar serve`` does not take: the
+    API entrypoint directly, with ``mstar serve``'s SHM default (the entrypoint's own default is RDMA)."""
+    model = job["model"]
+    cmd = [job["python"], "-m", "mstar.api_server.entrypoint", "--config", str(Path(arm["src"]) / model["config"]),
+           "--host", "127.0.0.1", "--port", "{port}", "--socket-path-prefix", f"{scratch}/sock/",
+           "--upload-dir", f"{scratch}/uploads/", "--tensor-comm-protocol", "SHM", *serve_args(arm),
+           "--timeout", f"{timeout_s:g}"]
+    return ManagedServer(model["serve"], command=cmd, env=server_env(arm),
+                         log_path=d / f"server-timeout{timeout_s:g}.log", startup_timeout_s=model["startup_timeout_s"],
+                         python=job["python"], cwd=arm["src"])
+
+
+def run_cases(server: ManagedServer, todo: list[dict], arm_name: str, session: int, cases: dict) -> bool:
+    """Each case's client commands against ``server``, results into ``cases``; False once the server hung or died
+    (the remaining cases are skipped)."""
+    model = job["model"]
+    d = out / arm_name / f"s{session}"
+    for case in todo:
+        cd = d / case["id"]
+        cd.mkdir(parents=True, exist_ok=True)
+        status(phase="case", arm=arm_name, session=session, case=case["id"])
+        before = health_before(server, server.log_path) if model.get("health") else None
+        t0, rc, hung = time.monotonic(), 0, False
+        cap = float(model.get("case_timeout_s") or CASE_TIMEOUT_S)
+        with open(cd / "client.log", "w") as f:
+            for cmd in case_cmds(case, server.url, f"{model['name']}-{case['id']}-{arm_name}", cd):
+                left = cap - (time.monotonic() - t0)
+                try:
+                    if left <= 0:
+                        raise subprocess.TimeoutExpired(cmd, cap)
+                    r = subprocess.run(cmd, env=client_env(), cwd=job["evalfw"], stdout=f,
+                                       stderr=subprocess.STDOUT, timeout=left, check=False)
+                    rc = r.returncode or rc
+                except subprocess.TimeoutExpired:
+                    rc, hung = "timeout", True
+                    log(f"{arm_name} s{session}: {case['id']} still running after {cap:.0f} s: saving stacks")
+                    dump_stacks(server.pid, cd / "stacks.txt")
+                    break
+        alive = not hung and is_healthy(server.url, timeout=10)
+        cases[case["id"]] = {"rc": rc, "elapsed_s": round(time.monotonic() - t0, 1), "server_alive_after": alive}
+        if hung:
+            cases[case["id"]].update(hung=True, cap_s=cap)
+        if before is not None:
+            cases[case["id"]]["health"] = health_after(before, server, server.log_path)
+        log(f"{arm_name} s{session}: {case['id']} rc={rc} {cases[case['id']]['elapsed_s']} s alive={alive}")
+        if hung:
+            log(f"{arm_name} s{session}: {case['id']} hung; skipping its remaining cases")
+            return False
+        if not alive:
+            log(f"{arm_name} s{session}: server died during {case['id']}; skipping its remaining cases")
+            return False
+    return True
+
+
 def run_arm(arm_name: str, session: int) -> dict:
     model, arm = job["model"], job["arms"][arm_name]
     d = out / arm_name / f"s{session}"
@@ -229,6 +446,7 @@ def run_arm(arm_name: str, session: int) -> dict:
                            log_path=d / "server.log", startup_timeout_s=timeout,
                            python=job["python"], cwd=arm["src"])
     cases: dict = {}
+    current, scratch = server, []
     try:
         server.start()
         (out / "server.pgid").write_text(str(server.pid))   # compare's last-resort kill reaches it
@@ -240,33 +458,45 @@ def run_arm(arm_name: str, session: int) -> dict:
         imported = os.path.realpath(prov.stdout.strip() or "/nonexistent")
         info["mstar_from_arm_src"] = imported.startswith(os.path.realpath(arm["src"]) + os.sep)
         log(f"{arm_name} s{session}: healthy after {info['startup_s']} s")
-        for case in model["cases"] if info["mstar_from_arm_src"] else []:
-            cd = d / case["id"]
-            cd.mkdir(parents=True, exist_ok=True)
-            status(phase="case", arm=arm_name, session=session, case=case["id"])
-            t0, rc = time.monotonic(), 0
-            with open(cd / "client.log", "w") as f:
-                for cmd in case_cmds(case, server.url, f"{model['name']}-{case['id']}-{arm_name}", cd):
-                    try:
-                        r = subprocess.run(cmd, env=client_env(), cwd=job["evalfw"], stdout=f,
-                                           stderr=subprocess.STDOUT, timeout=CASE_TIMEOUT_S, check=False)
-                        rc = r.returncode or rc
-                    except subprocess.TimeoutExpired:
-                        rc = "timeout"
-            alive = is_healthy(server.url, timeout=10)
-            cases[case["id"]] = {"rc": rc, "elapsed_s": round(time.monotonic() - t0, 1),
-                                 "server_alive_after": alive}
-            log(f"{arm_name} s{session}: {case['id']} rc={rc} {cases[case['id']]['elapsed_s']} s alive={alive}")
-            if not alive:
-                log(f"{arm_name} s{session}: server died during {case['id']}; skipping its remaining cases")
+        if job.get("stress") and info["mstar_from_arm_src"]:
+            status(phase="stress", arm=arm_name, session=session)
+            stress.run_session(server.url, server.pid, arm_name, session, d, job["stress"], status, log, _publish,
+                               stress.server_namespaces(server))
+        mine = model["cases"] if info["mstar_from_arm_src"] and not job.get("stress") else []
+        going = run_cases(server, [c for c in mine if not c.get("server_timeout_s")], arm_name, session, cases)
+        for to in sorted({c["server_timeout_s"] for c in mine if c.get("server_timeout_s")}) if going else []:
+            group = [c for c in mine if c.get("server_timeout_s") == to]
+            with signals_deferred():
+                current.stop()
+            wait_gpu_idle()
+            scratch.append(tempfile.mkdtemp(prefix="mstar-eval-to-"))
+            current = timeout_server(arm, d, to, scratch[-1])
+            status(phase="startup", arm=arm_name, session=session, timeout_s=to)
+            try:
+                current.start()
+                (out / "server.pgid").write_text(str(current.pid))
+                current.wait_ready()
+            except ServerError as e:
+                log(f"{arm_name} s{session}: the --timeout {to:g} server did not start: {e}")
+                for c in group:   # base lacking it reports base broken, head lacking it fails (report._row)
+                    cases[c["id"]] = {"rc": "no server", "elapsed_s": 0.0, "server_alive_after": False,
+                                      "health": [f"--timeout {to:g} server did not start"]}
+                continue
+            if not run_cases(current, group, arm_name, session, cases):
                 break
     except ServerError as e:
         info.update(healthy=False, error=str(e)[-500:])
         log(f"{arm_name} s{session}: did not start: {e}")
+        if job.get("stress"):
+            stress.lost_runs(stress.session_runs(job["stress"], session), arm_name, session, d, ["error"],
+                             "not run: the server did not start", _publish, no_server=True)
     finally:   # also when interrupted; a signal must not cut the process-group sweep short
         with signals_deferred():
+            current.stop()
             server.stop()
             (out / "server.pgid").unlink(missing_ok=True)
+            for x in scratch:
+                shutil.rmtree(x, ignore_errors=True)
             sampler.stop_ev.set()
             info["peak_vram_gb"] = round(sampler.peak / 1024, 1) if sampler.peak > 0 else None
             info["cases"] = cases
@@ -312,6 +542,21 @@ def watch_lease(lease_s: float) -> None:
             return
 
 
+def score_quality() -> None:
+    """The judges in their own process on the job's GPU, with no server running: their load and GPU time stay out
+    of the timed passes, and their memory is freed before ``compare`` starts the next model on this GPU. A judge
+    that fails leaves its scores out (the report says not scored), not the job."""
+    status(phase="quality")
+    with open(out / "quality.log", "w") as f:
+        try:
+            r = subprocess.run([job["python"], "-m", "benchmark.eval.e2e.quality", str(job_path)], env=client_env(),
+                               cwd=job["evalfw"], stdout=f, stderr=subprocess.STDOUT, timeout=QUALITY_TIMEOUT_S,
+                               check=False)
+            log(f"quality judges rc={r.returncode}")
+        except subprocess.TimeoutExpired:
+            log(f"quality judges timed out after {QUALITY_TIMEOUT_S} s")
+
+
 def _broken(problems: dict[str, str | None]) -> dict:
     """``{"broken": arm}`` when exactly one arm failed to build: the report fails a head that cannot build."""
     bad = [a for a, p in problems.items() if p]
@@ -348,15 +593,19 @@ def run() -> None:
             info = run_arm(arm_name, s)
             if info.get("healthy") and not info.get("mstar_from_arm_src"):
                 return done("error", reason=f"the {arm_name} server did not import mstar from its own checkout")
+    if any(c.get("quality") for c in model["cases"]) and not job.get("stress"):   # stress runs no cases
+        score_quality()
     status(phase="compare")
-    checks.compare_model(out, model["cases"], job["sessions"])
+    if not job.get("stress"):
+        checks.compare_model(out, model["cases"], job["sessions"])
     done("done", rust={a: p for a, p in problems.items() if p})
     status(phase="done")
 
 
 def main(argv: list[str] | None = None) -> None:
-    global job, out
-    job = json.loads(Path((argv or sys.argv[1:])[0]).read_text())
+    global job, job_path, out
+    job_path = Path((argv or sys.argv[1:])[0]).resolve()
+    job = json.loads(job_path.read_text())
     out = Path(job["out"])
     out.mkdir(parents=True, exist_ok=True)
     (out / "done.json").unlink(missing_ok=True)

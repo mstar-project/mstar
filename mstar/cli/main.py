@@ -242,6 +242,8 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    if args.enable_metrics:
+        argv += ["--enable-metrics"]
     # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
     # silently staying on uvicorn would be a footgun.
     if args.rust_frontend or args.rust_frontend_bin:
@@ -270,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--api-key", default=None,
         help="require 'Authorization: Bearer <key>' on every route except /health "
-             "(default: MSTAR_API_KEY; unset means no check)",
+             "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
@@ -291,6 +293,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-stats-file", default=None,
         help="append per-request profiling stats to this file (implies --log-stats)",
+    )
+    serve.add_argument(
+        "--enable-metrics", action="store_true",
+        help="serve Prometheus metrics at /metrics (needs mstar[metrics])",
     )
     serve.add_argument(
         "--rust-frontend", action="store_true",
