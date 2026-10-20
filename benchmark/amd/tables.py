@@ -76,9 +76,10 @@ TABLES: dict[str, Table] = {t.name: t for t in [
           ("mstar", "mstar-tpasync", "vllm", "vllm-aiter", "sglang-aiter"), ("text-chat-256", "text-long-1k"),
           note="Qwen3.5 dense, text in and out, greedy, fixed output length"),
     Table("tts", ("kokoro", "orpheus", "qwen3tts_1p7b"),
-          ("mstar", "ref-kokoro", "ref-orpheus-vllm", "vllm-omni", "vllm-omni-tuned", "sglang-omni"), ("tts-seed",),
-          note="TTS: Kokoro and Orpheus against their reference implementations, Qwen3-TTS 1.7B against "
-               "vllm-omni and sglang-omni"),
+          ("mstar", "mstar-colocated", "ref-kokoro", "ref-orpheus-vllm", "vllm-omni", "vllm-omni-tuned",
+           "sglang-omni"), ("tts-seed",),
+          note="TTS: Kokoro and Orpheus against their reference implementations, Qwen3-TTS 1.7B (two mstar "
+               "configs) against vllm-omni and sglang-omni"),
     Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"), ("mstar", "vllm-omni", "vllm-omni-tuned"),
           ("omni-text-speech", "omni-image-speech", "omni-audio-speech"),
           note="Qwen3-Omni, spoken answers to text, image and audio questions"),

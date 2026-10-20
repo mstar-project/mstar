@@ -235,8 +235,8 @@ def test_sglang_omni_launch(tmp_path):
     assert Launch(catalog.ARMS["mstar"], catalog.ROWS["kokoro"], [3], 8405, tmp_path / "ko",
                   worktree=wt).startup_wait == 3600
     t = tables.TABLES["tts"]
-    assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "vllm-omni", "vllm-omni-tuned",
-                                                                     "sglang-omni"]
+    assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "mstar-colocated", "vllm-omni",
+                                                                     "vllm-omni-tuned", "sglang-omni"]
     log = tmp_path / "server.log"
     log.write_text("SGLang runtime configuration: gpu_id=0, sm=94, attention_backend=aiter, "
                    "decode_attention_backend=aiter, prefill_attention_backend=aiter, sampling_backend=pytorch\n")
@@ -259,6 +259,30 @@ def test_gpu_locks(tmp_path, monkeypatch):
     assert not (tmp_path / "gpu2").exists()
 
 
+def test_mstar_arms_serve_their_own_configs(tmp_path):
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    for name in ("qwen3tts_1p7b", "qwen3tts_1p7b_split_bf16", "kokoro"):
+        (wt / "configs" / f"{name}.yaml").write_text(f"model: {name}\n")
+    row = catalog.ROWS["qwen3tts_1p7b"]
+    tts = list(tables.TABLES["tts"].arms)
+    assert [a.name for a in catalog.arms_for(row, tts)][:2] == ["mstar", "mstar-colocated"]
+    assert "mstar-colocated" not in [a.name for a in catalog.arms_for(catalog.ROWS["kokoro"], tts)]
+
+    def served(arm, r=row, gpu=2):
+        cmd = Launch(catalog.ARMS[arm], r, [gpu], 8400, tmp_path / arm / r.name, worktree=wt).command()
+        return Path(cmd[cmd.index("--config") + 1]).name, cmd[cmd.index("serve") + 1]
+
+    assert served("mstar") == ("qwen3tts_1p7b_split_bf16.yaml", "qwen3tts_1p7b_split_bf16")
+    assert served("mstar-colocated") == ("qwen3tts_1p7b.yaml", "qwen3tts_1p7b")
+    assert served("mstar", catalog.ROWS["kokoro"]) == ("kokoro.yaml", "kokoro")
+    assert catalog.mstar_config_name(row, "vllm-omni") == "qwen3tts_1p7b"
+    # A config the tree under test lacks fails the arm at start instead of serving another one.
+    (wt / "configs" / "qwen3tts_1p7b_split_bf16.yaml").unlink()
+    with pytest.raises(FileNotFoundError):
+        served("mstar")
+
+
 def test_table_render(tmp_path):
     run = tmp_path / "run"
     meta = {"table": "qwen35-dense", "run_id": "x", "dry": False, "rows": ["qwen3_5_0.8b"],
@@ -279,6 +303,10 @@ def test_table_render(tmp_path):
         (d / "cells/text-chat-256/c8").mkdir(parents=True)
         (d / "arm.json").write_text(json.dumps({"arm": arm, "row": "qwen3_5_0.8b", "status": "done",
                                                 "startup": {"ready_s": 100.0, "first_request_s": 1.5}}))
+        if arm == "mstar":
+            (d / "server").mkdir()
+            (d / "server" / "versions.json").write_text(json.dumps(
+                {"git": {"branch": "HEAD", "head": "6e6474b62abc"}, "config": "/wt/configs/qwen3_5_0.8b.yaml"}))
         summ = {"tok_s": {"median": tok, "min": tok - 5, "max": tok + 5, "n": 3},
                 "out_tokens_per_req": {"median": out_tok, "min": out_tok, "max": out_tok, "n": 3}}
         # mstar's client-bound comes from the timed-window measure and stays; vllm-aiter's predates it and goes.
@@ -299,6 +327,7 @@ def test_table_render(tmp_path):
     (void / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_0.8b", "status": "done"}))
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
+    assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml |" in md
     assert "| client-bound rerun |" in md and md.count("client-bound") == 1
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1)" in md and "node health check_resume1: PASS" in md
     assert "  - NODE bare_metal: VM/SR-IOV slice (virt=none" in md

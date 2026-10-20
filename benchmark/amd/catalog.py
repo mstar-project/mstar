@@ -18,7 +18,8 @@ REFENV = "/work1/stephaniewang/atindra/amd/results/correctness/data/refenv"
 
 @dataclass(frozen=True)
 class Row:
-    """One model served on ``gpus`` GPUs. ``name`` is also the mstar config name."""
+    """One model served on ``gpus`` GPUs. ``name`` is also the mstar config name, unless ``mstar_configs``
+    names another one for an arm."""
 
     name: str
     family: str  # text, tts, asr, omni, image or video
@@ -38,6 +39,12 @@ class Row:
     # mstar's fused-MoE layer sizes, as config file names start ("E=..,N=..,K=..,topk=.."). The table shows
     # whether each one loaded a tuned table, since a missing one silently runs the default launch config.
     moe_shapes: tuple[str, ...] = ()
+    # Deployment configs (configs/<name>.yaml) of mstar arms that serve this row with another one, by arm name.
+    mstar_configs: dict = field(default_factory=dict)
+
+
+def mstar_config_name(row: Row, arm: str) -> str:
+    return row.mstar_configs.get(arm, row.name)
 
 
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
@@ -48,12 +55,12 @@ def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row
 QWEN3_OMNI_MOE = ("E=128,N=768,K=2048,topk=8", "E=128,N=384,K=1024,topk=6")  # Thinker, Talker
 
 
-def _qwen3tts(name: str, size: str, runner_model: str, sglang_omni_config: str) -> Row:
+def _qwen3tts(name: str, size: str, runner_model: str, sglang_omni_config: str, **kw) -> Row:
     # sglang-omni's pipeline configs are paths relative to its checkout (the arm runs from there).
     tuned = str(VLLM_OMNI_DEPLOY / "qwen3_tts_rocm_tuned.yaml")
     return Row(name, "tts", f"Qwen/Qwen3-TTS-12Hz-{size}-CustomVoice", runner_model,
                engine_args={"sglang-omni": ("--config", f"examples/configs/{sglang_omni_config}"),
-                            "vllm-omni-tuned": ("--deploy-config", tuned)})
+                            "vllm-omni-tuned": ("--deploy-config", tuned)}, **kw)
 
 
 ROWS: dict[str, Row] = {r.name: r for r in [
@@ -66,7 +73,9 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("orpheus", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus", gpus=2),
     Row("orpheus_colocated", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus"),
     _qwen3tts("qwen3tts", "0.6B", "qwen3_tts", "qwen3_tts_0_6b_customvoice.yaml"),
-    _qwen3tts("qwen3tts_1p7b", "1.7B", "qwen3_tts_1p7b", "qwen3_tts_1_7b_customvoice.yaml"),
+    # mstar serves the codec on its own worker in bf16; mstar-colocated keeps the single-worker float32 config.
+    _qwen3tts("qwen3tts_1p7b", "1.7B", "qwen3_tts_1p7b", "qwen3_tts_1_7b_customvoice.yaml",
+              mstar_configs={"mstar": "qwen3tts_1p7b_split_bf16", "mstar-colocated": "qwen3tts_1p7b"}),
     # Qwen3-Omni speaks its answers. vllm-omni's own layout is two GPUs; the one-GPU row places its stages
     # on one device to sit next to mstar's colocated config. mstar's cold start ran past 2400 s on an MI300X
     # slice with an empty MIOpen DB (correctness campaign), hence the longer wait.
@@ -128,12 +137,15 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     # between TP ranks times out; a host network setting, not a tuning knob.
     Arm("mstar", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai",
         env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
-        recipe="configs/<row>.yaml unchanged; MSTAR_SHM_ARENA=1 as .claude/skills/benchmarking asks for numbers"),
+        recipe="the deployment config named in the engine column, unchanged; MSTAR_SHM_ARENA=1 as "
+               ".claude/skills/benchmarking asks for numbers"),
     # TP rows only: the worker's async scheduling for lockstep TP nodes, which defaults to off
     # (MSTAR_TP_ASYNC_SCHED, mstar/worker/worker.py).
     Arm("mstar-tpasync", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_9b_tp2",),
         env={"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
+    Arm("mstar-colocated", "mstar", ("tts",), client="ours_openai", rows=("qwen3tts_1p7b",),
+        env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the single-worker config"),
     Arm("vllm", "vllm", ("text",), client="vllm", image="vllm",
         recipe="image defaults (v0.31.0 picks ROCM_ATTN on gfx942, AITER off)"),
     Arm("vllm-aiter", "vllm", ("text",), client="vllm", image="vllm", env={"VLLM_ROCM_USE_AITER": "1"},
