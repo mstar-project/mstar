@@ -255,7 +255,7 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
 def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
     """mla_fused_prep on: the captured streams equal the eager ones and the unfused path's
     captured ones (q_lora_rank 256, a width the fused norms take)."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS
     streams = {}
     for fused_prep in (False, True):

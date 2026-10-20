@@ -18,7 +18,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.cuda_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -337,7 +337,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._fit_recompile_limit(configs)
         return configs
 
-    def _fit_recompile_limit(self, configs: list[CudaGraphConfig]) -> None:
+    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
         """Raise dynamo's recompile limit to what these captures take: a decoder layer's
         frames hold an entry per captured token count and layer kind (dense, MoE, the last
         one on sampled rows), and the shapes past the limit capture uncompiled."""
