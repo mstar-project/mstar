@@ -10,10 +10,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 _MAIN = "main"
 
 
-class _PackedPrefillConfig(PackedCudaGraphConfig):
+class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
     """Packed prefill capture without the buckets whose capture rows would pass the context
     limit: ``distribute_tokens`` gives row 0 the remainder, and such a capture fails."""
 
@@ -170,8 +170,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _compile_flags(self) -> dict[str, Any]:
         # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (escape hatch
-        # for an Inductor toolchain crash); "default" is the cuBLAS-backed
-        # mode of cuda_graph_runner.resolve_compile_mode, the fastest here.
+        # for an Inductor toolchain crash); "default" is torch.compile's own
+        # mode (cuBLAS GEMMs, no autotuning), the fastest here.
         return {
             "compile": os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             "compile_mode": "default",
@@ -196,9 +196,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return super().to(device=device, non_blocking=non_blocking)
         return self
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         if self.config.dsa_long_context:
             # DSA maintenance is host-side per-request work; a captured
             # decode would skip index upkeep. Eager-only.
@@ -211,7 +211,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         )
         flags = self._compile_flags()
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),

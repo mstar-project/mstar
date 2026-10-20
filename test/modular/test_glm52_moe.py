@@ -339,9 +339,9 @@ def test_cuda_graphs_return_with_fused_dispatch():
     object.__setattr__(sub, "language_model", lm)
 
     lm.blk._use_fused = False
-    assert sub.get_cuda_graph_configs(_torch.device("cpu")) == []
+    assert sub.get_accelerator_graph_configs(_torch.device("cpu")) == []
     lm.blk._use_fused = True
-    assert len(sub.get_cuda_graph_configs(_torch.device("cpu"))) == 2
+    assert len(sub.get_accelerator_graph_configs(_torch.device("cpu"))) == 2
 
 
 def test_autocast_then_restore_keeps_fp8_layout():

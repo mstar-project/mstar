@@ -338,12 +338,12 @@ def test_glm52_no_cuda_graphs_under_reference_dispatch():
     # captured; registering graph configs would fail every capture and then
     # break eager prefill. Reference modes must register none.
     fp8 = _make_submodule(Glm52ModelConfig.reduced_fp8())
-    assert fp8.get_cuda_graph_configs(torch.device("cpu")) == []
+    assert fp8.get_accelerator_graph_configs(torch.device("cpu")) == []
     bf16_tp = _make_submodule(Glm52ModelConfig.reduced())
-    assert bf16_tp.get_cuda_graph_configs(torch.device("cpu"), tp_world_size=8) == []
+    assert bf16_tp.get_accelerator_graph_configs(torch.device("cpu"), tp_world_size=8) == []
     # bf16 TP=1 uses the capture-safe fused kernel on GPU: graphs stay.
     bf16 = _make_submodule(Glm52ModelConfig.reduced())
-    assert len(bf16.get_cuda_graph_configs(torch.device("cpu"))) == 2
+    assert len(bf16.get_accelerator_graph_configs(torch.device("cpu"))) == 2
 
 
 def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
@@ -351,12 +351,12 @@ def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
     # the escape hatch for an Inductor-subprocess Triton crash that fails
     # every capture. Default stays compile-on, in the cuBLAS ("default") mode.
     sub = _make_submodule(Glm52ModelConfig.reduced())
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert all(c.compile for c in configs)
     assert all(c.compile_mode == "default" for c in configs)
     monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
     assert not any(
-        c.compile for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+        c.compile for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
     )
 
 

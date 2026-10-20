@@ -242,8 +242,8 @@ def test_no_cuda_graphs_when_long_context():
     cfg = Glm52ModelConfig.reduced()  # would otherwise register 2 configs
     cfg.dsa_long_context = True
     sub = _make_submodule(cfg)
-    assert sub.get_cuda_graph_configs(torch.device("cpu")) == []
-    assert sub.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32) == {}
+    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
+    assert sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
 
 
 # ---------------------------------------------------------------------------
