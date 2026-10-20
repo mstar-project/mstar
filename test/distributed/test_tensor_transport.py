@@ -230,6 +230,41 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
 
 
 @pytest.mark.parametrize("protocol", _PROTOCOLS)
+def test_a_repeat_register_keeps_a_partial_fanin(make_manager, protocol):
+    """A worker serving two partitions of a request registers it once per
+    NewRequest. The second must not drop a shard already buffered, or the
+    edge waits for it forever."""
+    sender0 = make_manager("w0", protocol)
+    sender1 = make_manager("w1", protocol)
+    receiver = make_manager("w2", protocol)
+    a_grp = ShardingGroup(nodes={"A"}, tp_size=2, graph_walks={"decode"})
+    a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a_grp], shard_dim={"x": 0})
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
+        NodeAndGraphWalk("B", "decode"): ["w2"],
+    })
+    for m in (sender0, sender1, receiver):
+        m.register_request("req1", cfg)
+
+    shard0 = torch.randn(3, 4)
+    shard1 = torch.randn(3, 4)
+    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2, fanin=2, shard_dim=0)
+    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2, fanin=2, shard_dim=0)
+    _drain_reads(receiver, "req1", [deepcopy(edge0)], graph_walk="decode")
+    assert receiver.get_ready_tensors(graph_walk="decode").get("req1", []) == []
+
+    # the second partition's NewRequest
+    receiver.register_request("req1", cfg)
+
+    _drain_reads(receiver, "req1", [deepcopy(edge1)], graph_walk="decode")
+    ready = receiver.get_ready_tensors(graph_walk="decode")
+    assert "req1" in ready and len(ready["req1"]) == 1
+    out_uuid = ready["req1"][0].tensor_info[0].uuid
+    assert torch.equal(receiver.get_tensor(out_uuid), torch.cat([shard0, shard1], dim=0))
+
+
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
 def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
     """TP=4 -> TP=2 gather: each receiver consolidates 2 source shards.
 
