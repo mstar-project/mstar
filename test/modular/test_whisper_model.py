@@ -554,7 +554,7 @@ def test_graph_walks_and_resources():
     # one more for the sink page, so the last of MAX_CONCURRENT_REQUESTS fits
     assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
     cap = model.MAX_CONCURRENT_REQUESTS
-    assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap + 2 * cap  # + the capture padding rows
+    assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap  # padding rows of a capture hold no pages
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32
 

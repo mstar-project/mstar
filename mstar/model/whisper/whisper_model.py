@@ -170,19 +170,11 @@ class WhisperModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    # The decode captures pad a batch up to its bucket, and each padding row
-    # holds a self-attention page from first use: fewer rows than are live per
-    # bucket, in each of the two plan slots.
-    CAPTURE_PADDING_PAGES_PER_REQUEST = 2
-
-    def _cache_pages(self, resource_key: str, tokens: int, page_size: int, requests: int) -> int:
+    @staticmethod
+    def _cache_pages(tokens: int, page_size: int, requests: int) -> int:
         """Pages for ``requests`` sequences of ``tokens`` each, plus the sink
-        page every KV cache keeps out of circulation, plus the capture padding
-        rows' pages in the self-attention cache."""
-        pages = 1 + requests * -(-tokens // page_size)
-        if resource_key == KV_CACHE:
-            pages += self.CAPTURE_PADDING_PAGES_PER_REQUEST * requests
-        return pages
+        page every KV cache keeps out of circulation."""
+        return 1 + requests * -(-tokens // page_size)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Decoder self-attention KV + a separate encoder-context KV.
@@ -203,7 +195,7 @@ class WhisperModel(Model):
             num_qo_heads=self.config.decoder_attention_heads,
             page_size=page_size,
             max_num_pages=self._cache_pages(
-                KV_CACHE, self.config.max_target_positions, page_size, requests,
+                self.config.max_target_positions, page_size, requests,
             ),
         )
         # The fixed 30 s window is max_source_positions (1500) tokens = 12
@@ -217,7 +209,7 @@ class WhisperModel(Model):
             num_qo_heads=self.config.decoder_attention_heads,
             page_size=page_size,
             max_num_pages=self._cache_pages(
-                CROSS_KV_CACHE, self.config.max_source_positions, page_size, requests,
+                self.config.max_source_positions, page_size, requests,
             ),
         )
         nodes = {DECODER_NODE}
@@ -298,12 +290,12 @@ class WhisperModel(Model):
             override = overrides.get(spec.resource_key) or {}
             page_size = int(override.get("page_size", kv.page_size))
             max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-            need = self._cache_pages(spec.resource_key, kv.max_seq_len, page_size, cap)
+            need = self._cache_pages(kv.max_seq_len, page_size, cap)
             if need > max_num_pages:
                 raise ValueError(
                     f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
                     f"need {need} pages of resources.{spec.resource_key} "
-                    f"({(need - 1) // cap} per request and the sink page), "
+                    f"({-(-kv.max_seq_len // page_size)} per request and the sink page), "
                     f"which has {max_num_pages}; raise max_num_pages or lower "
                     "max_concurrent_requests"
                 )

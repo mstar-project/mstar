@@ -161,13 +161,12 @@ def test_default_caches_hold_the_request_cap():
     model = _make_model()
     specs = _kv_specs(model)
     cap = WhisperModel.MAX_CONCURRENT_REQUESTS
-    # 1500 encoder tokens and 448 decoder tokens in 128-token pages, plus the sink,
-    # plus the decode captures' padding rows in the self-attention cache
+    # 1500 encoder tokens and 448 decoder tokens in 128-token pages, plus the sink
     assert specs[CROSS_KV_CACHE].config.max_num_pages == 1 + 12 * cap
-    assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap + 2 * cap
+    assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap
 
 
-@pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2"])
+@pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2", "whisper_large_v3_turbo"])
 def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
     path = CONFIGS / f"{name}.yaml"
     cfg = yaml.safe_load(path.read_text())
