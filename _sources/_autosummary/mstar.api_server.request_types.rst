@@ -18,6 +18,7 @@ mstar.api\_server.request\_types
    .. autosummary::
    
       APIServerMessage
+      ConductorStatus
       DataWorkerProfile
       PreprocessInput
       RequestComplete

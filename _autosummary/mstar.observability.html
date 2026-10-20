@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.observability.metrics" href="mstar.observability.metrics.html" />
+    <link rel="next" title="mstar.observability.catalog" href="mstar.observability.catalog.html" />
     <link rel="prev" title="mstar.model.z_image.components" href="mstar.model.z_image.components.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -373,7 +373,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.observability</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.observability.catalog.html">mstar.observability.catalog</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.observability.recorders.html">mstar.observability.recorders</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -636,8 +638,14 @@
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.observability.metrics.html#module-mstar.observability.metrics" title="mstar.observability.metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">metrics</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.observability.catalog.html#module-mstar.observability.catalog" title="mstar.observability.catalog"><code class="xref py py-obj docutils literal notranslate"><span class="pre">catalog</span></code></a></p></td>
+<td><p>Metric families whose values come from a process other than the API server.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.observability.metrics.html#module-mstar.observability.metrics" title="mstar.observability.metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">metrics</span></code></a></p></td>
 <td><p>Prometheus metrics for the API server: <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> and <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.observability.recorders.html#module-mstar.observability.recorders" title="mstar.observability.recorders"><code class="xref py py-obj docutils literal notranslate"><span class="pre">recorders</span></code></a></p></td>
+<td><p>Dependency-free accumulators for the families in <a class="reference internal" href="mstar.observability.catalog.html#module-mstar.observability.catalog" title="mstar.observability.catalog"><code class="xref py py-mod docutils literal notranslate"><span class="pre">catalog</span></code></a>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -665,11 +673,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="mstar.observability.metrics.html"
+       href="mstar.observability.catalog.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.observability.metrics</p>
+        <p class="prev-next-title">mstar.observability.catalog</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

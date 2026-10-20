@@ -50,8 +50,8 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.streaming" href="mstar.streaming.html" />
-    <link rel="prev" title="mstar.observability" href="mstar.observability.html" />
+    <link rel="next" title="mstar.observability.recorders" href="mstar.observability.recorders.html" />
+    <link rel="prev" title="mstar.observability.catalog" href="mstar.observability.catalog.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -377,7 +377,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.observability.html">mstar.observability</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="mstar.observability.catalog.html">mstar.observability.catalog</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.observability.recorders.html">mstar.observability.recorders</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -636,6 +638,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.RefusalMiddleware"><code class="docutils literal notranslate"><span class="pre">RefusalMiddleware</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.conductor_status"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.conductor_status()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>
@@ -668,8 +671,10 @@ carries the deployment’s <code class="docutils literal notranslate"><span clas
 a fixed set.</p>
 <p>Only the API server process imports <code class="docutils literal notranslate"><span class="pre">prometheus_client</span></code> and renders
 <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>. Other processes (data worker, conductor, workers) send plain
-numbers on messages they already send the API server, which records them
-here; no multiprocess directory, which would only aggregate one host.</p>
+numbers on messages they already send the API server, plus the conductor’s
+periodic status message, and the API server records them here; no
+multiprocess directory, which would only aggregate one host. Families whose
+values come from another process are defined in <a class="reference internal" href="mstar.observability.catalog.html#module-mstar.observability.catalog" title="mstar.observability.catalog"><code class="xref py py-mod docutils literal notranslate"><span class="pre">catalog</span></code></a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prometheus_client</span></code> is optional (<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar[metrics]'</span></code>) and only
 needed when metrics are on.</p>
 <p class="rubric">Module Attributes</p>
@@ -763,6 +768,20 @@ WebSocket handshakes are not counted. With metrics off it only checks
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.observability.metrics.ServingMetrics.conductor_status">
+<span class="sig-name descname"><span class="pre">conductor_status</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">status</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#ServingMetrics.conductor_status"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.ServingMetrics.conductor_status" title="Link to this definition">#</a></dt>
+<dd><p>Export the conductor’s latest status message.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>status</strong> (<a class="reference internal" href="mstar.api_server.request_types.html#mstar.api_server.request_types.ConductorStatus" title="mstar.api_server.request_types.ConductorStatus"><em>ConductorStatus</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.observability.metrics.ServingMetrics.record">
 <span class="sig-name descname"><span class="pre">record</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outcome</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#ServingMetrics.record"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.ServingMetrics.record" title="Link to this definition">#</a></dt>
@@ -881,20 +900,20 @@ before a method-only one.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.observability.html"
+       href="mstar.observability.catalog.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.observability</p>
+        <p class="prev-next-title">mstar.observability.catalog</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.streaming.html"
+       href="mstar.observability.recorders.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.streaming</p>
+        <p class="prev-next-title">mstar.observability.recorders</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -919,6 +938,7 @@ before a method-only one.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.RefusalMiddleware"><code class="docutils literal notranslate"><span class="pre">RefusalMiddleware</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.conductor_status"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.conductor_status()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>

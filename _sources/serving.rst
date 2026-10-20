@@ -545,6 +545,26 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
   ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
   ``/metrics`` request, so the API server exports them under the same name.
+- ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from the conductor taking the request in to admitting it for
+  dispatch. Zero unless the request queued at ``max_concurrent_requests``.
+
+While metrics are on, the conductor sends the API server a status message every second
+(nothing when they are off). These gauges show its latest one, so they can be up to a
+second old:
+
+- ``mstar_conductor_requests{model_name, state}``: requests the conductor holds.
+  ``state`` is ``waiting`` (queued at ``max_concurrent_requests``, not dispatched yet),
+  ``running`` (dispatched to workers, not finished) or ``draining`` (completed, aborted
+  or failed, and waiting for every reader to release its outputs before the workers free
+  its state; it still counts toward ``max_concurrent_requests``).
+- ``mstar_component_in_flight{model_name, component}``: per graph node (the
+  ``node_names`` of the config's ``node_groups``), running requests with a pass on that
+  node that the conductor dispatched and has not heard back from. The conductor sees
+  whole passes, so a node running a request's decode loop counts it once for the loop.
+- ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server
+  received the last status message, or since metrics were enabled before the first one.
+  More than a few seconds means the conductor stopped reporting.
 
 Where a successful request's time went, from the timestamps every request already
 carries (same ``model_name`` and ``output_modalities`` labels; the conductor's

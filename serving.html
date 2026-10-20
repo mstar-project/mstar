@@ -377,7 +377,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.catalog.html">mstar.observability.catalog</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.recorders.html">mstar.observability.recorders</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1224,6 +1226,26 @@ A request that was submitted and then failed counts once, as an <code class="doc
 <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code>, never here. WebSocket handshakes are not counted. With
 <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> keeps these counts and sends them with each
 <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request, so the API server exports them under the same name.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_queue_seconds{model_name,</span> <span class="pre">output_modalities}</span></code>: histogram over
+successful requests, from the conductor taking the request in to admitting it for
+dispatch. Zero unless the request queued at <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>.</p></li>
+</ul>
+<p>While metrics are on, the conductor sends the API server a status message every second
+(nothing when they are off). These gauges show its latest one, so they can be up to a
+second old:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_conductor_requests{model_name,</span> <span class="pre">state}</span></code>: requests the conductor holds.
+<code class="docutils literal notranslate"><span class="pre">state</span></code> is <code class="docutils literal notranslate"><span class="pre">waiting</span></code> (queued at <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>, not dispatched yet),
+<code class="docutils literal notranslate"><span class="pre">running</span></code> (dispatched to workers, not finished) or <code class="docutils literal notranslate"><span class="pre">draining</span></code> (completed, aborted
+or failed, and waiting for every reader to release its outputs before the workers free
+its state; it still counts toward <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_component_in_flight{model_name,</span> <span class="pre">component}</span></code>: per graph node (the
+<code class="docutils literal notranslate"><span class="pre">node_names</span></code> of the config’s <code class="docutils literal notranslate"><span class="pre">node_groups</span></code>), running requests with a pass on that
+node that the conductor dispatched and has not heard back from. The conductor sees
+whole passes, so a node running a request’s decode loop counts it once for the loop.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds{model_name}</span></code>: seconds since the API server
+received the last status message, or since metrics were enabled before the first one.
+More than a few seconds means the conductor stopped reporting.</p></li>
 </ul>
 <p>Where a successful request’s time went, from the timestamps every request already
 carries (same <code class="docutils literal notranslate"><span class="pre">model_name</span></code> and <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> labels; the conductor’s

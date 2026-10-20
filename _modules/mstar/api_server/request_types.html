@@ -730,7 +730,9 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.observability.catalog.html">mstar.observability.catalog</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.observability.recorders.html">mstar.observability.recorders</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -929,6 +931,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.loop_indices</span><span class="w"> </span><span class="kn">import</span> <span class="n">NestedLoopIndices</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.observability.recorders</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricSnapshot</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.format</span><span class="w"> </span><span class="kn">import</span> <span class="n">InputInfo</span><span class="p">,</span> <span class="n">RxInfo</span><span class="p">,</span> <span class="n">TxInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphTimings</span>
 
@@ -988,7 +991,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">conductor_finish_time</span><span class="p">:</span> <span class="nb">float</span>
     <span class="n">graph_timings</span><span class="p">:</span> <span class="n">GraphTimings</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">rx_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">RxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-    <span class="n">tx_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+    <span class="n">tx_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># When the conductor took the request in (queued or admitted), in the same</span>
+    <span class="c1"># clock as conductor_ingest_time. Only stamped while metrics are on.</span>
+    <span class="n">conductor_arrival_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1007,8 +1013,23 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="c1"># what an ``APIServerMessage`` carries; None for ``setup_done``</span>
-<span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="kc">None</span>
+<div class="viewcode-block" id="ConductorStatus">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ConductorStatus">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ConductorStatus</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The conductor's periodic status, sent only while metrics are on: one</span>
+<span class="sd">    snapshot per family in ``catalog.STATUS_FAMILIES``, current or cumulative</span>
+<span class="sd">    values only, never per-request data."""</span>
+    <span class="n">metrics</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]</span></div>
+
+
+
+<span class="c1"># what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder</span>
+<span class="c1"># tries branches in order and takes the first whose required fields are all</span>
+<span class="c1"># present, so a body must lack a required field of every branch before it.</span>
+<span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="n">ConductorStatus</span> <span class="o">|</span> <span class="kc">None</span>
+<span class="p">)</span>
 
 
 <div class="viewcode-block" id="APIServerMessage">
@@ -1016,7 +1037,8 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">APIServerMessage</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Envelope for messages received by the API server."""</span>
-    <span class="c1"># "result_tensors" | "result_tokens" | "request_complete" | "request_failed" | "setup_done"</span>
+    <span class="c1"># "result_tensors" | "result_tokens" | "request_complete" | "request_failed"</span>
+    <span class="c1"># | "conductor_status" | "setup_done"</span>
     <span class="n">message_type</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">body</span><span class="p">:</span> <span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="kc">None</span></div>
 

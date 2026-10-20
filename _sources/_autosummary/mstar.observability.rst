@@ -27,5 +27,7 @@
    :toctree:
    :recursive:
 
+   catalog
    metrics
+   recorders
 
