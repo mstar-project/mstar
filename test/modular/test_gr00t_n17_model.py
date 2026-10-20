@@ -52,6 +52,15 @@ the ragged config, since causality is a property of the step
 Then the request's two forward-pass hops, where the bucket key's span counts are
 derived from the persisted tensors' own ``dims``; then ``get_submodule``.
 
+Then ``postprocess``, the one thing in this file that carries a value rather than
+a shape. The decode itself is the processor's and is tested in
+``test_gr00t_n17_preprocessing.py``; what belongs here is the three things the
+*model* adds on top of it -- the batch axis the engine's ``(T, D)`` is missing,
+the two request kwargs it has to find in a dict the conductor stripped, and the
+concatenation order that is the client's only handle on which float is which
+joint. It gets a processor built on a four-line synthetic ``statistics``, so this
+file still reads no checkpoint.
+
 Nothing here allocates a parameter. The walks and the specs are checked on a
 config alone, through ``object.__new__`` -- no checkpoint, no processor, no
 network -- and the five submodules are built under ``torch.device("meta")``,
@@ -72,6 +81,7 @@ import glob
 import inspect
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -1400,6 +1410,124 @@ def test_an_unknown_node_is_none_and_is_not_cached():
         assert model.get_submodule(VISION_ENCODER.upper()) is None
         assert model.get_submodule("") is None
     assert model._submodules == {}
+
+
+# ----------------------------------------------------------------------------
+# postprocess
+# ----------------------------------------------------------------------------
+
+# One embodiment, two groups, and only what the decode reads. `arm` is relative
+# with [-1, 1] bounds, so its decoded value is the chunk's own number plus the
+# request's state; `grip` is absolute with q01 == q99 == 5, so it is 5 whatever
+# arrives. That is the pair that makes the concatenation *order* visible in the
+# bytes: one column of the output is constant and the others are not.
+_DECODE_KWARGS = {
+    "shortest_image_edge": 256, "crop_fraction": 0.95,
+    "modality_configs": {
+        "bot": {"video": {"modality_keys": ["cam"]}, "state": {"modality_keys": ["arm", "grip"]},
+                "action": {"delta_indices": [0, 1], "modality_keys": ["arm", "grip"],
+                           "action_configs": [
+                               {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "arm"},
+                               {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "grip"}]}},
+    },
+}
+_DECODE_STATS = {
+    "bot": {
+        "state": {"arm": {"q01": [-1.0, -1.0], "q99": [1.0, 1.0]}, "grip": {"q01": [0.0], "q99": [1.0]}},
+        "action": {"arm": {"q01": [0.0, 0.0], "q99": [2.0, 2.0]}, "grip": {"q01": [5.0], "q99": [5.0]}},
+        "relative_action": {"arm": {"min": [-1.0, -1.0], "max": [1.0, 1.0]}},
+    },
+}
+# the chunk the decoder would emit: (1, T=2, 3), padded to the config's width
+_CHUNK = torch.tensor([[[1.0, -1.0, 0.0, 0.0], [-1.0, 1.0, 0.0, 0.0]]])
+_RAW_STATE = {"arm": np.array([[[10.0, 20.0]]], np.float32)}
+# arm = state + chunk, grip = 5, in `modality_keys` order
+_DECODED = [[11.0, 19.0, 5.0], [9.0, 21.0, 5.0]]
+
+
+def _decoding_model() -> Gr00tN17Model:
+    """``_model()`` with a processor that can actually decode. The statistics are
+    synthetic, so this still reads nothing off disk; the point is that
+    ``postprocess`` is tested against the real ``unapply`` rather than a stub that
+    would agree with whatever order the model concatenated in."""
+    model = _model()
+    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6)
+    return model
+
+
+def test_postprocess_hands_back_the_groups_in_modality_keys_order_as_flat_float32():
+    """The client gets bytes, so the order *is* the API: it chose the embodiment
+    tag, and the group names and widths follow from the tag, but nothing in the
+    payload says which float is which joint. Concatenating in any other order --
+    the ``dict`` the decode happened to build, say -- still returns the right
+    number of plausible floats and would drive the wrong actuator.
+
+    float32, not the decode's float64: the groups come back float64 because the
+    statistics are, and the wire format is the same flat float32 pi05 promises.
+    Returning float64 would double the payload and silently halve the count a
+    client reading it as float32 sees.
+    """
+    raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": _RAW_STATE})
+    assert isinstance(raw, bytes) and len(raw) == 2 * 3 * 4
+    assert np.frombuffer(raw, np.float32).reshape(2, 3).tolist() == _DECODED
+    # the constant column is `grip`'s, which is last: grip-first would put it at 0
+    assert np.frombuffer(raw, np.float32).reshape(2, 3)[:, 2].tolist() == [5.0, 5.0]
+
+
+def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
+    """The worker hands one request's output back as ``(T, D)`` -- the batch axis
+    is gone by the time a single request's tensor is read out -- while ``unapply``
+    takes ``(B, T, D)`` and refuses anything else, because the batch axis is what
+    a relative group's per-request reference frame is matched against. If this
+    model did not add the axis, every single-request decode would raise.
+    """
+    model = _decoding_model()
+    kwargs = {"embodiment_tag": "bot", "state": _RAW_STATE}
+    assert model.postprocess(_CHUNK[0], "action", kwargs) == model.postprocess(_CHUNK, "action", kwargs)
+
+
+def test_postprocess_finds_the_tag_and_the_state_in_the_kwargs_the_data_worker_kept():
+    """Why ``embodiment_tag`` and ``state`` are in ``PREPROCESS_ONLY_KWARGS``.
+    GR00T decodes server-side ([[D06]]), so the inverse needs the checkpoint's
+    statistics *and* the request's own raw state at the very end of the request --
+    long after ``process_prompt`` turned them into tensors. The conductor's copy of
+    the kwargs is stripped of the preprocess-only ones; the data worker's is not
+    (``data_worker.py:586``), and that is the copy handed here.
+
+    The state is checked by moving it: the decode is relative, so a shifted
+    reference state has to shift every action by the same amount. A ``postprocess``
+    that dropped the state on the floor would pass the order test above and return
+    the relative chunk as if it were absolute.
+    """
+    assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
+    moved = {"arm": _RAW_STATE["arm"] + 100.0}
+    raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": moved})
+    assert np.frombuffer(raw, np.float32).reshape(2, 3).tolist() == [[111.0, 119.0, 5.0], [109.0, 121.0, 5.0]]
+
+
+@pytest.mark.parametrize("kwargs", [None, {}, {"state": _RAW_STATE}, {"embodiment_tag": None}])
+def test_postprocess_without_the_requests_embodiment_tag_is_refused(kwargs):
+    """The tag selects the statistics and the joint groups, so there is no default
+    that is safe: this checkpoint has eight embodiments of different widths and
+    different horizons, and decoding a DROID chunk against a G1's bounds would
+    return a full-looking chunk of wrong numbers. ``None`` is in the list because
+    ``request_kwargs`` is a dict the client fills, so a missing key and an explicit
+    null arrive the same way.
+    """
+    with pytest.raises(ValueError, match="embodiment_tag"):
+        _decoding_model().postprocess(_CHUNK, "action", kwargs)
+
+
+@pytest.mark.parametrize("modality", ["text", "image", "video", ""])
+def test_postprocess_refuses_a_modality_this_model_does_not_emit(modality):
+    """``output_modalities`` is the request's, and a GR00T request that asked for
+    text would reach here with a 132-wide action chunk: decoding it is meaningless
+    and *detokenizing* it would be worse. The check is first, before the tag is
+    even read, because the wrong modality is a wrong request and not a missing
+    argument.
+    """
+    with pytest.raises(ValueError, match="emits actions"):
+        _decoding_model().postprocess(_CHUNK, modality, {"embodiment_tag": "bot", "state": _RAW_STATE})
 
 
 # ----------------------------------------------------------------------------
