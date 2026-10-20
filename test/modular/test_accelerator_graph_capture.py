@@ -24,10 +24,12 @@ from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType, PiecewisePackedConfig
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
+    PiecewiseAcceleratorGraphRunner,
+    PiecewiseGraphData,
     capture_into_graph,
     fail_if_graphs_required,
 )
@@ -455,3 +457,23 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
+    """A region planning several ragged layouts gets each label's spans with
+    the padding rows' zero-length spans, as ``seq_lens`` has them."""
+    declared = []
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label, runner._current_slot = "region", 0
+    runner._config = PiecewisePackedConfig(
+        capture_fn=lambda call: {}, make_static_inputs=lambda shape: {}, total_tokens=[8],
+        declare_step=lambda rids, seq_lens, label_seq_lens=None: declared.append((seq_lens, label_seq_lens)),
+    )
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
+    runner._resolve = lambda bs, total_tokens: PiecewiseGraphData(
+        graph=SimpleNamespace(replay=lambda: None), static_inputs={}, static_outputs={},
+        dummy_rids=[100, 101], shape=SimpleNamespace(bs=2), bucket=None,
+    )
+    runner.run(static_inputs={}, request_ids=[7], seq_lens=[3, 2], real_bs=1,
+               label_seq_lens={"window": [1, 2, 2], "full": [5]})
+    assert declared == [([3, 2, 0], {"window": [1, 2, 2, 0], "full": [5, 0]})]
