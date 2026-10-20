@@ -9,7 +9,8 @@ stand-in or one of M\\*'s ragged resources (C07 supplies the second).
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +18,20 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
-from mstar.model.gr00t_n17.config import Gr00tN17Config
+from mstar.model.components.diffusion.attention import joint_attention
+from mstar.model.gr00t_n17.config import (
+    SA_SPAN,
+    VL_IMAGE_SPAN,
+    VL_TEXT_SPAN,
+    Gr00tN17Config,
+)
+
+# What a block attends with when no ragged resource is bound: SDPA over the
+# same `[B, S, H, D]` layout, which is the parity backend the DiT scaffold
+# sanctions (`diffusion-scaffold/SKILL.md:47`). Module-level, so its identity
+# is stable -- a compiled region guards on the identity of the callables it is
+# handed, and a fresh one per step retraces that frame every step.
+_SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 
 # Every LayerNorm in the DT is non-affine, and the checkpoint says so: `norm1`
 # carries only its `linear`, and `norm3` carries no tensor at all.
@@ -115,7 +129,6 @@ class BasicTransformerBlock(nn.Module):
         num_heads: int,
         head_dim: int,
         cross_attention_dim: int | None = None,
-        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -126,16 +139,16 @@ class BasicTransformerBlock(nn.Module):
         self.attn1 = _BlockAttention(dim, kv_dim, inner, num_heads, head_dim)
         self.norm3 = nn.LayerNorm(dim, _NORM_EPS, elementwise_affine=False)
         self.ff = FeedForward(dim, activation_fn="gelu-approximate", final_dropout=True)
-        self.attend = attend
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None,
+        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
         attended = self.attn1(
-            self.norm1(hidden_states, temb), encoder_hidden_states, self.attend,
+            self.norm1(hidden_states, temb), encoder_hidden_states, attend,
         )
         hidden_states = attended + hidden_states
         return self.ff(self.norm3(hidden_states)) + hidden_states
@@ -161,13 +174,8 @@ class _BlockAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
-        attend: Callable | None,
+        attend: Callable,
     ) -> torch.Tensor:
-        if attend is None:
-            raise RuntimeError(
-                "a DT block has no attention; the node supplies one when it "
-                "builds the stack"
-            )
         source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         batch, queries, _ = hidden_states.shape
         heads = (batch, -1, self.num_heads, self.head_dim)
@@ -195,10 +203,27 @@ def _attends_encoder(index: int) -> bool:
     this function would catch a mismatch.
 
     Not to be confused with ``attend_text_every_n_blocks``, which chooses
-    *which* rows a cross block reads (text or image, ``dit.py:391``). That is
-    the caller's business and does not reach this far.
+    *which* rows a cross block reads -- that is ``_span_for`` below.
     """
     return index % 2 == 0
+
+
+def _span_for(index: int, attend_text_every_n_blocks: int) -> str:
+    """Which span block ``index`` attends: its own rows, the text rows, or the
+    image rows.
+
+    The odd blocks attend themselves. The cross blocks alternate between the
+    bridge's two spans every ``attend_text_every_n_blocks`` *cross* blocks, so
+    at its one value, 2, the text blocks are 0, 4, 8 ... and the image blocks
+    are 2, 6, 10 ... (``dit.py:380-396``). Block 0 is a text block, which is
+    R7's off-by-one.
+
+    One function decides both which rows a block reads and which attention it
+    reads them with, so the two cannot disagree.
+    """
+    if not _attends_encoder(index):
+        return SA_SPAN
+    return VL_TEXT_SPAN if index % (2 * attend_text_every_n_blocks) == 0 else VL_IMAGE_SPAN
 
 
 class ActionPositionEmbedding(nn.Module):
@@ -237,13 +262,10 @@ class DiT(nn.Module):
     and nothing else moves.
     """
 
-    def __init__(
-        self,
-        config: Gr00tN17Config,
-        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-    ):
+    def __init__(self, config: Gr00tN17Config):
         super().__init__()
         stack = config.dit
+        self.attend_text_every_n_blocks = config.attend_text_every_n_blocks
         dim = stack.inner_dim
         self.timestep_encoder = TimestepEncoder(dim)
         self.transformer_blocks = nn.ModuleList(
@@ -256,7 +278,6 @@ class DiT(nn.Module):
                 # so this field and the checkpoint's 2048-wide `to_k` are the
                 # only two places the width is written down
                 cross_attention_dim=config.backbone_embedding_dim if _attends_encoder(i) else None,
-                attend=attend,
             )
             for i in range(stack.num_layers)
         )
@@ -267,23 +288,37 @@ class DiT(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        vl_text: torch.Tensor,
+        vl_image: torch.Tensor,
         timestep: torch.Tensor,
+        attends: Mapping[str, Callable] | None = None,
     ) -> torch.Tensor:
-        """The DT's ``[B, T, dim]`` rows and the bridge's ``[B, S, 2048]`` to
-        ``[B, T, output_dim]``, conditioned on one ``[B]`` timestep."""
+        """The DT's ``[B, T, dim]`` rows and the bridge's two spans to
+        ``[B, T, output_dim]``, conditioned on one ``[B]`` timestep.
+
+        ``attends`` maps a span label to the attention it is read with, built
+        once per resource binding by whoever owns this stack. A label with no
+        entry falls back to SDPA, which is how the parity backend runs and how
+        a deployment that declares no ragged resource still serves.
+
+        Passing the *same* rows as ``vl_text`` and ``vl_image`` makes every
+        cross block read all of them, which is the reference's plain
+        ``DiT.forward`` -- the unmasked case C06 measured against.
+        """
         temb = self.timestep_encoder(timestep)
         # the reference makes both contiguous here, and it is load-bearing:
         # non-contiguous rows take a different GEMM path and move the output by
         # a whole fp32 floor (1.14e-05, C06 CHK-3 QA). Free when they already
         # are, which is the usual case.
         hidden_states = hidden_states.contiguous()
-        encoder_hidden_states = encoder_hidden_states.contiguous()
+        spans = {VL_TEXT_SPAN: vl_text.contiguous(), VL_IMAGE_SPAN: vl_image.contiguous()}
         for index, block in enumerate(self.transformer_blocks):
+            span = _span_for(index, self.attend_text_every_n_blocks)
             hidden_states = block(
                 hidden_states,
                 temb,
-                encoder_hidden_states if _attends_encoder(index) else None,
+                spans.get(span),
+                _SDPA_ATTEND if attends is None else attends.get(span, _SDPA_ATTEND),
             )
         # `shift` first, where `AdaLayerNorm` takes `scale` first: the same
         # arithmetic from a differently-ordered linear (`dit.py:331`). Both

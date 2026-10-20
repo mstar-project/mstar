@@ -28,25 +28,38 @@ not again here.
 Then the DT block: ``AdaLayerNorm``, which carries one request's denoising timestep into all
 of that request's tokens, and ``BasicTransformerBlock``, which alternates cross-attention
 over the bridge's rows with self-attention over its own. Its attention arrives as a
-caller-supplied callable, so an inline reference can be handed the same one -- which leaves
-no kernel in the comparison that this file did not call itself, and makes every test there
-``torch.equal`` rather than a bar.
+caller-supplied callable, **per call** rather than bound at construction, so an inline
+reference can be handed the same one -- which leaves no kernel in the comparison that this
+file did not call itself, and makes every test there ``torch.equal`` rather than a bar.
 
-The last section is ``DiT`` itself -- the stack of those blocks and the output head on top of
-it -- with ``ActionPositionEmbedding`` and ``_attends_encoder`` beside it. Its tests are the
-details a dump comparison against the reference cannot resolve: that the head chunks
-``shift, scale`` where ``AdaLayerNorm`` chunks ``scale, shift``, that ``norm_out`` normalises
-at 1e-6 where every other norm in the model uses 1e-5, that it is not affine, that the
-position table reaches the action rows and not the state row, that the alternation starts
-with a cross block at every depth, and that ``attend_text_every_n_blocks`` is not the rule
-that decides it. Every value test there runs a **shallow** stack: the real one is 1.12B
-parameters, and only the key-set test builds it, on ``meta``.
+Then ``DiT`` itself -- the stack of those blocks and the output head on top of it -- with
+``ActionPositionEmbedding`` beside it. Its tests are the details a dump comparison against
+the reference cannot resolve: that the head chunks ``shift, scale`` where ``AdaLayerNorm``
+chunks ``scale, shift``, that ``norm_out`` normalises at 1e-6 where every other norm in the
+model uses 1e-5, that it is not affine, and that the position table reaches the action rows
+and not the state row.
+
+The last section is the alternation and the two spans. ``_attends_encoder`` says *whether* a
+block cross-attends -- the parity of the index, and it starts with a cross block at every
+depth. ``_span_for`` says *which* rows a cross block reads, and that is ``AlternateVLDiT``'s
+rule rather than the plain ``DiT``'s (``dit.py:379-396``): odd blocks self-attend, and an even
+block reads the text rows when ``idx % (2 * n) == 0`` and the image rows otherwise. So
+``attend_text_every_n_blocks`` is not the cross/self rule -- ``_attends_encoder`` takes an
+index and could not read the field if it wanted to -- but it *is* the text/image rule, which
+is what ``_span_for`` reads it for. Beside those two: that each block is handed the attention
+registered under its own span, that a span with no entry falls back to ``_SDPA_ATTEND``, and
+that the fallback is one object for the life of the module rather than one per step.
+
+Every value test over the stack runs a **shallow** one: the real stack is 32 blocks of
+1536 x 32 x 48, 1.12B parameters and 4.2 GiB per fp32 copy, so the only places the full 32
+blocks exist are the two key-set tests, on ``meta``, where nothing is allocated.
 """
 
 import glob
 import inspect
 import json
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -57,12 +70,14 @@ from safetensors import safe_open
 from torch import nn
 
 from mstar.model.gr00t_n17.components.dit import (
+    _SDPA_ATTEND,
     ActionPositionEmbedding,
     AdaLayerNorm,
     BasicTransformerBlock,
     DiT,
     TimestepEncoder,
     _attends_encoder,
+    _span_for,
 )
 from mstar.model.gr00t_n17.components.embodiment import (
     MultiEmbodimentActionEncoder,
@@ -70,7 +85,13 @@ from mstar.model.gr00t_n17.components.embodiment import (
     build_action_decoder,
     build_action_encoder,
 )
-from mstar.model.gr00t_n17.config import Gr00tN17Config, Gr00tN17StackConfig
+from mstar.model.gr00t_n17.config import (
+    SA_SPAN,
+    VL_IMAGE_SPAN,
+    VL_TEXT_SPAN,
+    Gr00tN17Config,
+    Gr00tN17StackConfig,
+)
 from mstar.model.gr00t_n17.weight_loader import NODE_PREFIXES
 
 _HUB = Path.home() / ".cache/huggingface/hub"
@@ -1079,13 +1100,13 @@ def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 
 def _block(cross: bool, seed: int = 23) -> BasicTransformerBlock:
-    """One block at either attention setting, filled, with the stand-in bound."""
+    """One block at either attention setting, filled. Nothing is bound here: the attention is
+    a ``forward`` argument, so every call below says which one it is handing this block."""
     block = BasicTransformerBlock(
         _DT_DIM,
         _DT_HEADS,
         _DT_HEAD_DIM,
         cross_attention_dim=_BRIDGE_DIM if cross else None,
-        attend=_sdpa,
     )
     _randomize(block, seed, _BLOCK_SCALE)
     return block
@@ -1107,6 +1128,7 @@ def _block_reference(
     temb: torch.Tensor,
     encoder: torch.Tensor | None,
     deviation: str | None = None,
+    attend=_sdpa,
 ) -> torch.Tensor:
     """AdaLN, attention, ``+ residual``, a plain LayerNorm, the feed-forward, ``+ residual``.
 
@@ -1115,6 +1137,10 @@ def _block_reference(
     the projections, and ``block.ff`` -- diffusers' own ``FeedForward``, whose gating, widths
     and activation are pinned on the same class in ``test_gr00t_n17_bridge.py`` and are not
     this cycle's claim.
+
+    ``attend`` is the attention this reference reads with, defaulting to the stand-in: the
+    module takes one per call now, so the span tests below hand both sides the same one and
+    stay exact.
     """
     # the width comes off the tensor, not from `_DT_DIM`: `DiT`'s own section below builds
     # its blocks at the inner width and hands them to this same reference
@@ -1124,7 +1150,7 @@ def _block_reference(
     if deviation == _WRONG_NORMS_SWAPPED:
         plain = F.layer_norm(hidden, (dim,), eps=_EPS)
     source = plain if encoder is None else encoder
-    out = _sdpa(
+    out = attend(
         block.attn1.to_q(plain).view(heads),
         block.attn1.to_k(source).view(heads),
         block.attn1.to_v(source).view(heads),
@@ -1168,7 +1194,7 @@ def test_the_block_is_the_reference_block(cross, requests, queries):
     hidden = _hidden(requests, queries)
     temb = _temb(requests)
     encoder = _bridge_rows(cross, requests)
-    out = block(hidden, temb, encoder)
+    out = block(hidden, temb, encoder, _sdpa)
 
     assert out.shape == (requests, queries, _DT_DIM)
     assert torch.equal(out, _block_reference(block, hidden, temb, encoder))
@@ -1188,7 +1214,7 @@ def test_a_block_wired_any_other_way_is_a_different_answer(cross, deviation):
     block = _block(cross)
     hidden, temb = _hidden(), _temb()
     encoder = _bridge_rows(cross)
-    out = block(hidden, temb, encoder)
+    out = block(hidden, temb, encoder, _sdpa)
     wrong = _block_reference(block, hidden, temb, encoder, deviation)
 
     assert not torch.equal(out, wrong)
@@ -1218,8 +1244,7 @@ def test_k_and_v_come_from_the_setting_and_q_always_from_the_tokens(cross):
         seen.update(q=q, k=k, v=v)
         return _sdpa(q, k, v)
 
-    block.attend = record
-    block(hidden, temb, encoder)
+    block(hidden, temb, encoder, record)
 
     assert block.attn1.to_q.in_features == _DT_DIM
     assert block.attn1.to_k.in_features == block.attn1.to_v.in_features
@@ -1261,8 +1286,7 @@ def test_the_callable_is_handed_heads_last_and_its_output_is_folded_back_the_sam
         seen.append((tuple(q.shape), tuple(k.shape), tuple(v.shape)))
         return q
 
-    block.attend = shapes
-    out = block(hidden, temb, encoder)
+    out = block(hidden, temb, encoder, shapes)
 
     assert seen == [(
         (_REQUESTS, _QUERIES, _DT_HEADS, _DT_HEAD_DIM),
@@ -1274,21 +1298,38 @@ def test_the_callable_is_handed_heads_last_and_its_output_is_folded_back_the_sam
     assert torch.equal(out, block.ff(F.layer_norm(attended, (_DT_DIM,), eps=_EPS)) + attended)
 
 
-def test_a_block_with_no_attention_says_so_rather_than_attending_its_own_tokens():
-    """The callable is the only seam, so the unbound case has to be an error and not a
-    default: a block that fell back to its own tokens would be a running model with every
-    second block ignoring the language and the images, which no shape and no loss curve
-    reports. The message names who supplies one, because the block is built two layers below
-    the node that does.
+def test_a_block_takes_its_attention_per_call_and_has_nowhere_to_keep_a_stale_one():
+    """The callable is still the only seam, but it moved from the constructor to the call, and
+    the enforcement has to move with it. Both halves are here.
+
+    No default on ``forward``, so a block nobody hands an attention to does not run at all. A
+    block that fell back to its own tokens instead would be a running model with every second
+    block ignoring the language and the images, which no shape and no loss curve reports --
+    the hazard the old ``RuntimeError`` named, now carried by the signature.
+
+    And no ``attend`` on ``__init__``, which is the new half: one attention per block for the
+    life of the stack cannot express the three spans the stack now reads (the odd blocks' own
+    rows, the text rows, the image rows), so a constructor that still accepted one would be a
+    block holding an attention for a span it is not being asked for. The spans are per call
+    because the attention is.
     """
     block = BasicTransformerBlock(_DT_DIM, _DT_HEADS, _DT_HEAD_DIM)
     hidden, temb = _hidden(), _temb()
 
-    with pytest.raises(RuntimeError, match="no attention"):
-        block(hidden, temb)
+    with pytest.raises(TypeError):
+        block(hidden, temb, None)
+    with pytest.raises(TypeError):
+        BasicTransformerBlock(_DT_DIM, _DT_HEADS, _DT_HEAD_DIM, attend=_sdpa)
 
-    block.attend = _sdpa  # and binding one is the whole of what the node has to do
-    assert block(hidden, temb).shape == (_REQUESTS, _QUERIES, _DT_DIM)
+    # handing one in is the whole of what the stack has to do, and it is positional
+    parameters = list(inspect.signature(block.forward).parameters)
+    assert parameters == ["hidden_states", "temb", "encoder_hidden_states", "attend"]
+    assert all(
+        inspect.signature(block.forward).parameters[name].default is inspect.Parameter.empty
+        for name in parameters
+    )
+    assert "attend" not in inspect.signature(BasicTransformerBlock.__init__).parameters
+    assert block(hidden, temb, None, _sdpa).shape == (_REQUESTS, _QUERIES, _DT_DIM)
 
 
 @torch.no_grad()
@@ -1431,16 +1472,24 @@ def _dit_config(depth: int = _DIT_DEPTH) -> Gr00tN17Config:
 
 
 def _dit(depth: int = _DIT_DEPTH, seed: int = 25) -> DiT:
-    """A **shallow** DT with the CPU stand-in bound to every block.
+    """A **shallow** DT, filled.
 
     Shallow is not a convenience. The real stack is 32 blocks of 1536 x 32 x 48 -- 1.12B
     parameters, 4.2 GiB in fp32 -- so nothing in this file builds one off ``meta``; the
     key-set test below is the only place the full stack appears, and it allocates nothing.
     Filled at ``_BLOCK_SCALE`` for the reason the block section gives.
     """
-    dit = DiT(_dit_config(depth), attend=_sdpa)
+    dit = DiT(_dit_config(depth))
     _randomize(dit, seed, _BLOCK_SCALE)
     return dit
+
+
+# Every span read with this file's own stand-in. Handed to each `DiT` forward below, so the
+# module and the reference reach the same callable on the same tensors and the comparison
+# holds no attention backend this file did not call itself -- which is what keeps the parity
+# tests `torch.equal`. The module's own fallback is bit-identical to it, which the span
+# section at the end of the file pins rather than assuming.
+_STAND_INS = dict.fromkeys((SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN), _sdpa)
 
 
 def _dit_rows(
@@ -1492,20 +1541,51 @@ def _head_reference(
     return dit.proj_out_2(normed * (1 + scale[:, None]) + shift[:, None])
 
 
+def _reference_span(index: int, attend_text_every_n_blocks: int) -> str:
+    """Which span block ``index`` reads, written out from ``AlternateVLDiT.forward``
+    (``dit.py:379-396``) -- the variant this checkpoint selects, and the one with two spans.
+
+    The reference carries one set of encoder rows and switches the *mask* over them, so the
+    rule reads off its three branches: ``idx % 2 == 1`` takes the self-attention branch; an
+    even block takes ``non_image_attention_mask`` when ``idx % (2 * n) == 0`` and
+    ``image_attention_mask`` otherwise. ``non_image`` is the text rows, which is the span this
+    port calls ``vl_text``.
+
+    Written out here rather than imported, so neither this reference nor the span tests below
+    borrow their expectation from ``_span_for``, the function they exist to check.
+    """
+    if index % 2 == 1:
+        return SA_SPAN
+    return VL_TEXT_SPAN if index % (2 * attend_text_every_n_blocks) == 0 else VL_IMAGE_SPAN
+
+
 def _dit_reference(
     dit: DiT,
     hidden: torch.Tensor,
-    encoder: torch.Tensor,
+    text: torch.Tensor,
+    image: torch.Tensor,
     timestep: torch.Tensor,
     deviation: str | None = None,
+    attends: dict | None = None,
 ) -> torch.Tensor:
     """The timestep encoder, then every block through this file's own block reference, then
-    the head. The alternation is written out here as ``index % 2 == 0`` rather than taken from
-    ``_attends_encoder``, so the stack's own rule is not borrowed from the module it tests.
+    the head. The alternation and the text/image split are ``_reference_span`` above rather
+    than ``_attends_encoder`` and ``_span_for``, so the stack's own rules are not borrowed
+    from the module it tests.
+
+    ``attends`` maps a span to the attention that span's blocks read with, as the module's
+    does, and defaults to the stand-in everywhere -- so a test that supplies its own for one
+    span has an exact expectation rather than a bar.
     """
     temb = dit.timestep_encoder(timestep)
+    rows = {SA_SPAN: None, VL_TEXT_SPAN: text, VL_IMAGE_SPAN: image}
     for index, block in enumerate(dit.transformer_blocks):
-        hidden = _block_reference(block, hidden, temb, encoder if index % 2 == 0 else None)
+        span = _reference_span(index, dit.attend_text_every_n_blocks)
+        # `deviation` is a reading of the *head*, which is where it is applied; the blocks
+        # here are the right wiring in every case, as they were before the spans existed
+        hidden = _block_reference(
+            block, hidden, temb, rows[span], None, (attends or {}).get(span, _sdpa),
+        )
     return _head_reference(dit, hidden, temb, deviation)
 
 
@@ -1513,6 +1593,13 @@ def _dit_reference(
 # The whole DT against the reference
 # ----------------------------------------------------------------------------
 
+# Every test in this section hands the *same* rows as `vl_text` and as `vl_image`, which is
+# not a shortcut around the split: with the two spans equal, every cross block reads all of
+# the bridge's rows whichever span it asked for, and that is exactly the reference's plain
+# `DiT.forward` -- the unmasked case C06 measured parity against. So these tests go on saying
+# what they said about the head, the norms and the batching, and they say it at both readings
+# of the split at once. The split itself is pinned in the next section, where the two spans
+# are deliberately different lengths.
 _DIT_SHAPES = {
     # the real shape is 41 rows: one state row and `action_horizon` action rows
     "a batch of requests": (_REQUESTS, _QUERIES),
@@ -1527,7 +1614,8 @@ _DIT_SHAPES = {
 def test_the_dit_is_its_blocks_then_the_output_head(shape, depth):
     """``[B, T, 1536]`` rows and the bridge's ``[B, S, 2048]`` to ``[B, T, output_dim]``, from
     one ``[B]`` timestep. ``torch.equal``, for the same reason the block's parity is: the
-    attention is the caller's callable, so the module and the reference reach the same one.
+    attention is the caller's callable, so the module and the reference reach the same one --
+    here one per span, all three of them this file's stand-in.
 
     Four depths, because a stack that alternates cannot be pinned at one. Depth 1 says block
     0 is a cross block, depth 2 that block 1 is not, and depths 3 and 4 separate ``index % 2``
@@ -1543,10 +1631,10 @@ def test_the_dit_is_its_blocks_then_the_output_head(shape, depth):
     hidden = _dit_rows(requests, rows)
     encoder = _bridge_rows(True, requests)
     timestep = _steps(requests)
-    out = dit(hidden, encoder, timestep)
+    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
 
     assert out.shape == (requests, rows, _DIT_OUT)
-    assert torch.equal(out, _dit_reference(dit, hidden, encoder, timestep))
+    assert torch.equal(out, _dit_reference(dit, hidden, encoder, encoder, timestep))
 
 
 @torch.no_grad()
@@ -1575,16 +1663,16 @@ def test_the_output_heads_chunk_is_shift_then_scale_and_not_adalns_order():
     hidden = _dit_rows()
     encoder = _bridge_rows(True)
     timestep = _steps()
-    out = dit(hidden, encoder, timestep)
-    swapped = _dit_reference(dit, hidden, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
+    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
+    swapped = _dit_reference(dit, hidden, encoder, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
 
     assert torch.equal(out, dit.proj_out_2.bias.expand(_REQUESTS, _QUERIES, _DIT_OUT))
     assert not torch.equal(out, swapped)
     assert swapped.abs().max() > 2.0 * out.abs().max()
 
     trained = _dit()
-    out = trained(hidden, encoder, timestep)
-    swapped = _dit_reference(trained, hidden, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
+    out = trained(hidden, encoder, encoder, timestep, _STAND_INS)
+    swapped = _dit_reference(trained, hidden, encoder, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
     first, second = trained.proj_out_1(F.silu(trained.timestep_encoder(timestep))).chunk(2, 1)
     assert first.pow(2).mean().sqrt() == pytest.approx(second.pow(2).mean().sqrt(), rel=0.3)
     assert not torch.equal(out, swapped)
@@ -1607,11 +1695,11 @@ def test_the_output_norm_normalises_at_1e_6_where_every_other_norm_uses_1e_5():
     hidden = _dit_rows(scale=1e-3)
     encoder = _bridge_rows(True)
     timestep = _steps()
-    out = flat(hidden, encoder, timestep)
+    out = flat(hidden, encoder, encoder, timestep, _STAND_INS)
 
     assert hidden.var(-1, unbiased=False).max() < 1e-05  # the input the eps is visible on
-    assert torch.equal(out, _dit_reference(flat, hidden, encoder, timestep))
-    at_1e_5 = _dit_reference(flat, hidden, encoder, timestep, _WRONG_HEAD_BLOCK_EPS)
+    assert torch.equal(out, _dit_reference(flat, hidden, encoder, encoder, timestep))
+    at_1e_5 = _dit_reference(flat, hidden, encoder, encoder, timestep, _WRONG_HEAD_BLOCK_EPS)
     assert not torch.equal(out, at_1e_5)
     assert (out - at_1e_5).abs().max() > 0.2 * out.abs().max()
 
@@ -1666,17 +1754,17 @@ def test_the_heads_pair_is_one_per_request_and_reaches_every_row_of_it():
     hidden = _dit_rows(requests, rows)
     encoder = _bridge_rows(True, requests)
     timestep = _steps(requests)
-    out = dit(hidden, encoder, timestep)
-    per_row = _dit_reference(dit, hidden, encoder, timestep, _WRONG_HEAD_PER_ROW)
+    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
+    per_row = _dit_reference(dit, hidden, encoder, encoder, timestep, _WRONG_HEAD_PER_ROW)
 
-    assert torch.equal(out, _dit_reference(dit, hidden, encoder, timestep))
+    assert torch.equal(out, _dit_reference(dit, hidden, encoder, encoder, timestep))
     assert not torch.equal(out, per_row)
     assert (out - per_row).abs().max() > 0.2 * out.abs().max()
 
     # at any other shape the dropped index is a shape error, which is why the square one is
     # the shape this test runs at
     with pytest.raises(RuntimeError):
-        _dit_reference(dit, _dit_rows(), _bridge_rows(True), _steps(), _WRONG_HEAD_PER_ROW)
+        _dit_reference(dit, _dit_rows(), _bridge_rows(True), _bridge_rows(True), _steps(), _WRONG_HEAD_PER_ROW)
 
 
 @torch.no_grad()
@@ -1695,11 +1783,11 @@ def test_a_dit_batch_can_hold_requests_at_different_denoising_steps():
     hidden = _dit_rows(3, _QUERIES)
     encoder = _bridge_rows(True, 3)
     timestep = _steps(3)
-    out = dit(hidden, encoder, timestep)
+    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
 
     moved = timestep.clone()
     moved[1] = _DENOISE_STEPS[3]
-    after = dit(hidden, encoder, moved)
+    after = dit(hidden, encoder, encoder, moved, _STAND_INS)
 
     # the four steps the reference's loop produces, which is what a batch is drawn from
     assert _DENOISE_STEPS == tuple(float(int(t / 4 * 1000)) for t in range(4))
@@ -1710,7 +1798,7 @@ def test_a_dit_batch_can_hold_requests_at_different_denoising_steps():
 
 
 # ----------------------------------------------------------------------------
-# The alternation, and the config field it is not
+# The alternation, the two spans it divides into, and the attention each one is read with
 # ----------------------------------------------------------------------------
 
 
@@ -1725,8 +1813,13 @@ def test_the_stack_is_built_and_run_as_cross_then_self_from_block_zero(depth):
 
     The forward half is read off the key count, not the width: a cross block is handed 6
     bridge rows and a self block its own 4, so the stand-in reports which source each block
-    got. The construction half is the ``in_features``, which is what the checkpoint's 2048
-    pins (see the block-variant test below).
+    got. One stand-in serves all three spans and appends in call order, so its position in the
+    list *is* the block index -- the blocks run in order. The construction half is the
+    ``in_features``, which is what the checkpoint's 2048 pins (see the block-variant test
+    below).
+
+    Both spans are the same rows here, so this test is about cross against self only; which
+    of the two a cross block reads is the next section's claim.
 
     Four depths, because an off-by-one in the rule survives a shallower test: ``index % 2``,
     ``index % 3`` and ``index % 4`` all agree on blocks 0 and 1.
@@ -1734,23 +1827,19 @@ def test_the_stack_is_built_and_run_as_cross_then_self_from_block_zero(depth):
     dit = _dit(depth)
     hidden = _dit_rows()
     encoder = _bridge_rows(True)
-    seen: list[tuple[int, int]] = []
+    seen: list[int] = []
 
-    for index, block in enumerate(dit.transformer_blocks):
-        def record(q, k, v, index=index):
-            seen.append((index, k.shape[1]))
-            return _sdpa(q, k, v)
+    def record(q, k, v):
+        seen.append(k.shape[1])
+        return _sdpa(q, k, v)
 
-        block.attend = record
-    dit(hidden, encoder, _steps())
+    dit(hidden, encoder, encoder, _steps(), dict.fromkeys(_STAND_INS, record))
 
     cross = [index % 2 == 0 for index in range(depth)]
     assert [_attends_encoder(index) for index in range(depth)] == cross
     assert _attends_encoder(0) is True  # the alternation starts with a cross block
     assert _BRIDGE_ROWS != _QUERIES  # so the key count says where k came from
-    assert seen == [
-        (index, _BRIDGE_ROWS if is_cross else _QUERIES) for index, is_cross in enumerate(cross)
-    ]
+    assert seen == [_BRIDGE_ROWS if is_cross else _QUERIES for is_cross in cross]
     for kind in ("to_k", "to_v"):
         assert [
             getattr(block.attn1, kind).in_features for block in dit.transformer_blocks
@@ -1759,18 +1848,18 @@ def test_the_stack_is_built_and_run_as_cross_then_self_from_block_zero(depth):
     assert {block.attn1.to_q.in_features for block in dit.transformer_blocks} == {_DIT_DIM}
 
 
-def test_attend_text_every_n_blocks_divides_the_cross_blocks_rather_than_choosing_them():
-    """The field that looks like the rule and is not. ``attend_text_every_n_blocks`` is 2 in
-    this checkpoint and the blocks alternate in twos, so ``index % n == 0`` and
-    ``_attends_encoder`` agree at every index -- a coincidence of one value.
+def test_the_cross_self_rule_is_the_parity_of_the_index_and_not_the_config_field():
+    """Half of the field's story: it is **not** what decides cross against self.
+    ``attend_text_every_n_blocks`` is 2 in this checkpoint and the blocks alternate in twos,
+    so ``index % n == 0`` and ``_attends_encoder`` agree at every index -- a coincidence of
+    one value, and the whole reason reading the field as the alternation is a bug waiting on
+    a config change. ``_attends_encoder`` could not read it if it wanted to: it takes an index
+    and has no config.
 
-    What the field actually governs is which **span** a cross block reads: the reference's
-    ``idx % (2 * n) == 0`` cross blocks attend the text rows and the rest attend the image
-    rows (``dit.py:390-396``). At n = 2 that is ``idx % 4``, which selects half the cross
-    blocks and no self block -- a subdivision of the alternation, not the alternation. This
-    port does not implement the split (it hands every cross block the whole bridge), so the
-    field reaches nothing in this cycle, and ``_attends_encoder`` could not read it if it
-    wanted to: it takes an index and has no config.
+    What the field *does* govern is the text/image split among the cross blocks, which is
+    ``_span_for``'s job and the next test's claim. The two are split apart because they are
+    two rules over the same index, and a reader who merged them would get the alternation
+    wrong at any ``n`` but 2.
     """
     config = _dit_config()
     indexes = range(8)
@@ -1780,16 +1869,219 @@ def test_attend_text_every_n_blocks_divides_the_cross_blocks_rather_than_choosin
     assert n == 2
     assert cross == [index % 2 == 0 for index in indexes]
     assert cross == [index % n == 0 for index in indexes]  # the coincidence, stated
-
-    text = [index % (2 * n) == 0 for index in indexes]
-    assert text != cross
-    assert all(cross[index] for index in indexes if text[index])  # every text block is cross
-    assert 2 * sum(text) == sum(cross)  # and half the cross blocks are text blocks
-    # at any other value of the field the two part company, which is what makes reading it as
-    # the rule a bug waiting on a config change
+    # at any other value of the field the two part company
     for other in (1, 3, 4):
         assert [index % other == 0 for index in indexes] != cross
     assert list(inspect.signature(_attends_encoder).parameters) == ["index"]
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_the_text_image_rule_is_the_config_field_dividing_the_cross_blocks(n):
+    """The other half: ``_span_for`` reads the field, and reads it for the one thing it
+    governs. Against ``_reference_span``, which is ``AlternateVLDiT``'s three branches written
+    out from the reference rather than taken from the module.
+
+    The field divides the cross blocks and touches nothing else, which is the shape of the
+    claim: at every ``n`` the set of blocks that read *some* encoder span is the same -- the
+    even ones, ``_attends_encoder``'s rule -- while which of the two they read moves with
+    ``n``. So a stack that read the field as the alternation would size half its ``to_k``
+    tensors wrong, and a stack that ignored it in ``_span_for`` would feed the image blocks
+    the text rows and run.
+
+    Four values rather than the checkpoint's one, because at n = 2 the text blocks are
+    ``idx % 4`` and several wrong readings agree with that: n = 1 makes every cross block a
+    text block, and n = 3 and 4 move the period off a power of two.
+    """
+    indexes = range(16)
+    spans = [_span_for(index, n) for index in indexes]
+
+    assert spans == [_reference_span(index, n) for index in indexes]
+    # the cross/self half is invariant in the field, and is `_attends_encoder`'s rule
+    assert [span != SA_SPAN for span in spans] == [_attends_encoder(index) for index in indexes]
+    assert [span != SA_SPAN for span in spans] == [index % 2 == 0 for index in indexes]
+    # the text/image half is not: the period is `2 * n` cross blocks
+    text = [index for index in indexes if spans[index] == VL_TEXT_SPAN]
+    assert text == [index for index in indexes if index % (2 * n) == 0]
+    assert len(text) == len(range(0, 16, 2 * n))
+    assert set(spans) == ({SA_SPAN, VL_TEXT_SPAN} if n == 1 else {SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
+    assert list(inspect.signature(_span_for).parameters) == [
+        "index", "attend_text_every_n_blocks",
+    ]
+
+
+def test_the_span_rule_runs_block_for_block_over_the_checkpoints_thirty_two():
+    """R7, at the depth the checkpoint actually has. The rule is a periodicity over the block
+    index, so the place an off-by-one hides is the *phase*, and the phase is only visible at
+    the real depth and against the real ``n``.
+
+    Block 0 is a **text** block, because ``0 % 4 == 0``. Starting the alternation at the image
+    rows instead -- which is what reading the reference's branches the other way round gives,
+    and what ``idx % (2 * n) == 1`` or a 1-based index would give -- is the same 32 blocks, the
+    same 456 tensors, the same widths and the same shapes end to end. Nothing but this
+    comparison says which way round it is: the checkpoint's ``to_k`` widths distinguish cross
+    from self and say nothing about text from image, and a bf16 dump of the whole stack would
+    differ only where the two spans differ, which is a value difference and not a structural
+    one.
+
+    Built from the config dataclass, not from a stack: ``_span_for`` takes two ints, so the
+    real 32 blocks cost nothing here.
+    """
+    config = _dit_config(32)
+    n = config.attend_text_every_n_blocks
+    spans = [_span_for(index, n) for index in range(config.dit.num_layers)]
+
+    assert (config.dit.num_layers, n) == (32, 2)
+    assert spans == [_reference_span(index, n) for index in range(config.dit.num_layers)]
+    assert spans[0] == VL_TEXT_SPAN  # R7
+    assert spans[:8] == [VL_TEXT_SPAN, SA_SPAN, VL_IMAGE_SPAN, SA_SPAN] * 2
+    # 16 self blocks, and the 16 cross blocks split evenly -- the language is read as often as
+    # the images, which is what `attend_text_every_n_blocks` = 2 buys
+    assert Counter(spans) == {SA_SPAN: 16, VL_TEXT_SPAN: 8, VL_IMAGE_SPAN: 8}
+
+
+# Three *different* kv lengths, so a span is told apart by what its attention was handed and
+# not only by the label it was handed under. The DT's own rows are 41 in the real model too;
+# the text span is shorter than one prompt's worth of tokens and the image span is one
+# 256-token tile, which is the real asymmetry between the two.
+_SA_ROWS = 41
+_TEXT_ROWS = 37
+_IMAGE_ROWS = 256
+
+
+def _spy(label: str, seen: list) -> Callable:
+    """An attention that records the span label it was registered under and the number of keys
+    it was handed, then attends. The pair is the point: the label says which entry of
+    ``attends`` the stack reached for and the key count says which rows it put in front of it,
+    so a stack that read the right span with the wrong attention, or the right attention over
+    the wrong span, is a different list either way.
+    """
+    def attend(q, k, v):
+        seen.append((label, k.shape[1]))
+        return _sdpa(q, k, v)
+
+    return attend
+
+
+def _zeros(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """An attention whose output is nothing, in the contract's own shape. Used where a test
+    needs a *supplied* attention to be distinguishable from the fallback: it keeps ``to_out``
+    and both residuals alive, so a block that ran it still moves its tokens, and it gives a
+    different answer from SDPA's wherever SDPA's own output is not already zero.
+    """
+    return torch.zeros_like(q)
+
+
+@torch.no_grad()
+def test_each_block_is_handed_the_attention_its_own_span_asked_for():
+    """The interface's whole claim in one list. One attention per span, each recording what it
+    saw, over a stack deep enough to hold all three spans: text, self, image, self.
+
+    What this catches that the parity tests above cannot: they pass the same rows as both
+    encoder spans, so there a cross block reading the image entry for the text span is the
+    same answer. Here the three lengths are 41, 37 and 256, so every such swap is a different
+    list -- and a stack that read ``attends`` once outside the loop, or keyed it by the block
+    index rather than by the span, would hand every cross block the same one entry.
+
+    The parity assertion at the end is the other half: the rows a block is handed are the
+    span's rows, which the reference's own span rule decides.
+    """
+    dit = _dit(4)
+    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
+    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
+    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
+    timestep = _steps()
+    seen: list[tuple[str, int]] = []
+
+    out = dit(hidden, text, image, timestep, {label: _spy(label, seen) for label in _STAND_INS})
+
+    assert len({_SA_ROWS, _TEXT_ROWS, _IMAGE_ROWS}) == 3  # so the key count names the span
+    assert seen == [
+        (VL_TEXT_SPAN, _TEXT_ROWS),
+        (SA_SPAN, _SA_ROWS),
+        (VL_IMAGE_SPAN, _IMAGE_ROWS),
+        (SA_SPAN, _SA_ROWS),
+    ]
+    assert torch.equal(out, _dit_reference(dit, hidden, text, image, timestep))
+
+
+@torch.no_grad()
+def test_a_span_with_no_attention_of_its_own_is_read_with_sdpa():
+    """The fallback, which is how the parity backend runs and how a deployment that declares
+    no ragged resource still serves. Three readings of ``attends`` have to agree: ``None``, an
+    empty map, and a map that names some labels and not others. A stack that raised on a
+    missing label would make SDPA unreachable; one that skipped the block, or attended its own
+    tokens instead, would run and be wrong.
+
+    Then the half that makes it a fallback rather than a default: a label that *is* supplied is
+    read with what was supplied, which is asserted against the reference with the same entry
+    in it rather than against a bar.
+
+    The last assertion is worth its line: the module's fallback is bit-identical to this
+    file's stand-in, so every ``torch.equal`` in the sections above -- all of which hand the
+    stand-in in explicitly -- is also a test of the default path.
+    """
+    dit = _dit(4)
+    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
+    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
+    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
+    timestep = _steps()
+    default = dit(hidden, text, image, timestep)
+
+    assert torch.equal(default, dit(hidden, text, image, timestep, {}))
+    assert torch.equal(default, dit(hidden, text, image, timestep, {SA_SPAN: _SDPA_ATTEND}))
+    assert torch.equal(
+        default, dit(hidden, text, image, timestep, dict.fromkeys(_STAND_INS, _SDPA_ATTEND)),
+    )
+    assert torch.equal(default, _dit_reference(dit, hidden, text, image, timestep))
+
+    supplied = dit(hidden, text, image, timestep, {VL_IMAGE_SPAN: _zeros})
+    assert not torch.equal(supplied, default)
+    assert torch.equal(
+        supplied,
+        _dit_reference(dit, hidden, text, image, timestep, attends={VL_IMAGE_SPAN: _zeros}),
+    )
+
+
+@torch.no_grad()
+def test_the_sdpa_fallback_is_one_object_and_not_one_per_forward(monkeypatch):
+    """Identity, not equality, and the reason is not style. A compiled transformer region
+    guards on the identity of the callables it is handed, so a fallback built inside the
+    forward -- ``attends.get(span, functools.partial(joint_attention, ragged=None))``, which
+    is the natural way to write it -- is a fresh object every step, retraces that frame every
+    step, and keeps retracing until Dynamo gives up on it
+    (``mstar/engine/resources/convenience.py:142-145``, where the ragged callables are held
+    per label for exactly this reason). Nothing about the numbers changes, so no parity test
+    in this file would see it; this is the only test that can.
+
+    Every block's fourth argument is collected: over two forwards of one stack, over a second
+    stack, and over a forward whose map covers one span and leaves the other two to fall back.
+    One object throughout, and it is the module's own.
+    """
+    seen: list = []
+    forward = BasicTransformerBlock.forward
+
+    def record(self, hidden_states, temb, encoder_hidden_states, attend):
+        seen.append(attend)
+        return forward(self, hidden_states, temb, encoder_hidden_states, attend)
+
+    monkeypatch.setattr(BasicTransformerBlock, "forward", record)
+    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
+    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
+    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
+    timestep = _steps()
+
+    dit = _dit(4)
+    dit(hidden, text, image, timestep)
+    dit(hidden, text, image, timestep)  # a second denoising step on the same stack
+    _dit(4)(hidden, text, image, timestep)  # and a second stack, so it is not per instance
+    assert len(seen) == 12
+    assert all(attend is _SDPA_ATTEND for attend in seen)
+    assert len({id(attend) for attend in seen}) == 1
+
+    # the spans a partial map leaves out fall back to that same object, not to a copy per span
+    dit(hidden, text, image, timestep, {SA_SPAN: _zeros})
+    assert [attend is _SDPA_ATTEND for attend in seen[12:]] == [True, False, True, False]
+    assert len({id(attend) for attend in seen}) == 2
 
 
 # ----------------------------------------------------------------------------

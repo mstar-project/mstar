@@ -22,6 +22,20 @@ LLM_ATTN = "llm_attn"
 # resource is per head geometry, so it cannot share the tower's
 BRIDGE_ATTN = "bridge_attn"
 
+# The DT's two attentions. Same 32 x 48 geometry, but a resource is one *kind*
+# of attention, so they cannot share one: the even blocks cross-attend the
+# bridge's text or image rows, the odd blocks attend the 41 `sa` rows.
+DT_ATTN = "dt_attn"
+DT_XATTN = "dt_xattn"
+
+# The spans a `denoise_step` declares. D03 packs the bridge's rows into two
+# per-request spans so the loop carries no attention masks at all; the cross
+# pairs say which queries read which of them.
+SA_SPAN = "sa"
+VL_TEXT_SPAN = "vl_text"
+VL_IMAGE_SPAN = "vl_image"
+DT_XATTN_PAIRS = ((SA_SPAN, VL_TEXT_SPAN), (SA_SPAN, VL_IMAGE_SPAN))
+
 
 def _read(path: str | Path) -> dict:
     path = Path(path)
