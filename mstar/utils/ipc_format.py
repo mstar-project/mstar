@@ -5,6 +5,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
@@ -39,6 +40,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -216,6 +218,8 @@ class ConductorMessageType(Enum):
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
+    WORKER_STATUS = "worker_status"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -280,6 +284,22 @@ class FailRequests(MessageBody):
     step can fail several of them for different reasons.
     """
     errors: dict[str, str]
+
+
+@dataclass
+class WorkerStatus(MessageBody):
+    """A worker's engine metrics, sent once per status interval only while
+    metrics are on: cumulative or current values per graph node or tensor
+    edge, never per-request data."""
+    worker_id: str
+    metrics: list[MetricSnapshot]
+
+
+@dataclass
+class EnableMetrics(MessageBody):
+    """Start the workers' histograms and counters. The API server sends it to
+    the conductor after its warmup requests; the conductor forwards it to
+    every worker (``WorkerMetrics.start_counting``)."""
 
 
 @dataclass

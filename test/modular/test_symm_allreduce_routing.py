@@ -491,6 +491,17 @@ def test_size_not_in_4_byte_units_goes_nccl(nccl_calls, symm_group):
     assert nccl_calls == [(t, g.device_group)]
 
 
+def test_compiled_one_shot_goes_nccl(monkeypatch, nccl_calls, symm_group):
+    """Inductor plans one_shot_all_reduce's input as a symmetric buffer of its own,
+    sized by the first call: BAGEL at TP2 failed capture at its second decode size."""
+    g, routed = symm_group()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    t = _CudaTensor(nbytes=16)
+    g.all_reduce(t)
+    assert routed == []
+    assert nccl_calls == [(t, g.device_group)]
+
+
 def test_cpu_tensor_goes_nccl(nccl_calls, symm_group):
     g, routed = symm_group()
     t = torch.zeros(4)
