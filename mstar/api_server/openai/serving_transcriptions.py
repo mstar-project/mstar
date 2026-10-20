@@ -489,7 +489,8 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
     """Stitch the windows: texts joined by a space, segments/words shifted by
     the window's start time (segments also carry the temperature and
     compression ratio their window was accepted at), the language from the
-    first window that reported one."""
+    first window that reported one, and the text as the adapter finishes it
+    (``final_text``)."""
     texts: list[str] = []
     segments: list[dict] = []
     words: list[dict] = []
@@ -508,7 +509,8 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
         language = language or t.language
     for idx, seg in enumerate(segments):
         seg["id"] = idx
-    return Transcript(text=" ".join(texts), language=language or req.language, segments=segments, words=words)
+    text = adapter.final_text(" ".join(texts))
+    return Transcript(text=text, language=language or req.language, segments=segments, words=words)
 
 
 async def create_transcription(

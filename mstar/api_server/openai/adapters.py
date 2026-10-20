@@ -313,6 +313,12 @@ class OpenAIAdapter:
         and timestamp tokens, an LLM decoder's tags) parses them here."""
         return Transcript(text=text.strip())
 
+    def final_text(self, text: str) -> str:
+        """The finished transcript's text as the client gets it (a response,
+        or the stream's ``transcript.text.done``); not applied to partial
+        text, which only grows. The default passes it through."""
+        return text
+
     def stream_text(self, raw: str) -> str:
         """The client-facing text of the raw stream so far. It must only
         grow as ``raw`` does, so a model with control tokens strips them and
@@ -1108,11 +1114,14 @@ class Qwen3ASRAdapter(OpenAIAdapter):
             return ""
         return raw
 
-    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+    def final_text(self, text: str) -> str:
         from mstar.model.qwen3_asr.repetition import fix_repetitions
 
-        # what the reference SDK does to every raw transcript before parsing it
-        raw = fix_repetitions(text.strip())
+        # the reference SDK collapses repetition loops in every finished transcript
+        return fix_repetitions(text)
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        raw = text.strip()
         if ASR_TEXT_TAG not in raw:
             return Transcript(text=raw, language=req.language)
         meta, body = raw.split(ASR_TEXT_TAG, 1)

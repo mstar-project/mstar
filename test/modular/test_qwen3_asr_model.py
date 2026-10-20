@@ -414,9 +414,15 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.parse_transcript("language Klingon<asr_text> x", free).language == "Klingon"
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
-    # a repetition loop is collapsed as the reference SDK does
-    looped = ad.parse_transcript("language English<asr_text>yes" + " no" * 40, free)
-    assert looped.text == "yes no" and looped.language == "en"
+    # a repetition loop is collapsed in the finished transcript, as the
+    # reference SDK does; the partial parse a realtime step holds text back by
+    # is left as it is, so a longer hypothesis still parses to a longer text
+    looped = "language English<asr_text>yes" + " no" * 40
+    assert ad.parse_transcript(looped, free).text == "yes" + " no" * 40
+    from mstar.api_server.openai.serving_transcriptions import Window, merge_windows
+
+    merged = merge_windows([Window(path="w.wav", offset=0.0, duration=5.0, raw_text=looped)], ad, free)
+    assert merged.text == "yes no" and merged.language == "en"
     assert ad.parse_transcript(" plain words ", req).language == "en"
     # the stream shows nothing until the language line has closed, then only the text after the tag
     assert ad.stream_text("language") == "" and ad.stream_text("language English") == ""
