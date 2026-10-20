@@ -1065,6 +1065,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># error ids of this item's distinct step failures (at most</span>
     <span class="c1"># MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item</span>
     <span class="n">failures</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="s2">""</span><span class="p">,</span> <span class="p">{})</span>
+    <span class="c1"># the first byte of a sample whose second byte is in the next append;</span>
+    <span class="c1"># kept across commit (the byte stream goes on), dropped by clear</span>
+    <span class="n">odd_byte</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">chunk_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1127,11 +1130,17 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="pcm16_to_float">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.pcm16_to_float">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">pcm16_to_float</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Base64 PCM16 (little-endian, mono) -&gt; float32 in [-1, 1). Strict</span>
-<span class="sd">    decoding: a malformed payload is an error, not silence."""</span>
-    <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span> <span class="n">validate</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">raw</span><span class="p">[:</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;i2"</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">/</span> <span class="mf">32768.0</span></div>
+<span class="k">def</span><span class="w"> </span><span class="nf">pcm16_to_float</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">carry</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Base64 PCM16 (little-endian, mono) -&gt; (float32 in [-1, 1), the odd</span>
+<span class="sd">    trailing byte). ``carry`` is the previous append's odd byte, so a sample</span>
+<span class="sd">    split across two appends is joined instead of shifting every sample after</span>
+<span class="sd">    it. Strict decoding: a malformed payload is an error, not silence."""</span>
+    <span class="c1"># whitespace is allowed (base64.encodebytes wraps lines); anything else</span>
+    <span class="c1"># outside the alphabet is an error. translate stays linear in the payload</span>
+    <span class="c1"># where split() would build a list of its pieces</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">carry</span> <span class="o">+</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">payload</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">)</span><span class="o">.</span><span class="n">translate</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="sa">b</span><span class="s2">" </span><span class="se">\t\n\r\v\f</span><span class="s2">"</span><span class="p">),</span> <span class="n">validate</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">whole</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span>
+    <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">raw</span><span class="p">[:</span><span class="n">whole</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;i2"</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">/</span> <span class="mf">32768.0</span><span class="p">,</span> <span class="n">raw</span><span class="p">[</span><span class="n">whole</span><span class="p">:]</span></div>
 
 
 
@@ -1373,18 +1382,19 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">return</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_event</span><span class="p">(</span><span class="s2">"transcription_session.updated"</span><span class="p">,</span> <span class="n">session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_session_view</span><span class="p">()))</span>
         <span class="k">elif</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"input_audio_buffer.append"</span><span class="p">:</span>
+            <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">audio</span> <span class="o">=</span> <span class="n">pcm16_to_float</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)</span>
+                <span class="n">audio</span><span class="p">,</span> <span class="n">odd_byte</span> <span class="o">=</span> <span class="n">pcm16_to_float</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">odd_byte</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — bad base64</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="s2">"audio is not base64"</span><span class="p">))</span>
                 <span class="k">return</span>
-            <span class="n">s</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span>
             <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">item_samples</span><span class="p">()</span> <span class="o">+</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"the item would pass </span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">max_item_seconds</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s of audio; "</span>
                     <span class="s2">"commit or clear the input audio buffer first"</span><span class="p">,</span>
                 <span class="p">))</span>
                 <span class="k">return</span>
+            <span class="n">s</span><span class="o">.</span><span class="n">odd_byte</span> <span class="o">=</span> <span class="n">odd_byte</span>
             <span class="n">s</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">chunk</span> <span class="o">:=</span> <span class="n">s</span><span class="o">.</span><span class="n">take_chunk</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
@@ -1403,6 +1413,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="k">elif</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"input_audio_buffer.clear"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">odd_byte</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_event</span><span class="p">(</span><span class="s2">"input_audio_buffer.cleared"</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">_error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unknown event </span><span class="si">{</span><span class="n">_excerpt</span><span class="p">(</span><span class="n">kind</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span></div>

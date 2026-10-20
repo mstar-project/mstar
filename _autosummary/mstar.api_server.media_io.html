@@ -1259,7 +1259,9 @@ of at most <code class="docutils literal notranslate"><span class="pre">step</sp
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.write_wav">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">write_wav</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#write_wav"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.write_wav" title="Link to this definition">#</a></dt>
-<dd><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p>
+<dd><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>. The inverse of
+reading PCM16 as <code class="docutils literal notranslate"><span class="pre">int16</span> <span class="pre">/</span> <span class="pre">32768</span></code>, so 16-bit audio comes back sample for
+sample.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
