@@ -120,7 +120,7 @@ def collect(run_dir: Path) -> dict:
             "correctness_pass": {k: v for k, v in (info.get("correctness_pass") or {}).items() if k != "error"},
             "correctness_pass_error": bool((info.get("correctness_pass") or {}).get("error")),
             "image": versions.get("image"), "stack": versions.get("stack"), "env": versions.get("env"),
-            "command": versions.get("command"), "git": versions.get("git"),
+            "command": versions.get("command"), "git": versions.get("git"), "config": versions.get("config"),
             "recipe": arm.recipe if arm else versions.get("recipe"),
             "differs": arm.differs if arm else versions.get("differs"),
             "host": (versions.get("host") or {}).get("host"), "cotenants": _cotenants(d),
@@ -206,9 +206,13 @@ def render(data: dict) -> str:
         im = a.get("image") or {}
         src = im.get("source") or {}
         stack = a.get("stack") or {}
-        if a["arm"] == "mstar" or not im:
+        engine = getattr(catalog.ARMS.get(a["arm"]), "engine", None)
+        if engine == "mstar" or not im:
             git = a.get("git") or {}
             what = f"mstar {git.get('branch', '')} {str(git.get('head', ''))[:9]}" if git else a["arm"]
+            if a.get("config"):
+                cfg = Path(a["config"])
+                what += f", {'configs/' + cfg.name if cfg.parent.name == 'configs' else cfg}"
             ver = " ".join(f"{k} {stack[k]}" for k in ("torch", "torch_hip", "amd-aiter", "amd-flashinfer", "triton",
                                                         "triton-rocm") if stack.get(k))
         else:
@@ -221,7 +225,6 @@ def render(data: dict) -> str:
         st = a.get("startup") or {}
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
-        engine = getattr(catalog.ARMS.get(a["arm"]), "engine", None)
         backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if engine == "mstar" else "")
         moe_txt = _moe_status(a)[0]
         ar = st.get("allreduce") or {}

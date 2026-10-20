@@ -26,6 +26,7 @@ from pathlib import Path
 
 import yaml
 
+from benchmark.amd import catalog
 from benchmark.amd.launch import REPO
 
 WORK = Path("/work1/stephaniewang/atindra")
@@ -69,9 +70,9 @@ def load(src: Path):
     return type("WSK", (), mods)
 
 
-def _family(C, worktree: Path, row_name: str):
-    cfg = yaml.safe_load((worktree / "configs" / f"{row_name}.yaml").read_text()) or {}
-    return C.families.family_for_config(row_name, cfg.get("model"), cfg, {}), cfg
+def _family(C, worktree: Path, config_name: str):
+    cfg = yaml.safe_load((worktree / "configs" / f"{config_name}.yaml").read_text()) or {}
+    return C.families.family_for_config(config_name, cfg.get("model"), cfg, {}), cfg
 
 
 def _write_pass(C, fam, sset, responses, out_dir: Path, header: dict, cfg: dict) -> dict:
@@ -132,7 +133,8 @@ def chunks_from_chat(body: bytes, tok, eos_ids: set[int]) -> tuple[list[str], in
 
 def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
     C = load(plan.correctness_src)
-    fam, cfg = _family(C, plan.worktree, row.name)
+    config = catalog.mstar_config_name(row, arm.name)
+    fam, cfg = _family(C, plan.worktree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     base = f"http://127.0.0.1:{port}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -161,7 +163,7 @@ def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
                 continue
             r.text_chunks = [c.encode("utf-8") for c in chunks]
         (out_dir / "prompt_tokens.json").write_text(json.dumps(prompt_tokens, indent=1))
-    header = {"config": row.name, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
+    header = {"config": config, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
               "restarts": 1, "concurrency": fam.default_concurrency, "family_opts": {},
               "seconds": round(time.monotonic() - t0, 1), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
@@ -217,7 +219,8 @@ def omni_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
     """The omni family's set, answered in text and speech. mstar gets the family's own /generate
     requests; vllm-omni gets the same questions as chat completions with text and PCM audio."""
     C = load(plan.correctness_src)
-    fam, cfg = _family(C, plan.worktree, row.name)
+    config = catalog.mstar_config_name(row, arm.name)
+    fam, cfg = _family(C, plan.worktree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     base = f"http://127.0.0.1:{port}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -237,7 +240,7 @@ def omni_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
                 chunks, pcm = parse_omni_stream(r.body)
                 r.text_chunks = [c.encode("utf-8") for c in chunks]
                 r.audio = bytearray(pcm)
-    header = {"config": row.name, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
+    header = {"config": config, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
               "restarts": 1, "concurrency": fam.default_concurrency, "family_opts": {},
               "seconds": round(time.monotonic() - t0, 1), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
@@ -278,7 +281,9 @@ def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Pa
                    ext: str) -> dict:
     """The correctness pass of a TTS (wav), ASR (txt), image (png) or video (mp4) arm: its first timed
     run at concurrency 1, which sends every item of the set once, in order."""
-    fam, cfg = _family(C, worktree, row_name)
+    row = catalog.ROWS.get(row_name)
+    config = catalog.mstar_config_name(row, arm_name) if row else row_name
+    fam, cfg = _family(C, worktree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     run = cell_dir / "a1r1"
     results = json.loads((run / "results.json").read_text())
@@ -304,7 +309,7 @@ def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Pa
             f.write(json.dumps(r.summary(), default=str) + "\n")
     (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     ok = sum(r.ok for r in responses)
-    header = {"config": row_name, "model": cfg.get("model"), "arm": arm_name, "restarts": 1, "concurrency": 1,
+    header = {"config": config, "model": cfg.get("model"), "arm": arm_name, "restarts": 1, "concurrency": 1,
               "set": sset.name, "n_items": len(sset.items), "ok": ok, "failed": len(responses) - ok,
               "source": str(run)}
     (out_dir / "pass.json").write_text(json.dumps(header, indent=1))
