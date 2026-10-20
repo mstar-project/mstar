@@ -359,6 +359,22 @@ def test_table_render(tmp_path):
     assert json.loads((run / "table.json").read_text())["meta"]["table"] == "qwen35-dense"
 
 
+def test_correctness_scores_skip_set_aside_arms(tmp_path, monkeypatch):
+    from benchmark.amd import correctness
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "sweep.json").write_text(json.dumps({"worktree": str(tmp_path), "correctness_src": str(tmp_path)}))
+    # Path order puts "mstar" before "mstar.hip4-1", so a set-aside run scored last would win the arm's key.
+    for d in ("mstar", "mstar.hip4-1"):
+        (run / "qwen3_5_4b" / d / "correctness").mkdir(parents=True)
+        (run / "qwen3_5_4b" / d / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_4b"}))
+        (run / "qwen3_5_4b" / d / "correctness" / "pass.json").write_text("{}")
+    monkeypatch.setattr(correctness, "load", lambda src: None)
+    monkeypatch.setattr(correctness, "score_dir", lambda C, wt, corr, device: {"verdict": corr.parent.name})
+    assert correctness.score(run) == {"qwen3_5_4b/mstar": {"verdict": "mstar"}}
+
+
 def test_moe_configs_reach_the_table(tmp_path):
     from benchmark.amd.launch import moe_configs_in_log
 
