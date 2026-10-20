@@ -89,6 +89,19 @@ def test_overlong_sentence_is_wrapped_at_clauses_then_spaces():
     assert chunks[0] == "alpha beta gamma,"
 
 
+def test_overlong_sentence_keeps_its_numbers_whole():
+    sentence = (
+        "The budget for the whole program across all regional offices is $4,500,000 "
+        "and the review starts at 9:45 on the third floor near the main entrance hall"
+    )
+    chunks = split_sentences(sentence, max_chars=60, min_chars=0)
+    assert all(len(c) <= 60 for c in chunks)
+    assert " ".join(chunks) == sentence
+    zh = "第一部分已经完成，第二部分正在进行，第三部分将在下个月开始，第四部分还在计划之中"
+    zh_chunks = split_sentences(zh, max_chars=20, min_chars=0)
+    assert len(zh_chunks) > 1 and all(len(c) <= 20 for c in zh_chunks)  # a full-width comma needs no space
+
+
 def test_tiny_trailing_fragment_merges_into_previous_chunk():
     text = ("A sentence that is fairly long and goes on for a while to fill the chunk nicely. "
             "Yes.")
