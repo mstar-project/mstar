@@ -1,6 +1,6 @@
 # KV offload copy benchmark
 
-How fast the paged KV cache moves pages to and from host memory (`CPUPagePool`), and what that costs a deployment whose pool is too small for its load.
+How fast the paged KV cache moves pages to and from host memory (`CPUPagePool`), and what that costs a deployment whose pool is too small for its load; and how fast a request's KV moves between two GPUs' caches (`CudaIpcKVTransferEngine`).
 
 ## Copy microbenchmark
 
@@ -30,3 +30,13 @@ grep -c "Offloaded request" server.log   # evictions; only rank 0 picks victims 
 ```
 
 Compare runs with a fresh server each; wall time is the number to read, and the timeouts are requests that waited past the client's 180 s.
+
+## CUDA IPC KV transfer
+
+`ipc_bench.py` measures one request's KV read from another process's cache, the prefill -> decode handoff of the PD-disaggregated configs and BAGEL's CFG-parallel replicas. A writer process publishes a cache on `--src-device`; the reader on `--dst-device` calls `CudaIpcKVTransferEngine._do_read` for `--tokens` tokens (every layer, last page partial) through each copier that loads, against `main`'s one `copy_` per (layer, page). It reports the time until the pages are written; `--busy` runs a GEMM loop on the reader's GPU meanwhile.
+
+Defaults are BAGEL-7B's LLM at TP1 (28 layers, 4 KV heads of 128, 128 tokens, bf16: 7.3 MB a page); median of 7. Needs two GPUs for a cross-GPU read (or pass the same device twice).
+
+```bash
+python benchmark/kv_offload/ipc_bench.py --tokens 512,2500,8000
+```
