@@ -9,13 +9,14 @@ success.
 """
 
 import asyncio
-import collections
 import queue
 import threading
 import time
 
+from api_server_helpers import make_test_api_server
+
 from mstar.api_server.data_worker import PreprocessWorkerThread
-from mstar.api_server.entrypoint import APIServer, PendingRequest
+from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -140,7 +141,7 @@ class _StubPreprocessWorker:
     def has_pending_tensors(self, rid):
         return self.pending
 
-    def received_final_chunks(self, rid, final_outputs):
+    def received_final_chunks(self, rid, output_chunk_counts):
         return self.final
 
     def finished_reading(self, rid, drained=True):
@@ -160,16 +161,14 @@ def _pending_request():
 
 
 def _api_server_stub(preprocess_worker):
-    server = object.__new__(APIServer)
-    server.recently_completed = collections.OrderedDict()
-    server._recently_completed_ttl = 15.0
-    server.pending_requests = {}
-    server.preprocess_worker = preprocess_worker
-    server.log_stats = False
-    server.request_lock = threading.Lock()
-    server.timeout_seconds = 5.0
-    server.enable_nvtx = False
-    return server
+    return make_test_api_server(preprocess_worker=preprocess_worker)
+
+
+def _register(server, rid, req):
+    """What ``submit_request`` registers, with the request's key equal to its id."""
+    server.pending_requests[rid] = req
+    server._live[rid] = rid
+    server._client_ids[rid] = rid
 
 
 def test_ttl_expiry_with_undelivered_chunks_fails_request():
@@ -227,7 +226,7 @@ def test_stream_carries_error_as_final_chunk():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r3"] = req
+    _register(server, "r3", req)
 
     async def _collect():
         return [chunk async for chunk in server.iter_result_chunks("r3")]
@@ -243,7 +242,7 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request()
-    server.pending_requests["r4"] = req
+    _register(server, "r4", req)
 
     async def _collect():
         loop = asyncio.get_running_loop()
@@ -315,7 +314,7 @@ def test_chunks_waiting_together_come_as_one_batch():
     req = _pending_request()
     for i in range(3):
         req.chunks.append(ResultChunk(request_id="r5", modality="text", data=f"t{i}".encode()))
-    server.pending_requests["r5"] = req
+    _register(server, "r5", req)
 
     async def _collect():
         batches = server.iter_result_chunk_batches("r5")
@@ -344,7 +343,7 @@ def test_error_tail_is_its_own_last_batch():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r6"] = req
+    _register(server, "r6", req)
 
     async def _collect():
         return [[c.modality for c in b] async for b in server.iter_result_chunk_batches("r6")]

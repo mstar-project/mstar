@@ -1,5 +1,7 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+from collections.abc import Mapping
+
 import torch
 
 from mstar.engine.resources.attn.base import (
@@ -8,15 +10,17 @@ from mstar.engine.resources.attn.base import (
     EagerSlotKey,
     WorkspacePool,
 )
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
+    FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
     check_flashinfer_head_dim,
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 
 
@@ -28,8 +32,12 @@ class FlashInferManager(AttentionManager):
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
         backend: str="auto",
+        splits: tuple[CombinedSplit, ...] = (),
+        max_rows_in_combined: Mapping[str, int | None] | None = None,
     ):
         self._kv_cache_name = kv_cache
+        self._splits = {split.combined_walk: split for split in splits}
+        self._max_rows_in_combined = max_rows_in_combined or {}
         self._device = device
         self._dtype = dtype
 
@@ -61,7 +69,9 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int) -> AttentionWrapper:
+    def _cg_wrapper(
+        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
+    ) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
         Built on the first plan for that key rather than up front: which labels
@@ -91,11 +101,24 @@ class FlashInferManager(AttentionManager):
             **self._wrapper_kv_kwargs,
             "max_num_pages": num_rows * self._kv_config.max_num_pages,
         }
-        if bucket.bs == bucket.num_tokens:
+        split = self._splits.get(bucket.graph_walk)
+        if split is not None:
+            # its own workspaces: both wrappers are planned for the one step
+            wrapper = FlashInferMixedWrapper(
+                decode_workspace=self._workspaces.get(f"{label}.split_decode", lease.slot),
+                prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
+                batch_size=num_rows,
+                max_total_tokens=bucket.num_tokens,
+                max_prefill_rows=split.max_prefill_rows(
+                    self._max_rows_in_combined, num_rows,
+                ),
+                **kv_kwargs,
+            )
+        elif bucket.bs == bucket.num_tokens and not force_prefill:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
-                use_cuda_graph=True,
+                accelerator_graph=True,
                 **kv_kwargs,
             )
         else:
@@ -103,7 +126,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
-                use_cuda_graph=True,
+                accelerator_graph=True,
                 **kv_kwargs,
             )
         self._cg_plan_states[key] = wrapper
@@ -141,10 +164,11 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "preplan requires a captured graph step: an eager wrapper shares its "
             "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
@@ -171,9 +195,9 @@ class FlashInferManager(AttentionManager):
             indptrs = kv_out.cpu_indptrs
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
-                wrapper = self._cg_wrapper(lease, label, num_rows)
+                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
             else:
-                is_decode = bool(
+                is_decode = not ctx.force_prefill and bool(
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
@@ -236,4 +260,3 @@ class FlashInferManager(AttentionManager):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
-

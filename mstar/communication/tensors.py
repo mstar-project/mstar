@@ -1,10 +1,13 @@
 import errno
 import hashlib
 import logging
+import math
 import os
 import platform
+import re
 import shutil
 import stat
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -68,6 +71,105 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: Rid = ""
     rx_time: float | None = None # seconds
+
+
+#: Earlier Mooncake releases let any host that reaches the TCP data port read
+#: or write arbitrary process memory (CVE-2026-103764). NVD lists "before
+#: 0.3.13" because it points at a later refactor; the fix (Mooncake #2314)
+#: shipped in 0.3.12.post1, see https://github.com/kvcache-ai/Mooncake/issues/4626.
+MOONCAKE_PATCHED_VERSION = "0.3.12.post1"
+_MOONCAKE_DISTRIBUTIONS = (
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-cuda13",
+    "mooncake-transfer-engine-non-cuda",
+)
+_mooncake_version_checked = False
+
+
+def _mooncake_dists_owning(engine_file: str | None, dists: list[str]) -> set[str]:
+    """Which of *dists* installed ``engine_file``, the Mooncake engine this
+    process imported: a RECORD entry that locates to it with its hash.
+
+    One replaced in the same directory keeps a hash that no longer matches,
+    and one installed elsewhere locates to another file. Empty when it can't
+    be told; a distribution whose metadata can't be read is skipped, since
+    this only refines a warning."""
+    import base64
+    from importlib.metadata import distribution
+    if engine_file is None:
+        return set()
+    try:
+        with open(engine_file, "rb") as fh:
+            digest = base64.urlsafe_b64encode(hashlib.sha256(fh.read()).digest()).rstrip(b"=").decode()
+    except OSError:
+        return set()
+    engine_path = os.path.realpath(engine_file)
+    found = set()
+    for dist in dists:
+        try:
+            for f in distribution(dist).files or []:
+                if (f.name == os.path.basename(engine_file) and f.hash is not None
+                        and f.hash.mode == "sha256" and f.hash.value == digest
+                        and os.path.realpath(f.locate()) == engine_path):
+                    found.add(dist)
+        except Exception:  # noqa: BLE001 - e.g. a corrupt RECORD
+            continue
+    return found
+
+
+def _warn_if_mooncake_unpatched() -> None:
+    """Warn once per process if the installed Mooncake predates that fix.
+
+    The extras require a patched release, so this only fires where the
+    environment was built without resolving them (``--no-deps``, a prebuilt
+    image). The distributions install the same ``mooncake`` package, and a
+    replaced one can leave its metadata behind, so with several installed
+    only the one that installed the imported engine counts; if that can't be
+    told, any unpatched one warns, since the warning blocks nothing."""
+    global _mooncake_version_checked
+    if _mooncake_version_checked:
+        return
+    _mooncake_version_checked = True
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return
+    from importlib.metadata import PackageNotFoundError, version
+    installed: list[tuple[str, Version]] = []
+    for dist in _MOONCAKE_DISTRIBUTIONS:
+        try:
+            installed.append((dist, Version(version(dist))))
+        except PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001 - a version that can't be read or parsed (corrupt or stale metadata)
+            return
+    owner_unknown = False
+    if len(installed) > 1:
+        engine = sys.modules.get("mooncake.engine")
+        owners = _mooncake_dists_owning(getattr(engine, "__file__", None), [d for d, _ in installed])
+        if owners:
+            installed = [(d, v) for d, v in installed if d in owners]
+        else:
+            owner_unknown = True
+    patched = Version(MOONCAKE_PATCHED_VERSION)
+    unpatched = [(d, v) for d, v in installed if v < patched]
+    if unpatched and owner_unknown:
+        logger.warning(
+            "Several Mooncake distributions are installed (%s) and none can be "
+            "matched to the imported engine; if it comes from one that predates "
+            "%s, any host that can reach the transfer engine's TCP data port can "
+            "read or write this process's memory (CVE-2026-103764). Uninstall the "
+            "old ones, and keep the TCP and RDMA transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
+    elif installed and len(unpatched) == len(installed):
+        logger.warning(
+            "Installed Mooncake (%s) predates %s: any host that can reach the "
+            "transfer engine's TCP data port can read or write this process's "
+            "memory (CVE-2026-103764). Upgrade it, and keep the TCP and RDMA "
+            "transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +300,41 @@ class AsyncMooncakeReader:
         self._executor.shutdown(wait=True)
 
 
+#: Mooncake's wheel per CUDA major. All of them install the same ``mooncake``
+#: package; the default one is built for CUDA 12.
+_MOONCAKE_WHEELS = {
+    "12": "mooncake-transfer-engine",
+    "13": "mooncake-transfer-engine-cuda13",
+}
+
+
+def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) -> str:
+    """Say which Mooncake wheel loads next to this torch build."""
+    major = torch_cuda.split(".")[0] if torch_cuda else None
+    want = _MOONCAKE_WHEELS.get(major) if major else "mooncake-transfer-engine-non-cuda"
+    missing = re.search(r"libcudart\.so\.(\d+)", str(err))
+    if want is None or missing is None:
+        if want and isinstance(err, ModuleNotFoundError) and (err.name or "").startswith("mooncake"):
+            return f"Install {want} or use SHM protocol."
+        return "Install mooncake-transfer-engine or use SHM protocol."
+    needed = missing.group(1)
+    if needed == major:
+        fix = (
+            "`uv pip install nvidia-cuda-runtime-cu12`"
+            if needed == "12"
+            else f"put libcudart.so.{needed} on the library path"
+        )
+        return f"torch is built for CUDA {torch_cuda} too, so {fix}, or use SHM protocol."
+    torch_desc = f"built for CUDA {torch_cuda}" if major else "built without CUDA"
+    have = _MOONCAKE_WHEELS.get(needed)
+    uninstall = f"uv pip uninstall {have} && " if have else ""
+    return (
+        f"This Mooncake build needs the CUDA {needed} runtime, but torch is {torch_desc}. "
+        f"Switch to {want}: `{uninstall}uv pip install --reinstall --no-deps {want}`, "
+        "or use SHM protocol."
+    )
+
+
 class MooncakeTransferEngine(TensorTransferEngine):
     """Wraps mooncake.engine.TransferEngine for RDMA or TCP transport."""
 
@@ -218,8 +355,9 @@ class MooncakeTransferEngine(TensorTransferEngine):
             raise RuntimeError(
                 "Mooncake TransferEngine is required for RDMA/TCP protocol. "
                 f"Failed to load mooncake: {detail}. "
-                "Install mooncake-transfer-engine or use SHM protocol."
+                + _mooncake_install_hint(MOONCAKE_IMPORT_ERROR, torch.version.cuda)
             )
+        _warn_if_mooncake_unpatched()
 
         if protocol == CommProtocol.RDMA:
             transfer_device = ""
@@ -302,6 +440,21 @@ EdgeNameToTxInfo = dict[str, TxInfo]
 SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
 
 
+def _is_dense(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` fills exactly its ``nbytes`` from ``data_ptr()``,
+    with no gaps or overlaps: contiguous up to a permutation of its dims."""
+    if tensor.numel() == 0:
+        return True
+    expected = 1
+    for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+        if size == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 class TensorCommunicationManager(ABC):
     """Base class for inter-worker tensor transport.
 
@@ -356,6 +509,8 @@ class TensorCommunicationManager(ABC):
         # req_id -> {name -> shards}
         self.buffered_shards: dict[Rid, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
+        self._flat_copy_stream: torch.cuda.Stream | None = None
+        self._flat_copy_pending = False
 
     @property
     def needs_cpu_tensor(self) -> bool:
@@ -364,7 +519,52 @@ class TensorCommunicationManager(ABC):
         False for transports that read device memory (TCP / RDMA)."""
         return False
 
+    #: Whether a consumer reads a stored tensor as ``nbytes`` contiguous bytes
+    #: from its ``address`` (Mooncake RDMA / TCP), so the store must hold a
+    #: layout that one flat read reproduces. False for transports that
+    #: serialize a contiguous copy at send time (SHM). An attribute, not a
+    #: property: every store call reads it.
+    needs_flat_layout: bool = False
+
     # ---- shared: store ----
+    def _flat_layout(
+        self, tensor: torch.Tensor, sharded: bool,
+        ready_event: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        """``tensor`` if one flat read of its ``nbytes`` from ``data_ptr()``
+        reproduces it, else a contiguous copy. Only for a non-contiguous
+        tensor on a ``needs_flat_layout`` transport.
+
+        A dense permutation (a transpose) is kept as is: the consumer
+        rebuilds it from the strides. A sharded tensor must be contiguous,
+        since its slices are byte ranges of rows. A CUDA copy runs on a side
+        stream so it does not queue behind the next step; the store waits for
+        it before returning the descriptors.
+
+        The side stream is ordered after the producer only by ``ready_event``
+        (the step's completion event). Without one, the producer's writes must
+        already be complete when the store is called, not just queued ahead on
+        some stream: the default-stream sync of ``skip_cuda_sync=False``, or
+        the caller's own wait.
+        """
+        if not sharded and _is_dense(tensor):
+            return tensor
+        if not tensor.is_cuda:
+            return tensor.contiguous()
+        stream = self._flat_copy_stream
+        if stream is None:
+            stream = self._flat_copy_stream = torch.cuda.Stream(device=tensor.device)
+        if ready_event is not None:
+            stream.wait_event(ready_event)
+        with torch.cuda.stream(stream):
+            copy = tensor.contiguous()
+        self._flat_copy_pending = True
+        return copy
+
+    def _wait_flat_copies(self) -> None:
+        self._flat_copy_pending = False
+        self._flat_copy_stream.synchronize()
+
     @staticmethod
     def _host_copies_by_tensor(
         tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
@@ -462,6 +662,7 @@ class TensorCommunicationManager(ABC):
             self._host_copies_by_tensor(tensors, cpu_tensors)
             if out_cpu is not None else {}
         )
+        flat = self.needs_flat_layout
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -474,6 +675,8 @@ class TensorCommunicationManager(ABC):
                 # it here unconditionally so TensorPointerInfo dims/strides
                 # match what receivers will read.
                 canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
+                if flat and not canonical.is_contiguous():
+                    canonical = self._flat_layout(canonical, shard_dim is not None)
                 # Built before the put: the store keeps the descriptor so an
                 # edge can be rebuilt from its uuid alone. This is the same
                 # object the edge carries, so later in-place edits (the
@@ -528,7 +731,8 @@ class TensorCommunicationManager(ABC):
         # (which waits for *only* the producing step, not the queued next
         # step), so the unconditional default-stream sync here would
         # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
-        # those call sites.
+        # those call sites, and only once the producer's writes are complete:
+        # a flat-layout copy (``_flat_layout``) reads them during this call.
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         request_ids: list[Rid] = []
@@ -545,6 +749,8 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.put_tensor_batch_multi(
             request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
         )
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return tensor_info
 
     def store_row_outputs_batch(
@@ -587,6 +793,7 @@ class TensorCommunicationManager(ABC):
             tp_rank=tp_rank,
         )
         want_cpu = host_rows is not None and self.needs_cpu_tensor
+        flat = self.needs_flat_layout
         # signal -> the row tensor it views, learned from the first request
         # that has it and checked on every other
         alias: dict[str, str] = {}
@@ -637,6 +844,11 @@ class TensorCommunicationManager(ABC):
                             return None
                         alias[signal] = name
                         if name not in template:
+                            # rows of one tensor share a layout; one that a
+                            # flat read cannot reproduce is copied per tensor
+                            # by the general path
+                            if flat and not row_views[name][0].is_contiguous():
+                                return None
                             template[name] = self._row_template(
                                 views, columns, host_rows if want_cpu else None, name,
                             )
@@ -717,6 +929,7 @@ class TensorCommunicationManager(ABC):
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
         cpu_tensors: dict[Rid, NameToTensorList] | None = None,
+        ready_event: torch.cuda.Event | None = None,
     ) -> StoredOutputs:
         """Store a whole output batch and return the columns routing needs.
 
@@ -737,6 +950,11 @@ class TensorCommunicationManager(ABC):
         ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already
         made (e.g. the stop check's), matched as in ``_host_copies_by_tensor``;
         kept only if ``needs_cpu_tensor``.
+
+        ``skip_cuda_sync=True`` as in ``store_and_return_tensor_info``: the
+        producer's writes must be complete, unless ``ready_event`` (the
+        producing step's completion event) is given, which a flat-layout copy
+        waits on before it reads them.
         """
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
@@ -748,6 +966,7 @@ class TensorCommunicationManager(ABC):
         canonicals: list[torch.Tensor] = []
         want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
         cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        flat = self.needs_flat_layout
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -806,6 +1025,10 @@ class TensorCommunicationManager(ABC):
                         canonical = self._ensure_leading_shard_dim(
                             shard_dim, tensor,
                         )
+                        if flat and not canonical.is_contiguous():
+                            canonical = self._flat_layout(
+                                canonical, shard_dim is not None, ready_event,
+                            )
                         flat_uuids.append(tensor_uuid)
                         flat_rids.append(request_id)
                         signal_idxs.append(i)
@@ -844,6 +1067,8 @@ class TensorCommunicationManager(ABC):
                 self.uuid_to_shard_dim.pop(uuid, None)
                 self.uuid_to_edge_name.pop(uuid, None)
             raise
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
     def _tensor_info(
@@ -997,13 +1222,22 @@ class TensorCommunicationManager(ABC):
             # Canonical layout has shard_dim leading and is contiguous, so a
             # contiguous byte range maps to a contiguous range of rows along
             # dim 0. Slicing along dim 0 keeps the view contiguous.
-            bytes_per_row = canonical_tensor[0].nbytes
-            assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
-                f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
-                f"to canonical row size {bytes_per_row}"
+            bytes_per_row = (
+                canonical_tensor.element_size()
+                * math.prod(canonical_tensor.shape[1:])
             )
-            start = info.offset // bytes_per_row
-            end = start + info.nbytes // bytes_per_row
+            if bytes_per_row == 0:
+                # Rows of zero bytes (a [4, 0] tensor) carry no offset to
+                # recover the start from, and hold nothing to read: only the
+                # row count matters.
+                start, end = 0, info.dims[0]
+            else:
+                assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
+                    f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
+                    f"to canonical row size {bytes_per_row}"
+                )
+                start = info.offset // bytes_per_row
+                end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
             self.uuid_to_shard_dim[new_uuid] = shard_dim
@@ -1374,6 +1608,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
         self.protocol = protocol
+        # the consumer has the engine copy ``nbytes`` from ``address + offset``
+        # into a buffer it views with the descriptor's strides
+        self.needs_flat_layout = protocol in (CommProtocol.RDMA, CommProtocol.TCP)
         self._async_reader = AsyncMooncakeReader(
             engine._engine, device=device,
             enable_prof=enable_prof
@@ -1408,9 +1645,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             logger.debug("Registering %s for send", uuid)
             tensor = self.tensor_store.get_tensor(uuid)
             t0 = time.perf_counter()
+            # Mooncake rejects a 0-byte region, and a reader of an empty
+            # tensor copies nothing (see start_read_tensors), so there is
+            # nothing to pin.
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
-            )
+            ) if tensor.nbytes else 0
             if PHASE_PERIOD:
                 phase_record(
                     "tensors.register_memory", time.perf_counter() - t0,
@@ -1440,11 +1680,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if registered is None:
             registered = self.tensor_store.is_registered(uuid)
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) and registered:
-            ret_value = self.transfer_engine.unregister_memory(
-                self.tensor_store.get_tensor(uuid).data_ptr()
-            )
-            if ret_value != 0:
-                raise RuntimeError("Mooncake memory unregistration failed.")
+            tensor = self.tensor_store.get_tensor(uuid)
+            # an empty tensor is marked ready without being registered
+            if tensor.nbytes:
+                ret_value = self.transfer_engine.unregister_memory(tensor.data_ptr())
+                if ret_value != 0:
+                    raise RuntimeError("Mooncake memory unregistration failed.")
         self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
@@ -1486,6 +1727,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
                 )
+                # Nothing to read, and Mooncake rejects a 0-byte region: the
+                # empty buffer is the whole tensor. With no reads, the edge
+                # gets no future and is ready once earlier reads are.
+                if info.nbytes == 0:
+                    continue
 
                 if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
                     self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)

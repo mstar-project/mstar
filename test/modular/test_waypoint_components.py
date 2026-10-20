@@ -882,8 +882,14 @@ def test_noise_conditioner_fourier_features_and_fp32_island():
 
     sigma = torch.tensor([[1.0, 0.9, 0.75, 0.3, 0.0]])
     phase = (sigma.reshape(-1).float() * 1000)[:, None] * freq[None, :]
-    want = cond.mlp(torch.cat((phase.sin(), phase.cos()), dim=-1) * 2**0.5).view(1, 5, 16)
+    precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        want = cond.mlp(torch.cat((phase.sin(), phase.cos()), dim=-1) * 2**0.5).view(1, 5, 16)
+    finally:
+        torch.set_float32_matmul_precision(precision)
     assert torch.equal(cond(sigma), want)
+    assert torch.get_float32_matmul_precision() == precision
 
     # The frequency table is derived state: not a buffer, not in state_dict, and
     # out of reach of a dtype cast.

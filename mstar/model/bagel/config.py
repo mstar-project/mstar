@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from typing import Any
 
+# combined walk of the LLM's prefill_text and decode
+MIXED_TEXT = "mixed_text"
+
 
 @dataclass
 class BagelAutoEncoderConfig:
@@ -64,6 +67,7 @@ class BagelModelConfig:
     cfg_renorm_type: str = "global"
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
+    accelerator_graph: bool = True
 
     # Sampling defaults (per-request overridable via model_kwargs)
     temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling

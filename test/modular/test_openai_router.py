@@ -7,10 +7,12 @@ paths are all exercised without the engine.
 
 import asyncio
 import base64
+import io
 import json
 import sys
 import tempfile
 import types
+import wave
 from pathlib import Path
 
 import pytest
@@ -142,6 +144,95 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
+def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    loop = tmp_path / "loop.png"
+    loop.symlink_to(loop)
+    for ref in (str(loop), str(tmp_path / "missing.png"), "/etc/hostname"):
+        r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{
+            "role": "user", "content": [{"type": "image_url", "image_url": {"url": ref}}]}]})
+        assert r.status_code == 400, (ref, r.text)
+        message = r.json()["error"]["message"]
+        assert message.startswith("server file paths are refused") and str(tmp_path) not in message
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
+    client, stub = client_and_stub
+    stub.model_name = model
+    # the suffix-less ones are valid base64; "//..." even decodes to an MPEG frame sync
+    for ref in ("/etc/passwd", "//etc/passwd", "//etc/shadow", "secret", "///x", "/etc/hostname.wav"):
+        r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+        assert r.status_code == 400, (ref, r.text)
+        assert r.json()["error"]["message"].startswith("server file paths are refused")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def _require_torchcodec_decode():
+    """Skip unless torchcodec can decode audio here. Newer torchcodec imports
+    without FFmpeg and raises only on the first decode, which the server reports
+    as an undecodable clip."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(bytes(3200))
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        AudioDecoder(buf.getvalue()).get_all_samples()
+    except Exception as exc:  # noqa: BLE001 — RuntimeError at import or decode without FFmpeg
+        pytest.skip(f"torchcodec cannot decode here: {exc}")
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_a_1_hz_data_url_with_400(client_and_stub, model):
+    if model == "omnivoice":
+        _require_torchcodec_decode()
+    else:
+        pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = model
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(1)
+        wf.writeframes(bytes(64000))
+    ref = "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode()
+    r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"].startswith("ref_audio must be audio the model can decode")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("form", ["base64", "data URL"])
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_a_61_s_clip_with_400(client_and_stub, model, form):
+    if model == "omnivoice":
+        _require_torchcodec_decode()
+    else:
+        pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = model
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(bytes(2 * 8000 * 61))
+    ref = base64.b64encode(buf.getvalue()).decode()
+    if form == "data URL":
+        ref = "data:audio/wav;base64," + ref
+    r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"].startswith("ref_audio must be 60 s or shorter")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 def test_chat_audio_output(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "qwen3_omni"
@@ -263,6 +354,48 @@ def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
     )
     assert r.status_code == 400
     assert "video" in r.json()["error"]["message"]
+
+
+def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, monkeypatch):
+    # LTX-2.5 generates audio with the video: the route asks the model for both and
+    # muxes the PCM chunk into the mp4 with its sample rate and channel count.
+    from mstar.api_server import media_io
+
+    client, stub = client_and_stub
+    stub.model_name = "ltx2_5"
+    mp4, pcm = b"\x00\x00\x00 ftypisommp4fake", b"\x01\x00\x02\x00"
+    stub.next_chunks = [_Chunk("video", mp4), _Chunk("audio", pcm, {"sample_rate": 48000, "num_channels": 2})]
+    muxed = {}
+
+    def fake_mux(video, audio, sample_rate, num_channels, video_fps=None):
+        muxed.update(video=video, audio=audio, sample_rate=sample_rate, num_channels=num_channels)
+        return b"muxed"
+
+    monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
+    body = client.post(
+        "/v1/videos/generations",
+        json={"model": "ltx2_5", "prompt": "a dog barking", "size": "960x544", "num_frames": 121,
+              "seed": 3, "negative_prompt": "blurry"},
+    ).json()
+    assert base64.b64decode(body["data"][0]["b64_json"]) == b"muxed"
+    assert muxed == {"video": mp4, "audio": pcm, "sample_rate": 48000, "num_channels": 2}
+    assert stub.last_submit["output_modalities"] == ["video", "audio"]
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk["width"], mk["height"], mk["num_frames"], mk["seed"]) == (960, 544, 121, 3)
+    assert mk["negative_prompt"] == "blurry" and "audio" not in mk  # extra_body passthrough
+
+
+def test_videos_generations_ltx2_5_video_only_and_rejects_conditioning(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "ltx2_5"
+    stub.next_chunks = [_Chunk("video", b"mp4")]
+    client.post("/v1/videos/generations", json={"model": "ltx2_5", "prompt": "x", "audio": False})
+    assert stub.last_submit["output_modalities"] == ["video"]
+    r = client.post(
+        "/v1/videos/generations",
+        json={"model": "ltx2_5", "prompt": "x", "image": "data:image/png;base64,AAAA"},
+    )
+    assert r.status_code == 400 and "text-to-video" in r.json()["error"]["message"]
 
 
 def test_chat_stream(client_and_stub):
@@ -578,8 +711,8 @@ def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
 
 
 @pytest.mark.parametrize("ref,message", [
-    ("/etc/passwd", "paths on the server are refused"),
-    ("file:///etc/passwd", "paths on the server are refused"),
+    ("/etc/passwd", "server file paths are refused"),
+    ("file:///etc/passwd", "server file paths are refused"),
     (123, "got int"),
     ({"url": "x"}, "got dict"),
 ])

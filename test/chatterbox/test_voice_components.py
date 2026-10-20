@@ -13,6 +13,9 @@ import numpy as np
 import pytest
 import torch
 
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 chatterbox = pytest.importorskip("chatterbox")
 librosa = pytest.importorskip("librosa")
 from safetensors.torch import load_file  # noqa: E402
