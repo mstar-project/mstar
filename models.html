@@ -298,6 +298,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.html">mstar.model.lingbot_world</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.components.html">mstar.model.lingbot_world.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.config.html">mstar.model.lingbot_world.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
 </ul>
@@ -796,23 +801,33 @@ requests. Apache-2.0.</p></td>
 <td><p>Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
 frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">robbyant/lingbot-world-v2-1.3b-causal-fast</span></code></p></td>
+<td><p>LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
+chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
+A request carries the whole camera trajectory as JSON in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, which the API
+server caps at 1 MiB: about 3,900 frames of <code class="docutils literal notranslate"><span class="pre">[4,</span> <span class="pre">4]</span></code> float32 poses; send <code class="docutils literal notranslate"><span class="pre">[F,</span> <span class="pre">3,</span> <span class="pre">4]</span></code>
+rows for up to the 4,077-frame maximum. Needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>; one rollout per GPU.
+The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
+before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (<code class="docutils literal notranslate"><span class="pre">Robbyant/lingbot-world</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
 <td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
 image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.5-Diffusers</span></code></p></td>
 <td><p>LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
 joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
 stereo audio. Gated; LTX-2.x Community License.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>

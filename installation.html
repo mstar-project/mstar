@@ -298,6 +298,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.html">mstar.model.lingbot_world</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.components.html">mstar.model.lingbot_world.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.lingbot_world.config.html">mstar.model.lingbot_world.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
 </ul>
@@ -630,7 +635,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
 </li>
@@ -744,7 +749,7 @@ Install the matching XPU build of PyTorch.</p></td>
 <td><p>Qwen3-Omni runtime: the BAGEL set plus <code class="docutils literal notranslate"><span class="pre">qwen-omni-utils</span></code>, <code class="docutils literal notranslate"><span class="pre">datasets</span></code>, and
 <code class="docutils literal notranslate"><span class="pre">ninja</span></code> (speeds up the JIT build of the vendored MoE align kernel).
 <strong>Also needs</strong> <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, which is installed separately —
-see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>.</p></td>
+see <a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[orpheus]</span></code></p></td>
 <td><p>Orpheus TTS runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
@@ -783,7 +788,7 @@ from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 Convenient for a machine that serves multiple models; heavier and slower to
 install than a single family’s extra. It excludes the separately installed
 TAEHV, <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> and <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> packages; see below,
-<a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a> and <a class="reference internal" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a>.</p></td>
+<a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a> and <a class="reference internal" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -834,8 +839,8 @@ transport for disaggregated deployments.</p>
 <ul class="simple">
 <li><p><strong>FlashInfer</strong> (<code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>) — paged attention and continuous batching for the
 autoregressive backbones (every model with a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> node runs attention through it).</p></li>
-<li><p><strong>flash-attn</strong> — used by Qwen3-Omni. <strong>Not installed by any extra</strong>; install it separately
-(see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>).</p></li>
+<li><p><strong>flash-attn</strong> — used by Qwen3-Omni and LingBot-World. <strong>Not installed by any extra</strong>; install it separately
+(see <a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a>).</p></li>
 <li><p><strong>flash-attn-4</strong> — Waypoint’s flex-attention <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend. <strong>Not installed by any
 extra</strong>; install it separately (see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>).</p></li>
 <li><p><strong>mooncake-transfer-engine</strong> (0.3.13.post1 or newer) — RDMA tensor transport for
@@ -882,10 +887,10 @@ mstar reads only the speech-tokenizer source files and runs them under transform
 lists them (<code class="docutils literal notranslate"><span class="pre">transformers==4.57.3</span></code>, <code class="docutils literal notranslate"><span class="pre">accelerate==1.12.0</span></code>, <code class="docutils literal notranslate"><span class="pre">gradio</span></code>, <code class="docutils literal notranslate"><span class="pre">sox</span></code> and
 others) as unmet for <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code>; that is expected.</p>
 </section>
-<section id="flash-attn-qwen3-omni">
-<h2>flash-attn (Qwen3-Omni)<a class="headerlink" href="#flash-attn-qwen3-omni" title="Link to this heading">#</a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> is only needed for <strong>Qwen3-Omni</strong>, and it is <strong>not</strong> pulled in by
-<code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code> or <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> — you install it as a separate step. The reason: flash-attn
+<section id="flash-attn-qwen3-omni-lingbot-world">
+<h2>flash-attn (Qwen3-Omni, LingBot-World)<a class="headerlink" href="#flash-attn-qwen3-omni-lingbot-world" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> is only needed for <strong>Qwen3-Omni</strong> and <strong>LingBot-World</strong>, and it is <strong>not</strong> pulled in by
+<code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code>, <code class="docutils literal notranslate"><span class="pre">.[lingbot_world]</span></code> or <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> — you install it as a separate step. The reason: flash-attn
 publishes no wheels on PyPI, so <code class="docutils literal notranslate"><span class="pre">pip</span></code>/<code class="docutils literal notranslate"><span class="pre">uv</span></code> fall back to compiling it from source, which is
 slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build; otherwise
 build from source (see <a class="reference internal" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a> below).</p>
@@ -1194,7 +1199,7 @@ Repeat the swap afterwards.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-tts-qwen3-tts">qwen-tts (Qwen3-TTS)</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
 </li>

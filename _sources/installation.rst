@@ -88,7 +88,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
        ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
        **Also needs** ``flash-attn``, which is installed separately —
-       see `flash-attn (Qwen3-Omni)`_.
+       see `flash-attn (Qwen3-Omni, LingBot-World)`_.
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -119,7 +119,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
        Convenient for a machine that serves multiple models; heavier and slower to
        install than a single family's extra. It excludes the separately installed
        TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
-       `flash-attn (Qwen3-Omni)`_ and `qwen-tts (Qwen3-TTS)`_.
+       `flash-attn (Qwen3-Omni, LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -174,8 +174,8 @@ The GPU model families depend on:
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
-- **flash-attn** — used by Qwen3-Omni. **Not installed by any extra**; install it separately
-  (see `flash-attn (Qwen3-Omni)`_).
+- **flash-attn** — used by Qwen3-Omni and LingBot-World. **Not installed by any extra**; install it separately
+  (see `flash-attn (Qwen3-Omni, LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
@@ -229,11 +229,11 @@ mstar reads only the speech-tokenizer source files and runs them under transform
 lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
 others) as unmet for ``qwen-tts``; that is expected.
 
-flash-attn (Qwen3-Omni)
------------------------
+flash-attn (Qwen3-Omni, LingBot-World)
+--------------------------------------
 
-``flash-attn`` is only needed for **Qwen3-Omni**, and it is **not** pulled in by
-``.[qwen3_omni]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
+``flash-attn`` is only needed for **Qwen3-Omni** and **LingBot-World**, and it is **not** pulled in by
+``.[qwen3_omni]``, ``.[lingbot_world]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
 publishes no wheels on PyPI, so ``pip``/``uv`` fall back to compiling it from source, which is
 slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build; otherwise
 build from source (see `No matching wheel — build from source`_ below).

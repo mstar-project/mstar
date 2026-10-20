@@ -34,6 +34,7 @@
    flux2_klein
    higgs_audio
    kokoro
+   lingbot_world
    loader
    ltx2_5
    media_limits
