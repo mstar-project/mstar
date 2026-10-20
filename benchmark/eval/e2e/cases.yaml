@@ -7,8 +7,11 @@
 # Case drivers:
 #   suite: tts | asr | duplex    the eval suites (`python -m benchmark.eval run <suite>`), on a dataset below
 #   client: <kind>               the `e2e` suite (`run e2e --kind <kind>`): chat_text, chat_image, chat_audio,
-#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames
+#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames,
+#                                world (image to world video along a seeded camera path)
 #   rp: whisper | omni           request-path cases (status codes per request), `--rp` only
+#   rp: cancel_* | timeout_*     cancels mid-transfer (worker-to-worker transport models); a case with
+#                                `server_timeout_s: N` runs on a second server started with `--timeout N`
 #   invariants: chat | speech    served invariants (AGENTS.md), `--rp` only
 #
 # Checks (correctness, head against base; a check fails only when head is worse):
@@ -26,14 +29,29 @@
 # value here).
 #
 # `requires`: what the server needs in the environment, checked in each arm's checkout before any server starts (the
-# model is skipped when both arms lack it): a module to import, or `module:function` to call with no arguments (the
-# server's own loader, for a package it loads without importing it).
+# model is skipped when both arms lack it): a module to import, `module:function` to call with no arguments (the
+# server's own loader, for a package it loads without importing it), or `rdma_nic` for an RDMA device on the host.
+#
+# Quality (`quality: [...]`, next to the check): each arm's saved c=1 outputs scored on their own after both servers
+# stop (e2e/quality.py). A case fails when head's mean score is below base's by more than 1.5x the row's A/A swing,
+# and never by less than the floor:
+#   mos          UTMOS22 predicted MOS of the speech (floor 0.1)
+#   speaker_sim  WavLM speaker similarity to the item's reference clip, voice-clone cases (floor 0.02)
+#   clip         CLIP score (openai/clip-vit-base-patch32) of the image or sampled video frames against the prompt
+#                (floor 0.5 points)
+# A psnr or text_match failure with every quality score holding reads "changed, quality same" and is not flagged.
 #
 # Perf: `latency` is the c=1 metric (lower is better), `throughput` the c=max metric (higher is better), `extra` are
 # shown in the details. A delta is a regression when it is worse than perf_pct, beyond noise_sigma combined standard
 # deviations of the passes, and beyond the row's A/A noise floor (calibration.yaml).
 #
-# `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first.
+# `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first. `gpus` (default 1) is how many
+# GPUs of one host serve the model; `case_timeout_s` caps each case's wall time (a case past it has hung).
+#
+# `stress` (optional): the model takes `compare --stress`, a pinned-id text workload on streamed `/generate`
+# (benchmark/eval/e2e/stress.py); `model_kwargs` are added to every request, `max_tokens` caps replies (64).
+#
+# `health: true` checks the server after each case (processes, /dev/shm, crash lines in its log; arm.health_after).
 
 defaults:
   conc: [1, 8]
@@ -67,6 +85,7 @@ models:
         data: tts
         args: [--voice, af_heart, --seed, "0"]
         check: {kind: wer, max_increase: 1.5}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, req_per_s]}
       - id: invariants
         modality: served invariants
@@ -87,6 +106,7 @@ models:
         data: tts
         args: [--seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
       - id: clone
         modality: tts (voice clone)
@@ -94,6 +114,7 @@ models:
         data: clone
         args: [--clone, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
 
   orpheus:
@@ -108,6 +129,7 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   omnivoice:
@@ -123,6 +145,7 @@ models:
         data: tts
         args: [--seed, "0"]
         check: {kind: wer, max_increase: 1.5}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
       - id: clone_upload
         modality: tts (clone, /generate upload)
@@ -130,6 +153,7 @@ models:
         data: clone
         n: 24
         check: {kind: audio_len, pct: 10}
+        quality: [mos, speaker_sim]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   qwen3_tts:
@@ -148,6 +172,7 @@ models:
         data: tts
         args: [--voice, vivian, --language, English, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   # ---------------- speech in ----------------
@@ -233,6 +258,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
       - id: decode_fixed
         modality: text (fixed 256-token reply)
@@ -258,6 +284,7 @@ models:
     family: LLM
     tags: [llm, text, image-in, small]
     est_min: 6
+    stress: {model_kwargs: {enable_thinking: false}}
     cases:
       - id: text
         modality: text
@@ -332,6 +359,7 @@ models:
         conc: [1]
         args: [--size, 512x512, --extra, num_timesteps=25]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   # ---------------- image and video generation ----------------
@@ -347,6 +375,7 @@ models:
         n: 8
         args: [--size, 1024x1024]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   wan22:
@@ -364,6 +393,7 @@ models:
         warmup: 1
         args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
       - id: i2v
         modality: image to video
@@ -374,6 +404,7 @@ models:
         warmup: 1
         args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   cosmos3_edge:
@@ -388,6 +419,7 @@ models:
         n: 4
         args: [--size, 640x640]
         check: {kind: psnr, min_db: 25}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
       - id: chat_image
         modality: image in
@@ -449,6 +481,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   orpheus_mooncake:
@@ -466,7 +499,441 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  # ---------------- multi-GPU configs (optional) ----------------
+  # Tensor parallel, sequence parallel, split and disaggregated deployments: `gpus` GPUs of one host serve both arms
+  # (ranks 0..gpus-1 of the config are the job's GPUs in order). The TP configs run c=16, the load that hung TP 2 in
+  # #332. A case still running after `case_timeout_s` has hung: its server's Python stacks are saved, head hanging
+  # fails the row, base hanging reports it broken. Not in `all`: select with `tag:multi-gpu` or by name.
+  whisper_large_tp2:     # encoder on rank 0; decoder TP 2 on ranks 0, 1
+    serve: whisper_large
+    config: configs/whisper_large_tp2.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: ASR
+    tags: [multi-gpu, tp, asr, speech-in, multipart, sse]
+    est_min: 8
+    conc: [1, 16]
+    cases:
+      - id: upload
+        modality: asr (multipart upload, TP 2)
+        suite: asr
+        data: asr
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: e2e_s_p50, throughput: req_per_s, extra: [rtfx]}
+      - id: sse
+        modality: asr (SSE stream, TP 2)
+        suite: asr
+        data: asr
+        args: [--stream]
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: first_text_s_p50, throughput: req_per_s, extra: [e2e_s_p50]}
+
+  qwen3omni_thinker_tp2:   # Thinker TP 2 on ranks 0, 1; encoders on 0; Talker and Code2Wav on 2
+    serve: qwen3_omni
+    config: configs/qwen3omni_thinker_tp2.yaml
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    family: Omni
+    tags: [multi-gpu, tp, omni, image-in, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 16
+    conc: [1, 16]
+    cases:
+      - id: text
+        modality: text (Thinker TP 2)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in (Thinker TP 2)
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (Thinker TP 2)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        quality: [mos]
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  cosmos3_nano_sp2:      # DiT Ulysses SP 2 on ranks 0, 1; VAE and audio decoder on 0
+    serve: cosmos3
+    config: configs/cosmos3_nano_sp2.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: World
+    tags: [multi-gpu, sp, world, image-gen]
+    est_min: 12
+    cases:
+      - id: t2i
+        modality: image gen 640px (DiT SP 2)
+        client: image
+        n: 4
+        conc: [1]
+        args: [--size, 640x640]
+        check: {kind: psnr, min_db: 25}
+        quality: [clip]
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  qwen3tts_1p7b_split:   # Talker on rank 0, codec on rank 1, both on GPU 0 (the config's rank_devices)
+    serve: qwen3_tts_1p7b
+    config: configs/qwen3tts_1p7b_split.yaml
+    optional: true
+    gpus: 1
+    case_timeout_s: 900
+    family: TTS
+    tags: [multi-gpu, split, tts, speech-out, ar]
+    requires: ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes"]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts (Talker and codec split)
+        suite: tts
+        data: tts
+        args: [--voice, vivian, --language, English, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  orpheus_pd_disaggregated:   # LLM prefill on rank 0, decode on rank 1; SNAC on 0
+    serve: orpheus
+    config: configs/orpheus_pd_disaggregated.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: TTS
+    tags: [multi-gpu, disaggregated, tts, speech-out, ar]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts (prefill and decode disaggregated)
+        suite: tts
+        data: tts
+        args: [--voice, tara, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  qwen3omni_pd_disaggregated:   # encoders, Code2Wav and Thinker prefill on rank 0; decode on 1; Talker on 2
+    serve: qwen3_omni
+    config: configs/qwen3omni_pd_disaggregated.yaml
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    family: Omni
+    tags: [multi-gpu, disaggregated, omni, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 16
+    cases:
+      - id: text
+        modality: text (prefill and decode disaggregated)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (prefill and decode disaggregated)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        quality: [mos]
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  # ---------------- newer models (optional until their PRs are on main) ----------------
+  # Each adds an engine path none of the models above covers (#577). Base must serve the model too, so these stay
+  # optional (out of `all`, select with `tag:new-model` or by name) until the model's PR is on main; until then
+  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. No entry yet for
+  # Fish S2-Pro (#491: its PR #492 is closed) or MiniCPM-o (#382 serves it on /generate only, with no chat adapter).
+  cosyvoice3:            # #495: speech codes streamed into a flow-matching decoder at 24 kHz; clone from an upload
+    serve: cosyvoice3
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile]
+    est_min: 8
+    cases:
+      - id: clone
+        modality: tts (voice clone, streamed)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, sim_mean]}
+
+  voxcpm2:               # #496: tokenizer-free latent patches; 48 kHz streamed audio
+    serve: voxcpm2
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile, soxr]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: clone
+        modality: tts (voice clone)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
+      - id: design
+        modality: tts (voice design)
+        suite: tts
+        data: tts
+        args: [--instructions, "A calm, warm female voice speaking at a moderate pace", --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
+
+  omnilingual_asr_ctc_300m:   # #515: CTC (non-autoregressive) ASR, no decode loop
+    serve: omnilingual_asr_ctc_300m
+    optional: true
+    family: ASR
+    tags: [new-model, asr, speech-in, multipart, small]
+    est_min: 4
+    conc: [1, 16]
+    cases:
+      - id: upload
+        modality: asr (multipart upload)
+        suite: asr
+        data: asr
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: e2e_s_p50, throughput: req_per_s, extra: [rtfx]}
+
+  lingbot_world_1_3b:    # #455: rolling sink plus window K/V inside a rollout loop; chunked video stream
+    serve: lingbot_world_1_3b
+    optional: true
+    family: World
+    tags: [new-model, world, frames, image-in, streaming]
+    requires: [ftfy, scipy, flash_attn]
+    est_min: 10
+    cases:
+      - id: world
+        modality: image to world, seeded camera path
+        client: world
+        n: 4
+        conc: [1]
+        repeats: 2
+        warmup: 1
+        check: {kind: psnr, min_db: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  # ---------------- worker-to-worker transport (optional) ----------------
+  # The split and disaggregated configs above move tensors between worker processes. Each runs here over shared
+  # memory (`_shm`), Mooncake TCP (`_tcp`, `--tensor-comm-protocol TCP`) and Mooncake RDMA (`_rdma`, skipped on a
+  # host without an RDMA device), with the multi-GPU cases plus two that cancel mid-transfer: `cancel` drops a
+  # stream after 3 chunks and after 1.5 s; `timeout` runs on a second server whose `--timeout` is shorter than one
+  # of its requests (#572's trigger). After every case `health` checks the server: its processes still alive, no
+  # mstar /dev/shm entry left behind, no crash or transfer-failure line in its log. A finding head has and base
+  # does not fails the row; base crashing reports it broken. Not in `all`: `tag:w2w` selects SHM and TCP (both also
+  # carry `transport`, with the Mooncake variants above), `tag:rdma` the RDMA ones. `tag:mooncake` stays the two
+  # one-worker entries above, so `--models all,tag:mooncake` does not pull in the 2- and 3-GPU entries.
+  qwen3tts_1p7b_split_shm:
+    serve: qwen3_tts_1p7b
+    config: configs/qwen3tts_1p7b_split.yaml
+    optional: true
+    gpus: 1
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [w2w, transport, shm, split, tts, speech-out, ar]
+    requires: ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes"]
+    est_min: 12
+    cases: &qwen3tts_split_w2w
+      - id: tts
+        modality: tts (Talker and codec split)
+        suite: tts
+        data: tts
+        args: [--voice, vivian, --language, English, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: cancel
+        modality: speech stream dropped mid-transfer
+        rp: cancel_speech
+        args: [--voice, vivian]
+        check: {kind: status_match}
+      - id: timeout
+        modality: speech timed out by the server mid-transfer
+        rp: timeout_speech
+        server_timeout_s: 5
+        args: [--voice, vivian]
+        check: {kind: status_match}
+
+  qwen3tts_1p7b_split_tcp:
+    serve: qwen3_tts_1p7b
+    config: configs/qwen3tts_1p7b_split.yaml
+    serve_args: [--tensor-comm-protocol, TCP]
+    optional: true
+    gpus: 1
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [w2w, transport, split, tts, speech-out, ar]
+    requires: ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes", mooncake.engine]
+    est_min: 12
+    cases: *qwen3tts_split_w2w
+
+  qwen3tts_1p7b_split_rdma:
+    serve: qwen3_tts_1p7b
+    config: configs/qwen3tts_1p7b_split.yaml
+    serve_args: [--tensor-comm-protocol, RDMA]
+    optional: true
+    gpus: 1
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [rdma, split, tts, speech-out, ar]
+    requires: ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes", mooncake.engine, rdma_nic]
+    est_min: 12
+    cases: *qwen3tts_split_w2w
+
+  orpheus_pd_disaggregated_shm:
+    serve: orpheus
+    config: configs/orpheus_pd_disaggregated.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [w2w, transport, shm, disaggregated, tts, speech-out, ar]
+    est_min: 12
+    cases: &orpheus_pd_w2w
+      - id: tts
+        modality: tts (prefill and decode disaggregated)
+        suite: tts
+        data: tts
+        args: [--voice, tara, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: cancel
+        modality: speech stream dropped mid-transfer
+        rp: cancel_speech
+        args: [--voice, tara]
+        check: {kind: status_match}
+      - id: timeout
+        modality: speech timed out by the server mid-transfer
+        rp: timeout_speech
+        server_timeout_s: 5
+        args: [--voice, tara]
+        check: {kind: status_match}
+
+  orpheus_pd_disaggregated_tcp:
+    serve: orpheus
+    config: configs/orpheus_pd_disaggregated.yaml
+    serve_args: [--tensor-comm-protocol, TCP]
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [w2w, transport, disaggregated, tts, speech-out, ar]
+    requires: [mooncake.engine]
+    est_min: 12
+    cases: *orpheus_pd_w2w
+
+  orpheus_pd_disaggregated_rdma:
+    serve: orpheus
+    config: configs/orpheus_pd_disaggregated.yaml
+    serve_args: [--tensor-comm-protocol, RDMA]
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    health: true
+    family: TTS
+    tags: [rdma, disaggregated, tts, speech-out, ar]
+    requires: [mooncake.engine, rdma_nic]
+    est_min: 12
+    cases: *orpheus_pd_w2w
+
+  qwen3omni_pd_disaggregated_shm:
+    serve: qwen3_omni
+    config: configs/qwen3omni_pd_disaggregated.yaml
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    health: true
+    family: Omni
+    tags: [w2w, transport, shm, disaggregated, omni, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 18
+    cases: &qwen3omni_pd_w2w
+      - id: text
+        modality: text (prefill and decode disaggregated)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (prefill and decode disaggregated)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        quality: [mos]
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: cancel
+        modality: chat stream (text and speech) dropped mid-transfer
+        rp: cancel_chat
+        check: {kind: status_match}
+      - id: timeout
+        modality: chat (text and speech) timed out by the server mid-transfer
+        rp: timeout_chat
+        server_timeout_s: 5
+        check: {kind: status_match}
+
+  qwen3omni_pd_disaggregated_tcp:
+    serve: qwen3_omni
+    config: configs/qwen3omni_pd_disaggregated.yaml
+    serve_args: [--tensor-comm-protocol, TCP]
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    health: true
+    family: Omni
+    tags: [w2w, transport, disaggregated, omni, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread, mooncake.engine]
+    est_min: 18
+    cases: *qwen3omni_pd_w2w
+
+  qwen3omni_pd_disaggregated_rdma:
+    serve: qwen3_omni
+    config: configs/qwen3omni_pd_disaggregated.yaml
+    serve_args: [--tensor-comm-protocol, RDMA]
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    health: true
+    family: Omni
+    tags: [rdma, disaggregated, omni, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread, mooncake.engine, rdma_nic]
+    est_min: 18
+    cases: *qwen3omni_pd_w2w
 
   # ---------------- robotics ----------------
   pi05:

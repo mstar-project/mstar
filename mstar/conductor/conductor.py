@@ -14,7 +14,12 @@ import numpy as np
 import torch
 import yaml
 
-from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestFailed
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    ConductorStatus,
+    RequestComplete,
+    RequestFailed,
+)
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -29,6 +34,8 @@ from mstar.distributed.communication import GlobalParallelConfig, WorkerParallel
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.observability import catalog
+from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
@@ -179,8 +186,10 @@ def _worker_process_target(
     log_level: str = "INFO",
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    """Top-level target for spawned worker processes. Must be module-level for
+    picklability. ``status_interval_s`` turns on the worker's metrics."""
     # before anything in this process touches the device runtime
     apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
@@ -228,6 +237,7 @@ def _worker_process_target(
             device=torch.device(device),
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            status_interval_s=status_interval_s,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -272,6 +282,9 @@ class RequestData:
     # stamped.
     conductor_ingest_time: float = 0.0
     conductor_finish_time: float = 0.0
+    # when the conductor took it in (queued, or admitted on arrival); None
+    # unless metrics are on
+    conductor_arrival_time: float | None = None
     graph_timings: GraphTimings = field(default_factory=dict)
     # Tensor-transport profiling merged across workers. Keyed so repeated
     # WorkerGraphsDone updates (cumulative per worker) replace rather than
@@ -331,6 +344,10 @@ def _message_request_ids(message) -> list[str | None]:
 
 
 class Conductor:
+    # Metrics are off unless __init__ gets an interval; class-level so an
+    # object built without __init__ reads them as off too.
+    _status_interval_s: float | None = None
+
     def __init__(
         self,
         model: Model,
@@ -341,7 +358,8 @@ class Conductor:
         enable_prof: bool = False,
         log_level: str = "INFO",
         tensor_comm_protocol=CommProtocol.RDMA,
-        tcp_transfer_device=""
+        tcp_transfer_device="",
+        status_interval_s: float | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
@@ -484,6 +502,21 @@ class Conductor:
         # don't collide on a hard-coded port.
         self._dist_init_port = _pick_free_tcp_port()
         self._dist_init_method = f"tcp://{hostname}:{self._dist_init_port}"
+
+        # Metrics: with an interval, the run loop sends the API server a
+        # ConductorStatus that often (see _maybe_send_status).
+        self._status_interval_s = status_interval_s
+        self._next_status = 0.0
+        # request id -> when it was queued at capacity
+        self._queued_since: dict[str, float] = {}
+        self._wg_nodes = {
+            wg_id: tuple(wg.section.get_nodes()) for wg_id, wg in self.worker_graphs.items()
+        }
+        self._components = sorted({n for nodes in self._wg_nodes.values() for n in nodes})
+        self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
+        self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        # worker id -> its latest WorkerStatus snapshots (cumulative)
+        self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
@@ -633,7 +666,8 @@ class Conductor:
                     "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
+                    "tcp_transfer_device": self.tcp_transfer_device,
+                    "status_interval_s": self._status_interval_s,
                 },
                 daemon=False,
             )
@@ -973,6 +1007,8 @@ class Conductor:
                 self.max_concurrent_requests,
             )
             self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since[body.request_id] = time.perf_counter()
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
@@ -1032,6 +1068,11 @@ class Conductor:
         """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
+        # A request admitted on arrival never waited.
+        arrival_time = (
+            None if self._status_interval_s is None
+            else self._queued_since.pop(body.request_id, ingest_time)
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers()
 
         model_kwargs = body.model_kwargs or {}
@@ -1090,6 +1131,7 @@ class Conductor:
             resource_configs={},
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
+            conductor_arrival_time=arrival_time,
         )
         self.requests[body.request_id] = request_data
 
@@ -1375,6 +1417,8 @@ class Conductor:
                 # Queued, never dispatched: the preprocess worker is the only
                 # holder of its (persisted) input signals, so hard-remove there.
                 self.waiting_queue.pop(i)
+                if self._status_interval_s is not None:
+                    self._queued_since.pop(request_id, None)
                 self._early_reads_done.pop(request_id, None)
                 self._send_remove_to_preprocess_worker(request_id)
                 logger.info("Aborted request %s before admission", request_id)
@@ -1453,6 +1497,7 @@ class Conductor:
                     graph_timings=request_data.graph_timings,
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
+                    conductor_arrival_time=request_data.conductor_arrival_time,
                 )
             )
         )
@@ -1784,6 +1829,15 @@ class Conductor:
             self._fail_requests(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.WORKER_STATUS:
+            self._worker_metrics[message.body.worker_id] = message.body.metrics
+        elif message.message_type == ConductorMessageType.ENABLE_METRICS:
+            # Every rank: each counts the tensors it reads. Sent before any
+            # message of a request the API server submits after its warmups.
+            for worker_id in self.worker_ids:
+                self.communicator.send(worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
+                ))
         elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
             rid = message.body.request_id
             # Draining requests linger in self.requests (concurrency
@@ -1828,6 +1882,53 @@ class Conductor:
             )
         except Exception:
             logger.exception("Could not fail request %s", request_id)
+
+    def _maybe_send_status(self) -> None:
+        """Send the API server a ConductorStatus once per status interval.
+        The gauges are sampled here rather than kept up to date per message."""
+        now = time.perf_counter()
+        if now < self._next_status:
+            return
+        self._next_status = now + self._status_interval_s
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(message_type="conductor_status", body=self._status()),
+        )
+
+    def _status(self) -> ConductorStatus:
+        running = 0
+        in_flight = dict.fromkeys(self._components, 0)
+        for request_id, request_data in self.requests.items():
+            if request_id in self.draining:
+                continue
+            running += 1
+            # wgs of this request's current passes that have not reported back
+            nodes = set()
+            for pstate in request_data.partition_states.values():
+                if pstate.is_done:
+                    continue
+                for wg_id in pstate.current_worker_graph_ids - pstate.completed_worker_graph_ids:
+                    nodes.update(self._wg_nodes[wg_id])
+            for node in nodes:
+                in_flight[node] += 1
+        states = self._requests_gauge
+        states.set(("waiting",), len(self.waiting_queue))
+        states.set(("running",), running)
+        states.set(("draining",), len(self.draining))
+        for node, count in in_flight.items():
+            self._in_flight_gauge.set((node,), count)
+        # Summed across workers: a node's replicas each report their own; for
+        # the engine families the other ranks of a lockstep instance report
+        # nothing, while every rank counts the tensor transfers it reads.
+        by_family: dict[str, list[MetricSnapshot]] = {}
+        for snapshots in self._worker_metrics.values():
+            for snap in snapshots:
+                by_family.setdefault(snap.name, []).append(snap)
+        return ConductorStatus(metrics=[
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            *(merge(family, by_family.get(name, ()))
+              for name, family in catalog.WORKER_FAMILIES.items()),
+        ])
 
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
@@ -1887,6 +1988,8 @@ class Conductor:
                             self._fail_after_error(request_id, "completing it", exc)
 
                 self._sweep_expiry()
+                if self._status_interval_s is not None:
+                    self._maybe_send_status()
 
             except Exception:
                 logger.exception("Conductor error in main loop")

@@ -265,12 +265,20 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - unset
      - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
        ``--api-key`` overrides it). When set, every route except
-       ``/health`` needs ``Authorization: Bearer <key>``, WebSocket
+       ``/health`` and ``/metrics`` needs ``Authorization: Bearer <key>``, WebSocket
        handshakes included; unset or empty turns the check off. The
        launcher passes it on to the Rust frontend only (the conductor and
        workers do not inherit it), and
        :class:`mstar.client.MStarClient` sends it when not given
        ``api_key``. See :ref:`api-key`.
+   * - ``MSTAR_SILERO_VAD_PATH``
+     - unset
+     - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
+       ``server_vad`` turn detection, read by
+       ``realtime_vad.silero_weights``. Unset, the copy bundled with the
+       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       with a file whose inputs or outputs differ (the package's other
+       exports), ``server_vad`` sessions are refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------
@@ -293,7 +301,7 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
-       once at startup): every route except ``/health`` needs
+       once at startup): every route except ``/health`` and ``/metrics`` needs
        ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
@@ -311,7 +319,7 @@ Read by the ``mstar-server`` binary and its bridge
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
-       ``/health`` and ``/v1/models`` bypass the cap.
+       ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
