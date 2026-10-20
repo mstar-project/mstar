@@ -1,0 +1,483 @@
+# Models `python -m benchmark.eval compare` serves, what it sends per modality, and how it judges each case.
+#
+# Each model is served once per arm (base, head) on the same GPU, back to back. Every case runs against that server
+# at each concurrency in `conc` with `repeats` measured passes (mean +- sample std over the passes), after `warmup`
+# untimed waves at that concurrency.
+#
+# Case drivers:
+#   suite: tts | asr | duplex    the eval suites (`python -m benchmark.eval run <suite>`), on a dataset below
+#   client: <kind>               the `e2e` suite (`run e2e --kind <kind>`): chat_text, chat_image, chat_audio,
+#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames
+#   rp: whisper | omni           request-path cases (status codes per request), `--rp` only
+#   invariants: chat | speech    served invariants (AGENTS.md), `--rp` only
+#
+# Checks (correctness, head against base; a check fails only when head is worse):
+#   text_match   share of c=1 outputs identical to base's >= min_match, or close: median similarity >= 0.6 and
+#                median length ratio 0.8 to 1.25 (greedy decoding can fork at a near-tie between processes)
+#   wer          head WER <= base WER + max_increase (percentage points); TTS round trip or ASR
+#   psnr         every seeded c=1 output's PSNR against base's >= min_db (images, video, streamed frames)
+#   action_diff  max |head - base| over the c=1 action outputs <= tol
+#   status_match same status code (and identity flags) per request-path case
+#   duplex       take-turn and yield rates within tol of base
+#   audio_len    total c=1 audio seconds within pct of base
+# Every check also fails when head has more request errors than base, or answered no request at a session and
+# concurrency where base answered some; a base that answered none there leaves the row without a verdict.
+# `compare calibrate` widens a limit that two processes of identical code already cross (never tighter than the
+# value here).
+#
+# `requires`: what the server needs in the environment, checked in each arm's checkout before any server starts (the
+# model is skipped when both arms lack it): a module to import, or `module:function` to call with no arguments (the
+# server's own loader, for a package it loads without importing it).
+#
+# Perf: `latency` is the c=1 metric (lower is better), `throughput` the c=max metric (higher is better), `extra` are
+# shown in the details. A delta is a regression when it is worse than perf_pct, beyond noise_sigma combined standard
+# deviations of the passes, and beyond the row's A/A noise floor (calibration.yaml).
+#
+# `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first.
+
+defaults:
+  conc: [1, 8]
+  repeats: 3
+  warmup: 2
+  startup_timeout_s: 1800
+  est_min: 10
+  thresholds:
+    perf_pct: 5
+    noise_sigma: 2
+
+# Inputs, relative to the directory `python -m benchmark.eval data e2e --out DIR` builds.
+datasets:
+  tts: tts/manifest.jsonl          # 24 Seed-TTS English target sentences
+  clone: clone/manifest.jsonl      # the same 24 with their Seed-TTS reference clips
+  asr: asr/manifest.jsonl          # 100 LibriSpeech test-clean clips
+  duplex: duplex/manifest.jsonl    # turn-taking and barge-in clips composed from the ASR set
+
+models:
+  # ---------------- speech out ----------------
+  kokoro:
+    serve: kokoro
+    family: TTS
+    tags: [tts, speech-out, small]
+    requires: [misaki, spacy, en_core_web_sm]
+    est_min: 4
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--voice, af_heart, --seed, "0"]
+        check: {kind: wer, max_increase: 1.5}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, req_per_s]}
+      - id: invariants
+        modality: served invariants
+        invariants: speech
+        optional: true
+        check: {kind: status_match}
+
+  chatterbox:
+    serve: chatterbox
+    family: TTS
+    tags: [tts, speech-out, clone]
+    requires: [perth, pyloudnorm]
+    est_min: 9
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: clone
+        modality: tts (voice clone)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
+
+  orpheus:
+    serve: orpheus
+    family: TTS
+    tags: [tts, speech-out, ar]
+    est_min: 8
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--voice, tara, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  omnivoice:
+    serve: omnivoice
+    family: TTS
+    tags: [tts, speech-out, clone, multipart]
+    requires: [omnivoice.models.omnivoice_flashinfer]
+    est_min: 7
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 1.5}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
+      - id: clone_upload
+        modality: tts (clone, /generate upload)
+        client: gen_clone
+        data: clone
+        n: 24
+        check: {kind: audio_len, pct: 10}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  qwen3_tts:
+    serve: qwen3_tts
+    config: configs/qwen3tts.yaml
+    family: TTS
+    tags: [tts, speech-out, ar]
+    # The server loads qwen-tts' codec files through its own loader (with a transformers 5.x shim); `import
+    # qwen_tts` raises under transformers 5.x, so it is not the check.
+    requires: ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes"]
+    est_min: 9
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--voice, vivian, --language, English, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  # ---------------- speech in ----------------
+  whisper_large:
+    serve: whisper_large
+    family: ASR
+    tags: [asr, speech-in, multipart, sse, small]
+    est_min: 6
+    cases:
+      - id: upload
+        modality: asr (multipart upload)
+        suite: asr
+        data: asr
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: e2e_s_p50, throughput: req_per_s, extra: [rtfx]}
+      - id: sse
+        modality: asr (SSE stream)
+        suite: asr
+        data: asr
+        args: [--stream]
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: first_text_s_p50, throughput: req_per_s, extra: [e2e_s_p50]}
+      - id: request_path
+        modality: request path
+        rp: whisper
+        optional: true
+        check: {kind: status_match}
+
+  nemotron_duplex:
+    serve: nemotron_duplex
+    family: Duplex
+    tags: [duplex, speech-in, speech-out, websocket]
+    est_min: 12
+    cases:
+      - id: duplex
+        modality: duplex
+        suite: duplex
+        data: duplex
+        warmup: 1
+        check: {kind: duplex, tol: 0.15}
+        perf: {latency: wall_ms_per_frame_p50, throughput: frames_per_s, extra: [response_latency_s_p50, take_turn_rate]}
+
+  # ---------------- omni: text, image, audio, video in; speech out ----------------
+  qwen3_omni:
+    serve: qwen3_omni
+    config: configs/qwen3omni_colocated.yaml
+    family: Omni
+    tags: [omni, llm, text, image-in, audio-in, video-in, speech-out, sse, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 16
+    cases:
+      - id: text
+        modality: text
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_in
+        modality: audio in
+        client: chat_audio
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: video_in
+        modality: video in
+        client: chat_video
+        n: 8
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (SSE)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: decode_fixed
+        modality: text (fixed 256-token reply)
+        client: chat_count
+        n: 8
+        args: [--max-tokens, "256"]
+        check: {kind: text_match, min_match: 0.75}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: request_path
+        modality: request path
+        rp: omni
+        optional: true
+        check: {kind: status_match}
+      - id: invariants
+        modality: served invariants
+        invariants: chat
+        optional: true
+        check: {kind: status_match}
+
+  qwen3_5_2b:
+    serve: qwen3_5_2b
+    config: configs/qwen3_5_2b.yaml
+    family: LLM
+    tags: [llm, text, image-in, small]
+    est_min: 6
+    cases:
+      - id: text
+        modality: text
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96", --extra, enable_thinking=false]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "96", --extra, enable_thinking=false]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: invariants
+        modality: served invariants
+        invariants: chat
+        optional: true
+        check: {kind: status_match}
+
+  qwen3_omni_rustfe:
+    serve: qwen3_omni
+    config: configs/qwen3omni_colocated.yaml
+    serve_args: [--rust-frontend, --rust-frontend-bin, "{rust_server_bin}"]
+    env: {MSTAR_ALLOW_REMOTE: "1"}
+    family: Omni
+    tags: [omni, rust-frontend, image-in, sse, big]
+    requires: [flash_attn, qwen_omni_utils]
+    est_min: 14
+    cases:
+      - id: text
+        modality: text (Rust frontend)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "64"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in (Rust frontend)
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "64"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  bagel:
+    serve: bagel
+    config: configs/bagel_single_gpu.yaml
+    family: Omni
+    tags: [llm, image-in, image-gen, big]
+    est_min: 15
+    cases:
+      - id: text
+        modality: text
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in
+        client: chat_image
+        n: 8
+        args: [--max-tokens, "64"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: t2i
+        modality: image gen 512px
+        client: image
+        n: 4
+        conc: [1]
+        args: [--size, 512x512, --extra, num_timesteps=25]
+        check: {kind: psnr, min_db: 30}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  # ---------------- image and video generation ----------------
+  z_image_turbo:
+    serve: z_image_turbo
+    family: Image
+    tags: [image-gen, diffusion]
+    est_min: 6
+    cases:
+      - id: t2i
+        modality: image gen 1024px
+        client: image
+        n: 8
+        args: [--size, 1024x1024]
+        check: {kind: psnr, min_db: 30}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  wan22:
+    serve: wan22
+    family: Video
+    tags: [video-gen, diffusion, image-in]
+    requires: [cv2]
+    est_min: 14
+    cases:
+      - id: t2v
+        modality: video gen 832x480x33
+        client: video
+        n: 8
+        repeats: 2
+        warmup: 1
+        args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
+        check: {kind: psnr, min_db: 30}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+      - id: i2v
+        modality: image to video
+        client: video_i2v
+        n: 2
+        conc: [1]
+        repeats: 2
+        warmup: 1
+        args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
+        check: {kind: psnr, min_db: 30}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  cosmos3_edge:
+    serve: cosmos3_edge
+    family: World
+    tags: [world, image-gen, image-in, llm]
+    est_min: 12
+    cases:
+      - id: t2i
+        modality: image gen 640px
+        client: image
+        n: 4
+        args: [--size, 640x640]
+        check: {kind: psnr, min_db: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+      - id: chat_image
+        modality: image in
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "64"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  waypoint_360p:
+    serve: waypoint
+    config: configs/waypoint_360p.yaml
+    family: World
+    tags: [world, frames, image-in, streaming]
+    requires: [taehv]
+    est_min: 10
+    cases:
+      - id: frames
+        modality: streamed frames 640x360
+        client: frames
+        n: 4
+        conc: [1]
+        args: [--size, 640x360]
+        check: {kind: psnr, min_db: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  # ---------------- Mooncake transport (optional) ----------------
+  # The same models with tensors moved by Mooncake's TransferEngine over TCP (`--tensor-comm-protocol TCP`, loopback
+  # on one host) instead of shared memory: the API server's preprocess and result path to and from the worker (image
+  # and audio in, streamed speech out). Both configs keep every node in one worker process, so worker-to-worker hops
+  # are not covered. Not in `all`: select with `tag:mooncake` or by name.
+  qwen3_omni_mooncake:
+    serve: qwen3_omni
+    config: configs/qwen3omni_colocated.yaml
+    serve_args: [--tensor-comm-protocol, TCP]
+    optional: true
+    family: Omni
+    tags: [mooncake, transport, omni, image-in, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, mooncake.engine]
+    est_min: 10
+    cases:
+      - id: text
+        modality: text (Mooncake TCP)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in (Mooncake TCP)
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (Mooncake TCP)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  orpheus_mooncake:
+    serve: orpheus
+    serve_args: [--tensor-comm-protocol, TCP]
+    optional: true
+    family: TTS
+    tags: [mooncake, transport, tts, speech-out, ar]
+    requires: [mooncake.engine]
+    est_min: 8
+    cases:
+      - id: tts
+        modality: tts (Mooncake TCP)
+        suite: tts
+        data: tts
+        args: [--voice, tara, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  # ---------------- robotics ----------------
+  pi05:
+    serve: pi05
+    family: VLA
+    tags: [vla, image-in, actions, multipart, small]
+    est_min: 4
+    cases:
+      - id: act
+        modality: VLA actions
+        client: pi05
+        n: 16
+        check: {kind: action_diff, tol: 0.05}
+        perf: {latency: lat_p50_s, throughput: req_per_s}

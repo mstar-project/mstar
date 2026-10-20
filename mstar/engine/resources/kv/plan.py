@@ -156,60 +156,58 @@ class PinnedIndexRing:
     hands FlashInfer, so its ``copy_(non_blocking=True)`` calls are really
     asynchronous (from pageable memory the driver stages each one).
 
-    ``take`` fills the next buffer and returns a view of it. A buffer is
-    rewritten only after the copies out of it have completed: the stream a
-    plan ran on records an event when the next ``take`` happens on that
-    stream (by then the plan's copies were issued), and a slot waits on its
-    event before reuse. Plans do not overlap, so one pending slot suffices.
-    Without CUDA the buffers are plain tensors and nothing is recorded.
+    The ring holds ``depth`` buffer sets, one per plan. ``begin_plan`` moves to
+    the next set, and each ``take`` until the next ``begin_plan`` fills a buffer
+    of that set no other take uses (the set grows if needed), so every label
+    of a plan keeps its arrays (four takes each) however many labels there
+    are. A set is rewritten only after the copies out of it have completed:
+    the next ``begin_plan`` records an event on the stream the plan ran on (by
+    then the plan's copies, and its consumers', were issued), and a set waits
+    on its event before reuse. Plans do not overlap, so one pending set
+    suffices. Without CUDA the buffers are plain tensors and nothing is
+    recorded.
     """
 
-    def __init__(self, numel: int = 4096, depth: int = 8):
+    def __init__(self, numel: int = 4096, depth: int = 2, per_plan: int = 4):
         self._depth = depth
-        self._numel = 0
+        self._numel = max(numel, 256)
         self._pinned = torch.cuda.is_available()
-        self._bufs: list[torch.Tensor] = []
+        self._sets: list[list[torch.Tensor]] = [
+            [self._alloc(self._numel) for _ in range(per_plan)] for _ in range(depth)
+        ]
         self._events: list = [None] * depth
         self._streams: list = [None] * depth
-        self._next = 0
-        self._last: int | None = None
-        self._grow(numel)
+        self._set = 0
+        self._used = 0
 
-    def _grow(self, numel: int) -> None:
-        numel = max(numel, self._numel * 2, 256)
-        self._bufs = [
-            torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
-            for _ in range(self._depth)
-        ]
-        self._numel = numel
+    def _alloc(self, numel: int) -> torch.Tensor:
+        return torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
+
+    def begin_plan(self) -> None:
+        cur = self._set
+        nxt = (cur + 1) % self._depth
+        if self._pinned:
+            if self._streams[cur] is not None:
+                ev = self._events[cur] or torch.cuda.Event()
+                self._events[cur] = ev
+                ev.record(self._streams[cur])
+            ev = self._events[nxt]
+            if ev is not None:
+                ev.synchronize()
+            self._streams[nxt] = torch.cuda.current_stream()
+        self._set = nxt
+        self._used = 0
 
     def take(self, values) -> torch.Tensor:
         n = len(values)
-        if n > self._numel:
-            self._grow(n)
-        if self._pinned:
-            stream = torch.cuda.current_stream()
-            if self._last is not None and self._streams[self._last] is not stream:
-                # the previous plan's copies were issued on another stream
-                # (an inline plan on the gpu thread after a pre-plan): record
-                # there, where they are
-                ev = self._events[self._last] or torch.cuda.Event()
-                self._events[self._last] = ev
-                ev.record(self._streams[self._last])
-            elif self._last is not None:
-                ev = self._events[self._last] or torch.cuda.Event()
-                self._events[self._last] = ev
-                ev.record(stream)
-            i = self._next
-            ev = self._events[i]
-            if ev is not None:
-                ev.synchronize()
-            self._streams[i] = stream
-        else:
-            i = self._next
-        self._next = (i + 1) % self._depth
-        self._last = i
-        out = self._bufs[i][:n]
+        bufs = self._sets[self._set]
+        i = self._used
+        if i == len(bufs):
+            bufs.append(self._alloc(max(n, self._numel)))
+        elif n > bufs[i].numel():
+            bufs[i] = self._alloc(max(n, bufs[i].numel() * 2))
+        self._used = i + 1
+        out = bufs[i][:n]
         out.numpy()[:] = values
         return out
 

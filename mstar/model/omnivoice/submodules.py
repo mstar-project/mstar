@@ -43,6 +43,21 @@ logger = logging.getLogger(__name__)
 UNMASK_LOOP_NAME = "unmask_loop"
 
 
+def _loop_step(fwd_info: CurrentForwardPassInfo, step_index: torch.Tensor) -> int:
+    """The unmask iteration a step runs, from the engine's loop counter.
+
+    ``step_index`` holds the same value, but it is the previous step's device
+    output: reading it on the host waits for that step to finish, which stalls
+    the speculative preparation of the next one. The counter is per batch and
+    counts speculative iterations too (#351). Callers that drive the
+    submodule without a loop counter (tests, harnesses) fall back to the edge.
+    """
+    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
+    if UNMASK_LOOP_NAME in counts:
+        return int(counts[UNMASK_LOOP_NAME])
+    return int(step_index.reshape(-1)[0].item())
+
+
 class _SingleRequestMixin:
     """Serve one request per step through the engine's batched entry point.
 
@@ -173,9 +188,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
         prefix_ids = inputs["prefix_ids"][0].to(device)
         prefix_audio_mask = inputs["prefix_audio_mask"][0].to(device)
-        # target_len rides an edge rather than step_metadata: computing it needs
-        # the tokenizer and the duration estimator, both data-worker assets.
-        target_len = int(inputs["target_len"][0].reshape(-1)[0].item())
 
         # Cloning walk only: the codec's reference tokens close out the prefix.
         # They are joined here rather than on the data worker because the encode
@@ -197,7 +209,11 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             # Iteration 0: the loop-back edges arrive empty. Seed a fully
             # masked canvas; there is no noise and no seed to honour, because
             # the stochastic part of this model is the reveal order, not the
-            # starting state.
+            # starting state. target_len rides an edge rather than
+            # step_metadata: computing it needs the tokenizer and the duration
+            # estimator, both data-worker assets. Later iterations read it off
+            # the canvas shape instead, which costs no host read.
+            target_len = int(inputs["target_len"][0].reshape(-1)[0].item())
             tokens = torch.full(
                 (self.config.num_audio_codebook, target_len),
                 self.config.audio_mask_id,
@@ -209,11 +225,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             step_index = torch.zeros(1, dtype=torch.int64, device=device)
         else:
             step_index = inputs["step_index"][0]
-            # Read the counter off the edge tensor, not from
-            # fwd_info.dynamic_loop_iter_counts: the worker sets that wrong on
-            # the speculative path, so the edge is the reliable source until
-            # that is fixed upstream. Costs a .item() per iteration.
-            k = int(step_index.reshape(-1)[0].item())
+            k = _loop_step(fwd_info, step_index)
             num_step = int(meta["num_step"])
             if k >= num_step:
                 # Async scheduling dispatched an iteration past this request's
@@ -225,6 +237,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 )
                 return None
             tokens = inputs["audio_tokens"][0].to(device)
+            target_len = tokens.shape[-1]
 
         return NodeInputs(
             tensor_inputs={
@@ -350,13 +363,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
         Scoring, the reveal schedule and the in-place write are per-request and
         data-dependent, which is what keeps them out of ``forward_batched``.
-        The iteration index is read off the ``step_index`` edge rather than
-        ``dynamic_loop_iter_counts``, which the worker sets wrong on the
-        speculative path; everything else comes from step metadata.
+        The iteration index is the engine's loop counter (see ``_loop_step``);
+        everything else comes from step metadata.
         """
         assert inputs is not None, "OmniVoice backbone postprocess needs its inputs"
         meta = request_info.step_metadata
-        k = int(inputs.tensor_inputs["step_index"].reshape(-1)[0].item())
+        k = _loop_step(request_info, inputs.tensor_inputs["step_index"])
 
         # Cloned because apply_reveal writes in place and this tensor is the
         # edge the engine routed in from the previous iteration; mutating it

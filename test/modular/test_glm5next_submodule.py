@@ -13,8 +13,8 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
-from mstar.engine.cuda_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -165,7 +165,7 @@ def _holders(pool: RecurrentStatePool) -> set[str]:
 
 
 def _padding_input() -> ARNodeInputs:
-    """What ``BatchedCudaGraphConfig.get_node_inputs`` hands a padding row:
+    """What ``BatchedAcceleratorGraphConfig.get_node_inputs`` hands a padding row:
     a clone of the config's single-request decode input (one token)."""
     return ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1)
 
@@ -274,7 +274,7 @@ class TestSurface:
         for name in (
             "prepare_inputs", "declare_step", "preprocess", "forward",
             "forward_batched", "can_batch", "postprocess", "check_stop",
-            "max_batch_size", "to", "get_cuda_graph_configs",
+            "max_batch_size", "to", "get_accelerator_graph_configs",
         ):
             assert name in Glm5NextLLMSubmodule.__dict__, name
             assert callable(getattr(Glm5NextLLMSubmodule, name)), name
@@ -483,14 +483,14 @@ class TestCudaGraphs:
         assert all(blk._use_fused is False for blk in _moe_blocks(lm))
         assert sub._moe_resolved_fused() is False
         assert sub._moe_capture_blocked(tp_world_size=1) is True
-        assert sub.get_cuda_graph_configs(DEVICE, tp_world_size=8) == []
-        assert sub.get_cuda_graph_configs(DEVICE, tp_world_size=1) == []
+        assert sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8) == []
+        assert sub.get_accelerator_graph_configs(DEVICE, tp_world_size=1) == []
 
         _model, lm, cfg = _build_model(seed=33)
         assert cfg.quantization_config is None
         sub = Glm5NextLLMSubmodule(lm, cfg)
         assert sub._moe_capture_blocked(tp_world_size=2) is True
-        assert sub.get_cuda_graph_configs(DEVICE, tp_world_size=2) == []
+        assert sub.get_accelerator_graph_configs(DEVICE, tp_world_size=2) == []
         # bf16 on one rank has no host loop in the way: capturable
         assert sub._moe_capture_blocked(tp_world_size=1) is False
 
@@ -500,17 +500,17 @@ class TestCudaGraphs:
         h = _Harness(seed=34, max_slots=max_slots)
         sub, lm = h.sub, h.lm
         sub.config.quantization_config = Glm5NextModelConfig.reduced_fp8().quantization_config
-        assert sub.get_cuda_graph_configs(DEVICE, tp_world_size=8) == []
+        assert sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8) == []
 
         for blk in _moe_blocks(lm):
             blk._use_fused = True
         assert sub._moe_resolved_fused() is True
         assert sub._moe_capture_blocked(tp_world_size=8) is False
 
-        configs = sub.get_cuda_graph_configs(DEVICE, tp_world_size=8)
+        configs = sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8)
         assert len(configs) == 1
         (config,) = configs
-        assert isinstance(config, BatchedCudaGraphConfig)
+        assert isinstance(config, BatchedAcceleratorGraphConfig)
         assert config.capture_graph_walk == "decode"
         assert config.replay_graph_walks == ["decode"]
         assert config.capture_forward_method == "forward_batched"
@@ -531,7 +531,7 @@ class TestCudaGraphs:
         # No slot pool to clamp by until the engine binds the resources.
         _model, lm, cfg = _build_model(seed=34)
         sub = Glm5NextLLMSubmodule(lm, cfg)
-        (config,) = sub.get_cuda_graph_configs(DEVICE, tp_world_size=1)
+        (config,) = sub.get_accelerator_graph_configs(DEVICE, tp_world_size=1)
         assert config.capture_batch_sizes == list(DEFAULT_CAPTURE_BATCH_SIZES)
 
     def test_max_batch_size_is_the_slot_pool(self):
