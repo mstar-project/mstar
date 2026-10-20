@@ -525,6 +525,12 @@ out["torch"] = torch.__version__
 out["torch_hip"] = getattr(torch.version, "hip", None)
 import mstar
 out["mstar_file"] = mstar.__file__
+# The package metadata below names the venv's mstar_rust even when a tree's own build is the one imported.
+try:
+    import mstar_rust
+    out["mstar_rust_file"] = mstar_rust.__file__
+except Exception as e:
+    out["mstar_rust_error"] = repr(e)
 for d in ("triton", "triton-rocm", "amd-aiter", "amd-flashinfer", "flashinfer-python", "transformers", "mstar-ai",
           "mstar_rust"):
     try:
@@ -607,6 +613,18 @@ def host_record(gpus: list[int]) -> dict:
     return rec
 
 
+def rust_from_worktree(stack: dict, worktree: Path) -> bool:
+    """Whether the server imports the tree's own mstar_rust build. A tree that carries one (``mstar_rust/`` at its
+    root) must import it: the venv's build is from another checkout's rust/, which imports fine and then fails or
+    behaves differently at request time."""
+    rfile = stack.get("mstar_rust_file") or ""
+    ours = bool(rfile) and Path(rfile).resolve().is_relative_to(worktree)
+    if (worktree / "mstar_rust").is_dir() and not ours:
+        raise RuntimeError(f"the server would import mstar_rust from {rfile or 'nowhere'} "
+                           f"({stack.get('mstar_rust_error', '')}), not {worktree / 'mstar_rust'}")
+    return ours
+
+
 def collect_versions(launch: Launch, cmd: list[str], env: dict) -> dict:
     rec = {"arm": launch.arm.name, "engine": launch.arm.engine, "row": launch.row.name, "hf_id": launch.row.hf_id,
            "gpus": launch.gpus, "port": launch.port, "recipe": launch.arm.recipe, "differs": launch.arm.differs,
@@ -626,6 +644,7 @@ def collect_versions(launch: Launch, cmd: list[str], env: dict) -> dict:
         rec["serves_worktree"] = bool(mfile) and Path(mfile).resolve().is_relative_to(launch.worktree)
         if not rec["serves_worktree"]:
             raise RuntimeError(f"the server would import {mfile or 'no mstar'}, not {launch.worktree}")
+        rec["rust_from_worktree"] = rust_from_worktree(rec["stack"], launch.worktree)
     else:
         rec["image"] = image_record(launch.arm.image)
         cenv = {k: v for k, v in env.items() if k in CTR_KEEP or k in ("GPUS", "CTR_SCRATCH")}
