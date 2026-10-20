@@ -250,6 +250,25 @@ type, run ``compare --base main --head main`` for the models concerned, then
 and judged on the passes' spread alone. A calibrated swing only widens a ``cases.yaml`` limit, never tightens it.
 Rows of the A/A run that failed or had request errors stay out of the floors; ``calibrate`` prints how many per model.
 
+**Stress.** ``--stress`` replaces the cases with a workload for load-dependent races, on the models whose
+``cases.yaml`` entry has a ``stress:`` block (``qwen3_5_2b``)::
+
+    python -m benchmark.eval compare --base main --head 548 --stress                  # 20 runs per arm of 60 s
+    python -m benchmark.eval compare --base main --head 548 --stress --stress-runs 60 --stress-clients 32
+
+Each run has ``--stress-clients`` clients (32), each holding one pinned ``request_id`` on streamed ``/generate``
+and mixing five patterns: close at a random chunk, close before reading, close then retry at once under the same
+id, reuse after a full read, and a second request while the first streams (one of the pair should get a 409).
+A run fails on a hang (no progress for ``--stress-hang-s``, 30 s), a 5xx, unexpected 4xx, empty reply or
+in-band error, cross-talk (a reply holding another prompt's answer), the server's own M\* tensor files left in
+``/dev/shm`` 30 s after the run (other servers on the host use another deployment token or pid, so theirs are not
+counted), or a server process that exits. Every 5 runs get a fresh server, arms alternated. Head is flagged
+when it crashes or shows cross-talk and base never does, or when its failed-run count beats base's at one-sided
+Fisher exact p < 0.05; the report states N and the smallest gap N can detect (``--stress-runs 20``: 0 against 5
+failed runs). When base fails every run, no head count can beat it, so read the per-pattern request outcomes in
+the report's toggle instead. ``--stress-patterns`` picks a subset
+(``barge_in,drop,retry,reuse,overlap``). The code is ``benchmark/eval/e2e/stress.py``.
+
 Adding a suite
 --------------
 

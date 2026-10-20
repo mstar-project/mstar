@@ -904,6 +904,24 @@ type, run <code class="docutils literal notranslate"><span class="pre">compare</
 <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.eval</span> <span class="pre">calibrate</span> <span class="pre">&lt;run</span> <span class="pre">dir&gt;</span></code>; rows without a floor on the run’s GPU are named in the report
 and judged on the passes’ spread alone. A calibrated swing only widens a <code class="docutils literal notranslate"><span class="pre">cases.yaml</span></code> limit, never tightens it.
 Rows of the A/A run that failed or had request errors stay out of the floors; <code class="docutils literal notranslate"><span class="pre">calibrate</span></code> prints how many per model.</p>
+<p><strong>Stress.</strong> <code class="docutils literal notranslate"><span class="pre">--stress</span></code> replaces the cases with a workload for load-dependent races, on the models whose
+<code class="docutils literal notranslate"><span class="pre">cases.yaml</span></code> entry has a <code class="docutils literal notranslate"><span class="pre">stress:</span></code> block (<code class="docutils literal notranslate"><span class="pre">qwen3_5_2b</span></code>):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">compare</span> <span class="o">--</span><span class="n">base</span> <span class="n">main</span> <span class="o">--</span><span class="n">head</span> <span class="mi">548</span> <span class="o">--</span><span class="n">stress</span>                  <span class="c1"># 20 runs per arm of 60 s</span>
+<span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">compare</span> <span class="o">--</span><span class="n">base</span> <span class="n">main</span> <span class="o">--</span><span class="n">head</span> <span class="mi">548</span> <span class="o">--</span><span class="n">stress</span> <span class="o">--</span><span class="n">stress</span><span class="o">-</span><span class="n">runs</span> <span class="mi">60</span> <span class="o">--</span><span class="n">stress</span><span class="o">-</span><span class="n">clients</span> <span class="mi">32</span>
+</pre></div>
+</div>
+<p>Each run has <code class="docutils literal notranslate"><span class="pre">--stress-clients</span></code> clients (32), each holding one pinned <code class="docutils literal notranslate"><span class="pre">request_id</span></code> on streamed <code class="docutils literal notranslate"><span class="pre">/generate</span></code>
+and mixing five patterns: close at a random chunk, close before reading, close then retry at once under the same
+id, reuse after a full read, and a second request while the first streams (one of the pair should get a 409).
+A run fails on a hang (no progress for <code class="docutils literal notranslate"><span class="pre">--stress-hang-s</span></code>, 30 s), a 5xx, unexpected 4xx, empty reply or
+in-band error, cross-talk (a reply holding another prompt’s answer), the server’s own M* tensor files left in
+<code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> 30 s after the run (other servers on the host use another deployment token or pid, so theirs are not
+counted), or a server process that exits. Every 5 runs get a fresh server, arms alternated. Head is flagged
+when it crashes or shows cross-talk and base never does, or when its failed-run count beats base’s at one-sided
+Fisher exact p &lt; 0.05; the report states N and the smallest gap N can detect (<code class="docutils literal notranslate"><span class="pre">--stress-runs</span> <span class="pre">20</span></code>: 0 against 5
+failed runs). When base fails every run, no head count can beat it, so read the per-pattern request outcomes in
+the report’s toggle instead. <code class="docutils literal notranslate"><span class="pre">--stress-patterns</span></code> picks a subset
+(<code class="docutils literal notranslate"><span class="pre">barge_in,drop,retry,reuse,overlap</span></code>). The code is <code class="docutils literal notranslate"><span class="pre">benchmark/eval/e2e/stress.py</span></code>.</p>
 </section>
 <section id="adding-a-suite">
 <h2>Adding a suite<a class="headerlink" href="#adding-a-suite" title="Link to this heading">#</a></h2>
