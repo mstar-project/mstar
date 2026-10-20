@@ -801,10 +801,9 @@ class KVManager(AttentionResource):
             or chain is None
         ):
             return
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and (
-            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
-        ) not in walks:
+        if walks is not None and walk not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -824,7 +823,7 @@ class KVManager(AttentionResource):
             end = chain.consumed + chain.spans[chain.done].length
             # Checking every span would end the chain at the first one the cache filled rather than this walk.
             if chain.consumed < stream.stored_len and end > start and (
-                chain.spans[chain.done].walk != ctx.graph_walk
+                chain.spans[chain.done].walk != walk
             ):
                 stream.chain = None
                 return

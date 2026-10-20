@@ -1732,7 +1732,7 @@ class Engine:
                         piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
             for rid in batch.cached_rids:
-                self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         return outputs
 
     def check_stop_for_batch(
