@@ -376,6 +376,10 @@
 </details></li>
 </ul>
 </details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+</ul>
+</details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
@@ -636,6 +640,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>
 </ul>
             </nav>
         </div>
@@ -690,7 +695,7 @@ cache), and then delegates to it.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--api-key</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>, else off</p></td>
 <td><p>Require <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> on every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code>
-(see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
+and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--gpus</span></code></p></td>
 <td><p>all visible</p></td>
@@ -730,6 +735,11 @@ not share sockets.</p></td>
 <td><p>stdout</p></td>
 <td><p>Append the per-request profiles to this file instead of stdout
 (implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Serve Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>).
+Needs <code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -809,7 +819,7 @@ not share sockets.</p></td>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--api-key</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>, else off</p></td>
 <td><p>Require <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> on every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code>
-(see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
+and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#api-key"><span class="std std-ref">API key</span></a>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">RDMA</span></code></p></td>
@@ -855,7 +865,12 @@ it defaults to a new directory per launch and removes it at exit.</p></td>
 <td><p>Append the per-request profiles to this file instead of stdout
 (implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Serve Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>).
+Needs <code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
 </tr>
@@ -879,8 +894,9 @@ set.</p>
 mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w">            </span><span class="c1"># or: mstar-serve --config ... [--rust-frontend]</span>
 </pre></div>
 </div>
-<p>With a key set, every HTTP route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> answers <code class="docutils literal notranslate"><span class="pre">401</span></code> unless the request
-carries <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, and WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>,
+<p>With a key set, every HTTP route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see
+<a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>) answers <code class="docutils literal notranslate"><span class="pre">401</span></code> unless the request carries
+<code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, and WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>,
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>) refuse the handshake without it. The check is one middleware over the
 whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
@@ -1163,6 +1179,42 @@ RDMA-read or SHM file-read time on <code class="docutils literal notranslate"><s
 conductor, and data worker skip the timing/transfer bookkeeping entirely.</p>
 </div>
 </section>
+<section id="metrics">
+<span id="serving-metrics"></span><h2>Metrics<a class="headerlink" href="#metrics" title="Link to this heading">#</a></h2>
+<p>Pass <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> (to either <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> or <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>) to serve
+Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>. It needs the <code class="docutils literal notranslate"><span class="pre">metrics</span></code> extra
+(<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar[metrics]'</span></code>); without it the server stops at startup with that
+hint. Off by default, and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> answers 404 then. Like <code class="docutils literal notranslate"><span class="pre">/health</span></code>, it needs no
+API key even when one is set, the usual convention for scrape endpoints. It exposes
+request counts, latencies and the model name (never prompts or outputs); if that
+matters for a deployment, keep the port on an internal network. The Rust frontend does
+not serve it yet, so <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span> <span class="pre">--rust-frontend</span></code> is refused at startup.</p>
+<p>Requests are counted when they leave the API server, from the first request after the
+warmup requests. Every family has a <code class="docutils literal notranslate"><span class="pre">model_name</span></code> label (the config’s <code class="docutils literal notranslate"><span class="pre">model</span></code>);
+<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> is the request’s output modalities, sorted and comma-joined
+(e.g. <code class="docutils literal notranslate"><span class="pre">audio,text</span></code>).</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_requests_total{model_name,</span> <span class="pre">output_modalities,</span> <span class="pre">outcome}</span></code>: counter.
+<code class="docutils literal notranslate"><span class="pre">outcome</span></code> is <code class="docutils literal notranslate"><span class="pre">success</span></code> (the result went to the HTTP layer), <code class="docutils literal notranslate"><span class="pre">error</span></code> (the
+request failed in the engine, preprocessing or result delivery), <code class="docutils literal notranslate"><span class="pre">abort</span></code> (the client
+went away, or its finished result was dropped unread) or <code class="docutils literal notranslate"><span class="pre">timeout</span></code> (<code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
+expired). Requests refused before they were submitted (a 400 for a bad form, a 409
+for a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight) are not counted.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_requests_in_flight{model_name}</span></code>: gauge, requests the API server holds
+(submitted and not yet returned, failed or aborted).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_e2e_request_latency_seconds{model_name,</span> <span class="pre">output_modalities}</span></code>: histogram over
+successful requests, from submission (after the request body was read) to the result
+leaving the API server.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_output_seconds{model_name,</span> <span class="pre">output_modalities}</span></code>: histogram over
+successful requests, from submission to the first result chunk of any modality
+reaching the API server. It is measured on the server, so it does not include the
+network to the client, and a non-streaming client sees nothing until the end.</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>kokoro<span class="w"> </span>--enable-metrics
+curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s1">'^mstar_'</span>
+</pre></div>
+</div>
+</section>
 </section>
 
 
@@ -1219,6 +1271,7 @@ conductor, and data worker skip the timing/transfer bookkeeping entirely.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>
 </ul>
   </nav></div>
 

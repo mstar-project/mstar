@@ -38,7 +38,7 @@ mstar serve
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
      - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       (see :ref:`api-key`).
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -69,6 +69,10 @@ mstar serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
 
 Each model maps to a default config (override with ``--config``):
 
@@ -124,7 +128,7 @@ mstar-serve
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
      - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       (see :ref:`api-key`).
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -159,6 +163,10 @@ mstar-serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -184,8 +192,9 @@ set.
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
    mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
 
-With a key set, every HTTP route except ``/health`` answers ``401`` unless the request
-carries ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
+With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
+:ref:`serving-metrics`) answers ``401`` unless the request carries
+``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
 ``/generate/ws``) refuse the handshake without it. The check is one middleware over the
 whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
@@ -486,3 +495,43 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
    Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
    conductor, and data worker skip the timing/transfer bookkeeping entirely.
+
+.. _serving-metrics:
+
+Metrics
+-------
+
+Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
+Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
+(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
+hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
+API key even when one is set, the usual convention for scrape endpoints. It exposes
+request counts, latencies and the model name (never prompts or outputs); if that
+matters for a deployment, keep the port on an internal network. The Rust frontend does
+not serve it yet, so ``--enable-metrics --rust-frontend`` is refused at startup.
+
+Requests are counted when they leave the API server, from the first request after the
+warmup requests. Every family has a ``model_name`` label (the config's ``model``);
+``output_modalities`` is the request's output modalities, sorted and comma-joined
+(e.g. ``audio,text``).
+
+- ``mstar_requests_total{model_name, output_modalities, outcome}``: counter.
+  ``outcome`` is ``success`` (the result went to the HTTP layer), ``error`` (the
+  request failed in the engine, preprocessing or result delivery), ``abort`` (the client
+  went away, or its finished result was dropped unread) or ``timeout`` (``--timeout``
+  expired). Requests refused before they were submitted (a 400 for a bad form, a 409
+  for a ``request_id`` in flight) are not counted.
+- ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds
+  (submitted and not yet returned, failed or aborted).
+- ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission (after the request body was read) to the result
+  leaving the API server.
+- ``mstar_time_to_first_output_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission to the first result chunk of any modality
+  reaching the API server. It is measured on the server, so it does not include the
+  network to the client, and a non-streaming client sees nothing until the end.
+
+.. code-block:: bash
+
+   mstar serve kokoro --enable-metrics
+   curl -s localhost:8000/metrics | grep '^mstar_'

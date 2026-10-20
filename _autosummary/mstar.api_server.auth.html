@@ -376,6 +376,10 @@
 </details></li>
 </ul>
 </details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+</ul>
+</details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
@@ -655,7 +659,7 @@
 <span id="mstar-api-server-auth"></span><h1>mstar.api_server.auth<a class="headerlink" href="#module-mstar.api_server.auth" title="Link to this heading">#</a></h1>
 <p>Optional API key for the HTTP and WebSocket surface.</p>
 <p>Off unless <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> or <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code> sets a key. When set, every
-request except the probe paths in <code class="docutils literal notranslate"><span class="pre">UNAUTHENTICATED_PATHS</span></code> must carry
+request except the probe and scrape paths in <code class="docutils literal notranslate"><span class="pre">UNAUTHENTICATED_PATHS</span></code> must carry
 <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> (what the OpenAI SDKs send for <code class="docutils literal notranslate"><span class="pre">api_key</span></code>);
 WebSocket routes are checked at the handshake. The check is one ASGI
 middleware over the whole app rather than a per-route dependency, so a route
@@ -664,7 +668,7 @@ added later is covered without anyone remembering to opt it in.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.auth.UNAUTHENTICATED_PATHS" title="mstar.api_server.auth.UNAUTHENTICATED_PATHS"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UNAUTHENTICATED_PATHS</span></code></a></p></td>
-<td><p>liveness probes from load balancers and orchestrators.</p></td>
+<td><p>liveness probes from load balancers and orchestrators, and the Prometheus scrape endpoint (request counts, latencies and the model name; never prompts or outputs).</p></td>
 </tr>
 </tbody>
 </table>
@@ -756,8 +760,10 @@ never buffers a streamed response.</p>
 
 <dl class="py data">
 <dt class="sig sig-object py" id="mstar.api_server.auth.UNAUTHENTICATED_PATHS">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.auth.</span></span><span class="sig-name descname"><span class="pre">UNAUTHENTICATED_PATHS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({'/health'})</span></span><a class="headerlink" href="#mstar.api_server.auth.UNAUTHENTICATED_PATHS" title="Link to this definition">#</a></dt>
-<dd><p>liveness probes from load balancers and orchestrators.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.auth.</span></span><span class="sig-name descname"><span class="pre">UNAUTHENTICATED_PATHS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({'/health',</span> <span class="pre">'/metrics'})</span></span><a class="headerlink" href="#mstar.api_server.auth.UNAUTHENTICATED_PATHS" title="Link to this definition">#</a></dt>
+<dd><p>liveness probes from load balancers and orchestrators,
+and the Prometheus scrape endpoint (request counts, latencies and the model
+name; never prompts or outputs).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>Served without a key</p>

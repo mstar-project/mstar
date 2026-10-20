@@ -376,6 +376,10 @@
 </details></li>
 </ul>
 </details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+</ul>
+</details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
@@ -947,7 +951,7 @@ variable and default.</p></td>
 <td><p>unset</p></td>
 <td><p>API key (read by <a class="reference internal" href="_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.resolve_api_key" title="mstar.api_server.auth.resolve_api_key"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.auth.resolve_api_key()</span></code></a>;
 <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> overrides it). When set, every route except
-<code class="docutils literal notranslate"><span class="pre">/health</span></code> needs <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, WebSocket
+<code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> needs <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, WebSocket
 handshakes included; unset or empty turns the check off. The
 launcher passes it on to the Rust frontend only (the conductor and
 workers do not inherit it), and
