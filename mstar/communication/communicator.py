@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 #: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
 #: install - e.g. a stale wheel after an upgrade - takes over the mesh
 #: silently, so the factory warns when the imported version differs.
-EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 
 
 #: The entity whose endpoint stands for the whole deployment: the one every
@@ -39,6 +39,13 @@ class BaseCommunicator(ABC):
         entity_id: worker_xyz, conductor, or api_server
         """
         pass
+
+    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
+        """Send a message already encoded with ``self.codec`` without
+        blocking: False, with nothing sent, when the peer is at its high-water
+        mark. A loop that must keep reading its own input while a peer is slow
+        sends with this and retries later."""
+        raise NotImplementedError(f"{type(self).__name__} has no non-blocking send")
 
     @abstractmethod
     def get_all_new_messages(self) -> list:
@@ -187,12 +194,22 @@ class ZMQCommunicator(BaseCommunicator):
             "%s to send a message %s to entity %s",
             self.my_id, msg, entity_id
         )
+        self._push_socket(entity_id).send(self.codec.encode(msg))
+
+    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
+        try:
+            self._push_socket(entity_id).send(data, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return False
+        return True
+
+    def _push_socket(self, entity_id: str):
         if entity_id not in self.push_sockets:
             sock = self.context.socket(zmq.PUSH)
             sock.connect(self._endpoint(entity_id))
             sock.setsockopt(zmq.LINGER, 0)
             self.push_sockets[entity_id] = sock
-        self.push_sockets[entity_id].send(self.codec.encode(msg))
+        return self.push_sockets[entity_id]
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
@@ -269,3 +286,4 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
             return RustZMQCommunicator(*args, **kwargs)
     logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
     return ZMQCommunicator(*args, **kwargs)
+

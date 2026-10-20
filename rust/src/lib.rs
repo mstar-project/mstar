@@ -90,6 +90,13 @@ impl PyZmqCommunicator {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// `send` that never blocks: false when the peer is at its high-water
+    /// mark, with nothing sent.
+    fn try_send(&self, peer_id: &str, data: &[u8]) -> PyResult<bool> {
+        self.inner.try_send(peer_id, data)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     fn try_recv<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.inner.try_recv().map(|b| PyBytes::new(py, &b))
     }
