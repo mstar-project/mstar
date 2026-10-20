@@ -11,9 +11,14 @@ between the two linears.
 The rest is what the reference cannot see: that the parameters carry the checkpoint's
 names and no others, and that the ragged attention resource reaches every block.
 
-The last section drives the ``vl_bridge`` node, ``Gr00tN17VLBridgeSubmodule``, the way the
+The next section drives the ``vl_bridge`` node, ``Gr00tN17VLBridgeSubmodule``, the way the
 engine does: the step it declares, the split of the bridge's rows into the denoise loop's
 two spans, and that it adds nothing to the forward above.
+
+The last section says what those two spans *are*. The reference's own predicate --
+``input_ids == image_token_id`` -- is the definition, so it is read off the backbone's
+``config.json`` and checked over twenty recorded prefills, with the ``LLM`` node deriving
+the image rows as it does in the engine. Those tests skip without the recordings.
 """
 
 import glob
@@ -34,9 +39,19 @@ from mstar.model.gr00t_n17.components.bridge import (
     BasicTransformerBlock,
     Gr00tN17VLBridge,
 )
-from mstar.model.gr00t_n17.config import BRIDGE_ATTN, Gr00tN17Config, Gr00tN17StackConfig
-from mstar.model.gr00t_n17.submodules import Gr00tN17VLBridgeSubmodule
+from mstar.model.gr00t_n17.components.llm import Gr00tN17LanguageModel
+from mstar.model.gr00t_n17.config import (
+    BRIDGE_ATTN,
+    Gr00tN17Config,
+    Gr00tN17StackConfig,
+    Gr00tN17TextConfig,
+)
+from mstar.model.gr00t_n17.submodules import (
+    Gr00tN17LLMSubmodule,
+    Gr00tN17VLBridgeSubmodule,
+)
 from mstar.model.gr00t_n17.weight_loader import _remapper
+from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
 _HUB = Path.home() / ".cache/huggingface/hub"
@@ -508,12 +523,10 @@ class _Run(NamedTuple):
 
 
 @torch.no_grad()
-def _drive(spec: tuple, seed: int = 1) -> _Run:
+def _drive_rows(rows: int, image: list[int], seed: int = 1) -> _Run:
     """prepare_inputs -> declare_step's resource -> preprocess -> forward, as the engine
-    runs it. The image rows are derived from the spec, so the split is checked against the
-    prompt rather than against the mask the node built."""
+    runs it, over ``rows`` backbone rows of which ``image`` are the image rows."""
     node = _node()
-    rows, image = _prompt(spec)
     features = _rows(rows, node.config.backbone_embedding_dim, seed=seed)
     walk = {
         "backbone_features": [features],
@@ -531,6 +544,12 @@ def _drive(spec: tuple, seed: int = 1) -> _Run:
         node, features, image, text, step, tensors,
         node.forward(_WALK, _ENGINE, **tensors),
     )
+
+
+def _drive(spec: tuple, seed: int = 1) -> _Run:
+    """``_drive_rows`` over a spec of runs. The image rows are derived from the spec, so the
+    split is checked against the prompt rather than against the mask the node built."""
+    return _drive_rows(*_prompt(spec), seed=seed)
 
 
 @pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
@@ -621,3 +640,195 @@ def test_more_image_rows_than_feature_rows_is_refused_where_they_arrive():
             _WALK, _FWD,
             {"backbone_features": [features], "image_rows": [torch.arange(3)]},
         )
+
+
+# ----------------------------------------------------------------------------
+# What the two spans are: the reference's predicate, over recorded prefills
+# ----------------------------------------------------------------------------
+
+# Twenty prefills recorded off the reference. They are not part of the checkpoint
+# download, so these tests gate on the dump directory as well as on the backbone.
+_DUMP = Path.home() / "gr00t-runs/dump"
+_RECORDED = sorted(_DUMP.glob("req_*.pt")) if _DUMP.is_dir() else []
+_HAVE_RECORDED = bool(_RECORDED) and _BACKBONE is not None
+
+# Equal spans: as many image rows as text rows, in two blocks each. A swap of the two
+# spans is invisible to every shape and every length here. The recorded prompts are 448
+# image rows against 13, where the counts would give a swap away, but nothing says a
+# prompt always has more of one than the other.
+_BALANCED = (("text", 2), ("image", 3), ("text", 3), ("image", 2))
+
+
+def _reference_image_token_id() -> int:
+    """The id the reference's predicate compares against.
+
+    ``Qwen3Backbone.forward`` builds the mask the DT's cross-attentions are masked with as
+    ``vl_input["input_ids"] == self.model.config.image_token_id``
+    (``gr00t/model/modules/qwen3_backbone.py:364``), and its ``self.model`` is the backbone
+    loaded from this path -- so the expectation comes off that config and not off ours.
+    That our config carries the same number is ``test_gr00t_n17_config``'s to say.
+    """
+    return json.loads((Path(_BACKBONE) / "config.json").read_text())["image_token_id"]
+
+
+class _Request(NamedTuple):
+    """One recorded prefill, with the reference's predicate already applied to its prompt."""
+
+    input_ids: torch.Tensor  # [tokens]
+    image_grid_thw: torch.Tensor  # [frames, 3]: the camera set the prompt was built from
+    bridge_rows: int  # rows in the recorded `vl_embeds`, which is the bridge's own output
+    is_image: torch.Tensor  # [tokens], bool
+
+
+def _request(path: Path) -> _Request:
+    """``mmap``ped: a recording is tens of MB of pixels and video, and only the prompt,
+    the grids and one shape are read out of it."""
+    dump = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    input_ids = dump["collated"]["inputs"]["input_ids"].reshape(-1)
+    return _Request(
+        input_ids=input_ids,
+        image_grid_thw=dump["collated"]["inputs"]["image_grid_thw"].reshape(-1, 3),
+        bridge_rows=dump["vl_embeds"].shape[1],
+        is_image=input_ids == _reference_image_token_id(),
+    )
+
+
+def _image_rows(request: _Request) -> torch.Tensor:
+    """The image rows as the ``LLM`` node derives them, which is where the bridge's come
+    from: the bridge never sees a prompt, so the two nodes together are the producer.
+
+    Only ``prepare_inputs`` is driven, and it reads the prompt, the grids and
+    ``image_token_id``. The language model is there for the device it answers with and the
+    two vision entries for the tap-count check, so all three are stand-ins -- the text
+    stack is one tiny layer and no forward runs on it.
+    """
+    backbone = json.loads((Path(_BACKBONE) / "config.json").read_text())
+    text = Gr00tN17TextConfig(
+        hidden_size=8, intermediate_size=16, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=8, num_hidden_layers=1, rms_norm_eps=1e-6, rope_theta=10000.0,
+        vocab_size=1, mrope_section=(2, 1, 1), mrope_interleaved=True,
+        image_token_id=_reference_image_token_id(), vision_start_token_id=0,
+    )
+    # the one vision field the node reads, and it has to be the real one: it is what the
+    # M-RoPE grids are measured in, so a stand-in would make the recorded grids disagree
+    # with the prompt's image runs and raise
+    vision = Qwen3_5VisionConfig(
+        depth=1, hidden_size=16, intermediate_size=32, num_heads=1, in_channels=3,
+        patch_size=2, temporal_patch_size=2, out_hidden_size=8, num_position_embeddings=16,
+        spatial_merge_size=backbone["vision_config"]["spatial_merge_size"],
+    )
+    config = Gr00tN17Config(
+        text=text, vision=vision, dit=None, bridge=None,
+        # one tap, because the node checks the count it is sent against this and nothing
+        # here reads the features
+        deepstack_visual_indexes=(0,), backbone_embedding_dim=0,
+    )
+    node = Gr00tN17LLMSubmodule(Gr00tN17LanguageModel(config), config)
+    rows = int(request.is_image.sum())
+    prepared = node.prepare_inputs(
+        _WALK, _FWD,
+        {
+            "input_ids": [request.input_ids],
+            "image_grid_thw": [request.image_grid_thw],
+            "vision_embeds": [torch.zeros(rows, text.hidden_size)],
+            "deepstack_embeds": [torch.zeros(rows, text.hidden_size)],
+        },
+    )
+    return prepared.tensor_inputs["image_rows"]
+
+
+@pytest.mark.skipif(not _HAVE_RECORDED, reason="recorded requests or backbone not cached")
+@pytest.mark.parametrize("path", _RECORDED, ids=[path.stem for path in _RECORDED])
+@torch.no_grad()
+def test_the_split_is_the_references_image_token_predicate(path):
+    """What the two spans *are*, on prompts the reference actually ran.
+
+    The reference masks each DT cross-attention with ``input_ids == image_token_id`` or
+    with its complement, alternating by block; we separate the rows once instead, so
+    ``vl_image`` has to be exactly the rows that predicate selects and ``vl_text`` exactly
+    the rest. If this fails the DT reads image rows where it should read text and text
+    where it should read image -- a swap that changes no shape, raises nothing, and costs
+    31% relative error at full depth.
+
+    The two gathers are also the partition: ``is_image`` is a mask over every row and the
+    second gather is its complement, so between them each row lands in one span exactly
+    once, with its contents and its position inside the span intact.
+
+    Both ends of the chain are in it. The bridge never sees a prompt, so the ``LLM`` node
+    derives the image rows here as it does in the engine, and the expectation is the
+    backbone's own ``image_token_id`` rather than anything our config did with it.
+
+    Only the row *pattern* comes from the recording: 448 image rows in four blocks with a
+    handful of text rows around them, which no prompt above resembles. The rows themselves
+    are this file's narrow stand-ins -- the split is a gather and does not depend on the
+    width, and the real 2048-wide bridge is 200M parameters.
+
+    Order inside a span is not load-bearing: the loop cross-attends a whole span with no
+    mask and softmax does not care in what order the keys arrive, which is D03's premise.
+    It is pinned anyway, because a gather in prompt order is the cheapest way to say that
+    no row moved, and because anyone lining our spans up against the reference's masked
+    attention needs it.
+    """
+    request = _request(path)
+    image_rows = _image_rows(request)
+    run = _drive_rows(request.input_ids.numel(), image_rows.tolist())
+    rows = run.by_hand()
+
+    # the handoff between the two nodes: what the LLM node sends is the predicate's rows
+    assert torch.equal(image_rows, request.is_image.nonzero(as_tuple=True)[0])
+    # and the recording agrees that the bridge emits one row per prompt token, which is
+    # what makes a mask over the prompt a mask over the bridge's output
+    assert request.bridge_rows == request.input_ids.numel()
+
+    assert torch.equal(run.out["vl_image"][0], rows[request.is_image])
+    assert torch.equal(run.out["vl_text"][0], rows[~request.is_image])
+
+
+def test_a_swap_of_the_two_spans_survives_everything_but_the_contents():
+    """Why the assertions above are gathers and not shapes.
+
+    Both spans are the bridge's width -- 2048 in the checkpoint -- so exchanging
+    ``vl_text`` and ``vl_image`` in the forward changes no width, no dtype and no key
+    order, and raises nothing; on this prompt it does not change a row count either. The
+    contents are all that separates them.
+
+    If it fails, every ``vl_text``/``vl_image`` assertion in this file could be passing on
+    a producer that has the two the wrong way round.
+    """
+    run = _drive(_BALANCED)
+    rows = run.by_hand()
+    text, image = run.out["vl_text"][0], run.out["vl_image"][0]
+
+    assert (text.shape, text.dtype) == (image.shape, image.dtype)
+    # which only says something about the split because the two are different rows
+    assert not torch.equal(text, image)
+    assert torch.equal(text, rows[run.text])
+    assert torch.equal(image, rows[run.image])
+
+
+@pytest.mark.skipif(not _HAVE_RECORDED, reason="recorded requests or backbone not cached")
+def test_the_image_span_is_fixed_by_the_cameras_and_the_text_span_is_not():
+    """Why a batch's bucket key carries the text length and not the image length.
+
+    A camera set is a fixed grid, so the rows the vision tower packs for it never move and
+    one camera set gives one image-span length. The text span is the prompt, and that
+    varies request to request. A key on the image length would therefore put prompts of
+    different text width in one bucket; a key on the text length separates them, and the
+    image length is implied by the cameras.
+
+    The lengths themselves are not pinned. A recording of another camera set is a
+    different number and no less correct, so what is asserted is the relationship.
+    """
+    spans: dict[tuple, set[tuple[int, int]]] = {}
+    for path in _RECORDED:
+        request = _request(path)
+        key = tuple(request.image_grid_thw.flatten().tolist())
+        image = int(request.is_image.sum())
+        spans.setdefault(key, set()).add((image, request.input_ids.numel() - image))
+
+    for key, lengths in spans.items():
+        assert len({image for image, _ in lengths}) == 1, f"image span moves within {key}"
+    assert len({text for lengths in spans.values() for _, text in lengths}) > 1, (
+        "the recording has to cover more than one prompt length: that the text span "
+        "varies where the image span does not is what this test is for"
+    )
