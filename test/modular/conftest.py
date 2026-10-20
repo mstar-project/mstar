@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from mstar.platforms import resolve_platform
+from mstar.platforms.dispatch import PlatformDispatch
 
 # --- torch._dynamo.config stub --------------------------------------------
 
@@ -76,8 +77,10 @@ def torch_flag():
 
 @pytest.fixture(autouse=True)
 def _fresh_platform():
-    """Clear the cached platform, so a test that stubs ``torch.cuda`` can't
-    leak its platform into later tests."""
+    """Clear the cached platform and every dispatch's cached kernel, so a test
+    that stubs ``torch.cuda`` or a kernel module can't leak them into later tests."""
     resolve_platform.cache_clear()
+    PlatformDispatch.reset_all()
     yield
     resolve_platform.cache_clear()
+    PlatformDispatch.reset_all()
