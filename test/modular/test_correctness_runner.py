@@ -432,6 +432,51 @@ def test_robotics_can_skip_episodes_without_a_task():
     assert len(family_for_config("pi05", "pi05", {}, {}).select_items(items)) == 2
 
 
+def _lossless_mp4(frames: np.ndarray, path: Path, preset: str) -> None:
+    import av
+
+    with av.open(str(path), "w") as c:
+        s = c.add_stream("libx264", rate=8)
+        s.height, s.width = frames.shape[1:3]
+        s.pix_fmt = "yuv420p"
+        s.options = {"qp": "0", "preset": preset}
+        for f in frames:
+            for packet in s.encode(av.VideoFrame.from_ndarray(f, format="rgb24")):
+                c.mux(packet)
+        for packet in s.encode():
+            c.mux(packet)
+
+
+def test_video_identity_compares_decoded_frames(tmp_path):
+    from benchmark.correctness.families.video import NoReferenceVideo
+
+    fam = NoReferenceVideo("cosmos3_super", {}, {})
+    sset = sets.SampleSet("video_v1", tmp_path, {}, [sets.Item(id="00", prompt="p", params={"seed": 0})])
+    frames = np.random.default_rng(0).integers(0, 256, (4, 64, 64, 3), dtype=np.uint8)
+    changed = frames.copy()
+    changed[2] = np.clip(changed[2].astype(int) + 40, 0, 255)
+    runs = {}
+    # Lossless, so the decoded frames don't depend on the encoder settings, while two presets give
+    # different files for the same frames.
+    for name, f, preset in (("r1", frames, "ultrafast"), ("r2", frames, "medium"), ("r3", changed, "ultrafast")):
+        runs[name] = tmp_path / name
+        (runs[name] / "outputs").mkdir(parents=True)
+        _lossless_mp4(f, runs[name] / "outputs" / "00.mp4", preset)
+    assert (runs["r1"] / "outputs/00.mp4").read_bytes() != (runs["r2"] / "outputs/00.mp4").read_bytes()
+    scores = {}
+    for other in ("r2", "r3"):
+        work = tmp_path / f"work_{other}"
+        work.mkdir()
+        scores[other] = fam.score(sset, [runs["r1"], runs[other]], None, work, "cpu")
+    same, diff = scores["r2"], scores["r3"]
+    assert same.rows[0]["frames_identical_r1_r2"] is True
+    assert same.metrics["frames_identical_r1_r2"] == {"identical": 1, "n": 1}
+    assert any("1/1 videos" in n for n in same.notes)
+    assert diff.rows[0]["frames_identical_r1_r2"] is False
+    assert diff.metrics["frames_identical_r1_r2"] == {"identical": 0, "n": 1}
+    assert same.rows[0]["psnr_r1_r2_min"] == float("inf") > diff.rows[0]["psnr_r1_r2_min"]
+
+
 def test_ltx2_5_audio_video_family(tmp_path):
     import io
     import struct
@@ -481,7 +526,8 @@ def test_ltx2_5_audio_video_family(tmp_path):
     assert by["audio tracks failing sanity"].value == 0, sc.rows
     assert by["same-seed min frame PSNR, two server instances (dB)"].verdict == "PASS"  # same mp4 bytes
     assert by["same-seed min audio SNR, two server instances (dB)"].verdict == "PASS"  # one sample differs
-    assert sc.metrics["byte_identical_r1_r2"] == {"mp4": 1, "pcm": 0, "n": 1}
+    assert sc.metrics["frames_identical_r1_r2"] == {"identical": 1, "n": 1}
+    assert sc.metrics["byte_identical_r1_r2"] == {"pcm": 0, "n": 1}
 
 
 def test_gpu_check_uses_hip_indices(monkeypatch, capsys):
