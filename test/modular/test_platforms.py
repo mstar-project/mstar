@@ -223,12 +223,22 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
         assert solver not in platform.process_env_defaults()
 
 
+IN_GRAPH_KNOBS = ("MSTAR_INGRAPH_DECODE_ROPE", "MSTAR_SAMPLER_INGRAPH_SCATTER")
+
+
+def test_only_rocm_builds_decode_rope_and_sampler_scatter_in_the_graph():
+    defaults = RocmPlatform().process_env_defaults()
+    assert all(defaults[knob] == "1" for knob in IN_GRAPH_KNOBS)
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert not set(IN_GRAPH_KNOBS) & set(platform.process_env_defaults())
+
+
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
 @pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
 def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, solver, exported, expected):
     monkeypatch.setattr(torch.version, "hip", "7.0")
     # set first, so teardown restores the variable whatever the call does
-    for name in MIOPEN_SPLIT_K:
+    for name in MIOPEN_SPLIT_K + IN_GRAPH_KNOBS:
         monkeypatch.setenv(name, "")
     if exported is None:
         monkeypatch.delenv(solver)
