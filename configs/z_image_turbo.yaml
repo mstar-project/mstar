@@ -17,7 +17,7 @@ model_kwargs:
   # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
   # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
-  cuda_graph: true
+  accelerator_graph: true
   capture_sizes: [[1024, 1024]]
   # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
   # values -- and it is an INPUT, not a shape: the DiT substitutes a learned

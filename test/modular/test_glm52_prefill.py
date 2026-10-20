@@ -7,21 +7,21 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.engine.cuda_graph_config import PackedCudaGraphConfig  # noqa: E402
+from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 
 
 def _submodule(config) -> Glm52LLMSubmodule:
-    # get_cuda_graph_configs reads only self.config
+    # get_accelerator_graph_configs reads only self.config
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     return sub
 
 
-def _prefill_config(sub) -> PackedCudaGraphConfig:
-    (packed,) = [c for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
+    (packed,) = [c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
                  if c.capture_graph_walk == "prefill"]
     return packed
 

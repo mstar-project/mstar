@@ -18,6 +18,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 chatterbox = pytest.importorskip("chatterbox")
 from chatterbox.models.s3gen import S3Gen as RefS3Gen  # noqa: E402
 from chatterbox.models.t3 import T3 as RefT3  # noqa: E402, N811

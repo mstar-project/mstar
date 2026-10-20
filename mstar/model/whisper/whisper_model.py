@@ -82,6 +82,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class WhisperModel(Model):
     """Whisper ASR: HF audio encoder + mstar-native AR decoder."""
 
+    # Requests the default decoder caches hold at once, each at full length.
+    # A deployment retunes the page counts under ``resources:`` in its YAML.
+    MAX_CONCURRENT_REQUESTS = 64
+
     def __init__(
         self,
         model_path_hf: str,
@@ -112,6 +116,12 @@ class WhisperModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _cache_pages(tokens: int, page_size: int, requests: int) -> int:
+        """Pages for ``requests`` sequences of ``tokens`` each, plus the sink
+        page every KV cache keeps out of circulation."""
+        return 1 + requests * -(-tokens // page_size)
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Decoder self-attention KV + a separate encoder-context KV.
 
@@ -120,26 +130,34 @@ class WhisperModel(Model):
         would have it planning the 1500-token context every step for nothing.
         ``audio_encoder`` is stateless.
         """
-        # Sequences cap at max_target_positions (448) = 4 pages per
-        # request; 128 pages ≈ 32 concurrent requests at ~2.7 GB
-        # (vs 43 GB with the 2048-page default).
+        page_size = 128
+        requests = self.MAX_CONCURRENT_REQUESTS
+        # Sequences cap at max_target_positions (448) = 4 pages per request;
+        # 257 pages at ~5 GiB for large-v3 (vs 40 GiB with the 2048-page default).
         kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_target_positions,
             num_qo_heads=self.config.decoder_attention_heads,
-            max_num_pages=128,
+            page_size=page_size,
+            max_num_pages=self._cache_pages(
+                self.config.max_target_positions, page_size, requests,
+            ),
         )
         # The fixed 30 s window is max_source_positions (1500) tokens = 12
-        # pages per request; 192 pages ≈ 16 concurrent at ~4 GB.
+        # pages per request, held from prefill to the last token; 769 pages at
+        # ~15 GiB for large-v3.
         context_kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_source_positions,
             num_qo_heads=self.config.decoder_attention_heads,
-            max_num_pages=192,
+            page_size=page_size,
+            max_num_pages=self._cache_pages(
+                self.config.max_source_positions, page_size, requests,
+            ),
         )
         return [
             KVSpec(resource_key=KV_CACHE, nodes={"decoder"}, config=kv_config),
@@ -187,6 +205,46 @@ class WhisperModel(Model):
                 ignore_eos=model_kwargs.get("ignore_eos", False),
             )
         }
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a request cap the decoder caches cannot hold.
+
+        A request keeps its encoder context from prefill to its last token, so
+        nothing frees cross-attention pages but a finished request. Past the
+        pool a prefill batch is refused and the worker offloads decoding
+        requests to admit it, which costs far more than queueing would. So
+        ``max_concurrent_requests`` requests at full length must fit in each
+        cache next to its sink page; the conductor queues the rest.
+        """
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: past the requests the decoder "
+                "caches hold, the worker offloads decoding requests to admit new "
+                "ones instead of queueing them", config_path,
+            )
+            return
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(
+                f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}"
+            )
+        overrides = config.get("resources") or {}
+        for spec in self.get_node_resources():
+            if not isinstance(spec, KVSpec):
+                continue
+            kv = spec.config
+            override = overrides.get(spec.resource_key) or {}
+            page_size = int(override.get("page_size", kv.page_size))
+            max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
+            need = self._cache_pages(kv.max_seq_len, page_size, cap)
+            if need > max_num_pages:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
+                    f"need {need} pages of resources.{spec.resource_key} "
+                    f"({-(-kv.max_seq_len // page_size)} per request and the sink page), "
+                    f"which has {max_num_pages}; raise max_num_pages or lower "
+                    "max_concurrent_requests"
+                )
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -314,6 +372,9 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
     # -------------------------------------------------------------------
+
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
 
     def process_prompt(
         self,

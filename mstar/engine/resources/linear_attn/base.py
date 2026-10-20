@@ -52,6 +52,7 @@ class LinearAttnManager(AttentionResource):
 
             return GDNManager(
                 config=spec.config,
+                max_rows_in_combined=info.max_rows_in_combined,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
                 state_dtype=pool_config.blocks["state"].dtype,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -59,6 +60,10 @@ class RecurrentAddressing:
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # real rows, before a capture bucket's padding
+    # The same two on the host, as built: a backend that splits rows between
+    # kernels by them must not read the device copies back
+    host_slot_indices: Sequence[int] | None = None
+    host_has_state: Sequence[bool] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -96,6 +101,10 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
+        # (rid, label) -> slot the live admit took fresh, for `rollback_admit`.
+        # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
+        # same way, so a released request's entries are purged with it.
+        self._admit_taken: dict[tuple[str, str], int] = {}
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -159,6 +168,7 @@ class RecurrentStatePool(Resource):
         request's state.
         """
         with self._lock:
+            self._forget_taken(lambda r: r == rid)
             labels = self._slots.get(rid)
             if not labels:
                 return
@@ -188,7 +198,15 @@ class RecurrentStatePool(Resource):
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
+            self._admit_taken[(rid, label)] = slot.index
             return slot
+
+    def _forget_taken(self, is_mine) -> None:
+        """Drop the rollback record of the rows ``is_mine`` accepts. Caller
+        holds the lock."""
+        taken = self._admit_taken
+        for key in [k for k in taken if is_mine(k[0])]:
+            del taken[key]
 
     # Step lifecycle
 
@@ -201,6 +219,9 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
+        if self._admit_taken:
+            with self._lock:
+                self._forget_taken(ctx.is_real_row)
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                 # reads its state without extending it, or a padding row
@@ -215,6 +236,26 @@ class RecurrentStatePool(Resource):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
         return ADMIT_OK
+
+    def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
+        """Free the slots this step's admit took fresh; slots a request already
+        held stay with it. Without this, two forking requests can each keep
+        the slot the other's fork needs, and the pool has no eviction to break
+        that."""
+        del step
+        if ctx.capture or not self._admit_taken:
+            return
+        with self._lock:
+            taken = self._admit_taken
+            for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
+                index = taken.pop((rid, label))
+                labels = self._slots.get(rid)
+                slot = labels.get(label) if labels else None
+                if slot is None or slot.index != index:
+                    continue  # reset or removed under us; the slot went with it
+                del labels[label]
+                self._zero_slot(index)
+                self._free.append(index)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
@@ -303,6 +344,9 @@ class RecurrentStatePool(Resource):
         if ctx.capture:
             return
         with self._lock:
+            # committed, so there is nothing left to unwind
+            if self._admit_taken:
+                self._forget_taken(ctx.is_real_row)
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
@@ -389,6 +433,10 @@ class RecurrentStatePool(Resource):
             slot_indices=target.slot_indices,
             has_state=target.has_state,
             num_rows=num_rows,
+            # the lists as built, not copies: this call made them and nothing
+            # changes them after
+            host_slot_indices=indices,
+            host_has_state=has_state,
         )
 
     def _addressing_buffers(
@@ -440,7 +488,7 @@ class RecurrentStatePool(Resource):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
