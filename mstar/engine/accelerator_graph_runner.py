@@ -1248,7 +1248,7 @@ class AcceleratorGraphRunner:
                 forward, **compile_kwargs(spec.config.compile_mode),
             )
         return with_inductor_overrides(
-            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+            self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
         )
 
     def _dummy_engine_inputs(
@@ -2074,7 +2074,7 @@ class PiecewiseAcceleratorGraphRunner:
         if self._config.compile:
             fn = with_inductor_overrides(
                 torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
-                shape.total_tokens,
+                shape.total_tokens, shape.bs,
             )
 
         def run_fn():
