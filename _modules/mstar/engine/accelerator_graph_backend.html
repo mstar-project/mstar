@@ -1018,7 +1018,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AcceleratorGraphBackend.create_graph">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphBackend.create_graph">[docs]</a>
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span> <span class="o">...</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span> <span class="o">...</span></div>
 
 
 <div class="viewcode-block" id="AcceleratorGraphBackend.graph_pool_handle">
@@ -1151,7 +1151,13 @@ window.runMermaid = runMermaid;</script>
         <span class="k">try</span><span class="p">:</span>
             <span class="n">end</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">pool</span><span class="o">.</span><span class="n">handle</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
-            <span class="k">pass</span>
+            <span class="c1"># not recording: it never started, or capture_end stopped it and the graph releases the pool</span>
+            <span class="k">return</span>
+        <span class="c1"># still recording, so the capture never ended and no graph will release the pool</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_release_pool</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_release_pool</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">index</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">device_type</span><span class="si">}</span><span class="s2">_releasePool"</span><span class="p">)(</span><span class="n">index</span><span class="p">,</span> <span class="n">pool</span><span class="o">.</span><span class="n">handle</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="CUDAGraphBackend">
@@ -1163,8 +1169,8 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="CUDAGraphBackend.create_graph">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CUDAGraphBackend.create_graph">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">(</span><span class="n">keep_graph</span><span class="o">=</span><span class="n">keep_graph</span><span class="p">)</span></div>
 </div>
 
 
@@ -1178,15 +1184,19 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="XPUGraphBackend.create_graph">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphBackend.create_graph">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">XPUGraph</span><span class="p">()</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturedGraph</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">XPUGraph</span><span class="p">(</span><span class="n">keep_graph</span><span class="o">=</span><span class="n">keep_graph</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="XPUGraphBackend.graph_pool_handle">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.XPUGraphBackend.graph_pool_handle">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">graph_pool_handle</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphPool</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">XPUGraphPool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">())</span></div>
-</div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_release_pool</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">index</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># the pool holds the failed graph instead (see `XPUGraphPool`)</span>
+        <span class="k">pass</span></div>
 
 
 

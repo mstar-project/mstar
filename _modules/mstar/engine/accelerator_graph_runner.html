@@ -906,11 +906,14 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.accelerator_graph_runner</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">is_dataclass</span><span class="p">,</span> <span class="n">replace</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">partial</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterator</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -930,6 +933,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">StepRunner</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedModelOutput</span><span class="p">,</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms.compile</span><span class="w"> </span><span class="kn">import</span> <span class="n">with_inductor_overrides</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">profiler</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.device</span><span class="w"> </span><span class="kn">import</span> <span class="n">DeviceCapability</span>
@@ -964,9 +968,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="agree_across_ranks">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.agree_across_ranks">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">agree_across_ranks</span><span class="p">(</span>
-    <span class="n">comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">flags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""AND each flag across every rank of the joint group.</span>
+    <span class="n">comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+    <span class="n">reduce</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Reduce each of ``values`` over every rank of the joint group with</span>
+<span class="sd">    ``reduce``. `torch.amin` ANDs flags and `torch.amax` takes the largest.</span>
 
 <span class="sd">    Capture failure is per-rank: a rank that keeps a graph another rank</span>
 <span class="sd">    dropped replays it while the other runs eager, which hangs as soon as the</span>
@@ -976,16 +982,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">groups</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">comm_group</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">[</span>
         <span class="n">comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">.</span><span class="n">sp_group</span>
     <span class="p">]</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">flags</span> <span class="ow">or</span> <span class="nb">all</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">flags</span>
-    <span class="n">gathered</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">flags</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">values</span> <span class="ow">or</span> <span class="nb">all</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">values</span>
+    <span class="n">gathered</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
     <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># all_gather is rank-major, so the min down dim 0 is the AND</span>
-            <span class="n">gathered</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">all_gather</span><span class="p">(</span><span class="n">gathered</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+            <span class="c1"># all_gather is rank-major, so dim 0 runs over the ranks</span>
+            <span class="n">gathered</span> <span class="o">=</span> <span class="n">reduce</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">all_gather</span><span class="p">(</span><span class="n">gathered</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
                 <span class="n">group</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span>
-            <span class="p">)</span><span class="o">.</span><span class="n">amin</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-    <span class="k">return</span> <span class="p">[</span><span class="nb">bool</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">gathered</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span></div>
+            <span class="p">),</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">gathered</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span></div>
 
 
 
@@ -1041,7 +1047,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="capture_into_graph">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_into_graph">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` into a new CUDA graph allocated from ``pool``.</span>
 
 <span class="sd">    Returns the graph and what ``run`` returned. A capture that fails part</span>
@@ -1062,7 +1068,12 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">backend</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Accelerator graphs are unsupported on device </span><span class="si">{</span><span class="n">device</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
     <span class="n">prev_stream</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
-    <span class="n">graph</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">create_graph</span><span class="p">()</span>
+    <span class="n">graph</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">create_graph</span><span class="p">(</span><span class="n">keep_graph</span><span class="p">)</span>
+    <span class="c1"># benchmark off, so cuDNN searches in the warm-up and not in here: a conv</span>
+    <span class="c1"># whose cached plan can't get its workspace would search again, timing</span>
+    <span class="c1"># candidates and emptying the allocator's cache, which fails the capture</span>
+    <span class="n">benchmark</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">benchmark</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">benchmark</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">set_stance</span><span class="p">(</span><span class="s2">"fail_on_recompile"</span><span class="p">),</span> \
                 <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">backend</span><span class="o">.</span><span class="n">device_type</span><span class="p">):</span>
@@ -1072,6 +1083,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">pool</span><span class="o">.</span><span class="n">on_failure</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span>
         <span class="n">backend</span><span class="o">.</span><span class="n">recover_failed_capture</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">prev_stream</span><span class="p">)</span>
         <span class="k">raise</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">benchmark</span> <span class="o">=</span> <span class="n">benchmark</span>
     <span class="n">backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
     <span class="n">pool</span><span class="o">.</span><span class="n">on_success</span><span class="p">()</span>
     <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">output</span></div>
@@ -1080,7 +1093,9 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="capture_with_static_outputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_with_static_outputs">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span>
+    <span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.</span>
 
 <span class="sd">    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:</span>
@@ -1108,7 +1123,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">static_outputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">static_outputs</span>
 
-    <span class="n">graph</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">)</span>
+    <span class="n">graph</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span></div>
 
 
@@ -1131,6 +1146,330 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_is_packed</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">AcceleratorGraphConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">FLASH_INFER_PACKED</span>
+
+
+<div class="viewcode-block" id="CaptureCost">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.CaptureCost">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">CaptureCost</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What one bucket costs on the device: its warm-up, and a capture thrown away, its own or its walk's largest."""</span>
+    <span class="c1"># bytes the eager forward allocated at its peak, above what was live</span>
+    <span class="n">peak</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># bytes one slot's graph holds at most, in its pool and out; None if it can't be captured</span>
+    <span class="n">graph</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="c1"># what of ``graph`` no later graph in the pool reuses: outputs, and a region's inputs</span>
+    <span class="n">kept</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># graphs the bucket captures, one per slot</span>
+    <span class="n">slots</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># bytes each slot's graph holds outside the allocator: its executable memory</span>
+    <span class="n">outside</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># the walk's measurement, whose copies hold memory the graphs reuse</span>
+    <span class="n">executable</span><span class="p">:</span> <span class="s2">"ExecutableMemory | None"</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="GraphMemory">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.GraphMemory">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">GraphMemory</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a captured graph holds: in its pool, and outside the allocator."""</span>
+    <span class="n">pool</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">outside</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="ExecutableMemory">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.ExecutableMemory">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ExecutableMemory</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The executable memory a walk's graphs take per node, outside any pool,</span>
+<span class="sd">    measured on copies of its first throwaway graph: executables instantiated</span>
+<span class="sd">    from it through libcuda. The cost per node changes with a graph's size,</span>
+<span class="sd">    even for the same kernels: a chain of adds takes 3.1 KiB a node at 300</span>
+<span class="sd">    nodes and 2.4 at 2222. A walk's graphs are about the same size, so the</span>
+<span class="sd">    first graph's cost per node holds for all of them.</span>
+
+<span class="sd">    The copies are held until the runner captures. The driver keeps a destroyed</span>
+<span class="sd">    graph's executable memory to reuse, and maps new memory beside it, so after</span>
+<span class="sd">    any destroy, free memory drops by less than a copy takes.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_node</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># a lower bound on the bytes the copies hold</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">held</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+
+<div class="viewcode-block" id="ExecutableMemory.measure">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.ExecutableMemory.measure">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">measure</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph</span><span class="p">,</span> <span class="n">nodes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Set ``per_node`` and ``held`` from copies of ``graph``, held until `release`.</span>
+
+<span class="sd">        The count starts after the first copy that takes free memory, since</span>
+<span class="sd">        copies until then fill pieces the driver mapped earlier. It adds one</span>
+<span class="sd">        2 MiB piece, since the first counted copy may start partway into a</span>
+<span class="sd">        piece. Free memory is the device's, so another process allocating or</span>
+<span class="sd">        freeing moves it: a count is kept only if free memory never rose and no</span>
+<span class="sd">        copy took more than two pieces above the mean. If no count is kept,</span>
+<span class="sd">        ``per_node`` is the largest rate a count gave. None if no copy could be</span>
+<span class="sd">        counted.</span>
+<span class="sd">        """</span>
+        <span class="n">cuda</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="s2">"libcuda.so.1"</span><span class="p">)</span>
+        <span class="n">largest</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">drops</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">free</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">tries</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">first</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">)</span>
+        <span class="k">while</span> <span class="n">tries</span> <span class="o">&lt;</span> <span class="n">_MEASURE_TRIES</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">_MEASURE_COPIES</span><span class="p">:</span>
+            <span class="n">copy</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">()</span>
+            <span class="n">status</span> <span class="o">=</span> <span class="n">cuda</span><span class="o">.</span><span class="n">cuGraphInstantiateWithFlags</span><span class="p">(</span>
+                <span class="n">ctypes</span><span class="o">.</span><span class="n">byref</span><span class="p">(</span><span class="n">copy</span><span class="p">),</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">(</span><span class="n">graph</span><span class="o">.</span><span class="n">raw_cuda_graph</span><span class="p">()),</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_ulonglong</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">status</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Stopped measuring graph executable memory: CUresult </span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="n">status</span><span class="p">)</span>
+                <span class="k">break</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">copy</span><span class="p">)</span>
+            <span class="n">drop</span> <span class="o">=</span> <span class="n">free</span> <span class="o">-</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">free</span> <span class="o">-=</span> <span class="n">drop</span>
+            <span class="k">if</span> <span class="n">drop</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">tries</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="n">drops</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">elif</span> <span class="n">drops</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">drop</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="n">drops</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">drops</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">drop</span><span class="p">)</span>
+                <span class="k">if</span> <span class="nb">sum</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">_MEASURE_BYTES</span><span class="p">:</span>
+                    <span class="n">rate</span> <span class="o">=</span> <span class="p">(</span><span class="nb">sum</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">+</span> <span class="n">_EXEC_PIECE</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">*</span> <span class="n">nodes</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">_EXEC_PIECE</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">per_node</span> <span class="o">=</span> <span class="n">rate</span>
+                        <span class="c1"># Subtract two pieces, since the count may start partway into one and leave the last</span>
+                        <span class="c1"># one partly unused.</span>
+                        <span class="n">each</span> <span class="o">=</span> <span class="p">(</span><span class="nb">sum</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">-</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">_EXEC_PIECE</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">held</span> <span class="o">+=</span> <span class="nb">int</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">)</span> <span class="o">-</span> <span class="n">first</span><span class="p">)</span> <span class="o">*</span> <span class="n">each</span><span class="p">)</span>
+                        <span class="k">return</span>
+                    <span class="n">largest</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">rate</span><span class="p">,</span> <span class="n">largest</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)</span>
+                    <span class="n">tries</span> <span class="o">+=</span> <span class="mi">1</span>
+                    <span class="n">drops</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">drops</span><span class="p">:</span>
+            <span class="n">largest</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span><span class="nb">sum</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">+</span> <span class="n">_EXEC_PIECE</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">drops</span><span class="p">)</span> <span class="o">*</span> <span class="n">nodes</span><span class="p">),</span> <span class="n">largest</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">drops</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">tries</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">:</span>
+            <span class="c1"># every copy fit in a piece mapped before</span>
+            <span class="n">largest</span> <span class="o">=</span> <span class="n">_EXEC_PIECE</span> <span class="o">/</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">)</span> <span class="o">*</span> <span class="n">nodes</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_node</span> <span class="o">=</span> <span class="n">largest</span></div>
+
+
+<div class="viewcode-block" id="ExecutableMemory.release">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.ExecutableMemory.release">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># copies are made only on NVIDIA GPUs, since others may have no libcuda</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">:</span>
+            <span class="n">cuda</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="s2">"libcuda.so.1"</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">copy</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="p">:</span>
+                <span class="n">cuda</span><span class="o">.</span><span class="n">cuGraphExecDestroy</span><span class="p">(</span><span class="n">copy</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_copies</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
+</div>
+
+
+
+<span class="c1">#: the driver maps executable memory in pieces of 2 MiB</span>
+<span class="n">_EXEC_PIECE</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+<span class="c1">#: copies are counted until they take 16 MiB, so the one piece added to a count is an eighth of it at most</span>
+<span class="n">_MEASURE_BYTES</span> <span class="o">=</span> <span class="mi">16</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+<span class="c1">#: a count spoiled by another process is tried again</span>
+<span class="n">_MEASURE_TRIES</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">_MEASURE_COPIES</span> <span class="o">=</span> <span class="mi">512</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_tensor_bytes</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Bytes of the distinct storages behind every tensor in ``value``, however nested."""</span>
+    <span class="n">storages</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">value</span><span class="p">]</span>
+    <span class="k">while</span> <span class="n">pending</span><span class="p">:</span>
+        <span class="n">item</span> <span class="o">=</span> <span class="n">pending</span><span class="o">.</span><span class="n">pop</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+            <span class="n">storages</span><span class="p">[</span><span class="n">item</span><span class="o">.</span><span class="n">untyped_storage</span><span class="p">()</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()]</span> <span class="o">=</span> <span class="n">item</span><span class="o">.</span><span class="n">untyped_storage</span><span class="p">()</span><span class="o">.</span><span class="n">nbytes</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">):</span>
+            <span class="n">pending</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)):</span>
+            <span class="n">pending</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">item</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">is_dataclass</span><span class="p">(</span><span class="n">item</span><span class="p">):</span>
+            <span class="n">pending</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="nb">vars</span><span class="p">(</span><span class="n">item</span><span class="p">)</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+    <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">storages</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_capture_thrown_away</span><span class="p">(</span>
+    <span class="n">capture</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">Any</span><span class="p">]],</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">executable</span><span class="p">:</span> <span class="n">ExecutableMemory</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GraphMemory</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Run ``capture`` into a pool of its own and hand it all back: what the</span>
+<span class="sd">    graph held, None if it failed.</span>
+
+<span class="sd">    A capture records kernels and collectives without running them, so a rank</span>
+<span class="sd">    short of memory fails its own capture here and no other rank waits on it.</span>
+<span class="sd">    """</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+    <span class="n">pool</span> <span class="o">=</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">graph_backend</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
+    <span class="c1"># Keep the graph so its nodes can be counted. It is never instantiated, so no executable is</span>
+    <span class="c1"># destroyed before `ExecutableMemory` measures. The measurement calls libcuda, so a ROCm</span>
+    <span class="c1"># graph's executable memory is counted as zero.</span>
+    <span class="n">counted</span> <span class="o">=</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">()</span>
+    <span class="n">nodes</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">graph</span><span class="p">,</span> <span class="n">outputs</span> <span class="o">=</span> <span class="n">capture</span><span class="p">(</span><span class="n">pool</span><span class="o">=</span><span class="n">pool</span><span class="p">,</span> <span class="n">keep_graph</span><span class="o">=</span><span class="n">counted</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">counted</span><span class="p">:</span>
+            <span class="n">nodes</span> <span class="o">=</span> <span class="n">_graph_nodes</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">nodes</span> <span class="ow">and</span> <span class="n">executable</span><span class="o">.</span><span class="n">per_node</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">executable</span><span class="o">.</span><span class="n">measure</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">nodes</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">executable</span><span class="o">.</span><span class="n">per_node</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># Leave the graph unsized. Counted as zero, its executable memory would go unplanned.</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Could not measure the executable memory of </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">what</span><span class="p">)</span>
+                    <span class="n">graph</span> <span class="o">=</span> <span class="n">outputs</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="s2">"</span><span class="si">%s</span><span class="s2">: graph executable memory, </span><span class="si">%.0f</span><span class="s2"> bytes a node, </span><span class="si">%.0f</span><span class="s2"> MiB held for the walk's graphs"</span><span class="p">,</span>
+                        <span class="n">what</span><span class="p">,</span> <span class="n">executable</span><span class="o">.</span><span class="n">per_node</span><span class="p">,</span> <span class="n">executable</span><span class="o">.</span><span class="n">held</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="p">,</span>
+                    <span class="p">)</span>
+    <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Could not capture </span><span class="si">%s</span><span class="s2"> to size it"</span><span class="p">,</span> <span class="n">what</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">graph</span> <span class="o">=</span> <span class="n">outputs</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">taken</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">graph</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">sum</span><span class="p">(</span>
+        <span class="n">segment</span><span class="p">[</span><span class="s2">"total_size"</span><span class="p">]</span> <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_snapshot</span><span class="p">(</span><span class="n">pool</span><span class="o">.</span><span class="n">handle</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="k">del</span> <span class="n">graph</span><span class="p">,</span> <span class="n">outputs</span>
+    <span class="c1"># A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS</span>
+    <span class="c1"># workspace in the pool. No real graph uses it yet.</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_cuda_clearCublasWorkspaces</span><span class="p">()</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+    <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">taken</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">GraphMemory</span><span class="p">(</span><span class="n">taken</span><span class="p">,</span> <span class="nb">round</span><span class="p">(</span><span class="n">nodes</span> <span class="o">*</span> <span class="p">(</span><span class="n">executable</span><span class="o">.</span><span class="n">per_node</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)))</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_graph_nodes</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""</span>
+    <span class="n">count</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_size_t</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">status</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="s2">"libcuda.so.1"</span><span class="p">)</span><span class="o">.</span><span class="n">cuGraphGetNodes</span><span class="p">(</span>
+        <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">(</span><span class="n">graph</span><span class="o">.</span><span class="n">raw_cuda_graph</span><span class="p">()),</span> <span class="kc">None</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">byref</span><span class="p">(</span><span class="n">count</span><span class="p">),</span>
+    <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">status</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"cuGraphGetNodes failed with CUresult </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">return</span> <span class="n">count</span><span class="o">.</span><span class="n">value</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_size_in_walk</span><span class="p">(</span>
+    <span class="n">captured</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CaptureCost</span><span class="p">],</span> <span class="n">cost</span><span class="p">:</span> <span class="n">CaptureCost</span><span class="p">,</span> <span class="n">kept_in_pool</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+    <span class="n">capture</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">Any</span><span class="p">]],</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">executable</span><span class="p">:</span> <span class="n">ExecutableMemory</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CaptureCost</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Return ``cost`` with its graph's size, and whether that size came from</span>
+<span class="sd">    another bucket's capture: the bucket is captured, thrown away, unless two</span>
+<span class="sd">    of its walk already were and they show it fits in the larger's scratch.</span>
+
+<span class="sd">    The lender is the bucket with the largest eager peak of those ``captured``</span>
+<span class="sd">    in the walk so far. A bucket that peaks no higher takes the lender's</span>
+<span class="sd">    scratch and adds its own kept bytes: a walk runs one forward at every</span>
+<span class="sd">    shape, and a smaller shape allocates no more at any step, so its graph</span>
+<span class="sd">    fits in the scratch a larger one leaves free. A smaller bucket runs the same</span>
+<span class="sd">    kernels, so its executable memory is taken as the lender's.</span>
+
+<span class="sd">    That holds only while no captured bucket took more scratch than the</span>
+<span class="sd">    lender. Where one did, a lender tells nothing of this walk, and every</span>
+<span class="sd">    bucket of it is captured: Chatterbox's CFG decode takes 24 MiB at 32 rows</span>
+<span class="sd">    and 56 MiB at 16.</span>
+<span class="sd">    """</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">scratch</span><span class="p">(</span><span class="n">bucket</span><span class="p">:</span> <span class="n">CaptureCost</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph</span> <span class="o">-</span> <span class="n">bucket</span><span class="o">.</span><span class="n">kept</span><span class="p">)</span> <span class="o">//</span> <span class="n">_SEGMENT</span><span class="p">)</span>
+
+    <span class="n">cost</span> <span class="o">=</span> <span class="n">cost</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">executable</span><span class="o">=</span><span class="n">executable</span><span class="p">)</span>
+    <span class="n">lender</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">bucket</span><span class="p">:</span> <span class="n">bucket</span><span class="o">.</span><span class="n">peak</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="p">(</span>
+        <span class="nb">len</span><span class="p">(</span><span class="n">captured</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">cost</span><span class="o">.</span><span class="n">peak</span> <span class="o">&lt;=</span> <span class="n">lender</span><span class="o">.</span><span class="n">peak</span>
+        <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">scratch</span><span class="p">(</span><span class="n">bucket</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">scratch</span><span class="p">(</span><span class="n">lender</span><span class="p">)</span> <span class="k">for</span> <span class="n">bucket</span> <span class="ow">in</span> <span class="n">captured</span><span class="p">)</span>
+    <span class="p">):</span>
+        <span class="k">return</span> <span class="n">cost</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">graph</span><span class="o">=</span><span class="n">lender</span><span class="o">.</span><span class="n">graph</span> <span class="o">-</span> <span class="n">lender</span><span class="o">.</span><span class="n">kept</span> <span class="o">+</span> <span class="n">cost</span><span class="o">.</span><span class="n">kept</span><span class="p">,</span> <span class="n">outside</span><span class="o">=</span><span class="n">lender</span><span class="o">.</span><span class="n">outside</span><span class="p">),</span> <span class="kc">True</span>
+    <span class="n">memory</span> <span class="o">=</span> <span class="n">_capture_thrown_away</span><span class="p">(</span><span class="n">capture</span><span class="p">,</span> <span class="n">what</span><span class="p">,</span> <span class="n">executable</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">memory</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">cost</span> <span class="o">=</span> <span class="n">cost</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span>
+            <span class="n">graph</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">pool</span> <span class="k">if</span> <span class="n">kept_in_pool</span> <span class="k">else</span> <span class="n">memory</span><span class="o">.</span><span class="n">pool</span> <span class="o">+</span> <span class="n">cost</span><span class="o">.</span><span class="n">kept</span><span class="p">,</span> <span class="n">outside</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">outside</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cost</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">cost</span><span class="p">,</span> <span class="kc">False</span>
+
+
+<span class="c1">#: the caching allocator's smallest segment: what a graph's kept tensors are counted in</span>
+<span class="n">_SEGMENT</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+
+
+<div class="viewcode-block" id="CapturePlan">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.CapturePlan">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">CapturePlan</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Which buckets each graph pool on a device captures, chosen before any is."""</span>
+    <span class="c1"># pool -&gt; the buckets it captures</span>
+    <span class="n">buckets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">]</span>
+    <span class="c1"># pool -&gt; bytes it is predicted to hold</span>
+    <span class="n">predicted</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># pool -&gt; bytes its graphs hold outside the allocator</span>
+    <span class="n">outside</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># bytes the largest eager step on the device takes</span>
+    <span class="n">floor</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="plan_captures">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.plan_captures">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">plan_captures</span><span class="p">(</span>
+    <span class="n">pools</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]],</span> <span class="n">free</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">reusable</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CapturePlan</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The cheapest buckets across every pool on a device, added while the</span>
+<span class="sd">    largest eager step still fits in ``free`` beside them.</span>
+
+<span class="sd">    A pool's graphs, captured largest first, reuse its memory: it holds what</span>
+<span class="sd">    every graph keeps, plus the most any one graph needs beyond that. So a</span>
+<span class="sd">    bucket adds its slots' kept bytes, and whatever it needs past the pool's</span>
+<span class="sd">    most so far. That is a model; the boot log compares it with what capture took.</span>
+<span class="sd">    A bucket also adds its slots' executable memory, less the memory its</span>
+<span class="sd">    graphs reuse from the walk's copies. A walk's copies pay for its planned</span>
+<span class="sd">    graphs' executable memory once, across all its buckets. ``reusable`` bounds</span>
+<span class="sd">    the reuse summed over all buckets, None for no bound.</span>
+<span class="sd">    """</span>
+    <span class="n">floor</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span><span class="n">cost</span><span class="o">.</span><span class="n">peak</span> <span class="k">for</span> <span class="n">costs</span> <span class="ow">in</span> <span class="n">pools</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">cost</span> <span class="ow">in</span> <span class="n">costs</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">room</span> <span class="o">=</span> <span class="n">free</span> <span class="o">-</span> <span class="n">floor</span>
+    <span class="n">plan</span> <span class="o">=</span> <span class="n">CapturePlan</span><span class="p">({</span><span class="n">pool</span><span class="p">:</span> <span class="nb">set</span><span class="p">()</span> <span class="k">for</span> <span class="n">pool</span> <span class="ow">in</span> <span class="n">pools</span><span class="p">},</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">pools</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">pools</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">floor</span><span class="p">)</span>
+    <span class="n">scratch</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">pools</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># walk's measurement -&gt; what its copies held that no planned graph reuses yet</span>
+    <span class="n">unused</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">cost</span><span class="o">.</span><span class="n">executable</span><span class="p">:</span> <span class="n">cost</span><span class="o">.</span><span class="n">executable</span><span class="o">.</span><span class="n">held</span>
+        <span class="k">for</span> <span class="n">costs</span> <span class="ow">in</span> <span class="n">pools</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">cost</span> <span class="ow">in</span> <span class="n">costs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="n">cost</span><span class="o">.</span><span class="n">executable</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="p">}</span>
+    <span class="n">bound</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"inf"</span><span class="p">)</span> <span class="k">if</span> <span class="n">reusable</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">reusable</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">reused</span><span class="p">(</span><span class="n">cost</span><span class="p">:</span> <span class="n">CaptureCost</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">unused</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">cost</span><span class="o">.</span><span class="n">executable</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">bound</span><span class="p">,</span> <span class="n">cost</span><span class="o">.</span><span class="n">slots</span> <span class="o">*</span> <span class="n">cost</span><span class="o">.</span><span class="n">outside</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">added</span><span class="p">(</span><span class="n">pool</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cost</span><span class="p">:</span> <span class="n">CaptureCost</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># whole segments: the costliest graph's scratch may have no room left for a small tensor</span>
+        <span class="n">kept</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">cost</span><span class="o">.</span><span class="n">kept</span> <span class="o">//</span> <span class="n">_SEGMENT</span><span class="p">)</span> <span class="o">*</span> <span class="n">_SEGMENT</span>
+        <span class="k">return</span> <span class="n">cost</span><span class="o">.</span><span class="n">slots</span> <span class="o">*</span> <span class="n">kept</span> <span class="o">+</span> <span class="nb">max</span><span class="p">(</span><span class="n">cost</span><span class="o">.</span><span class="n">graph</span> <span class="o">-</span> <span class="n">cost</span><span class="o">.</span><span class="n">kept</span> <span class="o">-</span> <span class="n">scratch</span><span class="p">[</span><span class="n">pool</span><span class="p">],</span> <span class="mi">0</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">on_device</span><span class="p">(</span><span class="n">candidate</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">pool</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">cost</span> <span class="o">=</span> <span class="n">candidate</span>
+        <span class="k">return</span> <span class="n">added</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">cost</span><span class="p">)</span> <span class="o">+</span> <span class="n">cost</span><span class="o">.</span><span class="n">slots</span> <span class="o">*</span> <span class="n">cost</span><span class="o">.</span><span class="n">outside</span> <span class="o">-</span> <span class="n">reused</span><span class="p">(</span><span class="n">cost</span><span class="p">)</span>
+
+    <span class="n">left</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">bucket</span><span class="p">,</span> <span class="n">cost</span><span class="p">)</span> <span class="k">for</span> <span class="n">pool</span><span class="p">,</span> <span class="n">costs</span> <span class="ow">in</span> <span class="n">pools</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">index</span><span class="p">,</span> <span class="p">(</span><span class="n">bucket</span><span class="p">,</span> <span class="n">cost</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">costs</span><span class="o">.</span><span class="n">items</span><span class="p">())</span> <span class="k">if</span> <span class="n">cost</span><span class="o">.</span><span class="n">graph</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="p">]</span>
+    <span class="k">while</span> <span class="n">left</span><span class="p">:</span>
+        <span class="c1"># a tie goes to the pool named first, which leads with its node, then to capture order</span>
+        <span class="n">best</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">candidate</span><span class="p">:</span> <span class="p">(</span><span class="n">on_device</span><span class="p">(</span><span class="n">candidate</span><span class="p">),</span> <span class="o">*</span><span class="n">candidate</span><span class="p">[:</span><span class="mi">2</span><span class="p">]))</span>
+        <span class="n">pool</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">bucket</span><span class="p">,</span> <span class="n">cost</span> <span class="o">=</span> <span class="n">best</span>
+        <span class="k">if</span> <span class="n">on_device</span><span class="p">(</span><span class="n">best</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">room</span><span class="p">:</span>
+            <span class="k">break</span>
+        <span class="n">room</span> <span class="o">-=</span> <span class="n">on_device</span><span class="p">(</span><span class="n">best</span><span class="p">)</span>
+        <span class="n">used</span> <span class="o">=</span> <span class="n">reused</span><span class="p">(</span><span class="n">cost</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">used</span><span class="p">:</span>
+            <span class="n">unused</span><span class="p">[</span><span class="n">cost</span><span class="o">.</span><span class="n">executable</span><span class="p">]</span> <span class="o">-=</span> <span class="n">used</span>
+            <span class="n">bound</span> <span class="o">-=</span> <span class="n">used</span>
+        <span class="n">plan</span><span class="o">.</span><span class="n">predicted</span><span class="p">[</span><span class="n">pool</span><span class="p">]</span> <span class="o">+=</span> <span class="n">added</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">cost</span><span class="p">)</span>
+        <span class="n">plan</span><span class="o">.</span><span class="n">outside</span><span class="p">[</span><span class="n">pool</span><span class="p">]</span> <span class="o">+=</span> <span class="n">cost</span><span class="o">.</span><span class="n">slots</span> <span class="o">*</span> <span class="n">cost</span><span class="o">.</span><span class="n">outside</span>
+        <span class="n">scratch</span><span class="p">[</span><span class="n">pool</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">scratch</span><span class="p">[</span><span class="n">pool</span><span class="p">],</span> <span class="n">cost</span><span class="o">.</span><span class="n">graph</span> <span class="o">-</span> <span class="n">cost</span><span class="o">.</span><span class="n">kept</span><span class="p">)</span>
+        <span class="n">plan</span><span class="o">.</span><span class="n">buckets</span><span class="p">[</span><span class="n">pool</span><span class="p">]</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">bucket</span><span class="p">)</span>
+        <span class="n">left</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">best</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">plan</span></div>
+
 
 
 <div class="viewcode-block" id="DummyRowPool">
@@ -1230,6 +1569,22 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="WarmedSpec">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.WarmedSpec">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">WarmedSpec</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A spec prepared and run eagerly: what its capture reads."""</span>
+    <span class="n">run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">Any</span><span class="p">]</span>
+    <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
+    <span class="n">static_input_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">dummy_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]</span>
+    <span class="c1"># bytes the last warm-up forward allocated at its peak, above what was live</span>
+    <span class="n">peak</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># bytes of what it returned</span>
+    <span class="n">returned</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
 <div class="viewcode-block" id="AcceleratorGraphRunner">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AcceleratorGraphRunner</span><span class="p">:</span>
@@ -1279,6 +1634,12 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_blocked_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># set by prepare_for_capture; capture reuses it rather than re-deriving</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># bucket -&gt; what it costs, from size_captures</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># the buckets of them sized by a lender's capture, not their own</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># walk -&gt; its graphs' executable memory</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">,</span> <span class="n">ExecutableMemory</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="c1"># (config_idx, tensor_key) → max-bucket static buffer. Lazily populated</span>
         <span class="c1"># by _intern_static_buffer on the first capture. Smaller-bucket captures</span>
@@ -1410,10 +1771,99 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span></div>
 
 
+<div class="viewcode-block" id="AcceleratorGraphRunner.size_captures">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">size_captures</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Warm every spec up, and capture each walk's largest buckets once,</span>
+<span class="sd">        thrown away, before any runner captures for real.</span>
+
+<span class="sd">        Every bucket is warmed rather than the first in capture order: that</span>
+<span class="sd">        order leads with batch size, so it can open on a decode bucket while a</span>
+<span class="sd">        one-row prefill of thousands of tokens peaks far higher. And every slot: a</span>
+<span class="sd">        slot's first plan builds state of its own (FlashInfer's graph wrappers</span>
+<span class="sd">        and their workspace, 750 MiB for the Talker's second slot), which has</span>
+<span class="sd">        to be spent before free memory is read.</span>
+<span class="sd">        """</span>
+        <span class="c1"># walk -&gt; the buckets of it captured so far</span>
+        <span class="n">captured</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">CaptureCost</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">():</span>
+            <span class="c1"># the warm-up may hold collectives; every rank sizes these specs, in</span>
+            <span class="c1"># config order, as it does the captures</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+            <span class="n">free</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">slot</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                        <span class="n">walk</span> <span class="o">=</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">],</span> <span class="n">lent</span> <span class="o">=</span> <span class="n">_size_in_walk</span><span class="p">(</span>
+                            <span class="n">captured</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="p">[]),</span>
+                            <span class="n">CaptureCost</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">peak</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">returned</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">),</span> <span class="kc">True</span><span class="p">,</span>
+                            <span class="n">partial</span><span class="p">(</span>
+                                <span class="n">capture_into_graph</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+                                <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                            <span class="p">),</span>
+                            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">spec</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="n">ExecutableMemory</span><span class="p">()),</span>
+                        <span class="p">)</span>
+                        <span class="k">if</span> <span class="n">lent</span><span class="p">:</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="c1"># Fail the boot. A skipped step would leave its peak out of the plan's floor.</span>
+                <span class="c1"># A step that cannot run here cannot run once graphs hold memory either.</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"AcceleratorGraphRunner[</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="si">}</span><span class="s2">]: could not run </span><span class="si">{</span><span class="n">spec</span><span class="si">}</span><span class="s2"> eagerly to size "</span>
+                    <span class="sa">f</span><span class="s2">"its capture, with </span><span class="si">{</span><span class="n">free</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB free before it: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span></div>
+
+
+<div class="viewcode-block" id="AcceleratorGraphRunner.size_lent_captures">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_lent_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">size_lent_captures</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wanted</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Capture every bucket a lender sized, thrown away, if ``wanted`` here</span>
+<span class="sd">        or on another rank: a plan that leaves graphs out needs what each</span>
+<span class="sd">        takes, not what its walk's largest does.</span>
+
+<span class="sd">        Every rank asks, so the ranks of a group size again together or not at</span>
+<span class="sd">        all, and plan on the same kind of cost. With no forward and no barrier:</span>
+<span class="sd">        sizing ran the forwards, and a capture runs no collective.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">wanted</span><span class="p">)],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amax</span><span class="p">)[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span>
+        <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">slot</span> <span class="o">!=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">)</span>
+            <span class="n">cost</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">graph</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">forwards</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+                    <span class="n">memory</span> <span class="o">=</span> <span class="n">_capture_thrown_away</span><span class="p">(</span>
+                        <span class="n">partial</span><span class="p">(</span>
+                            <span class="n">capture_into_graph</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+                            <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                        <span class="p">),</span>
+                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">spec</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="p">[(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">)],</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">memory</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">cost</span> <span class="o">=</span> <span class="n">cost</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">graph</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">pool</span><span class="p">,</span> <span class="n">outside</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">outside</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"AcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: could not prepare </span><span class="si">%s</span><span class="s2"> to size its capture"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="n">spec</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">cost</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span></div>
+
+
 <div class="viewcode-block" id="AcceleratorGraphRunner.warmup_and_capture">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Capture graphs for all configs and batch sizes."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">planned</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Capture the ``planned`` buckets, of every config and batch size.</span>
+<span class="sd">        With no plan, every bucket, each warmed up first as sizing would have."""</span>
+        <span class="c1"># the plan has read free memory, and the graphs captured here reuse what the copies held</span>
+        <span class="k">for</span> <span class="n">executable</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+            <span class="n">executable</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                 <span class="s2">"</span><span class="si">%s</span><span class="s2"> is not available, skipping graph capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
@@ -1426,20 +1876,34 @@ window.runMermaid = runMermaid;</script>
         <span class="n">mem_before</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>
 
         <span class="n">slot_specs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">()</span>
+        <span class="n">sized</span> <span class="o">=</span> <span class="n">planned</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="c1"># what every rank planned, as though captured in full (see `_buckets_captured_everywhere`)</span>
+        <span class="n">planned</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets_captured_everywhere</span><span class="p">(</span><span class="n">slot_specs</span><span class="p">,</span> <span class="p">{</span>
+            <span class="n">bucket</span><span class="p">:</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">bucket</span> <span class="ow">in</span> <span class="p">(</span><span class="n">planned</span> <span class="k">if</span> <span class="n">sized</span> <span class="k">else</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span><span class="p">})</span>
+        <span class="p">})</span>
+        <span class="c1"># costliest first, so the graphs after it fit in what it leaves free; by</span>
+        <span class="c1"># the most each costs on any rank, so every rank warms up in one order</span>
+        <span class="n">buckets</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span><span class="p">))</span>
+        <span class="n">costs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">buckets</span><span class="p">,</span> <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">graph</span> <span class="k">if</span> <span class="n">sized</span> <span class="ow">and</span> <span class="n">bucket</span> <span class="ow">in</span> <span class="n">planned</span> <span class="k">else</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">bucket</span> <span class="ow">in</span> <span class="n">buckets</span>
+        <span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amax</span><span class="p">),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
 
         <span class="c1"># bucket -&gt; slot index -&gt; (spec, captured slot). Registration is</span>
         <span class="c1"># deferred to a whole bucket at a time: its slots are double buffers of</span>
         <span class="c1"># one shape, so a bucket holding only some of them would silently hand</span>
         <span class="c1"># pre-plan and replay the same buffers.</span>
         <span class="n">captured</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">AcceleratorGraphSlot</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">slot_specs</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">spec</span><span class="p">:</span> <span class="o">-</span><span class="n">costs</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="p">]):</span>
+            <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">planned</span><span class="p">:</span>
+                <span class="k">continue</span>
             <span class="c1"># every rank barriers once per spec, pass or fail — a rank that</span>
             <span class="c1"># stopped early here would leave the others waiting</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
 
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">spec</span><span class="p">)</span>
+                <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">forwards</span><span class="o">=</span><span class="mi">0</span> <span class="k">if</span> <span class="n">sized</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                     <span class="s2">"Failed to capture accelerator graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
@@ -1468,8 +1932,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">spec</span><span class="p">,</span> <span class="n">slot</span> <span class="o">=</span> <span class="n">slots</span><span class="p">[</span><span class="n">slot_idx</span><span class="p">]</span>
                 <span class="k">for</span> <span class="n">key_spec</span> <span class="ow">in</span> <span class="p">[</span><span class="n">spec</span><span class="p">,</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_get_addtl_slot_specs</span><span class="p">(</span><span class="n">spec</span><span class="p">)]:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_register_slot</span><span class="p">(</span><span class="n">key_spec</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                <span class="c1"># pre-seed preplan inputs; cached per bucket, so once is enough</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">bucket_key</span><span class="p">]</span><span class="o">.</span><span class="n">config</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">AcceleratorGraphConfigType</span><span class="o">.</span><span class="n">BASIC_BATCHED</span><span class="p">:</span>
+                <span class="c1"># pre-seed preplan inputs; cached per bucket, so once is enough.</span>
+                <span class="c1"># A packed bucket's rows would never be read: a batch with no inputs</span>
+                <span class="c1"># yet can only lease a batched one (see `select_batched_bucket`).</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">declare_inputs_for</span><span class="p">(</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">bucket_key</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">release_all</span><span class="p">()</span>
@@ -1518,7 +1985,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">agreed</span> <span class="o">=</span> <span class="n">agree_across_ranks</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span>
             <span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">captured</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">()))</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span><span class="p">],</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amin</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="p">{</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">ok</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">order</span><span class="p">,</span> <span class="n">agreed</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="k">if</span> <span class="n">ok</span><span class="p">}</span>
 
@@ -1552,7 +2019,29 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="n">mem_after</span> <span class="o">-</span> <span class="n">mem_before</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="mi">1024</span> <span class="o">**</span> <span class="mi">2</span><span class="p">),</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphSlot</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">forwards</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AcceleratorGraphSlot</span><span class="p">:</span>
+        <span class="c1"># no forward after sizing, which already ran this spec's</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">forwards</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+            <span class="c1"># what preparing it left cached in the allocator is out of the</span>
+            <span class="c1"># capture pool's reach</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+            <span class="n">graph</span><span class="p">,</span> <span class="n">output</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
+                <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_slot_from_capture</span><span class="p">(</span>
+                <span class="n">output</span><span class="o">=</span><span class="n">BatchedModelOutput</span><span class="o">.</span><span class="n">coerce</span><span class="p">(</span><span class="n">output</span><span class="p">),</span>
+                <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
+                <span class="n">static_inputs</span><span class="o">=</span><span class="n">warmed</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">,</span>
+                <span class="n">static_input_keys</span><span class="o">=</span><span class="n">warmed</span><span class="o">.</span><span class="n">static_input_keys</span><span class="p">,</span>
+                <span class="n">dummy_rids</span><span class="o">=</span><span class="n">warmed</span><span class="o">.</span><span class="n">dummy_rids</span><span class="p">,</span>
+                <span class="n">dummy_metadata</span><span class="o">=</span><span class="n">warmed</span><span class="o">.</span><span class="n">dummy_metadata</span><span class="p">,</span>
+                <span class="n">config_idx</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span>
+            <span class="p">)</span>
+
+    <span class="nd">@contextmanager</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_warmed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">forwards</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="n">WarmedSpec</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Prepare ``spec`` and run its forward eagerly ``forwards`` times, as</span>
+<span class="sd">        its first capture needs."""</span>
         <span class="n">walk</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
         <span class="n">dummy_rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">ensure</span><span class="p">(</span>
@@ -1621,28 +2110,28 @@ window.runMermaid = runMermaid;</script>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">set_device</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">):</span>
+            <span class="n">peak</span> <span class="o">=</span> <span class="n">returned</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">forwards</span><span class="p">):</span>
+                <span class="c1"># the last forward's peak, not the first's: that one may compile and autotune</span>
+                <span class="n">live</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
                 <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
-                    <span class="n">run_forward</span><span class="p">()</span>
+                    <span class="n">returned</span> <span class="o">=</span> <span class="n">_tensor_bytes</span><span class="p">(</span><span class="n">run_forward</span><span class="p">())</span>
+                <span class="n">peak</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span> <span class="o">-</span> <span class="n">live</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
                 <span class="c1"># capture after it) sees the same shapes the first prepare did</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
                 <span class="n">prepare</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-            <span class="n">graph</span><span class="p">,</span> <span class="n">output</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
-                <span class="n">run_forward</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
-            <span class="p">)</span>
-            <span class="n">output</span> <span class="o">=</span> <span class="n">BatchedModelOutput</span><span class="o">.</span><span class="n">coerce</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
-
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_slot_from_capture</span><span class="p">(</span>
-                <span class="n">output</span><span class="o">=</span><span class="n">output</span><span class="p">,</span>
-                <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
+            <span class="k">yield</span> <span class="n">WarmedSpec</span><span class="p">(</span>
+                <span class="n">run</span><span class="o">=</span><span class="n">run_forward</span><span class="p">,</span>
                 <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
                 <span class="n">static_input_keys</span><span class="o">=</span><span class="n">static_input_keys</span><span class="p">,</span>
                 <span class="n">dummy_rids</span><span class="o">=</span><span class="n">dummy_rids</span><span class="p">,</span>
                 <span class="n">dummy_metadata</span><span class="o">=</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">,</span>
-                <span class="n">config_idx</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span>
+                <span class="n">peak</span><span class="o">=</span><span class="n">peak</span><span class="p">,</span>
+                <span class="n">returned</span><span class="o">=</span><span class="n">returned</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="c1"># Capture ran the dummy rows as real requests; free their storage</span>
@@ -2152,6 +2641,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="WarmedRegion">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.WarmedRegion">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">WarmedRegion</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A region's shape planned and run eagerly: what its capture reads."""</span>
+    <span class="n">run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">Any</span><span class="p">]</span>
+    <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">warm_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">peak</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
 <div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseAcceleratorGraphRunner</span><span class="p">:</span>
@@ -2205,6 +2706,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">memory_pool</span>
         <span class="c1"># (bs, total_tokens) shapes that failed to capture and run eagerly</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># bucket -&gt; what it costs, from size_captures</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># the buckets of them sized by a lender's capture, not their own</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># executable memory of the region's graphs, which are all one walk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span> <span class="o">=</span> <span class="n">ExecutableMemory</span><span class="p">()</span>
+        <span class="c1"># bucket -&gt; the shape, dtype and device of each output of its warm-up</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_output_likes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span> <span class="o">=</span> <span class="n">DummyRowPool</span><span class="p">(</span>
             <span class="n">prefix</span><span class="o">=</span><span class="sa">f</span><span class="s2">"pw_</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">step_runner</span><span class="o">=</span><span class="n">step_runner</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="n">resources</span><span class="p">,</span>
         <span class="p">)</span>
@@ -2299,9 +2808,101 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_shapes</span></div>
 
 
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.size_captures">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">size_captures</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Warm every shape up and capture the largest once, thrown away; see</span>
+<span class="sd">        `AcceleratorGraphRunner.size_captures`."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">set_device</span><span class="p">()</span>
+        <span class="n">shapes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">),</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="c1"># the region is one walk</span>
+        <span class="n">captured</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CaptureCost</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">shapes</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">):</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+                <span class="n">free</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_output_likes</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)]</span> <span class="o">=</span> <span class="p">{</span>
+                            <span class="n">name</span><span class="p">:</span> <span class="p">(</span><span class="n">value</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                        <span class="p">}</span>
+                        <span class="k">if</span> <span class="n">slot</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                            <span class="c1"># a region's outputs and inputs live outside the pool, a set per graph</span>
+                            <span class="n">kept</span> <span class="o">=</span> <span class="n">_tensor_bytes</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span><span class="p">)</span> <span class="o">+</span> <span class="n">_tensor_bytes</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">)</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)],</span> <span class="n">lent</span> <span class="o">=</span> <span class="n">_size_in_walk</span><span class="p">(</span>
+                                <span class="n">captured</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">peak</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">kept</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">),</span> <span class="kc">False</span><span class="p">,</span>
+                                <span class="n">partial</span><span class="p">(</span>
+                                    <span class="n">capture_with_static_outputs</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span><span class="p">,</span>
+                                    <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                                <span class="p">),</span>
+                                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="si">}</span><span class="s2"> bs=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2"> total_tokens=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span><span class="p">,</span>
+                            <span class="p">)</span>
+                            <span class="k">if</span> <span class="n">lent</span><span class="p">:</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">))</span>
+                <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                    <span class="c1"># as in `AcceleratorGraphRunner.size_captures`</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="si">}</span><span class="s2">]: could not run bs=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2"> "</span>
+                        <span class="sa">f</span><span class="s2">"total_tokens=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2"> slot=</span><span class="si">{</span><span class="n">slot</span><span class="si">}</span><span class="s2"> eagerly to size its capture, "</span>
+                        <span class="sa">f</span><span class="s2">"with </span><span class="si">{</span><span class="n">free</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB free before it: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="c1"># hand the pages back: held through the captures, they would shift every</span>
+        <span class="c1"># admit after them on a node that shares the resource</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">release_all</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span></div>
+
+
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.size_lent_captures">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_lent_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">size_lent_captures</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wanted</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CaptureCost</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Capture every shape a lender sized, thrown away, if ``wanted`` here</span>
+<span class="sd">        or on another rank; see `AcceleratorGraphRunner.size_lent_captures`."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">wanted</span><span class="p">)],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amax</span><span class="p">)[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span>
+        <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">():</span>
+            <span class="n">bucket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">bucket</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_lent</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">bucket</span><span class="p">)</span>
+            <span class="n">cost</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">graph</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">forwards</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+                    <span class="n">memory</span> <span class="o">=</span> <span class="n">_capture_thrown_away</span><span class="p">(</span>
+                        <span class="n">partial</span><span class="p">(</span>
+                            <span class="n">capture_with_static_outputs</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs_like</span><span class="p">(</span><span class="n">bucket</span><span class="p">),</span>
+                            <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                        <span class="p">),</span>
+                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="si">}</span><span class="s2"> bs=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2"> total_tokens=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">memory</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">cost</span> <span class="o">=</span> <span class="n">cost</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">graph</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">pool</span> <span class="o">+</span> <span class="n">cost</span><span class="o">.</span><span class="n">kept</span><span class="p">,</span> <span class="n">outside</span><span class="o">=</span><span class="n">memory</span><span class="o">.</span><span class="n">outside</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: could not prepare bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"to size its capture"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="n">bucket</span><span class="p">]</span> <span class="o">=</span> <span class="n">cost</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">release_all</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_outputs_like</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bucket</span><span class="p">:</span> <span class="n">BucketKey</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Tensors shaped as the outputs of sizing's warm-up of ``bucket``, one</span>
+<span class="sd">        element each, expanded: a capture reads their shape and dtype."""</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">size</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_output_likes</span><span class="p">[</span><span class="n">bucket</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+
 <div class="viewcode-block" id="PiecewiseAcceleratorGraphRunner.warmup_and_capture">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">warmup_and_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">planned</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                 <span class="s2">"</span><span class="si">%s</span><span class="s2"> is not available, skipping piecewise capture for </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
@@ -2322,8 +2923,21 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ordered</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
             <span class="n">shapes</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">s</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">),</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span>
         <span class="p">)</span>
-        <span class="n">captured</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">ordered</span><span class="p">:</span>
+        <span class="c1"># as in `AcceleratorGraphRunner.warmup_and_capture`: what every rank planned, costliest first</span>
+        <span class="n">sized</span> <span class="o">=</span> <span class="n">planned</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">planned_everywhere</span> <span class="o">=</span> <span class="n">agree_across_ranks</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="p">[</span><span class="ow">not</span> <span class="n">sized</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span> <span class="ow">in</span> <span class="n">planned</span> <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">ordered</span><span class="p">],</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amin</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">costs</span> <span class="o">=</span> <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_costs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)]</span><span class="o">.</span><span class="n">graph</span> <span class="k">if</span> <span class="n">sized</span> <span class="ow">and</span> <span class="n">ok</span> <span class="k">else</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">shape</span><span class="p">,</span> <span class="n">ok</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">ordered</span><span class="p">,</span> <span class="n">planned_everywhere</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amax</span><span class="p">)</span>
+        <span class="n">captured</span> <span class="o">=</span> <span class="p">[</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">)),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">i</span><span class="p">:</span> <span class="o">-</span><span class="n">costs</span><span class="p">[</span><span class="n">i</span><span class="p">]):</span>
+            <span class="n">shape</span> <span class="o">=</span> <span class="n">ordered</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">planned_everywhere</span><span class="p">[</span><span class="n">i</span><span class="p">]:</span>
+                <span class="k">continue</span>
             <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">):</span>
                 <span class="c1"># keep ranks in lockstep: the region may hold collectives, and a</span>
@@ -2334,7 +2948,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
                 <span class="k">try</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">forwards</span><span class="o">=</span><span class="mi">0</span> <span class="k">if</span> <span class="n">sized</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">)</span>
                 <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
                     <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">False</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -2342,7 +2956,7 @@ window.runMermaid = runMermaid;</script>
                         <span class="s2">"total_tokens=</span><span class="si">%d</span><span class="s2"> slot=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span>
                         <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                     <span class="p">)</span>
-            <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">shape_captured</span><span class="p">)</span>
+            <span class="n">captured</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">shape_captured</span>
             <span class="k">if</span> <span class="n">shape_captured</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
                     <span class="s2">"PiecewiseAcceleratorGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
@@ -2353,7 +2967,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># `ordered` comes from the config, so every rank agrees on the order</span>
         <span class="k">for</span> <span class="n">shape</span><span class="p">,</span> <span class="n">ok</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
             <span class="n">ordered</span><span class="p">,</span>
-            <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="n">captured</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">),</span>
+            <span class="n">agree_across_ranks</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="p">,</span> <span class="n">captured</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">amin</span><span class="p">),</span>
             <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">ok</span><span class="p">:</span>
@@ -2381,7 +2995,30 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">forwards</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># as in `AcceleratorGraphRunner._capture_one`</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warmed</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">forwards</span><span class="p">)</span> <span class="k">as</span> <span class="n">warmed</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+            <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span> <span class="o">=</span> <span class="n">capture_with_static_outputs</span><span class="p">(</span>
+                <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span> <span class="k">if</span> <span class="n">forwards</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
+            <span class="n">bs</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
+        <span class="p">)]</span> <span class="o">=</span> <span class="n">PiecewiseGraphData</span><span class="p">(</span>
+            <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
+            <span class="n">static_inputs</span><span class="o">=</span><span class="n">warmed</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">,</span>
+            <span class="n">static_outputs</span><span class="o">=</span><span class="n">static_outputs</span><span class="p">,</span>
+            <span class="n">dummy_rids</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">dummy_rids</span><span class="p">),</span>
+            <span class="n">shape</span><span class="o">=</span><span class="n">shape</span><span class="p">,</span>
+            <span class="n">bucket</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span>
+        <span class="p">)</span>
+
+    <span class="nd">@contextmanager</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_warmed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">forwards</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="n">WarmedRegion</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Plan ``shape`` and run the region eagerly ``forwards`` times; see</span>
+<span class="sd">        ``AcceleratorGraphRunner._warmed``."""</span>
         <span class="n">dummy_rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">ensure</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span>
         <span class="p">)</span>
@@ -2407,35 +3044,28 @@ window.runMermaid = runMermaid;</script>
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-            <span class="n">warm_outputs</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">):</span>
+            <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">peak</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">forwards</span><span class="p">):</span>
+                <span class="c1"># as in `AcceleratorGraphRunner._warmed`</span>
+                <span class="n">live</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
                 <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
                     <span class="n">warm_outputs</span> <span class="o">=</span> <span class="n">run_fn</span><span class="p">()</span>
+                <span class="n">peak</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span> <span class="o">-</span> <span class="n">live</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
                 <span class="c1"># capture after it) sees the shapes the first plan did</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-            <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span> <span class="o">=</span> <span class="n">capture_with_static_outputs</span><span class="p">(</span>
-                <span class="n">run_fn</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="k">yield</span> <span class="n">WarmedRegion</span><span class="p">(</span>
+                <span class="n">run</span><span class="o">=</span><span class="n">run_fn</span><span class="p">,</span> <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
+                <span class="n">dummy_rids</span><span class="o">=</span><span class="n">dummy_rids</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="o">=</span><span class="n">warm_outputs</span><span class="p">,</span> <span class="n">peak</span><span class="o">=</span><span class="n">peak</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="c1"># pages stay with the dummy streams: replay's padding rows address</span>
             <span class="c1"># the same ids, so their plan finds the storage already resident</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
-            <span class="n">bs</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
-        <span class="p">)]</span> <span class="o">=</span> <span class="n">PiecewiseGraphData</span><span class="p">(</span>
-            <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
-            <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
-            <span class="n">static_outputs</span><span class="o">=</span><span class="n">static_outputs</span><span class="p">,</span>
-            <span class="n">dummy_rids</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">),</span>
-            <span class="n">shape</span><span class="o">=</span><span class="n">shape</span><span class="p">,</span>
-            <span class="n">bucket</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span>
-        <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_call_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>

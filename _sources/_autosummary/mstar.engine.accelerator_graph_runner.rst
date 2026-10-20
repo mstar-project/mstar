@@ -22,6 +22,7 @@ mstar.engine.accelerator\_graph\_runner
       dummy_rid_handle
       dummy_rid_name
       fail_if_graphs_required
+      plan_captures
    
    
 
@@ -34,11 +35,17 @@ mstar.engine.accelerator\_graph\_runner
       AcceleratorGraphBucket
       AcceleratorGraphRunner
       AcceleratorGraphSlot
+      CaptureCost
+      CapturePlan
       DummyRowPool
+      ExecutableMemory
+      GraphMemory
       PiecewiseAcceleratorGraphRunner
       PiecewiseGraphData
       PiecewiseGraphKey
       PiecewiseOutput
+      WarmedRegion
+      WarmedSpec
    
    
 

@@ -640,6 +640,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.run_forward"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.run_forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_batched_bucket"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.select_batched_bucket()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_bucket"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.select_bucket()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_captures"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.size_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_lent_captures"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.size_lent_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.slot_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_ids"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.step_ids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_metadata"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.step_metadata()</span></code></a></li>
@@ -656,11 +658,38 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_outputs"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphSlot.static_outputs</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost"><code class="docutils literal notranslate"><span class="pre">CaptureCost</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.executable"><code class="docutils literal notranslate"><span class="pre">CaptureCost.executable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.graph"><code class="docutils literal notranslate"><span class="pre">CaptureCost.graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.kept"><code class="docutils literal notranslate"><span class="pre">CaptureCost.kept</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.outside"><code class="docutils literal notranslate"><span class="pre">CaptureCost.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.peak"><code class="docutils literal notranslate"><span class="pre">CaptureCost.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.slots"><code class="docutils literal notranslate"><span class="pre">CaptureCost.slots</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan"><code class="docutils literal notranslate"><span class="pre">CapturePlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.buckets"><code class="docutils literal notranslate"><span class="pre">CapturePlan.buckets</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.floor"><code class="docutils literal notranslate"><span class="pre">CapturePlan.floor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.outside"><code class="docutils literal notranslate"><span class="pre">CapturePlan.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.predicted"><code class="docutils literal notranslate"><span class="pre">CapturePlan.predicted</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool"><code class="docutils literal notranslate"><span class="pre">DummyRowPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.ensure"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.ensure()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.handles"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.handles()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.release_all"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.release_all()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.reset"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.reset()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.measure"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.measure()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.per_node"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.per_node</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.release"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.release()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory"><code class="docutils literal notranslate"><span class="pre">GraphMemory</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory.outside"><code class="docutils literal notranslate"><span class="pre">GraphMemory.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory.pool"><code class="docutils literal notranslate"><span class="pre">GraphMemory.pool</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -674,6 +703,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.prepare_for_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.run"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.set_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.set_slot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_captures"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.size_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_lent_captures"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.size_lent_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.warmup_and_capture()</span></code></a></li>
 </ul>
 </li>
@@ -698,6 +729,24 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseOutput.keys"><code class="docutils literal notranslate"><span class="pre">PiecewiseOutput.keys()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion"><code class="docutils literal notranslate"><span class="pre">WarmedRegion</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.dummy_rids"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.dummy_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.peak"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.run"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.run</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.static_inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.warm_outputs"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.warm_outputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec"><code class="docutils literal notranslate"><span class="pre">WarmedSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.dummy_metadata</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_rids"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.dummy_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.peak"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.returned"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.returned</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.run"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.run</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_input_keys"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_input_keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_inputs</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="docutils literal notranslate"><span class="pre">blocked_capture_resources()</span></code></a></li>
@@ -707,6 +756,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="docutils literal notranslate"><span class="pre">fail_if_graphs_required()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.plan_captures"><code class="docutils literal notranslate"><span class="pre">plan_captures()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -723,8 +773,8 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">agree_across_ranks</span></code></a>(comm_group, flags, device)</p></td>
-<td><p>AND each flag across every rank of the joint group.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">agree_across_ranks</span></code></a>(comm_group, values, ...)</p></td>
+<td><p>Reduce each of <code class="docutils literal notranslate"><span class="pre">values</span></code> over every rank of the joint group with <code class="docutils literal notranslate"><span class="pre">reduce</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="mstar.engine.accelerator_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype, device_type)</p></td>
 <td><p>A forward's autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the submodule in its own dtype and shuts out any ambient autocast.</p></td>
@@ -732,10 +782,10 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources" title="mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">blocked_capture_resources</span></code></a>(step, resources)</p></td>
 <td><p>Return resource keys that prevent capture of the declared step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...[, ...])</p></td>
 <td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_with_static_outputs</span></code></a>(run, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_with_static_outputs</span></code></a>(run, ...[, ...])</p></td>
 <td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_metadata" title="mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
@@ -749,6 +799,9 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required" title="mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
 <td><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup failure, for deployments that would rather not come up than serve the eager path at 10-20x the latency.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="mstar.engine.accelerator_graph_runner.plan_captures"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_captures</span></code></a>(pools, free[, reusable])</p></td>
+<td><p>The cheapest buckets across every pool on a device, added while the largest eager step still fits in <code class="docutils literal notranslate"><span class="pre">free</span></code> beside them.</p></td>
 </tr>
 </tbody>
 </table>
@@ -765,8 +818,20 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot" title="mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AcceleratorGraphSlot</span></code></a>(graph, static_inputs, ...)</p></td>
 <td><p>One captured graph + the buffers its replay reads and writes.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CaptureCost</span></code></a>(peak, graph, kept, slots[, ...])</p></td>
+<td><p>What one bucket costs on the device: its warm-up, and a capture thrown away, its own or its walk's largest.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CapturePlan" title="mstar.engine.accelerator_graph_runner.CapturePlan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CapturePlan</span></code></a>(buckets, predicted, outside, floor)</p></td>
+<td><p>Which buckets each graph pool on a device captures, chosen before any is.</p></td>
+</tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.DummyRowPool" title="mstar.engine.accelerator_graph_runner.DummyRowPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DummyRowPool</span></code></a>(prefix, step_runner, resources)</p></td>
 <td><p>The padding rows captured replays pad onto.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory" title="mstar.engine.accelerator_graph_runner.ExecutableMemory"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ExecutableMemory</span></code></a>()</p></td>
+<td><p>The executable memory a walk's graphs take per node, outside any pool, measured on copies of its first throwaway graph: executables instantiated from it through libcuda.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.GraphMemory" title="mstar.engine.accelerator_graph_runner.GraphMemory"><code class="xref py py-obj docutils literal notranslate"><span class="pre">GraphMemory</span></code></a>(pool, outside)</p></td>
+<td><p>What a captured graph holds: in its pool, and outside the allocator.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner" title="mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner</span></code></a>(label, ...)</p></td>
 <td><p>Captures one inner callable of a submodule's forward as a CUDA graph.</p></td>
@@ -779,6 +844,12 @@
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.PiecewiseOutput" title="mstar.engine.accelerator_graph_runner.PiecewiseOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code></a>(outputs, real_len)</p></td>
 <td><p>Dict-like view over a captured region's output buffers.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.WarmedRegion" title="mstar.engine.accelerator_graph_runner.WarmedRegion"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WarmedRegion</span></code></a>(run, static_inputs, dummy_rids, ...)</p></td>
+<td><p>A region's shape planned and run eagerly: what its capture reads.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.WarmedSpec" title="mstar.engine.accelerator_graph_runner.WarmedSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WarmedSpec</span></code></a>(run, static_inputs, ...)</p></td>
+<td><p>A spec prepared and run eagerly: what its capture reads.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1121,6 +1192,43 @@ carries, so the request is scaled by that config’s multiplier.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_captures">
+<span class="sig-name descname"><span class="pre">size_captures</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#AcceleratorGraphRunner.size_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_captures" title="Link to this definition">#</a></dt>
+<dd><p>Warm every spec up, and capture each walk’s largest buckets once,
+thrown away, before any runner captures for real.</p>
+<p>Every bucket is warmed rather than the first in capture order: that
+order leads with batch size, so it can open on a decode bucket while a
+one-row prefill of thousands of tokens peaks far higher. And every slot: a
+slot’s first plan builds state of its own (FlashInfer’s graph wrappers
+and their workspace, 750 MiB for the Talker’s second slot), which has
+to be spent before free memory is read.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a>, <a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><em>CaptureCost</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_lent_captures">
+<span class="sig-name descname"><span class="pre">size_lent_captures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">wanted</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#AcceleratorGraphRunner.size_lent_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_lent_captures" title="Link to this definition">#</a></dt>
+<dd><p>Capture every bucket a lender sized, thrown away, if <code class="docutils literal notranslate"><span class="pre">wanted</span></code> here
+or on another rank: a plan that leaves graphs out needs what each
+takes, not what its walk’s largest does.</p>
+<p>Every rank asks, so the ranks of a group size again together or not at
+all, and plan on the same kind of cost. With no forward and no barrier:
+sizing ran the forwards, and a capture runs no collective.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>wanted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a>, <a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><em>CaptureCost</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for">
 <span class="sig-name descname"><span class="pre">slot_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lease</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#AcceleratorGraphRunner.slot_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1171,8 +1279,14 @@ its own id; only the padding rows run against the slot’s own state.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture">
-<span class="sig-name descname"><span class="pre">warmup_and_capture</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#AcceleratorGraphRunner.warmup_and_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture" title="Link to this definition">#</a></dt>
-<dd><p>Capture graphs for all configs and batch sizes.</p>
+<span class="sig-name descname"><span class="pre">warmup_and_capture</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">planned</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#AcceleratorGraphRunner.warmup_and_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.warmup_and_capture" title="Link to this definition">#</a></dt>
+<dd><p>Capture the <code class="docutils literal notranslate"><span class="pre">planned</span></code> buckets, of every config and batch size.
+With no plan, every bucket, each warmed up first as sizing would have.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>planned</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1233,6 +1347,102 @@ to pre-plan keeps a single slot.</p>
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_outputs">
 <span class="sig-name descname"><span class="pre">static_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput" title="mstar.model.submodule_base.BatchedModelOutput"><span class="pre">BatchedModelOutput</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">CaptureCost</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">peak</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kept</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outside</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">executable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#CaptureCost"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>What one bucket costs on the device: its warm-up, and a capture thrown away, its own or its walk’s largest.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>peak</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>kept</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>slots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>outside</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>executable</strong> (<a class="reference internal" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory" title="mstar.engine.accelerator_graph_runner.ExecutableMemory"><em>ExecutableMemory</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.executable">
+<span class="sig-name descname"><span class="pre">executable</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory" title="mstar.engine.accelerator_graph_runner.ExecutableMemory"><span class="pre">ExecutableMemory</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.executable" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 5</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.graph">
+<span class="sig-name descname"><span class="pre">graph</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.graph" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.kept">
+<span class="sig-name descname"><span class="pre">kept</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.kept" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.outside">
+<span class="sig-name descname"><span class="pre">outside</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.outside" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.peak">
+<span class="sig-name descname"><span class="pre">peak</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.peak" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CaptureCost.slots">
+<span class="sig-name descname"><span class="pre">slots</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CaptureCost.slots" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CapturePlan">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">CapturePlan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">buckets</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">predicted</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outside</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">floor</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#CapturePlan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CapturePlan" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>Which buckets each graph pool on a device captures, chosen before any is.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>buckets</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>]</em>)</p></li>
+<li><p><strong>predicted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>outside</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>floor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CapturePlan.buckets">
+<span class="sig-name descname"><span class="pre">buckets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CapturePlan.buckets" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CapturePlan.floor">
+<span class="sig-name descname"><span class="pre">floor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CapturePlan.floor" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CapturePlan.outside">
+<span class="sig-name descname"><span class="pre">outside</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CapturePlan.outside" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.CapturePlan.predicted">
+<span class="sig-name descname"><span class="pre">predicted</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.CapturePlan.predicted" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
 
 </dd></dl>
 
@@ -1316,6 +1526,85 @@ replay pads with zero-length rows, so it is capture-time residue.</p>
 <dd class="field-even"><p>None</p>
 </dd>
 </dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.ExecutableMemory">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">ExecutableMemory</span></span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#ExecutableMemory"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>The executable memory a walk’s graphs take per node, outside any pool,
+measured on copies of its first throwaway graph: executables instantiated
+from it through libcuda. The cost per node changes with a graph’s size,
+even for the same kernels: a chain of adds takes 3.1 KiB a node at 300
+nodes and 2.4 at 2222. A walk’s graphs are about the same size, so the
+first graph’s cost per node holds for all of them.</p>
+<p>The copies are held until the runner captures. The driver keeps a destroyed
+graph’s executable memory to reuse, and maps new memory beside it, so after
+any destroy, free memory drops by less than a copy takes.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.ExecutableMemory.measure">
+<span class="sig-name descname"><span class="pre">measure</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#ExecutableMemory.measure"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.measure" title="Link to this definition">#</a></dt>
+<dd><p>Set <code class="docutils literal notranslate"><span class="pre">per_node</span></code> and <code class="docutils literal notranslate"><span class="pre">held</span></code> from copies of <code class="docutils literal notranslate"><span class="pre">graph</span></code>, held until <cite>release</cite>.</p>
+<p>The count starts after the first copy that takes free memory, since
+copies until then fill pieces the driver mapped earlier. It adds one
+2 MiB piece, since the first counted copy may start partway into a
+piece. Free memory is the device’s, so another process allocating or
+freeing moves it: a count is kept only if free memory never rose and no
+copy took more than two pieces above the mean. If no count is kept,
+<code class="docutils literal notranslate"><span class="pre">per_node</span></code> is the largest rate a count gave. None if no copy could be
+counted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.ExecutableMemory.per_node">
+<span class="sig-name descname"><span class="pre">per_node</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.per_node" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.ExecutableMemory.release">
+<span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#ExecutableMemory.release"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.release" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.GraphMemory">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">GraphMemory</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outside</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#GraphMemory"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.GraphMemory" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>What a captured graph holds: in its pool, and outside the allocator.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>outside</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.GraphMemory.outside">
+<span class="sig-name descname"><span class="pre">outside</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.GraphMemory.outside" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.GraphMemory.pool">
+<span class="sig-name descname"><span class="pre">pool</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.GraphMemory.pool" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
 </dd></dl>
 
 </dd></dl>
@@ -1458,11 +1747,41 @@ is baked into the graph.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture">
-<span class="sig-name descname"><span class="pre">warmup_and_capture</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#PiecewiseAcceleratorGraphRunner.warmup_and_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_captures">
+<span class="sig-name descname"><span class="pre">size_captures</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#PiecewiseAcceleratorGraphRunner.size_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_captures" title="Link to this definition">#</a></dt>
+<dd><p>Warm every shape up and capture the largest once, thrown away; see
+<cite>AcceleratorGraphRunner.size_captures</cite>.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a>, <a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><em>CaptureCost</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_lent_captures">
+<span class="sig-name descname"><span class="pre">size_lent_captures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">wanted</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#PiecewiseAcceleratorGraphRunner.size_lent_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_lent_captures" title="Link to this definition">#</a></dt>
+<dd><p>Capture every shape a lender sized, thrown away, if <code class="docutils literal notranslate"><span class="pre">wanted</span></code> here
+or on another rank; see <cite>AcceleratorGraphRunner.size_lent_captures</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>wanted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a>, <a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><em>CaptureCost</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture">
+<span class="sig-name descname"><span class="pre">warmup_and_capture</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">planned</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#PiecewiseAcceleratorGraphRunner.warmup_and_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>planned</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><em>BucketKey</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1601,10 +1920,121 @@ the same step; use <code class="docutils literal notranslate"><span class="pre">
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">WarmedRegion</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dummy_rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">peak</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#WarmedRegion"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A region’s shape planned and run eagerly: what its capture reads.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>run</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>static_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>dummy_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>warm_outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>peak</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion.dummy_rids">
+<span class="sig-name descname"><span class="pre">dummy_rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.dummy_rids" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion.peak">
+<span class="sig-name descname"><span class="pre">peak</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.peak" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion.run">
+<span class="sig-name descname"><span class="pre">run</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.run" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion.static_inputs">
+<span class="sig-name descname"><span class="pre">static_inputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.static_inputs" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedRegion.warm_outputs">
+<span class="sig-name descname"><span class="pre">warm_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.warm_outputs" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">WarmedSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_input_keys</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dummy_rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dummy_metadata</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">peak</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returned</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#WarmedSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A spec prepared and run eagerly: what its capture reads.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>run</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>static_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>static_input_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>dummy_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>dummy_metadata</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>peak</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>returned</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_metadata">
+<span class="sig-name descname"><span class="pre">dummy_metadata</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><span class="pre">CurrentForwardPassInfo</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_metadata" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_rids">
+<span class="sig-name descname"><span class="pre">dummy_rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_rids" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.peak">
+<span class="sig-name descname"><span class="pre">peak</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.peak" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 5</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.returned">
+<span class="sig-name descname"><span class="pre">returned</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.returned" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 6</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.run">
+<span class="sig-name descname"><span class="pre">run</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.run" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.static_input_keys">
+<span class="sig-name descname"><span class="pre">static_input_keys</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_input_keys" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs">
+<span class="sig-name descname"><span class="pre">static_inputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.agree_across_ranks">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">agree_across_ranks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flags</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#agree_across_ranks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="Link to this definition">#</a></dt>
-<dd><p>AND each flag across every rank of the joint group.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">agree_across_ranks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reduce</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#agree_across_ranks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="Link to this definition">#</a></dt>
+<dd><p>Reduce each of <code class="docutils literal notranslate"><span class="pre">values</span></code> over every rank of the joint group with
+<code class="docutils literal notranslate"><span class="pre">reduce</span></code>. <cite>torch.amin</cite> ANDs flags and <cite>torch.amax</cite> takes the largest.</p>
 <p>Capture failure is per-rank: a rank that keeps a graph another rank
 dropped replays it while the other runs eager, which hangs as soon as the
 captured region holds a collective. Callers pass an order derived from the
@@ -1613,12 +2043,13 @@ configs, which are identical on every rank.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>comm_group</strong> (<em>JointGroups</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>flags</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+<li><p><strong>values</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
+<li><p><strong>reduce</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>...</em><em>]</em><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1654,7 +2085,7 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.capture_into_graph">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_into_graph</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_into_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_into_graph</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_into_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="Link to this definition">#</a></dt>
 <dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
 <p>Returns the graph and what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned. A capture that fails part
 way leaves two things behind that would sink every later capture on the
@@ -1670,14 +2101,17 @@ before it compiles, which CUDA refuses during capture, so such a capture
 cannot succeed and would otherwise die with an unrelated error.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p></li>
+<li><p><strong>keep_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.capture_with_static_outputs">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_with_static_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_with_static_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_with_static_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_with_static_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="Link to this definition">#</a></dt>
 <dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">warm_outputs</span></code> is what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned on a warm-up call (<code class="docutils literal notranslate"><span class="pre">{name:</span>
 <span class="pre">Tensor}</span></code>); it fixes the shapes and dtypes. The captured graph ends with a
@@ -1695,7 +2129,10 @@ the pool stay valid until this graph’s own next replay, whatever else the
 node runs in between.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p></li>
+<li><p><strong>keep_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -1756,6 +2193,33 @@ eager path at 10-20x the latency.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.plan_captures">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">plan_captures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pools</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">free</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reusable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#plan_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="Link to this definition">#</a></dt>
+<dd><p>The cheapest buckets across every pool on a device, added while the
+largest eager step still fits in <code class="docutils literal notranslate"><span class="pre">free</span></code> beside them.</p>
+<p>A pool’s graphs, captured largest first, reuse its memory: it holds what
+every graph keeps, plus the most any one graph needs beyond that. So a
+bucket adds its slots’ kept bytes, and whatever it needs past the pool’s
+most so far. That is a model; the boot log compares it with what capture took.
+A bucket also adds its slots’ executable memory, less the memory its
+graphs reuse from the walk’s copies. A walk’s copies pay for its planned
+graphs’ executable memory once, across all its buckets. <code class="docutils literal notranslate"><span class="pre">reusable</span></code> bounds
+the reuse summed over all buckets, None for no bound.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pools</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>, </em><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CaptureCost" title="mstar.engine.accelerator_graph_runner.CaptureCost"><em>CaptureCost</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>free</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>reusable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.CapturePlan" title="mstar.engine.accelerator_graph_runner.CapturePlan"><em>CapturePlan</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1834,6 +2298,8 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.run_forward"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.run_forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_batched_bucket"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.select_batched_bucket()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.select_bucket"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.select_bucket()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_captures"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.size_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.size_lent_captures"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.size_lent_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.slot_for"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.slot_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_ids"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.step_ids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_metadata"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphRunner.step_metadata()</span></code></a></li>
@@ -1850,11 +2316,38 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.AcceleratorGraphSlot.static_outputs"><code class="docutils literal notranslate"><span class="pre">AcceleratorGraphSlot.static_outputs</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost"><code class="docutils literal notranslate"><span class="pre">CaptureCost</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.executable"><code class="docutils literal notranslate"><span class="pre">CaptureCost.executable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.graph"><code class="docutils literal notranslate"><span class="pre">CaptureCost.graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.kept"><code class="docutils literal notranslate"><span class="pre">CaptureCost.kept</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.outside"><code class="docutils literal notranslate"><span class="pre">CaptureCost.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.peak"><code class="docutils literal notranslate"><span class="pre">CaptureCost.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CaptureCost.slots"><code class="docutils literal notranslate"><span class="pre">CaptureCost.slots</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan"><code class="docutils literal notranslate"><span class="pre">CapturePlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.buckets"><code class="docutils literal notranslate"><span class="pre">CapturePlan.buckets</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.floor"><code class="docutils literal notranslate"><span class="pre">CapturePlan.floor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.outside"><code class="docutils literal notranslate"><span class="pre">CapturePlan.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.CapturePlan.predicted"><code class="docutils literal notranslate"><span class="pre">CapturePlan.predicted</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool"><code class="docutils literal notranslate"><span class="pre">DummyRowPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.ensure"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.ensure()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.handles"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.handles()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.release_all"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.release_all()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.DummyRowPool.reset"><code class="docutils literal notranslate"><span class="pre">DummyRowPool.reset()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.measure"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.measure()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.per_node"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.per_node</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.ExecutableMemory.release"><code class="docutils literal notranslate"><span class="pre">ExecutableMemory.release()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory"><code class="docutils literal notranslate"><span class="pre">GraphMemory</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory.outside"><code class="docutils literal notranslate"><span class="pre">GraphMemory.outside</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.GraphMemory.pool"><code class="docutils literal notranslate"><span class="pre">GraphMemory.pool</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1868,6 +2361,8 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.prepare_for_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.run"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.set_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.set_slot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_captures"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.size_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.size_lent_captures"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.size_lent_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.warmup_and_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphRunner.warmup_and_capture()</span></code></a></li>
 </ul>
 </li>
@@ -1892,6 +2387,24 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.PiecewiseOutput.keys"><code class="docutils literal notranslate"><span class="pre">PiecewiseOutput.keys()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion"><code class="docutils literal notranslate"><span class="pre">WarmedRegion</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.dummy_rids"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.dummy_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.peak"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.run"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.run</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.static_inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedRegion.warm_outputs"><code class="docutils literal notranslate"><span class="pre">WarmedRegion.warm_outputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec"><code class="docutils literal notranslate"><span class="pre">WarmedSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.dummy_metadata</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.dummy_rids"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.dummy_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.peak"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.peak</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.returned"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.returned</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.run"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.run</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_input_keys"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_input_keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_inputs</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="docutils literal notranslate"><span class="pre">blocked_capture_resources()</span></code></a></li>
@@ -1901,6 +2414,7 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="docutils literal notranslate"><span class="pre">fail_if_graphs_required()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.plan_captures"><code class="docutils literal notranslate"><span class="pre">plan_captures()</span></code></a></li>
 </ul>
   </nav></div>
 
