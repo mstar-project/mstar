@@ -181,6 +181,19 @@ def self_consistency_check(sc, values: list[float], name: str, n_runs: int, pass
         sc.check(name, worst, band(worst, pass_if, warn_if), rule)
 
 
+def frame_identity(sc, rows: list[dict], encoded: bool) -> None:
+    """Count the videos whose frames match between the first two runs (``frames_identical_r1_r2`` per row)."""
+    flags = [r["frames_identical_r1_r2"] for r in rows if "frames_identical_r1_r2" in r]
+    if not flags:
+        return
+    same = sum(flags)
+    sc.metrics["frames_identical_r1_r2"] = {"identical": same, "n": len(flags)}
+    note = f"Frames identical between the two runs on {same}/{len(flags)} videos (same count, size and pixels)."
+    if encoded:
+        note += " The mp4s are decoded first, their bytes aren't compared."
+    sc.notes.append(note)
+
+
 def failed_items(run_dir: Path) -> dict[str, str]:
     """Map of item id to error for the items the server failed."""
     out = {}
