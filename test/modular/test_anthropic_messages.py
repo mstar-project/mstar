@@ -36,10 +36,21 @@ class _StubAPI:
         self.last_submit = None
         self.next_chunks: list = []
         self.aborted: list = []
+        self.ended: dict = {}  # how each submission stopped early ended
 
     def submit_request(self, **kw):
         self.last_submit = kw
         return kw["request_id"]
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        # once per submission, as the real one: after a handler ends a whole
+        # reply (a success), the stream's close aborts nothing more
+        if key not in self.ended:
+            self.ended[key] = outcome
+            self.aborted.append(key)
 
     async def iter_result_chunk_batches(self, request_id):
         finished = False
@@ -49,7 +60,7 @@ class _StubAPI:
             finished = True
         finally:
             if not finished:
-                self.aborted.append(request_id)
+                self.abort_submission(request_id)
 
 WEATHER = {"name": "get_weather", "description": "Weather by city",
            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}
@@ -211,6 +222,7 @@ def test_a_stop_sequence_ends_the_reply_and_is_named(client_and_stub):
     assert msg["content"][-1] == {"type": "text", "text": "one "}
     assert (msg["stop_reason"], msg["stop_sequence"]) == ("stop_sequence", "two")
     assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
 
 
 def test_a_call_cut_off_by_max_tokens_has_no_tool_use(client_and_stub):

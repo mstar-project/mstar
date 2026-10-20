@@ -153,8 +153,10 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     by Starlette.
 
     A stop string ends the reply where it starts, and a parser that is
-    ``done`` (one call, under ``parallel_tool_calls: false``) ends it too; the
-    request stops in the engine: closing the chunk iterator early aborts it.
+    ``done`` (one call, under ``parallel_tool_calls: false``) ends it too:
+    the request stops in the engine, and counts as a success, as the client
+    has its whole reply. Closing the chunk iterator early otherwise, as a
+    client that goes away does, aborts it.
     Usage counts every token read until then, the stop's own included, as
     vLLM counts them. It can count more: the tokens that arrived in one chunk
     with the stop's last (up to k under MTP, k drafts a step), and those read
@@ -163,11 +165,13 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     ``usage``, when given, is filled as the chunks arrive (a stream that opens
     with the prompt's count reads it from there).
     """
-    return _events(api.iter_result_chunk_batches(request_id), parser, stops,
+    batches = api.iter_result_chunk_batches(request_id)
+    key = api.submission_key(request_id)
+    return _events(batches, lambda: api.abort_submission(key, outcome="success"), parser, stops,
                    Usage() if usage is None else usage)
 
 
-async def _events(batches, parser, stops, usage):
+async def _events(batches, served, parser, stops, usage):
     matcher = StopMatcher(stops) if stops else None
     stop: str | None = None
     # a byte-level BPE token's bytes can end inside a character: hold them
@@ -204,6 +208,7 @@ async def _events(batches, parser, stops, usage):
                         events = []
                     yield [Media(c.modality, c.data)]
             if stop is not None or parser is not None and parser.done:
+                served()  # before the close below, which would count an abort
                 yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
                 return
             if events:
