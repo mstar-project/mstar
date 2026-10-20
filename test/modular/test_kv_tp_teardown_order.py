@@ -2,8 +2,10 @@
 
 Rank 0 decides each step and every rank admits it against its own allocator, so the
 allocators have to stay in step. A teardown that lands on the other side of an admit from
-rank 0's changes what that admit finds free. The worker keeps it in the same gap
-(``test_tp_async_teardown_order``); this shows what a slip costs.
+rank 0's changes what that admit finds free; one that lands in the same gap but in another
+order changes which pages come back out, as the free list hands them out in the order they
+were freed. The worker keeps both (``test_tp_async_teardown_order``); this shows what each
+slip costs.
 """
 
 from __future__ import annotations
@@ -91,3 +93,24 @@ def test_ranks_that_tear_down_on_either_side_of_an_admit_disagree_on_whether_it_
     assert set(_pages(leader, "s")) <= set(let_go)
     assert not _run(follower, "s", PAGE_SIZE + 1)
 
+
+def test_ranks_that_free_two_requests_in_either_order_hand_out_other_pages_once_the_pool_wraps():
+    """The free list hands pages back out in the order they were freed. Two teardowns in
+    one gap, landed in either order, leave the ranks agreeing until the allocator reaches
+    the pages they freed; the step that does takes other pages. The counts still agree, so
+    nothing is refused: it costs only where ranks share page ids."""
+    ranks = leader, follower = _manager(0, max_num_pages=9), _manager(1, max_num_pages=9)
+    for kv in ranks:
+        for rid in ("a", "b"):
+            assert _run(kv, rid, 2 * PAGE_SIZE + 1)
+    for rid in ("a", "b"):
+        leader.remove_request(rid)
+    for rid in ("b", "a"):
+        follower.remove_request(rid)
+
+    for kv in ranks:
+        for rid in ("fresh", "wrapped"):
+            assert _run(kv, rid, PAGE_SIZE + 1)
+    assert _pages(leader, "fresh") == _pages(follower, "fresh"), "pages nobody freed"
+    assert _pages(leader, "wrapped") != _pages(follower, "wrapped")
+    assert leader._arena.num_free == follower._arena.num_free

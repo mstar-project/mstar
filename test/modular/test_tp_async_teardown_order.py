@@ -229,3 +229,17 @@ def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypat
     _run(w)
 
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
+
+
+def test_a_follower_tears_down_in_the_order_rank_0_did(monkeypatch):
+    """Rank 0 tore "gone" down, then "also", both after N+1. "gone" reaches this rank
+    before it pops N+1 and is held; "also" after, when its step is already reached. The
+    free list hands pages back out in the order they were freed, so "gone" goes first."""
+    gone, also = (
+        RemoveRequest(request_id=rid, source=MessageSource.TP_RANK_0, after_tp_seq=1)
+        for rid in ("gone", "also")
+    )
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [gone], [also]])
+    _run(w)
+
+    assert [entry[1] for entry in log if entry[0] == "teardown"] == ["gone", "also"], log

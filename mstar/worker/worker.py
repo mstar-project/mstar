@@ -877,6 +877,11 @@ class Worker:
                     body.after_tp_seq, []
                 ).append(body.request_id)
                 return
+            if body.source == MessageSource.TP_RANK_0:
+                # One held above came from rank 0 before this one, and its step has
+                # landed too. The free list hands pages back out in the order they
+                # were freed, so they go first, as on rank 0.
+                self._apply_removes_whose_step_landed()
 
         # Async-scheduling deferral: if this rid is currently held by an
         # in-flight GPU step (or its speculation), tearing down engine /
