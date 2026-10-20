@@ -17,7 +17,7 @@ import traceback
 from pathlib import Path
 
 from benchmark.amd import catalog, tables
-from benchmark.amd.launch import REPO, Launch, gpu_list
+from benchmark.amd.launch import REPO, Launch, arm_worktree, gpu_list, tree_list
 
 
 def plan_jobs(rows: list[str], arms: list[str]) -> list[tuple[catalog.Row, catalog.Arm]]:
@@ -29,14 +29,16 @@ def plan_jobs(rows: list[str], arms: list[str]) -> list[tuple[catalog.Row, catal
     return sorted(jobs, key=lambda j: -j[0].gpus)
 
 
-def run(jobs, gpus: list[int], out: Path, worktree: Path, port_base: int, log=print) -> dict:
+def run(jobs, gpus: list[int], out: Path, worktree: Path, port_base: int, log=print,
+        trees: dict[str, Path] | None = None) -> dict:
     free = list(gpus)
     cond = threading.Condition()
     results: dict = {}
 
     def worker(row, arm, mine, port):
         key = f"{row.name}/{arm.name}"
-        launch = Launch(arm=arm, row=row, gpus=mine, port=port, run_dir=out / row.name / arm.name, worktree=worktree)
+        launch = Launch(arm=arm, row=row, gpus=mine, port=port, run_dir=out / row.name / arm.name,
+                        worktree=arm_worktree(arm, worktree, trees or {}))
         t0 = time.monotonic()
         try:
             res = {"gpus": mine, **launch.start()}
@@ -78,14 +80,18 @@ def main(argv=None) -> int:
     ap.add_argument("--arms", default=None)
     ap.add_argument("--rows", default=None)
     ap.add_argument("--port-base", type=int, default=8600)
+    ap.add_argument("--tree", action="append", default=[], metavar="NAME=PATH",
+                    help="a named mstar tree for the arms that serve one (as in the sweep)")
     args = ap.parse_args(argv)
     t = tables.TABLES[args.table]
-    jobs = plan_jobs(args.rows.split(",") if args.rows else list(t.rows),
-                     args.arms.split(",") if args.arms else list(t.arms))
+    trees = tree_list(args.tree)
+    jobs = [(row, arm) for row, arm in plan_jobs(args.rows.split(",") if args.rows else list(t.rows),
+                                                 args.arms.split(",") if args.arms else list(t.arms))
+            if not arm.tree or arm.tree in trees]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     res = run(jobs, gpu_list(args.gpus), out, Path(args.worktree).resolve(), args.port_base,
-              log=lambda m: print(time.strftime("[%H:%M:%S] ") + m, flush=True))
+              log=lambda m: print(time.strftime("[%H:%M:%S] ") + m, flush=True), trees=trees)
     return 1 if any("error" in r for r in res.values()) else 0
 
 
