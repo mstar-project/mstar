@@ -23,6 +23,8 @@ from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-expor
     TensorStore,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.observability.catalog import TRANSFER_API_SERVER
+from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
 
@@ -40,6 +42,7 @@ from mstar.communication.communicator import (
     BaseCommunicator,
     CommProtocol,
 )
+from mstar.communication.tensor_uuid import _DATA_WORKER as _DATA_WORKER_ENTITY
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
@@ -71,6 +74,37 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: Rid = ""
     rx_time: float | None = None # seconds
+    # What the read moved over the transport (see count_read), set only while
+    # transfer metrics are on and cleared once counted. Unannotated, so class
+    # attributes rather than fields: a read with them off stores nothing more.
+    read_src = None
+    read_bytes = 0
+    read_tensors = 0
+    # src -> [bytes, tensors] for producers after the first: the conductor
+    # joins one name produced in several walks or nodes into one edge
+    read_more = None
+
+    def count_read(self, info: TensorPointerInfo) -> None:
+        """Count one tensor this read moved over the transport."""
+        src = info._source_node_name
+        if src is None:
+            # The data worker mints the request's inputs outside any node.
+            # Every worker output carries its node; the entity id is a
+            # bounded fallback should one ever arrive without.
+            src = (TRANSFER_API_SERVER if info.source_entity == _DATA_WORKER_ENTITY
+                   else info.source_entity)
+        if src == self.read_src:
+            self.read_bytes += info.nbytes
+            self.read_tensors += 1
+        elif self.read_src is None:
+            self.read_src, self.read_bytes, self.read_tensors = src, info.nbytes, 1
+        else:
+            more = self.read_more
+            if more is None:
+                more = self.read_more = {}
+            row = more.setdefault(src, [0, 0])
+            row[0] += info.nbytes
+            row[1] += 1
 
 
 #: Earlier Mooncake releases let any host that reaches the TCP data port read
@@ -231,10 +265,8 @@ class AsyncMooncakeReader:
         self, engine, device,
         max_workers: int = 3,
         max_batch_size=500,
-        enable_prof: bool=False
     ):
         self._engine = engine
-        self.enable_prof = enable_prof
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
@@ -283,10 +315,11 @@ class AsyncMooncakeReader:
                 if status < 0:
                     raise RuntimeError(f"Mooncake read failed. Status: {status}")
         end_time = time.perf_counter()
-        if self.enable_prof:
+        # The caller points every read of one edge at its FutureAndPointers
+        # only when it wants the time (--log-stats or transfer metrics).
+        if read_info[0].fp is not None:
             for info in read_info:
-                if info.fp is not None:
-                    info.fp.rx_time = (end_time - start_time)
+                info.fp.rx_time = (end_time - start_time)
 
     def wait_all(self):
         """Block until all pending writes complete. Re-raises exceptions."""
@@ -469,6 +502,13 @@ class TensorCommunicationManager(ABC):
     key -- only ``rid_to_str`` cares, and its default (``str``) is the
     identity on strings.
     """
+
+    # Transfer metrics, off until enable_transfer_metrics(); class-level so a
+    # manager built without __init__ reads them as off too.
+    transfer_stats: EdgeTransfers | None = None
+    _transfer_dst: str | None = None
+    #: The ``transport`` label: the protocol the bytes move over.
+    transport_label: str = CommProtocol.SHM.value
 
     def __init__(
         self,
@@ -1301,10 +1341,39 @@ class TensorCommunicationManager(ABC):
         """
         self._collect_and_send_acks(request_id, graph_edges)
 
+    def enable_transfer_metrics(self) -> EdgeTransfers:
+        """Count what this manager reads from now on (see ``EdgeTransfers``).
+        Called once, before or while reads run on the reading thread."""
+        if self.my_entity_id == _DATA_WORKER_ENTITY:
+            self._transfer_dst = TRANSFER_API_SERVER
+        self.transfer_stats = EdgeTransfers(self.transport_label)
+        return self.transfer_stats
+
+    def _record_transfer(self, stats: EdgeTransfers, ep: FutureAndPointers) -> None:
+        """One delivered edge read: one transfer per producing node. The edge
+        is read as a whole, so an edge joined from several producers splits
+        its read time between them by bytes (by tensors if it moved none)."""
+        src = ep.read_src
+        # Counted once: a later future that raises leaves this entry pending
+        # for the next poll.
+        ep.read_src = None
+        dst = self._transfer_dst or ep.graph_edges[0].next_node
+        seconds = ep.rx_time or 0.0
+        if ep.read_more is None:
+            stats.record(src, dst, ep.read_bytes, ep.read_tensors, seconds)
+            return
+        rows = {src: [ep.read_bytes, ep.read_tensors], **ep.read_more}
+        total = sum(r[0] for r in rows.values())
+        col = 0 if total else 1
+        total = total or sum(r[1] for r in rows.values())
+        for src, row in rows.items():
+            stats.record(src, dst, row[0], row[1], seconds * row[col] / total)
+
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[Rid, list[GraphEdge]]:
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
+        stats = self.transfer_stats
         # the async reader finishes a request's reads in any order, so a read
         # that is done waits for the ones started before it: a streamed token
         # must not reach the client ahead of the one before it
@@ -1314,6 +1383,8 @@ class TensorCommunicationManager(ABC):
             if done and ep.request_id not in waiting:
                 if ep.future is not None:
                     ep.future.result()
+                if stats is not None and ep.read_src is not None:
+                    self._record_transfer(stats, ep)
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -1617,10 +1688,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # the consumer has the engine copy ``nbytes`` from ``address + offset``
         # into a buffer it views with the descriptor's strides
         self.needs_flat_layout = protocol in (CommProtocol.RDMA, CommProtocol.TCP)
-        self._async_reader = AsyncMooncakeReader(
-            engine._engine, device=device,
-            enable_prof=enable_prof
-        )
+        self._async_reader = AsyncMooncakeReader(engine._engine, device=device)
+
+    @property
+    def transport_label(self) -> str:
+        return self.protocol.value
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync and self._on_cuda:
@@ -1699,6 +1771,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         graph_walk: str | None=None
     ) -> list[Future]:
         futures = []
+        stats = self.transfer_stats
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue
@@ -1709,6 +1782,13 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             read_info = []
+            # Created before the reads and pointed at by each of them, so the
+            # async reader can stamp ``rx_time`` on it when the read completes
+            # (the reader runs on another thread; the object identity is
+            # stable, only ``.future`` is filled in after submit).
+            fp = FutureAndPointers(
+                future=None, graph_edges=[graph_edge], request_id=request_id
+            )
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
@@ -1733,6 +1813,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
                 )
+                if stats is not None:
+                    fp.count_read(info)
                 # Nothing to read, and Mooncake rejects a 0-byte region: the
                 # empty buffer is the whole tensor. With no reads, the edge
                 # gets no future and is ready once earlier reads are.
@@ -1749,14 +1831,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     nbytes=info.nbytes,
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
-            # Create the FutureAndPointers before submit and point each read at
-            # it, so the async reader can stamp ``rx_time`` on it when the read
-            # completes (the reader runs on another thread; the object identity
-            # is stable, only ``.future`` is filled in after submit).
-            fp = FutureAndPointers(
-                future=None, graph_edges=[graph_edge], request_id=request_id
-            )
-            if self.enable_prof:
+            if self.enable_prof or fp.read_src is not None:
                 for ri in read_info:
                     ri.fp = fp
             fut = self._async_reader.submit(read_info)
@@ -2032,6 +2107,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # consumer's in-flight default-stream work. We make default wait
         # for the H2D stream at the end so downstream kernels see the data.
         h2d_did_work = False
+        stats = self.transfer_stats
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
@@ -2046,6 +2122,9 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
                 )
                 rx_t0 = time.perf_counter()
+                fp = FutureAndPointers(
+                    future=None, graph_edges=[graph_edge], request_id=request_id,
+                )
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
@@ -2075,14 +2154,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     # +1 for transit (released by get_ready_tensors)
                     # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                     self.tensor_store.increment_ref(info.uuid, 2)
+                    if stats is not None:
+                        fp.count_read(info)
                     logger.debug("SHM: read tensor %s from %s", info.uuid, path)
-                self.pending.append(
-                    FutureAndPointers(
-                        future=None, graph_edges=[graph_edge],
-                        request_id=request_id,
-                        rx_time=time.perf_counter() - rx_t0,
-                    )
-                )
+                fp.rx_time = time.perf_counter() - rx_t0
+                self.pending.append(fp)
         if h2d_did_work and self._h2d_stream is not None:
             torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []

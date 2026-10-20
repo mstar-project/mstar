@@ -81,6 +81,7 @@ from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,11 @@ class PendingBatch:
     loop_name: str = None
     # The leader's broadcast seq for this batch (``ScheduleTPNode.spec_seq``).
     tp_seq: int = -1
+    # perf_counter when the main thread handed it to the GPU thread, stamped
+    # only while metrics are on and only off the speculative path: a
+    # speculated step is handed off before the step it follows finishes, so
+    # its step time starts at that finish anyway (see WorkerMetrics.step_done)
+    submitted_at: float = 0.0
 
 
 @dataclass
@@ -320,6 +326,10 @@ class Worker:
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
 
+    # Metrics are off unless __init__ gets a status interval; class-level so a
+    # worker built without __init__ reads them as off too.
+    _metrics: WorkerMetrics | None = None
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -343,7 +353,8 @@ class Worker:
         enable_nvtx: bool = False,
         enable_prof: bool = False,
         tcp_transfer_device="",
-        dist_init_method=None
+        dist_init_method=None,
+        status_interval_s: float | None = None,
     ):
         self.worker_id = worker_id
         self.device = device
@@ -672,6 +683,22 @@ class Worker:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
+
+        if status_interval_s is not None:
+            self._metrics = self._start_metrics(status_interval_s)
+
+    def _start_metrics(self, interval_s: float) -> WorkerMetrics:
+        """Metrics on: send the conductor a WorkerStatus every ``interval_s``,
+        and from ``ENABLE_METRICS`` on record the steps of the nodes this rank
+        leads and the tensors every rank reads."""
+        return WorkerMetrics(
+            self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
+            self.engine_manager.engine, self.scheduler,
+            send=lambda status: self.communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.WORKER_STATUS, body=status,
+            )),
+            enable_transfers=self.tensor_manager.enable_transfer_metrics,
+        )
 
     @staticmethod
     def _build_innermost_loop_cache(
@@ -1176,6 +1203,9 @@ class Worker:
                 self._register_tp_follow(message.body)
             elif message.message_type == WorkerMessageType.TP_NO_SPEC:
                 self._register_tp_nospec(message.body)
+            elif message.message_type == WorkerMessageType.ENABLE_METRICS:
+                # sent only with metrics on, so _metrics is set
+                self._metrics.start_counting()
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -4268,6 +4298,9 @@ class Worker:
         # anything. ``benchmark/worker_phases`` segments on it.
         phase_bs: list[int] = []
 
+        # None with metrics off: then nothing below records or sends anything
+        metrics = self._metrics
+
         def _phase_flush() -> None:
             if phase_period <= 0 or phase_iter[0] % phase_period != 0:
                 return
@@ -4346,6 +4379,10 @@ class Worker:
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+
+                # Reads only: whether a rank sends this changes nothing it runs.
+                if metrics is not None:
+                    metrics.maybe_report()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
@@ -4534,6 +4571,11 @@ class Worker:
                     if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
+                        if metrics is not None:
+                            metrics.step_done(
+                                pending.node_name, pending.graph_walk,
+                                pending.node_batch.inputs, pending.submitted_at,
+                            )
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -4592,6 +4634,7 @@ class Worker:
                 # iteration schedules against an admit that hasn't run.
                 node_batch.launch_started_event = threading.Event()
                 self._set_in_flight_flag(batch, True)
+                submitted_at = _time.perf_counter() if metrics is not None else 0.0
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
@@ -4605,6 +4648,7 @@ class Worker:
                     graph_walk=batch.graph_walk,
                     future=future,
                     tp_seq=fallthrough_tp_seq,
+                    submitted_at=submitted_at,
                 ))
                 # Same accounting as the speculative path above
                 if phase_period:

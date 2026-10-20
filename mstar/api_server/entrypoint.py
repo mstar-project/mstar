@@ -40,7 +40,14 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
-from mstar.observability.metrics import INSTALL_HINT, MISSING_DEPENDENCY, ServingMetrics
+from mstar.observability.catalog import STATUS_INTERVAL_S
+from mstar.observability.metrics import (
+    INSTALL_HINT,
+    MISSING_DEPENDENCY,
+    RefusalMiddleware,
+    ServingMetrics,
+    mark_submitted,
+)
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -91,9 +98,11 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Runs DummyConductor.run() in a spawned process."""
+    """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
+    turns on the conductor's status message (metrics on)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -145,7 +154,8 @@ def _conductor_process_target(
         enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        status_interval_s=status_interval_s,
     )
     try:
         conductor.run()
@@ -245,6 +255,8 @@ class PendingRequest:
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
     wake_per_chunk: bool = True
+    # Output modality -> perf_counter of its first chunk; kept only with metrics on.
+    first_chunk_times: dict[str, float] = field(default_factory=dict)
 
     def notify(self) -> None:
         """Wake the waiting handler, from any thread."""
@@ -498,13 +510,22 @@ class APIServer:
             callback()
 
     def enable_metrics(self) -> None:
-        """Count requests from now on and serve them at ``/metrics``.
+        """Count requests from now on and serve them at ``/metrics``, and
+        have the engine workers start their histograms and counters.
 
         ``main()`` calls this after the warmup requests, so their first-shape
         compile times stay out of the latency histograms."""
+        # The data worker reads every result, so it is the dst of the edges
+        # out of the graph; workers report the rest through the conductor.
+        transfers = (self.preprocess_worker.enable_transfer_metrics()
+                     if self.preprocess_worker is not None else None)
         self.metrics = ServingMetrics(
             self.model_name, in_flight=lambda: len(self.pending_requests),
+            data_worker_queue_depth=self.preprocess_worker.queue_depth,
+            local_status=(lambda: transfers.latest) if transfers is not None else None,
         )
+        self.preprocess_worker.report_preprocess_finish()
+        self.preprocess_worker.enable_worker_metrics()
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -572,6 +593,8 @@ class APIServer:
                 ),
                 request_id=request_id,
             )
+        if self.metrics is not None:
+            mark_submitted()
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
@@ -738,6 +761,14 @@ class APIServer:
                             self.preprocess_worker.wake()
                         continue
 
+                    if message.message_type == "conductor_status":
+                        # Sent only with --enable-metrics, from before the
+                        # warmups; dropped until enable_metrics() runs.
+                        metrics = self.metrics
+                        if metrics is not None:
+                            metrics.conductor_status(message.body)
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
@@ -791,6 +822,8 @@ class APIServer:
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
                                     message.body.conductor_finish_time
+                                req.profile.timing.conductor_arrival_time = \
+                                    message.body.conductor_arrival_time
                                 req.profile.graph_timings = list(message.body.graph_timings.values())
                                 # Conductor-merged worker-side transfers; extend
                                 # so they combine with the data worker's own
@@ -819,7 +852,14 @@ class APIServer:
                 # Apply data-worker profiling: preprocess-finish timestamp + raw
                 # input sizes. (The data worker's own tx/rx are snapshotted
                 # directly in _prune_recently_completed once the request is done.)
+                metrics = self.metrics
                 for update in self.preprocess_worker.get_profile_updates():
+                    # A --log-stats profile begun before metrics were on has
+                    # no dequeue time.
+                    if metrics is not None and update.dequeue_time is not None:
+                        metrics.record_preprocess(update)
+                    if update.failed:
+                        continue
                     with self.request_lock:
                         req = self.pending_requests.get(update.request_id)
                         if req is not None:
@@ -850,6 +890,8 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if metrics is not None and result_chunk.modality != "error":
+                            req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
                             result_chunk.request_id = req.request_id
                         if result_chunk.modality == "error":
@@ -876,6 +918,10 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                    if metrics is not None and result_chunk.modality != "error":
+                        metrics.record_chunk(
+                            result_chunk.modality, result_chunk.data, result_chunk.metadata,
+                        )
                 if to_wake:
                     notify_many(to_wake.values())
 
@@ -1425,6 +1471,14 @@ app.add_middleware(BodyLimitMiddleware)
 # is read.
 api_key_guard = APIKeyGuard(resolve_api_key())
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
+# Outside the key check and the body limit, which refuse before routing, and
+# inside CORS, so a browser preflight is not counted. ``routes`` must list
+# every included router's routes (test_serving_metrics checks each route).
+app.add_middleware(
+    RefusalMiddleware,
+    metrics=lambda: getattr(api_server, "metrics", None),
+    routes=lambda: (*app.router.routes, *openai_router.routes),
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1950,9 +2004,6 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
-    if args.enable_metrics and args.rust_frontend:
-        parser.error("--enable-metrics is not served by the Rust frontend yet; "
-                     "drop --rust-frontend or --enable-metrics")
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
 
@@ -2015,6 +2066,8 @@ def main(argv: list[str] | None = None):
             CommProtocol(args.tensor_comm_protocol),
             args.tcp_transfer_device
         ),
+        # The API server drops these until enable_metrics(), after the warmups.
+        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

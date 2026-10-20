@@ -246,7 +246,9 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance.
+       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
+       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
+       detection is null (client commits) or ``server_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -328,6 +330,34 @@ Per-model notes:
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
+- **Realtime turn detection** — by default the client ends each utterance with
+  ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
+  server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),
+  ``prefix_padding_ms`` (300) and ``silence_duration_ms`` (500). Silero VAD scores each
+  32 ms frame; a turn starts on a frame at or above ``threshold`` with up to
+  ``prefix_padding_ms`` of the audio before it. Silence starts on a frame below
+  ``threshold`` minus 0.15, and a frame at or above ``threshold`` cancels it; the turn
+  ends on whichever frame completes ``silence_duration_ms`` of whole frames counted from
+  that first silent frame, borderline frames included. The hysteresis is that of
+  Silero's own ``VADIterator``, but ``VADIterator`` counts from the frame after the first
+  silent one and ends only on a frame below ``threshold`` minus 0.15, so with a nonzero
+  ``silence_duration_ms`` it ends a turn one frame or more later. The server then sends
+  ``input_audio_buffer.speech_started`` (``audio_start_ms``),
+  ``input_audio_buffer.speech_stopped`` (``audio_end_ms``) and ``committed``, and the
+  transcription completes. Times are milliseconds of audio since the session started,
+  cleared audio included. A commit takes exactly the turn's audio; what follows, even
+  in the same append, goes to the next turn. A turn never passes the item cap: it is
+  committed before the frame that would pass it, and speech goes on in a new turn that
+  starts with that frame. A client ``commit`` ends an open turn; between turns it
+  drops what the VAD has not put in a turn yet. ``create_response`` and
+  ``interrupt_response`` are accepted and echoed but do nothing in a transcription
+  session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
+  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
+  ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
+  exports take other inputs, and with one of them ``server_vad`` is refused); weights are
+  never downloaded. The Dynamo bridge has no turn detection yet and
+  refuses it.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.

@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # Dashboards in ../../dashboards refer to the data source by this uid.
+    uid: prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Matches scrape_interval in prometheus.yml, so rate() windows in
+      # dashboards cover at least one scrape.
+      timeInterval: 5s

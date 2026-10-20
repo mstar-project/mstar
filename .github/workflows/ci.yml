@@ -173,8 +173,9 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
-          # pyyaml: the runtime tests reach mstar.model.base, which imports it
-          pip install pytest pyzmq msgpack numpy pyyaml
+          # pyyaml: the runtime tests reach mstar.model.base, which imports it;
+          # prometheus-client: the frontend's /metrics test renders a real registry
+          pip install pytest pyzmq msgpack numpy pyyaml prometheus-client
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

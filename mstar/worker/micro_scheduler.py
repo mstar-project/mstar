@@ -1,7 +1,7 @@
 import functools
 import logging
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1276,6 +1276,20 @@ class MicroScheduler:
             self.fail_rids({rid})
             return False
         return outcome.ok and outcome.ready
+
+    def pending_rows(self) -> Counter[str]:
+        """Per node this rank schedules, rows ready for a step but not in one:
+        its backlog, and graph-ready rows still on the queues. Read-only and
+        graph-level (no engine readiness check, which can reload), so a held
+        or not yet reloaded row counts; a failed or removed one does not."""
+        exclude = self.pending_removes | self.failed_rids
+        rows: Counter[str] = Counter()
+        for (node, _), waiting in self.backlog.items():
+            rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
+        for spec in self.runtime.get_ready_nodes(exclude):
+            if spec.node_name in self.parallel_leader_nodes:
+                rows[spec.node_name] += len(spec.rids)
+        return rows
 
     def take_admit_errors(self) -> dict[int, str]:
         """Hand the accumulated terminal admit failures to the caller, once."""

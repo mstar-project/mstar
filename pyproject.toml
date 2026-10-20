@@ -106,6 +106,13 @@ audioseal = [
     "audioseal>=0.2,<0.3",
 ]
 
+# Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
+# its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+vad = [
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
+]
+
 # Optional: serve a deployment as a NVIDIA Dynamo backend
 # (python -m mstar.integrations.dynamo). Nothing outside
 # mstar/integrations/dynamo/ imports these.
@@ -345,6 +352,8 @@ all = [
     "ruff",
     "pytest>=8.2",
     "soundfile",
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
     "av",
     "diffusers>=0.39",
     "fa3-fwd",

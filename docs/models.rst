@@ -380,6 +380,12 @@ Qwen3-TTS notes
   Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
   without the package. Each request's PCM is marked chunk by chunk with its own
   streaming state, so a streamed utterance carries the same mark as a whole one.
+  At startup the engine captures the generator per chunk length of the codec
+  schedule (by default 1, 3, 8, 16 and 25 frames) and batch bucket, so marking a step's
+  chunks costs one graph replay per distinct length. The captures hold GPU memory: about
+  2.5 GiB for the default 30 graphs (5 lengths, 6 batch buckets) on an H200, 5.7 GiB with
+  25 lengths. A chunk outside them (another length, more rows than the largest bucket,
+  a partial frame) runs eagerly, and the first one of each kind is logged.
   Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
   (``--message``, the deployment's payload: without it the verdict is the
   score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
