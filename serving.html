@@ -1201,7 +1201,8 @@ warmup requests. Every family has a <code class="docutils literal notranslate"><
 request failed in the engine, preprocessing or result delivery), <code class="docutils literal notranslate"><span class="pre">abort</span></code> (the client
 went away, or its finished result was dropped unread) or <code class="docutils literal notranslate"><span class="pre">timeout</span></code> (<code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
 expired). Requests refused before they were submitted (a 400 for a bad form, a 409
-for a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight) are not counted.</p></li>
+for a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight) are not counted here but in
+<code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_requests_in_flight{model_name}</span></code>: gauge, requests the API server holds
 (submitted and not yet returned, failed or aborted).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_e2e_request_latency_seconds{model_name,</span> <span class="pre">output_modalities}</span></code>: histogram over
@@ -1211,6 +1212,18 @@ leaving the API server.</p></li>
 successful requests, from submission to the first result chunk of any modality
 reaching the API server. It is measured on the server, so it does not include the
 network to the client, and a non-streaming client sees nothing until the end.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total{model_name,</span> <span class="pre">route,</span> <span class="pre">status}</span></code>: counter, HTTP requests the
+frontend answered with a 4xx status without submitting them to the API server: <code class="docutils literal notranslate"><span class="pre">401</span></code>
+(missing or wrong API key), <code class="docutils literal notranslate"><span class="pre">413</span></code> (body over <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>), <code class="docutils literal notranslate"><span class="pre">422</span></code> (body
+that fails validation), <code class="docutils literal notranslate"><span class="pre">400</span></code> (a bad form field or request), <code class="docutils literal notranslate"><span class="pre">409</span></code> (a
+<code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight), <code class="docutils literal notranslate"><span class="pre">404</span></code> (unknown route, or a model without the endpoint),
+<code class="docutils literal notranslate"><span class="pre">405</span></code> (wrong method), plus <code class="docutils literal notranslate"><span class="pre">503</span></code> when the Rust frontend’s
+<code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code> cap turns a request away. <code class="docutils literal notranslate"><span class="pre">route</span></code> is the route’s
+path as declared (<code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code>), <code class="docutils literal notranslate"><span class="pre">unmatched</span></code> when no route matches.
+A request that was submitted and then failed counts once, as an <code class="docutils literal notranslate"><span class="pre">error</span></code> in
+<code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code>, never here. WebSocket handshakes are not counted. With
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> keeps these counts and sends them with each
+<code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request, so the API server exports them under the same name.</p></li>
 </ul>
 <p>Where a successful request’s time went, from the timestamps every request already
 carries (same <code class="docutils literal notranslate"><span class="pre">model_name</span></code> and <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> labels; the conductor’s

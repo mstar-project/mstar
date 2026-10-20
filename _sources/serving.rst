@@ -522,7 +522,8 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   request failed in the engine, preprocessing or result delivery), ``abort`` (the client
   went away, or its finished result was dropped unread) or ``timeout`` (``--timeout``
   expired). Requests refused before they were submitted (a 400 for a bad form, a 409
-  for a ``request_id`` in flight) are not counted.
+  for a ``request_id`` in flight) are not counted here but in
+  ``mstar_http_refusals_total``.
 - ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds
   (submitted and not yet returned, failed or aborted).
 - ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``: histogram over
@@ -532,6 +533,18 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   successful requests, from submission to the first result chunk of any modality
   reaching the API server. It is measured on the server, so it does not include the
   network to the client, and a non-streaming client sees nothing until the end.
+- ``mstar_http_refusals_total{model_name, route, status}``: counter, HTTP requests the
+  frontend answered with a 4xx status without submitting them to the API server: ``401``
+  (missing or wrong API key), ``413`` (body over ``MSTAR_MAX_BODY_MB``), ``422`` (body
+  that fails validation), ``400`` (a bad form field or request), ``409`` (a
+  ``request_id`` in flight), ``404`` (unknown route, or a model without the endpoint),
+  ``405`` (wrong method), plus ``503`` when the Rust frontend's
+  ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
+  path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
+  A request that was submitted and then failed counts once, as an ``error`` in
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
+  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+  ``/metrics`` request, so the API server exports them under the same name.
 
 Where a successful request's time went, from the timestamps every request already
 carries (same ``model_name`` and ``output_modalities`` labels; the conductor's

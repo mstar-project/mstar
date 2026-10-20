@@ -928,8 +928,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Requests are counted where they leave :class:`~mstar.api_server.entrypoint.APIServer`,</span>
 <span class="sd">which ``/generate``, ``/generate/ws``, the OpenAI routes, the Rust-frontend</span>
-<span class="sd">bridge and the Dynamo bridge all go through. Each family carries the</span>
-<span class="sd">deployment's ``model_name``; every other label takes values from a fixed set.</span>
+<span class="sd">bridge and the Dynamo bridge all go through. Requests the HTTP frontend</span>
+<span class="sd">refuses before that (a missing API key, a body over the limit, a bad form)</span>
+<span class="sd">are counted by route and status in ``mstar_http_refusals_total``. Each family</span>
+<span class="sd">carries the deployment's ``model_name``; every other label takes values from</span>
+<span class="sd">a fixed set.</span>
 
 <span class="sd">Only the API server process imports ``prometheus_client`` and renders</span>
 <span class="sd">``/metrics``. Other processes (data worker, conductor, workers) send plain</span>
@@ -942,8 +945,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Iterable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">contextvars</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextVar</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="k">try</span><span class="p">:</span>
@@ -954,7 +959,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">Histogram</span><span class="p">,</span>
         <span class="n">generate_latest</span><span class="p">,</span>
     <span class="p">)</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">prometheus_client.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">GaugeMetricFamily</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">prometheus_client.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">CounterMetricFamily</span><span class="p">,</span> <span class="n">GaugeMetricFamily</span>
 <span class="k">except</span> <span class="ne">ModuleNotFoundError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
     <span class="c1"># Only a missing package means "not installed"; a broken install must</span>
     <span class="c1"># still raise.</span>
@@ -1041,6 +1046,148 @@ window.runMermaid = runMermaid;</script>
     <span class="n">delivery</span><span class="p">:</span> <span class="n">Any</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_Refusals</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``mstar_http_refusals_total``: what the Python frontend counts here,</span>
+<span class="sd">    plus the latest cumulative counts the Rust frontend sends with each</span>
+<span class="sd">    ``/metrics`` request (``mstar-server`` keeps them; see ``rust/server/src/refusals.rs``).</span>
+<span class="sd">    Only one of the two frontends serves a deployment, so the sum is that</span>
+<span class="sd">    frontend's counts."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">model_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_python</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">inc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">route</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">route</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">status</span><span class="p">))</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_python</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_python</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">update_rust</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">routes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">statuses</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">counts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take the Rust frontend's cumulative counts (three parallel lists).</span>
+<span class="sd">        Two scrapes can cross on their way here, so a count only moves up:</span>
+<span class="sd">        an older snapshot never lowers what a newer one set."""</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">route</span><span class="p">,</span> <span class="n">status</span><span class="p">,</span> <span class="n">count</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">routes</span><span class="p">,</span> <span class="n">statuses</span><span class="p">,</span> <span class="n">counts</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">route</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="n">status</span><span class="p">))</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">count</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">collect</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">family</span> <span class="o">=</span> <span class="n">CounterMetricFamily</span><span class="p">(</span>
+            <span class="s2">"mstar_http_refusals"</span><span class="p">,</span>
+            <span class="s2">"HTTP requests answered with an error before they reached the API server "</span>
+            <span class="s2">"(a 4xx, or the Rust frontend's admission cap 503), by route template and status."</span><span class="p">,</span>
+            <span class="n">labels</span><span class="o">=</span><span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="s2">"route"</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">],</span>
+        <span class="p">)</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">counts</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_python</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">counts</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="n">n</span>
+        <span class="k">for</span> <span class="p">(</span><span class="n">route</span><span class="p">,</span> <span class="n">status</span><span class="p">),</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">counts</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+            <span class="n">family</span><span class="o">.</span><span class="n">add_metric</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">route</span><span class="p">,</span> <span class="n">status</span><span class="p">],</span> <span class="n">n</span><span class="p">)</span>
+        <span class="k">yield</span> <span class="n">family</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_Request</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One HTTP request seen by :class:`RefusalMiddleware`."""</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"submitted"</span><span class="p">,)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">submitted</span> <span class="o">=</span> <span class="kc">False</span>
+
+
+<span class="c1"># A mutable holder rather than a bool: run_in_threadpool and new tasks run in</span>
+<span class="c1"># a copy of the context, which still holds the same object.</span>
+<span class="n">_REQUEST</span><span class="p">:</span> <span class="n">ContextVar</span><span class="p">[</span><span class="n">_Request</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="n">ContextVar</span><span class="p">(</span><span class="s2">"mstar_http_request"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="mark_submitted">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.mark_submitted">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">mark_submitted</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The HTTP request being served reached ``APIServer``: it is counted in</span>
+<span class="sd">    ``mstar_requests_total`` when it ends, so it is never a refusal."""</span>
+    <span class="n">request</span> <span class="o">=</span> <span class="n">_REQUEST</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">request</span><span class="o">.</span><span class="n">submitted</span> <span class="o">=</span> <span class="kc">True</span></div>
+
+
+
+<div class="viewcode-block" id="route_template">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.route_template">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">route_template</span><span class="p">(</span><span class="n">scope</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">routes</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The route path the request matched (``/v1/chat/completions``), never</span>
+<span class="sd">    the raw URL; ``unmatched`` when no route matches. ``routes`` are the</span>
+<span class="sd">    app's routes, searched for a request refused before routing (the API</span>
+<span class="sd">    key, a declared body size) the way the router matches: a full match</span>
+<span class="sd">    before a method-only one."""</span>
+    <span class="n">route</span> <span class="o">=</span> <span class="n">scope</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"route"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">route</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">starlette.routing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Match</span>
+
+        <span class="n">partial</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">for</span> <span class="n">candidate</span> <span class="ow">in</span> <span class="n">routes</span><span class="p">:</span>
+            <span class="c1"># FastAPI 0.150+ lists an included router as one entry with no</span>
+            <span class="c1"># path, whose match names no route; its routes are listed too.</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">candidate</span><span class="p">,</span> <span class="s2">"path"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">match</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">candidate</span><span class="o">.</span><span class="n">matches</span><span class="p">(</span><span class="n">scope</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">match</span> <span class="ow">is</span> <span class="n">Match</span><span class="o">.</span><span class="n">FULL</span><span class="p">:</span>
+                <span class="n">route</span> <span class="o">=</span> <span class="n">candidate</span>
+                <span class="k">break</span>
+            <span class="k">if</span> <span class="n">match</span> <span class="ow">is</span> <span class="n">Match</span><span class="o">.</span><span class="n">PARTIAL</span> <span class="ow">and</span> <span class="n">partial</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">partial</span> <span class="o">=</span> <span class="n">candidate</span>
+        <span class="n">route</span> <span class="o">=</span> <span class="n">route</span> <span class="ow">or</span> <span class="n">partial</span>
+    <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">route</span><span class="p">,</span> <span class="s2">"path"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"unmatched"</span></div>
+
+
+
+<div class="viewcode-block" id="RefusalMiddleware">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.RefusalMiddleware">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RefusalMiddleware</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Counts ``mstar_http_refusals_total`` for the Python frontend: every</span>
+<span class="sd">    HTTP response with a 4xx status for a request that never reached</span>
+<span class="sd">    ``APIServer.submit_request`` (:func:`mark_submitted`). A request that was</span>
+<span class="sd">    submitted and then failed is counted by ``mstar_requests_total`` instead.</span>
+
+<span class="sd">    Sits outside the API key and body limit middlewares (their 401 and 413 are</span>
+<span class="sd">    sent before routing) and inside CORS (a preflight is not a request).</span>
+<span class="sd">    WebSocket handshakes are not counted. With metrics off it only checks</span>
+<span class="sd">    ``metrics()`` for None.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">app</span><span class="p">,</span> <span class="n">metrics</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">ServingMetrics</span> <span class="o">|</span> <span class="kc">None</span><span class="p">],</span> <span class="n">routes</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">Iterable</span><span class="p">],</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">app</span> <span class="o">=</span> <span class="n">app</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">metrics</span> <span class="o">=</span> <span class="n">metrics</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">routes</span> <span class="o">=</span> <span class="n">routes</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">):</span>
+        <span class="n">metrics</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">metrics</span><span class="p">()</span> <span class="k">if</span> <span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"http"</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">metrics</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">app</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span>
+            <span class="k">return</span>
+        <span class="n">request</span> <span class="o">=</span> <span class="n">_Request</span><span class="p">()</span>
+        <span class="n">status</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">send_and_note_status</span><span class="p">(</span><span class="n">message</span><span class="p">):</span>
+            <span class="k">nonlocal</span> <span class="n">status</span>
+            <span class="k">if</span> <span class="n">message</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"http.response.start"</span><span class="p">:</span>
+                <span class="n">status</span> <span class="o">=</span> <span class="n">message</span><span class="p">[</span><span class="s2">"status"</span><span class="p">]</span>
+            <span class="k">await</span> <span class="n">send</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
+
+        <span class="n">token</span> <span class="o">=</span> <span class="n">_REQUEST</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">app</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send_and_note_status</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="n">_REQUEST</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
+            <span class="k">if</span> <span class="mi">400</span> <span class="o">&lt;=</span> <span class="n">status</span> <span class="o">&lt;</span> <span class="mi">500</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">request</span><span class="o">.</span><span class="n">submitted</span><span class="p">:</span>
+                <span class="n">metrics</span><span class="o">.</span><span class="n">refusals</span><span class="o">.</span><span class="n">inc</span><span class="p">(</span><span class="n">route_template</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">routes</span><span class="p">()),</span> <span class="n">status</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="ServingMetrics">
 <a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ServingMetrics</span><span class="p">:</span>
@@ -1073,6 +1220,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">_InFlight</span><span class="p">(</span><span class="n">model_name</span><span class="p">,</span> <span class="n">in_flight</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">refusals</span> <span class="o">=</span> <span class="n">_Refusals</span><span class="p">(</span><span class="n">model_name</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">refusals</span><span class="p">)</span>
 
         <span class="c1"># Where a successful request's time went, from the timestamps it</span>
         <span class="c1"># carries. The conductor's perf_counter is compared with this</span>

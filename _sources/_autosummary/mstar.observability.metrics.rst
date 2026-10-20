@@ -19,8 +19,10 @@ mstar.observability.metrics
 
    .. autosummary::
    
+      mark_submitted
       modalities_label
       require_prometheus_client
+      route_template
    
    
 
@@ -30,6 +32,7 @@ mstar.observability.metrics
 
    .. autosummary::
    
+      RefusalMiddleware
       ServingMetrics
    
    

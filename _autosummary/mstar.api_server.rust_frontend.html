@@ -668,7 +668,8 @@ protocol are untouched):</p>
 prompt_parts, streaming} | {t:”abort”, rid, sub}</p>
 </div></blockquote>
 <div class="line-block">
-<div class="line">{t:”ping”, rid, sub} | {t:”metrics”, rid, sub}</div>
+<div class="line">{t:”ping”, rid, sub}</div>
+<div class="line">{t:”metrics”, rid, sub, refusals:{route, status, count}}</div>
 </div>
 </dd>
 <dt>bridge -&gt; frontend:  {t:”chunk”, rid, sub, modality, data(bin), metadata}</dt><dd><div class="line-block">
@@ -679,9 +680,12 @@ prompt_parts, streaming} | {t:”abort”, rid, sub}</p>
 </dd>
 </dl>
 </div></blockquote>
-<p>A <code class="docutils literal notranslate"><span class="pre">metrics</span></code> reply is what <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code> serves on the Python frontend:
-the text rendered from <code class="docutils literal notranslate"><span class="pre">APIServer.metrics</span></code> with its <code class="docutils literal notranslate"><span class="pre">content_type</span></code> in
-<code class="docutils literal notranslate"><span class="pre">metadata</span></code>, or empty <code class="docutils literal notranslate"><span class="pre">metadata</span></code> when metrics are off (a 404).</p>
+<p>A <code class="docutils literal notranslate"><span class="pre">metrics</span></code> request carries the frontend’s cumulative refusal counts as
+three parallel lists (route template, status, count), which the API server
+exports as <code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code>. The reply is what <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>
+serves on the Python frontend: the text rendered from <code class="docutils literal notranslate"><span class="pre">APIServer.metrics</span></code>
+with its <code class="docutils literal notranslate"><span class="pre">content_type</span></code> in <code class="docutils literal notranslate"><span class="pre">metadata</span></code>, or empty <code class="docutils literal notranslate"><span class="pre">metadata</span></code> when metrics
+are off (a 404; the counts are then ignored).</p>
 <p><code class="docutils literal notranslate"><span class="pre">sub</span></code> names one submission and is never reused. A client may resubmit its
 <code class="docutils literal notranslate"><span class="pre">rid</span></code> as soon as it drops a stream, and that stream’s <code class="docutils literal notranslate"><span class="pre">done</span></code> or late
 chunks can cross the retry, so everything about a submission is addressed by

@@ -634,14 +634,17 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.RefusalMiddleware"><code class="docutils literal notranslate"><span class="pre">RefusalMiddleware</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.mark_submitted"><code class="docutils literal notranslate"><span class="pre">mark_submitted()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.modalities_label"><code class="docutils literal notranslate"><span class="pre">modalities_label()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.require_prometheus_client"><code class="docutils literal notranslate"><span class="pre">require_prometheus_client()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.route_template"><code class="docutils literal notranslate"><span class="pre">route_template()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -658,8 +661,11 @@
 <p>Prometheus metrics for the API server: <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> and <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>.</p>
 <p>Requests are counted where they leave <code class="xref py py-class docutils literal notranslate"><span class="pre">APIServer</span></code>,
 which <code class="docutils literal notranslate"><span class="pre">/generate</span></code>, <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, the OpenAI routes, the Rust-frontend
-bridge and the Dynamo bridge all go through. Each family carries the
-deployment’s <code class="docutils literal notranslate"><span class="pre">model_name</span></code>; every other label takes values from a fixed set.</p>
+bridge and the Dynamo bridge all go through. Requests the HTTP frontend
+refuses before that (a missing API key, a body over the limit, a bad form)
+are counted by route and status in <code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code>. Each family
+carries the deployment’s <code class="docutils literal notranslate"><span class="pre">model_name</span></code>; every other label takes values from
+a fixed set.</p>
 <p>Only the API server process imports <code class="docutils literal notranslate"><span class="pre">prometheus_client</span></code> and renders
 <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>. Other processes (data worker, conductor, workers) send plain
 numbers on messages they already send the API server, which records them
@@ -678,11 +684,17 @@ needed when metrics are on.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.metrics.modalities_label" title="mstar.observability.metrics.modalities_label"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modalities_label</span></code></a>(modalities)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.metrics.mark_submitted" title="mstar.observability.metrics.mark_submitted"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mark_submitted</span></code></a>()</p></td>
+<td><p>The HTTP request being served reached <code class="docutils literal notranslate"><span class="pre">APIServer</span></code>: it is counted in <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> when it ends, so it is never a refusal.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.metrics.modalities_label" title="mstar.observability.metrics.modalities_label"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modalities_label</span></code></a>(modalities)</p></td>
 <td><p>One label value per set of output modalities, e.g. <code class="docutils literal notranslate"><span class="pre">audio,text</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.metrics.require_prometheus_client" title="mstar.observability.metrics.require_prometheus_client"><code class="xref py py-obj docutils literal notranslate"><span class="pre">require_prometheus_client</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.metrics.require_prometheus_client" title="mstar.observability.metrics.require_prometheus_client"><code class="xref py py-obj docutils literal notranslate"><span class="pre">require_prometheus_client</span></code></a>()</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.metrics.route_template" title="mstar.observability.metrics.route_template"><code class="xref py py-obj docutils literal notranslate"><span class="pre">route_template</span></code></a>(scope, routes)</p></td>
+<td><p>The route path the request matched (<code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code>), never the raw URL; <code class="docutils literal notranslate"><span class="pre">unmatched</span></code> when no route matches.</p></td>
 </tr>
 </tbody>
 </table>
@@ -690,7 +702,10 @@ needed when metrics are on.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.metrics.ServingMetrics" title="mstar.observability.metrics.ServingMetrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a>(model_name, in_flight)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.observability.metrics.RefusalMiddleware" title="mstar.observability.metrics.RefusalMiddleware"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RefusalMiddleware</span></code></a>(app, metrics, routes)</p></td>
+<td><p>Counts <code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code> for the Python frontend: every HTTP response with a 4xx status for a request that never reached <code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code> (<a class="reference internal" href="#mstar.observability.metrics.mark_submitted" title="mstar.observability.metrics.mark_submitted"><code class="xref py py-func docutils literal notranslate"><span class="pre">mark_submitted()</span></code></a>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.observability.metrics.ServingMetrics" title="mstar.observability.metrics.ServingMetrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a>(model_name, in_flight)</p></td>
 <td><p>The API server's registry and its request metrics.</p></td>
 </tr>
 </tbody>
@@ -709,6 +724,28 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
 </dd>
 <dt class="field-even">Type<span class="colon">:</span></dt>
 <dd class="field-even"><p>the result went to the HTTP layer. <code class="docutils literal notranslate"><span class="pre">error</span></code></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.observability.metrics.RefusalMiddleware">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.observability.metrics.</span></span><span class="sig-name descname"><span class="pre">RefusalMiddleware</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">app</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metrics</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">routes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#RefusalMiddleware"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.RefusalMiddleware" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Counts <code class="docutils literal notranslate"><span class="pre">mstar_http_refusals_total</span></code> for the Python frontend: every
+HTTP response with a 4xx status for a request that never reached
+<code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code> (<a class="reference internal" href="#mstar.observability.metrics.mark_submitted" title="mstar.observability.metrics.mark_submitted"><code class="xref py py-func docutils literal notranslate"><span class="pre">mark_submitted()</span></code></a>). A request that was
+submitted and then failed is counted by <code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> instead.</p>
+<p>Sits outside the API key and body limit middlewares (their 401 and 413 are
+sent before routing) and inside CORS (a preflight is not a request).
+WebSocket handshakes are not counted. With metrics off it only checks
+<code class="docutils literal notranslate"><span class="pre">metrics()</span></code> for None.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>metrics</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="#mstar.observability.metrics.ServingMetrics" title="mstar.observability.metrics.ServingMetrics"><em>ServingMetrics</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>routes</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><em>Iterable</em><em>]</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -774,6 +811,18 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.observability.metrics.mark_submitted">
+<span class="sig-prename descclassname"><span class="pre">mstar.observability.metrics.</span></span><span class="sig-name descname"><span class="pre">mark_submitted</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#mark_submitted"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.mark_submitted" title="Link to this definition">#</a></dt>
+<dd><p>The HTTP request being served reached <code class="docutils literal notranslate"><span class="pre">APIServer</span></code>: it is counted in
+<code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> when it ends, so it is never a refusal.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.observability.metrics.modalities_label">
 <span class="sig-prename descclassname"><span class="pre">mstar.observability.metrics.</span></span><span class="sig-name descname"><span class="pre">modalities_label</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">modalities</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#modalities_label"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.modalities_label" title="Link to this definition">#</a></dt>
 <dd><p>One label value per set of output modalities, e.g. <code class="docutils literal notranslate"><span class="pre">audio,text</span></code>.</p>
@@ -793,6 +842,27 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.observability.metrics.route_template">
+<span class="sig-prename descclassname"><span class="pre">mstar.observability.metrics.</span></span><span class="sig-name descname"><span class="pre">route_template</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">scope</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">routes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#route_template"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.route_template" title="Link to this definition">#</a></dt>
+<dd><p>The route path the request matched (<code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code>), never
+the raw URL; <code class="docutils literal notranslate"><span class="pre">unmatched</span></code> when no route matches. <code class="docutils literal notranslate"><span class="pre">routes</span></code> are the
+app’s routes, searched for a request refused before routing (the API
+key, a declared body size) the way the router matches: a full match
+before a method-only one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>scope</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+<li><p><strong>routes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -847,14 +917,17 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.RefusalMiddleware"><code class="docutils literal notranslate"><span class="pre">RefusalMiddleware</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.mark_submitted"><code class="docutils literal notranslate"><span class="pre">mark_submitted()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.modalities_label"><code class="docutils literal notranslate"><span class="pre">modalities_label()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.require_prometheus_client"><code class="docutils literal notranslate"><span class="pre">require_prometheus_client()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.route_template"><code class="docutils literal notranslate"><span class="pre">route_template()</span></code></a></li>
 </ul>
   </nav></div>
 
