@@ -702,7 +702,10 @@ bit-identical to the reference’s input.</p>
 <p>libsndfile through <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> first; then, for a WAV file, a reader here
 that scales samples as libsndfile does, so a server without soundfile still
 decodes WAV exactly; then FFmpeg through <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> for the containers
-neither reads.</p>
+neither reads. The two library decoders stop just past
+<code class="docutils literal notranslate"><span class="pre">MAX_AUDIO_SECONDS</span></code> and refuse a longer file with
+<a class="reference internal" href="mstar.api_server.media_io.html#mstar.api_server.media_io.AudioTooLongError" title="mstar.api_server.media_io.AudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">AudioTooLongError</span></code></a>, whatever its header
+declares.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>

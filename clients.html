@@ -979,7 +979,10 @@ as is. <code class="docutils literal notranslate"><span class="pre">long_form=&q
 once, each cut at the quietest moment before its boundary. Segment timestamps
 are offset to the whole file. For Whisper, <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>
 (5 to 30) sets the window length for one request, and an upload longer than it
-is windowed.</p></li>
+is windowed. An upload, like any audio a request attaches, is refused once it
+decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
+worker). The decode up to that point still runs, so this bounds memory, not
+time: refusing a 31 min file takes about as long as decoding it.</p></li>
 <li><p><strong>Omnilingual ASR</strong> (<code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code>): no language code is needed for any of
 its 1,600+ languages, and <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">prompt</span></code> / <code class="docutils literal notranslate"><span class="pre">temperature</span></code> have no effect. A
 clip of up to 20 s is one request; a longer upload is cut into windows of about equal

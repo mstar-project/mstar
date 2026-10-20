@@ -309,7 +309,10 @@ Per-model notes:
   once, each cut at the quietest moment before its boundary. Segment timestamps
   are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
   (5 to 30) sets the window length for one request, and an upload longer than it
-  is windowed.
+  is windowed. An upload, like any audio a request attaches, is refused once it
+  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
+  worker). The decode up to that point still runs, so this bounds memory, not
+  time: refusing a 31 min file takes about as long as decoding it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal
