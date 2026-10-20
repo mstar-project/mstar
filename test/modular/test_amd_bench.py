@@ -111,6 +111,23 @@ def test_resume_refuses_another_chip(tmp_path):
             sweep.refuse_mixed_chips(mi325, now, tmp_path)
 
 
+def test_resume_of_part_of_a_table_keeps_the_rest(tmp_path):
+    table_ = tables.TABLES["qwen35-dense"]
+    prev = {"started": "t0", "rows": list(table_.rows), "arms": ["mstar", "vllm", "vllm-aiter", "sglang-aiter"],
+            "workloads": list(table_.workloads), "concurrency": {"text-chat-256": [1, 64]}, "gpus": [0, 1, 2, 4, 5, 6],
+            "lanes": 5, "numa": True, "resumed": [{"at": "t1", "job": "1"}]}
+    meta = {"started": "t2", "node": {"host": "k002-002"}, "job": "468005", "gpus": [0, 1, 4], "lanes": 2,
+            "numa": True, "driver": "/d", "rows": ["qwen3_5_4b", "qwen3_5_9b_tp2"], "arms": ["mstar", "mstar-tpasync"],
+            "workloads": ["text-chat-256"], "concurrency": {"text-chat-256": [1, 4]}}
+    out = sweep.resumed_meta(meta, prev, table_)
+    assert out["rows"] == list(table_.rows) and out["workloads"] == list(table_.workloads)
+    assert out["arms"] == ["mstar", "mstar-tpasync", "vllm", "vllm-aiter", "sglang-aiter"]
+    assert out["started"] == "t0" and out["gpus"] == [0, 1, 2, 4, 5, 6] and out["lanes"] == 5
+    assert out["concurrency"] == {"text-chat-256": [1, 4]}
+    assert [r["job"] for r in out["resumed"]] == ["1", "468005"]
+    assert out["resumed"][-1]["gpus"] == [0, 1, 4] and out["resumed"][-1]["lanes"] == 2
+
+
 def test_run_rows_shares_the_gpu_pool(monkeypatch):
     seen, lock = [], __import__("threading").Lock()
 
@@ -288,7 +305,9 @@ def test_table_render(tmp_path):
     meta = {"table": "qwen35-dense", "run_id": "x", "dry": False, "rows": ["qwen3_5_0.8b"],
             "arms": ["mstar", "vllm-aiter"], "workloads": ["text-chat-256"], "repeats": 3, "spread_limit": 0.05,
             "node": {"gpu_names": {"0": "AMD Instinct MI325X"}, "host": "h", "partition": "mi3258x"}, "gpus": [0],
-            "resumed": [{"at": "2026-10-19T09:00:00-0500", "host": "h", "job": "1"}]}
+            "resumed": [{"at": "2026-10-19T09:00:00-0500", "host": "h", "job": "1"},
+                        {"at": "2026-10-20T03:00:00-0500", "host": "h", "job": "2", "gpus": [0, 1, 4], "lanes": 2,
+                         "measured": ["qwen3_5_4b/mstar", "qwen3_5_9b_tp2/mstar-tpasync"]}]}
     run.mkdir()
     (run / "sweep.json").write_text(json.dumps(meta))
     (run / "health").mkdir()
@@ -329,7 +348,9 @@ def test_table_render(tmp_path):
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
     assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml |" in md
     assert "| client-bound rerun |" in md and md.count("client-bound") == 1
-    assert "resumed 2026-10-19T09:00:00-0500 on h (job 1)" in md and "node health check_resume1: PASS" in md
+    assert "resumed 2026-10-19T09:00:00-0500 on h (job 1); finished" in md and "node health check_resume1: PASS" in md
+    assert ("resumed 2026-10-20T03:00:00-0500 on h (job 2), GPUs [0, 1, 4], lanes 2; measured qwen3_5_4b/mstar, "
+            "qwen3_5_9b_tp2/mstar-tpasync; finished arms and cells kept") in md
     assert "  - NODE bare_metal: VM/SR-IOV slice (virt=none" in md
     assert "| ws-j-moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
     assert "PASS exact 30/32" in md and "output tokens/request 300 vs mstar 256" in md
