@@ -310,6 +310,19 @@ def test_an_unprepared_row_has_no_length():
     assert (batch.seq_len_of(0), batch.seq_len_of(1)) == (7, -1)
 
 
+def test_a_continuing_decode_row_is_estimated_at_one_token():
+    from mstar.model.bagel.submodules import LLMSubmodule as BagelLLM
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+    from mstar.model.qwen3_5.submodules import LLMSubmodule as QwenLLM
+
+    for cls, prompt_walk in ((QwenLLM, "prefill_text"), (OrpheusLLMSubmodule, "prefill"), (BagelLLM, "prefill_text")):
+        llm = object.__new__(cls)
+        assert llm.speculative_input_seq_len("decode", None, 40) == 1
+        # elsewhere the span in flight on this node, and nothing from another node
+        assert llm.speculative_input_seq_len(prompt_walk, None, 64) == 64
+        assert llm.speculative_input_seq_len(prompt_walk, None, -1) is None
+
+
 def test_final_keeps_only_the_last_chunk_and_holds_nothing_before():
     from mstar.model.submodule_base import ChunkedPrefillOutputMode, ChunkedPrefillOutputPolicy
 

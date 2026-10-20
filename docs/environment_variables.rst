@@ -430,14 +430,6 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
-   * - ``MSTAR_PRE_PLAN_PACKED``
-     - ``1``
-     - Also pre-plan a speculative step on a packed capture (a mixed or
-       prompt step), from its rows' spans measured before
-       ``prepare_inputs``: rows in hand from their inputs, rows continuing
-       from the step in flight from the submodule's
-       ``speculative_input_seq_len``. A step whose prepared spans differ is
-       planned inline. ``0`` plans every packed step inline.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads

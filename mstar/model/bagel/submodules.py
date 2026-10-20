@@ -969,22 +969,6 @@ class LLMSubmodule(ARNodeSubmodule):
             return 1
         return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
-    def declare_inputs_from_spans(self, graph_walk, spans, walks, infos):
-        # a text row declares its span, walk and guidance (as prepare_inputs
-        # stamps it); its ids only feed the sampler's prompt mask, which a
-        # pre-plan leaves alone, and only image rows carry custom positions
-        if graph_walk not in ("prefill_text", MIXED_TEXT):
-            return None
-        return [
-            ARNodeInputs(
-                input_seq_len=span, graph_walk=walk,
-                resource_step_info=(
-                    info.step_metadata.get("requires_cfg", False) if info is not None else False
-                ),
-            )
-            for span, walk, info in zip(spans, walks, infos, strict=True)
-        ]
-
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,

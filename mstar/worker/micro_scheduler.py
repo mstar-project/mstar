@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
-from mstar.model.submodule_base import InputMetadata, InputSeqLenInfo
+from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -812,14 +812,12 @@ class MicroScheduler:
         blocked = set()
         if backlogged is not None:
             waiting = self._waiting_rids(backlogged)
-            infos, tokens, chunks = self._measure_rows(
-                request_state, backlogged, waiting, max_tokens,
-            )
+            tokens, chunks = self._measure_rows(request_state, backlogged, waiting)
             # bounded by what this step could take, so a long backlog is not
             # swept in full on every pass. Not `remaining`: that is the
             # caller's own walk's leftover and is None when it holds no rows.
             blocked = self._unready_backlog_rids(
-                backlogged, request_state, waiting, infos,
+                backlogged, request_state, waiting,
                 self._scan_limit(node_walk, pre_existing_batch_size),
                 capture_group_of, only_walk, skip_walk,
             )
@@ -832,12 +830,8 @@ class MicroScheduler:
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
         if fresh:
-            # Measured for the chunk sizing below, not to gate admission: the
-            # has_room gate went with #364, so a row's length no longer makes
-            # it not-ready.
-            _, tokens, chunks = self._measure_rows(
-                request_state, fresh, max_tokens=max_tokens,
-            )
+            # measured for the chunk sizing below, not to gate admission
+            tokens, chunks = self._measure_rows(request_state, fresh)
             row_tokens.update(tokens)
             chunkable |= chunks
         if backlogged is None and not fresh:
@@ -964,12 +958,10 @@ class MicroScheduler:
 
     def _measure_rows(
         self, request_state: RequestStateManager, batch: ScheduledBatch,
-        skip: set[int] = frozenset(), max_tokens: int | None = None,
-    ) -> tuple[dict[int, InputSeqLenInfo], dict[int, int], set[int]]:
-        """For a node that reports row lengths: what each row of ``batch``
-        needs admitted for its next step, its remaining tokens, and the rows
-        that may be chunked. A chunkable row needs room for one step's budget,
-        not its whole input."""
+        skip: set[int] = frozenset(),
+    ) -> tuple[dict[int, int], set[int]]:
+        """For a node that reports row lengths: each row of ``batch``'s
+        remaining tokens, and the rows that may be chunked."""
         node = batch.node_name
         engine = self.engine_manager.get_engine(node)
         rids = [rid for rid in batch.request_to_worker_graph if rid not in skip]
@@ -978,28 +970,24 @@ class MicroScheduler:
             [rid for rid in rids if (rid, node) not in self.chunk_progress],
         )
         if lens is None:
-            return {}, {}, set()
-        infos: dict[int, InputSeqLenInfo] = {}
+            return {}, set()
         tokens: dict[int, int] = {}
         chunkable: set[int] = set()
         for rid in rids:
             walk = batch.walk_of(rid)
             progress = self.chunk_progress.get((rid, node))
             if progress is not None:
-                info = InputSeqLenInfo(progress.total - progress.done)
+                tokens[rid] = progress.total - progress.done
             else:
                 info = lens[rid]
                 if info is None:
                     continue
                 if info.cached_prefix:
                     self.cached_prefix[(rid, node)] = info.cached_prefix
-            tokens[rid] = info.seq_len
+                tokens[rid] = info.seq_len
             if engine.supports_chunked_prefill(node, walk):
                 chunkable.add(rid)
-                if max_tokens is not None and info.seq_len > max_tokens:
-                    info = InputSeqLenInfo(max(max_tokens, 1))
-            infos[rid] = info
-        return infos, tokens, chunkable
+        return tokens, chunkable
 
     def _waiting_rids(self, batch: ScheduledBatch) -> set[int]:
         """``batch``'s held (OOM backoff) and pending-remove rows."""
@@ -1011,13 +999,12 @@ class MicroScheduler:
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
-        waiting: set[int], lens: dict[int, Any],
+        waiting: set[int],
         max_bs: int | None = None, capture_group_of: int | None = None,
         only_walk: str | None = None, skip_walk: str | None = None,
     ) -> set[int]:
         """The rows of a backlogged ``batch`` that cannot run this step; failed
-        rows are dropped from it instead. One readiness check per row, with its
-        length from ``lens`` when the submodule reports one.
+        rows are dropped from it instead. One readiness check per row.
 
         ``waiting`` -- OOM backoff and pending remove -- is the caller's: those
         rows wait without asking the engine, as on the fresh path, since asking
@@ -1062,7 +1049,6 @@ class MicroScheduler:
             if not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
-                seq_len_info=lens.get(rid),
             ):
                 not_ready_rids.add(rid)
                 continue
@@ -1441,16 +1427,15 @@ class MicroScheduler:
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
-        allow_reload: bool=True, seq_len_info: Any | None = None,
+        allow_reload: bool=True,
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; a ``terminal`` reason never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
         engine = self.engine_manager.get_engine(node_name)
-        extra = {} if seq_len_info is None else {"seq_len_info": seq_len_info}
         outcome = engine.check_ready(
-            node_name, rid, fwd_info, allow_reload=allow_reload, **extra,
+            node_name, rid, fwd_info, allow_reload=allow_reload,
         )
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(

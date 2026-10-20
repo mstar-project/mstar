@@ -28,7 +28,6 @@ from mstar.engine.resources import (
     SubmoduleStep,
     topo_sort,
 )
-from mstar.model.submodule_base import InputSeqLenInfo
 
 
 class _Stub(Resource):
@@ -404,18 +403,6 @@ def test_admit_retrieve_short_circuits_on_failure():
     assert not outcome.ok
     assert isinstance(outcome.reason, AllocationFailed)
     assert sampler.calls == [], "the sweep stops at the first failure"
-
-
-def test_a_declared_length_does_not_gate_the_row():
-    """Admission is the admit path's job: a declared length is carried for
-    chunk sizing, and must not make a row not-ready on its own. The gate that
-    did used to deadlock decode, which held every page and so could never run
-    to free one."""
-    runner = StepRunner({"kv": _Stub("kv")})
-
-    for info in (InputSeqLenInfo(8), InputSeqLenInfo(10_000)):
-        outcome = runner.admit_retrieve("r1", "llm", "decode", None, info)
-        assert (outcome.ok, outcome.ready) == (True, True)
 
 
 def test_build_accelerator_graph_buffers_reaches_every_resource():

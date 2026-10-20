@@ -319,13 +319,8 @@ NO_CHUNKING = ChunkingPolicy()
 class InputSeqLenInfo(NamedTuple):
     """A row's token count before ``prepare_inputs``, for admission."""
     seq_len: int
-    # resource key -> tokens that resource reserves, when not ``seq_len``
-    resource_segment_lengths: dict[str, int] = {}
     # leading tokens the prefix cache already holds, not counted in ``seq_len``
     cached_prefix: int = 0
-
-    def get_admit_segment_len(self, resource: str) -> int:
-        return self.resource_segment_lengths.get(resource, self.seq_len)
 
 
 @dataclass
@@ -813,23 +808,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         that step, or -1 if it ran on another node. The default repeats the
         last span on this node and has no estimate otherwise; a walk that
         fixes its span (one token a decode step) should say so. Only an
-        estimate: a wrong one costs a pre-plan, and the prepared rows are
-        checked against it."""
+        estimate, which sizes the token budget left for the rows merged in
+        beside it."""
         del graph_walk, fwd_info
         return prev_seq_len if prev_seq_len >= 0 else None
-
-    def declare_inputs_from_spans(
-        self, graph_walk: str, spans: Sequence[int], walks: Sequence[str],
-        infos: Sequence[CurrentForwardPassInfo | None],
-    ) -> list[NodeInputs] | None:
-        """Rows of these spans and walks (and each row's forward info, None
-        for a padding row) to declare a packed step over before
-        ``prepare_inputs`` runs, so the step can be pre-planned; None when this
-        walk's ``declare_step`` reads more of a row than that (the step is then
-        planned inline). Built on the plan thread beside the step in flight,
-        so host-only: no device tensors."""
-        del graph_walk, spans, walks, infos
-        return None
 
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         """Loop-back input signals of this walk whose per-row value the node

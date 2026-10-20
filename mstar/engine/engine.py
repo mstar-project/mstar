@@ -91,9 +91,6 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # request on every step; in a decode loop nothing reads it until the loop
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
-# Pre-plan a speculative step on a packed capture from its rows' spans
-# measured ahead (see `Engine.measure_ahead_spans`); 0 plans those inline.
-_PRE_PLAN_PACKED = os.environ.get("MSTAR_PRE_PLAN_PACKED", "1") == "1"
 
 
 
@@ -292,11 +289,6 @@ class ExecutingBatch:
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
     preplanned_rids: tuple[int, ...] | None = None
-    # Each row's span as measured before ``prepare_inputs``, which is what lets
-    # a packed step lease and pre-plan; ``preplanned_spans`` is what the staged
-    # plan was built over, stale once the prepared rows disagree
-    ahead_spans: tuple[int, ...] | None = None
-    preplanned_spans: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -2399,7 +2391,7 @@ class Engine:
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
         policy = self.chunking_policy(node_name, graph_walk)
         if (
-            info is None or rid is None or info.resource_segment_lengths
+            info is None or rid is None
             or graph_walk not in self._keyed_walks.get(node_name, ())
             or not policy.chunkable
             or (policy.reuses_cached_prefix is not None
@@ -2418,7 +2410,6 @@ class Engine:
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
         allow_reload: bool = True,
-        seq_len_info: InputSeqLenInfo | None = None,
     ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
@@ -2441,7 +2432,6 @@ class Engine:
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
-            seq_len_info=seq_len_info,
         )
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
@@ -2452,9 +2442,8 @@ class Engine:
         lease unset, i.e. the step runs eager.
 
         A batch that hasn't been through ``prepare_inputs`` has no token count
-        yet, so only a batched capture can serve it (see
-        ``CudaGraphRunner.select_batched_bucket``), unless its rows' spans were
-        measured ahead (``ahead_spans``), which picks a packed one.
+        yet, so only a batched capture can serve it — see
+        ``CudaGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
@@ -2478,10 +2467,8 @@ class Engine:
             bs=len(batch.request_ids),
             slot=batch.slot,
             num_tokens=(
-                sum(inp.input_seq_len for inp in batch.inputs)
-                if batch.inputs is not None
-                else sum(batch.ahead_spans) if batch.ahead_spans is not None
-                else None
+                None if batch.inputs is None
+                else sum(inp.input_seq_len for inp in batch.inputs)
             ),
             cg_key_info=batch.cg_key_info,
         )
@@ -2503,19 +2490,6 @@ class Engine:
             return False
         return any(r.supports_preplan for r in mgmt.resources.values())
 
-    def wants_ahead_spans(self, node_name: str, graph_walk: str) -> bool:
-        """Whether a ``graph_walk`` step of this node can be pre-planned on a
-        packed capture once its rows' spans are measured ahead: the node
-        reports lengths before ``prepare_inputs`` and can declare from them."""
-        mgmt = self._submodules.get(node_name)
-        if not _PRE_PLAN_PACKED or mgmt is None or mgmt.cuda_graph_runner is None:
-            return False
-        return (
-            mgmt.cuda_graph_runner.packs_walk(graph_walk)
-            and self.declares_input_sequence_len(node_name)
-            and mgmt.submodule.declare_inputs_from_spans(graph_walk, (), (), ()) is not None
-        )
-
     def speculative_input_seq_len(
         self, node_name: str, graph_walk: str,
         fwd_info: CurrentForwardPassInfo | None, prev_seq_len: int,
@@ -2523,36 +2497,6 @@ class Engine:
         return self._submodules[node_name].submodule.speculative_input_seq_len(
             graph_walk, fwd_info, prev_seq_len,
         )
-
-    def measure_ahead_spans(
-        self, batch: ExecutingBatch, prev_seq_lens: Mapping[int, int],
-    ) -> None:
-        """Each row's span before ``prepare_inputs``; unset if any row has none.
-
-        A row with its inputs in hand is measured from them. A row continuing
-        from the step in flight (a key of ``prev_seq_lens``: its span there,
-        -1 from another node) has none yet, so its span is the submodule's
-        estimate (``speculative_input_seq_len``). A wrong one costs the
-        pre-plan, not correctness: ``settle_preplan`` drops a stage the
-        prepared spans do not match.
-        """
-        ctx = batch.step_context
-        submodule = self._submodules[batch.node_name].submodule
-        spans = []
-        for rid in batch.request_ids:
-            walk, info = ctx.walk_of(rid), batch.per_request_info[rid]
-            if rid in prev_seq_lens:
-                span = submodule.speculative_input_seq_len(walk, info, prev_seq_lens[rid])
-            else:
-                measured = submodule.get_input_sequence_len(
-                    walk, info, batch.per_request_input_tensors.get(rid, {}),
-                )
-                span = None if measured is None else measured.seq_len
-            if span is None:
-                batch.ahead_spans = None
-                return
-            spans.append(span)
-        batch.ahead_spans = tuple(spans)
 
     def pre_plan_for_batch(self, batch: ExecutingBatch) -> bool:
         """Admit and plan the pre-planning resources a step ahead.
@@ -2598,17 +2542,11 @@ class Engine:
 
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
-        spans = None
-        if batch.inputs is not None:
-            inputs = cg_runner.pad_inputs(lease, batch.inputs)
-        elif cg_runner.is_packed(lease):
-            # rows of the spans measured ahead; the padding rows run no tokens
-            inputs = self._ahead_inputs(batch, submodule_mgmt.submodule, lease)
-            if inputs is None:
-                return False
-            spans = batch.ahead_spans
-        else:
-            inputs = cg_runner.declare_inputs_for(lease)
+        inputs = (
+            cg_runner.declare_inputs_for(lease)
+            if batch.inputs is None
+            else cg_runner.pad_inputs(lease, batch.inputs)
+        )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
@@ -2623,10 +2561,6 @@ class Engine:
         if PHASE_PERIOD:
             phase_record("engine.pre_declare", perf_counter() - t0)
         if step is None:
-            return False
-        if spans is not None and step.cg_key_info != lease.bucket.cg_key_info:
-            # declared from spans, the step names another capture than the
-            # lease's: a plan staged here would not be the one exec replays
             return False
         if batch.inputs is not None or (
             not submodule_mgmt.piecewise_runners
@@ -2655,66 +2589,16 @@ class Engine:
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
-            batch.preplanned_spans = spans
         finally:
             batch.step_context.is_preplan = False
         return True
 
-    @staticmethod
-    def _ahead_inputs(
-        batch: ExecutingBatch, submodule: NodeSubmodule, lease: SlotLease,
-    ) -> list[NodeInputs] | None:
-        """The rows a packed step declares over before ``prepare_inputs``."""
-        spans = batch.ahead_spans
-        if spans is None or len(spans) != len(batch.request_ids):
-            return None
-        ctx = batch.step_context
-        walk = ctx.graph_walk
-        pad = lease.bucket.bs - len(spans)
-        row_walks = [ctx.walk_of(rid) for rid in batch.request_ids] if ctx.request_walks else [walk] * len(spans)
-        return submodule.declare_inputs_from_spans(
-            walk, (*spans, *(0,) * pad), (*row_walks, *(walk,) * pad),
-            (*(batch.per_request_info[rid] for rid in batch.request_ids), *(None,) * pad),
-        )
-
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
-        """Whether the staged plan no longer describes this batch: a row left
-        it, or (planned from spans measured ahead) a prepared row's span is
-        not the one planned, e.g. a cached prefix cut it."""
-        if batch.preplanned_rids is None:
-            return False
-        if batch.preplanned_rids != tuple(batch.request_ids):
-            return True
-        return batch.preplanned_spans is not None and batch.inputs is not None and (
-            batch.preplanned_spans != tuple(inp.input_seq_len for inp in batch.inputs)
+        """Whether the staged plan no longer describes this batch."""
+        return (
+            batch.preplanned_rids is not None
+            and batch.preplanned_rids != tuple(batch.request_ids)
         )
-
-    def settle_preplan(self, batch: ExecutingBatch) -> None:
-        """After ``prepare_inputs``: drop a stale pre-plan, and a packed lease
-        taken on spans measured ahead that the prepared rows no longer match,
-        so ``exec`` leases and plans for the rows it actually has."""
-        if self.preplan_is_stale(batch):
-            self.reset_pre_plan_for_batch(batch)
-        elif self._ahead_lease(batch) is not None and batch.inputs is not None and (
-            batch.ahead_spans != tuple(inp.input_seq_len for inp in batch.inputs)
-        ):
-            self._drop_ahead_lease(batch)
-
-    def _ahead_lease(self, batch: ExecutingBatch) -> SlotLease | None:
-        """The packed lease this batch took on spans measured ahead, if any."""
-        lease = batch.step_context.slot_lease
-        cg_runner = self._submodules[batch.node_name].cuda_graph_runner
-        if lease is None or cg_runner is None or batch.ahead_spans is None:
-            return None
-        return lease if cg_runner.is_packed(lease) else None
-
-    def _drop_ahead_lease(self, batch: ExecutingBatch) -> None:
-        lease = self._ahead_lease(batch)
-        if lease is None:
-            return
-        self._submodules[batch.node_name].cuda_graph_runner.release(lease, len(batch.request_ids))
-        batch.step_context.slot_lease = None
-        batch.step_context.force_prefill = False
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
         """Drop planned-ahead state, e.g. when its batch never dispatched.
@@ -2731,7 +2615,6 @@ class Engine:
                 mark(f"engine.preplan_discarded.{batch.node_name}")
             batch.preplan_event = None
             batch.preplanned_rids = None
-            batch.preplanned_spans = None
             # The step was declared over the rows the pre-plan saw: template
             # rows for an unprepared batch, or a request set that has since
             # lost rows to prepare_inputs (preplan_is_stale). Either way exec
@@ -2742,10 +2625,6 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].accelerator_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
-                if batch.ahead_spans is not None and cg_runner.is_packed(lease):
-                    # chosen for spans the batch may no longer have: exec leases anew
-                    batch.step_context.slot_lease = None
-                    batch.step_context.force_prefill = False
         # through the runner, so its record of the staged step goes too
         self._runner.clear_preplan()
 

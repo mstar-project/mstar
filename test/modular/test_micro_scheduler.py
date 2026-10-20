@@ -1647,8 +1647,7 @@ class _SizedEngine(_Engine):
         self.measured.append(len(inputs))
         return InputSeqLenInfo(len(inputs))
 
-    def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
-        del seq_len_info
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         if rid in self.unready:
             return FULL_ADMIT_NOT_READY
         return super().check_ready(node_name, rid, fwd_info, allow_reload)
