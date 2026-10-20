@@ -1138,6 +1138,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Resource.ingest_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">overrides</span><span class="p">:</span> <span class="n">ResourceReqConfig</span> <span class="o">|</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Must be idempotent: the conductor sends one NewRequest per partition,</span>
+<span class="sd">        so a worker serving several partitions of a request ingests it once</span>
+<span class="sd">        for each, possibly after a node has already run a step for it."""</span>
         <span class="k">return</span></div>
 
 

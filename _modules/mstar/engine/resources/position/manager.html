@@ -1100,7 +1100,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">overrides</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">del</span> <span class="n">overrides</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span></div>
+        <span class="c1"># setdefault: a worker serving two partitions ingests the rid twice</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span></div>
 
 
 <div class="viewcode-block" id="RopeManager.remove_request">

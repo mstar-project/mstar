@@ -1238,7 +1238,10 @@ earlier call already sized.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request">
 <span class="sig-name descname"><span class="pre">ingest_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overrides</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.ingest_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>Must be idempotent: the conductor sends one NewRequest per partition,
+so a worker serving several partitions of a request ingests it once
+for each, possibly after a node has already run a step for it.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
