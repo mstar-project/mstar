@@ -649,6 +649,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
@@ -662,6 +663,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.source"><code class="docutils literal notranslate"><span class="pre">DrainRequest.source</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.EnableMetrics"><code class="docutils literal notranslate"><span class="pre">EnableMetrics</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests"><code class="docutils literal notranslate"><span class="pre">FailRequests</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests.errors"><code class="docutils literal notranslate"><span class="pre">FailRequests.errors</span></code></a></li>
 </ul>
@@ -799,6 +801,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.DRAIN_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>
@@ -842,64 +845,67 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.DrainRequest" title="mstar.utils.ipc_format.DrainRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DrainRequest</span></code></a>(request_id, source)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.FailRequests" title="mstar.utils.ipc_format.FailRequests"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FailRequests</span></code></a>(errors)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.EnableMetrics" title="mstar.utils.ipc_format.EnableMetrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EnableMetrics</span></code></a>()</p></td>
+<td><p>Start the workers' histograms and counters.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.FailRequests" title="mstar.utils.ipc_format.FailRequests"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FailRequests</span></code></a>(errors)</p></td>
 <td><p>A worker reporting requests it can no longer serve.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageBody</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageBody</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageSource" title="mstar.utils.ipc_format.MessageSource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageSource</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageSource" title="mstar.utils.ipc_format.MessageSource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageSource</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequest" title="mstar.utils.ipc_format.NewRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequest</span></code></a>(request_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequest" title="mstar.utils.ipc_format.NewRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequest</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequestConductor" title="mstar.utils.ipc_format.NewRequestConductor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequestConductor</span></code></a>(request_id, ...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequestConductor" title="mstar.utils.ipc_format.NewRequestConductor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequestConductor</span></code></a>(request_id, ...[, ...])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OffloadDelta</span></code></a>([rids, is_offload])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OffloadDelta</span></code></a>([rids, is_offload])</p></td>
 <td><p>A rank's offloads and reloads, in the order it made them.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ReadsDone" title="mstar.utils.ipc_format.ReadsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReadsDone</span></code></a>(request_id, entity_id)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ReadsDone" title="mstar.utils.ipc_format.ReadsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReadsDone</span></code></a>(request_id, entity_id)</p></td>
 <td><p>An entity confirming it has no in-flight reads for a request and will start none — the conductor's gate before sending the hard RemoveRequest.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source, after_tp_seq)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source, after_tp_seq)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.SetupDone" title="mstar.utils.ipc_format.SetupDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SetupDone</span></code></a>(worker_id)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.SetupDone" title="mstar.utils.ipc_format.SetupDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SetupDone</span></code></a>(worker_id)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.Status" title="mstar.utils.ipc_format.Status"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Status</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.Status" title="mstar.utils.ipc_format.Status"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Status</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.StopLoops" title="mstar.utils.ipc_format.StopLoops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLoops</span></code></a>(request_id, loop_names, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.StopLoops" title="mstar.utils.ipc_format.StopLoops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLoops</span></code></a>(request_id, loop_names, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TPNoSpeculation" title="mstar.utils.ipc_format.TPNoSpeculation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a>(node_name, graph_walk, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TPNoSpeculation" title="mstar.utils.ipc_format.TPNoSpeculation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
 <td><p>A worker's engine metrics, sent once per status interval only while metrics are on: cumulative or current values per graph node or tensor edge, never per-request data.</p></td>
 </tr>
 </tbody>
@@ -952,6 +958,11 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST">
 <span class="sig-name descname"><span class="pre">ABORT_REQUEST</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'abort_request'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS">
+<span class="sig-name descname"><span class="pre">ENABLE_METRICS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'enable_metrics'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1008,6 +1019,17 @@
 <span class="sig-name descname"><span class="pre">source</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.utils.ipc_format.DrainRequest.source" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.EnableMetrics">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">EnableMetrics</span></span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#EnableMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.EnableMetrics" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>Start the workers’ histograms and counters. The API server sends it to
+the conductor after its warmup requests; the conductor forwards it to
+every worker (<code class="docutils literal notranslate"><span class="pre">WorkerMetrics.start_counting</span></code>).</p>
+<dl class="field-list simple">
+</dl>
 </dd></dl>
 
 <dl class="py class">
@@ -1755,6 +1777,11 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS">
+<span class="sig-name descname"><span class="pre">ENABLE_METRICS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'enable_metrics'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS">
 <span class="sig-name descname"><span class="pre">INPUT_SIGNALS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'input_signals'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1883,6 +1910,7 @@ edge, never per-request data.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
@@ -1896,6 +1924,7 @@ edge, never per-request data.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.source"><code class="docutils literal notranslate"><span class="pre">DrainRequest.source</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.EnableMetrics"><code class="docutils literal notranslate"><span class="pre">EnableMetrics</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests"><code class="docutils literal notranslate"><span class="pre">FailRequests</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests.errors"><code class="docutils literal notranslate"><span class="pre">FailRequests.errors</span></code></a></li>
 </ul>
@@ -2033,6 +2062,7 @@ edge, never per-request data.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.DRAIN_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>

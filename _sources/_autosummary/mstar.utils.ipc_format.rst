@@ -21,6 +21,7 @@ mstar.utils.ipc\_format
       ConductorMessage
       ConductorMessageType
       DrainRequest
+      EnableMetrics
       FailRequests
       InputSignals
       MessageBody

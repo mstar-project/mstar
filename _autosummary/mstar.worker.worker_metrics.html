@@ -641,6 +641,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.maybe_report"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.maybe_report()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.snapshot"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.snapshot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.start_counting"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.start_counting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.step_done"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.step_done()</span></code></a></li>
 </ul>
 </li>
@@ -663,6 +664,9 @@ per-request work), and the tensor manager records each edge it reads
 (<code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code>). Everything else is sampled at most once per status
 interval, when the worker sends the conductor one <code class="docutils literal notranslate"><span class="pre">WorkerStatus</span></code> with
 cumulative snapshots; the conductor forwards them to the API server.</p>
+<p>The gauges are live from worker start. The histograms and counters, and the
+transfers, start at <code class="docutils literal notranslate"><span class="pre">start_counting()</span></code>, which the API server triggers after
+its warmup requests, as it does for its own families.</p>
 <p>Engine families cover only the nodes this rank leads (<code class="docutils literal notranslate"><span class="pre">components</span></code>): the
 other ranks of a lockstep instance run the same steps over the same page
 counts. Transfers are every rank’s own reads (each reads its slice).
@@ -678,7 +682,7 @@ Recording never changes what any rank runs.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.WorkerMetrics">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -689,7 +693,7 @@ Recording never changes what any rank runs.</p>
 <li><p><strong>engine</strong> (<em>Engine</em>)</p></li>
 <li><p><strong>scheduler</strong> (<em>MicroScheduler</em>)</p></li>
 <li><p><strong>send</strong> (<em>Callable</em><em>[</em><em>[</em><a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><em>WorkerStatus</em></a><em>]</em><em>, </em><em>None</em><em>]</em>)</p></li>
-<li><p><strong>transfers</strong> (<a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><em>EdgeTransfers</em></a>)</p></li>
+<li><p><strong>enable_transfers</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><em>EdgeTransfers</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -711,6 +715,19 @@ Recording never changes what any rank runs.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.MetricSnapshot" title="mstar.observability.recorders.MetricSnapshot"><em>MetricSnapshot</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.WorkerMetrics.start_counting">
+<span class="sig-name descname"><span class="pre">start_counting</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics.start_counting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics.start_counting" title="Link to this definition">#</a></dt>
+<dd><p>Count the steps whose time starts from now on (see <code class="docutils literal notranslate"><span class="pre">step_done</span></code>),
+the prefix-cache lookups after this, and the tensors this rank reads
+from now on.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -791,6 +808,7 @@ not counted twice.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.maybe_report"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.maybe_report()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.snapshot"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.snapshot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.start_counting"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.start_counting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.step_done"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.step_done()</span></code></a></li>
 </ul>
 </li>

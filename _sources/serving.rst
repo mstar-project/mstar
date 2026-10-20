@@ -572,8 +572,9 @@ The engine workers also send the conductor their own metrics every second, which
 adds to its status message, so these can be up to two seconds old. ``component`` is the
 graph node; a node with replicas on several workers shows their sum, and the ranks of a
 tensor or sequence parallel instance count once (the instance's first rank reports).
-The histograms and counters count from worker start, warmup requests included, so read
-them with ``rate()`` or ``increase()``.
+The histograms and counters count from the first request after the warmup requests, as
+the API server's do (the gauges show the current state), so read them with ``rate()``
+or ``increase()``.
 
 - ``mstar_kv_pages_used{model_name, component, resource}``,
   ``mstar_kv_pages_total{model_name, component, resource}``: pages of each paged KV
@@ -629,9 +630,8 @@ Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_Z
 report the same series. A tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
-replicated, so an edge two ranks read is two reads. As above, the workers' counts include
-the warmup requests (the data worker counts from when metrics are enabled), so read them
-with ``rate()`` or ``increase()``.
+replicated, so an edge two ranks read is two reads. Like the data worker, the workers
+count from the first request after the warmup requests.
 
 Where a successful request's time went, from the timestamps every request already
 carries (same ``model_name`` and ``output_modalities`` labels; the conductor's

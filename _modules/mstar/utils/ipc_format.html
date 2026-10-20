@@ -984,7 +984,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">TENSOR_RECEIVED</span> <span class="o">=</span> <span class="s2">"tensor_received"</span>
     <span class="n">SCHEDULE_TP</span> <span class="o">=</span> <span class="s2">"schedule_tp"</span>
     <span class="n">STOP_LOOPS</span> <span class="o">=</span> <span class="s2">"stop_loops"</span>
-    <span class="n">TP_NO_SPEC</span> <span class="o">=</span> <span class="s2">"tp_no_spec"</span></div>
+    <span class="n">TP_NO_SPEC</span> <span class="o">=</span> <span class="s2">"tp_no_spec"</span>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
 
 
 
@@ -1225,7 +1226,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">ABORT_REQUEST</span> <span class="o">=</span> <span class="s2">"abort_request"</span>
     <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
     <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span>
-    <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span></div>
+    <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
 
 
 
@@ -1320,6 +1322,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    edge, never per-request data."""</span>
     <span class="n">worker_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">metrics</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MetricSnapshot</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="EnableMetrics">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.EnableMetrics">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EnableMetrics</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Start the workers' histograms and counters. The API server sends it to</span>
+<span class="sd">    the conductor after its warmup requests; the conductor forwards it to</span>
+<span class="sd">    every worker (``WorkerMetrics.start_counting``)."""</span></div>
 
 
 

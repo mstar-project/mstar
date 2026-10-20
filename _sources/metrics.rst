@@ -83,9 +83,11 @@ What is counted from when
 - **API server families count from the first request after warmup.** The server
   enables metrics after its warmup requests, so first-shape compile times stay out of
   the request latency histograms.
-- **Engine worker families, and the transfers workers read, count from worker start,
-  warmup included.** Their histograms and counters are cumulative from process start,
-  so read them with ``rate()`` or ``increase()`` rather than as absolute values.
+- **Engine worker histograms and counters, and the transfers workers read, count
+  from the same point.** When the API server enables its metrics it has the conductor
+  tell every worker, so a worker counts the steps whose time starts after that, and
+  the prefix-cache lookups and tensor reads after it. The gauges (KV pages, pending
+  steps) show the current state from worker start.
 - **Requests refused before submission** (a bad form, a missing API key, a body over
   the limit, a ``request_id`` already in flight) are counted only in
   ``mstar_http_refusals_total``. A request that was submitted and then failed is
