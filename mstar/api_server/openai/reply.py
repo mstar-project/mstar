@@ -1,6 +1,6 @@
 """A chat reply as protocol-neutral events, which each API writes in its own
-shape: chat completions (``serving_chat``) and Anthropic messages
-(``serving_messages``).
+shape: chat completions (``serving_chat``), Anthropic messages
+(``serving_messages``) and responses (``serving_responses``).
 
 ``reply_events`` reads a request's result chunks and yields, per batch the
 server hands out, a list of events:
@@ -37,6 +37,9 @@ class Usage:
     prompt: int = 0
     completion: int = 0
     stopped: bool = True
+    # of ``completion``, the tokens of the chunks that began inside the
+    # reasoning (the one that closes it too; under MTP a chunk can straddle)
+    reasoning: int = 0
 
     def add(self, chunk) -> None:
         meta = chunk.metadata or {}
@@ -176,6 +179,8 @@ async def _events(batches, parser, stops, usage):
             for c in batch:
                 if c.modality == "text":
                     usage.add(c)
+                    if parser is not None and parser.reasoning:
+                        usage.reasoning += (c.metadata or {}).get("tokens", 0)
                     piece = text.decode(c.data)
                     if not piece:
                         continue

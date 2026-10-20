@@ -18,6 +18,7 @@ from mstar.api_server.openai import (
     serving_images,
     serving_messages,
     serving_realtime,
+    serving_responses,
     serving_speech,
     serving_transcriptions,
     serving_videos,
@@ -137,6 +138,26 @@ async def messages(raw_request: Request):
 async def messages_count_tokens(raw_request: Request):
     return await _anthropic("supports_messages", raw_request, lambda api, name, adapter, body: (
         serving_messages.count_tokens(api, adapter, body)))
+
+
+@router.post("/v1/responses")
+async def responses(raw_request: Request):
+    """OpenAI's Responses API, stateless, on the chat path (see ``serving_responses``)."""
+    api, model_name, adapter, err = _resolve("supports_responses")
+    if err is not None:
+        return err
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        return _error(400, "the request body is not JSON")
+    try:
+        result = await serving_responses.create_response(api, model_name, adapter, body, raw_request)
+    except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+    if isinstance(result, dict):
+        return JSONResponse(result)
+    return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/v1/audio/speech")

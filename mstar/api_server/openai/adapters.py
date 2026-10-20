@@ -1184,8 +1184,10 @@ class GlmChatAdapter(TextChatAdapter):
     supports_messages = True
     supports_responses = True
 
-    def __init__(self, *, always_thinks: bool):
+    def __init__(self, *, always_thinks: bool, reasoning_efforts: tuple[str, ...]):
         self.always_thinks = always_thinks
+        # the template's reasoning_effort levels, least first; it reads any other as the last
+        self.reasoning_efforts = reasoning_efforts
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         # flatten_messages refuses a tool turn; the template takes each turn's role
@@ -1339,8 +1341,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
-    "glm52": GlmChatAdapter(always_thinks=False),
-    "glm5_next": GlmChatAdapter(always_thinks=True),
+    "glm52": GlmChatAdapter(always_thinks=False, reasoning_efforts=("high", "max")),
+    "glm5_next": GlmChatAdapter(always_thinks=True, reasoning_efforts=("low", "high", "max")),
 }
 
 # One key per size; every size takes the same adapter.

@@ -204,6 +204,11 @@ class GlmReplyParser:
         self._held_space = ""
 
     @property
+    def reasoning(self) -> bool:
+        """Whether the text read so far leaves the reply inside its reasoning."""
+        return self._state == "reasoning"
+
+    @property
     def finish_reason(self) -> str:
         return "tool_calls" if self._calls and not self._cut else "stop"
 
