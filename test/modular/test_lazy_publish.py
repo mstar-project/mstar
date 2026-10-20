@@ -261,3 +261,35 @@ def test_kv_snapshot_of_a_stream_reset_since_publishes_the_stream_as_it_stands()
     assert _seq(lazy).page_indices == _seq(live).page_indices
     assert _seq(lazy).reset_generation == _seq(live).reset_generation
     assert _seq(lazy).latest_kv_transfer_info == _seq(live).latest_kv_transfer_info
+
+
+class _WalkPublisher(Resource):
+    """Publishes the walk it was asked under, so a test can see which one."""
+
+    def __init__(self):
+        pass
+
+    def build(self, *args, **kwargs):
+        pass
+
+    def publish(self, request_id):
+        return None
+
+    def publish_for_step(self, request_id, node_name, graph_walk):
+        del node_name
+        return f"{request_id}@{graph_walk}"
+
+
+def test_a_mixed_step_publishes_each_row_under_its_own_walk_lazily_too():
+    """Under a combined walk the eager publish takes each row's own walk; the
+    snapshot and its finish must as well, or a publisher keyed on the walk
+    (BAGEL's per-(node, walk) KV labels) sees the combined label instead."""
+    runner = StepRunner({"pub": _WalkPublisher()})
+    walks = {"a": "prefill", "b": "decode", "c": "decode"}
+    kwargs = dict(node_name="LLM", graph_walk="mixed", request_walks=walks)
+    eager = runner.publish(["a", "b", "c"], **kwargs)
+    snaps = runner.publish_snapshot(["a", "b", "c"], **kwargs)
+    lazy = runner.publish_from_snapshots(snaps, ["a", "b", "c"], **kwargs)
+    assert lazy == eager == {
+        "a": {"pub": "a@prefill"}, "b": {"pub": "b@decode"}, "c": {"pub": "c@decode"},
+    }

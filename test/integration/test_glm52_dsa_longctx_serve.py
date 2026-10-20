@@ -7,7 +7,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_runner import autocast_scope
+from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
     AttnBackend,
     KVLayout,
@@ -279,8 +279,8 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert isinstance(submodule, Glm52LLMSubmodule)
     # Long-context serving is eager-only (host-side DSA upkeep would not
     # replay inside a captured graph): neither whole-forward nor piecewise.
-    assert submodule.get_cuda_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_cuda_graph_configs(DEVICE, DTYPE) == {}
+    assert submodule.get_accelerator_graph_configs(DEVICE) == []
+    assert submodule.get_piecewise_accelerator_graph_configs(DEVICE, DTYPE) == {}
     # The absorbed declaration: one latent row per token, the MLA resource
     # planned over it (its torch fallback at reduced dims).
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}

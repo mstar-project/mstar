@@ -155,7 +155,7 @@ def test_code_predictor_decode_attention_matches_sdpa(cache_len: int):
 
 
 def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
-    tensors = model.process_prompt(
+    result = model.process_prompt(
         "Testing Qwen three TTS.",
         input_modalities=["text"],
         output_modalities=["audio"],
@@ -165,9 +165,10 @@ def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     prepared = talker.prepare_inputs(
         "talker_prefill",
         # rid_handle, not request_id: the talker keys its per-request
-        # state by the worker-local handle.
-        SimpleNamespace(request_id="integration-prefill", rid_handle=0),
-        tensors,
+        # state by the worker-local handle. The layout and tags arrive as
+        # step metadata.
+        SimpleNamespace(request_id="integration-prefill", rid_handle=0, step_metadata=result.metadata),
+        result.new_input_tensors,
     )
 
     assert prepared.input_embeds.ndim == 2

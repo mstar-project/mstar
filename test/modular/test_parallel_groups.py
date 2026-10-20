@@ -12,6 +12,9 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 sys.path.insert(0, ".")
 
 from mstar.distributed.communication import (
@@ -168,3 +171,86 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     assert not worker_view.all_have_compatible_parallel_shape(
         {"llm", "llm_cfg"}
     )
+
+
+@pytest.mark.parametrize(
+    ("device_type", "device_backend", "expected_backend"),
+    [
+        ("cpu", "gloo", "gloo"),
+        ("cuda", "nccl", "nccl"),
+        ("xpu", "xccl", "cpu:gloo,xpu:xccl"),
+    ],
+)
+def test_init_dist_uses_mixed_groups_only_on_xpu(
+    monkeypatch, device_type, device_backend, expected_backend,
+):
+    from mstar.distributed import communication
+
+    groups = WorkerParallelGroups(
+        num_workers=4, global_rank=0, any_parallelism=True,
+        world_parallel_groups=[(0, 1), (2, 3)],
+    )
+    tp = _tp([0, 1])
+    sp = _tp([0, 1])
+    groups.add("llm", tp)
+    groups.add("llm_cfg", tp)
+    groups.add_sp("llm", sp)
+    singleton = CommGroup.trivial()
+    groups.add("codec", singleton)
+    calls = []
+    handles = {}
+    devices = []
+    store = object()
+    store_calls = []
+
+    def create_store(init_method, rank, world_size, timeout):
+        store_calls.append((init_method, rank, world_size, timeout))
+        return store
+
+    monkeypatch.setattr(communication, "rendezvous_store", create_store)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", devices.append)
+    monkeypatch.setattr(
+        communication.dist, "get_default_backend_for_device", lambda device: device_backend,
+    )
+    monkeypatch.setattr(
+        communication.dist, "init_process_group", lambda **kwargs: calls.append(kwargs),
+    )
+
+    def new_group(ranks, **kwargs):
+        calls.append((tuple(ranks), kwargs))
+        key = (tuple(ranks), kwargs.get("backend"))
+        handles[key] = object()
+        return handles[key]
+
+    monkeypatch.setattr(communication.dist, "new_group", new_group)
+    device = torch.device(device_type, 0) if device_type != "cpu" else torch.device("cpu")
+    groups.init_dist(init_method="test://world", device=device)
+    timeout = communication.default_group_timeout(expected_backend)
+    assert store_calls == [("test://world", 0, 4, timeout)]
+
+    expected_group_calls = []
+    for ranks in ((0, 1), (2, 3)):
+        expected_group_calls.append((ranks, {}))
+        if device_type != "xpu":
+            expected_group_calls.append((
+                ranks, {"backend": "gloo", "use_local_synchronization": True},
+            ))
+    assert calls == [
+        {
+            "backend": expected_backend, "store": store, "timeout": timeout,
+            "world_size": 4, "rank": 0,
+            "device_id": device,
+        },
+        *expected_group_calls,
+    ]
+    assert devices == ([] if device_type == "cpu" else [device])
+    for group in (tp, sp):
+        assert group.initialized
+        assert group.device_group is handles[((0, 1), None)]
+        if device_type == "xpu":
+            assert group.cpu_group is group.device_group
+        else:
+            assert group.cpu_group is handles[((0, 1), "gloo")]
+            assert group.cpu_group is not group.device_group
+    assert singleton.initialized
+    assert singleton.device_group is None

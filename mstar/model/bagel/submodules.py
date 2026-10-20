@@ -13,12 +13,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -34,11 +34,12 @@ from mstar.model.bagel.components.modeling_utils import (
     vllm_vit_resize,
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
-from mstar.model.bagel.config import BagelModelConfig
+from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -86,7 +87,7 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     off every walk is just "main". ``image_gen_cfg`` is the parallel variant,
     where each LLM node owns exactly one branch.
     """
-    if graph_walk in {"prefill_text", "decode"}:
+    if graph_walk in {"prefill_text", "decode", MIXED_TEXT}:
         if cfg:
             return ["main", "cfg_img"]
     elif graph_walk == "image_gen":
@@ -95,6 +96,33 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     elif graph_walk == "image_gen_cfg":
         return [NODE_TO_CFG_LABEL.get(node_name, "main")]
     return ["main"]
+
+
+# Shared at module level so `vit_patches` counts with the same resizes `prepare_inputs` runs.
+_VAE_TRANSFORM = ImageTransform(1024, 512, 16)
+_VIT_TRANSFORM = ImageTransform(980, 224, 14)
+# An image block is its patches between two sentinels, and occupies one position
+# regardless of token count. The walks and the prefix layout both read these.
+IMAGE_SENTINELS = 2
+IMAGE_ADVANCE = 1
+
+
+def vit_preprocess(image_preprocess: str | None) -> str:
+    """The name of the resize the ViT applies for a request's ``image_preprocess``.
+    Any name but "vllm" means the default."""
+    return "vllm" if image_preprocess == "vllm" else "default"
+
+
+def vit_patches(
+    height: int, width: int, image_preprocess: str,
+    patch_size: int, max_num_patches_per_side: int,
+) -> int:
+    """How many patches the ViT cuts an image of this size into. Its ``prepare_inputs`` asserts the same count."""
+    if image_preprocess == "vllm":
+        return max_num_patches_per_side ** 2
+    height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+    height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
+    return (height // patch_size) * (width // patch_size)
 
 
 class ViTEncoderSubmodule(NodeSubmodule):
@@ -113,6 +141,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         vit_pos_embed: nn.Module,
         vit_patch_size: int,
         vit_max_num_patch_per_side: int,
+        accelerator_graph: bool = False,
     ):
         super().__init__()
         self.vit_model = vit_model
@@ -121,23 +150,25 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
-        self.transform = ImageTransform(980, 224, 14)
-        self.vae_transform = ImageTransform(1024, 512, 16)
+        self.transform = _VIT_TRANSFORM
+        self.vae_transform = _VAE_TRANSFORM
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
         # CUDA-graph capture of the ViT block loop, over the engine's ragged
         # attention resource. Off by default: capture costs one graph per
         # (bs, token bucket) and the eager flash-attn path is already fast;
         # the win is removing per-layer launch overhead on small images.
-        self._cuda_graph_enabled = os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
-        self._cg_token_buckets = [
+        self._accelerator_graph_enabled = (
+            accelerator_graph and os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH", "0") == "1"
+        )
+        self._accelerator_graph_token_buckets = [
             int(t) for t in os.environ.get(
-                "MSTAR_VIT_CG_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
+                "MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
             ).split(",") if t.strip()
         ]  # 4900 == 70*70, the exact length the "vllm" preprocess option emits
-        self._cg_batch_sizes = [
+        self._accelerator_graph_batch_sizes = [
             int(b) for b in
-            os.environ.get("MSTAR_VIT_CG_BATCH_SIZES", "1,2,4").split(",")
+            os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "1,2,4").split(",")
             if b.strip()
         ] if self._vit_batching else [1]
         # `prepare_inputs` emits exactly one varlen segment (one image) per
@@ -154,7 +185,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         image_inputs = inputs["image_inputs"]
 
-        image_preprocess = fwd_info.step_metadata.get("image_preprocess", "default")
+        image_preprocess = vit_preprocess(fwd_info.step_metadata.get("image_preprocess"))
         if image_preprocess == "vllm":
             # vllm-omni parity: SiglipImageProcessor resizes to a fixed square
             # (size = max_num_patch_per_side * patch_size, e.g. 70*14=980),
@@ -179,6 +210,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
         # (C, H, W), so its .shape[0] is the channel count, not the patch
         # count flashattn / cu_seqlens needs.
         num_tokens = pixel_values.shape[0]
+        assert num_tokens == vit_patches(
+            *image_inputs[0].shape[-2:], image_preprocess,
+            self.vit_patch_size, self.vit_max_num_patch_per_side,
+        ), (
+            f"the ViT cut a {tuple(image_inputs[0].shape[-2:])} image into {num_tokens} patches, "
+            "not the count `vit_patches` gives a layout to key it by"
+        )
 
         cu_seqlens = torch.tensor(
             [0, num_tokens], dtype=torch.int32, device=device
@@ -220,13 +258,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
         features = features + self.vit_pos_embed(packed_position_ids)
         return {"img_emb": [features]}
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Capture the ViT block loop, leaving patch-embed and the RoPE gathers
         eager — they are data-dependent indexing with no business in a graph."""
-        if not self._cuda_graph_enabled:
+        if not self._accelerator_graph_enabled:
             return {}
         vit_config = self.vit_model.vision_model.config
         hidden = vit_config.hidden_size
@@ -265,8 +303,8 @@ class ViTEncoderSubmodule(NodeSubmodule):
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
-                total_tokens=sorted(self._cg_token_buckets),
-                capture_batch_sizes=sorted(self._cg_batch_sizes),
+                total_tokens=sorted(self._accelerator_graph_token_buckets),
+                capture_batch_sizes=sorted(self._accelerator_graph_batch_sizes),
             )
         }
 
@@ -666,13 +704,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _sample_per_request(
         self, request_ids: list[str], logits: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        """The batched forward's output shape: rid -> that rid's outputs."""
-        tokens = self._sample_tokens(request_ids, logits)
-        return {
-            rid: {"new_token": [token]}
-            for rid, token in zip(request_ids, tokens.split(1), strict=True)
-        }
+    ) -> BatchedModelOutput:
+        """The batched forward's output: row i of ``new_token`` is request i."""
+        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(request_ids, logits)})
 
     def __init__(
         self,
@@ -742,11 +776,12 @@ class LLMSubmodule(ARNodeSubmodule):
         return tensor_inputs
 
     PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # past 4 for mixed_text, whose decode rows ride in these captures
+    PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BatchedCudaGraphConfig | PackedCudaGraphConfig]:
+    ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
         """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
@@ -759,13 +794,15 @@ class LLMSubmodule(ARNodeSubmodule):
         unaffected (they don't depend on this capture's snapshot
         semantics).
         """
+        if not self.config.accelerator_graph:
+            return []
 
         # `additional_key_info` carries what `requires_cfg` / `labels` used to:
         # the cfg-on and cfg-off decodes declare different segments, so they
         # are different capture buckets. `declare_step` stamps the same value
         # on the step (`cg_key_info`) so a replay lands on its own bucket.
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
@@ -773,7 +810,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     input_seq_len=1
                 ),
             ),
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -782,9 +819,10 @@ class LLMSubmodule(ARNodeSubmodule):
                     resource_step_info=True, # requires cfg
                 ),
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text"],
+                # decode rows of a mixed step are one-token segments
+                replay_graph_walks=["prefill_text", MIXED_TEXT],
                 capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -840,7 +878,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
             node_inputs.input_embeds = self._wrap_with_boi_eoi(inputs["img_emb"][0])
-            seq_len = node_inputs.input_embeds.shape[0]
+            seq_len = inputs["img_emb"][0].shape[0] + IMAGE_SENTINELS
             node_inputs.input_seq_len = seq_len
 
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
@@ -955,8 +993,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
         if graph_walk in ("prefill_vit", "prefill_vae"):
-            # An image block occupies one position regardless of token count.
-            pos_advance = (1,) * len(segments)
+            pos_advance = (IMAGE_ADVANCE,) * len(segments)
         elif not writes:
             # Flow matching: the caches are frozen and every iteration puts the
             # latents at the same position, so the counters must not move.
@@ -970,10 +1007,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
+        fork_rids = None
+        row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
-            if graph_walk == "prefill_text":
+            if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
-                # anything plans or writes.
+                # anything plans or writes: the prompt rows only, not a
+                # decode row sharing the step
+                fork_rids = frozenset(
+                    rid for rid, walk in zip(request_ids, row_walks, strict=True)
+                    if walk == "prefill_text"
+                )
                 pre_forks = (("main", "cfg_text"),)
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
@@ -983,21 +1027,24 @@ class LLMSubmodule(ARNodeSubmodule):
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
         steps: dict = {}
-        # the prefill rows whose token `postprocess` keeps
+        # the rows whose token `postprocess` keeps
         info = per_request_info or {}
         kept_rids = frozenset(
-            rid for rid in request_ids
-            if rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
-        ) if graph_walk in {"prefill_text", "prefill_vit"} else None
-        if graph_walk == "prefill_text":
+            rid for rid, walk in zip(request_ids, row_walks, strict=True)
+            if walk == "decode" or (
+                rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
+            )
+        ) if graph_walk in {"prefill_text", "prefill_vit", MIXED_TEXT} else None
+
+        if graph_walk in ("prefill_text", MIXED_TEXT):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
             steps["sampler"] = SamplerStep(
                 prefill_tracked_tokens={
                     rid: inp.input_ids
-                    for rid, inp in zip(request_ids, inputs, strict=True)
-                    if inp.input_ids is not None
+                    for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+                    if inp.input_ids is not None and walk == "prefill_text"
                 },
                 kept_rids=kept_rids,
             )
@@ -1014,10 +1061,11 @@ class LLMSubmodule(ARNodeSubmodule):
                 commit=writes,
                 pre_forks=pre_forks,
                 post_forks=post_forks,
+                fork_rids=fork_rids,
             ),
             "attn": AttentionStep(
                 segments=segments,
-                causal=graph_walk in ("prefill_text", "decode"),
+                causal=graph_walk in ("prefill_text", "decode", MIXED_TEXT),
             ),
             "rope": PositionStep(
                 segments=segments,
@@ -1489,7 +1537,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
             )
-        elif graph_walk == "prefill_text":
+        elif graph_walk in ("prefill_text", MIXED_TEXT):
             out = self._forward_prefill_text(
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
@@ -1567,7 +1615,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
+        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit", MIXED_TEXT]
 
     def postprocess(
         self, request_id: str,
