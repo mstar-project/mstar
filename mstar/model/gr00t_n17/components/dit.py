@@ -33,6 +33,13 @@ from mstar.model.gr00t_n17.config import (
 # handed, and a fresh one per step retraces that frame every step.
 _SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 
+# Every span a block can ask for. A label outside this set reaches no block, so
+# without the check below a misspelt key would leave that span on SDPA --
+# bitwise identical to passing nothing, off the planned resource and off the
+# kernel a captured graph recorded. The engine side raises for an unplanned
+# label; this makes our side raise too (C07 QA).
+_SPANS = frozenset({SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
+
 # Every LayerNorm in the DT is non-affine, and the checkpoint says so: `norm1`
 # carries only its `linear`, and `norm3` carries no tensor at all.
 _NORM_EPS = 1e-5
@@ -305,6 +312,12 @@ class DiT(nn.Module):
         cross block read all of them, which is the reference's plain
         ``DiT.forward`` -- the unmasked case C06 measured against.
         """
+        if attends is not None and not attends.keys() <= _SPANS:
+            raise ValueError(
+                f"the DT has no span {sorted(attends.keys() - _SPANS)}; it reads "
+                f"{sorted(_SPANS)}. The node that binds the resources names the "
+                "spans it declared in its step."
+            )
         temb = self.timestep_encoder(timestep)
         # the reference makes both contiguous here, and it is load-bearing:
         # non-contiguous rows take a different GEMM path and move the output by
