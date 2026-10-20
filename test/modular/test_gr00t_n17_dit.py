@@ -2005,6 +2005,34 @@ def test_each_block_is_handed_the_attention_its_own_span_asked_for():
 
 
 @torch.no_grad()
+def test_a_span_label_no_block_reads_is_refused_rather_than_ignored():
+    """A misspelt span key used to be indistinguishable from passing nothing.
+
+    ``attends`` is a mapping, so an unknown key reaches no block and that span quietly
+    falls back to SDPA -- bitwise identical to ``attends=None``, but off the resource the
+    node planned and off the kernel a captured graph recorded. The engine side already
+    raises for an unplanned label (``ragged attention has no plan for label ...``); this
+    is the matching refusal on ours. Found by C07's blind QA, which measured the typo
+    case as bitwise equal to the fallback.
+
+    If this fails, a deployment can serve a span on the wrong kernel and look correct.
+    """
+    dit = _dit(2)
+    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
+    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
+    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
+    timestep = _steps()
+
+    with pytest.raises(ValueError, match=r"no span \['vl_txt'\]"):
+        dit(hidden, text, image, timestep, {"vl_txt": _sdpa})
+    # the message names the spans the caller could have meant, and who supplies them
+    with pytest.raises(ValueError, match="names the spans it declared"):
+        dit(hidden, text, image, timestep, {SA_SPAN: _sdpa, "sa_rows": _sdpa})
+    # a subset is still legal: that is the documented fallback, not a mistake
+    dit(hidden, text, image, timestep, {SA_SPAN: _sdpa})
+
+
+@torch.no_grad()
 def test_a_span_with_no_attention_of_its_own_is_read_with_sdpa():
     """The fallback, which is how the parity backend runs and how a deployment that declares
     no ragged resource still serves. Three readings of ``attends`` have to agree: ``None``, an
