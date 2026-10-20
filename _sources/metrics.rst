@@ -379,6 +379,11 @@ JSON placed in ``examples/observability/grafana/dashboards/``. Its README covers
 the containers reach the host on Linux, a server on another port, and the optional
 anonymous viewer.
 
+The ``M* serving`` dashboard there (``mstar.json``) has a panel for every family on
+this page, in one row per component: requests, request stages and output, data worker,
+conductor, engine workers, tensor transport and HTTP refusals. Its ``model`` variable
+picks the ``model_name`` values to show.
+
 To scrape from an existing Prometheus, add a job for the server's address:
 
 .. code-block:: yaml

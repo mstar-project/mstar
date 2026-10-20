@@ -1006,6 +1006,10 @@ docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> 
 JSON placed in <code class="docutils literal notranslate"><span class="pre">examples/observability/grafana/dashboards/</span></code>. Its README covers how
 the containers reach the host on Linux, a server on another port, and the optional
 anonymous viewer.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">M*</span> <span class="pre">serving</span></code> dashboard there (<code class="docutils literal notranslate"><span class="pre">mstar.json</span></code>) has a panel for every family on
+this page, in one row per component: requests, request stages and output, data worker,
+conductor, engine workers, tensor transport and HTTP refusals. Its <code class="docutils literal notranslate"><span class="pre">model</span></code> variable
+picks the <code class="docutils literal notranslate"><span class="pre">model_name</span></code> values to show.</p>
 <p>To scrape from an existing Prometheus, add a job for the server’s address:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">scrape_configs</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mstar</span>
