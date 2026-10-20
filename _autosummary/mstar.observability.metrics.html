@@ -636,6 +636,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>
 </ul>
 </li>
@@ -743,6 +744,24 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.observability.metrics.ServingMetrics.record_chunk">
+<span class="sig-name descname"><span class="pre">record_chunk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">modality</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metadata</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#ServingMetrics.record_chunk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.ServingMetrics.record_chunk" title="Link to this definition">#</a></dt>
+<dd><p>Count one result chunk that reached the API server (not an error chunk).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>modality</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>data</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+<li><p><strong>metadata</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.observability.metrics.ServingMetrics.render">
 <span class="sig-name descname"><span class="pre">render</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/observability/metrics.html#ServingMetrics.render"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.observability.metrics.ServingMetrics.render" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -830,6 +849,7 @@ unread. <code class="docutils literal notranslate"><span class="pre">timeout</sp
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.OUTCOMES"><code class="docutils literal notranslate"><span class="pre">OUTCOMES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics"><code class="docutils literal notranslate"><span class="pre">ServingMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.record_chunk"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.record_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.observability.metrics.ServingMetrics.render"><code class="docutils literal notranslate"><span class="pre">ServingMetrics.render()</span></code></a></li>
 </ul>
 </li>

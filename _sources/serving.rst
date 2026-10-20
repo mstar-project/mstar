@@ -533,6 +533,32 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   reaching the API server. It is measured on the server, so it does not include the
   network to the client, and a non-streaming client sees nothing until the end.
 
+Where a successful request's time went, from the timestamps every request already
+carries (same ``model_name`` and ``output_modalities`` labels; the conductor's
+timestamps are compared with the API server's, which assumes both run on one host, as
+they do today):
+
+- ``mstar_request_preprocess_seconds``: histogram, from submission to the data worker
+  handing the preprocessed request to the conductor, including its wait in the data
+  worker's queue.
+- ``mstar_request_engine_seconds``: histogram, from the conductor taking the request in
+  to the conductor finishing it.
+- ``mstar_request_delivery_seconds``: histogram, from the conductor finishing the
+  request to the result leaving the API server (the last chunks' postprocessing and
+  transfer, and the client handler picking it up).
+
+Output, per output modality (``modality`` is the chunk's modality, e.g. ``audio``):
+
+- ``mstar_output_chunks_total{model_name, modality}`` and
+  ``mstar_output_bytes_total{model_name, modality}``: counters of the result chunks (and
+  their bytes) that reached the API server, for every request whatever its outcome;
+  error chunks are not counted.
+- ``mstar_output_audio_seconds_total{model_name}``: counter, seconds of audio in those
+  chunks (16-bit PCM at the chunk's sample rate and channel count).
+- ``mstar_time_to_first_chunk_seconds{model_name, modality}``: histogram over
+  successful requests, from submission to the first chunk of each output modality
+  reaching the API server (time to first audio, first image, first video frame).
+
 .. code-block:: bash
 
    mstar serve kokoro --enable-metrics

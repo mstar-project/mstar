@@ -1212,6 +1212,32 @@ successful requests, from submission to the first result chunk of any modality
 reaching the API server. It is measured on the server, so it does not include the
 network to the client, and a non-streaming client sees nothing until the end.</p></li>
 </ul>
+<p>Where a successful request’s time went, from the timestamps every request already
+carries (same <code class="docutils literal notranslate"><span class="pre">model_name</span></code> and <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> labels; the conductor’s
+timestamps are compared with the API server’s, which assumes both run on one host, as
+they do today):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds</span></code>: histogram, from submission to the data worker
+handing the preprocessed request to the conductor, including its wait in the data
+worker’s queue.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_engine_seconds</span></code>: histogram, from the conductor taking the request in
+to the conductor finishing it.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_delivery_seconds</span></code>: histogram, from the conductor finishing the
+request to the result leaving the API server (the last chunks’ postprocessing and
+transfer, and the client handler picking it up).</p></li>
+</ul>
+<p>Output, per output modality (<code class="docutils literal notranslate"><span class="pre">modality</span></code> is the chunk’s modality, e.g. <code class="docutils literal notranslate"><span class="pre">audio</span></code>):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_output_chunks_total{model_name,</span> <span class="pre">modality}</span></code> and
+<code class="docutils literal notranslate"><span class="pre">mstar_output_bytes_total{model_name,</span> <span class="pre">modality}</span></code>: counters of the result chunks (and
+their bytes) that reached the API server, for every request whatever its outcome;
+error chunks are not counted.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_output_audio_seconds_total{model_name}</span></code>: counter, seconds of audio in those
+chunks (16-bit PCM at the chunk’s sample rate and channel count).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_time_to_first_chunk_seconds{model_name,</span> <span class="pre">modality}</span></code>: histogram over
+successful requests, from submission to the first chunk of each output modality
+reaching the API server (time to first audio, first image, first video frame).</p></li>
+</ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>kokoro<span class="w"> </span>--enable-metrics
 curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s1">'^mstar_'</span>
 </pre></div>

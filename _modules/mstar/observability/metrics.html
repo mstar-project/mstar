@@ -944,7 +944,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="k">try</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">prometheus_client</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -985,6 +985,14 @@ window.runMermaid = runMermaid;</script>
     <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.25</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.75</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.5</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">,</span> <span class="mf">3.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">,</span> <span class="mf">7.5</span><span class="p">,</span> <span class="mf">10.0</span><span class="p">,</span>
     <span class="mf">15.0</span><span class="p">,</span> <span class="mf">20.0</span><span class="p">,</span> <span class="mf">30.0</span><span class="p">,</span> <span class="mf">60.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">300.0</span><span class="p">,</span> <span class="mf">600.0</span><span class="p">,</span> <span class="mf">1200.0</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="c1"># Preprocess and delivery: under a millisecond for a short text prompt, up to</span>
+<span class="c1"># seconds for a long video upload or a large final payload.</span>
+<span class="n">STAGE_BUCKETS</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="mf">0.0005</span><span class="p">,</span> <span class="mf">0.001</span><span class="p">,</span> <span class="mf">0.0025</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">,</span> <span class="mf">0.025</span><span class="p">,</span> <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.25</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span>
+    <span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.5</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">,</span> <span class="mf">10.0</span><span class="p">,</span> <span class="mf">30.0</span><span class="p">,</span> <span class="mf">60.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">300.0</span><span class="p">,</span> <span class="mf">600.0</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="c1"># 16-bit PCM: the data worker emits audio as headerless s16le.</span>
+<span class="n">_AUDIO_BYTES_PER_SAMPLE</span> <span class="o">=</span> <span class="mi">2</span>
 
 
 <div class="viewcode-block" id="require_prometheus_client">
@@ -1022,6 +1030,17 @@ window.runMermaid = runMermaid;</script>
         <span class="k">yield</span> <span class="n">family</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_RequestSeries</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One output-modality set's labeled series, looked up once: a</span>
+<span class="sd">    ``labels()`` call costs about as much as the observation itself."""</span>
+    <span class="n">outcomes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
+    <span class="n">e2e</span><span class="p">:</span> <span class="n">Any</span>
+    <span class="n">first_output</span><span class="p">:</span> <span class="n">Any</span>
+    <span class="n">preprocess</span><span class="p">:</span> <span class="n">Any</span>
+    <span class="n">engine</span><span class="p">:</span> <span class="n">Any</span>
+    <span class="n">delivery</span><span class="p">:</span> <span class="n">Any</span>
+
+
 <div class="viewcode-block" id="ServingMetrics">
 <a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ServingMetrics</span><span class="p">:</span>
@@ -1054,29 +1073,122 @@ window.runMermaid = runMermaid;</script>
             <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">_InFlight</span><span class="p">(</span><span class="n">model_name</span><span class="p">,</span> <span class="n">in_flight</span><span class="p">))</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_seen_modalities</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+
+        <span class="c1"># Where a successful request's time went, from the timestamps it</span>
+        <span class="c1"># carries. The conductor's perf_counter is compared with this</span>
+        <span class="c1"># process's: both read the host's monotonic clock.</span>
+        <span class="n">stages</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="s2">"output_modalities"</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">preprocess_latency</span> <span class="o">=</span> <span class="n">Histogram</span><span class="p">(</span>
+            <span class="s2">"mstar_request_preprocess_seconds"</span><span class="p">,</span>
+            <span class="s2">"Successful requests: submission to the data worker handing the "</span>
+            <span class="s2">"request to the conductor, including its wait in the data worker's queue."</span><span class="p">,</span>
+            <span class="n">stages</span><span class="p">,</span> <span class="n">buckets</span><span class="o">=</span><span class="n">STAGE_BUCKETS</span><span class="p">,</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">engine_latency</span> <span class="o">=</span> <span class="n">Histogram</span><span class="p">(</span>
+            <span class="s2">"mstar_request_engine_seconds"</span><span class="p">,</span>
+            <span class="s2">"Successful requests: conductor ingest to conductor finish."</span><span class="p">,</span>
+            <span class="n">stages</span><span class="p">,</span> <span class="n">buckets</span><span class="o">=</span><span class="n">E2E_BUCKETS</span><span class="p">,</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">delivery_latency</span> <span class="o">=</span> <span class="n">Histogram</span><span class="p">(</span>
+            <span class="s2">"mstar_request_delivery_seconds"</span><span class="p">,</span>
+            <span class="s2">"Successful requests: conductor finish to the result leaving the API server."</span><span class="p">,</span>
+            <span class="n">stages</span><span class="p">,</span> <span class="n">buckets</span><span class="o">=</span><span class="n">STAGE_BUCKETS</span><span class="p">,</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Output volume, counted per chunk as it reaches the API server, for</span>
+        <span class="c1"># every request; modality names come from the model's graph.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output_chunks</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">(</span>
+            <span class="s2">"mstar_output_chunks"</span><span class="p">,</span>
+            <span class="s2">"Result chunks that reached the API server, by modality."</span><span class="p">,</span>
+            <span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">],</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output_bytes</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">(</span>
+            <span class="s2">"mstar_output_bytes"</span><span class="p">,</span>
+            <span class="s2">"Bytes of result chunks that reached the API server, by modality."</span><span class="p">,</span>
+            <span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">],</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output_audio_seconds</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">(</span>
+            <span class="s2">"mstar_output_audio_seconds"</span><span class="p">,</span>
+            <span class="s2">"Seconds of audio in the result chunks that reached the API server."</span><span class="p">,</span>
+            <span class="p">[</span><span class="s2">"model_name"</span><span class="p">],</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="n">model_name</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">time_to_first_chunk</span> <span class="o">=</span> <span class="n">Histogram</span><span class="p">(</span>
+            <span class="s2">"mstar_time_to_first_chunk_seconds"</span><span class="p">,</span>
+            <span class="s2">"Successful requests: submission to the first result chunk of each "</span>
+            <span class="s2">"output modality reaching the API server."</span><span class="p">,</span>
+            <span class="p">[</span><span class="s2">"model_name"</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">],</span> <span class="n">buckets</span><span class="o">=</span><span class="n">FIRST_OUTPUT_BUCKETS</span><span class="p">,</span> <span class="n">registry</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">registry</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="c1"># Label lookups resolved once per modality set or modality. Two</span>
+        <span class="c1"># threads may resolve the same key at once; labels() returns the same</span>
+        <span class="c1"># series to both, so the race is harmless.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_request_series</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_RequestSeries</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_first_chunk_series</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_series</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_series</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">modalities</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_RequestSeries</span><span class="p">:</span>
+        <span class="n">series</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_series</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">modalities</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">series</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">labels</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modalities</span><span class="p">)</span>
+            <span class="n">series</span> <span class="o">=</span> <span class="n">_RequestSeries</span><span class="p">(</span>
+                <span class="c1"># Exported at 0 from here on: rate() and increase() miss the</span>
+                <span class="c1"># first increment of a series that appears at 1.</span>
+                <span class="n">outcomes</span><span class="o">=</span><span class="p">{</span><span class="n">o</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">requests</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">,</span> <span class="n">o</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">OUTCOMES</span><span class="p">},</span>
+                <span class="n">e2e</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">e2e_latency</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">),</span>
+                <span class="n">first_output</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">time_to_first_output</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">),</span>
+                <span class="n">preprocess</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">preprocess_latency</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">),</span>
+                <span class="n">engine</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">engine_latency</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">),</span>
+                <span class="n">delivery</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">delivery_latency</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="o">*</span><span class="n">labels</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_request_series</span><span class="p">[</span><span class="n">modalities</span><span class="p">]</span> <span class="o">=</span> <span class="n">series</span>
+        <span class="k">return</span> <span class="n">series</span>
 
 <div class="viewcode-block" id="ServingMetrics.record">
 <a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics.record">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">record</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">PendingRequest</span><span class="p">,</span> <span class="n">outcome</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Count one request that left the API server's table."""</span>
         <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-        <span class="n">modalities</span> <span class="o">=</span> <span class="n">modalities_label</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">output_modalities</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">modalities</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seen_modalities</span><span class="p">:</span>
-            <span class="c1"># rate() and increase() miss the first increment of a series that</span>
-            <span class="c1"># appears at 1, so every outcome is exported at 0 from here on.</span>
-            <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">OUTCOMES</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">requests</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modalities</span><span class="p">,</span> <span class="n">o</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_seen_modalities</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">modalities</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">requests</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modalities</span><span class="p">,</span> <span class="n">outcome</span><span class="p">)</span><span class="o">.</span><span class="n">inc</span><span class="p">()</span>
+        <span class="n">series</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_series</span><span class="p">(</span><span class="n">modalities_label</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">output_modalities</span><span class="p">))</span>
+        <span class="n">series</span><span class="o">.</span><span class="n">outcomes</span><span class="p">[</span><span class="n">outcome</span><span class="p">]</span><span class="o">.</span><span class="n">inc</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">outcome</span> <span class="o">!=</span> <span class="s2">"success"</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="n">timing</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">profile</span><span class="o">.</span><span class="n">timing</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">e2e_latency</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modalities</span><span class="p">)</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span>
-            <span class="n">now</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span>
+        <span class="n">series</span><span class="o">.</span><span class="n">e2e</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">now</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">timing</span><span class="o">.</span><span class="n">first_chunk_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">time_to_first_output</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modalities</span><span class="p">)</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span>
-                <span class="n">timing</span><span class="o">.</span><span class="n">first_chunk_time</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span></div>
+            <span class="n">series</span><span class="o">.</span><span class="n">first_output</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">timing</span><span class="o">.</span><span class="n">first_chunk_time</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">timing</span><span class="o">.</span><span class="n">preprocess_finish_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">series</span><span class="o">.</span><span class="n">preprocess</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">timing</span><span class="o">.</span><span class="n">preprocess_finish_time</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span>
+        <span class="c1"># Every successful request got its RequestComplete, which carries</span>
+        <span class="c1"># both; a value from another host's clock would come out negative.</span>
+        <span class="k">if</span> <span class="n">timing</span><span class="o">.</span><span class="n">conductor_finish_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">now</span> <span class="o">&gt;=</span> <span class="n">timing</span><span class="o">.</span><span class="n">conductor_finish_time</span><span class="p">:</span>
+            <span class="n">series</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">timing</span><span class="o">.</span><span class="n">conductor_finish_time</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">conductor_ingest_time</span><span class="p">)</span>
+            <span class="n">series</span><span class="o">.</span><span class="n">delivery</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">now</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">conductor_finish_time</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">modality</span><span class="p">,</span> <span class="n">first</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">first_chunk_times</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">first_chunk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_first_chunk_series</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">modality</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">first_chunk</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">first_chunk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">time_to_first_chunk</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modality</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_first_chunk_series</span><span class="p">[</span><span class="n">modality</span><span class="p">]</span> <span class="o">=</span> <span class="n">first_chunk</span>
+            <span class="n">first_chunk</span><span class="o">.</span><span class="n">observe</span><span class="p">(</span><span class="n">first</span> <span class="o">-</span> <span class="n">timing</span><span class="o">.</span><span class="n">recv_time</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ServingMetrics.record_chunk">
+<a class="viewcode-back" href="../../../_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics.record_chunk">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">record_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">modality</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Count one result chunk that reached the API server (not an error chunk)."""</span>
+        <span class="n">series</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_series</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">modality</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">series</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">series</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">output_chunks</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modality</span><span class="p">),</span>
+                      <span class="bp">self</span><span class="o">.</span><span class="n">output_bytes</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">modality</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_series</span><span class="p">[</span><span class="n">modality</span><span class="p">]</span> <span class="o">=</span> <span class="n">series</span>
+        <span class="n">chunks</span><span class="p">,</span> <span class="n">nbytes</span> <span class="o">=</span> <span class="n">series</span>
+        <span class="n">chunks</span><span class="o">.</span><span class="n">inc</span><span class="p">()</span>
+        <span class="n">nbytes</span><span class="o">.</span><span class="n">inc</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">metadata</span><span class="p">:</span>
+            <span class="c1"># Chunks from the result-token path carry no sample rate.</span>
+            <span class="n">rate</span> <span class="o">=</span> <span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sample_rate"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">rate</span><span class="p">:</span>
+                <span class="n">channels</span> <span class="o">=</span> <span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_channels"</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">1</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">output_audio_seconds</span><span class="o">.</span><span class="n">inc</span><span class="p">(</span>
+                    <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">_AUDIO_BYTES_PER_SAMPLE</span> <span class="o">*</span> <span class="n">channels</span> <span class="o">*</span> <span class="n">rate</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="ServingMetrics.render">
