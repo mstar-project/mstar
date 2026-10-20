@@ -651,8 +651,9 @@ land. Segments are mapped once and never move, so the one-time
 <code class="docutils literal notranslate"><span class="pre">cudaHostRegister</span></code> per segment (within <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN_MAX_MB</span></code>)
 holds for its lifetime and keeps the side-stream copies truly async.</p>
 <p>Capacity degrades in layers: grow by segments up to
-<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code>; at the cap, briefly backpressure for
-consumer ACKs; then spill the tensor to the per-uuid file protocol
+<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code> (or until /dev/shm cannot back another
+segment: segments commit their pages when created); at the cap, briefly
+backpressure for consumer ACKs; then spill the tensor to the per-uuid file protocol
 (<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>, default on) — slower, never fails, like the old
 transport at saturation. <code class="docutils literal notranslate"><span class="pre">stats_summary()</span></code> exposes occupancy and the
 fragmentation gauge (largest contiguous free block); <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code> logs it

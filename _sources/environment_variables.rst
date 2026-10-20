@@ -81,7 +81,12 @@ Communication
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
-       existing segments never move (registrations stay valid).
+       existing segments never move (registrations stay valid). A
+       segment's /dev/shm pages are committed when it is created (pinned
+       segments always were, by ``cudaHostRegister``), so the whole
+       segment counts against /dev/shm, as do spill files, which land in
+       /dev/shm by default. A segment /dev/shm cannot hold counts as arena
+       full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
      - ``32``
      - Growth cap PER ENTITY. Every entity (workers + the api-server data

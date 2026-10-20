@@ -921,8 +921,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">holds for its lifetime and keeps the side-stream copies truly async.</span>
 
 <span class="sd">Capacity degrades in layers: grow by segments up to</span>
-<span class="sd">``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for</span>
-<span class="sd">consumer ACKs; then spill the tensor to the per-uuid file protocol</span>
+<span class="sd">``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another</span>
+<span class="sd">segment: segments commit their pages when created); at the cap, briefly</span>
+<span class="sd">backpressure for consumer ACKs; then spill the tensor to the per-uuid file protocol</span>
 <span class="sd">(``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old</span>
 <span class="sd">transport at saturation. ``stats_summary()`` exposes occupancy and the</span>
 <span class="sd">fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it</span>
@@ -1030,17 +1031,21 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""libcudart via ctypes: unlike the torch binding, a ctypes call</span>
 <span class="sd">    RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the</span>
 <span class="sd">    send path cannot stall the process's other Python threads (serve loop,</span>
-<span class="sd">    stream relays, the wake watcher)."""</span>
+<span class="sd">    stream relays, the wake watcher). Loaded by the soname of torch's CUDA</span>
+<span class="sd">    major, which reaches the copy torch already loaded even where it is not</span>
+<span class="sd">    on the loader path (a pip install of torch)."""</span>
     <span class="k">global</span> <span class="n">_CUDART</span>
     <span class="k">if</span> <span class="n">_CUDART</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes.util</span>
 
-        <span class="n">name</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">find_library</span><span class="p">(</span><span class="s2">"cudart"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"libcudart.so"</span>
-        <span class="n">lib</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">cuda</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span><span class="s2">"torch is not built with CUDA"</span><span class="p">)</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="sa">f</span><span class="s2">"libcudart.so.</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">'.'</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_size_t</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_uint</span><span class="p">]</span>
         <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">]</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
         <span class="n">_CUDART</span> <span class="o">=</span> <span class="n">lib</span>
     <span class="k">return</span> <span class="n">_CUDART</span>
 
@@ -1065,13 +1070,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">False</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">lib</span> <span class="o">=</span> <span class="n">_cudart</span><span class="p">()</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
-
-        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">]</span>
-        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
-        <span class="n">rc</span> <span class="o">=</span> <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
-        <span class="n">rc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="n">rc</span> <span class="o">=</span> <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">rc</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># Left set, the thread's next torch kernel launch raises it.</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaGetLastError</span><span class="p">()</span>
     <span class="k">return</span> <span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span>
 
 
@@ -1100,9 +1104,15 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
         <span class="k">return</span> <span class="kc">False</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="n">rc</span> <span class="o">=</span> <span class="n">_cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>  <span class="c1"># no loadable libcudart: fall back to the torch binding</span>
-        <span class="n">rc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">_cudart</span><span class="p">()</span>
+    <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"ARENA: cannot load libcudart (</span><span class="si">%s</span><span class="s2">); copies fall back "</span>
+                       <span class="s2">"to pageable bandwidth"</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="n">rc</span> <span class="o">=</span> <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">rc</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># Set by an already-registered range (accepted below) too.</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaGetLastError</span><span class="p">()</span>
     <span class="n">ok</span> <span class="o">=</span> <span class="n">rc</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">_CUDA_HOST_ALREADY_REGISTERED</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"cudaHostRegister(</span><span class="si">%#x</span><span class="s2">, </span><span class="si">%d</span><span class="s2">) failed rc=</span><span class="si">%d</span><span class="s2"> — copies fall "</span>
@@ -1171,6 +1181,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_spill_after_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
             <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SPILL_AFTER_S"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_frag_warned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spill_warned</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="c1"># h2d completion watcher: turns a CUDA event into a real Future so</span>
         <span class="c1"># the worker's eventfd wakes the moment reads finish (no 10 ms tick).</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="p">:</span> <span class="n">queue</span><span class="o">.</span><span class="n">Queue</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1519,7 +1530,9 @@ window.runMermaid = runMermaid;</script>
         <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">seg</span><span class="p">,</span> <span class="n">off</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">reserve</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">nbytes</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
-            <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+            <span class="c1"># Both the segment cap and a failed growth (no room in</span>
+            <span class="c1"># /dev/shm for a new segment) land here as "full".</span>
+            <span class="k">except</span> <span class="ne">RuntimeError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reclaim_expired</span><span class="p">():</span>
                     <span class="k">continue</span>   <span class="c1"># expired slots freed: retry the reserve</span>
                 <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
@@ -1534,12 +1547,18 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_frag_warned</span> <span class="o">=</span> <span class="kc">True</span>
                 <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">deadline</span><span class="p">:</span>
                     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span><span class="p">:</span>
+                        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill_warned</span><span class="p">:</span>
+                            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                                <span class="s2">"ARENA: spilling sends to the file "</span>
+                                <span class="s2">"transport (</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">_spill_warned</span> <span class="o">=</span> <span class="kc">True</span>
                         <span class="k">return</span> <span class="kc">None</span>
                     <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                         <span class="sa">f</span><span class="s2">"SHM arena full for &gt;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span><span class="si">}</span><span class="s2">s "</span>
-                        <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="si">}</span><span class="s2"> segments); raise "</span>
-                        <span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB or check "</span>
-                        <span class="s2">"for consumers not ACKing"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+                        <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="si">}</span><span class="s2"> segments: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">); raise "</span>
+                        <span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB, free "</span>
+                        <span class="s2">"/dev/shm space, or check for consumers not "</span>
+                        <span class="s2">"ACKing"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">warned</span><span class="p">:</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                         <span class="s2">"SHM arena at capacity; backpressuring sends until "</span>
