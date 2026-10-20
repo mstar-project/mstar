@@ -416,6 +416,50 @@ def test_parallel_long_form_submits_everything_up_front(client_and_stub):
     assert all("long_form" not in s["model_kwargs"] for s in stub.submits)
 
 
+
+@requires_audio_duration
+def test_parallel_timed_window_that_stops_inside_a_segment_decodes_its_tail(client_and_stub):
+    """Whisper writes the next segment's start near a window's end and stops;
+    in parallel mode the next window starts at the cut, so the audio from the
+    last closed segment to the cut is decoded as a window of its own."""
+    client, stub = client_and_stub
+    stub.queued_chunks = [
+        _text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off"),
+        _text("<|0.00|>", " Two.", "<|29.00|>"),
+        _text("<|0.00|>", " Three.", "<|1.00|>"),
+        _text("<|0.00|>", " The tail.", "<|4.00|>"),
+    ]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # the open segment's partial text gives way to the tail's decode
+    assert body["text"] == "One. The tail. Two. Three."
+    segments = [(s["start"], s["end"], s["text"]) for s in body["segments"]]
+    assert segments[:2] == [(0.0, 20.0, "One."), (20.0, 24.0, "The tail.")]
+    assert len(stub.submits) == 4
+    first, tail = stub.wav_seconds[0], stub.wav_seconds[3]
+    assert tail == pytest.approx(first - 20.0, abs=1e-3)
+
+
+@requires_audio_duration
+@pytest.mark.parametrize("last_end", ["0.50", "29.80"])
+def test_parallel_unfinished_window_keeps_its_text_when_there_is_no_tail_to_decode(client_and_stub, last_end):
+    """A seek point under a second in, or a tail under half a second, is left
+    as it is, as sequential mode does with a seek under a second."""
+    client, stub = client_and_stub
+    stub.queued_chunks = [
+        _text("<|en|>", "<|0.00|>", " One.", f"<|{last_end}|>", f"<|{last_end}|>", " open"),
+        _text("<|0.00|>", " Two.", "<|29.00|>"),
+        _text("<|0.00|>", " Three.", "<|1.00|>"),
+    ]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 200, r.text
+    assert r.json()["text"] == "One. open Two. Three."
+    assert len(stub.submits) == 3
+
+
 def test_long_form_rejects_unknown_mode(client_and_stub):
     client, stub = client_and_stub
     r = _post(client, {"model": "whisper_large", "long_form": "zigzag"}, filename="a.wav", content=_wav_bytes(1))

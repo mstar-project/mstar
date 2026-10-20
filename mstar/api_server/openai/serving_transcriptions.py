@@ -30,7 +30,10 @@ Long uploads
 
     ``parallel`` cuts fixed windows, each at the quietest moment shortly
     before its nominal boundary, with no conditioning, and keeps up to
-    :data:`PARALLEL_INFLIGHT` of them on the engine at once.
+    :data:`PARALLEL_INFLIGHT` of them on the engine at once. With timestamps
+    (a non-streamed timed format), a window that stopped inside a segment
+    keeps its closed segments as in sequential mode, and the audio from the
+    last of them to the cut is decoded as one more window.
 
     Uploads longer than :data:`MAX_DURATION_SECONDS` are rejected. Every
     window still on the engine when the request ends (error, disconnect) is
@@ -76,6 +79,8 @@ TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 PROMPT_RESET_TEMPERATURE = 0.5
 # a seek shorter than this re-hears too much for too little, so take the window
 MIN_SEEK_SECONDS = 1.0
+# parallel mode: a window's unfinished tail shorter than this is not decoded again
+MIN_TAIL_SECONDS = 0.5
 # parallel mode: how far before a fixed boundary to look for the quietest cut,
 # and the frame length compared
 CUT_SEARCH_SECONDS = 2.0
@@ -230,6 +235,12 @@ class WindowPlanner:
         start = int(round(offset * SAMPLE_RATE))
         stop = media_io.window_stop(start, len(audio), int(round(self.max_seconds * SAMPLE_RATE)), self.balanced)
         return self._write(audio[start:stop], offset)
+
+    def cut(self, offset: float, duration: float) -> Window:
+        """``duration`` seconds of the upload from ``offset`` on, as a window."""
+        audio = self._decoded()
+        start = int(round(offset * SAMPLE_RATE))
+        return self._write(audio[start:start + int(round(duration * SAMPLE_RATE))], offset)
 
     def _decoded(self):
         if self._audio is None:
@@ -404,6 +415,27 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
+def _tails(adapter, req, planner: WindowPlanner, windows: list[Window]) -> list[tuple[int, Window]]:
+    """Parallel windows decoded with timestamps that stopped inside a segment.
+    Near its end Whisper writes the next segment's start and ends the window,
+    leaving that speech to the next window, which in parallel mode starts at
+    the fixed cut instead. As in sequential mode, such a window keeps its closed
+    segments, and the audio from the last of them to the cut becomes a window
+    of its own: ``(index of the window it follows, the new window)``."""
+    if not adapter.seeks_by_timestamps or planner.single:
+        return []
+    tails = []
+    for index, window in enumerate(windows):
+        parsed = adapter.parse_transcript(window.raw_text, req)
+        if not (parsed.unfinished and parsed.segments):
+            continue
+        end = parsed.segments[-1]["end"]
+        if MIN_SEEK_SECONDS <= end <= window.duration - MIN_TAIL_SECONDS:
+            window.transcript = _closed(parsed)
+            tails.append((index, planner.cut(window.offset + end, window.duration - end)))
+    return tails
+
+
 async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[str], raw_request=None):
     """openai-whisper's loop over the upload; yields each window once its
     transcript is accepted (see the module docstring)."""
@@ -526,6 +558,14 @@ async def create_transcription(
             windows = planner.fixed()
             async for _ in _parallel(api, adapter, req, windows, inflight, raw_request):
                 pass
+            tails = _tails(adapter, req, planner, windows)
+            if tails:
+                async for _ in _parallel(api, adapter, req, [t for _, t in tails], inflight, raw_request):
+                    pass
+                after, merged = dict(tails), []
+                for index, window in enumerate(windows):
+                    merged += [window, after[index]] if index in after else [window]
+                windows = merged
         else:
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
