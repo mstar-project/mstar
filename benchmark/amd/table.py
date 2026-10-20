@@ -124,6 +124,7 @@ def collect(run_dir: Path) -> dict:
             "correctness_pass_error": bool((info.get("correctness_pass") or {}).get("error")),
             "image": versions.get("image"), "stack": versions.get("stack"), "env": versions.get("env"),
             "command": versions.get("command"), "git": versions.get("git"), "config": versions.get("config"),
+            "rust_from_worktree": versions.get("rust_from_worktree"),
             "recipe": arm.recipe if arm else versions.get("recipe"),
             "differs": arm.differs if arm else versions.get("differs"),
             "host": (versions.get("host") or {}).get("host"), "cotenants": _cotenants(d),
@@ -222,6 +223,8 @@ def render(data: dict) -> str:
                 what += f", {'configs/' + cfg.name if cfg.parent.name == 'configs' else cfg}"
             ver = " ".join(f"{k} {stack[k]}" for k in ("torch", "torch_hip", "amd-aiter", "amd-flashinfer", "triton",
                                                         "triton-rocm") if stack.get(k))
+            if a.get("rust_from_worktree") is not None:
+                ver += f" mstar_rust {'from the tree' if a['rust_from_worktree'] else 'from the venv'}"
         else:
             what = f"{src.get('repo')}:{src.get('tag')} {str(src.get('digest', ''))[:19]}"
             ver = " ".join(f"{k} {stack[k]}" for k in ("vllm", "sglang", "vllm-omni", "torch", "torch_hip",
