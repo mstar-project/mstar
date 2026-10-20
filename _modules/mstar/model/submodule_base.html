@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -1984,8 +1985,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""``postprocess`` for a rows-only step, which has no per-request</span>
-<span class="sd">        outputs: works on the rows of ``outputs`` in place. Optional; only</span>
+<span class="w">        </span><span class="sd">"""Once per step, for work that batches across the step's requests</span>
+<span class="sd">        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on</span>
+<span class="sd">        ``outputs`` in place: its rows on a rows-only step, which has no</span>
+<span class="sd">        per-request outputs, and otherwise the per-request outputs after</span>
+<span class="sd">        every request's ``postprocess``, for the requests whose</span>
+<span class="sd">        ``postprocess`` succeeded (``request_infos``' keys, in the order of</span>
+<span class="sd">        ``inputs``); a raise then fails every one of them. Optional; only</span>
 <span class="sd">        called when overridden."""</span></div>
 
 

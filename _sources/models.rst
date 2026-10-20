@@ -352,6 +352,26 @@ Qwen3-TTS notes
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML halves its GPU time when throughput matters more than
   bit-exactness (the Talker is bf16 either way).
+- Opt-in AudioSeal watermark on the codec's output (off by default; install
+  ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
+
+     model_kwargs:
+       audio_watermark:
+         enabled: true      # default false
+         message: 0xBEEF    # 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)
+         alpha: 1.0         # strength, in (0, 4] (default 1.0)
+         generator: audioseal_wm_streaming   # AudioSeal card name or checkpoint path (default)
+
+  Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
+  without the package. Each request's PCM is marked chunk by chunk with its own
+  streaming state, so a streamed utterance carries the same mark as a whole one.
+  Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
+  (``--message``, the deployment's payload: without it the verdict is the
+  score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
+  ``--threshold``, default 0.5; ``--device``; needs ``.[audio]`` for
+  ``soundfile``); a file at another rate than 24 kHz is resampled to 24 kHz
+  first, since the mark is found only at the rate it was added at. Detect on
+  whole utterances: a clip under a few seconds can miss the mark. The helper lives in ``mstar/model/audio_watermark.py``.
 - Weight loading checks coverage in both directions: a parameter the checkpoint
   does not fill, or a checkpoint tensor the port does not load, fails startup.
 - The 12 Hz codec does not require the system SoX executable. M* imports only

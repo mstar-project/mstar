@@ -269,6 +269,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -988,7 +989,7 @@ voices for a picker: the bundled voices whose G2P extra is installed on the serv
 </section>
 <section id="qwen3-tts-notes">
 <h2>Qwen3-TTS notes<a class="headerlink" href="#qwen3-tts-notes" title="Link to this heading">#</a></h2>
-<ul class="simple">
+<ul>
 <li><p>Install the model-specific dependencies with <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[qwen3_tts]'</span></code>
 plus <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">--no-deps</span> <span class="pre">'qwen-tts==0.1.1'</span></code> (see <a class="reference internal" href="installation.html"><span class="doc">Installation</span></a>), and launch a single-GPU deployment with <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">&lt;key&gt;</span> <span class="pre">--gpus</span> <span class="pre">0</span></code> where
 <code class="docutils literal notranslate"><span class="pre">&lt;key&gt;</span></code> is one of <code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code> (0.6B CustomVoice), <code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code>,
@@ -1048,6 +1049,27 @@ throughput by about a fifth on an H100.</p></li>
 decoder bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span> <span class="pre">bfloat16}</span></code> in the
 deployment YAML halves its GPU time when throughput matters more than
 bit-exactness (the Talker is bf16 either way).</p></li>
+<li><p>Opt-in AudioSeal watermark on the codec’s output (off by default; install
+<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[audioseal]'</span></code>). Turn it on in the deployment YAML:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">model_kwargs</span><span class="p">:</span>
+  <span class="n">audio_watermark</span><span class="p">:</span>
+    <span class="n">enabled</span><span class="p">:</span> <span class="n">true</span>      <span class="c1"># default false</span>
+    <span class="n">message</span><span class="p">:</span> <span class="mh">0xBEEF</span>    <span class="c1"># 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)</span>
+    <span class="n">alpha</span><span class="p">:</span> <span class="mf">1.0</span>         <span class="c1"># strength, in (0, 4] (default 1.0)</span>
+    <span class="n">generator</span><span class="p">:</span> <span class="n">audioseal_wm_streaming</span>   <span class="c1"># AudioSeal card name or checkpoint path (default)</span>
+</pre></div>
+</div>
+<p>Unknown keys or out-of-range values fail startup, and so does <code class="docutils literal notranslate"><span class="pre">enabled:</span> <span class="pre">true</span></code>
+without the package. Each request’s PCM is marked chunk by chunk with its own
+streaming state, so a streamed utterance carries the same mark as a whole one.
+Check files with <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.model.audio_watermark</span> <span class="pre">detect</span> <span class="pre">--message</span> <span class="pre">0xBEEF</span> <span class="pre">out.wav</span></code>
+(<code class="docutils literal notranslate"><span class="pre">--message</span></code>, the deployment’s payload: without it the verdict is the
+score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
+<code class="docutils literal notranslate"><span class="pre">--threshold</span></code>, default 0.5; <code class="docutils literal notranslate"><span class="pre">--device</span></code>; needs <code class="docutils literal notranslate"><span class="pre">.[audio]</span></code> for
+<code class="docutils literal notranslate"><span class="pre">soundfile</span></code>); a file at another rate than 24 kHz is resampled to 24 kHz
+first, since the mark is found only at the rate it was added at. Detect on
+whole utterances: a clip under a few seconds can miss the mark. The helper lives in <code class="docutils literal notranslate"><span class="pre">mstar/model/audio_watermark.py</span></code>.</p>
+</li>
 <li><p>Weight loading checks coverage in both directions: a parameter the checkpoint
 does not fill, or a checkpoint tensor the port does not load, fails startup.</p></li>
 <li><p>The 12 Hz codec does not require the system SoX executable. M* imports only

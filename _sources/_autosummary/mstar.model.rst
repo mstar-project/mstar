@@ -27,6 +27,7 @@
    :toctree:
    :recursive:
 
+   audio_watermark
    base
    chatterbox
    components
