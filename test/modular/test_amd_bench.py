@@ -341,6 +341,19 @@ def test_correctness_reads_each_arm_s_tree(tmp_path):
     assert correctness._arm_tree(d, tmp_path) == Path("/trees/base")
 
 
+def test_mstar_rust_must_come_from_a_tree_that_builds_its_own(tmp_path):
+    from benchmark.amd.launch import rust_from_worktree
+
+    venv = {"mstar_rust_file": "/venv/site-packages/mstar_rust/__init__.py"}
+    assert rust_from_worktree(venv, tmp_path) is False  # no build in the tree: recorded, not refused
+    (tmp_path / "mstar_rust").mkdir()
+    with pytest.raises(RuntimeError):
+        rust_from_worktree(venv, tmp_path)
+    with pytest.raises(RuntimeError):
+        rust_from_worktree({"mstar_rust_error": "ImportError()"}, tmp_path)
+    assert rust_from_worktree({"mstar_rust_file": str(tmp_path / "mstar_rust" / "__init__.py")}, tmp_path) is True
+
+
 def test_table_render(tmp_path):
     run = tmp_path / "run"
     meta = {"table": "qwen35-dense", "run_id": "x", "dry": False, "rows": ["qwen3_5_0.8b"],
@@ -366,7 +379,8 @@ def test_table_render(tmp_path):
         if arm == "mstar":
             (d / "server").mkdir()
             (d / "server" / "versions.json").write_text(json.dumps(
-                {"git": {"branch": "HEAD", "head": "6e6474b62abc"}, "config": "/wt/configs/qwen3_5_0.8b.yaml"}))
+                {"git": {"branch": "HEAD", "head": "6e6474b62abc"}, "config": "/wt/configs/qwen3_5_0.8b.yaml",
+                 "rust_from_worktree": False, "stack": {"torch": "2.12.1"}}))
         summ = {"tok_s": {"median": tok, "min": tok - 5, "max": tok + 5, "n": 3},
                 "out_tokens_per_req": {"median": out_tok, "min": out_tok, "max": out_tok, "n": 3}}
         # mstar's client-bound comes from the timed-window measure and stays; vllm-aiter's predates it and goes.
@@ -388,7 +402,7 @@ def test_table_render(tmp_path):
     (void / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_0.8b", "status": "done"}))
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
-    assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml |" in md
+    assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml | torch 2.12.1 mstar_rust from the venv |" in md
     assert "\n- note: HIP 4 runs hot on this node.\n" in md
     assert "| client-bound rerun |" in md and md.count("client-bound") == 1
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1); finished" in md and "node health check_resume1: PASS" in md
