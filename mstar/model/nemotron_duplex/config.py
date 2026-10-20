@@ -195,10 +195,15 @@ class EarTTSConfig:
     # Streaming codec chunking (engine Talker->Codec connection): decode `chunk` new
     # code frames with `left_context` prior frames so the causal codec has enough
     # receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).
-    codec_chunk_frames: int = 5
-    # The decoder only looks back ~2.3 code frames (three causal k=7 blocks at
-    # 9 positions per frame, plus the iSTFT window), so 3 frames of context give
-    # the same samples as decoding the whole history.
+    # One frame per chunk: a larger chunk holds a frame's audio back until the
+    # chunk fills, up to (chunk - 1) * 80 ms, and so delays the whole output stream.
+    codec_chunk_frames: int = 1
+    # The first sample a window emits (its held 12 samples) reaches back through
+    # the iSTFT and the three causal k=7 blocks of each of the 441-, 63- and
+    # 9-positions-per-frame stages to 2.44 code frames before the new frames
+    # (the upsampling convs have kernel == stride, so they add nothing). 3
+    # frames of context therefore give the full-history decode's samples at any
+    # chunk size, and 2 do not.
     codec_left_context_frames: int = 3
 
     sample_rate: int = 22050

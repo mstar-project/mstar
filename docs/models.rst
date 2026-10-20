@@ -426,11 +426,14 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
-  PCM: each 5-frame chunk is decoded with the previous 3 frames as left context,
-  which covers the decoder's receptive field, and a window's last 12 samples,
-  the inverse-STFT overlap, are held back and emitted with the next chunk, so
-  the stream equals the full-history decode sample for sample; that steady
-  window of 8 frames replays a CUDA graph, other windows decode eagerly).
+  PCM, one 80 ms frame per step: each frame is decoded with the previous 3
+  frames as left context, which covers the decoder's receptive field, and a
+  window's last 12 samples, the inverse-STFT overlap, are held back and emitted
+  with the next frame, so the stream equals the full-history decode sample for
+  sample; that steady window of 4 frames replays a CUDA graph, a call's first
+  three frames decode eagerly). A larger ``codec_chunk_frames`` (a
+  ``model_kwargs`` entry) runs fewer codec steps but holds a frame's audio back
+  up to ``(chunk - 1) x 80`` ms, and the whole output stream with it.
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with

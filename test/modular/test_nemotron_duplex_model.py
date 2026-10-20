@@ -40,6 +40,7 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+from mstar.model.nemotron_duplex.submodules import AudioCodecDecoderSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
@@ -366,6 +367,22 @@ def test_duplex_stream_connection_policies():
     assert isinstance(codec, FixedChunkPolicy)
     assert codec.next_chunk_size(100) == model.config.eartts.codec_chunk_frames
     assert codec.continue_after_producer_done() is False
+
+
+@pytest.mark.parametrize("chunk", [None, 5])
+def test_duplex_codec_chunk_is_a_model_kwarg(chunk):
+    """One frame per codec chunk by default; ``model_kwargs: {codec_chunk_frames}``
+    trades latency for fewer codec steps, through the stream's chunk and the
+    codec's captured window alike."""
+    kwargs = {} if chunk is None else {"codec_chunk_frames": chunk}
+    model = NemotronDuplexModel(model_path_hf=HF_MODELS["nemotron_duplex"]["model_path_hf"], **kwargs)
+    want = chunk or 1
+    (conn,) = [c for c in model.get_partition_topology().connections if c.edge_name == "codec_tokens"]
+    assert conn.chunk_policy_factory().next_chunk_size(100) == want
+    assert model.config.eartts.codec_left_context_frames + want == \
+        AudioCodecDecoderSubmodule(codec=None, config=model.config)._steady_window
+    with pytest.raises(ValueError, match="codec_chunk_frames"):
+        NemotronDuplexModel(model_path_hf="x", codec_chunk_frames=0)
 
 
 def test_duplex_process_prompt_seeds_frame0_feedback():

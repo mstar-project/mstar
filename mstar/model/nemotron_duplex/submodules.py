@@ -949,18 +949,17 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     chunk in isolation clicks at the boundaries. Each request keeps a rolling
     context of its previous ``codec_left_context_frames`` code frames (in its
     ``PerRequestState``); a chunk of NEW frames is decoded as ``context + new``
-    and only the new frames' samples are emitted. Same "decode with left
-    context, emit the tail" math as the verified standalone path, but O(1) per
-    chunk instead of re-decoding the whole history. The inverse STFT's last
+    and only the new frames' samples are emitted. The inverse STFT's last
     ``n_fft - hop`` samples of a window still lack the following frames'
     overlap, so a chunk holds those samples back and the next chunk emits them
     recomputed with its context: the emitted stream is the full-history decode
-    sample for sample; the final chunk emits its held tail too.
-    Requests whose windows have the same length are decoded in one batched
-    call; a steady-state window (left context + one chunk, every chunk after a
-    call's first) replays a CUDA graph (``DECODE_REGION``). Calls that started
-    at different times reach their chunk boundaries on different frames, so a
-    live load runs many small decodes. Declares no resources.
+    sample for sample, at any chunk size; the final chunk emits its held tail.
+    A chunk is one frame by default (``codec_chunk_frames``), so a frame's audio
+    leaves on the step after the talker makes its codes.
+    Requests with the same context and chunk lengths are decoded in one batched
+    call; the steady-state window (full context + one chunk, every chunk after
+    a call's first few) replays a CUDA graph (``DECODE_REGION``). Declares no
+    resources.
     """
 
     # Per-request context is keyed by request id -> eager around the decode. No
@@ -1044,13 +1043,6 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         audio, _ = self.codec.decode(call.static_inputs["codes"], by_matmul=True)
         return {"wav": audio.squeeze(1)}
 
-    def _window(self, rid: str, codes: torch.Tensor) -> tuple[torch.Tensor, int]:
-        """This request's ``context + new`` code window and its context length."""
-        prev = self.request_state(rid).get(self.CONTEXT_KEY)             # (n_ctx, num_q) or None
-        if prev is None:
-            return codes, 0
-        return torch.cat([prev, codes], dim=0), prev.shape[0]
-
     def forward_batched(
         self, graph_walk, engine_inputs, codes=None, flush=None, **kwargs,
     ) -> dict[str, NameToTensorList]:
@@ -1058,41 +1050,43 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         rids = list(engine_inputs.request_ids)
         flush = flush or [False] * len(rids)
         out: dict[str, NameToTensorList] = {}
-        windows: dict[int, tuple[torch.Tensor, int]] = {}
+        # Rows grouped by (context, new) frame counts, so each group's windows
+        # are two stacks and a cat and its PCM one conversion: this runs every
+        # frame, and per-row tensor ops would cost a launch each per call.
+        contexts: list[torch.Tensor | None] = [None] * len(rids)
+        groups: dict[tuple[int, int], list[int]] = {}
         for i, (rid, c) in enumerate(zip(rids, codes, strict=True)):
             if c is None:
                 # an empty final chunk: nothing to decode, emit what was held
                 tail = self.request_state(rid).get(self.TAIL_KEY)
                 out[rid] = {"audio_chunk": [tail if tail is not None else torch.zeros(0, dtype=torch.int16)]}
-            else:
-                windows[i] = self._window(rid, c)
-        # one decode per distinct window length (steady state: every request is
-        # at the full context + chunk length, so one call for the whole batch)
-        by_len: dict[int, list[int]] = {}
-        for i, (full, _) in windows.items():
-            by_len.setdefault(full.shape[0], []).append(i)
+                continue
+            contexts[i] = prev = self.request_state(rid).get(self.CONTEXT_KEY)   # (n_ctx, num_q) or None
+            groups.setdefault((0 if prev is None else prev.shape[0], c.shape[0]), []).append(i)
         runner = (engine_inputs.piecewise_runners or {}).get(self.DECODE_REGION)
-        for tf, idxs in by_len.items():
-            batch = torch.stack([windows[i][0] for i in idxs]).long()   # (G, Tf, num_q)
-            if runner is not None and tf == self._steady_window and runner.can_run(len(idxs)):
+        for (n_ctx, n_new), idxs in groups.items():
+            batch = torch.stack([codes[i] for i in idxs])
+            if n_ctx:
+                batch = torch.cat([torch.stack([contexts[i] for i in idxs]), batch], dim=1)
+            batch = batch.long()                                        # (G, n_ctx + n_new, num_q)
+            if runner is not None and n_ctx + n_new == self._steady_window and runner.can_run(len(idxs)):
                 wav = runner.run(static_inputs={"codes": batch}, real_bs=len(idxs))["wav"]
             else:
                 audio, _ = self.codec.decode(batch)                     # (G, 1, samples)
                 wav = audio.squeeze(1)                                  # (G, samples)
-            spf = wav.shape[1] // tf                                    # samples per frame
+            # the new frames' samples, less the right edge held for the next
+            # chunk, plus the previous chunk's held edge now that its overlap
+            # partners exist (a first chunk has nothing held)
+            start = n_ctx * (wav.shape[1] // (n_ctx + n_new)) - self._hold if n_ctx else 0
+            pcm = (wav[:, start:].clamp(-1, 1) * 32767).to(torch.int16)
+            held = pcm.shape[1] - self._hold
             for row, i in enumerate(idxs):
-                full, n_ctx = windows[i]
-                # the new frames' samples, less the right edge held for the next
-                # chunk, plus the previous chunk's held edge now that its
-                # overlap partners exist (a first chunk has nothing held)
-                start = n_ctx * spf - self._hold if n_ctx > 0 else 0
-                end = wav.shape[1] if flush[i] else wav.shape[1] - self._hold
-                pcm = (wav[row, start:].clamp(-1, 1) * 32767).to(torch.int16)
+                end = pcm.shape[1] if flush[i] else held
                 state = self.request_state(rids[i])
-                state.add(self.CONTEXT_KEY, full[-lc:].detach())
+                state.add(self.CONTEXT_KEY, batch[row, -lc:])
                 if self._hold:
-                    state.add(self.TAIL_KEY, pcm[end - start :])
-                out[rids[i]] = {"audio_chunk": [pcm[: end - start]]}
+                    state.add(self.TAIL_KEY, pcm[row, end:])
+                out[rids[i]] = {"audio_chunk": [pcm[row, :end]]}
         return out
 
     def forward(self, graph_walk, engine_inputs, codes=None, flush=None, **kwargs) -> NameToTensorList:

@@ -350,7 +350,7 @@ def test_codec_batches_requests_with_equal_windows():
     _run_codec(codec, "b", 5, 2)
     codec.codec.calls = 0
     out = _run_codec_batch(codec, ["a", "b", "c"], [(5, 3), (5, 4), (5, 5)])
-    assert codec.codec.calls == 2                      # {a, b} at 10 frames, c at 5
+    assert codec.codec.calls == 2                      # {a, b} at 3 + 5 frames, c at 5
     spf = _FakeCodec.SPF
     for rid, value in (("a", 3), ("b", 4), ("c", 5)):
         wav = out[rid]["audio_chunk"][0]
@@ -433,14 +433,9 @@ def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 
     return runner
 
 
-@pytest.mark.parametrize("region", [False, True])
-@pytest.mark.parametrize("frames", [23, 25])
-def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, region):
-    """With the real (tiny-channel, real kernel / rates / block count) decoder,
-    the chunked stream -- 3 frames of left context, right edge carried into the
-    next chunk -- equals the one-shot decode of all frames, sample for sample.
-    The final chunk flushes the held tail; 25 frames end on an empty one. With
-    the decode region, the steady-state windows go through it, padded."""
+def _tiny_real_codec():
+    """The real decoder at tiny widths: its kernel, rates and block count, so its
+    receptive field, are the checkpoint's."""
     from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
     from mstar.model.nemotron_duplex.config import CodecConfig
 
@@ -450,7 +445,51 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, r
     for prm in real.parameters():
         if prm.is_floating_point():
             prm.data.normal_(0, 0.05)
+    return real
+
+
+def _codec_stream(codec, calls, chunk, runners=None):
+    """Feed each call's codes through the codec in ``chunk``-frame chunks, all
+    calls in one batch per step, the last chunk final (empty when the count is a
+    multiple of ``chunk``); each call's emitted PCM, concatenated."""
+    frames = next(iter(calls.values())).shape[0]
+    starts = list(range(0, frames + (frames % chunk == 0), chunk))
+    pieces = {rid: [] for rid in calls}
+    with torch.no_grad():
+        for start in starts:
+            inputs = []
+            for codes in calls.values():
+                piece = codes[start:start + chunk]
+                inputs.append(codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [piece] if len(piece) else []},
+                                                   is_final_stream_chunk=start == starts[-1]))
+            eng = SimpleNamespace(request_ids=list(calls), resources={}, per_request_states=None,
+                                  piecewise_runners=runners or {})
+            out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, inputs))
+            for rid in calls:
+                pieces[rid].append(out[rid]["audio_chunk"][0])
+    return {rid: torch.cat(p) for rid, p in pieces.items()}
+
+
+def _whole_decode(real, codes):
+    with torch.no_grad():
+        wav, _ = real.decode(codes.unsqueeze(0))
+    return (wav[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
+
+
+@pytest.mark.parametrize("region", [False, True])
+@pytest.mark.parametrize("frames", [23, 25])
+@pytest.mark.parametrize("chunk", [1, 2, 5])
+def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(chunk, frames, region):
+    """With the real (tiny-channel, real kernel / rates / block count) decoder,
+    the chunked stream -- 3 frames of left context, right edge carried into the
+    next chunk -- equals the one-shot decode of all frames, sample for sample, at
+    any chunk size. The final chunk flushes the held tail; a frame count that is
+    a multiple of the chunk ends on an empty one. With the decode region, the
+    steady-state windows go through it, padded."""
+    real = _tiny_real_codec()
+    ccfg = real.config
     cfg = NemotronDuplexConfig()
+    cfg.eartts.codec_chunk_frames = chunk
     codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
     assert cfg.eartts.codec_left_context_frames == 3 and codec._hold == ccfg.n_fft - ccfg.hop_length == 12
     runners = {}
@@ -459,43 +498,47 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames, r
         label = AudioCodecDecoderSubmodule.DECODE_REGION
         runners[label] = _captured_on_cpu(
             codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label], label)
-    chunk = 5
     codes = torch.randint(0, ccfg.codebook_size, (frames, ccfg.num_quantizers))
-    with torch.no_grad():
-        whole, _ = real.decode(codes.unsqueeze(0))
-        whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
-        pieces = []
-        starts = list(range(0, frames + (frames % chunk == 0), chunk))
-        for start in starts:
-            piece = codes[start:start + chunk]
-            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [piece] if len(piece) else []},
-                                       is_final_stream_chunk=start == starts[-1])
-            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None,
-                                  piecewise_runners=runners)
-            out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, [inp]))
-            pieces.append(out["r"]["audio_chunk"][0])
-    stream = torch.cat(pieces)
+    stream = _codec_stream(codec, {"r": codes}, chunk, runners)["r"]
     if region:
         assert runners[AudioCodecDecoderSubmodule.DECODE_REGION].calls >= 3
+    whole = _whole_decode(real, codes)
     assert stream.shape[0] == whole.shape[0]
     torch.testing.assert_close(stream, whole, atol=1, rtol=0)   # int16: one quantization step
 
 
-def test_codec_region_replays_three_windows_with_a_padding_row():
+def test_codec_left_context_covers_the_receptive_field_exactly():
+    """The first sample a window emits (its held edge, ``n_fft - hop`` samples
+    before the new frames) depends on the code frame three before the new
+    frames and on none earlier: three frames of context are enough, two are not."""
+    real = _tiny_real_codec()
+    ccfg = real.config
+    n, lc = 10, NemotronDuplexConfig().eartts.codec_left_context_frames
+    first = n * ccfg.wav_to_token_ratio - (ccfg.n_fft - ccfg.hop_length)
+    codes = torch.randint(0, ccfg.codebook_size, (n + 1, ccfg.num_quantizers))
+
+    def decode_changing(frame):
+        changed = codes.clone()
+        changed[frame] = (changed[frame] + 1) % ccfg.codebook_size
+        with torch.no_grad():
+            return real.decode(changed.unsqueeze(0))[0][0, 0]
+
+    with torch.no_grad():
+        base = real.decode(codes.unsqueeze(0))[0][0, 0]
+    assert decode_changing(n - lc)[first] != base[first]
+    assert torch.equal(decode_changing(n - lc - 1)[first:], base[first:])
+
+
+@pytest.mark.parametrize("chunk", [1, 5])
+def test_codec_region_replays_three_windows_with_a_padding_row(chunk):
     """Three calls in step decode their steady windows together through the
     region, in a bucket of four: the padding row decodes nothing any call
     receives, and each call's stream is its full-history decode."""
-    from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
-    from mstar.model.nemotron_duplex.config import CodecConfig
-
-    torch.manual_seed(0)
-    ccfg = CodecConfig(base_hidden_size=8, latent_size=16, codebook_size=16, num_quantizers=4)
-    real = AudioCodec(ccfg).eval()
-    for prm in real.parameters():
-        if prm.is_floating_point():
-            prm.data.normal_(0, 0.05)
+    real = _tiny_real_codec()
+    ccfg = real.config
     cfg = NemotronDuplexConfig()
     cfg.eartts.num_quantizers = ccfg.num_quantizers
+    cfg.eartts.codec_chunk_frames = chunk
     codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
     label = AudioCodecDecoderSubmodule.DECODE_REGION
     region = _captured_on_cpu(codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label],
@@ -503,22 +546,25 @@ def test_codec_region_replays_three_windows_with_a_padding_row():
     rows, run = [], region.run
     region.run = lambda *a, real_bs=None, **k: rows.append(real_bs) or run(*a, real_bs=real_bs, **k)
     calls = {rid: torch.randint(0, ccfg.codebook_size, (23, ccfg.num_quantizers)) for rid in ("a", "b", "c")}
-    pieces = {rid: [] for rid in calls}
-    with torch.no_grad():
-        starts = list(range(0, 23, 5))
-        for start in starts:
-            inputs = [codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [codes[start:start + 5]]},
-                                           is_final_stream_chunk=start == starts[-1]) for codes in calls.values()]
-            eng = SimpleNamespace(request_ids=list(calls), resources={}, per_request_states=None,
-                                  piecewise_runners={label: region})
-            out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, inputs))
-            for rid in calls:
-                pieces[rid].append(out[rid]["audio_chunk"][0])
-        assert 3 in rows
-        for rid, codes in calls.items():
-            whole, _ = real.decode(codes.unsqueeze(0))
-            whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
-            torch.testing.assert_close(torch.cat(pieces[rid]), whole, atol=1, rtol=0)
+    streams = _codec_stream(codec, calls, chunk, {label: region})
+    assert 3 in rows
+    for rid, codes in calls.items():
+        torch.testing.assert_close(streams[rid], _whole_decode(real, codes), atol=1, rtol=0)
+
+
+def test_codec_decodes_a_steady_batch_in_one_call():
+    """Calls at full context decoding one frame each share one decode; a call
+    still filling its context is decoded apart, by its own window length."""
+    codec = _make_codec()
+    codec.config.eartts.codec_chunk_frames = 1
+    for rid in ("a", "b", "c"):
+        _run_codec(codec, rid, 3, 1)
+    codec.codec.calls = 0
+    out = _run_codec_batch(codec, ["a", "b", "c", "d"], [(1, 2), (1, 3), (1, 4), (1, 5)])
+    assert codec.codec.calls == 2                      # {a, b, c} at 3 + 1 frames, d at 1
+    for rid, v in zip("abcd", (2, 3, 4, 5), strict=True):
+        wav = out[rid]["audio_chunk"][0]
+        assert wav.shape[0] == _FakeCodec.SPF and (wav == int(v / 1000.0 * 32767)).all()
 
 
 def _live_tensors() -> int:
@@ -1093,15 +1139,8 @@ def test_encoder_regions_run_no_fft():
 def test_codec_region_runs_no_fft():
     """As the encoder's: the decode region's inverse DFT is a matmul, and its
     stream is still the full-history decode."""
-    from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
-    from mstar.model.nemotron_duplex.config import CodecConfig
-
-    torch.manual_seed(0)
-    ccfg = CodecConfig(base_hidden_size=8, latent_size=16, codebook_size=16, num_quantizers=4)
-    real = AudioCodec(ccfg).eval()
-    for prm in real.parameters():
-        if prm.is_floating_point():
-            prm.data.normal_(0, 0.05)
+    real = _tiny_real_codec()
+    ccfg = real.config
     cfg = NemotronDuplexConfig()
     cfg.eartts.num_quantizers = ccfg.num_quantizers
     codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
@@ -1110,20 +1149,9 @@ def test_codec_region_runs_no_fft():
         _without_fft(codec.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[label]),
         label)
     codes = torch.randint(0, ccfg.codebook_size, (23, ccfg.num_quantizers))
-    pieces = []
-    with torch.no_grad():
-        starts = list(range(0, 23, 5))
-        for start in starts:
-            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [codes[start:start + 5]]},
-                                       is_final_stream_chunk=start == starts[-1])
-            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None,
-                                  piecewise_runners={label: region})
-            pieces.append(codec.forward_batched("codec_chunk", eng,
-                                                **codec.preprocess("codec_chunk", eng, [inp]))["r"]["audio_chunk"][0])
-        whole, _ = real.decode(codes.unsqueeze(0))
+    stream = _codec_stream(codec, {"r": codes}, cfg.eartts.codec_chunk_frames, {label: region})["r"]
     assert region.calls >= 3
-    whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
-    torch.testing.assert_close(torch.cat(pieces), whole, atol=1, rtol=0)
+    torch.testing.assert_close(stream, _whole_decode(real, codes), atol=1, rtol=0)
 
 
 @pytest.mark.parametrize("autocast", [False, True])

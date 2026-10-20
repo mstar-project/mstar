@@ -362,10 +362,14 @@ class NemotronDuplexModel(Model):
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
                  max_session_s: float | None = None, max_prompt_tokens: int | None = None,
-                 **kwargs):
+                 codec_chunk_frames: int | None = None, **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
+        if codec_chunk_frames is not None:
+            if codec_chunk_frames < 1:
+                raise ValueError(f"codec_chunk_frames must be at least 1, got {codec_chunk_frames}")
+            self.config.eartts.codec_chunk_frames = codec_chunk_frames
         if max_session_s:
             self.max_session_s = max_session_s
         if max_prompt_tokens:
