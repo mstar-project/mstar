@@ -1047,6 +1047,23 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="context_only_views">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.context_only_views">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">context_only_views</span><span class="p">(</span>
+    <span class="n">views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">],</span> <span class="n">query_spans</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The views of a step's streams without the tokens the step appends: ``length`` shrinks by</span>
+<span class="sd">    ``to_compute`` (the pages beyond it dropped) and ``to_compute`` becomes the row's query count.</span>
+<span class="sd">    For attention over the stored context alone (``AttentionStep.context_only``)."""</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">view</span><span class="p">,</span> <span class="n">queries</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">views</span><span class="p">,</span> <span class="n">query_spans</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+        <span class="n">length</span> <span class="o">=</span> <span class="n">view</span><span class="o">.</span><span class="n">length</span> <span class="o">-</span> <span class="n">view</span><span class="o">.</span><span class="n">to_compute</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">start</span> <span class="o">+</span> <span class="n">length</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span> <span class="k">if</span> <span class="n">length</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">page_idxs</span><span class="o">=</span><span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">[:</span><span class="n">pages</span><span class="p">],</span> <span class="n">length</span><span class="o">=</span><span class="n">length</span><span class="p">,</span> <span class="n">to_compute</span><span class="o">=</span><span class="n">queries</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">out</span></div>
+
+
+
 <div class="viewcode-block" id="build_paged_indptrs">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.build_paged_indptrs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">build_paged_indptrs</span><span class="p">(</span>

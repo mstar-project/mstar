@@ -259,8 +259,35 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
        ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``. A
-       malformed or failing warmup is logged and skipped.
+       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
+       long prompts take (a long-context prefill). A malformed or failing warmup
+       is logged and skipped.
+   * - ``dist_timeout_s``
+     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
+       subgroups during weight load and warmup; serving keeps PyTorch's default.
+       Unset keeps PyTorch's default throughout. Raise it only where weight load,
+       JIT or CUDA-graph capture can exceed that default.
+   * - ``tp_allreduce``
+     - *(optional)* Small-message all-reduce path of every TP and SP group:
+       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``; any other value
+       fails at startup. The last two send
+       contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
+       torch symmetric memory: one-shot reads every peer's buffer over NVLink and
+       reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
+       Larger messages stay on NCCL, and so does one-shot inside a
+       ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
+       differs from NCCL's, so bf16 results can differ at the last bit. Falls back
+       to NCCL, with a warning, where symmetric memory cannot be set up on every
+       rank of the group.
+   * - ``tp_allreduce_max_kb``
+     - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
+       larger ones go to NCCL. It is also the size of the buffer each group
+       rendezvouses. Default 512.
+   * - ``tp_async_sched``
+     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
+       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+       overrides it).
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

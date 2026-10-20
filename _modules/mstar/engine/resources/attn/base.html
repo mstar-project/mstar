@@ -956,6 +956,7 @@ window.runMermaid = runMermaid;</script>
 <span class="n">_BACKEND_KV_CONFIG</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">AttnBackend</span><span class="p">,</span> <span class="nb">type</span><span class="p">[</span><span class="n">KVConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">AttnBackend</span><span class="o">.</span><span class="n">DENSE</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
     <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
+    <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
     <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLEX</span><span class="p">:</span> <span class="n">RingKVConfig</span><span class="p">,</span>
     <span class="n">AttnBackend</span><span class="o">.</span><span class="n">XPU_PAGED</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
 <span class="p">}</span>
@@ -1012,6 +1013,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">required</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">, but KV resource </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="si">!r}</span><span class="s2"> "</span>
                 <span class="sa">f</span><span class="s2">"holds a </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">kv_config</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">. "</span>
             <span class="p">)</span>
+        <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sm_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">backend</span> <span class="o">!=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"attention backend </span><span class="si">{</span><span class="n">backend</span><span class="o">.</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> ignores sm_scale; only "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="o">.</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> reads it"</span>
+            <span class="p">)</span>
         <span class="c1"># `shard` lives on the KVConfig base, so this is unchanged for both.</span>
         <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
@@ -1039,6 +1045,17 @@ window.runMermaid = runMermaid;</script>
             <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
             <span class="n">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">,</span> <span class="n">backend</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.flashinfer_mla</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlashInferMLAManager</span>
+
+            <span class="k">return</span> <span class="n">FlashInferMLAManager</span><span class="p">(</span>
+                <span class="n">kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
+                <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
+                <span class="n">sm_scale</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sm_scale</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.flashinfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlashInferManager</span>
 

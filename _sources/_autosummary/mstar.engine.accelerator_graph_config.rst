@@ -13,6 +13,7 @@ mstar.engine.accelerator\_graph\_config
 
    .. autosummary::
    
+      check_compile_mode
       decode_rows_then_prompt
       distribute_tokens
    

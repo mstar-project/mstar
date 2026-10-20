@@ -1045,7 +1045,11 @@ that depends on nothing: it names no cache, because it has none.</p></li>
 <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code> adds <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and five fields that
 a deployment can tune: <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>
 (the number of pinned host pages used for offload; 0 disables offload),
-<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> and <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code>.</p></td>
+<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> and <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code>. <code class="docutils literal notranslate"><span class="pre">layout=KVLayout.MLA</span></code> stores one
+Multi-head Latent Attention latent per token in place of K and V. It needs
+<code class="docutils literal notranslate"><span class="pre">kv_lora_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">qk_rope_head_dim</span></code>, and sets <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> to 1 and
+<code class="docutils literal notranslate"><span class="pre">head_dim</span></code> to their sum. Every rank holds the whole latent; only
+<code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code> shards, and MLA attention needs it set to the model’s query heads.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=RingKVConfig(...))</span></code></p></td>
 <td><p>A fixed-capacity frame ring. It adds <code class="docutils literal notranslate"><span class="pre">tokens_per_frame</span></code>, one
@@ -1056,11 +1060,19 @@ Ring storage is currently paired with FlexAttention.</p></td>
 <td><p>Self-attention planned over the named cache. <code class="docutils literal notranslate"><span class="pre">backend</span></code> selects
 <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code> (the default, which lets the engine pick the platform’s
 paged backend, FlashInfer for now), <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code>,
-<code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code> or <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code>. Leave it at <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> unless the
-model needs a specific kernel. FlashInfer and dense attention require a
-<code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
+<code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code>, <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code> or <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER_MLA</span></code>.
+Leave it at <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> unless the model needs a specific kernel. FlashInfer, dense
+and MLA attention require a <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a
+<code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> selects a kernel generation: <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fa2&quot;</span></code> or
-<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected.</p></td>
+<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
+Multi-head Latent Attention over a <code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code> cache. It needs <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code>,
+the softmax scale of the model’s original qk head dim, which the other backends
+refuse. Its <code class="docutils literal notranslate"><span class="pre">run</span></code> takes the absorbed query (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">kv_lora_rank]</span></code>)
+with the rope part as <code class="docutils literal notranslate"><span class="pre">q_pe</span></code>, and returns the output in the latent space, so
+the layer applies <code class="docutils literal notranslate"><span class="pre">W_UV</span></code>. FlashInfer’s kernel covers a 512-wide latent with a
+64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
+fallback, which cannot be captured in a CUDA graph.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
 <td><p>Attention over a paged context that is written once and never extended.
@@ -1458,7 +1470,10 @@ nothing. A request contributes one segment per label that is active for it.</p><
 <li><p>The <code class="docutils literal notranslate"><span class="pre">segments</span></code> argument of <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code> is a default value. Any <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code>
 that does not set its own <code class="docutils literal notranslate"><span class="pre">segments</span></code> uses this list.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">KVStep(commit=,</span> <span class="pre">combined_labels=,</span> <span class="pre">pre_forks=,</span> <span class="pre">post_forks=)</span></code>. See below.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=)</span></code> describes the attention plan. A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>
+<li><p><code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=,</span> <span class="pre">context_only=)</span></code> describes the attention plan.
+<code class="docutils literal notranslate"><span class="pre">context_only=True</span></code> has the queries attend to the stored context alone, not to the
+tokens this step appends, and the step’s own <code class="docutils literal notranslate"><span class="pre">segments</span></code> then give the query counts.
+Only the MLA backend reads it; the others refuse it. A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>
 steps through this same type. There, the segments are the whole layout rather than an
 extension of a cache. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">PositionStep(pos_ids=,</span> <span class="pre">advance=)</span></code>. With <code class="docutils literal notranslate"><span class="pre">pos_ids=None</span></code>, positions are derived from
@@ -1711,6 +1726,11 @@ one place. This field replaces the removed <code class="docutils literal notrans
 engine’s eager batch size for the walk. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>, so the engine never
 batches beyond a captured size.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> before capture. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode. The default, <code class="docutils literal notranslate"><span class="pre">None</span></code>, is
+<code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. <code class="docutils literal notranslate"><span class="pre">default</span></code> keeps Inductor’s fusion but takes cuBLAS for
+every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
+that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>, <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which
+fail inside the runner’s capture.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every bucket in the config mandatory. If capture fails locally or
 on another participating rank, warmup raises after rank-wide agreement instead of
 dropping the bucket and falling back to eager execution. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
@@ -1825,6 +1845,7 @@ them.</p></li>
 default.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is
 <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode, as on <code class="docutils literal notranslate"><span class="pre">AcceleratorGraphConfig</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every declared shape mandatory. If any participating rank cannot
 capture one, warmup raises instead of leaving that shape on the eager path. The default
 is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>

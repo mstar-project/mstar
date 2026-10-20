@@ -44,6 +44,7 @@
    logging_config
    orphan
    profiler
+   quant_fp8
    socket_prefix
    streams
 

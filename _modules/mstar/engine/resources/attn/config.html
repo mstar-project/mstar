@@ -954,7 +954,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FLASHINFER</span> <span class="o">=</span> <span class="s2">"flashinfer"</span>
     <span class="n">DENSE</span> <span class="o">=</span> <span class="s2">"dense"</span>
     <span class="n">FLEX</span> <span class="o">=</span> <span class="s2">"flex"</span>
-    <span class="n">XPU_PAGED</span> <span class="o">=</span> <span class="s2">"xpu_paged"</span></div>
+    <span class="n">XPU_PAGED</span> <span class="o">=</span> <span class="s2">"xpu_paged"</span>
+    <span class="c1"># Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's</span>
+    <span class="c1"># ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form</span>
+    <span class="n">FLASHINFER_MLA</span> <span class="o">=</span> <span class="s2">"flashinfer_mla"</span></div>
 
 
 
@@ -965,6 +968,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">kv_cache</span><span class="p">:</span> <span class="nb">str</span> <span class="c1"># name of the KV cache</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
     <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
+    <span class="c1"># softmax scale; None means the kernel default (head_dim ** -0.5). MLA must</span>
+    <span class="c1"># pass the *original* qk head dim's scale, not the latent width's. Only the MLA</span>
+    <span class="c1"># backend reads it; the others refuse it at build</span>
+    <span class="n">sm_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># FlashInfer only: combined walks whose captured steps plan their</span>
     <span class="c1"># one-token rows on the decode wrapper and their prompt rows on a prefill</span>
     <span class="c1"># wrapper sized to them (`FlashInferMixedWrapper`)</span>
@@ -1081,7 +1088,25 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionStep">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
-    <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
+    <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># queries attend to the stream's stored context only, not to the tokens this step appends</span>
+    <span class="c1"># (a draft block over the context the target has produced so far); the step's own</span>
+    <span class="c1"># `segments` then carry the query counts, the cache's segments the appended counts.</span>
+    <span class="c1"># Only the MLA backend reads it; the others refuse it (`refuse_context_only`).</span>
+    <span class="n">context_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
+
+
+
+<div class="viewcode-block" id="refuse_context_only">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.refuse_context_only">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">refuse_context_only</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">manager</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""For the attention resources that don't read ``context_only``: planned without it,</span>
+<span class="sd">    the step's queries would attend to the tokens it appends as well."""</span>
+    <span class="k">if</span> <span class="n">step</span><span class="o">.</span><span class="n">context_only</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">manager</span><span class="si">}</span><span class="s2"> does not read AttentionStep.context_only; only the "</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="o">.</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> backend does"</span>
+        <span class="p">)</span></div>
 
 </pre></div>
 

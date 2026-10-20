@@ -967,6 +967,24 @@ window.runMermaid = runMermaid;</script>
 <span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">]</span>
 
 
+<span class="c1"># torch.compile mode for a captured forward whose config's ``compile_mode`` is None</span>
+<span class="n">_DEFAULT_COMPILE_MODE</span> <span class="o">=</span> <span class="s2">"max-autotune-no-cudagraphs"</span>
+
+
+<div class="viewcode-block" id="compile_kwargs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.compile_kwargs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">compile_kwargs</span><span class="p">(</span><span class="n">config_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``torch.compile``'s arguments for a capture config whose ``compile_mode``</span>
+<span class="sd">    is ``config_mode``, which the config checked when it was built."""</span>
+    <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"fullgraph"</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"dynamic"</span><span class="p">:</span> <span class="kc">False</span><span class="p">}</span>
+    <span class="n">mode</span> <span class="o">=</span> <span class="n">_DEFAULT_COMPILE_MODE</span> <span class="k">if</span> <span class="n">config_mode</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config_mode</span>
+    <span class="c1"># "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">!=</span> <span class="s2">"default"</span><span class="p">:</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s2">"mode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">mode</span>
+    <span class="k">return</span> <span class="n">kwargs</span></div>
+
+
+
 <div class="viewcode-block" id="blocked_capture_resources">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.blocked_capture_resources">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">blocked_capture_resources</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -2178,10 +2196,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="n">forward</span>
         <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                <span class="n">forward</span><span class="p">,</span>
-                <span class="n">mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span>
-                <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">forward</span><span class="p">,</span> <span class="o">**</span><span class="n">compile_kwargs</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile_mode</span><span class="p">),</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">with_inductor_overrides</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">],</span> <span class="n">spec</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
@@ -3055,9 +3070,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">fn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">capture_fn</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">compile</span><span class="p">:</span>
             <span class="n">fn</span> <span class="o">=</span> <span class="n">with_inductor_overrides</span><span class="p">(</span>
-                <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                    <span class="n">fn</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="p">),</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="o">**</span><span class="n">compile_kwargs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">compile_mode</span><span class="p">)),</span>
                 <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
             <span class="p">)</span>
 

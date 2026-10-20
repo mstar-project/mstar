@@ -1143,8 +1143,9 @@ length); over it, the request gets a 400.</p></td>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>Async scheduling for lockstep-parallel (TP / SP) nodes. <code class="docutils literal notranslate"><span class="pre">1</span></code>: the
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+deployment config’s <code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code>. <code class="docutils literal notranslate"><span class="pre">1</span></code> (or <code class="docutils literal notranslate"><span class="pre">true</span></code>): the
 instance leader speculates step N+1 of the parallel node during
 forward N (the existing single-worker speculation machinery, gate
 opened) and broadcasts it at once as a speculative
@@ -1155,7 +1156,7 @@ critical path. Voids (allocation failure, per-rid failure, a
 continuing request without loop-back output) are derived by each
 rank from replicated state, never signalled. A comma-separated
 list of node names (<code class="docutils literal notranslate"><span class="pre">thinker,talker</span></code>) enables it for those
-parallel nodes only. <code class="docutils literal notranslate"><span class="pre">0</span></code>: the serial path — leader schedules
+parallel nodes only. <code class="docutils literal notranslate"><span class="pre">0</span></code> (or <code class="docutils literal notranslate"><span class="pre">false</span></code>): the serial path — leader schedules
 after N, followers rebuild after the broadcast. Set it identically
 on every rank of an instance: the workers compare it at startup and
 refuse to start on a mismatch. Leave <code class="docutils literal notranslate"><span class="pre">MSTAR_ENGINE_STEP_SYNC</span></code> at

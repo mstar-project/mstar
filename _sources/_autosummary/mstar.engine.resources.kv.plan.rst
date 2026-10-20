@@ -14,6 +14,7 @@ mstar.engine.resources.kv.plan
    .. autosummary::
    
       build_paged_indptrs
+      context_only_views
       group_by_plan_label
    
    

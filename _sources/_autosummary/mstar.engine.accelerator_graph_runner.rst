@@ -18,6 +18,7 @@ mstar.engine.accelerator\_graph\_runner
       blocked_capture_resources
       capture_into_graph
       capture_with_static_outputs
+      compile_kwargs
       dummy_metadata
       dummy_rid_handle
       dummy_rid_name

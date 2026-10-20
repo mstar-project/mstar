@@ -9,6 +9,12 @@ mstar.engine.resources.attn.config
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      refuse_context_only
+   
    
 
    

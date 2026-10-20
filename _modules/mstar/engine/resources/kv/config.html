@@ -951,9 +951,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVLayout">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVLayout">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVLayout</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
-    <span class="n">NHD</span> <span class="o">=</span> <span class="s2">"NHD"</span></div>
+    <span class="n">NHD</span> <span class="o">=</span> <span class="s2">"NHD"</span>
+    <span class="c1"># Multi-head Latent Attention: one compressed latent per token per layer,</span>
+    <span class="c1"># ``[num_layers, max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim]``.</span>
+    <span class="c1"># No K/V axis and a single (replicated) KV head; only query heads shard.</span>
+    <span class="n">MLA</span> <span class="o">=</span> <span class="s2">"MLA"</span></div>
 
-    <span class="c1"># TODO: can add more, like HND, MLA</span>
 
 
 <div class="viewcode-block" id="KVConfig">
@@ -1031,6 +1034,29 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># folded into the root, not checked at match time</span>
     <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``</span>
+    <span class="n">kv_lora_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">qk_rope_head_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which</span>
+    <span class="c1"># the attention backend would plan; a cache only stored (index keys) needs no query heads</span>
+    <span class="n">qo_heads_given</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layout</span> <span class="o">==</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">MLA</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">qo_heads_given</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="c1"># the cache stores one latent per token: a single KV "head" of the</span>
+            <span class="c1"># latent width, whatever the model's head counts are</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">latent_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Per-token cache width under MLA."""</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">layout</span> <span class="o">==</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">MLA</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
 
 <div class="viewcode-block" id="PagedKVConfig.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.apply_yaml_overrides">[docs]</a>
