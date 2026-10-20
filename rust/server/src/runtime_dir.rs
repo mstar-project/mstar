@@ -7,6 +7,42 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// `/tmp/mstar_uploads_<user>/`, as `default_upload_dir` in
+/// `mstar/utils/socket_prefix.py`: the ownership check refuses another user's
+/// upload dir, so one shared default would stop the second user on a host.
+pub fn default_upload_dir() -> PathBuf {
+    // getpass.getuser's order: these variables, then the passwd entry
+    let name = ["LOGNAME", "USER", "LNAME", "USERNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .or_else(passwd_name);
+    // SAFETY: getuid has no preconditions and cannot fail.
+    upload_dir_for(name.as_deref(), unsafe { libc::getuid() })
+}
+
+/// The user name when it is a short ASCII name, else the uid (the rule of
+/// `_user` in `mstar/utils/socket_prefix.py`).
+fn upload_dir_for(name: Option<&str>, uid: u32) -> PathBuf {
+    let tag = match name {
+        Some(n) if (1..=32).contains(&n.len())
+            && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) => n.to_string(),
+        _ => uid.to_string(),
+    };
+    PathBuf::from(format!("/tmp/mstar_uploads_{tag}/"))
+}
+
+fn passwd_name() -> Option<String> {
+    // SAFETY: called once at startup, before other threads could call getpw*;
+    // the entry is copied out before returning.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_name).to_str().ok().map(str::to_string)
+    }
+}
+
 /// Create `path` with mode 0700 if it is missing, then require a real
 /// directory owned by this user and not writable by group or others.
 ///
@@ -78,6 +114,27 @@ pub fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn the_default_upload_dir_is_per_user() {
+        // the cases of test_the_upload_dir_default_holds_the_user_name_only_when_short_and_ascii
+        let long = "a".repeat(32);
+        let accented = "\u{e9}".repeat(30);
+        for (name, kept) in [
+            (Some("alice"), true),
+            (Some(long.as_str()), true),
+            (Some(&"a".repeat(33)[..]), false),
+            (Some(accented.as_str()), false),
+            (Some("a b"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            let tag = if kept { name.unwrap().to_string() } else { "1234".to_string() };
+            assert_eq!(upload_dir_for(name, 1234), PathBuf::from(format!("/tmp/mstar_uploads_{tag}/")), "{name:?}");
+        }
+        assert_ne!(upload_dir_for(Some("alice"), 1), upload_dir_for(Some("bob"), 2));
+        assert!(default_upload_dir().starts_with("/tmp"));
+    }
 
     fn uid() -> u32 {
         unsafe { libc::geteuid() }

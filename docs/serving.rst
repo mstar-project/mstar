@@ -159,8 +159,10 @@ mstar-serve
        worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
        it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
-     - ``/tmp/mstar_uploads``
-     - Temp directory for uploaded media.
+     - ``/tmp/mstar_uploads_<user>/``
+     - Temp directory for uploaded media; per user, because the server
+       refuses an upload dir another user owns. The Dynamo worker uses the
+       same default.
    * - ``--timeout``
      - ``600``
      - Per-request timeout (seconds).

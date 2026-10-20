@@ -244,3 +244,85 @@ def test_an_existing_file_at_the_upload_name_is_not_overwritten(tmp_path, monkey
     with pytest.raises(FileExistsError):
         write_private_file(up / "planted.wav", b"new")
     assert outside.read_bytes() == b"keep"
+
+
+class _StopError(Exception):
+    pass
+
+
+def _upload_dirs(monkeypatch, tmp_path) -> dict:
+    """The upload dir each entry point uses when none is given, without starting a server."""
+    import sys
+    import types
+
+    from mstar.api_server import entrypoint
+    from mstar.cli import main as cli
+    from mstar.integrations.dynamo import worker
+    from mstar.model import registry
+
+    seen = {}
+
+    def fake_api_server(**kwargs):
+        seen["mstar-serve"] = kwargs["upload_dir"]
+        raise _StopError
+
+    class _Model:
+        PREPROCESS_TORCH_THREADS = None
+
+        def __init__(self, **kwargs):
+            pass
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("model: fake\n")
+    with monkeypatch.context() as m:
+        m.setattr(registry, "get_model_class", lambda name: _Model)
+        m.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+        m.setattr(entrypoint, "APIServer", fake_api_server)
+        with pytest.raises(_StopError):
+            entrypoint.main(["--config", str(cfg)])
+
+    def fake_ensure(path):
+        seen["APIServer"] = path
+        raise _StopError
+
+    with monkeypatch.context() as m:
+        m.setattr(entrypoint, "ensure_private_dir", fake_ensure)
+        with pytest.raises(_StopError):
+            entrypoint.APIServer()
+
+    def fake_build_server(args):
+        seen["dynamo worker"] = args.upload_dir
+        raise _StopError
+
+    with monkeypatch.context() as m:
+        m.setattr(worker, "build_server", fake_build_server)
+        with pytest.raises(_StopError):
+            worker.main(["--config", "c.yaml", "--model-path", "/m", "--socket-path-prefix", str(tmp_path)])
+
+    argvs = []
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "mstar.api_server.entrypoint", types.SimpleNamespace(main=argvs.append))
+        cli.main(["serve", "kokoro"])
+    seen["mstar serve"] = argvs[0][argvs[0].index("--upload-dir") + 1]
+    return seen
+
+
+def test_every_entry_point_defaults_to_a_per_user_upload_dir(monkeypatch, tmp_path):
+    # a shared default would be refused for every user but the one who created it
+    from mstar.utils import socket_prefix
+
+    monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: "alice")
+    assert _upload_dirs(monkeypatch, tmp_path) == dict.fromkeys(
+        ("mstar-serve", "APIServer", "dynamo worker", "mstar serve"), "/tmp/mstar_uploads_alice/")
+    monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: "bob")
+    assert set(_upload_dirs(monkeypatch, tmp_path).values()) == {"/tmp/mstar_uploads_bob/"}
+
+
+@pytest.mark.parametrize("name, kept", [("alice", True), ("a" * 32, True), ("a" * 33, False),
+                                        ("\u00e9" * 30, False), ("a b", False), ("", False)])
+def test_the_upload_dir_default_holds_the_user_name_only_when_short_and_ascii(monkeypatch, name, kept):
+    # the same rule as the socket prefix; the Rust twin is runtime_dir::upload_dir_for
+    from mstar.utils import socket_prefix
+
+    monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: name)
+    assert socket_prefix.default_upload_dir() == f"/tmp/mstar_uploads_{name if kept else os.getuid()}/"

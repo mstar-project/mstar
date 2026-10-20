@@ -100,11 +100,12 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let socket_dir = std::env::args().nth(3);
-    let upload_dir = private_dir_or_exit(Path::new(
+    let upload_dir = private_dir_or_exit(
         &std::env::args()
             .nth(4)
-            .unwrap_or_else(|| "/tmp/mstar_uploads".to_string()),
-    ));
+            .map(PathBuf::from)
+            .unwrap_or_else(runtime_dir::default_upload_dir),
+    );
     let sample_rate: u32 = std::env::var("MSTAR_SAMPLE_RATE")
         .ok()
         .and_then(|s| s.parse().ok())

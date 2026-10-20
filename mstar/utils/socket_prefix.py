@@ -31,6 +31,14 @@ def per_port_socket_prefix(port: int) -> str:
     return f"/tmp/mstar_{_user()}_{port}/"
 
 
+def default_upload_dir() -> str:
+    """``/tmp/mstar_uploads_<user>/``: ``ensure_private_dir`` refuses an upload
+    dir owned by another user, so one shared default would stop the second user
+    on a host from starting. The Rust frontend's twin is
+    ``runtime_dir::default_upload_dir``."""
+    return f"/tmp/mstar_uploads_{_user()}/"
+
+
 def per_launch_socket_prefix() -> str:
     """A new ``/tmp/mstar_<user>_<random>`` directory (mode 0700) for a server
     with no port of its own; the caller removes it at exit."""
