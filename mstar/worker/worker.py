@@ -2109,8 +2109,9 @@ class Worker:
         # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
         # the rid's own count is, or failed) has no step to retry: on success
         # the routing drops it too. Re-queued, it would run again with its
-        # loop-back inputs already spent.
-        prepared = set(node_batch.request_ids)
+        # loop-back inputs already spent. A row the cache served is retried,
+        # because its walk completes only on a step that runs.
+        prepared = set(node_batch.request_ids) | node_batch.cached_rids
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)

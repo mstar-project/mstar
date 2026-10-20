@@ -132,13 +132,13 @@ class _FakeWorker:
         self.scheduler.hold_requests(list(batch.request_to_worker_graph))
 
 
-def _batches(reason, prepared=("r0", "r1")):
+def _batches(reason, prepared=("r0", "r1"), cached=()):
     batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared),
+        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
     )
     return batch, node_batch
 
