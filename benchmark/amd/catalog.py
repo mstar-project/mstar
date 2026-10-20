@@ -125,6 +125,9 @@ class Arm:
     startup_timeout: int | None = None
     # Extra PYTHONPATH entries for the benchmark client (packages the client needs outside mstar's venv).
     client_path: tuple[str, ...] = ()
+    # A named mstar tree from the sweep's --tree NAME=PATH instead of its --worktree; the sweep skips the arm when
+    # that tree isn't given.
+    tree: str = ""
 
 
 VLLM_GUIDE = ("AMD vLLM guide https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/"
@@ -146,6 +149,14 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
     Arm("mstar-colocated", "mstar", ("tts",), client="ours_openai", rows=("qwen3tts_1p7b",),
         env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the single-worker config"),
+    # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
+    # change is measured in the same session. Each serves its own tree's configs.
+    Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",
+        env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
+        recipe="the mstar arm on the base tree (its head in the engine column)"),
+    Arm("mstar-base-tpasync", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_9b_tp2",), tree="base",
+        env={"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
+        recipe="the mstar-tpasync arm on the base tree"),
     Arm("vllm", "vllm", ("text",), client="vllm", image="vllm",
         recipe="image defaults (v0.31.0 picks ROCM_ATTN on gfx942, AITER off)"),
     Arm("vllm-aiter", "vllm", ("text",), client="vllm", image="vllm", env={"VLLM_ROCM_USE_AITER": "1"},
