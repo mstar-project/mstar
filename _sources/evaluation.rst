@@ -206,6 +206,17 @@ cases and served invariants. Speech cases use the ``tts``, ``asr`` and ``duplex`
 suite (``run e2e --kind chat_image|image|video|pi05|frames|...``). Inputs are built once into ``--data-dir``
 (``python -m benchmark.eval data e2e --out DIR``: Seed-TTS and LibriSpeech sets plus generated media).
 
+**Multi-GPU configs.** Tensor parallel, sequence parallel, split and disaggregated deployments
+(``whisper_large_tp2``, ``qwen3omni_thinker_tp2``, ``cosmos3_nano_sp2``, ``qwen3tts_1p7b_split``,
+``orpheus_pd_disaggregated``, ``qwen3omni_pd_disaggregated``) are optional entries with ``gpus: N``: select them with
+``--models tag:multi-gpu``. Such a model runs on N GPU slots of one host at once (``--hosts user@gpu8:0-7``), and
+a host with fewer slots never takes it. Each case has a wall cap (``case_timeout_s``; 3600 s by default, 900 s on
+these entries), which has to sit well above the slowest normal case on the host: a case still running then has
+hung, its server's Python stacks are saved (``py-spy dump`` when installed) to ``stacks.txt``, a hung head fails the
+row and a hung base reports it broken. py-spy shows threads, not coroutines, so a hang at an ``await`` in the API
+server shows an idle event loop. Where ptrace is restricted, ``--stacks-sudo`` retries the dump with ``sudo -n``; it
+is off by default because a refused ``sudo`` is logged, and often mailed, on shared clusters.
+
 The run directory holds every results file and ``report/report.md`` (a table for a PR body, details in toggles),
 ``report/chart.png`` and ``report/summary.json``. ``compare`` exits with 1 when any row is flagged, else with 2
 when any row has no verdict (its job failed or was interrupted, the model was skipped or never got a GPU, base
