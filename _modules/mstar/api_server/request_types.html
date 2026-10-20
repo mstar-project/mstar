@@ -1049,13 +1049,21 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.DataWorkerProfile">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">DataWorkerProfile</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Profiling reported by the API-server data worker at preprocess finish:</span>
-<span class="sd">    the timestamp at which the request was handed to the conductor and the</span>
-<span class="sd">    per-modality sizes of the raw inputs. (The data worker's tx/rx are read</span>
-<span class="sd">    directly from its tensor manager at request completion, not via this.)"""</span>
+<span class="w">    </span><span class="sd">"""Profiling reported by the API-server data worker at preprocess finish</span>
+<span class="sd">    (or failure): the timestamp at which the request was handed to the</span>
+<span class="sd">    conductor and the per-modality sizes of the raw inputs. (The data worker's</span>
+<span class="sd">    tx/rx are read directly from its tensor manager at request completion,</span>
+<span class="sd">    not via this.)"""</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">preprocess_finish_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># time.perf_counter</span>
-    <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">InputInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+    <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">InputInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># Set only with metrics on: the data worker's own numbers for the request.</span>
+    <span class="n">dequeue_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># perf_counter, taken off the data worker's queue</span>
+    <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># modality -&gt; size in bytes of each input file, read when it was dequeued</span>
+    <span class="n">upload_sizes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># preprocessing raised: the client gets an error chunk instead</span>
+    <span class="n">failed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 

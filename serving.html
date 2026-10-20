@@ -1307,6 +1307,38 @@ chunks (16-bit PCM at the chunk’s sample rate and channel count).</p></li>
 successful requests, from submission to the first chunk of each output modality
 reaching the API server (time to first audio, first image, first video frame).</p></li>
 </ul>
+<p>The data worker (a thread in the API server that loads each request’s media and runs
+the model’s prompt processing, preprocessing one request at a time) reports its own
+work.
+<code class="docutils literal notranslate"><span class="pre">input_modalities</span></code> is the request’s input modalities, sorted and comma-joined like
+<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_preprocess_seconds{model_name,</span> <span class="pre">input_modalities}</span></code>: histogram over
+requests whose preprocessing finished, from the data worker taking the request off its
+queue to handing it to the conductor. Unlike <code class="docutils literal notranslate"><span class="pre">mstar_request_preprocess_seconds</span></code> it
+leaves out the wait in the queue, and it counts requests whatever their outcome later.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_preprocess_failures_total{model_name,</span> <span class="pre">input_modalities}</span></code>:
+counter, requests whose preprocessing failed in the data worker, each once, whatever
+raised: a file count or media length over its limit, a file that cannot be decoded,
+the model’s prompt processing, or handing the inputs on. The client gets the error
+(a 400 for a bad input), so the request also ends as <code class="docutils literal notranslate"><span class="pre">outcome=&quot;error&quot;</span></code> in
+<code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code> unless its client had already gone. That counter counts
+failures from every stage by output modalities; this one only the data worker’s
+preprocessing, by input modalities (failures turning results into output chunks are
+not counted here).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_upload_size_bytes{model_name,</span> <span class="pre">modality}</span></code>: histogram, the size on disk of
+each image, audio or video file a request carried to the data worker (<code class="docutils literal notranslate"><span class="pre">modality</span></code> is
+<code class="docutils literal notranslate"><span class="pre">image</span></code>, <code class="docutils literal notranslate"><span class="pre">audio</span></code> or <code class="docutils literal notranslate"><span class="pre">video</span></code>), whether the request succeeded or failed. Every
+route writes its media to a file first: an upload as received, inline media (a
+<code class="docutils literal notranslate"><span class="pre">data:</span></code> URL, base64 files on <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>) after base64 decoding. The realtime
+route and long transcriptions send WAV files they write from the decoded audio, so
+those count the WAV sizes. Requests refused before they were submitted (an oversized
+body, a bad form) are not counted.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_data_worker_queue_depth{model_name}</span></code>: gauge, read at scrape time, requests
+submitted and not yet taken up by the data worker (the one it is working on is not
+counted). A request whose client went away still counts until the data worker takes
+it up.</p></li>
+</ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>kokoro<span class="w"> </span>--enable-metrics
 curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s1">'^mstar_'</span>
 </pre></div>

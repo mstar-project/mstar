@@ -625,6 +625,38 @@ Output, per output modality (``modality`` is the chunk's modality, e.g. ``audio`
   successful requests, from submission to the first chunk of each output modality
   reaching the API server (time to first audio, first image, first video frame).
 
+The data worker (a thread in the API server that loads each request's media and runs
+the model's prompt processing, preprocessing one request at a time) reports its own
+work.
+``input_modalities`` is the request's input modalities, sorted and comma-joined like
+``output_modalities``:
+
+- ``mstar_data_worker_preprocess_seconds{model_name, input_modalities}``: histogram over
+  requests whose preprocessing finished, from the data worker taking the request off its
+  queue to handing it to the conductor. Unlike ``mstar_request_preprocess_seconds`` it
+  leaves out the wait in the queue, and it counts requests whatever their outcome later.
+- ``mstar_data_worker_preprocess_failures_total{model_name, input_modalities}``:
+  counter, requests whose preprocessing failed in the data worker, each once, whatever
+  raised: a file count or media length over its limit, a file that cannot be decoded,
+  the model's prompt processing, or handing the inputs on. The client gets the error
+  (a 400 for a bad input), so the request also ends as ``outcome="error"`` in
+  ``mstar_requests_total`` unless its client had already gone. That counter counts
+  failures from every stage by output modalities; this one only the data worker's
+  preprocessing, by input modalities (failures turning results into output chunks are
+  not counted here).
+- ``mstar_upload_size_bytes{model_name, modality}``: histogram, the size on disk of
+  each image, audio or video file a request carried to the data worker (``modality`` is
+  ``image``, ``audio`` or ``video``), whether the request succeeded or failed. Every
+  route writes its media to a file first: an upload as received, inline media (a
+  ``data:`` URL, base64 files on ``/generate/ws``) after base64 decoding. The realtime
+  route and long transcriptions send WAV files they write from the decoded audio, so
+  those count the WAV sizes. Requests refused before they were submitted (an oversized
+  body, a bad form) are not counted.
+- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests
+  submitted and not yet taken up by the data worker (the one it is working on is not
+  counted). A request whose client went away still counts until the data worker takes
+  it up.
+
 .. code-block:: bash
 
    mstar serve kokoro --enable-metrics
