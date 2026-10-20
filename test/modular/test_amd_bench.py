@@ -150,7 +150,7 @@ def test_run_rows_shares_the_gpu_pool(monkeypatch):
 def test_arms_of_a_row_get_their_own_ports(monkeypatch):
     ports = []
     monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: ports.append((arm.name, port)))
-    plan = type("P", (), {"arms": ["mstar", "vllm-omni", "vllm-omni-tuned", "sglang-omni"]})()
+    plan = type("P", (), {"arms": ["mstar", "vllm-omni", "vllm-omni-tuned", "sglang-omni"], "trees": {}})()
     sweep.run_row(plan, catalog.ROWS["qwen3tts_1p7b"], 1, [3], 8480)
     assert sorted(p for _, p in ports) == [8480, 8481, 8482, 8483] and ports[0][0] == "vllm-omni"
 
@@ -252,8 +252,8 @@ def test_sglang_omni_launch(tmp_path):
     assert Launch(catalog.ARMS["mstar"], catalog.ROWS["kokoro"], [3], 8405, tmp_path / "ko",
                   worktree=wt).startup_wait == 3600
     t = tables.TABLES["tts"]
-    assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "mstar-colocated", "vllm-omni",
-                                                                     "vllm-omni-tuned", "sglang-omni"]
+    assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "mstar-colocated", "mstar-base",
+                                                                     "vllm-omni", "vllm-omni-tuned", "sglang-omni"]
     log = tmp_path / "server.log"
     log.write_text("SGLang runtime configuration: gpu_id=0, sm=94, attention_backend=aiter, "
                    "decode_attention_backend=aiter, prefill_attention_backend=aiter, sampling_backend=pytorch\n")
@@ -298,6 +298,47 @@ def test_mstar_arms_serve_their_own_configs(tmp_path):
     (wt / "configs" / "qwen3tts_1p7b_split_bf16.yaml").unlink()
     with pytest.raises(FileNotFoundError):
         served("mstar")
+
+
+def test_base_arms_serve_the_base_tree(tmp_path, monkeypatch):
+    from benchmark.amd.launch import arm_worktree, tree_list
+
+    head, base = tmp_path / "head", tmp_path / "base"
+    for t in (head, base):
+        (t / "configs").mkdir(parents=True)
+        for name in ("qwen3tts_1p7b", "qwen3tts_1p7b_split_bf16"):
+            (t / "configs" / f"{name}.yaml").write_text(f"model: {name}\n")
+    trees = tree_list([f"base={base}"])
+    assert trees == {"base": base.resolve()}
+    for bad in ("base", f"={base}", f"base={tmp_path / 'nope'}"):
+        with pytest.raises(ValueError):
+            tree_list([bad])
+    mstar, mstar_base = catalog.ARMS["mstar"], catalog.ARMS["mstar-base"]
+    assert arm_worktree(mstar, head, trees) == head and arm_worktree(mstar_base, head, {}) is None
+    # The base arm serves its own tree's default config, the single-worker one on Qwen3-TTS 1.7B.
+    row = catalog.ROWS["qwen3tts_1p7b"]
+    b = Launch(mstar_base, row, [2], 8400, tmp_path / "b", worktree=arm_worktree(mstar_base, head, trees))
+    assert b.mstar_config() == base.resolve() / "configs" / "qwen3tts_1p7b.yaml"
+    seen = []
+    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: seen.append((arm.name, port)))
+    dense, tp2 = list(tables.TABLES["qwen35-dense"].arms), catalog.ROWS["qwen3_5_9b_tp2"]
+    # Without --tree base the row runs as before: same arms, order and ports.
+    sweep.run_row(type("P", (), {"arms": dense, "trees": {}})(), tp2, 0, [0, 1], 8400)
+    assert seen == [("mstar", 8400), ("mstar-tpasync", 8401), ("vllm", 8402), ("vllm-aiter", 8403),
+                    ("sglang-aiter", 8404)]
+    seen.clear()
+    sweep.run_row(type("P", (), {"arms": dense, "trees": trees})(), tp2, 0, [0, 1], 8400)
+    assert [n for n, _ in seen][:4] == ["mstar", "mstar-tpasync", "mstar-base", "mstar-base-tpasync"]
+
+
+def test_correctness_reads_each_arm_s_tree(tmp_path):
+    from benchmark.amd import correctness
+
+    d = tmp_path / "arm"
+    (d / "server").mkdir(parents=True)
+    assert correctness._arm_tree(d, tmp_path) == tmp_path
+    (d / "server" / "versions.json").write_text(json.dumps({"git": {"worktree": "/trees/base"}}))
+    assert correctness._arm_tree(d, tmp_path) == Path("/trees/base")
 
 
 def test_table_render(tmp_path):
