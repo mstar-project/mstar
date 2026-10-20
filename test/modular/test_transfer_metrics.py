@@ -56,6 +56,13 @@ class _Sink:
     def send(self, entity_id, msg):
         self.sent.append((entity_id, msg))
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
     def get_all_new_messages(self):
         return []
 

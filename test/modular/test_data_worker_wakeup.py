@@ -8,6 +8,7 @@ import select
 import threading
 import time
 from concurrent.futures import Future
+from types import SimpleNamespace
 
 from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread
 from mstar.communication.event import EventWakeup
@@ -41,6 +42,13 @@ class _PollingComm:
     def send(self, entity, msg):
         pass
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
 
 class _BareComm:
     def get_all_new_messages(self):
@@ -48,6 +56,13 @@ class _BareComm:
 
     def send(self, entity, msg):
         pass
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
 
 class _TM:

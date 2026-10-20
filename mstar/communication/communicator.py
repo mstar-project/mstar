@@ -1,3 +1,4 @@
+import collections
 import fcntl
 import logging
 import os
@@ -44,7 +45,7 @@ class BaseCommunicator(ABC):
         """Send a message already encoded with ``self.codec`` without
         blocking: False, with nothing sent, when the peer is at its high-water
         mark. A loop that must keep reading its own input while a peer is slow
-        sends with this and retries later."""
+        sends with this and retries later (see ``OutboxCommunicator``)."""
         raise NotImplementedError(f"{type(self).__name__} has no non-blocking send")
 
     @abstractmethod
@@ -283,7 +284,59 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
                     "expected %s — a stale wheel may be shadowing the "
                     "vendored rust/ build (rebuild with `maturin develop "
                     "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
-            return RustZMQCommunicator(*args, **kwargs)
+            if hasattr(mstar_rust.ZmqCommunicator, "try_send"):
+                return RustZMQCommunicator(*args, **kwargs)
+            # built before try_send, which OutboxCommunicator's sends need:
+            # every request would fail on its first send
+            stale = (f"mstar_rust {version} predates ZmqCommunicator.try_send; "
+                     "rebuild it with `maturin develop --release` in rust/")
+            if choice == "1":
+                raise RuntimeError(stale)
+            logger.warning("%s. Using pyzmq meanwhile", stale)
     logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
     return ZMQCommunicator(*args, **kwargs)
 
+
+class OutboxCommunicator:
+    """A communicator whose sends never block: a send the peer can't take now
+    (at its high-water mark) is queued, in order behind any earlier one to the
+    same peer, and retried by ``flush``.
+
+    For a loop that peers block on while it sends to them (the API server's
+    preprocess thread, against the conductor and the workers): if it blocked on
+    a full peer it would stop reading the input that peer waits to deliver, and
+    the two would wait on each other for good. Everything else is the wrapped
+    communicator's.
+    """
+
+    def __init__(self, inner: BaseCommunicator):
+        self._inner = inner
+        self._outbox: dict[str, collections.deque[bytes]] = {}
+
+    def send(self, entity_id: str, msg) -> None:
+        # Encoded here, queued or not: a message the codec refuses fails its
+        # sender now, as a blocking send would, rather than at the head of the
+        # queue where it would hold up every later message.
+        data = self._inner.codec.encode(msg)
+        backlog = self._outbox.get(entity_id)
+        if backlog or not self._inner.try_send_bytes(entity_id, data):
+            self._outbox.setdefault(entity_id, collections.deque()).append(data)
+
+    def flush(self) -> bool:
+        """Send what peers can take now; True if anything is still queued.
+
+        A queued message whose send fails outright (not just a full peer) is
+        dropped and logged: there is no caller left to raise to, and keeping
+        it would stop every message behind it."""
+        for entity_id, backlog in self._outbox.items():
+            while backlog:
+                try:
+                    if not self._inner.try_send_bytes(entity_id, backlog[0]):
+                        break
+                except Exception:  # noqa: BLE001 — that message's failure alone
+                    logger.exception("Dropping a queued message to %s that failed to send", entity_id)
+                backlog.popleft()
+        return any(self._outbox.values())
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)

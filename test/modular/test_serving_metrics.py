@@ -716,8 +716,12 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
-        communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                           send=lambda entity, msg: sent.append(msg)),
+        # codec / try_send_bytes: the thread's outbox sends through them
+        communicator=types.SimpleNamespace(
+            get_all_new_messages=lambda: [],
+            codec=types.SimpleNamespace(encode=lambda msg: msg),
+            try_send_bytes=lambda entity, msg: sent.append(msg) or True,
+        ),
         tensor_manager=_StubTensorManager(), model=_Model(),
         timing_requested=facade.timing_requested,
     )
@@ -1055,8 +1059,12 @@ class _RealDataWorker:
             abort_request_queue=facade.abort_request_queue,
             reads_done_queue=facade.reads_done_queue,
             discard_tensor_queue=facade.discard_tensor_queue, stop_event=facade.stop_event,
-            communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                               send=lambda entity, msg: self.sent.append(msg)),
+            # codec / try_send_bytes: the thread's outbox sends through them
+            communicator=types.SimpleNamespace(
+                get_all_new_messages=lambda: [],
+                codec=types.SimpleNamespace(encode=lambda msg: msg),
+                try_send_bytes=lambda entity, msg: self.sent.append(msg) or True,
+            ),
             tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
             worker_metrics_requested=facade.worker_metrics_requested,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,6 +71,13 @@ class _Conductor:
 
     def send(self, entity, msg):
         self.sent.append((entity, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def deliver(self, message_type, body):
         self.inbox.put(WorkerMessage(message_type=message_type, body=body))
