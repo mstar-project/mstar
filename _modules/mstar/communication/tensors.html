@@ -2731,6 +2731,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        before ACKing (which the soft path would otherwise defer forever).</span>
 <span class="sd">        """</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cleanup_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">force</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="TensorCommunicationManager.unlink_owned_files">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">unlink_owned_files</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># noqa: B027</span>
+<span class="w">        </span><span class="sd">"""Unlink the shared-memory files this process wrote for its peers and</span>
+<span class="sd">        still owns. A no-op here: only the SHM file transport (and the arena's</span>
+<span class="sd">        spills) writes any."""</span></div>
 </div>
 
 
@@ -3280,7 +3288,24 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"SHM: unlinked </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
                 <span class="k">pass</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+
+<div class="viewcode-block" id="SharedMemoryCommunicationManager.unlink_owned_files">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.SharedMemoryCommunicationManager.unlink_owned_files">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">unlink_owned_files</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Unlink every tensor file this manager wrote that is still waiting</span>
+<span class="sd">        for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is</span>
+<span class="sd">        stopping. A second call finds nothing left."""</span>
+        <span class="n">files</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span>
+        <span class="k">while</span> <span class="n">files</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">files</span><span class="o">.</span><span class="n">popitem</span><span class="p">()</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+                <span class="c1"># Already gone (FileNotFoundError) or not removable: either</span>
+                <span class="c1"># way, keep going so the rest are still reclaimed.</span>
+                <span class="k">pass</span></div>
+</div>
 
 
 

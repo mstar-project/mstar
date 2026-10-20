@@ -691,6 +691,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.start_read_tensors()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.StoredOutputs"><code class="docutils literal notranslate"><span class="pre">StoredOutputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -738,6 +739,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transfer_stats"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transfer_stats</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transport_label"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transport_label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.unlink_owned_files()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_shard_dim"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_shard_dim</span></code></a></li>
 </ul>
@@ -1281,6 +1283,19 @@ uuid, so taking uuids avoids rebuilding one per tensor.</p>
 <li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.SharedMemoryCommunicationManager.unlink_owned_files">
+<span class="sig-name descname"><span class="pre">unlink_owned_files</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#SharedMemoryCommunicationManager.unlink_owned_files"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.unlink_owned_files" title="Link to this definition">#</a></dt>
+<dd><p>Unlink every tensor file this manager wrote that is still waiting
+for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
+stopping. A second call finds nothing left.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1888,6 +1903,19 @@ What is stored is what the general path would store: one uuid per
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files">
+<span class="sig-name descname"><span class="pre">unlink_owned_files</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.unlink_owned_files"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files" title="Link to this definition">#</a></dt>
+<dd><p>Unlink the shared-memory files this process wrote for its peers and
+still owns. A no-op here: only the SHM file transport (and the arena’s
+spills) writes any.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name">
 <span class="sig-name descname"><span class="pre">uuid_to_edge_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name" title="Link to this definition">#</a></dt>
@@ -2138,6 +2166,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.start_read_tensors()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.StoredOutputs"><code class="docutils literal notranslate"><span class="pre">StoredOutputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2185,6 +2214,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transfer_stats"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transfer_stats</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transport_label"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transport_label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.unlink_owned_files()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_shard_dim"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_shard_dim</span></code></a></li>
 </ul>
