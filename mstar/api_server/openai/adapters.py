@@ -1157,13 +1157,19 @@ class GlmChatAdapter(TextChatAdapter):
     the checkpoint's chat template; the reply comes back with
     ``reasoning_content`` and ``tool_calls`` split out (see ``glm_chat``).
 
-    ``tool_choice`` is ``"auto"`` (default) or ``"none"``, which leaves the tools
-    out of the prompt; ``"required"`` and a named function need constrained
-    decoding and are refused. ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always
-    reasons, and turning it off is a 400), ``reasoning_effort`` and
-    ``clear_thinking`` reach the template, flat in ``extra_body`` or under
-    ``chat_template_kwargs``; other template keys are dropped, as vLLM drops the
-    ones a template does not read.
+    ``tool_choice`` is ``"auto"`` (default), ``"none"``, which leaves the tools
+    out of the prompt, ``"required"`` or a named function. With no grammar, a
+    forced call is the prompt's: it ends in ``<tool_call>`` (and the name), so
+    the reply opens inside the call. ``"required"`` over one tool names it;
+    over several the model picks, and a name it makes up stays text. The call
+    opens the reply, so a forced call has no reasoning: GLM-5.2's prompt ends
+    as with thinking off, GLM-5.3's closes the empty ``<think>``, and an
+    explicit ``enable_thinking`` with it is a 400.
+
+    ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always reasons, and turning it
+    off is a 400), ``reasoning_effort`` and ``clear_thinking`` reach the
+    template, flat in ``extra_body`` or under ``chat_template_kwargs``; other
+    template keys are dropped, as vLLM drops the ones a template does not read.
     """
 
     def __init__(self, *, always_thinks: bool):
@@ -1177,7 +1183,7 @@ class GlmChatAdapter(TextChatAdapter):
         ]})
         args = super().chat_to_request(checked, upload_dir)
         mk = args.model_kwargs
-        tools, template_kwargs = self._options(mk)
+        tools, template_kwargs, forced = self._options(mk)
         thinking = template_kwargs.get("enable_thinking")
         if self.always_thinks and thinking is not None and not thinking:
             # the template has no switch, so off would still reason
@@ -1185,28 +1191,30 @@ class GlmChatAdapter(TextChatAdapter):
         mk["messages"] = glm_chat.template_messages(req.messages)
         if tools:
             mk["tools"] = tools
+        if forced is not None:
+            # GLM-5.3's prompt ends inside <think>: an empty reasoning, as the template
+            # renders a turn without one
+            mk["reply_prefix"] = (glm_chat.THINK_END if self.always_thinks else "") + glm_chat.CALL_START + forced
         mk["chat_template_kwargs"] = template_kwargs
         return args
 
     def make_output_parser(self, req: ChatCompletionRequest):
-        tools, template_kwargs = self._options(_passthrough(req))
+        tools, template_kwargs, forced = self._options(_passthrough(req))
         # truthiness, as the GLM-5.2 template reads it
         thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
         return glm_chat.GlmReplyParser(
-            thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None,
+            thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None, forced_call=forced,
         )
 
-    @staticmethod
-    def _options(mk: dict) -> tuple[list | None, dict]:
-        """Takes ``tools``, ``tool_choice`` and the template's keys out of ``mk``."""
+    def _options(self, mk: dict) -> tuple[list | None, dict, str | None]:
+        """Takes ``tools``, ``tool_choice`` and the template's keys out of ``mk``.
+        The third is the call a forced ``tool_choice`` opens the reply with:
+        the function's name, or ``""`` for the model to name one."""
+        if "reply_prefix" in mk:
+            raise ValueError("reply_prefix is not a request field; tool_choice sets it")
         tools = mk.pop("tools", None) or None
         choice = mk.pop("tool_choice", None)
-        if choice not in (None, "auto", "none"):
-            raise ValueError(f"tool_choice {choice!r} needs constrained decoding; use 'auto' or 'none'")
-        if tools is not None:
-            glm_chat.tool_parameters(tools)
-            if choice == "none":
-                tools = None
+        names = list(glm_chat.tool_parameters(tools)) if tools is not None else []
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if not isinstance(template_kwargs, dict):
             raise ValueError("chat_template_kwargs must be an object")
@@ -1214,7 +1222,29 @@ class GlmChatAdapter(TextChatAdapter):
         for key in glm_chat.TEMPLATE_KWARGS:
             if key in mk:
                 template_kwargs.setdefault(key, mk.pop(key))
-        return tools, template_kwargs
+        forced = None
+        if choice == "none":
+            tools = None
+        elif choice == "required" or isinstance(choice, dict):
+            if not names:
+                raise ValueError(f"tool_choice {choice!r} needs tools")
+            if choice == "required":
+                forced = names[0] if len(names) == 1 else ""
+            else:
+                fn = choice.get("function")
+                forced = fn.get("name") if choice.get("type") == "function" and isinstance(fn, dict) else None
+                if forced not in names:
+                    raise ValueError(f"tool_choice {choice!r} names no function in tools {names}")
+            if template_kwargs.get("enable_thinking"):
+                raise ValueError("a forced tool call opens the reply, which leaves no room to reason; "
+                                 "leave enable_thinking unset, or use tool_choice 'auto'")
+            if not self.always_thinks:
+                # the prompt ends in <think></think>, as a turn that does not reason
+                template_kwargs["enable_thinking"] = False
+        elif choice not in (None, "auto"):
+            raise ValueError(f"tool_choice takes 'auto', 'none', 'required' or "
+                             f"{{'type': 'function', 'function': {{'name': ...}}}}; got {choice!r}")
+        return tools, template_kwargs, forced
 
 
 class OmnilingualASRAdapter(OpenAIAdapter):

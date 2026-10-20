@@ -157,15 +157,19 @@ class GlmReplyParser:
     call may end the reasoning without ``</think>``, and a call to a function the
     request did not offer stays text.
     Content is stripped at both ends, as the template strips it on the way back.
+    ``forced_call`` says the prompt opened a call (a forced ``tool_choice``):
+    the reply starts inside it, after the name if the prompt gave one.
     """
 
-    def __init__(self, *, thinking: bool, tools: dict[str, dict] | None):
+    def __init__(self, *, thinking: bool, tools: dict[str, dict] | None, forced_call: str | None = None):
         self._thinking = thinking
         self._state = "reasoning" if thinking else "content"
         self._tools = tools
         self._buf = ""
         # a call's text up to the last feed that did not end it
         self._call_text: list[str] = []
+        if forced_call is not None:
+            self._state, self._call_text = "call", [forced_call]
         self._calls = 0
         self._content_started = False
         self._held_space = ""

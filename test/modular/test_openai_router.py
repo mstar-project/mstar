@@ -788,14 +788,18 @@ def test_glm_chat_streams_reasoning_then_the_call(client_and_stub):
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
-def test_glm_chat_refuses_a_required_tool_choice(client_and_stub):
+def test_glm_chat_forces_a_required_tool_call(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "glm52"
-    r = client.post("/v1/chat/completions", json={
+    # the prompt ended in <tool_call>get_weather: the reply starts at the arguments
+    stub.next_chunks = [_Chunk("text", b"<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>")]
+    choice = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}],
         "tools": _GLM_TOOLS, "tool_choice": "required",
-    })
-    assert r.status_code == 400 and "constrained decoding" in r.json()["error"]["message"]
+    }).json()["choices"][0]
+    assert stub.last_submit["model_kwargs"]["reply_prefix"] == "<tool_call>get_weather"
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
 
 
 def _usage_chunks(*parts, stop=True):
