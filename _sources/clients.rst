@@ -237,7 +237,7 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``
+     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -306,7 +306,16 @@ Per-model notes:
   Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
   as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
   once, each cut at the quietest moment before its boundary. Segment timestamps
-  are offset to the whole file.
+  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
+  (5 to 30) sets the window length for one request, and an upload longer than it
+  is windowed.
+- **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
+  its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
+  clip of up to 20 s is one request; a longer upload is cut into windows of about equal
+  length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
+  in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
+  get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
+  ``language`` is the request's ``language`` as given, or null.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``

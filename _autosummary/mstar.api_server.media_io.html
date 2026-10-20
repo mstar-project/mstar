@@ -311,6 +311,14 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnilingual_asr.audio.html">mstar.model.omnilingual_asr.audio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnilingual_asr.components.html">mstar.model.omnilingual_asr.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnilingual_asr.config.html">mstar.model.omnilingual_asr.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnilingual_asr.tokenizer.html">mstar.model.omnilingual_asr.tokenizer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnilingual_asr.weight_loader.html">mstar.model.omnilingual_asr.weight_loader</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
@@ -634,6 +642,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.window_stop"><code class="docutils literal notranslate"><span class="pre">window_stop()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.write_wav"><code class="docutils literal notranslate"><span class="pre">write_wav()</span></code></a></li>
 </ul>
             </nav>
@@ -720,7 +729,10 @@ the base install stays slim.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.wav_stream_header" title="mstar.api_server.media_io.wav_stream_header"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wav_stream_header</span></code></a>(sample_rate[, ...])</p></td>
 <td><p>A 44-byte WAV header with streaming (unknown-length) size fields.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.write_wav" title="mstar.api_server.media_io.write_wav"><code class="xref py py-obj docutils literal notranslate"><span class="pre">write_wav</span></code></a>(audio, path[, sample_rate])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.window_stop" title="mstar.api_server.media_io.window_stop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">window_stop</span></code></a>(start, total, step, balanced)</p></td>
+<td><p>Nominal end of the window starting at <code class="docutils literal notranslate"><span class="pre">start</span></code>: <code class="docutils literal notranslate"><span class="pre">step</span></code> samples on, or, <code class="docutils literal notranslate"><span class="pre">balanced</span></code>, an equal share of what is left over the fewest windows of at most <code class="docutils literal notranslate"><span class="pre">step</span></code> (so the last window is never a sliver).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.write_wav" title="mstar.api_server.media_io.write_wav"><code class="xref py py-obj docutils literal notranslate"><span class="pre">write_wav</span></code></a>(audio, path[, sample_rate])</p></td>
 <td><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p></td>
 </tr>
 </tbody>
@@ -1053,13 +1065,14 @@ publicly should allowlist hosts or disable remote fetch (data-URL only).</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.split_windows">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">split_windows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_seconds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">search_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">frame_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.02</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#split_windows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.split_windows" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">split_windows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_seconds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">search_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">frame_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.02</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">balanced</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#split_windows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.split_windows" title="Link to this definition">#</a></dt>
 <dd><p>Cut a waveform into consecutive windows of at most <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>;
 concatenating them gives the input back sample for sample.</p>
 <p>With <code class="docutils literal notranslate"><span class="pre">search_seconds</span></code> a cut is moved back from its nominal boundary to
 the end of the quietest <code class="docutils literal notranslate"><span class="pre">frame_seconds</span></code> frame within that span (the
 last such frame on a tie, so silence cuts at the boundary): the cut lands
-in a pause rather than on a word when there is one to find.</p>
+in a pause rather than on a word when there is one to find. <code class="docutils literal notranslate"><span class="pre">balanced</span></code>
+places the nominal boundaries as <a class="reference internal" href="#mstar.api_server.media_io.window_stop" title="mstar.api_server.media_io.window_stop"><code class="xref py py-func docutils literal notranslate"><span class="pre">window_stop()</span></code></a> does.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1067,6 +1080,7 @@ in a pause rather than on a word when there is one to find.</p>
 <li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>search_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
 <li><p><strong>frame_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>balanced</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1093,6 +1107,27 @@ open-ended stream, which players and the OpenAI client’s
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.window_stop">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">window_stop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">start</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">balanced</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#window_stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.window_stop" title="Link to this definition">#</a></dt>
+<dd><p>Nominal end of the window starting at <code class="docutils literal notranslate"><span class="pre">start</span></code>: <code class="docutils literal notranslate"><span class="pre">step</span></code> samples on,
+or, <code class="docutils literal notranslate"><span class="pre">balanced</span></code>, an equal share of what is left over the fewest windows
+of at most <code class="docutils literal notranslate"><span class="pre">step</span></code> (so the last window is never a sliver).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>total</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>balanced</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1182,6 +1217,7 @@ open-ended stream, which players and the OpenAI client’s
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.window_stop"><code class="docutils literal notranslate"><span class="pre">window_stop()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.write_wav"><code class="docutils literal notranslate"><span class="pre">write_wav()</span></code></a></li>
 </ul>
   </nav></div>

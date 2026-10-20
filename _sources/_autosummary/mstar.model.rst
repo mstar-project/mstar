@@ -39,6 +39,7 @@
    media_limits
    multimodal
    nemotron_duplex
+   omnilingual_asr
    omnivoice
    orpheus
    pi05

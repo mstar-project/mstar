@@ -664,6 +664,14 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.audio.html">mstar.model.omnilingual_asr.audio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.components.html">mstar.model.omnilingual_asr.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.config.html">mstar.model.omnilingual_asr.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.tokenizer.html">mstar.model.omnilingual_asr.tokenizer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.weight_loader.html">mstar.model.omnilingual_asr.weight_loader</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
@@ -1310,11 +1318,25 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="window_stop">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.window_stop">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">window_stop</span><span class="p">(</span><span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">total</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">balanced</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Nominal end of the window starting at ``start``: ``step`` samples on,</span>
+<span class="sd">    or, ``balanced``, an equal share of what is left over the fewest windows</span>
+<span class="sd">    of at most ``step`` (so the last window is never a sliver)."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">balanced</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">total</span><span class="p">,</span> <span class="n">start</span> <span class="o">+</span> <span class="n">step</span><span class="p">)</span>
+    <span class="n">remaining</span> <span class="o">=</span> <span class="n">total</span> <span class="o">-</span> <span class="n">start</span>
+    <span class="n">windows</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">remaining</span> <span class="o">//</span> <span class="n">step</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">start</span> <span class="o">+</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">remaining</span> <span class="o">//</span> <span class="n">windows</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="split_windows">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.split_windows">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">split_windows</span><span class="p">(</span>
     <span class="n">audio</span><span class="p">,</span> <span class="n">window_seconds</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16000</span><span class="p">,</span>
-    <span class="n">search_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span> <span class="n">frame_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.02</span><span class="p">,</span>
+    <span class="n">search_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span> <span class="n">frame_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.02</span><span class="p">,</span> <span class="n">balanced</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Cut a waveform into consecutive windows of at most ``window_seconds``;</span>
 <span class="sd">    concatenating them gives the input back sample for sample.</span>
@@ -1322,7 +1344,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    With ``search_seconds`` a cut is moved back from its nominal boundary to</span>
 <span class="sd">    the end of the quietest ``frame_seconds`` frame within that span (the</span>
 <span class="sd">    last such frame on a tie, so silence cuts at the boundary): the cut lands</span>
-<span class="sd">    in a pause rather than on a word when there is one to find.</span>
+<span class="sd">    in a pause rather than on a word when there is one to find. ``balanced``</span>
+<span class="sd">    places the nominal boundaries as :func:`window_stop` does.</span>
 <span class="sd">    """</span>
     <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span>
     <span class="n">step</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="n">window_seconds</span> <span class="o">*</span> <span class="n">sample_rate</span><span class="p">))</span>
@@ -1330,7 +1353,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">frame</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="n">frame_seconds</span> <span class="o">*</span> <span class="n">sample_rate</span><span class="p">)))</span>
     <span class="n">pieces</span><span class="p">,</span> <span class="n">start</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span>
     <span class="k">while</span> <span class="n">start</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">):</span>
-        <span class="n">stop</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">),</span> <span class="n">start</span> <span class="o">+</span> <span class="n">step</span><span class="p">)</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="n">window_stop</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">),</span> <span class="n">step</span><span class="p">,</span> <span class="n">balanced</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">stop</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span> <span class="ow">and</span> <span class="n">search</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">num_frames</span> <span class="o">=</span> <span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">search</span><span class="p">,</span> <span class="n">stop</span> <span class="o">-</span> <span class="n">start</span> <span class="o">-</span> <span class="n">frame</span><span class="p">))</span> <span class="o">//</span> <span class="n">frame</span>
             <span class="k">if</span> <span class="n">num_frames</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
