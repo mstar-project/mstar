@@ -1,18 +1,27 @@
 # Qwen3-TTS-12Hz-1.7B-CustomVoice: built-in speakers, optional style instruction (instruct=...)
-# Same graph, resources and single-GPU placement as the 0.6B deployment
-# (configs/qwen3tts.yaml); only the checkpoint differs. KV geometry is
-# identical across sizes (28 layers, 8 KV heads, head_dim 128).
+# The Codec runs on a second worker that shares GPU 0 (rank_devices), so the
+# Talker's decode steps never wait for codec windows, and it decodes in bf16
+# (float32 matches the reference decoder bit for bit at about half the speed;
+# Whisper WER stays inside the reference's range). Single-worker float32:
+# configs/qwen3tts_1p7b_colocated.yaml. Codec on its own worker in float32:
+# configs/qwen3tts_1p7b_split.yaml.
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
-# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
-# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+model_kwargs:
+  codec_dtype: bfloat16
 resources:
   talker_attn:
     flashinfer_backend: fa2
+  # Two workers share the GPU: cap the KV pool at 1024 pages x 128 tokens
+  # (16 GB; 32 concurrent requests of a few hundred tokens use ~300 pages)
+  # so the Talker's weights, graphs and pool fit next to the codec worker's.
+  talker_kv:
+    max_num_pages: 1024
 node_groups:
   - node_names: [Talker]
     ranks: [0]
     graph_walks: [talker_prefill, talker_decode]
   - node_names: [Codec]
-    ranks: [0]
+    ranks: [1]
     graph_walks: [codec_chunk]
+rank_devices: {1: 0}

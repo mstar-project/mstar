@@ -237,13 +237,25 @@ def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
             (CONFIG_PATH.parent / yaml_name).read_text(encoding="utf-8")
         )
         assert deployment["model"] == key
-        assert deployment["resources"] == base_yaml["resources"]
-        ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
-        base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
+        # the 1.7B default puts the codec on a second worker and caps the
+        # Talker's pool to make room for it; the rest is shared
+        resources = dict(deployment["resources"])
+        if deployment.get("rank_devices"):
+            resources.pop("talker_kv", None)
+        assert resources == base_yaml["resources"]
+        def devices(cfg):
+            # a rank_devices entry places a rank on another rank's GPU
+            on = {int(k): v for k, v in (cfg.get("rank_devices") or {}).items()}
+            return {
+                name: [on.get(r, r) for r in group["ranks"]]
+                for group in cfg["node_groups"] for name in group["node_names"]
+            }
+
+        ranks, base_ranks = devices(deployment), devices(base_yaml)
         assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
         if key == "qwen3_tts_base":
             assert ranks["RefEncoder"] == ranks["Talker"]   # the clone prefill runs on the Talker's GPU
-        else:
+        elif not deployment.get("rank_devices"):
             assert deployment["node_groups"] == base_yaml["node_groups"]
         assert isinstance(get_adapter(key), Qwen3TTSAdapter)
     assert isinstance(get_adapter("qwen3_tts"), Qwen3TTSAdapter)
