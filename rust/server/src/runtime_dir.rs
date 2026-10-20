@@ -11,13 +11,19 @@ use std::path::{Path, PathBuf};
 /// `mstar/utils/socket_prefix.py`: the ownership check refuses another user's
 /// upload dir, so one shared default would stop the second user on a host.
 pub fn default_upload_dir() -> PathBuf {
-    // getpass.getuser's order: these variables, then the passwd entry
-    let name = ["LOGNAME", "USER", "LNAME", "USERNAME"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-        .or_else(passwd_name);
+    let vars = ["LOGNAME", "USER", "LNAME", "USERNAME"].map(std::env::var_os);
+    let name = login_name(&vars).or_else(passwd_name);
     // SAFETY: getuid has no preconditions and cannot fail.
     upload_dir_for(name.as_deref(), unsafe { libc::getuid() })
+}
+
+/// getpass.getuser's pick: the first non-empty variable, even one that is not
+/// UTF-8 (it then fails the name rule and the uid is used, as in Python).
+fn login_name(vars: &[Option<std::ffi::OsString>]) -> Option<String> {
+    vars.iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(|v| v.to_str().unwrap_or_default().to_string())
 }
 
 /// The user name when it is a short ASCII name, else the uid (the rule of
@@ -134,6 +140,19 @@ mod tests {
         }
         assert_ne!(upload_dir_for(Some("alice"), 1), upload_dir_for(Some("bob"), 2));
         assert!(default_upload_dir().starts_with("/tmp"));
+    }
+
+    #[test]
+    fn the_login_name_is_the_first_non_empty_variable_even_if_not_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad = Some(OsString::from_vec(vec![0xff]));
+        let user = Some(OsString::from("alice"));
+        assert_eq!(login_name(&[None, Some(OsString::new()), user.clone()]).as_deref(), Some("alice"));
+        // Python takes LOGNAME here, fails its name rule and uses the uid
+        let picked = login_name(&[bad, user]);
+        assert_eq!(upload_dir_for(picked.as_deref(), 1001), PathBuf::from("/tmp/mstar_uploads_1001/"));
+        assert_eq!(login_name(&[None, None]), None);
     }
 
     fn uid() -> u32 {
