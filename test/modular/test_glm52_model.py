@@ -125,7 +125,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert kv.config.head_dim == cfg.padded_head_dim == 64  # qk 24 -> FlashInfer 64
     assert kv.config.num_qo_heads == 4
     assert isinstance(attn, AttentionSpec)
-    assert attn.config.backend is AttnBackend.FLASHINFER
+    assert attn.config.backend is AttnBackend.AUTO  # #603: the platform picks, FlashInfer here
     assert attn.config.kv_cache == KV_RESOURCE
 
 
