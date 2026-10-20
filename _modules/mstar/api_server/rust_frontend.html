@@ -936,8 +936,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    frontend -&gt; bridge:  {t:"submit", rid, sub, text, file_paths,</span>
 <span class="sd">                          input_modalities, output_modalities, model_kwargs,</span>
 <span class="sd">                          prompt_parts, streaming} | {t:"abort", rid, sub}</span>
+<span class="sd">                       | {t:"ping", rid, sub} | {t:"metrics", rid, sub}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}</span>
 <span class="sd">                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}</span>
+<span class="sd">                       | {t:"pong", rid, sub}</span>
+<span class="sd">                       | {t:"metrics", rid, sub, data(bin), metadata}</span>
+
+<span class="sd">A ``metrics`` reply is what ``GET /metrics`` serves on the Python frontend:</span>
+<span class="sd">the text rendered from ``APIServer.metrics`` with its ``content_type`` in</span>
+<span class="sd">``metadata``, or empty ``metadata`` when metrics are off (a 404).</span>
 
 <span class="sd">``sub`` names one submission and is never reused. A client may resubmit its</span>
 <span class="sd">``rid`` as soon as it drops a stream, and that stream's ``done`` or late</span>
@@ -1129,6 +1136,30 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">abort_submission</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">sub</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_metrics</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">metrics</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">metrics</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"metrics"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"rid"</span><span class="p">],</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">),</span>
+                 <span class="s2">"data"</span><span class="p">:</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{}}</span>
+        <span class="k">if</span> <span class="n">metrics</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">reply</span><span class="p">[</span><span class="s2">"data"</span><span class="p">]</span> <span class="o">=</span> <span class="n">metrics</span><span class="o">.</span><span class="n">render</span><span class="p">()</span>
+            <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"content_type"</span><span class="p">:</span> <span class="n">metrics</span><span class="o">.</span><span class="n">content_type</span><span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_handle</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"t"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"submit"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_submit</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"abort"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_abort</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"ping"</span><span class="p">:</span>
+            <span class="c1"># Deep-health liveness: the frontend's /health goes red</span>
+            <span class="c1"># unless this loop answers.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"pong"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"rid"</span><span class="p">],</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">)})</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"metrics"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_metrics</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"bridge: unknown message type </span><span class="si">%r</span><span class="s2">"</span><span class="p">,</span> <span class="n">t</span><span class="p">)</span>
+
     <span class="c1"># -- loop ----------------------------------------------------------------</span>
 
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_serve</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1153,17 +1184,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># and takes the whole server down. `_submit` is already wrapped;</span>
                 <span class="c1"># this guards every other branch.</span>
                 <span class="k">try</span><span class="p">:</span>
-                    <span class="n">t</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"t"</span><span class="p">)</span>
-                    <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"submit"</span><span class="p">:</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_submit</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
-                    <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"abort"</span><span class="p">:</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_abort</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
-                    <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"ping"</span><span class="p">:</span>
-                        <span class="c1"># Deep-health liveness: the frontend's /health goes red</span>
-                        <span class="c1"># unless this loop answers.</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"pong"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"rid"</span><span class="p">],</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">)})</span>
-                    <span class="k">else</span><span class="p">:</span>
-                        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"bridge: unknown message type </span><span class="si">%r</span><span class="s2">"</span><span class="p">,</span> <span class="n">t</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_handle</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
                 <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — one bad message must not kill the loop</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"bridge: dropping a message that raised (</span><span class="si">%r</span><span class="s2">)"</span><span class="p">,</span>
                                      <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"t"</span><span class="p">))</span>

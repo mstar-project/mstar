@@ -507,8 +507,10 @@ Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. The Rust frontend does
-not serve it yet, so ``--enable-metrics --rust-frontend`` is refused at startup.
+matters for a deployment, keep the port on an internal network. With
+``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
+it over the bridge, so both frontends show the same names, and it answers ``503`` if the
+bridge does not reply within two seconds, as ``/health`` does.
 
 Requests are counted when they leave the API server, from the first request after the
 warmup requests. Every family has a ``model_name`` label (the config's ``model``);

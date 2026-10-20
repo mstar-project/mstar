@@ -988,7 +988,7 @@ workers do not inherit it), and
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Same rule as the Python server (<code class="docutils literal notranslate"><span class="pre">rust/server/src/auth.rs</span></code>, read
-once at startup): every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> needs
+once at startup): every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> needs
 <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code>
 sets it from <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / its own environment.</p></td>
 </tr>
@@ -1010,7 +1010,7 @@ an error and the request is aborted in the backend.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
 <td><p>Admission cap on in-flight generation requests; beyond it clients
 get an immediate 503 instead of queueing into the request timeout.
-<code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> bypass the cap.</p></td>
+<code class="docutils literal notranslate"><span class="pre">/health</span></code>, <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> bypass the cap.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>

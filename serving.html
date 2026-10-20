@@ -1187,8 +1187,10 @@ Prometheus metrics at <code class="docutils literal notranslate"><span class="pr
 hint. Off by default, and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> answers 404 then. Like <code class="docutils literal notranslate"><span class="pre">/health</span></code>, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. The Rust frontend does
-not serve it yet, so <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span> <span class="pre">--rust-frontend</span></code> is refused at startup.</p>
+matters for a deployment, keep the port on an internal network. With
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves the same text: it asks the API server for
+it over the bridge, so both frontends show the same names, and it answers <code class="docutils literal notranslate"><span class="pre">503</span></code> if the
+bridge does not reply within two seconds, as <code class="docutils literal notranslate"><span class="pre">/health</span></code> does.</p>
 <p>Requests are counted when they leave the API server, from the first request after the
 warmup requests. Every family has a <code class="docutils literal notranslate"><span class="pre">model_name</span></code> label (the config’s <code class="docutils literal notranslate"><span class="pre">model</span></code>);
 <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code> is the request’s output modalities, sorted and comma-joined

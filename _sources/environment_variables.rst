@@ -276,7 +276,7 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
-       once at startup): every route except ``/health`` needs
+       once at startup): every route except ``/health`` and ``/metrics`` needs
        ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
@@ -294,7 +294,7 @@ Read by the ``mstar-server`` binary and its bridge
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
-       ``/health`` and ``/v1/models`` bypass the cap.
+       ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
