@@ -542,12 +542,13 @@ Worker scheduling
        synchronous host-to-device copy per step. ``0`` keeps every node on
        the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
-     - config's ``knobs: ingraph_decode_rope``, else ``0``
+     - config's ``knobs: ingraph_decode_rope``, else ``0`` (``1`` on ROCm)
      - A captured decode step builds its rotary tables inside the graph from
        the position resource's planned positions instead of staging them.
-       Experiment knob, measured and gated on its own.
+       On by default on AMD GPUs (``RocmPlatform.process_env_defaults``), where
+       each launch beside a replayed graph costs about 5 us of GPU time.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``0`` (``1`` on ROCm)
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
@@ -555,8 +556,9 @@ Worker scheduling
        postprocess wins). Padding rows then address a trash master row and
        the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
        ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
-       cap with this on). Only with the device
-       loop-back on. An experiment knob; measure before turning it on.
+       cap with this on). Only with the device loop-back on. On by default
+       on AMD GPUs, like ``MSTAR_INGRAPH_DECODE_ROPE``; measure before
+       turning it on elsewhere.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the
