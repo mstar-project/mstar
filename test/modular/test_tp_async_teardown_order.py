@@ -1,5 +1,5 @@
 """Every rank of a TP instance tears a request down after its admit of the step rank 0
-stamped the teardown with, and in the order rank 0 did.
+stamped the teardown with, before its admit of the next, and in the order rank 0 did.
 
 A teardown releases pages, so the side of an admit it lands on decides what that admit finds
 free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last
@@ -8,8 +8,10 @@ message between popping a step and the admit fence at the top of the next pass, 
 after that admit. Rank 0 lands it there too. A removal deferred behind step N is retried
 once N is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
 ``_remove_request`` defers it again while N is still the step in flight, and the next pass
-tears it down behind N+1's admit fence. The order matters as well: the free list hands pages
-back out in the order they were freed.
+tears it down behind N+1's admit fence. A removal that reaches rank 0 once N is done, with
+nothing in flight, lands before N+1 is sent; a follower still running N defers it, and tears
+it down once N is done, before it takes N+1. The order matters as well: the free list hands
+pages back out in the order they were freed.
 
 Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
 a request is torn down, or a while.
@@ -295,3 +297,14 @@ def test_a_follower_tears_down_nothing_ahead_of_one_it_deferred(monkeypatch):
     _run(w)
 
     assert [entry[1] for entry in log if entry[0] == "teardown"] == ["gone", "idle"], log
+
+
+def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(monkeypatch):
+    """Rank 0 had nothing in flight when it tore "gone" down, so it did before it sent
+    N+1; here N still runs it. Once N is done the teardown goes, before this rank admits
+    N+1, which rank 0 admitted against the pages "gone" let go."""
+    gone = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=0)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [gone]], serial=True)
+    _run(w)
+
+    assert log.index(("teardown", "gone")) < log.index(("admit", 1)), log

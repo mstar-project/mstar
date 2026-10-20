@@ -4597,6 +4597,11 @@ class Worker:
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     _set_pending(None)
+                    if spec_pending is None and self.is_tp_follower:
+                        # N is done and nothing runs. Rank 0 tore down what N held
+                        # here before it sent the next step, so this rank does too,
+                        # before it takes that step.
+                        self._apply_pending_removes_safe_to_drop(set())
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
