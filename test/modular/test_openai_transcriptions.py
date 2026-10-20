@@ -460,6 +460,38 @@ def test_parallel_unfinished_window_keeps_its_text_when_there_is_no_tail_to_deco
     assert len(stub.submits) == 3
 
 
+@requires_audio_duration
+def test_client_gone_before_a_parallel_tail_submits_no_tail(client_and_stub, monkeypatch):
+    """The tail pass runs only once every window is in: a window left
+    unfinished does not get its tail decoded for a client that has gone."""
+    from starlette.requests import Request
+
+    client, stub = client_and_stub
+    gone = False
+    collect = stub.collect_results
+
+    async def collect_until_gone(request_id, raw_request=None):
+        nonlocal gone
+        if len(stub.submits) > 1 and stub.submits[1]["request_id"] == request_id:
+            gone = True
+            return []
+        return await collect(request_id, raw_request)
+
+    async def is_disconnected(self):
+        return gone
+
+    stub.collect_results = collect_until_gone
+    monkeypatch.setattr(Request, "is_disconnected", is_disconnected)
+    # window 0 stopped inside a segment, so it has a tail to decode
+    stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")]
+    stub.queued_chunks += [_text("<|0.00|>", f" w{i}.", "<|29.00|>") for i in range(1, 30)]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
+    assert r.status_code == 200, r.text
+    assert len(stub.submits) == 1 + serving_transcriptions.PARALLEL_INFLIGHT
+    assert not list(stub.upload_dir.iterdir())
+
+
 def test_long_form_rejects_unknown_mode(client_and_stub):
     client, stub = client_and_stub
     r = _post(client, {"model": "whisper_large", "long_form": "zigzag"}, filename="a.wav", content=_wav_bytes(1))
@@ -506,6 +538,26 @@ def test_streaming_parallel_windows_stream_token_by_token(client_and_stub):
     deltas = [e["delta"] for e in events if e["type"] == "transcript.text.delta"]
     assert deltas == [" one", " two", " ", " three"]
     assert events[-1]["text"] == "one two three"
+
+
+
+@requires_audio_duration
+def test_streamed_parallel_windows_decode_without_timestamps(client_and_stub):
+    """A stream carries text only; a window decoded with timestamps could stop
+    early and leave its tail to the next window, which in parallel mode starts
+    at the cut."""
+    client, stub = client_and_stub
+    stub.queued_chunks = [_text("<|en|>", " one"), _text(" two")]
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true", "long_form": "parallel",
+              "response_format": "verbose_json"},
+        files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    assert json.loads(lines[-2][len("data: "):])["text"] == "one two"
+    assert len(stub.submits) == 2
+    assert all("timestamps" not in s["model_kwargs"] for s in stub.submits)
 
 
 def _wav_seconds(path: str) -> float:

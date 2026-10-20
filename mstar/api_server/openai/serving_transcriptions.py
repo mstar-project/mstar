@@ -58,6 +58,7 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -415,13 +416,18 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
-def _tails(adapter, req, planner: WindowPlanner, windows: list[Window]) -> list[tuple[int, Window]]:
+class _Tail(NamedTuple):
+    after: int       # index of the window whose unfinished tail this is
+    window: Window
+
+
+def _tails(adapter, req, planner: WindowPlanner, windows: list[Window]) -> list[_Tail]:
     """Parallel windows decoded with timestamps that stopped inside a segment.
     Near its end Whisper writes the next segment's start and ends the window,
     leaving that speech to the next window, which in parallel mode starts at
     the fixed cut instead. As in sequential mode, such a window keeps its closed
     segments, and the audio from the last of them to the cut becomes a window
-    of its own: ``(index of the window it follows, the new window)``."""
+    of its own."""
     if not adapter.seeks_by_timestamps or planner.single:
         return []
     tails = []
@@ -432,7 +438,7 @@ def _tails(adapter, req, planner: WindowPlanner, windows: list[Window]) -> list[
         end = parsed.segments[-1]["end"]
         if MIN_SEEK_SECONDS <= end <= window.duration - MIN_TAIL_SECONDS:
             window.transcript = _closed(parsed)
-            tails.append((index, planner.cut(window.offset + end, window.duration - end)))
+            tails.append(_Tail(index, planner.cut(window.offset + end, window.duration - end)))
     return tails
 
 
@@ -556,13 +562,13 @@ async def create_transcription(
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed()
-            async for _ in _parallel(api, adapter, req, windows, inflight, raw_request):
-                pass
-            tails = _tails(adapter, req, planner, windows)
+            collected = [w async for w in _parallel(api, adapter, req, windows, inflight, raw_request)]
+            # fewer than all means the client is gone: submit nothing more
+            tails = _tails(adapter, req, planner, windows) if len(collected) == len(windows) else []
             if tails:
-                async for _ in _parallel(api, adapter, req, [t for _, t in tails], inflight, raw_request):
+                async for _ in _parallel(api, adapter, req, [t.window for t in tails], inflight, raw_request):
                     pass
-                after, merged = dict(tails), []
+                after, merged = {t.after: t.window for t in tails}, []
                 for index, window in enumerate(windows):
                     merged += [window, after[index]] if index in after else [window]
                 windows = merged
@@ -684,10 +690,15 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed()
+            # The stream carries text only, and a window decoded with timestamps
+            # can stop early and leave its tail to the next one (see _tails).
+            window_req = req if planner.single else req.model_copy(
+                update={"response_format": "json", "timestamp_granularities": None},
+            )
             submitted = 0
             for i, window in enumerate(windows):
                 while submitted < min(len(windows), i + PARALLEL_INFLIGHT):
-                    _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
+                    _submit(api, adapter, window_req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
                 raw, emitted = "", ""
                 # holds back a character split across tokens until its last byte
