@@ -61,7 +61,8 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+arrive. A request that fails after its stream has started ends it with one chunk of
+modality ``error`` (the HTTP status in ``metadata.status``); nothing follows it. A client that sends ``Accept: application/vnd.mstar.frames`` receives
 length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
 ``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response ``Content-Type``. ``GET /health`` returns
@@ -92,7 +93,7 @@ as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way. Both carry the HTTP ``status`` when there is one
+was accepted ends with one such reply. Both carry the HTTP ``status`` when there is one
 (``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the

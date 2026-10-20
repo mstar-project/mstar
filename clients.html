@@ -717,7 +717,8 @@ drops a stream can resubmit its id at once).</p></td>
 </pre></div>
 </div>
 <p>A streaming response is <code class="docutils literal notranslate"><span class="pre">application/x-ndjson</span></code> — one JSON object per line as chunks
-arrive. A client that sends <code class="docutils literal notranslate"><span class="pre">Accept:</span> <span class="pre">application/vnd.mstar.frames</span></code> receives
+arrive. A request that fails after its stream has started ends it with one chunk of
+modality <code class="docutils literal notranslate"><span class="pre">error</span></code> (the HTTP status in <code class="docutils literal notranslate"><span class="pre">metadata.status</span></code>); nothing follows it. A client that sends <code class="docutils literal notranslate"><span class="pre">Accept:</span> <span class="pre">application/vnd.mstar.frames</span></code> receives
 length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
 <code class="docutils literal notranslate"><span class="pre">video_frame</span></code> payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response <code class="docutils literal notranslate"><span class="pre">Content-Type</span></code>. <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/health</span></code> returns
@@ -746,7 +747,7 @@ as a msgpack binary frame (<code class="docutils literal notranslate"><span clas
 message: one frame per result chunk, <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;modality&quot;,</span> <span class="pre">&quot;data&quot;,</span> <span class="pre">&quot;metadata&quot;}</span></code>,
 then <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;finish&quot;:</span> <span class="pre">true}</span></code>. A rejected message answers
 <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;error&quot;:</span> <span class="pre">...}</span></code> and the socket stays open; a request that fails after it
-was accepted ends the same way. Both carry the HTTP <code class="docutils literal notranslate"><span class="pre">status</span></code> when there is one
+was accepted ends with one such reply. Both carry the HTTP <code class="docutils literal notranslate"><span class="pre">status</span></code> when there is one
 (<code class="docutils literal notranslate"><span class="pre">409</span></code> for a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> still in flight, as on <code class="docutils literal notranslate"><span class="pre">/generate</span></code>), and no
 <code class="docutils literal notranslate"><span class="pre">finish</span></code> follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
