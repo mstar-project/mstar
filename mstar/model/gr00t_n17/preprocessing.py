@@ -72,15 +72,20 @@ class Gr00tN17Preprocessor:
 
     @classmethod
     def from_pretrained(
-        cls, path: str | Path, max_state_dim: int, max_action_horizon: int, backbone_path: str | Path | None = None,
+        cls, path: str | Path, max_state_dim: int, max_action_horizon: int,
+        backbone_path: str | Path | None = None, cache_dir: str | None = None,
     ):
         """``backbone_path`` (Cosmos-Reason2-2B) loads the text/image processor;
-        without it only ``state``/``image``/``embodiment_id``/``action_mask`` work."""
+        without it only ``state``/``image``/``embodiment_id``/``action_mask`` work.
+
+        It may be a hub id, which is what registration passes, so ``cache_dir``
+        goes with it: a deployment that sets one expects nothing written to the
+        default cache."""
         processor = None
         if backbone_path is not None:
             from transformers import AutoProcessor
 
-            processor = AutoProcessor.from_pretrained(backbone_path)
+            processor = AutoProcessor.from_pretrained(backbone_path, cache_dir=cache_dir)
         path = Path(path)
         return cls(
             processor_kwargs=json.loads((path / "processor_config.json").read_text())["processor_kwargs"],
