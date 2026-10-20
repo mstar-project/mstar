@@ -284,7 +284,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
     encoder = WhisperEncoderModel(cfg)
     encoder.load_weights(list(_hf_encoder(cfg).state_dict().items()))
     sub = WhisperEncoderSubmodule(encoder, cfg).eval()
-    (capture,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (capture,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == PREFILL_WALK
     assert set(capture.replay_graph_walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK}
     assert capture.single_request_inputs.tensor_inputs["audio"].shape == (cfg.n_samples,)
@@ -393,7 +393,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     sub.postprocess("ts", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
     # the capture template carries the same row so the graph's input set is fixed
-    (decode_cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (decode_cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
     # language detection never applies the rules
     # timestamps=True on purpose: the detection walk must still decode with

@@ -298,7 +298,7 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     assert sub.preprocess(DECODE_WALK, _engine_inputs("r"), [decode_row])["input_ids"].tolist() == [42]
     step = sub.declare_step(PREFILL_WALK, ["r"], [row])
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
-    (decode, prefill) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
     assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
     assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)

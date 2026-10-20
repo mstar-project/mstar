@@ -35,6 +35,10 @@ mstar serve
    * - ``--port``
      - ``8000``
      - HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -48,8 +52,9 @@ mstar serve
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar_<user>/``
-     - ZMQ IPC socket prefix.
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix; one per server, so servers on other ports do
+       not share sockets.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads_<user>/``
      - Temp directory for uploaded media.
@@ -64,6 +69,10 @@ mstar serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
 
 Each model maps to a default config (override with ``--config``):
 
@@ -116,6 +125,10 @@ mstar-serve
    * - ``--host`` / ``--port``
      - ``0.0.0.0`` / ``8000``
      - Bind address / HTTP port.
+   * - ``--api-key``
+     - ``MSTAR_API_KEY``, else off
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
+       and ``/metrics`` (see :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -123,8 +136,10 @@ mstar-serve
      - HF default
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar``
-     - ZMQ IPC socket prefix (shared with conductor/workers).
+     - ``/tmp/mstar_<user>_<port>/``
+     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
+       worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
+       it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.
@@ -148,6 +163,10 @@ mstar-serve
      - stdout
      - Append the per-request profiles to this file instead of stdout
        (implies ``--log-stats``).
+   * - ``--enable-metrics``
+     - off
+     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
+       Needs ``.[metrics]``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -157,6 +176,42 @@ mstar-serve
    ``mstar serve`` defaults the tensor protocol to ``SHM`` (safe on a single node),
    whereas ``mstar-serve`` defaults to ``RDMA``. On a single node without RDMA, pass
    ``--tensor-comm-protocol SHM`` to ``mstar-serve``.
+
+.. _api-key:
+
+API key
+-------
+
+Both commands listen on all interfaces by default and accept requests from anyone who
+can reach the port. If no gateway in front of the server authenticates clients, set a
+key or bind ``--host 127.0.0.1``; the server logs a warning at startup while no key is
+set.
+
+.. code-block:: bash
+
+   export MSTAR_API_KEY="$(openssl rand -hex 32)"
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+
+With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
+:ref:`serving-metrics`) answers ``401`` unless the request carries
+``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
+``/generate/ws``) refuse the handshake without it. The check is one middleware over the
+whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+however much of the key matches. CORS preflights still get their answer, since browsers
+send them without credentials. ``--api-key`` overrides the environment variable, but
+prefer the variable: a command-line flag is visible to every local user in the process
+list. An empty value turns the check off, so ``--api-key ""`` disables a key set in the
+environment, and so does a variable that expands to nothing (``--api-key "$UNSET_VAR"``).
+
+Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
+``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
+:doc:`clients`. The standalone Nemotron realtime server
+(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
+variable.
+
+Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
+``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
+Dynamo's frontend or a gateway in front of it.
 
 Config files
 ------------
@@ -175,15 +230,28 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
+       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. Each node of a
+       walk must be placed by exactly one entry for that walk.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue.
+   * - ``gpu_memory_fraction``
+     - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
+       done, for workers that share a GPU (see below). Unset, capture plans against
+       whatever is free.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``speculation_mixes_walks``
+     - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
+       walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
+       chain on it merges ready rows of the other walks of its combined walk, so
+       decode steps take in new prompts as they arrive. Off (the default), a chain
+       keeps to its own walk and yields to the others, and a step mixes walks only
+       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       walk outside its combined walks, fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -257,6 +325,13 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
 
+At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws
+away, then captures the cheapest buckets across all of them while its largest eager step
+still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
+other's memory only as used, so the first to capture can take the other's room. Set
+``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
+counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
+
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
 
@@ -318,6 +393,15 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``TCP`` — works anywhere; used for some multi-node setups.
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
+
+``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers.
+Each worker's engine picks its handshake and data ports at startup, so restrict by host: only
+the deployment's own hosts should reach the workers. The model extras require
+``mooncake-transfer-engine`` 0.3.13.post1
+or newer: earlier than 0.3.12.post1, any host that reaches the TCP data port can read or
+write the worker's memory (CVE-2026-103764), and a worker warns at startup if it finds such a
+version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
+CVE-2026-103761) are still open in 0.3.13.post1.
 
 .. _request-profiling:
 
@@ -411,3 +495,43 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
    Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
    conductor, and data worker skip the timing/transfer bookkeeping entirely.
+
+.. _serving-metrics:
+
+Metrics
+-------
+
+Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
+Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
+(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
+hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
+API key even when one is set, the usual convention for scrape endpoints. It exposes
+request counts, latencies and the model name (never prompts or outputs); if that
+matters for a deployment, keep the port on an internal network. The Rust frontend does
+not serve it yet, so ``--enable-metrics --rust-frontend`` is refused at startup.
+
+Requests are counted when they leave the API server, from the first request after the
+warmup requests. Every family has a ``model_name`` label (the config's ``model``);
+``output_modalities`` is the request's output modalities, sorted and comma-joined
+(e.g. ``audio,text``).
+
+- ``mstar_requests_total{model_name, output_modalities, outcome}``: counter.
+  ``outcome`` is ``success`` (the result went to the HTTP layer), ``error`` (the
+  request failed in the engine, preprocessing or result delivery), ``abort`` (the client
+  went away, or its finished result was dropped unread) or ``timeout`` (``--timeout``
+  expired). Requests refused before they were submitted (a 400 for a bad form, a 409
+  for a ``request_id`` in flight) are not counted.
+- ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds
+  (submitted and not yet returned, failed or aborted).
+- ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission (after the request body was read) to the result
+  leaving the API server.
+- ``mstar_time_to_first_output_seconds{model_name, output_modalities}``: histogram over
+  successful requests, from submission to the first result chunk of any modality
+  reaching the API server. It is measured on the server, so it does not include the
+  network to the client, and a non-streaming client sees nothing until the end.
+
+.. code-block:: bash
+
+   mstar serve kokoro --enable-metrics
+   curl -s localhost:8000/metrics | grep '^mstar_'

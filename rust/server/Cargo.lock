@@ -860,6 +860,7 @@ dependencies = [
 name = "mstar-rust"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "pyo3",
  "rmp",
@@ -884,8 +885,10 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "subtle",
  "tokenizers",
  "tokio",
+ "tower",
  "tower-http",
  "ureq",
  "uuid",

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from mstar.platforms import current_platform
+
 
 def reset_device_scheduling(device) -> None:
     """Create and destroy a throwaway CUDA context on ``device``.
@@ -19,7 +21,8 @@ def reset_device_scheduling(device) -> None:
     """
     import ctypes
 
-    if not torch.cuda.is_available():
+    # goes through the CUDA driver API: NVIDIA only
+    if not current_platform.is_cuda():
         return
     dev = torch.device(device)
     if dev.type != "cuda":

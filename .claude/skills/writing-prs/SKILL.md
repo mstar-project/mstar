@@ -16,10 +16,11 @@ A PR description is for a reviewer who has not seen the branch's history, the pl
 ## What goes in the description
 
 - **What changed and why, organized by concern**, not by commit. For a model: the graph and nodes, resources, correctness, performance, API, other changes, tests, follow-ups.
-- **Tests: the commands and their results** (`ruff check .`, `python -m pytest @test/cpu-core.txt` with the pass/skip counts, the new test files and what they cover, GPU and live checks).
+- **Tests: the commands and their results** (`ruff check .`, the CPU Core command (`python -m pytest test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases`, the paths in `scripts/ci/select_cpu_tests.py`) with the pass/skip counts, the new test files and what they cover, GPU and live checks).
 - **Evidence for every correctness or performance claim**: the harness, the hardware, and the number (invariant 10). Label an unverified mechanism as a hypothesis. For parity, give the yardstick (the reference against itself) next to the result.
 - **What the PR does not do**, as follow-ups, so a reviewer doesn't ask.
 - **New dependencies and environment variables**, with the reason (AGENTS.md "Also", invariant 9).
+- **AI assistance**, in one line, as [CONTRIBUTING.md](../../../CONTRIBUTING.md) requires: say that AI assistance was used; the tests and their results are already in the description.
 
 ## What stays out
 

@@ -31,6 +31,7 @@ vision-language-action policies, and world models — through a **Python SDK**, 
 
    serving
    clients
+   evaluation
 
 .. toctree::
    :maxdepth: 2
