@@ -410,6 +410,62 @@ def test_a_resumed_ingest_waits_for_the_previous_request_to_hand_state_over():
     assert w._sessions.get_rids("s") == {"Y"}
 
 
+def test_the_last_leaving_request_s_removal_admits_the_held_resume():
+    w = _worker(known_rids=("X", "W"), sessions={"s": {"X", "W"}})
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert w.admitted == [], "W is still leaving"
+
+    Worker._remove_request(w, RemoveRequest(request_id="W"))
+    assert w.admitted == ["Y"]
+
+
+def test_a_follower_builds_a_head_naming_a_resume_freed_inside_its_follow_loop():
+    # The follower holds Y behind X and gets rank 0's removal of X only inside
+    # the follow loop, whose head names Y; step 0 alone would free Y too late
+    from concurrent.futures import Future
+
+    from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
+
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}}, is_follower=True)
+    Worker._add_new_request(w, _new_request(session_id="s"))
+    head = SimpleNamespace(
+        speculative=True, spec_from_seq=0, spec_seq=1, request_ids=["Y"],
+    )
+    w.scheduler.peek_tp_follow = lambda: head
+    w._tp_nospec = set()
+    inbox = deque([[WorkerMessage(
+        message_type=WorkerMessageType.REMOVE_REQUEST,
+        body=RemoveRequest(request_id="X", source=MessageSource.TP_RANK_0),
+    )]])
+
+    def wait_for_work(_ms):
+        # the first poll delivers X's removal; a second means it did not help
+        assert inbox, "follower stuck on held Y"
+    w.communicator.wait_for_work = wait_for_work
+    w._process_messages = lambda: Worker._process_message_list(w, inbox.popleft())
+    w._check_ready_tensors = w._poll_stream_buffers = lambda: None
+    sched = SimpleNamespace(
+        rid_of=w._graph_runtime.get_rid_handle,
+        handles_awaiting_admit=w._handles_awaiting_admit,
+    )
+    # pop_ready_rids' rule: a head builds once every rid it names resolves
+    w._try_follow_speculation = lambda pending: (
+        REMOVED_RID not in MicroScheduler.tp_rids(sched, head) or None
+    )
+    done = Future()
+    done.set_result({})
+    pending = SimpleNamespace(
+        tp_seq=0, future=done,
+        node_batch=SimpleNamespace(admit_error=None, failed_requests=None),
+    )
+
+    _, spec = Worker._await_tp_follow_step(w, pending, arm=lambda spec: None)
+
+    assert spec is True and w.admitted == ["Y"]
+
+
 def test_the_second_new_request_for_one_rid_is_not_held_by_the_first():
     # the conductor sends a NEW_REQUEST per partition, so a worker serving two
     # of them ingests the same rid twice
@@ -453,46 +509,33 @@ def test_a_request_awaiting_its_session_opens_no_engine_state():
     assert w._sessions.session_of("Y") == "s"
 
 
-def test_a_teardown_that_runs_at_once_still_fails_the_waiter():
-    # The other order: nothing of the session's is leaving, so the teardown
-    # runs immediately and takes the waiter out via forget_session rather than
-    # take_held_ingests. Both have to clear the handle and fail the request --
-    # dropping the body alone leaves the handle in _handles_awaiting_admit,
-    # where nothing ever takes it out and the scheduler excludes it forever.
+def test_a_teardown_behind_the_resume_x_s_removal_admitted_waits_for_it():
+    # X's removal admits Y at once, so the teardown finds a live request
     w = _worker(known_rids=("X",), sessions={"s": {"X"}})
-    failed = []
-    w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
     Worker._add_new_request(w, _new_request(session_id="s"))
-    assert w._handles_awaiting_admit == {"Y"}
 
-    # X leaves first, so requests_still_leaving is false and the teardown does
-    # not have to wait
-    Worker._remove_request(w, RemoveRequest(request_id="X"))
-    _deliver(w, TeardownSession(session_id="s"))
+    _deliver(w, RemoveRequest(request_id="X"), TeardownSession(session_id="s"))
+    assert w.admitted == ["Y"] and w.removed_sessions == []
 
-    assert w.removed_sessions == ["s"]
-    assert w._handles_awaiting_admit == set(), "the handle would be stranded"
-    [(errors, statuses)] = failed
-    assert list(errors) == ["Y"] and statuses == {"Y": 410}
-    assert w._sessions.has_pending is False
+    _deliver(w, RemoveRequest(request_id="Y"))
+    Worker._apply_pending_sessions(w)
+    assert w.removed_sessions == ["s"] and _acks(w) == ["s"]
 
 
 def test_a_teardown_fails_the_requests_still_waiting_to_adopt_too():
     # ingested, but not yet admitted into a step, so it has taken nothing
     # from the session and would resume from an empty context
-    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    w = _worker(known_rids=(), sessions={"s": set()})
     failed = []
     w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
     w.engine_manager.remove_session = (
         lambda sid: w.removed_sessions.append(sid) or ["Z"]
     )
-    Worker._add_new_request(w, _new_request(session_id="s"))
 
-    Worker._remove_request(w, RemoveRequest(request_id="X"))
     _deliver(w, TeardownSession(session_id="s"))
 
     [(errors, statuses)] = failed
-    assert set(errors) == {"Y", "Z"} and statuses == {"Y": 410, "Z": 410}
+    assert set(errors) == {"Z"} and statuses == {"Z": 410}
 
 
 def test_a_request_whose_session_dies_while_it_waits_is_failed_410():

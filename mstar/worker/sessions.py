@@ -150,6 +150,24 @@ class WorkerSessionManager:
             )
         return ready, dropped
 
+    def take_ingests_freed_by(self, session_id: str) -> list[NewRequest]:
+        """The session's held requests, once its last leaving request has left.
+
+        Nothing while one is still leaving, or while the session's own teardown
+        is held: ``take_held_ingests`` fails those at the next pass, ahead of
+        the teardown.
+        """
+        if (
+            session_id in self._pending_session_teardowns
+            or self.requests_still_leaving(session_id)
+        ):
+            return []
+        freed, kept = [], []
+        for held in self._pending_session_ingests:
+            (freed if _session_id_of(held) == session_id else kept).append(held)
+        self._pending_session_ingests = kept
+        return freed
+
     def bind(
         self, request_id: int, session_id: str | None,
         tp_followers: set[str] | None = None,

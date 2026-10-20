@@ -1000,7 +1000,7 @@ class Worker:
         # The session keeps what this request built; ending it is a
         # TEARDOWN_SESSION of its own, which the conductor sends behind this
         # removal when the session is over.
-        self._sessions.release(request_id)
+        session_id = self._sessions.release(request_id)
         self.engine_manager.remove_request(
             request_id, overshot_nodes=overshot_nodes,
             session_idle_seq=idle_seq,
@@ -1021,6 +1021,14 @@ class Worker:
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+        # A resume held behind this request is admitted now, not at the next
+        # step 0. A TP follower may be applying this removal inside its follow
+        # loop, waiting on a head that names the resume; it would never build.
+        if session_id is not None:
+            self._admit_held_ingests(
+                self._sessions.take_ingests_freed_by(session_id),
+            )
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -1207,8 +1215,20 @@ class Worker:
         ready, dropped = self._sessions.take_held_ingests()
         for session_id, waiters in _by_session(dropped).items():
             self._fail_requests_awaiting_session(waiters, session_id)
-        for body in ready:
+        self._admit_held_ingests(ready)
+        for session_id in self._sessions.ready_teardowns():
+            # SELF: it already passed the TP checks when it was first held
+            self._teardown_session(TeardownSession(
+                session_id=session_id, source=MessageSource.SELF,
+            ))
+
+    def _admit_held_ingests(self, bodies: list[NewRequest]) -> None:
+        """Finish admitting held requests whose session has handed over."""
+        for body in bodies:
             handle = body.request_info.rid_handle
+            if self._rid(body.request_id) != handle:
+                # removed meanwhile, by a message an earlier admission unparked
+                continue
             if body.request_id in self._draining_rids:
                 # Drained while it waited: open no engine state, and leave the
                 # handle gated until its REMOVE clears it rather than resolving
@@ -1222,11 +1242,6 @@ class Worker:
             if self._sessions.hold_if_not_ready(body, handle):
                 continue  # another of its session's requests is still leaving
             self._finish_admission(body, handle)
-        for session_id in self._sessions.ready_teardowns():
-            # SELF: it already passed the TP checks when it was first held
-            self._teardown_session(TeardownSession(
-                session_id=session_id, source=MessageSource.SELF,
-            ))
 
     def _ack_session_torn_down(self, session_id: str) -> None:
         self.communicator.send(
