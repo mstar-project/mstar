@@ -281,6 +281,21 @@ def test_a_rid_prepare_dropped_is_not_requeued(reason):
     assert "r1" not in worker.held
 
 
+@pytest.mark.parametrize(
+    "reason", [_alloc_failed("r0"), _offloading("r0")], ids=["allocation", "offloading"]
+)
+def test_a_rid_the_cache_served_is_requeued(reason):
+    worker = _RefusedWorker()
+    batch, node_batch = _batches(reason, prepared=["r0"], cached=["r1"])
+    node_batch.failed_resource = None
+
+    worker._handle_admit_failure(batch, node_batch)
+
+    assert sorted(worker._graph_runtime.pushed_back) == ["r0", "r1"], (
+        "a row the cache served left the refused step, so its walk never completes"
+    )
+
+
 def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplog):
     worker = _HoldingWorker()
 
