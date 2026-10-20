@@ -1238,16 +1238,17 @@ def _rocm_sampling(name: str):
     return factory
 
 
-# FlashInfer's rejection samplers, reading one device seed/offset per row
+# FlashInfer's rejection samplers, reading one device seed/offset per row.
+# Every platform but ROCm keeps upstream FlashInfer, as before this dispatch.
 _top_p_sampling_from_probs = PlatformDispatch(
     "top_p_sampling_from_probs",
-    cuda=_flashinfer_sampling("top_p_sampling_from_probs"),
     rocm=_rocm_sampling("top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_p_sampling_from_probs"),
 )
 _top_k_top_p_sampling_from_probs = PlatformDispatch(
     "top_k_top_p_sampling_from_probs",
-    cuda=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
     rocm=_rocm_sampling("top_k_top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
 )
 
 
