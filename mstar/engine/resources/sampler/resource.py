@@ -143,6 +143,11 @@ class SamplerResource(Resource):
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
+        # Idempotent, like the KV streams: the conductor sends one NewRequest per
+        # partition, and a second ingest after a step would clear the seen tokens
+        # and restart the RNG offset.
+        if rid in self._sampler._sampling_config:
+            return
         extra_kwargs = asdict(overrides) if overrides is not None else {}
         self._sampler.add_request(request_id=rid)
         self._sampler.set_config(
