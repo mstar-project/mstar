@@ -115,13 +115,20 @@ def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
         )
 
 
+def _form_request(**fields):
+    async def form():
+        return fields
+
+    return SimpleNamespace(form=form)
+
+
 def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", object())
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(streaming="false"),
                 text=None,
                 files=None,
                 input_modalities=None,
@@ -142,7 +149,7 @@ def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(input_modalities="video_frame"),
                 text=None,
                 files=None,
                 input_modalities="video_frame",

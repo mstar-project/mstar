@@ -77,6 +77,9 @@ class _Model:
             "text_inputs", "ids", "prefill", self._decode_walk,
         )}}
 
+    def max_input_files(self):
+        return {}
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},

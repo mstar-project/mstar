@@ -9,6 +9,8 @@ writes one file per point. Layout (``schema: "mstar-eval/1"``)::
       "suite": "tts", "label": "kokoro", "created_at": "2026-10-16T07:00:00Z",
       "config": {...},       # everything that decides the numbers (dataset, n, load, judges, seed)
       "meta": {...},         # git commit, GPU, driver, versions, MSTAR_* env, server, CLI flags
+                             # (meta.git and meta.versions describe the eval's checkout;
+                             # meta.server.git and meta.server.versions what was served)
       "repeats": [{"index": 0, "wall_s": 12.3, "metrics": {...}, "requests": [...]}, ...],
       "summary": {"<metric>": {"mean": .., "std": .., "min": .., "max": .., "n": 3}, ...}
     }

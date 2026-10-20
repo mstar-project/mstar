@@ -918,8 +918,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         request_infos: dict[int, CurrentForwardPassInfo],
         inputs: list[NodeInputs],
     ) -> None:
-        """``postprocess`` for a rows-only step, which has no per-request
-        outputs: works on the rows of ``outputs`` in place. Optional; only
+        """Once per step, for work that batches across the step's requests
+        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on
+        ``outputs`` in place: its rows on a rows-only step, which has no
+        per-request outputs, and otherwise the per-request outputs after
+        every request's ``postprocess``, for the requests whose
+        ``postprocess`` succeeded (``request_infos``' keys, in the order of
+        ``inputs``); a raise then fails every one of them. Optional; only
         called when overridden."""
 
     def check_stop(

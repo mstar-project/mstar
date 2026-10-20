@@ -141,7 +141,7 @@ class _StubPreprocessWorker:
     def has_pending_tensors(self, rid):
         return self.pending
 
-    def received_final_chunks(self, rid, final_outputs):
+    def received_final_chunks(self, rid, output_chunk_counts):
         return self.final
 
     def finished_reading(self, rid, drained=True):

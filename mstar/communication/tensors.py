@@ -320,17 +320,17 @@ def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) ->
     needed = missing.group(1)
     if needed == major:
         fix = (
-            "`pip install nvidia-cuda-runtime-cu12`"
+            "`uv pip install nvidia-cuda-runtime-cu12`"
             if needed == "12"
             else f"put libcudart.so.{needed} on the library path"
         )
         return f"torch is built for CUDA {torch_cuda} too, so {fix}, or use SHM protocol."
     torch_desc = f"built for CUDA {torch_cuda}" if major else "built without CUDA"
     have = _MOONCAKE_WHEELS.get(needed)
-    uninstall = f"pip uninstall -y {have} && " if have else ""
+    uninstall = f"uv pip uninstall {have} && " if have else ""
     return (
         f"This Mooncake build needs the CUDA {needed} runtime, but torch is {torch_desc}. "
-        f"Switch to {want}: `{uninstall}pip install --force-reinstall --no-deps {want}`, "
+        f"Switch to {want}: `{uninstall}uv pip install --reinstall --no-deps {want}`, "
         "or use SHM protocol."
     )
 

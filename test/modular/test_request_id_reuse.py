@@ -138,7 +138,8 @@ class _Rig:
         facade.reads_done_queue = self.worker.reads_done_queue
         facade.cleanup_request_queue = self.worker.cleanup_request_queue
         facade.discard_tensor_queue = self.worker.discard_tensor_queue
-        facade.output_loop_idxs = {}
+        facade.output_queue = self.worker.out_queue
+        facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.data_worker = facade
         self.server = _api_server(facade)
@@ -252,6 +253,80 @@ def test_the_older_request_s_remove_does_not_unlink_the_reuse_s_inputs(rig):
     assert rig.tm.forced == [first.request_id]
     chunk = rig.output(second.request_id)
     assert chunk is not None and chunk.data == b"<7>"
+
+
+def _received(rig, key):
+    """A worker's chunk for ``key`` as the message thread hands it over; returns
+    the chunks the API server reads back from the data worker."""
+    rig.data_worker.new_result_token(key, 7, None, "text_inputs", "text")
+    rig.settle()
+    return rig.data_worker.get_result_chunks()
+
+
+def _completed(s, key, output_chunk_counts):
+    """The conductor's request_complete for ``key``, then one prune pass;
+    returns whether the request was released."""
+    with s.request_lock:
+        s.recently_completed[key] = time.time()
+        s.pending_requests[key].output_chunk_counts = output_chunk_counts
+        s._prune_recently_completed()
+        return s.pending_requests[key].event.is_set()
+
+
+def test_a_reuse_does_not_inherit_the_older_request_s_chunks(rig):
+    """X finished with two chunks reported and one received, so it is held open
+    and its id stays in use. The client aborts it and resubmits X; the older
+    request's last chunk lands after the reuse started and must not count
+    toward the reuse's hold."""
+    s = rig.server
+    first = rig.submit("first").request_id
+    assert len(_received(rig, first)) == 1
+    assert not _completed(s, first, {"text_inputs": 2})
+    with pytest.raises(HTTPException) as refused:
+        s.submit_request(text="early", request_id="X", streaming=False, **TEXT)
+    assert refused.value.status_code == 409
+
+    s.abort_request("X")
+    rig.settle()
+    second = rig.submit("second").request_id
+    assert _received(rig, first) == []
+
+    assert not _completed(s, second, {"text_inputs": 1}), (
+        "the reuse was released on the older request's chunk"
+    )
+    assert [c.request_id for c in _received(rig, second)] == [second]
+    with s.request_lock:
+        s._prune_recently_completed()
+    assert s.pending_requests[second].event.is_set()
+
+
+def test_the_older_request_s_release_does_not_release_the_reuse(rig):
+    """X failed, which frees the id while the data worker still holds its
+    state until the client lets go. The reuse is held for its second chunk when
+    the older request is released; the reuse stays held until that chunk."""
+    s = rig.server
+    first = rig.submit("first").request_id
+    with s.request_lock:
+        s.pending_requests[first].event.set()
+        s.recently_completed[first] = time.time()
+
+    second = rig.submit("second").request_id
+    assert len(_received(rig, second)) == 1
+    assert not _completed(s, second, {"text_inputs": 2})
+
+    with s.request_lock:
+        s.pending_requests.pop(first)  # its client read the error
+        s._prune_recently_completed()
+    assert first not in s.recently_completed
+    assert not s.pending_requests[second].event.is_set(), (
+        "the older request's release released the reuse"
+    )
+    assert rig.data_worker.received_chunk_counts[second] == {"text_inputs": 1}
+
+    assert len(_received(rig, second)) == 1
+    with s.request_lock:
+        s._prune_recently_completed()
+    assert s.pending_requests[second].event.is_set()
 
 
 def test_the_seed_still_derives_from_the_client_request_id(rig):

@@ -516,12 +516,15 @@ class KVManager(AttentionResource):
         # (rid, label) -> pages the live reservation freshly acquired, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
         # or the GPU thread holds a reservation at a time, and the unwind has to
-        # find it whichever it was.
+        # find it whichever it was. Admit, commit and unwind each touch only
+        # their own step's rows: the unbatched fallback admits every request
+        # before any runs, and a refusal unwinds the ones already admitted.
         #
         # Handle-keyed, so it MUST be purged when the handle is released: handles
         # are recycled, and a stale entry would resolve against whichever request
-        # gets that handle next. ``admit`` clears the record, but a pre-planned
-        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
+        # gets that handle next. ``admit`` clears its rows' entries, but a
+        # pre-planned step's admit returns first -- see ``remove_request`` /
+        # ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
@@ -1365,7 +1368,8 @@ class KVManager(AttentionResource):
             # stale and the clear below is right for this path.
             self.clear_preplan()
         with self._lock:
-            self._admit_reserved_pages.clear()
+            if self._admit_reserved_pages:
+                self._forget_step_reservations(ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -1464,7 +1468,7 @@ class KVManager(AttentionResource):
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
             # this step has already been given. last, and only once every
-            # reservation above succeeded, so a refusal has nothing to unwind.
+            # reservation above succeeded, so a refusal here sets none.
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
@@ -1487,18 +1491,31 @@ class KVManager(AttentionResource):
         return ADMIT_OK
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
-        """Give back the pages this admit freshly acquired. Does not touch pages
-        retained by a shared prefix or a lease converted onto the stream.
+        """Give back the pages this admit freshly acquired, and clear the
+        ``step_in_flight`` marks over the step's segments as ``commit`` does.
+        Does not touch pages retained by a shared prefix or a lease converted
+        onto the stream.
 
         ``page_indices`` maps token position to page, so the reserved pages can
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
         """
         self._touch_plan_cache()
-        del step, ctx
         with self._lock:
-            reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
-            for (rid, label), pages in reserved.items():
+            # No owner check: every rollback finishes before `commit_done` is
+            # released, and the only pre-admit (`Worker._preplan_spec`) waits on
+            # it, so no other uncommitted step can hold marks on these streams.
+            # `.get` as in `admit`: a refusal can come before a stream exists
+            for segment in step.segments:
+                stream = self._streams.get(
+                    segment.request_id, {}
+                ).get(segment.label)
+                if stream is not None:
+                    stream.step_in_flight = False
+            reserved = self._admit_reserved_pages
+            mine = [key for key in reserved if ctx.is_real_row(key[0])]
+            for rid, label in mine:
+                pages = reserved.pop((rid, label))
                 if not pages:
                     continue  # `page_indices[:-0]` would empty the whole stream
                 stream = self._streams.get(rid, {}).get(label)
@@ -1525,6 +1542,12 @@ class KVManager(AttentionResource):
         """Drop ``rid``'s unwind record. Caller holds the lock."""
         for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
             del self._admit_reserved_pages[key]
+
+    def _forget_step_reservations(self, ctx: StepContext) -> None:
+        """Drop the unwind record of this step's rows only. Caller holds the lock."""
+        reserved = self._admit_reserved_pages
+        for key in [k for k in reserved if ctx.is_real_row(k[0])]:
+            del reserved[key]
 
     def _sequence_views(
         self,
@@ -2149,7 +2172,8 @@ class KVManager(AttentionResource):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             # committed, so there is nothing left to unwind
-            self._admit_reserved_pages.clear()
+            if self._admit_reserved_pages:
+                self._forget_step_reservations(ctx)
             for segment in step.segments:
                 if ctx.is_padding_row(segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing

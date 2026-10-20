@@ -67,7 +67,7 @@ class AcceleratorGraphBackend(ABC):
     def synchronize(self) -> None: ...
 
     @abstractmethod
-    def create_graph(self) -> CapturedGraph: ...
+    def create_graph(self, keep_graph: bool = False) -> CapturedGraph: ...
 
     @abstractmethod
     def graph_pool_handle(self) -> AcceleratorGraphPool: ...
@@ -174,7 +174,13 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
         try:
             end(index, pool.handle)
         except RuntimeError:
-            pass
+            # not recording: it never started, or capture_end stopped it and the graph releases the pool
+            return
+        # still recording, so the capture never ended and no graph will release the pool
+        self._release_pool(index, pool)
+
+    def _release_pool(self, index: int, pool: AcceleratorGraphPool) -> None:
+        getattr(torch._C, f"_{self.device_type}_releasePool")(index, pool.handle)
 
 
 class CUDAGraphBackend(_TorchGraphBackend):
@@ -182,8 +188,8 @@ class CUDAGraphBackend(_TorchGraphBackend):
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="cuda", runtime=torch.cuda)
 
-    def create_graph(self) -> CapturedGraph:
-        return self._runtime.CUDAGraph()
+    def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
+        return self._runtime.CUDAGraph(keep_graph=keep_graph)
 
 
 class XPUGraphBackend(_TorchGraphBackend):
@@ -191,11 +197,15 @@ class XPUGraphBackend(_TorchGraphBackend):
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="xpu", runtime=torch.xpu)
 
-    def create_graph(self) -> CapturedGraph:
-        return self._runtime.XPUGraph()
+    def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
+        return self._runtime.XPUGraph(keep_graph=keep_graph)
 
     def graph_pool_handle(self) -> AcceleratorGraphPool:
         return XPUGraphPool(self._runtime.graph_pool_handle())
+
+    def _release_pool(self, index: int, pool: AcceleratorGraphPool) -> None:
+        # the pool holds the failed graph instead (see `XPUGraphPool`)
+        pass
 
 
 _GRAPH_BACKENDS: dict[str, type[AcceleratorGraphBackend]] = {

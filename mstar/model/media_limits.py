@@ -258,6 +258,60 @@ def charge_decoded_audio(audio: torch.Tensor, sample_rate: int) -> None:
     _charge_request("audio", audio.numel() / sample_rate)
 
 
+def sound_file_seconds(frames: int, rate: int) -> float | None:
+    """The length a libsndfile header declares, or None when it declares none
+    (a sample count of 0 or libsndfile's "unknown" value)."""
+    return frames / rate if 0 < frames < UNKNOWN_FRAMES and rate else None
+
+
+def _sound_file_blocks(sound, max_seconds: float, dtype: str):
+    """Blocks of an open ``soundfile.SoundFile`` until its end or just past
+    ``max_seconds``, for a header that gives no sample count.
+
+    A header-less FLAC cannot seek past its last block, so libsndfile raises on
+    the read that reaches it; that read ends the clip, which loses its last
+    FLAC frame (4096 samples from libsndfile's own encoder).
+    """
+    limit = max_seconds * sound.samplerate
+    frames = 0
+    while frames <= limit:
+        try:
+            block = sound.read(_COUNT_BLOCK_FRAMES, dtype=dtype, always_2d=True)
+        except RuntimeError:  # soundfile.LibsndfileError
+            return
+        if len(block):
+            yield block
+        frames += len(block)
+        if len(block) < _COUNT_BLOCK_FRAMES:
+            return
+
+
+def count_sound_file_seconds(filepath: str, max_seconds: float) -> float:
+    """The length of a libsndfile file whose header gives none, counted as it
+    decodes and keeping no samples; stops just past ``max_seconds``, so the
+    caller's limit check refuses a longer clip without decoding all of it."""
+    import soundfile
+
+    with soundfile.SoundFile(filepath) as sound:
+        frames = sum(len(block) for block in _sound_file_blocks(sound, max_seconds, "int16"))
+        return frames / sound.samplerate
+
+
+def read_sound_file(filepath: str, max_seconds: float):
+    """``soundfile.read(filepath, dtype="float32", always_2d=True)`` for a
+    header that gives no sample count, where ``soundfile.read`` would size its
+    buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes
+    block by block and stops just past ``max_seconds``, so the caller's length
+    check refuses a longer clip."""
+    import numpy as np
+    import soundfile
+
+    with soundfile.SoundFile(filepath) as sound:
+        blocks = list(_sound_file_blocks(sound, max_seconds, "float32"))
+        empty = np.zeros((0, sound.channels), dtype=np.float32)
+        return (np.concatenate(blocks) if blocks else empty), sound.samplerate
+
+
 def check_image_size(filepath: str, formats: tuple[str, ...] = IMAGE_FORMATS) -> tuple[str, bool]:
     """Refuse an image whose header promises more than ``max_image_pixels()``
     or that is not in ``formats`` (the ones the caller's decoder reads);

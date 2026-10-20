@@ -335,6 +335,11 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # Keys only this model's process_prompt sets (prompt layouts, stream
+    # leads) for the conductor to read back from model_kwargs. The data
+    # worker drops a client's values for them before process_prompt.
+    INTERNAL_KWARGS: tuple[str, ...] = ()
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's
@@ -769,10 +774,12 @@ class Model(ABC):
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
+        # FFmpeg build torchcodec happens to load (some base images ship a
+        # video-only one); torchcodec for the other containers.
+        from mstar.model.components.audio_features import load_audio_file
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):

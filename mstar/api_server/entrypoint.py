@@ -199,6 +199,15 @@ def _client_text(text: str, key: str, request_id: str | None) -> str:
     return text if request_id is None else text.replace(key, request_id)
 
 
+def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
+    """``chunks`` up to and including the first error chunk, which ends the
+    response, and whether there was one."""
+    for i, chunk in enumerate(chunks):
+        if chunk.modality == "error":
+            return chunks[:i + 1], True
+    return list(chunks), False
+
+
 def request_id_in_use(request_id: str) -> str:
     """The 409 detail for a ``request_id`` that still has a request in flight."""
     return (
@@ -215,7 +224,7 @@ class PendingRequest:
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
     chunks: list[ResultChunk] = field(default_factory=list)
-    final_outputs: dict = field(default_factory=dict)
+    output_chunk_counts: dict[str, int] = field(default_factory=dict)
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
@@ -620,7 +629,7 @@ class APIServer:
                 req is not None
                 and not self.preprocess_worker.has_pending_tensors(rid)
                 and self.preprocess_worker.received_final_chunks(
-                    rid, req.final_outputs
+                    rid, req.output_chunk_counts
                 )
             )
             if drained or req is None:
@@ -753,14 +762,14 @@ class APIServer:
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
-                                if not message.body.final_outputs:
+                                if not message.body.output_chunk_counts:
                                     logger.warning(
                                         "Request %s completed with no reported "
                                         "outputs; holding for late results "
                                         "until the cleanup TTL", rid,
                                     )
                                 req = self.pending_requests[rid]
-                                req.final_outputs = message.body.final_outputs
+                                req.output_chunk_counts = message.body.output_chunk_counts
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
@@ -915,6 +924,11 @@ class APIServer:
     ):
         start = time.time()
         finished = False
+        # An error chunk ends the response: whatever follows it for this
+        # request (a second error, a late output) is not part of the answer.
+        # The message thread sets req.event in the same request_lock block
+        # that appends an error chunk, so a read that sees one is also done.
+        errored = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
@@ -944,6 +958,7 @@ class APIServer:
                         done = True
 
                 if new_chunks:
+                    new_chunks, errored = _until_error(new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -957,19 +972,25 @@ class APIServer:
                     with self.request_lock:
                         req = self.pending_requests.get(key)
                         if req:
-                            remaining = req.chunks[req.consumed_chunks:]
+                            if not errored:
+                                remaining = req.chunks[req.consumed_chunks:]
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
-                    tail = list(remaining)
+                    tail, tail_errored = _until_error(remaining)
+                    errored = errored or tail_errored
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
-                    # in-band as the final chunk.
-                    if finished_req is not None and finished_req.error is not None:
+                    # in-band as the final chunk, once.
+                    if (
+                        not errored
+                        and finished_req is not None
+                        and finished_req.error is not None
+                    ):
                         tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
@@ -1616,6 +1637,11 @@ async def generate(
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+
+    # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
+    # HTML checkbox) instead of its declared default, for Optional[bool] too.
+    if "streaming" not in await request.form():
+        streaming = True
 
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
     streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)

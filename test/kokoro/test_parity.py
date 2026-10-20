@@ -29,6 +29,9 @@ from mstar.model.kokoro.config import KokoroModelConfig
 from mstar.model.kokoro.weight_loader import load_kokoro_weights
 
 HF_REPO = "hexgrad/Kokoro-82M"
+# a submodule of the reference: mstar/model/kokoro also answers to `kokoro` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("kokoro.model", reason="the `kokoro` reference package is the oracle")
 kokoro = pytest.importorskip("kokoro", reason="the `kokoro` reference package is the oracle")
 
 

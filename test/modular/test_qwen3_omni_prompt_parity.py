@@ -27,7 +27,10 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+# Qwen3OmniModel's submodules import flashinfer at module level.
+pytest.importorskip("flashinfer")
+from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen team, Alibaba Group, "

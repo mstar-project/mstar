@@ -179,6 +179,27 @@ def test_registry_graph_and_yaml_are_consistent(key, repo, yaml_name):
     assert all(wg.ranks == [0] for wg in worker_graphs)
 
 
+def _first_chunk_audio_s(cfg: ChatterboxConfig) -> float:
+    """Audio the first streamed chunk carries: its tokens less the encoder's
+    look-ahead, as mel frames, less the frames the vocoder holds back."""
+    s3 = cfg.s3gen
+    tokens = cfg.stream_first_chunk_tokens - s3.encoder.pre_lookahead_len
+    frames = tokens * s3.token_mel_ratio - cfg.stream_mel_cache_frames
+    return frames * s3.mel.hop_size / s3.sample_rate
+
+
+def test_the_first_chunk_covers_the_wait_for_the_second():
+    # At 4 to 8 streams the second chunk lands about 0.95 s after the first
+    # (H200); the old 15-token first chunk carried 0.32 s and stalled there.
+    english = ChatterboxConfig.from_variant("chatterbox")
+    assert _first_chunk_audio_s(english) == pytest.approx(1.12)
+    policy = _make_model("chatterbox").get_partition_topology().connections[0].chunk_policy_factory()
+    assert policy.is_ready(35) and not policy.is_ready(34)
+    # not measured on these two; they keep the old first chunk
+    for variant in ("multilingual", "turbo"):
+        assert ChatterboxConfig.from_variant(variant).stream_first_chunk_tokens == 15
+
+
 def test_cli_adapter_and_benchmark_entries_are_registered():
     repo_root = str(Path(__file__).resolve().parents[2])
     sys.path.insert(0, repo_root)
@@ -1582,7 +1603,7 @@ def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
 
 def test_chunk_policy_growth_knobs_reach_the_ramp():
     model = ChatterboxModel(
-        model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=15,
         stream_chunk_tokens=25, stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
     )
     policy = model._chunk_policy()
@@ -1592,16 +1613,16 @@ def test_chunk_policy_growth_knobs_reach_the_ramp():
         sizes.append(policy.next_chunk_size(buffered))
         policy.register_chunk(buffered)
     assert sizes == [15, 25, 50, 100, 100]
-    # the shipped default: 15, then 50, 100, 200, 200 ... with a 25-token context window
+    # the shipped default: 35, then 50, 100, 200, 200 ... with a 25-token context window
     default = _make_model()
     assert default.config.stream_context_tokens == 25
     policy = default._chunk_policy()
     sizes = []
-    for buffered in (15, 50, 100, 200, 200):
+    for buffered in (35, 50, 100, 200, 200):
         assert policy.is_ready(buffered)
         sizes.append(policy.next_chunk_size(buffered))
         policy.register_chunk(buffered)
-    assert sizes == [15, 50, 100, 200, 200]
+    assert sizes == [35, 50, 100, 200, 200]
 
 
 def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():

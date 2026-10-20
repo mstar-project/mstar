@@ -61,7 +61,8 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+arrive. A request that fails after its stream has started ends it with one chunk of
+modality ``error`` (the HTTP status in ``metadata.status``); nothing follows it. A client that sends ``Accept: application/vnd.mstar.frames`` receives
 length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
 ``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response ``Content-Type``. ``GET /health`` returns
@@ -92,7 +93,7 @@ as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way. Both carry the HTTP ``status`` when there is one
+was accepted ends with one such reply. Both carry the HTTP ``status`` when there is one
 (``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
@@ -237,7 +238,7 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``
+     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -306,7 +307,19 @@ Per-model notes:
   Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
   as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
   once, each cut at the quietest moment before its boundary. Segment timestamps
-  are offset to the whole file.
+  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
+  (5 to 30) sets the window length for one request, and an upload longer than it
+  is windowed. An upload, like any audio a request attaches, is refused once it
+  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
+  worker). The decode up to that point still runs, so this bounds memory, not
+  time: refusing a 31 min file takes about as long as decoding it.
+- **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
+  its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
+  clip of up to 20 s is one request; a longer upload is cut into windows of about equal
+  length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
+  in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
+  get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
+  ``language`` is the request's ``language`` as given, or null.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``

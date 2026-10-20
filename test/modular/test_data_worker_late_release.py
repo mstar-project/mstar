@@ -143,7 +143,7 @@ class _Rig:
         facade.result_tensor_input_queue = self.worker.result_tensor_queue
         facade.abort_request_queue = self.worker.abort_request_queue
         facade.reads_done_queue = self.worker.reads_done_queue
-        facade.output_loop_idxs = {}
+        facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.api = facade
         self.thread = threading.Thread(target=self.worker.run, daemon=True)

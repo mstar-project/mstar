@@ -50,8 +50,13 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
+    "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
+    "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
+    "omnilingual_asr_ctc_7b": "omnilingual_asr_ctc_7b.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
+    "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
@@ -175,7 +180,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model in ("whisper_large", "higgs_audio"):
+    if model in ("whisper_large", "higgs_audio") or model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")
@@ -201,6 +206,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         if model == "ltx2_5":
             lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")
             lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"960x544\"})")
+    if model.startswith("omnilingual_asr_ctc_"):
+        lines += ["", "  OpenAI-compatible:",
+                  "    from openai import OpenAI",
+                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")",
+                  f"    oai.audio.transcriptions.create(model=\"{model}\", file=open(\"speech.wav\", \"rb\")).text"]
     lines.append("")
     return "\n".join(lines)
 

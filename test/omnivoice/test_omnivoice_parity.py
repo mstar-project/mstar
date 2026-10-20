@@ -28,11 +28,11 @@ unoptimised dense one.  The tiers say which is which:
 
 Run the structural tier anywhere::
 
-    pytest test/omnivoice/test_parity.py -k "layout or schedule or prefix or mask_class"
+    pytest test/omnivoice/test_omnivoice_parity.py -k "layout or schedule or prefix or mask_class"
 
 and the rest on a box with a GPU and the checkpoint::
 
-    OMNIVOICE_PATH=/path/to/OmniVoice pytest test/omnivoice/test_parity.py
+    OMNIVOICE_PATH=/path/to/OmniVoice pytest test/omnivoice/test_omnivoice_parity.py
 """
 
 import os
@@ -271,7 +271,8 @@ def test_denoise_survives_a_reference_that_is_not_encoded_yet():
 
 def test_language_names_resolve_to_ids():
     """A name reaching the style span as prose produces noise, not speech."""
-    pytest.importorskip("omnivoice")
+    # the reference's submodule: mstar/model/omnivoice also answers to `omnivoice` with mstar/model on sys.path
+    pytest.importorskip("omnivoice.models.omnivoice")
     from mstar.model.omnivoice.components.text import resolve_language
 
     assert resolve_language("Chinese") == "zh"
@@ -284,7 +285,7 @@ def test_language_names_resolve_to_ids():
 
 def test_prefix_parity():
     """The canvas prefix must match the reference token for token."""
-    pytest.importorskip("omnivoice")
+    pytest.importorskip("omnivoice.models.omnivoice")
     from omnivoice.models.omnivoice import OmniVoice
     from omnivoice.models.omnivoice import OmniVoiceConfig as RefConfig
     from transformers import AutoTokenizer
@@ -451,7 +452,7 @@ def _run_reference(model, specs, num_step=None):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_packed_parity_single():
     """Tier A: same kernels, one request, token-exact."""
-    pytest.importorskip("omnivoice")
+    pytest.importorskip("omnivoice.models.omnivoice")
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
     config = OmniVoiceConfig()
@@ -486,7 +487,7 @@ def test_packed_parity_batched():
     neighbour's content -- so this checks the logits are within tolerance and
     that WHO the neighbour is does not matter.
     """
-    pytest.importorskip("omnivoice")
+    pytest.importorskip("omnivoice.models.omnivoice")
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
     config = OmniVoiceConfig()
@@ -554,7 +555,7 @@ def test_dense_agreement():
     0.927, well clear of that noise floor; a porting bug would land at or
     below it.
     """
-    pytest.importorskip("omnivoice")
+    pytest.importorskip("omnivoice.models.omnivoice")
     from omnivoice.models.omnivoice import OmniVoice
 
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone

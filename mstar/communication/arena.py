@@ -13,8 +13,9 @@ land. Segments are mapped once and never move, so the one-time
 holds for its lifetime and keeps the side-stream copies truly async.
 
 Capacity degrades in layers: grow by segments up to
-``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for
-consumer ACKs; then spill the tensor to the per-uuid file protocol
+``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another
+segment: segments commit their pages when created); at the cap, briefly
+backpressure for consumer ACKs; then spill the tensor to the per-uuid file protocol
 (``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old
 transport at saturation. ``stats_summary()`` exposes occupancy and the
 fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it
@@ -122,17 +123,21 @@ def _cudart():
     """libcudart via ctypes: unlike the torch binding, a ctypes call
     RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the
     send path cannot stall the process's other Python threads (serve loop,
-    stream relays, the wake watcher)."""
+    stream relays, the wake watcher). Loaded by the soname of torch's CUDA
+    major, which reaches the copy torch already loaded even where it is not
+    on the loader path (a pip install of torch)."""
     global _CUDART
     if _CUDART is None:
         import ctypes
-        import ctypes.util
 
-        name = ctypes.util.find_library("cudart") or "libcudart.so"
-        lib = ctypes.CDLL(name)
+        if not torch.version.cuda:
+            raise OSError("torch is not built with CUDA")
+        lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
         lib.cudaHostRegister.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
         lib.cudaHostRegister.restype = ctypes.c_int
+        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        lib.cudaHostUnregister.restype = ctypes.c_int
         _CUDART = lib
     return _CUDART
 
@@ -157,13 +162,12 @@ def _unpin(ptr: int) -> bool:
         return False
     try:
         lib = _cudart()
-        import ctypes
-
-        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
-        lib.cudaHostUnregister.restype = ctypes.c_int
-        rc = lib.cudaHostUnregister(ptr)
     except OSError:
-        rc = torch.cuda.cudart().cudaHostUnregister(ptr)
+        return False
+    rc = lib.cudaHostUnregister(ptr)
+    if rc != 0:
+        # Left set, the thread's next torch kernel launch raises it.
+        lib.cudaGetLastError()
     return rc == 0
 
 
@@ -192,9 +196,15 @@ def _pin(ptr: int, nbytes: int) -> bool:
     if not torch.cuda.is_available():
         return False
     try:
-        rc = _cudart().cudaHostRegister(ptr, nbytes, 0)
-    except OSError:  # no loadable libcudart: fall back to the torch binding
-        rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+        lib = _cudart()
+    except OSError as e:
+        logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
+                       "to pageable bandwidth", e)
+        return False
+    rc = lib.cudaHostRegister(ptr, nbytes, 0)
+    if rc != 0:
+        # Set by an already-registered range (accepted below) too.
+        lib.cudaGetLastError()
     ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
     if not ok:
         logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
@@ -261,6 +271,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._spill_after_s = float(
             os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0"))
         self._frag_warned = False
+        self._spill_warned = False
         # h2d completion watcher: turns a CUDA event into a real Future so
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
         self._wake_q: queue.Queue | None = None
@@ -606,7 +617,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         while True:
             try:
                 seg, off = self._arena.reserve(max(nbytes, 1))
-            except RuntimeError:
+            # Both the segment cap and a failed growth (no room in
+            # /dev/shm for a new segment) land here as "full".
+            except RuntimeError as e:
                 if self._reclaim_expired():
                     continue   # expired slots freed: retry the reserve
                 total, free, largest = self._arena.stats()
@@ -621,12 +634,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     self._frag_warned = True
                 if time.monotonic() > deadline:
                     if self._spill:
+                        if not self._spill_warned:
+                            logger.warning(
+                                "ARENA: spilling sends to the file "
+                                "transport (%s)", e)
+                            self._spill_warned = True
                         return None
                     raise RuntimeError(
                         f"SHM arena full for >{self._full_timeout_s}s "
-                        f"({self._arena.num_segments} segments); raise "
-                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB or check "
-                        "for consumers not ACKing") from None
+                        f"({self._arena.num_segments} segments: {e}); raise "
+                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB, free "
+                        "/dev/shm space, or check for consumers not "
+                        "ACKing") from None
                 if not warned:
                     logger.warning(
                         "SHM arena at capacity; backpressuring sends until "

@@ -205,6 +205,14 @@ You must implement these abstract methods:
    ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
 
+.. note::
+
+   The metadata ``process_prompt`` returns is laid over the request's own
+   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
+   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
+   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
+   lists its prompt layout, speaker, language, clip digest and codec stream lead.
+
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,

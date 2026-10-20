@@ -80,15 +80,25 @@ audio = [
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
-# builders and the charts import the rest lazily. Install it in a separate
-# client environment if the server's should stay lean.
+# builders, compare's media inputs and PSNR checks (PyAV, Pillow) and the
+# charts import the rest lazily. Install it in a separate client environment
+# if the server's should stay lean.
 eval = [
     "aiohttp",
+    "av",
     "datasets",
     "huggingface-hub",
     "matplotlib",
+    "Pillow",
     "soundfile",
     "transformers",
+]
+
+# Optional: the opt-in AudioSeal watermark on generated speech
+# (``audio_watermark`` in a deployment's model_kwargs; MIT code and weights).
+# 0.3 may change the streaming layers mstar.model.audio_watermark drives.
+audioseal = [
+    "audioseal>=0.2,<0.3",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend
@@ -276,6 +286,23 @@ waypoint = [
     # on PyPI; install it separately, see docs/installation.rst.
 ]
 
+lingbot_world = [
+    # UMT5 and the Wan2.1 VAE load through transformers / diffusers (see [wan22]);
+    # scipy resamples the camera trajectory (Slerp) as the reference does;
+    # ftfy and regex clean the prompt as the reference's T5 tokenizer does.
+    # flash-attn (FA2 varlen, what the reference attends with) is installed
+    # separately, see docs/installation.rst.
+    "accelerate",
+    "diffusers>=0.39",
+    "einops",
+    "ftfy",
+    "huggingface-hub",
+    "regex",
+    "safetensors",
+    "scipy",
+    "transformers",
+]
+
 flux2_klein = [
     # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
     # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
@@ -340,6 +367,9 @@ all = [
     # waypoint. TAEHV is intentionally installed separately because PyPI rejects
     # direct-URL dependencies in project metadata; see docs/installation.rst.
     "tensordict==0.10.0",
+    # lingbot_world: camera trajectory resampling and prompt cleaning
+    "scipy",
+    "ftfy",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
     # flash-attn-4 (waypoint's default flex attention backend) is also installed
@@ -350,6 +380,7 @@ all = [
     "misaki>=0.9.4",
     "spacy>=3.8",
     "num2words",
+    "audioseal>=0.2,<0.3",  # see the audioseal extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.

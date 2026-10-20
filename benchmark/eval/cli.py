@@ -15,6 +15,9 @@ Examples::
     # tables and charts from any set of results files
     python -m benchmark.eval report results/kokoro results/qwen3_tts --md table.md \\
         --chart sweep.png --chart-metrics ttfa_ms_p50,audio_s_per_s
+
+    # base vs head on the same GPUs (local, or --hosts over SSH): correctness and perf per model and case
+    python -m benchmark.eval compare --base main --head 548 --models tag:tts,qwen3_omni
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ import sys
 from pathlib import Path
 
 from benchmark.eval import datasets
+from benchmark.eval.e2e import compare as e2e_compare
+from benchmark.eval.e2e import hosts as e2e_hosts
 from benchmark.eval.harness import SAVE_AUDIO, run_point
 from benchmark.eval.load import MODES, LoadSpec
 from benchmark.eval.schema import collect_metadata, served_models
@@ -61,7 +66,8 @@ def _add_run(sub) -> None:
         srv.add_argument("--serve-env", action="append", default=[], metavar="K=V", help="server environment")
         srv.add_argument("--startup-timeout", type=float, default=1800.0)
         p.add_argument("--model-name", default=None, help="'model' field sent (default: --serve MODEL or 'default')")
-        p.add_argument("--data", required=True, help="manifest .jsonl or a .txt of sentences")
+        p.add_argument("--data", default=None,
+                       help="manifest .jsonl or a .txt of sentences (optional only for suites that build their own)")
         p.add_argument("--limit", type=int, default=None, help="first N items")
         p.add_argument("--shuffle-seed", type=int, default=None, help="shuffle items with this seed first")
         p.add_argument("--mode", choices=MODES, default="closed")
@@ -114,6 +120,9 @@ def _add_data(sub) -> None:
     for k in (ls, fl, st, dx):
         k.add_argument("--out", required=True)
         k.add_argument("--n", type=int, default=None)
+    e2e = kinds.add_parser("e2e", allow_abbrev=False, help="every input `compare` sends (speech sets and media)")
+    e2e.add_argument("--archive", default=None, help="local seedtts_testset.tar (skips the download)")
+    e2e.add_argument("--out", required=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_report(sub)
     _add_rescore(sub)
     _add_data(sub)
+    e2e_compare.add_args(sub)
     return parser
 
 
@@ -154,20 +164,22 @@ def cmd_run(args) -> list[Path]:
 
     cls = SUITES[args.suite]
     args.model_name = args.model_name or args.serve or "default"
-    items = datasets.load_manifest(args.data)
+    suite = cls(args)
+    items = datasets.load_manifest(args.data) if args.data else suite.default_items()
+    if items is None:
+        raise SystemExit(f"suite {args.suite!r} needs --data")
     if args.shuffle_seed is not None:
         random.Random(args.shuffle_seed).shuffle(items)
     items = items[: args.limit] if args.limit else items
     if not items:
-        raise SystemExit(f"no items in {args.data}")
-    suite = cls(args)
+        raise SystemExit(f"no items in {args.data or 'the suite defaults'}")
     suite.check_items(items)
     points = _points(args)
     label = args.label or Path(args.model_name).name
     file_label = re.sub(r"[^\w.-]+", "_", label)
     out = Path(args.out)
     config = {
-        "data": {"path": Path(args.data).name, "items": len(items), "limit": args.limit,
+        "data": {"path": Path(args.data).name if args.data else None, "items": len(items), "limit": args.limit,
                  "shuffle_seed": args.shuffle_seed, "first_id": items[0].id, "last_id": items[-1].id},
         "model_name": args.model_name,
     }
@@ -239,6 +251,10 @@ def cmd_data(args) -> None:
         path = datasets.build_fleurs(out, args.lang, args.split, args.n or 100)
     elif args.kind == "seedtts":
         path = datasets.build_seedtts(out, args.locale, args.n, args.archive)
+    elif args.kind == "e2e":
+        from benchmark.eval.e2e import media
+
+        path = media.build(out, args.archive)
     else:
         from benchmark.eval.suites.duplex import compose_items
 
@@ -253,6 +269,17 @@ def _exit_on_signal(signum, frame) -> None:  # noqa: ARG001
     raise SystemExit(128 + signum)
 
 
+def _interrupted(e: BaseException | None) -> str:
+    """The one line ``compare`` prints on Ctrl-C instead of a traceback."""
+    while e is not None and not isinstance(e, e2e_hosts.Interrupted):   # a second Ctrl-C while cleaning up
+        e = e.__context__
+    if e is None:
+        return "interrupted; no job was running"
+    if e.stopped:
+        return "interrupted; remote job stopped"
+    return f"interrupted; a job still running stops itself within {e2e_compare.LEASE_S // 60} min (its lease)"
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -263,5 +290,14 @@ def main(argv: list[str] | None = None) -> None:
         cmd_report(args)
     elif args.command == "rescore":
         cmd_rescore(args)
+    elif args.command == "compare":
+        try:
+            code = e2e_compare.cmd_compare(args)
+        except KeyboardInterrupt as e:
+            print(_interrupted(e), file=sys.stderr)
+            code = 128 + signal.SIGINT
+        sys.exit(code)
+    elif args.command == "calibrate":
+        sys.exit(e2e_compare.cmd_calibrate(args))
     else:
         cmd_data(args)
