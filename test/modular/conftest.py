@@ -20,7 +20,8 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from mstar.platforms import resolve_platform
+from mstar.platforms import current_platform, resolve_platform
+from mstar.platforms.dispatch import PlatformDispatch
 
 # --- torch._dynamo.config stub --------------------------------------------
 
@@ -131,10 +132,18 @@ def torch_flag():
 
 # --- platform cache ----------------------------------------------------------
 
+def _reset_platform_state():
+    resolve_platform.cache_clear()
+    PlatformDispatch.reset_all()
+    # a monkeypatch on the proxy itself leaves the restored bound method in its __dict__, which
+    # would answer for the platform cached at that time from then on
+    vars(current_platform).clear()
+
+
 @pytest.fixture(autouse=True)
 def _fresh_platform():
-    """Clear the cached platform, so a test that stubs ``torch.cuda`` can't
-    leak its platform into later tests."""
-    resolve_platform.cache_clear()
+    """Clear the cached platform and every dispatch's cached kernel, so a test
+    that stubs ``torch.cuda`` or a kernel module can't leak them into later tests."""
+    _reset_platform_state()
     yield
-    resolve_platform.cache_clear()
+    _reset_platform_state()
