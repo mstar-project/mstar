@@ -341,12 +341,14 @@ def test_table_render(tmp_path):
             {"markers": ["ws-j", "ws-j-moe-tune"] if arm == "mstar" else ["ws-j"], "loadavg": [12.4, 9.0, 7.0]}))
     (run / "correctness.json").write_text(json.dumps({"qwen3_5_0.8b/mstar": {"verdict": "PASS",
                                                                              "exact_vs_reference": "30/32"}}))
+    (run / "notes.txt").write_text("HIP 4 runs hot on this node.\n\n")
     void = run / "qwen3_5_0.8b" / "mstar.health-fail-1"
     void.mkdir()
     (void / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3_5_0.8b", "status": "done"}))
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
     assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml |" in md
+    assert "\n- note: HIP 4 runs hot on this node.\n" in md
     assert "| client-bound rerun |" in md and md.count("client-bound") == 1
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1); finished" in md and "node health check_resume1: PASS" in md
     assert ("resumed 2026-10-20T03:00:00-0500 on h (job 2), GPUs [0, 1, 4], lanes 2; measured qwen3_5_4b/mstar, "
