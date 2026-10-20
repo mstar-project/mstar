@@ -700,6 +700,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.plan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.remove_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.reset_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.reset_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.supports_preplan</span></code></a></li>
 </ul>
 </li>
@@ -1298,6 +1299,26 @@ request’s state.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit">
+<span class="sig-name descname"><span class="pre">rollback_admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.rollback_admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit" title="Link to this definition">#</a></dt>
+<dd><p>Free the slots this step’s admit took fresh; slots a request already
+held stay with it. Without this, two forking requests can each keep
+the slot the other’s fork needs, and the pool has no eviction to break
+that.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentStep" title="mstar.engine.resources.recurrent.config.RecurrentStep"><em>RecurrentStep</em></a>)</p></li>
+<li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">supports_preplan</span></span><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan" title="Link to this definition">#</a></dt>
@@ -1513,6 +1534,7 @@ admit and copied at plan (pre) or commit (post).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.plan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.remove_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.reset_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.reset_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.supports_preplan</span></code></a></li>
 </ul>
 </li>

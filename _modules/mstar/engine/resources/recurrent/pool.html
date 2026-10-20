@@ -1034,6 +1034,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">assert</span> <span class="n">sink</span> <span class="o">==</span> <span class="n">SINK_SLOT</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"expected slot </span><span class="si">{</span><span class="n">SINK_SLOT</span><span class="si">}</span><span class="s2"> first, got </span><span class="si">{</span><span class="n">sink</span><span class="si">}</span><span class="s2">"</span>
         <span class="c1"># guards `_slots`/`_free` across threads; see `KVManager._lock`</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span>
+        <span class="c1"># (rid, label) -&gt; slot the live admit took fresh, for `rollback_admit`.</span>
+        <span class="c1"># Per row like `KVManager._admit_reserved_pages`, and handle-keyed the</span>
+        <span class="c1"># same way, so a released request's entries are purged with it.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_max_bs</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_addressing</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">RecurrentAddressing</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1108,6 +1112,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        request's state.</span>
 <span class="sd">        """</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_forget_taken</span><span class="p">(</span><span class="k">lambda</span> <span class="n">r</span><span class="p">:</span> <span class="n">r</span> <span class="o">==</span> <span class="n">rid</span><span class="p">)</span>
             <span class="n">labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">labels</span><span class="p">:</span>
                 <span class="k">return</span>
@@ -1138,7 +1143,15 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># than check, and a scatter with two rows on one slot is</span>
             <span class="c1"># nondeterministic. The free list guarantees it.</span>
             <span class="n">slot</span> <span class="o">=</span> <span class="n">labels</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">SlotState</span><span class="p">(</span><span class="n">index</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="o">.</span><span class="n">pop</span><span class="p">())</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">[(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)]</span> <span class="o">=</span> <span class="n">slot</span><span class="o">.</span><span class="n">index</span>
             <span class="k">return</span> <span class="n">slot</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_forget_taken</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">is_mine</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Drop the rollback record of the rows ``is_mine`` accepts. Caller</span>
+<span class="sd">        holds the lock."""</span>
+        <span class="n">taken</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">taken</span> <span class="k">if</span> <span class="n">is_mine</span><span class="p">(</span><span class="n">k</span><span class="p">[</span><span class="mi">0</span><span class="p">])]:</span>
+            <span class="k">del</span> <span class="n">taken</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
 
     <span class="c1"># Step lifecycle</span>
 
@@ -1153,6 +1166,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        """</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">ADMIT_OK</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_forget_taken</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">():</span>
             <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_padding_row</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">):</span>
                 <span class="c1"># reads its state without extending it, or a padding row</span>
@@ -1167,6 +1183,29 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_alloc</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_out_of_slots</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">ADMIT_OK</span></div>
+
+
+<div class="viewcode-block" id="RecurrentStatePool.rollback_admit">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rollback_admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">RecurrentStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Free the slots this step's admit took fresh; slots a request already</span>
+<span class="sd">        held stay with it. Without this, two forking requests can each keep</span>
+<span class="sd">        the slot the other's fork needs, and the pool has no eviction to break</span>
+<span class="sd">        that."""</span>
+        <span class="k">del</span> <span class="n">step</span>
+        <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">taken</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span>
+            <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">label</span> <span class="ow">in</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">taken</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">k</span><span class="p">[</span><span class="mi">0</span><span class="p">])]:</span>
+                <span class="n">index</span> <span class="o">=</span> <span class="n">taken</span><span class="o">.</span><span class="n">pop</span><span class="p">((</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">))</span>
+                <span class="n">labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="n">slot</span> <span class="o">=</span> <span class="n">labels</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="k">if</span> <span class="n">labels</span> <span class="k">else</span> <span class="kc">None</span>
+                <span class="k">if</span> <span class="n">slot</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">slot</span><span class="o">.</span><span class="n">index</span> <span class="o">!=</span> <span class="n">index</span><span class="p">:</span>
+                    <span class="k">continue</span>  <span class="c1"># reset or removed under us; the slot went with it</span>
+                <span class="k">del</span> <span class="n">labels</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_zero_slot</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">index</span><span class="p">)</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_out_of_slots</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
@@ -1264,6 +1303,9 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="c1"># committed, so there is nothing left to unwind</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_forget_taken</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">():</span>
                 <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_padding_row</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">):</span>
                     <span class="k">continue</span>

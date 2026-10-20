@@ -1390,15 +1390,26 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"Admit for resource </span><span class="si">%s</span><span class="s2"> failed with error: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span> <span class="n">outcome</span><span class="o">.</span><span class="n">reason</span><span class="o">.</span><span class="n">message</span>
                 <span class="p">)</span>
-                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">covered</span><span class="p">,</span> <span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
-                        <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
-                    <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_unwind</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="p">[</span><span class="o">*</span><span class="n">covered</span><span class="p">,</span> <span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">])</span>
                 <span class="k">return</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">outcome</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
             <span class="n">admitted</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
             <span class="n">ready</span> <span class="o">=</span> <span class="n">ready</span> <span class="ow">and</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ready</span>
         <span class="k">return</span> <span class="n">FULL_ADMIT_OK</span> <span class="k">if</span> <span class="n">ready</span> <span class="k">else</span> <span class="n">FULL_ADMIT_NOT_READY</span></div>
 
+
+<div class="viewcode-block" id="StepRunner.rollback_admit">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.rollback_admit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rollback_admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Give back everything an admitted step reserved, for a step that</span>
+<span class="sd">        will not run: the unwind a refused ``admit`` does, over every</span>
+<span class="sd">        resource the step declares."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unwind</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">))</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_unwind</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># reverse dependency order, off a list so every rank unwinds alike</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">keys</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
 
 <div class="viewcode-block" id="StepRunner.plan">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.plan">[docs]</a>
@@ -1454,10 +1465,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"Admit for pre-planning resource </span><span class="si">%s</span><span class="s2"> failed with error: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span> <span class="n">outcome</span><span class="o">.</span><span class="n">reason</span><span class="o">.</span><span class="n">message</span>
                 <span class="p">)</span>
-                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
-                        <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
-                    <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_unwind</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="p">[</span><span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">])</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="k">return</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">outcome</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
             <span class="n">admitted</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
