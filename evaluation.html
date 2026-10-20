@@ -643,6 +643,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suites">Suites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#datasets">Datasets</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quality-judges">Quality judges</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-bench-v1-5">Full-Duplex-Bench v1.5</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#judges-and-agreement">Judges and agreement</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results-and-reports">Results and reports</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#base-vs-head-compare">Base vs head: <code class="docutils literal notranslate"><span class="pre">compare</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-suite">Adding a suite</a></li>
@@ -738,6 +742,11 @@ world-model frames. Latency percentiles, time to first output and requests/s; th
 saved for <code class="docutils literal notranslate"><span class="pre">compare</span></code> to diff. It builds its own prompts, so <code class="docutils literal notranslate"><span class="pre">--data</span></code> is optional (<code class="docutils literal notranslate"><span class="pre">gen_clone</span></code> takes a
 voice-clone manifest) and <code class="docutils literal notranslate"><span class="pre">--media</span></code> points at <code class="docutils literal notranslate"><span class="pre">data</span> <span class="pre">e2e</span></code>’s <code class="docutils literal notranslate"><span class="pre">media/</span></code>.</p>
 </dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fdb</span></code> (opt-in, non-commercial data)</dt><dd><p><a class="reference external" href="https://github.com/DanielLin94144/Full-Duplex-Bench">Full-Duplex-Bench</a> v1.5 on the
+same streamed <code class="docutils literal notranslate"><span class="pre">/generate</span></code> client: stop and response latency, LLM-judged behavior
+labels, semantic quality, and the agreement between judges. See
+<a class="reference internal" href="#id1"><span class="std std-ref">Full-Duplex-Bench v1.5</span></a> below.</p>
+</dd>
 </dl>
 </section>
 <section id="datasets">
@@ -781,6 +790,11 @@ identify speakers</p></td>
 <td><p>composed from an ASR manifest</p></td>
 <td><p>inherits the source’s terms</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fdb-v15</span></code></p></td>
+<td><p>Full-Duplex-Bench v1.5 (498 pairs), the official Google Drive via gdown
+(<code class="docutils literal notranslate"><span class="pre">--per-category</span> <span class="pre">N</span></code> takes the first N of each category)</p></td>
+<td><p>CC BY-NC 4.0, non-commercial use only; never vendored</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -805,6 +819,113 @@ published SIM uses a WavLM-large ECAPA checkpoint, so absolute values differ.</p
 </ul>
 <p>Judges run between repeats, after the load has finished, so they never compete with
 measured requests; <code class="docutils literal notranslate"><span class="pre">--judge-device</span></code> moves them to another GPU or the CPU.</p>
+</section>
+<section id="full-duplex-bench-v1-5">
+<span id="id1"></span><h2>Full-Duplex-Bench v1.5<a class="headerlink" href="#full-duplex-bench-v1-5" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Full-Duplex-Bench’s code and data are licensed
+<a class="reference external" href="https://github.com/DanielLin94144/Full-Duplex-Bench/blob/3e799c45a045256f47d5f1c9cda90157e2d2ec9e/LICENSE">CC BY-NC 4.0</a>:
+non-commercial use only. This repository contains none of it. <code class="docutils literal notranslate"><span class="pre">data</span> <span class="pre">fdb-v15</span></code>
+downloads the v1.5 subsets from the benchmark’s official Google Drive, and the
+suite downloads the official scoring code (<code class="docutils literal notranslate"><span class="pre">get_timing.py</span></code>, <code class="docutils literal notranslate"><span class="pre">eval_behavior.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">instruction/behavior.txt</span></code>, <code class="docutils literal notranslate"><span class="pre">get_transcript/asr.py</span></code>) at the pinned revision
+<code class="docutils literal notranslate"><span class="pre">3e799c45</span></code> into the Hugging Face cache, checking each file’s SHA-256. Using the
+suite means accepting those terms.</p>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">fdb</span></code> suite follows the reference runner (<code class="docutils literal notranslate"><span class="pre">benchmarks/duplex/fdb_v15</span></code>, pinned in
+<code class="docutils literal notranslate"><span class="pre">benchmark/eval/fdb_reference.py</span></code>) metric for metric, so its numbers can be compared with that runner’s. v1.5 has 498
+pairs in four categories: <code class="docutils literal notranslate"><span class="pre">user_interruption</span></code> (200), <code class="docutils literal notranslate"><span class="pre">user_backchannel</span></code> (98),
+<code class="docutils literal notranslate"><span class="pre">talking_to_other</span></code> (100) and <code class="docutils literal notranslate"><span class="pre">background_speech</span></code> (100). A pair is the user’s query
+with a later overlapping event (<code class="docutils literal notranslate"><span class="pre">input.wav</span></code>) and the query alone
+(<code class="docutils literal notranslate"><span class="pre">clean_input.wav</span></code>); each is its own session:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">data</span> <span class="n">fdb</span><span class="o">-</span><span class="n">v15</span> <span class="o">--</span><span class="n">out</span> <span class="o">~/</span><span class="nb">eval</span><span class="o">-</span><span class="n">data</span><span class="o">/</span><span class="n">fdb</span> <span class="o">--</span><span class="n">per</span><span class="o">-</span><span class="n">category</span> <span class="mi">12</span>   <span class="c1"># or all</span>
+
+<span class="c1"># a local judge on the same GPU, started first so it gets a fixed share of memory:</span>
+<span class="c1"># any OpenAI-compatible server for Qwen/Qwen3.8-27B at revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0,</span>
+<span class="c1"># served as qwen3.8-27b on port 30000 with a qwen3 reasoning parser, 42% of GPU memory</span>
+<span class="c1"># and a 65536-token context</span>
+
+<span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">run</span> <span class="n">fdb</span> <span class="o">--</span><span class="n">serve</span> <span class="n">nemotron_duplex</span> \
+    <span class="o">--</span><span class="n">data</span> <span class="o">~/</span><span class="nb">eval</span><span class="o">-</span><span class="n">data</span><span class="o">/</span><span class="n">fdb</span><span class="o">/</span><span class="n">manifest</span><span class="o">-</span><span class="mf">12.</span><span class="n">jsonl</span> <span class="o">--</span><span class="n">concurrency</span> <span class="mi">16</span> <span class="o">--</span><span class="n">repeats</span> <span class="mi">3</span> <span class="o">--</span><span class="n">out</span> <span class="n">results</span><span class="o">/</span><span class="n">fdb</span> \
+    <span class="o">--</span><span class="n">judge</span> <span class="n">qwen</span><span class="o">=</span><span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="mf">127.0.0.1</span><span class="p">:</span><span class="mi">30000</span><span class="o">/</span><span class="n">v1</span> <span class="o">--</span><span class="n">judge</span><span class="o">-</span><span class="n">revision</span> <span class="n">qwen</span><span class="o">=</span><span class="mi">1</span><span class="n">d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0</span> \
+    <span class="o">--</span><span class="n">judge</span> <span class="n">gpt4o</span><span class="o">=</span><span class="n">openai</span>
+
+<span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">report</span> <span class="n">results</span><span class="o">/</span><span class="n">fdb</span> <span class="o">--</span><span class="n">md</span> <span class="n">fdb</span><span class="o">.</span><span class="n">md</span> <span class="o">--</span><span class="n">chart</span> <span class="n">fdb</span><span class="o">.</span><span class="n">png</span>
+<span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">agreement</span> <span class="n">results</span><span class="o">/</span><span class="n">fdb</span> <span class="o">--</span><span class="n">md</span> <span class="n">agreement</span><span class="o">.</span><span class="n">md</span> <span class="o">--</span><span class="n">chart</span> <span class="n">confusion</span><span class="o">.</span><span class="n">png</span>
+</pre></div>
+</div>
+<p>What is measured (each number is per category and for <code class="docutils literal notranslate"><span class="pre">all</span></code>, mean +- std over repeats):</p>
+<ul class="simple">
+<li><p><strong>Observation window.</strong> The model’s output over <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">T]</span></code>, T the input length, as
+16 kHz mono with exactly the input’s sample count. A frame-synchronous model emits
+one output frame per input frame, so this is the audio a client would hear with no
+transport delay; a client that streams in real time and plays what arrives (as the
+reference runner does) also gets the server’s processing and transport delay in its window.
+<code class="docutils literal notranslate"><span class="pre">wall_ms_per_frame</span></code> and <code class="docutils literal notranslate"><span class="pre">on_time_rate</span></code> show whether the server kept up live.</p></li>
+<li><p><strong>Stop and response latency.</strong> The official <code class="docutils literal notranslate"><span class="pre">get_timing.py</span></code> on Silero VAD speech
+spans (<code class="docutils literal notranslate"><span class="pre">silero-vad</span></code> package, user spans merged across 0.6 s gaps, model spans
+across 0.5 s). Stop intervals are overlaps of user and model speech; response
+intervals run from the end of a user span to the next later model start. These are
+whole-file intervals of the overlap session, pooled: the mean over every interval of
+every timed session, null when there is none. Lower stop latency is better on
+<code class="docutils literal notranslate"><span class="pre">user_interruption</span></code>; on the other three categories the model should keep its turn,
+so the overlap mostly tracks how long the other speech lasts.</p></li>
+<li><p><strong>Behavior labels.</strong> The four files of a pair are transcribed with word timestamps by
+the official ASR script on <code class="docutils literal notranslate"><span class="pre">nvidia/parakeet-tdt-0.6b-v2</span></code> (pinned revision and
+SHA-256; needs <code class="docutils literal notranslate"><span class="pre">nemo_toolkit[asr]</span></code>), then each judge labels the pair with the exact
+official prompt: <code class="docutils literal notranslate"><span class="pre">C_RESPOND</span></code> (addressed the overlap), <code class="docutils literal notranslate"><span class="pre">C_RESUME</span></code> (ignored it and
+continued), <code class="docutils literal notranslate"><span class="pre">C_UNCERTAIN_HANDLING</span></code> (asked for a repeat) or <code class="docutils literal notranslate"><span class="pre">C_UNKNOWN</span></code> (off-target
+or silent). The share that should be high is <code class="docutils literal notranslate"><span class="pre">C_RESPOND</span></code> on <code class="docutils literal notranslate"><span class="pre">user_interruption</span></code>
+and <code class="docutils literal notranslate"><span class="pre">C_RESUME</span></code> on the other three. Shares are over valid labels; <code class="docutils literal notranslate"><span class="pre">judged_pairs</span></code>
+says how many there were.</p></li>
+<li><p><strong>Semantic quality</strong> (non-official, one local judge, as in the reference runner). Each pair is
+graded <code class="docutils literal notranslate"><span class="pre">accept</span></code>, <code class="docutils literal notranslate"><span class="pre">fail</span></code> or <code class="docutils literal notranslate"><span class="pre">unresolved</span></code> on <code class="docutils literal notranslate"><span class="pre">interaction_handling</span></code>,
+<code class="docutils literal notranslate"><span class="pre">relevance</span></code> and <code class="docutils literal notranslate"><span class="pre">grounding</span></code> with the reference judge’s frozen prompt and schema (fetched
+at a pinned commit); <code class="docutils literal notranslate"><span class="pre">joint</span></code> fails if any axis fails and accepts only if all three
+accept. A verdict without an exact quote of its source becomes <code class="docutils literal notranslate"><span class="pre">unresolved</span></code>.
+<code class="docutils literal notranslate"><span class="pre">quality</span> <span class="pre">=</span> <span class="pre">A/(A+F)</span></code> and <code class="docutils literal notranslate"><span class="pre">coverage</span> <span class="pre">=</span> <span class="pre">(A+F)/N</span></code>, N every selected pair: read them
+together. Before grading, six frozen control cases must reproduce all 18 expected
+statuses, or the run is not graded (a rubric check, not judge accuracy).</p></li>
+</ul>
+<p>Failed sessions stay in every denominator and are never timed or judged.</p>
+<section id="judges-and-agreement">
+<h3>Judges and agreement<a class="headerlink" href="#judges-and-agreement" title="Link to this heading">#</a></h3>
+<p>A judge is any OpenAI-compatible chat endpoint, named with <code class="docutils literal notranslate"><span class="pre">--judge</span> <span class="pre">NAME=...</span></code>:</p>
+<ul class="simple">
+<li><p><strong>local</strong>: <code class="docutils literal notranslate"><span class="pre">NAME=http://host:port/v1</span></code> (any OpenAI-compatible server, M* included if it serves the model).
+The model sent is the endpoint’s <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> entry (<code class="docutils literal notranslate"><span class="pre">URL#name</span></code> picks one) and
+every reply must report it. Behavior labels decode as the reference judge does:
+non-thinking, temperature 0, top_p 1, 512 tokens, retry seeds 1 to 3. The semantic
+judge runs thinking mode, temperature 0, seed 1, in batches of 8 pairs; serve with a
+reasoning parser (<code class="docutils literal notranslate"><span class="pre">--reasoning-parser</span> <span class="pre">qwen3</span></code>) so the JSON answer arrives in
+<code class="docutils literal notranslate"><span class="pre">content</span></code>. <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-27B</span></code> is the reference runner’s choice.</p></li>
+<li><p><strong>API</strong>: <code class="docutils literal notranslate"><span class="pre">NAME=openai</span></code> is <code class="docutils literal notranslate"><span class="pre">gpt-4o-2024-08-06</span></code>, the paper’s judge, with the
+official decoding. It reads <code class="docutils literal notranslate"><span class="pre">OPENAI_API_KEY</span></code> (and <code class="docutils literal notranslate"><span class="pre">OPENAI_BASE_URL</span></code>) from the
+environment and is skipped, with the reason in the results file and the report,
+when the key is not set. Keys are never written anywhere.</p></li>
+</ul>
+<p>Labels from different judges are kept apart (<code class="docutils literal notranslate"><span class="pre">&lt;category&gt;.&lt;judge&gt;.&lt;label&gt;</span></code>); compare
+runs only under the same judge. With two or more judges, every repeat also records
+<code class="docutils literal notranslate"><span class="pre">agreement.&lt;a&gt;.&lt;b&gt;.agreement</span></code> and <code class="docutils literal notranslate"><span class="pre">.kappa</span></code> (Cohen’s) over the pairs both labeled
+validly, and <code class="docutils literal notranslate"><span class="pre">agreement</span></code> pools them over repeats into a confusion matrix with
+per-category agreement and each judge’s label shares. The reference runner measured Qwen
+against gpt-4o on Nemotron VoiceChat (the model behind <code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>): 84.9%
+agreement, kappa 0.72, with Qwen giving far fewer <code class="docutils literal notranslate"><span class="pre">C_UNKNOWN</span></code> labels, so a local
+judge’s numbers are for comparing like with like, and the API judge’s for comparing
+with published results.</p>
+<p><code class="docutils literal notranslate"><span class="pre">rejudge</span></code> adds a judge to finished results from the transcripts they hold, without a
+server or GPU (for example once an API key is available), and recomputes the label
+and agreement metrics:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">eval</span> <span class="n">rejudge</span> <span class="n">results</span><span class="o">/</span><span class="n">fdb</span> <span class="o">--</span><span class="n">judge</span> <span class="n">gpt4o</span><span class="o">=</span><span class="n">openai</span> <span class="o">--</span><span class="n">out</span> <span class="n">results</span><span class="o">/</span><span class="n">fdb</span><span class="o">-</span><span class="n">gpt4o</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--semantic-only</span> <span class="pre">--semantic-judge</span> <span class="pre">NAME</span></code> regrades only the semantic A/F/U axes and keeps
+every judge’s labels; <code class="docutils literal notranslate"><span class="pre">--retry-failed</span></code> relabels only the pairs whose label from an
+unchanged judge failed. Rate limits, server errors and dropped connections are retried
+with the same request and seed, with exponential backoff (<code class="docutils literal notranslate"><span class="pre">Retry-After</span></code> honored), so they
+never move the official loop to its next seed; a pair whose retries run out is <code class="docutils literal notranslate"><span class="pre">failed</span></code>.</p>
+</section>
 </section>
 <section id="results-and-reports">
 <h2>Results and reports<a class="headerlink" href="#results-and-reports" title="Link to this heading">#</a></h2>
@@ -1003,6 +1124,10 @@ every suite against a stdlib fake server on CPU; add a case there.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suites">Suites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#datasets">Datasets</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quality-judges">Quality judges</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-bench-v1-5">Full-Duplex-Bench v1.5</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#judges-and-agreement">Judges and agreement</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results-and-reports">Results and reports</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#base-vs-head-compare">Base vs head: <code class="docutils literal notranslate"><span class="pre">compare</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-suite">Adding a suite</a></li>
