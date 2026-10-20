@@ -895,7 +895,14 @@ large-v3 round trip for TTS) rose more than <code class="docutils literal notran
 below <code class="docutils literal notranslate"><span class="pre">min_db</span></code> PSNR against base; VLA actions moved more than <code class="docutils literal notranslate"><span class="pre">tol</span></code>; duplex take-turn or yield rates dropped
 more than <code class="docutils literal notranslate"><span class="pre">tol</span></code>; a request-path status code changed; head had more request errors than base; or head answered
 no request at a server session and concurrency where base answered some (request errors per arm are a column of
-the main table);</p></li>
+the main table). A greedy-text failure on its limit alone (no missing, cut-short, undecodable or reshaped
+outputs, no extra errors) whose <code class="docutils literal notranslate"><span class="pre">quality</span></code> scores all hold reads “changed, quality same” instead and is not
+flagged. A PSNR failure stays flagged whatever its CLIP score: a seed the server stops honouring changes the
+pixels, not their quality;</p></li>
+<li><p><strong>quality worse</strong>: a <code class="docutils literal notranslate"><span class="pre">quality</span></code> score of the case (<code class="docutils literal notranslate"><span class="pre">mos</span></code>: UTMOS22 of the speech; <code class="docutils literal notranslate"><span class="pre">speaker_sim</span></code>: WavLM
+similarity to the reference clip; <code class="docutils literal notranslate"><span class="pre">clip</span></code>: CLIP score of the image or video against its prompt; each arm scored
+on its own c=1 outputs after the servers stop) is below base’s by more than 1.5 times the row’s A/A swing, and at
+least 0.1 UTMOS, 0.02 similarity or 0.5 CLIP points;</p></li>
 <li><p><strong>a regression</strong>: c=1 latency or c=max throughput is worse by more than 5%, by more than two combined standard
 deviations of the passes, and by more than 1.5 times the largest drift that row showed between two server
 processes of identical code in its last 8 A/A runs (its A/A noise floor; a lone drift over 10% and over three
@@ -906,8 +913,9 @@ while base does.</p></li>
 </ul>
 <p>A perf row flagged with one session per arm is rerun with two (ABBA) before it is reported, since a server process
 can settle at one of two speeds; <code class="docutils literal notranslate"><span class="pre">--no-rerun</span></code> turns that off.</p>
-<p><strong>Calibrating.</strong> Noise floors and correctness swings come from A/A runs (base and head the same commit), per GPU
-type, in <code class="docutils literal notranslate"><span class="pre">benchmark/eval/e2e/calibration.yaml</span></code>. After a large change on <code class="docutils literal notranslate"><span class="pre">main</span></code>, a new model, or on a new GPU
+<p><strong>Calibrating.</strong> Noise floors, correctness swings and quality-score swings come from A/A runs (base and head the
+same commit), per GPU type, in <code class="docutils literal notranslate"><span class="pre">benchmark/eval/e2e/calibration.yaml</span></code>; each kind keeps its own list of folded
+runs (<code class="docutils literal notranslate"><span class="pre">_runs</span></code>, <code class="docutils literal notranslate"><span class="pre">_runs_correct</span></code>, <code class="docutils literal notranslate"><span class="pre">_runs_quality</span></code>), so a run folded before a kind existed can still add it. After a large change on <code class="docutils literal notranslate"><span class="pre">main</span></code>, a new model, or on a new GPU
 type, run <code class="docutils literal notranslate"><span class="pre">compare</span> <span class="pre">--base</span> <span class="pre">main</span> <span class="pre">--head</span> <span class="pre">main</span></code> for the models concerned, then
 <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.eval</span> <span class="pre">calibrate</span> <span class="pre">&lt;run</span> <span class="pre">dir&gt;</span></code>; rows without a floor on the run’s GPU are named in the report
 and judged on the passes’ spread alone. A calibrated swing only widens a <code class="docutils literal notranslate"><span class="pre">cases.yaml</span></code> limit, never tightens it.

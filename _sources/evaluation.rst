@@ -238,7 +238,14 @@ is broken, or base answered no request at some server session and concurrency, w
   below ``min_db`` PSNR against base; VLA actions moved more than ``tol``; duplex take-turn or yield rates dropped
   more than ``tol``; a request-path status code changed; head had more request errors than base; or head answered
   no request at a server session and concurrency where base answered some (request errors per arm are a column of
-  the main table);
+  the main table). A greedy-text failure on its limit alone (no missing, cut-short, undecodable or reshaped
+  outputs, no extra errors) whose ``quality`` scores all hold reads "changed, quality same" instead and is not
+  flagged. A PSNR failure stays flagged whatever its CLIP score: a seed the server stops honouring changes the
+  pixels, not their quality;
+* **quality worse**: a ``quality`` score of the case (``mos``: UTMOS22 of the speech; ``speaker_sim``: WavLM
+  similarity to the reference clip; ``clip``: CLIP score of the image or video against its prompt; each arm scored
+  on its own c=1 outputs after the servers stop) is below base's by more than 1.5 times the row's A/A swing, and at
+  least 0.1 UTMOS, 0.02 similarity or 0.5 CLIP points;
 * **a regression**: c=1 latency or c=max throughput is worse by more than 5%, by more than two combined standard
   deviations of the passes, and by more than 1.5 times the largest drift that row showed between two server
   processes of identical code in its last 8 A/A runs (its A/A noise floor; a lone drift over 10% and over three
@@ -250,8 +257,9 @@ is broken, or base answered no request at some server session and concurrency, w
 A perf row flagged with one session per arm is rerun with two (ABBA) before it is reported, since a server process
 can settle at one of two speeds; ``--no-rerun`` turns that off.
 
-**Calibrating.** Noise floors and correctness swings come from A/A runs (base and head the same commit), per GPU
-type, in ``benchmark/eval/e2e/calibration.yaml``. After a large change on ``main``, a new model, or on a new GPU
+**Calibrating.** Noise floors, correctness swings and quality-score swings come from A/A runs (base and head the
+same commit), per GPU type, in ``benchmark/eval/e2e/calibration.yaml``; each kind keeps its own list of folded
+runs (``_runs``, ``_runs_correct``, ``_runs_quality``), so a run folded before a kind existed can still add it. After a large change on ``main``, a new model, or on a new GPU
 type, run ``compare --base main --head main`` for the models concerned, then
 ``python -m benchmark.eval calibrate <run dir>``; rows without a floor on the run's GPU are named in the report
 and judged on the passes' spread alone. A calibrated swing only widens a ``cases.yaml`` limit, never tightens it.
