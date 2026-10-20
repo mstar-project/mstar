@@ -25,6 +25,11 @@ uuid = { version = "1", features = ["v4"] }
 serde_bytes = "0.11"
 tower-http = { version = "0.5", features = ["cors"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Constant-time API key compare; already in the tree through rustls.
+subtle = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

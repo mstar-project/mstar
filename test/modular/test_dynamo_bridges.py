@@ -527,6 +527,17 @@ def test_images_n_follows_native_seed_contract(tmp_path):
     assert len(unseeded["data"]) == 2
 
 
+@pytest.mark.parametrize("n", [0, -1, 11])
+def test_images_n_outside_one_to_the_cap_is_400_before_submit(tmp_path, monkeypatch, n):
+    monkeypatch.delenv("MSTAR_MAX_IMAGES_PER_REQUEST", raising=False)
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(bridge._images({"prompt": "a cat", "model": "bagel", "n": n}, _Ctx()))
+    assert (refused.value.code, refused.value.message) == (400, f"n must be between 1 and 10, got {n}")
+    assert not server.submitted
+
+
 def test_images_edit_carries_declared_seed(tmp_path):
     # seed is a declared request field, so model_extra never carries it; the
     # edit path must hand it to the adapter explicitly.

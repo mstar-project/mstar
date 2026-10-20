@@ -72,25 +72,33 @@ A typical model lives in its own package under ``mstar/model/<your_model>/``:
    ├── submodules.py        # NodeSubmodule subclasses (the compute wrappers)
    └── components/          # the actual nn.Modules (attention, decoder, etc.)
 
-Plus two things outside that package:
+Plus a handful of things outside that package:
 
-- an entry in ``mstar/model/registry.py`` so the model is discoverable, and
-- a config YAML in ``configs/`` mapping nodes to ranks.
+- an entry in ``mstar/model/registry.py`` so the model is discoverable,
+- a config YAML in ``configs/`` mapping nodes to ranks,
+- an entry in ``DEFAULT_CONFIGS`` (``mstar/cli/main.py``) so ``mstar serve`` knows the name,
+- a row in ``docs/models.rst``, and
+- an OpenAI adapter, only if the model needs OpenAI-compatible routes.
+
+Step 1 covers all of them.
 
 Step 1 — Register the model
 ---------------------------
 
-Open ``mstar/model/registry.py`` and add your class to ``MODEL_REGISTRY`` (and, if it
+Open ``mstar/model/registry.py`` and add your model to ``MODEL_REGISTRY`` (and, if it
 loads weights from Hugging Face, to ``HF_MODELS``). The dict key is the string you put
 under ``model:`` in a config YAML.
 
+The value is a ``(module_path, class_name)`` tuple, not an imported class: the module is
+imported lazily through ``import_module`` when the model is actually used, which keeps
+``mstar.model.registry`` cheap to import. A direct class import here would pull every
+model's dependencies into every process.
+
 .. code-block:: python
 
-   from mstar.model.your_model.your_model_model import YourModel
-
-   MODEL_REGISTRY: dict[str, type[Model]] = {
+   MODEL_REGISTRY: dict[str, tuple[str, str]] = {
        # ...
-       "your_model": YourModel,
+       "your_model": ("mstar.model.your_model.your_model_model", "YourModel"),
    }
 
    HF_MODELS: dict[str, dict] = {
@@ -98,8 +106,22 @@ under ``model:`` in a config YAML.
        "your_model": {"model_path_hf": "org/your-model-id"},
    }
 
-This is the only wiring step. There is no plugin scan. The registry import is the single
-source of truth.
+There is no plugin scan, so the registry is the only place the class is discovered — but it
+is **not** the only wiring step. A model also needs:
+
+- ``DEFAULT_CONFIGS`` in ``mstar/cli/main.py``, mapping the name to its default config file.
+  Without it, ``mstar serve <your_model>`` exits with ``error: unknown model`` before
+  anything loads.
+- a row in ``docs/models.rst``, which is the model list users read.
+- an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
+  (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
+  such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
+  only through ``POST /generate`` needs none.
+- the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
+  usage snippet. Cosmetic, but user-visible.
+
+``test/modular/test_model_registration.py`` enforces the registry, CLI and docs entries, so
+CI fails rather than shipping a model nobody can reach.
 
 Step 2 — Implement the ``Model`` class
 --------------------------------------
@@ -182,6 +204,14 @@ You must implement these abstract methods:
    lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
    ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
+
+.. note::
+
+   The metadata ``process_prompt`` returns is laid over the request's own
+   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
+   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
+   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
+   lists its prompt layout, speaker, language, clip digest and codec stream lead.
 
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
@@ -354,30 +384,49 @@ The spec types are:
        ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
        a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
-       ``prefix_cache`` and ``prefix_cache_salt``.
+       ``prefix_cache`` and ``prefix_cache_salt``. ``layout=KVLayout.MLA`` stores one
+       Multi-head Latent Attention latent per token in place of K and V. It needs
+       ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
+       ``head_dim`` to their sum. Every rank holds the whole latent; only
+       ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
        Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
-       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
-       ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
+       ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
+       paged backend, FlashInfer for now), ``AttnBackend.FLASHINFER``,
+       ``AttnBackend.DENSE``, ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``.
+       Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
+       and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
+       ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"`` when the FlashInfer backend is selected.
+       ``"fa3"`` when the FlashInfer backend is selected. ``FLASHINFER_MLA`` is
+       Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
+       the softmax scale of the model's original qk head dim, which the other backends
+       refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
+       with the rope part as ``q_pe``, and returns the output in the latent space, so
+       the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
+       64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
+       fallback, which cannot be captured in a CUDA graph.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
-     - Attention over a paged context that is written once and never extended. Only
-       the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
-       models)`_.
+     - Attention over a paged context that is written once and never extended.
+       ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
+       See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
-       defaults to ``head_dim ** -0.5``, ``flashinfer_backend``, and the two
-       CUDA-graph ceilings ``max_segments_per_request`` and
+       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
+       default, or ``RaggedAttnBackend.FLASHINFER``), ``flashinfer_backend``, and the
+       two CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
+   * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
+     - The cross-attention counterpart: one span of each request attends another
+       (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
+       between spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -585,6 +634,29 @@ declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
 ``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise CUDA
 graphs (capturing an inner loop)`_.
 
+Cross-attention between spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A diffusion transformer whose streams attend each other (video queries over text keys, or
+audio over video) has several spans per request and no cache either. Declare each span as
+its own label, and the cross-attentions as a ``RaggedCrossAttentionSpec`` beside the
+``RaggedAttentionSpec`` for the self-attention: a resource is one kind of attention. Its
+step names the ``(q_label, kv_label)`` pairs:
+
+.. code-block:: python
+
+   RaggedCrossAttentionStep(
+       segments=segments,              # one Segment per (request, label) the pairs use
+       pairs=(("video", "text"), ("audio", "video")),
+   )
+
+Each pair is planned as its own layout, pairing each request's ``q_label`` span with that
+request's ``kv_label`` span; cross-attention is never causal. A layer attends through
+``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``, passing the key
+span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
+attentions differ in head count or head dim declares one spec per (kind, geometry).
+LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
+
 .. note::
 
    The eager varlen path is sometimes good to have. The BAGEL ViT has a head dimension of
@@ -760,7 +832,10 @@ resource key:
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
   that does not set its own ``segments`` uses this list.
 - ``KVStep(commit=, combined_labels=, pre_forks=, post_forks=)``. See below.
-- ``AttentionStep(causal=)`` describes the attention plan. A ``RaggedAttentionSpec``
+- ``AttentionStep(causal=, context_only=)`` describes the attention plan.
+  ``context_only=True`` has the queries attend to the stored context alone, not to the
+  tokens this step appends, and the step's own ``segments`` then give the query counts.
+  Only the MLA backend reads it; the others refuse it. A ``RaggedAttentionSpec``
   steps through this same type. There, the segments are the whole layout rather than an
   extension of a cache. See `Cacheless attention (encoder towers)`_.
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
@@ -966,6 +1041,16 @@ into one GPU call. A submodule controls this behavior with three methods:
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
 
+**Combined walks.** By default a step holds one walk. A model lets several walks of a node
+share a step by returning ``{node: {combined_walk: {walks}}}`` from
+``get_combined_graph_walks``, for example decode rows beside a prompt's prefill. The
+combined walk is a name of its own, which ``max_batch_size`` and the CUDA-graph configs
+can key on. A step of one walk keeps that walk's cap. A step that mixes walks takes the
+combined walk's ``max_batch_size`` when it has one, else the smallest cap of the walks it
+holds, so a small prefill cap never limits a decode-only step.
+``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
+step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``).
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
@@ -1017,6 +1102,11 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
+- ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, is
+  ``max-autotune-no-cudagraphs``. ``default`` keeps Inductor's fusion but takes cuBLAS for
+  every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
+  that turns on Inductor's own CUDA graphs (``reduce-overhead``, ``max-autotune``), which
+  fail inside the runner's capture.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
@@ -1131,6 +1221,7 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
+- ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.
 - ``required`` makes every declared shape mandatory. If any participating rank cannot
   capture one, warmup raises instead of leaving that shape on the eager path. The default
   is ``False``.
@@ -1265,6 +1356,8 @@ Step 6 — Write a config YAML
 A config maps nodes to GPU ranks. The value under ``model:`` is your registry key. Each
 ``node_groups`` entry assigns one or more ``node_names`` to ``ranks``. An entry can also
 name specific ``graph_walks``, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.
 
 .. code-block:: yaml
 
@@ -1313,16 +1406,16 @@ that a misspelled setting is never silently ignored:
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``AttentionSpec``
-     - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
    * - ``CrossAttentionSpec``
-     - ``backend`` (only ``flashinfer`` is implemented), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
-     - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
-       ``max_segments_per_request``, ``max_tokens_per_request``. The two ceilings size
-       CUDA-graph buckets, which is a memory-against-coverage trade the deployment makes,
-       not the model.
+     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+       (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
+       ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
+       memory-against-coverage trade the deployment makes, not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
@@ -1658,11 +1751,18 @@ The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcri
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the
-default. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages per
-request. 128 pages therefore support about 32 concurrent requests and use about 2.7 GB.
-The 2048-page default would use about 43 GB. The fixed 30-second context window is
-``max_source_positions`` (1500) tokens, which is 12 pages per request, so 192 pages
-support about 16 concurrent requests.
+default. Both caches use 128-token pages and hold ``WhisperModel.MAX_CONCURRENT_REQUESTS``
+(64) requests at full length, plus the sink page that every ``KVManager`` keeps out of
+circulation. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages
+per request, so the self-attention cache has 64 * 4 + 1 = 257 pages, about 5 GiB for
+large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context
+window is ``max_source_positions`` (1500) tokens, which is 12 pages per request held from
+prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
+``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
+refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
+overrides.
 
 Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
@@ -1751,13 +1851,23 @@ Override these methods:
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
 - ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it.
+  and the partitions that produce data into it. Every walk belongs to exactly one
+  partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
+
+Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
+later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
+whose every input is streamed runs again as soon as the next chunk arrives, and the
+runtime and conductor count passes per worker graph, so the conductor refuses at startup
+such a consumer sharing its worker graph with another top-level node or ``Loop``, and a
+stream-consuming walk split over worker graphs, unless every consumer also waits on a
+non-streamed input and all the walk's worker graphs run on the same workers. That input
+must arrive once per pass (from the conductor, say); startup cannot check this.
 
 Checklist
 ---------
@@ -1781,8 +1891,14 @@ Checklist
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
          [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
-   [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
+   [ ] mstar/model/registry.py                    — (module_path, class_name) in MODEL_REGISTRY
+         [ ] HF_MODELS too, if weights come from Hugging Face
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)
+   [ ] mstar/cli/main.py DEFAULT_CONFIGS          — else `mstar serve <name>` says "unknown model"
+         [ ] the client-example tuples lower down (cosmetic, user-visible)
+   [ ] docs/models.rst                            — one row in the registry-key table
+   [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+   [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 
 Testing

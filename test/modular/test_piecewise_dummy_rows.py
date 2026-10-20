@@ -2,7 +2,7 @@
 
 A capture hands each padding row a share of the bucket's token budget, and a
 packed replay pads with zero-length rows, so what the capture allocated is
-never read again. ``CudaGraphRunner`` releases it after warmup; the piecewise
+never read again. ``AcceleratorGraphRunner`` releases it after warmup; the piecewise
 runner has to do the same, or the largest buckets of every region stay out of
 the pool for the server's lifetime.
 """
@@ -19,9 +19,10 @@ from unittest import mock
 import pytest
 import torch
 
-from mstar.engine import cuda_graph_runner as cgr
-from mstar.engine.cuda_graph_config import PiecewiseBatchedConfig, PiecewisePackedConfig
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine import accelerator_graph_runner as cgr
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
+from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig, PiecewisePackedConfig
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources import (
     KVStep,
     Segment,
@@ -58,6 +59,27 @@ class _StubTransferManager:
         del request_id
 
 
+class _CpuGraphBackend:
+    """The graph backend calls the piecewise runner makes, as no-ops on the CPU."""
+
+    device_type = "cpu"
+
+    def is_available(self):
+        return True
+
+    def set_device(self):
+        pass
+
+    def synchronize(self):
+        pass
+
+    def graph_pool_handle(self):
+        return AcceleratorGraphPool("cpu")
+
+
+_CPU_GRAPHS = SimpleNamespace(graph_backend=_CpuGraphBackend())
+
+
 @pytest.fixture(autouse=True)
 def _cpu_capture(monkeypatch):
     """The runner's capture path on the CPU: every CUDA call it makes is a
@@ -66,10 +88,14 @@ def _cpu_capture(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
-    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", lambda: None)
+    # warm-up reads the device's memory through torch.accelerator, which has no CPU device
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda device=None: 0, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda device=None: 0, raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda device=None: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(
         cgr, "capture_into_graph",
-        lambda run, pool, device, dtype: (SimpleNamespace(replay=lambda: None), run()),
+        lambda run, pool, device, dtype, keep_graph=False: (SimpleNamespace(replay=lambda: None), run()),
     )
 
 
@@ -94,7 +120,7 @@ def _declare(request_ids, seq_lens):
     )
 
 
-def _runner(kv: KVManager) -> PiecewiseCudaGraphRunner:
+def _runner(kv: KVManager) -> PiecewiseAcceleratorGraphRunner:
     step_runner = StepRunner({"kv": kv})
     config = PiecewisePackedConfig(
         capture_fn=lambda call: {"x": call.static_inputs["x"] + 1},
@@ -103,9 +129,10 @@ def _runner(kv: KVManager) -> PiecewiseCudaGraphRunner:
         total_tokens=[16, 32],
         capture_batch_sizes=[1, 2],
     )
-    return PiecewiseCudaGraphRunner(
+    return PiecewiseAcceleratorGraphRunner(
         label="region", config=config, resources={"kv": kv},
         step_runner=step_runner, device=CPU, autocast_dtype=None, num_slots=1,
+        device_capability=_CPU_GRAPHS,
     )
 
 
@@ -114,7 +141,7 @@ def test_capture_pages_come_back_to_the_pool():
     free = kv._arena.num_free
     runner = _runner(kv)
 
-    runner.warmup_and_capture()
+    runner.warmup_and_capture(None)
 
     assert runner.any_graphs
     assert kv._arena.num_free == free, (
@@ -125,7 +152,7 @@ def test_capture_pages_come_back_to_the_pool():
 def test_a_replay_after_release_allocates_only_the_real_rows():
     kv = _kv()
     runner = _runner(kv)
-    runner.warmup_and_capture()
+    runner.warmup_and_capture(None)
     kv.ingest_request("real")
     free = kv._arena.num_free
 
@@ -138,7 +165,7 @@ def test_a_replay_after_release_allocates_only_the_real_rows():
 def test_the_whole_pool_is_usable_after_capture():
     kv = _kv()
     runner = _runner(kv)
-    runner.warmup_and_capture()
+    runner.warmup_and_capture(None)
     kv.ingest_request("real")
     step = _declare(["real"], [63 * PAGE_SIZE])
     step.set_ctx(StepContext(request_ids=("real",), graph_walk="w", slot=0, capture=False))
@@ -158,11 +185,12 @@ def test_a_batched_region_keeps_its_padding_rows():
         seq_len=8,
         capture_batch_sizes=[2],
     )
-    runner = PiecewiseCudaGraphRunner(
+    runner = PiecewiseAcceleratorGraphRunner(
         label="region", config=config, resources={"kv": kv},
         step_runner=StepRunner({"kv": kv}), device=CPU, autocast_dtype=None, num_slots=1,
+        device_capability=_CPU_GRAPHS,
     )
-    runner.warmup_and_capture()
+    runner.warmup_and_capture(None)
     kv.ingest_request("big")
     big = _declare(["big"], [kv._arena.num_free * PAGE_SIZE - 2 * PAGE_SIZE])
     big.set_ctx(StepContext(request_ids=("big",), graph_walk="w", slot=0, capture=False))

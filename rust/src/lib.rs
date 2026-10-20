@@ -273,8 +273,9 @@ impl PySegmentedShmArena {
     /// -> (segment_idx, offset); grows by one segment when full (dedicated
     /// segment for oversized allocations), errors at the max_segments cap.
     /// GIL released: the growth path creates + maps a new shm segment
-    /// (file create, ftruncate, mmap — milliseconds), which must not stall
-    /// other Python threads (the serve loop, stream relays).
+    /// (file create, preallocate, mmap: on the order of 0.1 s per 256 MiB),
+    /// which must not stall other Python threads (the serve loop, stream
+    /// relays).
     fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<(usize, usize)> {
         py.allow_threads(|| self.arena.reserve(nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))

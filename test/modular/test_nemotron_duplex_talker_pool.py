@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
@@ -18,7 +19,6 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
-from test.modular.test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 P = 37   # speaker warm-up positions
 
@@ -141,7 +141,7 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
 
 def test_decode_capture_config_commits_two_labels_per_row():
     sub = make_sub()
-    cfgs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    cfgs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert len(cfgs) == 1 and cfgs[0].capture_graph_walk == "talker_decode"
     assert cfgs[0].total_tokens_multiplier == 2 and cfgs[0].compile is False
     assert cfgs[0].single_request_inputs.input_seq_len == 1
@@ -215,5 +215,5 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     assert sub.declare_step("talker_decode", ["a", "b"], [first, later]).cg_key_info is None
     assert sub.cg_key_info("talker_decode", {"b": infos["b"]}) == sub.DECODE_KEY
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
-    (cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert cfg.additional_key_info == sub.DECODE_KEY

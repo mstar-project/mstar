@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=$DEVICES nsys profile --trace=cuda,nvtx --output=orpheus_pr
     python mstar/api_server/entrypoint.py --enable-nvtx \
     --config configs/orpheus_colocated.yaml --port $PORT \
     --cache-dir $ORPHEUS_CACHE_DIR \
-    --socket-path-prefix /tmp/mstar_${WHO}/ \
+    --socket-path-prefix /tmp/mstar_${WHO}_${PORT}/ \
     --upload-dir /tmp/mstar_uploads_${WHO}/ \
     --tensor-comm-protocol $TENSOR_PROTOCOL \
     --tcp-transfer-device ${TCP_DEVICE:-0.0.0.0.0}

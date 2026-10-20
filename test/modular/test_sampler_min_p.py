@@ -145,7 +145,7 @@ def test_spec_capability_defaults_off():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampler requires CUDA")
 def test_min_p_one_is_greedy_for_every_seed_on_cuda():
     pytest.importorskip("flashinfer")
-    from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu, sample_tokens
+    from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu, sample_tokens
 
     dev = torch.device("cuda")
     torch.manual_seed(0)
@@ -158,7 +158,7 @@ def test_min_p_one_is_greedy_for_every_seed_on_cuda():
             logits, temperature=1.0, min_p=1.0, seed=seeds, rand_offset=offsets,
             any_greedy=False, top_k_zero_count=logits.shape[0],
         )
-        graph = sample_cuda_graphable_gpu(
+        graph = sample_accelerator_graphable_gpu(
             logits, torch.ones(4, device=dev), torch.zeros(4, device=dev, dtype=torch.int32),
             torch.ones(4, device=dev), seeds, offsets, min_p=torch.ones(4, device=dev),
         )

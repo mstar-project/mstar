@@ -137,11 +137,15 @@ class RealtimeConnection:
             self._response_open = False
 
 
-def build_app(model):
-    """Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model."""
+def build_app(model, api_key: str | None = None):
+    """Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model.
+    With ``api_key``, the handshake needs ``Authorization: Bearer <key>``."""
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+    from mstar.api_server.auth import APIKeyGuard, APIKeyMiddleware
+
     app = FastAPI()
+    app.add_middleware(APIKeyMiddleware, guard=APIKeyGuard(api_key))
 
     @app.websocket("/v1/realtime")
     async def realtime(ws: WebSocket):
@@ -164,14 +168,18 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--api-key", default=None, help="bearer key for /v1/realtime (default: MSTAR_API_KEY)")
     args = ap.parse_args()
 
     import uvicorn
 
+    from mstar.api_server.auth import resolve_api_key, warn_if_no_api_key
     from mstar.model.registry import HF_MODELS, get_model_class
+    api_key = resolve_api_key(args.api_key)
     model = get_model_class(args.model)(**HF_MODELS[args.model])
     model.prepare_streaming(device=args.device)  # warm the submodules (Phase B)
-    uvicorn.run(build_app(model), host=args.host, port=args.port)
+    warn_if_no_api_key(api_key, args.host, args.port)
+    uvicorn.run(build_app(model, api_key=api_key), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

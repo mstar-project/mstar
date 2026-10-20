@@ -83,6 +83,9 @@ class InputSignals(MessageBody):
     # untyped on the wire, so an empty set a Rust sender writes came back a
     # list.
     producer_done: set[str] = field(default_factory=set)
+    # Stream edge -> items its producer sent this worker in total. The stream
+    # ends only once that many have arrived.
+    producer_done_items: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -184,6 +187,10 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # under a combined walk, request_ids[i] runs walks[walk_idx[i]]; empty
+    # means every rid runs graph_walk
+    walks: list[str] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -219,6 +226,9 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # The client's request_id. ``request_id`` is the API server's key for this
+    # one submission, never reused; the seed still derives from the client's.
+    client_request_id: str | None = None
 
 
 @dataclass
@@ -228,12 +238,15 @@ class WorkerGraphsDone(MessageBody):
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
+    # one name per chunk this worker emitted to the client since its last report
     output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
-    output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # Stream edge -> destination worker -> items sent since the last report.
+    # Every rank reports its own.
+    stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)

@@ -47,6 +47,13 @@ class PerthWatermarker:
                 "watermarked (pip install resemble-perth)"
             )
             return None
+        if perth.PerthImplicitWatermarker is None:
+            # perth's __init__ swallows the ImportError of its own watermarker
+            raise RuntimeError(
+                "resemble-perth is installed but could not load PerthImplicitWatermarker; "
+                "resemble-perth 1.0.1 needs pkg_resources, which setuptools 82 removed: "
+                "pip install 'setuptools<82' (the chatterbox extra pins it)"
+            )
         impl = perth.PerthImplicitWatermarker(device=device)
         return cls(impl, device)
 
