@@ -18,6 +18,7 @@ from benchmark.correctness.families.base import (
     Family,
     MathSdpaReference,
     failed_items,
+    frame_identity,
     self_consistency_check,
     write_meta,
 )
@@ -152,6 +153,7 @@ class VideoFamily(MathSdpaReference, Family):
             if out is not None:
                 row["frames"] = len(out)
                 row["dims"] = "x".join(map(str, out.shape[1:3]))
+            o2 = None
             if len(runs) > 1 and out is not None and (runs[1] / "outputs" / f"{it.id}.mp4").is_file():
                 o2 = read_video(runs[1] / "outputs" / f"{it.id}.mp4")
                 if o2.shape == out.shape:
@@ -164,6 +166,8 @@ class VideoFamily(MathSdpaReference, Family):
                                                                       max(1, len(out) // 8))), 4),
                            frame_count_match=len(out) == len(ref))
                 medians.append(row["psnr_median"])
+            if o2 is not None:  # last, so the report's per-item table keeps the reference columns
+                row["frames_identical_r1_r2"] = M.frames_equal(out, o2)
             sc.rows.append(row)
             for frames, tag in ((ref, "ref"), (out, "out")):
                 if frames is None:
@@ -217,7 +221,8 @@ class VideoFamily(MathSdpaReference, Family):
             repro = [r["psnr_r1_r2_min"] for r in sc.rows if r.get("psnr_r1_r2_min") is not None]
             self_consistency_check(sc, repro, "same-seed min frame PSNR, two server instances (dB)", len(runs),
                                    lambda v: v >= 40, lambda v: v >= 25,
-                                   ">=40 PASS (inf = identical after the same lossy encode), >=25 WARN (provisional)")
+                                   ">=40 PASS (inf = identical decoded frames), >=25 WARN (provisional)")
+        frame_identity(sc, sc.rows, encoded=True)
         M.contact_sheet(sheet, labels, work / "contact_sheet.png")
         sc.artifacts += [str(work / "contact_sheet.png"), str(runs[0] / "outputs")]
         (work / "video_scores.json").write_text(json.dumps(sc.rows, indent=1))

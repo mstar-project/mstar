@@ -423,6 +423,11 @@ def frame_psnrs(ref: np.ndarray, out: np.ndarray, peak: float = 255.0) -> list[f
     return [psnr(ref[i], out[i], peak) for i in range(n)]
 
 
+def frames_equal(a: np.ndarray | None, b: np.ndarray | None) -> bool:
+    """Same frame count, size and pixels."""
+    return a is not None and b is not None and bool(np.array_equal(a, b))
+
+
 # ---------------------------------------------------------------------------
 # arrays (actions, latents, embeddings)
 # ---------------------------------------------------------------------------
