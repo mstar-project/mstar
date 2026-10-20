@@ -179,3 +179,4 @@ test/modular/test_hf_attention.py
 test/modular/test_pi05_siglip_keys.py
 test/modular/test_loader_dropped_keys.py
 test/modular/vjepa2/test_preprocess.py
+test/modular/test_position_ingest.py

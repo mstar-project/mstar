@@ -192,7 +192,9 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        self._counters[rid] = {}
+        # Idempotent, like the KV streams: the conductor sends one NewRequest per
+        # partition, and a second ingest after a prefill would restart rope at 0.
+        self._counters.setdefault(rid, {})
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
