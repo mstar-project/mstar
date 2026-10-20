@@ -157,6 +157,12 @@ class RocmPlatform(Platform):
             # one runs transposed convs (LTX-2.5's vocoder upsamplers).
             "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC": "0",
             "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_BWD_GTC_XDLOPS_NHWC": "0",
+            # Each launch next to a replayed decode graph costs about 5 us of GPU
+            # time on MI300X. Building the rope tables and scattering the
+            # sampler's rows inside the graph drops about ten a step (Qwen3.5
+            # 2B/9B: +1-3% tok/s at c=1-4).
+            "MSTAR_INGRAPH_DECODE_ROPE": "1",
+            "MSTAR_SAMPLER_INGRAPH_SCATTER": "1",
         }
 
     def visible_devices_env(
