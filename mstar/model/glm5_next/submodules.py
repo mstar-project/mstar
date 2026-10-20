@@ -13,12 +13,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
-from mstar.engine.cuda_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -233,9 +233,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return max(self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS)
         return cap
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         if self._moe_capture_blocked(tp_world_size):
             logger.warning(
                 "glm5_next: reference MoE dispatch active; decode runs eager "
@@ -268,8 +268,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         ]
         # Graphs capture the eager forward: a Triton crash in Inductor's compile
         # subprocess would fail every capture and fall back to eager silently.
-        configs: list[CudaGraphConfig] = [
-            BatchedCudaGraphConfig(
+        configs: list[AcceleratorGraphConfig] = [
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
@@ -286,7 +286,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         elif self.config.prefill_graphs:
             # One graph per (rows, token bucket); a batch past every bucket
             # runs eager rather than being split.
-            configs.append(PackedCudaGraphConfig(
+            configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 capture_token_lengths=list(
                     self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS),

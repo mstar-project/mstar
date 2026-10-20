@@ -450,7 +450,7 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
     against each other rather than a literal for that reason."""
     templates = {
         cfg.capture_graph_walk: cfg.single_request_inputs
-        for cfg in submodule.get_cuda_graph_configs(torch.device("meta"))
+        for cfg in submodule.get_accelerator_graph_configs(torch.device("meta"))
     }
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
@@ -476,7 +476,7 @@ def test_input_seq_dims_covers_every_static_input_on_dim_zero(submodule):
     row ``preprocess`` concatenates on dim 0. ``input_seq_dims`` must declare
     exactly those keys, all on dim 0, or the runner falls back to its
     size-based guess for whichever key is missing."""
-    for cfg in submodule.get_cuda_graph_configs(torch.device("meta")):
+    for cfg in submodule.get_accelerator_graph_configs(torch.device("meta")):
         assert cfg.input_seq_dims is not None, cfg.capture_graph_walk
         assert set(cfg.input_seq_dims) == set(cfg.single_request_inputs.tensor_inputs), (
             cfg.capture_graph_walk
@@ -746,10 +746,10 @@ def test_validate_config_yaml_refuses_invalid_world_pool_size(
 def test_validate_config_yaml_refuses_more_arrivals_than_worlds(
     model, tmp_path, limit, worlds
 ):
-    """A queue longer than the pool is a delayed failure: the conductor admits
+    """A queue longer than the pool would wait forever: the conductor admits
     ``limit`` requests, the ring hands out ``num_sessions``, and the
-    difference dies at ``admit`` with an ``AdmitRuntimeError`` no retry,
-    eviction, or reload can clear.
+    difference is refused at ``admit`` until a session is released, which a
+    request that never finishes never does. Refused at startup instead.
 
     ``worlds=None`` is the accidental case: raising
     ``max_concurrent_requests`` without touching ``resources``, the shape
@@ -915,7 +915,7 @@ def test_dit_can_batch_is_true(submodule):
 
 def test_both_dit_walks_are_optional_captures(submodule, config):
     """Prime and rollout both capture; the declaration order is capture order."""
-    configs = submodule.get_cuda_graph_configs(torch.device("meta"))
+    configs = submodule.get_accelerator_graph_configs(torch.device("meta"))
     # Rollout first: the two share one graph pool and rollout's five forwards
     # are a superset of prime's one, so rollout sizes the pool; the runner's
     # largest-first sort is stable given both specs are (1, tokens_per_frame).
@@ -975,7 +975,7 @@ def test_both_walks_capture_the_same_geometric_buckets(config):
     dit.cast_serving_dtypes()
     submodule = WaypointDitSubmodule(dit, _FakeTaehv(), batched)
 
-    configs = submodule.get_cuda_graph_configs(torch.device("meta"))
+    configs = submodule.get_accelerator_graph_configs(torch.device("meta"))
     assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK, PRIME_WALK]
     for cfg in configs:
         assert cfg.capture_batch_sizes == [1, 2, 4, 8]
@@ -990,19 +990,19 @@ def test_dit_prime_capture_can_be_declined_on_its_own(config):
     dit.cast_serving_dtypes()
     submodule = WaypointDitSubmodule(dit, _FakeTaehv(), no_prime)
 
-    configs = submodule.get_cuda_graph_configs(torch.device("meta"))
+    configs = submodule.get_accelerator_graph_configs(torch.device("meta"))
     assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK]
     assert "noise" in configs[0].single_request_inputs.tensor_inputs
 
 
-def test_dit_declares_no_capture_when_cuda_graph_is_disabled(config):
-    eager_config = dataclasses.replace(config, cuda_graph=False)
+def test_dit_declares_no_capture_when_accelerator_graph_is_disabled(config):
+    eager_config = dataclasses.replace(config, accelerator_graph=False)
     with torch.device("meta"):
         dit = WaypointDiT(eager_config)
     dit.cast_serving_dtypes()
     eager = WaypointDitSubmodule(dit, _FakeTaehv(), eager_config)
 
-    assert eager.get_cuda_graph_configs(torch.device("meta")) == []
+    assert eager.get_accelerator_graph_configs(torch.device("meta")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1216,7 +1216,7 @@ def test_encoder_captures_one_config_per_seed_size(taehv_weights, ae_config):
     )
     encoder = WaypointVaeEncoderSubmodule(taehv_weights, multi)
 
-    configs = encoder.get_cuda_graph_configs(torch.device("cpu"))
+    configs = encoder.get_accelerator_graph_configs(torch.device("cpu"))
 
     assert {cfg.additional_key_info for cfg in configs} == {
         (360, 640), (720, 1280), (1080, 1920),
@@ -1420,8 +1420,8 @@ def test_the_encoder_and_the_fused_decode_share_only_weights(
 
 
 def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder):
-    encoder_configs = encoder.get_cuda_graph_configs(torch.device("cpu"))
-    fused_configs = decoder.get_cuda_graph_configs(torch.device("cpu"))
+    encoder_configs = encoder.get_accelerator_graph_configs(torch.device("cpu"))
+    fused_configs = decoder.get_accelerator_graph_configs(torch.device("cpu"))
     assert [cfg.capture_graph_walk for cfg in encoder_configs] == [PRIME_WALK]
     assert {cfg.capture_graph_walk for cfg in fused_configs} == {
         PRIME_WALK, ROLLOUT_WALK,
@@ -1441,15 +1441,15 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert decoder.disable_autocast is True
 
 
-def test_ae_nodes_declare_no_capture_when_cuda_graph_is_disabled(
+def test_ae_nodes_declare_no_capture_when_accelerator_graph_is_disabled(
     taehv_weights, ae_config,
 ):
-    eager_config = dataclasses.replace(ae_config, cuda_graph=False)
+    eager_config = dataclasses.replace(ae_config, accelerator_graph=False)
     encoder = WaypointVaeEncoderSubmodule(taehv_weights, eager_config)
     fused = WaypointDitSubmodule(_FakeDit(eager_config), taehv_weights, eager_config)
 
-    assert encoder.get_cuda_graph_configs(torch.device("cpu")) == []
-    assert fused.get_cuda_graph_configs(torch.device("cpu")) == []
+    assert encoder.get_accelerator_graph_configs(torch.device("cpu")) == []
+    assert fused.get_accelerator_graph_configs(torch.device("cpu")) == []
 
 
 def test_seed_capture_sizes_rejects_a_non_16_9_entry(ae_config):

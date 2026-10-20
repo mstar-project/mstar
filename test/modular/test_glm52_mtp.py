@@ -29,11 +29,6 @@ def _cpu_flashinfer() -> types.ModuleType:
 # mtp.py's import chain reaches flashinfer via decoder_layer -> attention;
 # stub it before the import so construction-level tests import at all on
 # machines without CUDA wheels.
-try:
-    import flashinfer  # noqa: F401  (the real one stays for later test files)
-except ImportError:
-    sys.modules["flashinfer"] = _cpu_flashinfer()
-
 
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):

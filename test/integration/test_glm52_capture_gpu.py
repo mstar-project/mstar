@@ -1,6 +1,6 @@
 """GLM-5.2 whole-forward CUDA graphs on one GPU: a reduced model at the real
 MLA latent dims (512/64, FlashInfer's MLA kernel) captured through the
-engine's ``CudaGraphRunner`` and replayed the way the engine replays it,
+engine's ``AcceleratorGraphRunner`` and replayed the way the engine replays it,
 against the same model served eager."""
 import dataclasses
 
@@ -10,7 +10,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_runner import CudaGraphRunner, autocast_scope
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, autocast_scope
 from mstar.engine.resources import (
     StepContext,
     StepRunner,
@@ -95,7 +95,7 @@ def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
 
 class _Node:
     """The node's resources as the engine builds them, the step cycle around
-    the submodule, and (``capture=True``) a warmed-up ``CudaGraphRunner``
+    the submodule, and (``capture=True``) a warmed-up ``AcceleratorGraphRunner``
     whose replay path is the engine's: lease, pad, declare over the padded
     ids, plan on the lease, stage and replay, map the slot's outputs back.
     """
@@ -128,13 +128,13 @@ class _Node:
         )
         self.cg = None
         if capture:
-            self.cg = CudaGraphRunner(
+            self.cg = AcceleratorGraphRunner(
                 submodule_name=NODE, submodule=submodule, resources=self.resources,
                 step_runner=self.runner, device=DEVICE, autocast_dtype=DTYPE,
                 joint_comm_group=self.groups, num_slots=1,
             )
             with torch.no_grad():
-                self.cg.warmup_and_capture()
+                self.cg.warmup_and_capture(None)
 
     def info(self, rid: str) -> CurrentForwardPassInfo:
         return CurrentForwardPassInfo(
@@ -154,7 +154,7 @@ class _Node:
         if self.cg is not None:
             lease = self.cg.lease_slot(walk, len(rids), slot=0, num_tokens=num_tokens)
             if lease is None:  # fine only for a walk the submodule does not capture
-                walks = {c.capture_graph_walk for c in self.sub.get_cuda_graph_configs(DEVICE)}
+                walks = {c.capture_graph_walk for c in self.sub.get_accelerator_graph_configs(DEVICE)}
                 assert walk not in walks, f"no captured bucket for {walk} bs={len(rids)}"
         step_ids, meta = rids, infos
         if lease is not None:
@@ -228,7 +228,7 @@ class _Node:
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     model, submodule = _load(tmp_path, monkeypatch, fp8)
     assert model.config.kv_lora_rank == 512 and model.config.mla_absorb
     if fp8:
@@ -241,7 +241,7 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
     eager.close()
 
     node = _Node(model, submodule, capture=True, prompts=prompts)
-    assert len(submodule.get_cuda_graph_configs(DEVICE)) == 2
+    assert len(submodule.get_accelerator_graph_configs(DEVICE)) == 2
     assert node.cg.any_graphs, "no CUDA graph captured"
     assert node.cg.dropped_buckets == []
     captured_streams = node.generate()
@@ -257,7 +257,7 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
 def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
     """mla_fused_prep on: the captured streams equal the eager ones and the unfused path's
     captured ones (q_lora_rank 256, a width the fused norms take)."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS
     streams = {}
     for fused_prep in (False, True):
@@ -291,13 +291,13 @@ def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
     eager tokens. Prefill replays its 16-row bucket, padded, with every row selecting on its
     own when the bucket is wider than index_topk and dense attention when not; decode is sparse
     for every row over the serving window, through the slot's re-planned sparse wrapper."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     if not compiled:
         monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
     overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
                      index_head_dim=64, max_seq_len=64)  # the indexer ropes its first 64 dims
     model, submodule = _load(tmp_path, monkeypatch, False, cfg_overrides=overrides)
-    walks = [c.capture_graph_walk for c in submodule.get_cuda_graph_configs(DEVICE)]
+    walks = [c.capture_graph_walk for c in submodule.get_accelerator_graph_configs(DEVICE)]
     assert walks == ["decode", "prefill"]
     eager = _Node(model, submodule, capture=False, prompts=PROMPTS)
     eager_streams = eager.generate()

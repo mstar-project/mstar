@@ -6,7 +6,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import SamplingReqConfig, StepRunner
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -97,7 +97,7 @@ class _NoTransfer:
 
 
 class _Engine:
-    """The submodule, its real resources and a CudaGraphRunner, stepped like Engine
+    """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine
     (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> unpack)."""
 
     def __init__(self, k, seed=0, long_context=False):
@@ -126,12 +126,12 @@ class _Engine:
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
         trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
-        self.cg = CudaGraphRunner(
+        self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,
             joint_comm_group=trivial, num_slots=2,
         )
-        self.cg.warmup_and_capture()
+        self.cg.warmup_and_capture(None)
 
     def info(self, rid, walk):
         return CurrentForwardPassInfo(

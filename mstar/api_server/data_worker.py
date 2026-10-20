@@ -1,5 +1,6 @@
 
 
+import hashlib
 import logging
 import math
 import os
@@ -28,9 +29,16 @@ from mstar.communication.communicator import BaseCommunicator, CommProtocol, mak
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, ProcessPromptOutput
+from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.media_limits import (
+    RequestMediaBudget,
+    charge_decoded_audio,
+    check_audio_duration,
+    check_file_counts,
+    check_media_limits,
+)
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -47,6 +55,20 @@ from mstar.utils.ipc_format import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sha256(path: str) -> bytes:
+    with open(path, "rb") as file:
+        return hashlib.file_digest(file, "sha256").digest()
+
+
+def _file_state(path: str) -> tuple[int, int, int]:
+    stat = os.stat(path)
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+class _FileChangedError(Exception):
+    """A file was rewritten between its load and its hash."""
 
 
 def _video_frame_metadata(
@@ -116,17 +138,16 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
     return {
         spec.resource_key: spec.config.page_size
         for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
     }
 
 
-NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
 class PreprocessWorker:
@@ -141,6 +162,7 @@ class PreprocessWorker:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
     ):
+        check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -154,7 +176,8 @@ class PreprocessWorker:
         self.wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
-        self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
+        # request id -> output name -> chunks received, for received_final_chunks
+        self.received_chunk_counts: dict[str, dict[str, int]] = {}
 
         # Build the communicator + tensor manager here (main thread) and hand
         # them to the worker thread, rather than constructing them inside it.
@@ -207,7 +230,7 @@ class PreprocessWorker:
             wakeup.signal()
 
     def new_request(self, input: PreprocessInput):
-        self.output_loop_idxs[input.request_id] = {}
+        self.received_chunk_counts[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
         self._signal()
@@ -220,7 +243,7 @@ class PreprocessWorker:
         # out from under it. Drop only the main-thread bookkeeping here.
         self.abort_request_queue.put(request_id)
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def finished_reading(self, request_id: str, drained: bool = True):
@@ -232,21 +255,20 @@ class PreprocessWorker:
         for any in-flight read."""
         self.reads_done_queue.put((request_id, drained))
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
-        if input.request_id not in self.output_loop_idxs:
+        if input.request_id not in self.received_chunk_counts:
             # Request was removed while this output was still in flight; ack the
             # tensors so the producing worker can reclaim them rather than leak.
             logger.debug("Late result_tensors for cleaned-up request %s, acking and dropping", input.request_id)
             self.discard_result_tensors(input)
             return
 
-        self.output_loop_idxs[input.request_id][name] = input.loop_indices.max(
-            self.output_loop_idxs[input.request_id].get(name, None)
-        )
+        counts = self.received_chunk_counts[input.request_id]
+        counts[name] = counts.get(name, 0) + 1
 
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         logger.debug(
@@ -265,13 +287,11 @@ class PreprocessWorker:
         transport read and nothing to ack. ``wake=False`` queues without
         ending the thread's idle wait: a frame's caller hands over every
         request's value first and calls ``wake`` once."""
-        if request_id not in self.output_loop_idxs:
+        if request_id not in self.received_chunk_counts:
             logger.debug("Late token for cleaned-up request %s dropped", request_id)
             return
-        if loop_indices is not None:
-            self.output_loop_idxs[request_id][signal] = loop_indices.max(
-                self.output_loop_idxs[request_id].get(signal, None)
-            )
+        counts = self.received_chunk_counts[request_id]
+        counts[signal] = counts.get(signal, 0) + 1
         self.per_request_reading_tensors[request_id] += 1
         self.result_tensor_input_queue.put(
             InlineToken(request_id, value, loop_indices, modality)
@@ -297,18 +317,18 @@ class PreprocessWorker:
 
     def received_final_chunks(
         self, request_id: str,
-        final_outputs: dict[str, NestedLoopIndices],
+        output_chunk_counts: dict[str, int],
     ):
         # Every serving walk reports at least one client-facing output, so an
         # empty dict means the walk emitted nothing (or completion raced ahead
         # of every result). Report not-done and let the TTL backstop close the
         # request rather than completing it instantly with zero chunks.
-        if not final_outputs:
+        if not output_chunk_counts:
             return False
+        received = self.received_chunk_counts.get(request_id, {})
         return all(
-            not loop_iters.label_context_gt( # recv'd loop iters is not less than the final_fwd
-                self.output_loop_idxs[request_id].get(name, None)
-            ) for name, loop_iters in final_outputs.items()
+            received.get(name, 0) >= count
+            for name, count in output_chunk_counts.items()
         )
 
     def get_result_chunks(self)-> list[ResultChunk]:
@@ -361,7 +381,7 @@ class PreprocessWorker:
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def shutdown(self):
@@ -428,14 +448,12 @@ class PreprocessWorkerThread:
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
-        self._prefix_streams = (
-            model.prefix_key_streams()
-            if model is not None and model_config else {}
-        )
+        declared = model.prefix_key_streams() if model is not None and model_config else {}
         # resolved as the worker does at load, so both split a prompt into the same pages
-        self._prefix_page_sizes = (
-            _kv_page_sizes(model, model_config) if self._prefix_streams else {}
-        )
+        self._prefix_page_sizes = _kv_page_sizes(model, model_config) if declared else {}
+        self._prefix_streams = {
+            key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
+        }
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
@@ -449,6 +467,13 @@ class PreprocessWorkerThread:
         # and those we've already ACKed READS_DONE for (avoid double-ACK).
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        # Requests under each rid that started here and are not removed yet
+        # (by REMOVE_REQUEST, or by failing before they reached the conductor).
+        # A release (finished_reading or an abort) for a rid with none must not
+        # enter the sets above: its request is gone and no REMOVE_REQUEST
+        # follows. A count, since a client can reuse a rid before the last
+        # request under it is removed.
+        self._live_requests: dict[str, int] = {}
 
         self.stop_event = stop_event
         self.device = device
@@ -510,11 +535,16 @@ class PreprocessWorkerThread:
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
+        file_states: dict[str, list[tuple[int, int, int]]] = {}
+        self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
 
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
         if input.file_paths is not None:
+            counts = {modality: len(paths) for modality, paths in input.file_paths.items()}
+            check_file_counts(counts, self.model.max_input_files())
+            budget = RequestMediaBudget(sum(counts.values()))
             for modality in input.file_paths:
                 key = f"{modality}_inputs"
                 tensors[key] = []
@@ -522,23 +552,30 @@ class PreprocessWorkerThread:
                 input_metadata[key] = []
 
                 for filepath in input.file_paths[modality]:
-                    # ---- Image ----
-                    if modality == "image":
-                        out = self.model.load_image(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                    if self._prefix_streams:
+                        # Record the file's state before loading it. If the file changes before it
+                        # is hashed, its KV would be keyed by bytes we never decoded.
+                        file_states.setdefault(modality, []).append(_file_state(filepath))
+                    with budget.file():
+                        # ---- Image ----
+                        if modality == "image":
+                            out = self.model.load_image(filepath, self.device)
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
-                    # ---- Audio ----
-                    elif modality == "audio":
-                        out = self.model.load_audio(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                        # ---- Audio ----
+                        elif modality == "audio":
+                            check_audio_duration(filepath)
+                            out = self.model.load_audio(filepath, self.device)
+                            charge_decoded_audio(out.data, out.metadata["sample_rate"])
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
-                    # ---- Video ----
-                    elif modality == "video":
-                        out = self.model.load_video(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                        # ---- Video ----
+                        elif modality == "video":
+                            out = self.model.load_video(filepath, self.device)
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -548,8 +585,10 @@ class PreprocessWorkerThread:
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
-        # another request's pages and be served that request's KV
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+        # another request's pages and be served that request's KV. Likewise
+        # only process_prompt sets the model's INTERNAL_KWARGS.
+        internal = getattr(self.model, "INTERNAL_KWARGS", ())
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -566,14 +605,13 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            layouts = model_kwargs.pop("prefix_layout", {})
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
-            if prefix_keys:
-                model_kwargs["prefix_keys"] = prefix_keys
-                model_kwargs["prefix_tail"] = prefix_tail
-                if prefix_decode:
-                    model_kwargs["prefix_decode"] = prefix_decode
+            if model_kwargs.get("prefix_cache") is not False:
+                model_kwargs.update(self._prefix_keys(
+                    tensors, layouts, input.file_paths, file_states,
+                ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
@@ -611,7 +649,8 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=conductor_kwargs
+                model_kwargs=conductor_kwargs,
+                client_request_id=input.client_request_id,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -628,32 +667,158 @@ class PreprocessWorkerThread:
                 inputs=self._summarize_inputs(input),
             ))
 
-    def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
+    def _prefix_keys(
+        self, tensors: dict, layouts: dict, file_paths: dict | None,
+        file_states: dict[str, list[tuple[int, int, int]]],
+    ) -> dict:
         """Key each page of every declared stream, by resource and label.
 
-        Returns the keys, the prompt tail past the last whole page, and the output
-        tensor each stream's sampled ids arrive in. The keys are unrooted.
+        Returns the kwargs that carry the keys, the prompt tail past the last whole
+        page, each stream's layout as ``[length, advance, walk, digest, end_key]``
+        rows, and the output tensor each stream's sampled ids arrive in. The keys
+        are unrooted.
         """
+        if not self._prefix_streams:
+            return {}
+        for resource_key, by_label in layouts.items():
+            for label in by_label:
+                if label not in self._prefix_streams.get(resource_key, {}):
+                    raise ValueError(
+                        f"{type(self.model).__name__} returned a prefix_layout for "
+                        f"{resource_key!r}/{label!r}, which it does not declare"
+                    )
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
+        layout_rows: dict[str, dict[str, list[list]]] = {}
         decode: dict[str, dict[str, str]] = {}
         for resource_key, by_label in self._prefix_streams.items():
             page_size = self._prefix_page_sizes[resource_key]
             for label, stream in by_label.items():
-                ids = tensors.get(stream.tensor)
-                if stream.keyed_by != "ids" or not ids:
-                    continue
-                flat = ids[0].flatten().tolist()
-                pages = [
-                    flat[at:at + page_size]
-                    for at in range(0, len(flat), page_size)
-                ]
-                keys.setdefault(resource_key, {})[label] = chain(pages)
-                whole = len(flat) // page_size
-                tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
+                layout = layouts.get(resource_key, {}).get(label)
+                if layout is None:
+                    ids = tensors.get(stream.tensor)
+                    if stream.keyed_by != "ids" or not ids:
+                        continue
+                    layout = [Span(
+                        "ids", stream.walk, ids[0].numel(), ids[0].numel(),
+                        stream.tensor,
+                    )]
+                elif not stream.layout_walks:
+                    raise ValueError(
+                        f"{type(self.model).__name__} returned a prefix_layout "
+                        f"for {resource_key!r}/{label!r}, which declares no "
+                        "layout_walks"
+                    )
+                try:
+                    digests = [
+                        self._digest(span, file_paths, file_states)
+                        if span.kind == "digest" else None
+                        for span in layout
+                    ]
+                except _FileChangedError as changed:
+                    logger.warning(
+                        "%s changed while it was loaded, so its request runs with the prefix cache off", changed,
+                    )
+                    return {"prefix_cache": False}
+                pages, items = self._page_layout(
+                    stream, layout, digests, tensors, page_size,
+                )
+                page_keys = chain(pages, items)
+                keys.setdefault(resource_key, {})[label] = page_keys
+                total = sum(span.length for span in layout)
+                tails.setdefault(resource_key, {})[label] = (
+                    pages[-1] if total % page_size else []
+                )
+                rows, at = [], 0
+                for span, digest in zip(layout, digests, strict=True):
+                    at += span.length
+                    page, end = divmod(at, page_size)
+                    rows.append([span.length, span.advance, span.walk, digest, end_key(
+                        page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
+                    ) if digest is not None and end else None])
+                layout_rows.setdefault(resource_key, {})[label] = rows
                 if stream.decode_walk is not None:
                     decode.setdefault(resource_key, {})[label] = stream.tensor
-        return keys, tails, decode
+        if not keys:
+            return {}
+        kwargs = {
+            "prefix_keys": keys, "prefix_tail": tails, "prefix_layout": layout_rows,
+        }
+        if decode:
+            kwargs["prefix_decode"] = decode
+        return kwargs
+
+    def _page_layout(
+        self, stream: PrefixStream, layout: list[Span],
+        digests: list[bytes | None], tensors: dict, page_size: int,
+    ) -> tuple[list[list[int]], dict[int, list[PageItem]]]:
+        """Check the layout's spans and return each page's ids and items."""
+        walks = {stream.walk, *stream.layout_walks}
+        entries: dict[str, int] = {}
+        total = sum(span.length for span in layout)
+        pages: list[list[int]] = [[] for _ in range(-(-total // page_size))]
+        at = 0
+        for span in layout:
+            if span.kind not in ("ids", "digest"):
+                raise ValueError(f"a span of kind {span.kind!r}")
+            if span.walk not in walks:
+                raise ValueError(
+                    f"a {span.kind} span names walk {span.walk!r}, which the "
+                    f"stream does not declare; it declares {sorted(walks)}"
+                )
+            if not (isinstance(span.length, int) and isinstance(span.advance, int)):
+                raise ValueError(
+                    f"a {span.kind} span's length and advance are "
+                    f"{type(span.length).__name__} and {type(span.advance).__name__}"
+                )
+            touched = range(at // page_size, -(-(at + span.length) // page_size))
+            if span.kind == "ids":
+                entry = entries.get(span.source, 0)
+                entries[span.source] = entry + 1
+                if entry >= len(tensors.get(span.source, ())):
+                    raise ValueError(f"ids span {entry} of {span.source!r} has no entry to key")
+                ids = tensors[span.source][entry].flatten().tolist()
+                if not len(ids) == span.length == span.advance:
+                    raise ValueError(
+                        f"an ids span of length {span.length} and advance "
+                        f"{span.advance} over {len(ids)} ids of {span.source!r}; "
+                        "an ids span fills one slot and one position per id"
+                    )
+                for page in touched:
+                    first = max(at, page * page_size)
+                    last = min(at + span.length, (page + 1) * page_size)
+                    pages[page].extend(ids[first - at:last - at])
+            elif span.length <= 0:
+                raise ValueError("a zero-length digest span has no slot, so no page to fold into")
+            at += span.length
+        return pages, page_items(zip((span.length for span in layout), digests, strict=True), page_size)
+
+    def _digest(
+        self, span: Span, file_paths: dict | None,
+        file_states: dict[str, list[tuple[int, int, int]]],
+    ) -> bytes:
+        """Hash the whole file a digest span names, with everything else that decides its KV.
+
+        The digest is never cut short or turned into an id. Either would let two
+        images share a key, and one request would be served another's KV.
+        """
+        if type(span.params) is not tuple or not all(
+            type(param) in (type(None), bool, int, float, str, bytes)
+            for param in span.params
+        ):
+            raise ValueError(f"digest params {span.params!r} are not a tuple of plain values, whose repr is exact")
+        modality, index = span.source
+        paths = (file_paths or {}).get(modality, ())
+        if not 0 <= index < len(paths):
+            raise ValueError(f"a digest span names {modality} {index}, but the request sent {len(paths)}")
+        raw = _sha256(paths[index])
+        if _file_state(paths[index]) != file_states[modality][index]:
+            raise _FileChangedError(paths[index])
+        return fingerprint(
+            raw, modality, self.model.preprocess_fingerprint(), span.advance,
+            # Use repr, not str. True and "True" can preprocess differently
+            *(repr(param) for param in span.params),
+        )
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:
@@ -687,7 +852,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
-        sequence: int | None = None,
+        sequence: int | None = None, abort: bool = True,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -699,6 +864,9 @@ class PreprocessWorkerThread:
         ``sequence`` is the output slot the failed tensor held. Its error chunk
         takes that slot in the reorder buffer; put straight on ``out_queue`` it
         would leave every later sequence held in ``pending`` until the TTL.
+
+        ``abort`` (False for a request the conductor has not seen) stops the
+        request's walk, since its client already has its answer.
         """
         logger.exception("%s failed for request %s", stage, request_id)
         status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
@@ -715,6 +883,37 @@ class PreprocessWorkerThread:
             self._queue_completed_output(request_id, sequence, chunks.pop())
         for chunk in chunks:
             self.out_queue.put(chunk)
+        if abort:
+            self._abort_failed_request(request_id)
+
+    def _abort_failed_request(self, request_id: str) -> None:
+        """Stop the walk of a request this thread failed. Left running, it
+        would produce every remaining output only for each to be read and
+        dropped. Skipped for a request already being torn down, or already
+        handed back by the API server (whose own abort or finish covers it)."""
+        if (
+            request_id in self._draining_rids
+            or request_id in self._reads_done_sent
+            or request_id not in self.in_flight_requests
+        ):
+            return
+        logger.info("Aborting request %s: one of its outputs failed", request_id)
+        self._send_abort(request_id)
+
+    def _send_abort(self, request_id: str) -> None:
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.ABORT_REQUEST,
+                body=AbortRequest(request_id=request_id),
+            ),
+        )
+        # Begin draining our own reads immediately, overlapping with the
+        # conductor round-trip (it also sends a DrainRequest).
+        # None live: already removed, or still queued in in_queue,
+        # where the abort above makes the conductor drop it.
+        if request_id in self._live_requests:
+            self._begin_drain(request_id)
 
     def _sequence_unanswered(self, request_id: str, sequence: int) -> bool:
         """True if no chunk has been queued for ``sequence`` yet."""
@@ -950,6 +1149,8 @@ class PreprocessWorkerThread:
         away — the happy path pays nothing. Otherwise delivery was abandoned
         (TTL, client gone) with reads possibly still running, so gate the ACK on
         them; ACKing there would let the conductor unlink under a read."""
+        if request_id not in self._live_requests:
+            return
         if drained:
             self._send_reads_done(request_id)
         else:
@@ -988,10 +1189,28 @@ class PreprocessWorkerThread:
     def _hard_cleanup(self, request_id: str) -> None:
         """Phase-2 teardown: unconditionally drop all tensor state for the rid
         (unlink the input-signal SHM). Safe now that every reader has drained."""
-        self._draining_rids.discard(request_id)
-        self._reads_done_sent.discard(request_id)
+        self._removed(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
+
+    def _removed(self, request_id: str) -> None:
+        """A request under the rid is gone: no REMOVE_REQUEST comes for it again."""
+        self._draining_rids.discard(request_id)
+        self._reads_done_sent.discard(request_id)
+        live = self._live_requests.pop(request_id, 0) - 1
+        if live > 0:
+            self._live_requests[request_id] = live
+
+    def _process_releases(self) -> bool:
+        """Apply the API server's aborts and finished_reading calls."""
+        did_work = False
+        while not self.abort_request_queue.empty():
+            did_work = True
+            self._send_abort(self.abort_request_queue.get())
+        while not self.reads_done_queue.empty():
+            did_work = True
+            self._finish_reading(*self.reads_done_queue.get())
+        return did_work
 
     def _idle_wait(self):
         """How a pass that found nothing waits: on the communicator's poll,
@@ -1049,22 +1268,7 @@ class PreprocessWorkerThread:
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
                         )
-                while not self.abort_request_queue.empty():
-                    did_work = True
-                    rid = self.abort_request_queue.get()
-                    self.communicator.send(
-                        "conductor",
-                        ConductorMessage(
-                            message_type=ConductorMessageType.ABORT_REQUEST,
-                            body=AbortRequest(request_id=rid),
-                        ),
-                    )
-                    # Begin draining our own reads immediately, overlapping with
-                    # the conductor round-trip (it also sends a DrainRequest).
-                    self._begin_drain(rid)
-                while not self.reads_done_queue.empty():
-                    did_work = True
-                    self._finish_reading(*self.reads_done_queue.get())
+                did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
                     self._discard_result_tensor(self.discard_tensor_queue.get())
@@ -1079,6 +1283,9 @@ class PreprocessWorkerThread:
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
+                    # Releases queued before this request was submitted belong
+                    # to an earlier request under its id: apply them first.
+                    self._process_releases()
                     try:
                         self._process_input(pre_input)
                     except Exception as exc:  # noqa: BLE001 — any failure must reach the client
@@ -1088,12 +1295,13 @@ class PreprocessWorkerThread:
                         # error chunk instead of leaving the client to hit the
                         # server timeout.
                         self._fail_request(
-                            pre_input.request_id, exc, "preprocessing",
+                            pre_input.request_id, exc, "preprocessing", abort=False,
                         )
                         # Never reached the conductor, so there are no remote
                         # readers to race: hard-drop the (possibly persisted)
                         # input signals directly.
                         self._cleanup_request_state(pre_input.request_id, force=True)
+                        self._removed(pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 

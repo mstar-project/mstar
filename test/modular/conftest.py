@@ -10,11 +10,16 @@ Two stubs that exist purely so test imports survive on local macOS dev:
    load. Triton is GPU-only and not installed on macOS. We inject a
    minimal stub so the import succeeds; tests that exercise the kernels
    themselves still need a real GPU.
+
+And one autouse fixture that clears the cached platform around every test.
 """
 import sys
 import types
 
+import pytest
 import torch
+
+from mstar.platforms import resolve_platform
 
 # --- torch._dynamo.config stub --------------------------------------------
 
@@ -52,3 +57,14 @@ if "triton" not in sys.modules:
     triton.heuristics = lambda *a, **k: (lambda f: f)
     sys.modules["triton"] = triton
     sys.modules["triton.language"] = triton.language
+
+
+# --- platform cache ----------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _fresh_platform():
+    """Clear the cached platform, so a test that stubs ``torch.cuda`` can't
+    leak its platform into later tests."""
+    resolve_platform.cache_clear()
+    yield
+    resolve_platform.cache_clear()

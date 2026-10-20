@@ -7,7 +7,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_runner import autocast_scope
+from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
     AttnBackend,
     KVLayout,
