@@ -281,7 +281,7 @@ def test_collect_results_is_woken_by_the_completion():
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request()
-    server.pending_requests["r5"] = req
+    _register(server, "r5", req)
     seen = {}
 
     def producer():
