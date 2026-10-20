@@ -3,6 +3,7 @@ prompt processing, the conductor state machine and the T3 step declaration.
 No weights are loaded: the model object is built without ``__init__``, or with
 the checkpoint lookup and the tokenizer stubbed (``_no_checkpoint``)."""
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -223,6 +224,20 @@ def test_cli_adapter_and_benchmark_entries_are_registered():
         sys.path.remove(repo_root)
 
 
+def _wav_bytes(seconds: float = 0.5, rate: int = 24000) -> bytes:
+    """A real mono 16-bit WAV of silence: the adapter opens reference clips."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(2 * int(seconds * rate)))
+    return buf.getvalue()
+
+
 def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_path, monkeypatch):
     from mstar.api_server import media_io
     from mstar.api_server.openai.adapters import ChatterboxAdapter
@@ -232,14 +247,21 @@ def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_
         model_extra={"ref_audio": "http://example.invalid/ref.wav"},
     )
     fetched = []
-    monkeypatch.setattr(media_io, "save_remote_url", lambda url, d: fetched.append(url) or ("audio", "/x.wav"))
+    clip = tmp_path / "fetched.wav"
+
+    def fetch(url, upload_dir):
+        fetched.append(url)
+        clip.write_bytes(_wav_bytes())
+        return "audio", str(clip)
+
+    monkeypatch.setattr(media_io, "save_remote_url", fetch)
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     with pytest.raises(ValueError, match="Remote media fetch is disabled"):
         ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert fetched == []
     monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
-    assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
+    assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": [str(clip)]}
 
 
 def test_speech_adapter_refuses_server_paths(tmp_path):
@@ -280,12 +302,12 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
 
     req = SimpleNamespace(
         input="Hi", voice=None, temperature=None, top_p=None, seed=None,
-        model_extra={"ref_audio": "data:audio/wav;base64,UklGRg=="},
+        model_extra={"ref_audio": "data:audio/wav;base64," + base64.b64encode(_wav_bytes()).decode()},
     )
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert args.input_modalities == ["text", "audio"]
     (path,) = args.file_paths["audio"]
-    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == b"RIFF"
+    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == _wav_bytes()
     assert "ref_audio" not in args.model_kwargs
 
 

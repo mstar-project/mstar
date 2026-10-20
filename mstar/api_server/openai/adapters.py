@@ -520,7 +520,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -664,10 +664,7 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if not isinstance(ref_audio, str):
-                raise ValueError(f"ref_audio must be a data URL, got {type(ref_audio).__name__}")
-            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(

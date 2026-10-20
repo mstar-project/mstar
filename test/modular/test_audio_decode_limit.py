@@ -259,11 +259,14 @@ def test_soundfile_loaders_are_capped(monkeypatch, clip):
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
     from mstar.model.components.audio_features import load_audio_file
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
 
+    omnivoice = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
     for load in (
         lambda: load_audio_file(clip),
         lambda: ChatterboxModel._decode_audio(clip),
         lambda: NemotronDuplexModel.load_audio(None, clip, "cpu"),
+        lambda: OmniVoiceModel.load_audio(omnivoice, clip, "cpu"),
     ):
         sf = _use_soundfile(monkeypatch, _FakeSoundfile(TOO_LONG, header_seconds=10))
         # chatterbox falls back to torchcodec on a soundfile failure; the cap must not
