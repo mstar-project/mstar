@@ -189,9 +189,9 @@ class Qwen3ASRModel(Model):
     # -------------------------------------------------------------------
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Requests past the cap wait in the conductor instead of fighting for
-        KV pages. A 20 min file takes about 122 pages of 128 tokens, so the
-        page count, not the cap, bounds how many long files decode at once."""
+        """Requests past the cap wait in the conductor. A 20 min file holds
+        about 150 pages of 128 tokens (prompt and transcript), so the page
+        count, not the cap, bounds how many long files decode at once."""
         cap = config.get("max_concurrent_requests")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise ValueError(f"{config_path}: set max_concurrent_requests to a positive int")

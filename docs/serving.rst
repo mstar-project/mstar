@@ -242,6 +242,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``pre_plan``
+     - *(optional)* ``false`` plans each step's attention on the GPU thread instead of
+       pre-planning the speculative batch on its own thread (default ``true``). A model
+       whose steps are too short to hide the planning behind sets it off
+       (``whisper_large_v3_turbo.yaml``). ``MSTAR_PRE_PLAN_SPEC`` overrides it.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``speculation_mixes_walks``

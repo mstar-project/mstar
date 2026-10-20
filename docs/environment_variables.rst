@@ -412,7 +412,8 @@ Worker scheduling
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread.
+       thread. Unset, the serve config's ``pre_plan:`` decides (default on);
+       set, it overrides it. Read in ``Worker.__init__``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
