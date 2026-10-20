@@ -131,10 +131,11 @@ def chunks_from_chat(body: bytes, tok, eos_ids: set[int]) -> tuple[list[str], in
     return chunks, (doc.get("usage") or {}).get("prompt_tokens")
 
 
-def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
+def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = None) -> dict:
     C = load(plan.correctness_src)
     config = catalog.mstar_config_name(row, arm.name)
-    fam, cfg = _family(C, plan.worktree, config)
+    tree = worktree or plan.worktree
+    fam, cfg = _family(C, tree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     base = f"http://127.0.0.1:{port}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -215,12 +216,13 @@ def parse_omni_stream(body: bytes) -> tuple[list[str], bytes]:
     return chunks, bytes(audio)
 
 
-def omni_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
+def omni_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = None) -> dict:
     """The omni family's set, answered in text and speech. mstar gets the family's own /generate
     requests; vllm-omni gets the same questions as chat completions with text and PCM audio."""
     C = load(plan.correctness_src)
     config = catalog.mstar_config_name(row, arm.name)
-    fam, cfg = _family(C, plan.worktree, config)
+    tree = worktree or plan.worktree
+    fam, cfg = _family(C, tree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     base = f"http://127.0.0.1:{port}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -333,6 +335,13 @@ def _key_metrics(score) -> dict:
     return out
 
 
+def _arm_tree(arm_dir: Path, default: Path) -> Path:
+    """The mstar tree an arm served (from its versions.json), whose configs its correctness family reads."""
+    v = arm_dir / "server" / "versions.json"
+    tree = (json.loads(v.read_text()).get("git") or {}).get("worktree") if v.is_file() else None
+    return Path(tree) if tree else default
+
+
 def score_dir(C, worktree: Path, corr_dir: Path, device: str) -> dict:
     header = json.loads((corr_dir / "pass.json").read_text())
     fam, _ = _family(C, worktree, header["config"])
@@ -377,14 +386,15 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
         if arm_dir.name != info.get("arm"):
             continue  # an arm run set aside (e.g. voided by its health check); its score would replace the live one's
         corr = arm_dir / "correctness"
+        tree = _arm_tree(arm_dir, worktree)
         if not (corr / "pass.json").is_file():
             for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
                 cell = arm_dir / "cells" / wl / "c1"
                 if (cell / "a1r1" / "results.json").is_file():
-                    pass_from_cell(C, worktree, info["row"], info["arm"], cell, corr, ext)
+                    pass_from_cell(C, tree, info["row"], info["arm"], cell, corr, ext)
                     break
         if (corr / "pass.json").is_file():
-            results[f"{info['row']}/{info['arm']}"] = score_dir(C, worktree, corr, device)
+            results[f"{info['row']}/{info['arm']}"] = score_dir(C, tree, corr, device)
     (run_dir / "correctness.json").write_text(json.dumps(results, indent=1, default=str))
     return results
 

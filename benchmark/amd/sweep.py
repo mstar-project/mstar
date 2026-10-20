@@ -41,10 +41,12 @@ from benchmark.amd.launch import (
     Launch,
     _entries,
     amd_smi_json,
+    arm_worktree,
     gpu_list,
     gpu_occupancy,
     host_record,
     smi_gpu,
+    tree_list,
 )
 
 WORK = Path("/work1/stephaniewang/atindra")
@@ -194,6 +196,7 @@ class Plan:
     resume: bool = False
     expect_gpus: int | None = None
     measured: list[str] = field(default_factory=list)  # row/arm of every arm this invocation ran
+    trees: dict = field(default_factory=dict)  # named mstar trees (--tree) for arms that serve one
     log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str) -> None:
@@ -326,7 +329,8 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
     hlth = health.ArmHealth(arm_dir / "health", health.smi_gpus(gpus))
     try:
         if arm.engine != "reference":
-            server = Launch(arm=arm, row=row, gpus=gpus, port=port, run_dir=arm_dir / "server", worktree=plan.worktree,
+            tree = arm_worktree(arm, plan.worktree, plan.trees)
+            server = Launch(arm=arm, row=row, gpus=gpus, port=port, run_dir=arm_dir / "server", worktree=tree,
                             numa_node=numa, lane=lane)
             plan.log(f"{row.name}/{arm.name}: starting on GPUs {gpus} port {port}")
             info["startup"] = server.start()
@@ -336,7 +340,8 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 from benchmark.amd import correctness
                 passes = {"text": correctness.text_pass, "omni": correctness.omni_pass}
                 try:
-                    info["correctness_pass"] = passes[row.family](plan, row, arm, port, arm_dir / "correctness")
+                    info["correctness_pass"] = passes[row.family](plan, row, arm, port, arm_dir / "correctness",
+                                                                  worktree=tree)
                 except Exception:
                     info["correctness_pass"] = {"error": traceback.format_exc()[-3000:]}
                     plan.log(f"{row.name}/{arm.name}: correctness pass failed, see arm.json")
@@ -383,7 +388,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
 
 def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
     """Every arm of one row, back to back on the same GPUs."""
-    arms = catalog.arms_for(row, plan.arms)
+    arms = [a for a in catalog.arms_for(row, plan.arms) if not a.tree or a.tree in plan.trees]
     # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
     k = index % len(arms) if arms else 0
     # Each arm gets its own port: right after a server stops, its port can sit in TIME_WAIT, and a server that
@@ -518,6 +523,8 @@ def main(argv=None) -> int:
     ap.add_argument("--correctness-src", default=None,
                     help="checkout or git ref with benchmark/correctness (default: this tree)")
     ap.add_argument("--skip-health", action="store_true", help="dry runs only")
+    ap.add_argument("--tree", action="append", default=[], metavar="NAME=PATH",
+                    help="a named mstar tree for the arms that serve one (base=TREE for the mstar-base arms)")
     args = ap.parse_args(argv)
 
     table = tables.TABLES[args.table]
@@ -540,7 +547,10 @@ def main(argv=None) -> int:
                 worktree=Path(args.worktree).resolve(), port_base=args.port_base,
                 repeats=args.repeats or table.repeats, lanes=args.lanes, dry=args.dry,
                 correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
-                expect_gpus=args.expect_gpus)
+                expect_gpus=args.expect_gpus, trees=tree_list(args.tree))
+    skipped = sorted({a for a in arms if catalog.ARMS[a].tree and catalog.ARMS[a].tree not in plan.trees})
+    if skipped:
+        plan.log(f"no --tree for {', '.join(skipped)}; those arms are skipped")
     node = check_node(plan, args.node_type)
     prev = json.loads((run_dir / "sweep.json").read_text()) if (run_dir / "sweep.json").is_file() else None
     if prev:
@@ -554,7 +564,8 @@ def main(argv=None) -> int:
             "job": job, "gpus": gpus, "rows": [r.name for r in rows], "arms": arms, "workloads": [w.name for w in wls],
             "concurrency": {w.name: list(w.concurrency) for w in wls},
             "repeats": plan.repeats, "spread_limit": table.spread_limit, "lanes": args.lanes, "numa": args.numa,
-            "worktree": str(plan.worktree), "driver": str(REPO), "argv": sys.argv,
+            "worktree": str(plan.worktree), "trees": {k: str(v) for k, v in plan.trees.items()},
+            "driver": str(REPO), "argv": sys.argv,
             "correctness_src": str(plan.correctness_src) if plan.correctness_src else None,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     if prev:
