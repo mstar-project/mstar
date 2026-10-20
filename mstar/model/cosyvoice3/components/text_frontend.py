@@ -29,7 +29,10 @@ left alone. The reference decides Chinese or English once for the whole text,
 so the pieces of a request with Chinese in it all take the Chinese rules (an
 English piece keeps its digits), which ``normalize(chinese=True)`` follows.
 
-Differences from the reference: ``wetext`` grammars are read from the local
+Differences from the reference: text without Chinese whose letters are mostly
+not Latin (kana, Hangul, Cyrillic) is left as written, digits included, for
+the LM to read; the reference reads its digits as English words, which made
+kana and Russian number text worse in served tests. ``wetext`` grammars are read from the local
 ModelScope cache when present (``wetext`` itself asks ModelScope on every
 start and fails when rate-limited), a text that ``wetext`` raises on or that is
 longer than ``WETEXT_MAX_CHARS`` goes to the rules alone (``wetext`` slows down
@@ -62,6 +65,20 @@ _CLOSING_QUOTES = ('"', "”")
 
 def contains_chinese(text: str) -> bool:
     return bool(_CHINESE.search(text))
+
+
+def latin_script(text: str) -> bool:
+    """Whether most of ``text``'s letters are Latin; digits, punctuation,
+    spaces and marks do not count, so text without letters counts as Latin
+    and a tie does not."""
+    latin = other = 0
+    for c in text:
+        if c.isalpha():
+            if c < "\x80" or unicodedata.name(c, "").startswith("LATIN"):
+                latin += 1
+            else:
+                other += 1
+    return latin > other or other == 0
 
 
 def replace_blank(text: str) -> str:
@@ -187,8 +204,10 @@ class CosyVoice3TextFrontend:
             out = remove_bracket(out)
             out = _ZH_TRAILING_COMMAS.sub("。", out)
             lang = "zh"
-        else:
+        elif latin_script(stripped):
             out = normalize_english(self._wetext_normalize(stripped, "en"))
             lang = "en"
+        else:
+            return text
         # nothing left to speak: the reference would synthesize nothing; keep the text
         return close_sentences(out, lang) or stripped

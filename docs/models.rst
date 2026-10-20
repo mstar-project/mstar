@@ -729,8 +729,10 @@ CosyVoice3 notes
   ``wetext`` grammars run first (fetched from ModelScope on the first start,
   read from its cache after), and normalize Chinese numbers too. Text with
   Chinese gets the reference's blank, bracket and punctuation rules, and text
-  with a ``<|...|>`` tag is left alone. ``text_frontend: false`` sends the
-  text as written.
+  with a ``<|...|>`` tag is left alone. Unlike the reference, text whose
+  letters are mostly not Latin (kana, Hangul, Cyrillic) keeps its digits for
+  the model to read: read as English words, they made kana and Russian number
+  text worse. ``text_frontend: false`` sends the text as written.
 - The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
   rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
   float64).

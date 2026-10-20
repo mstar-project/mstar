@@ -516,25 +516,53 @@ def test_digit_heavy_pieces_fit_the_model(monkeypatch):
     assert " ".join(pieces).split() == _IDS.split()
 
 
-@pytest.mark.parametrize(
-    "sentences",
-    [
-        "회의는 2024년 3월 15일 오후 7시 30분에 시작합니다. 참석자는 125명이고 예산은 4,500,000원입니다. ",
-        "かいぎは 2024ねん 3がつ 15にち ごご 7じ 30ぷんに はじまります。さんかしゃは 125にんです。",
-        "Встреча начнётся 15 марта 2024 года в 19:30. Участников 125, бюджет 4 500 000 рублей. ",
-    ],
-    ids=["hangul", "kana", "cyrillic"],
-)
-def test_pieces_of_other_scripts_are_sized_on_their_spelled_out_tokens(monkeypatch, sentences):
-    """Spelled-out digits are English words among Hangul, kana or Cyrillic, so a
-    piece sized for 80 tokens as written runs past 80 once read out."""
+_NON_LATIN = [
+    "회의는 2024년 3월 15일 오후 7시 30분에 시작합니다. 참석자는 125명이고 예산은 4,500,000원입니다. ",
+    "かいぎは 2024ねん 3がつ 15にち ごご 7じ 30ぷんに はじまります。さんかしゃは 125にんです。",
+    "Встреча начнётся 15 марта 2024 года в 19:30. Участников 125, бюджет 4 500 000 рублей. ",
+]
+
+
+@pytest.mark.parametrize("sentences", _NON_LATIN, ids=["hangul", "kana", "cyrillic"])
+def test_text_in_other_scripts_keeps_its_digits_and_is_sized_as_written(monkeypatch, sentences):
+    """Read as English words, digits made served kana and Russian number text
+    worse than leaving them to the LM, so text whose letters are mostly not
+    Latin is left as written, unlike the reference."""
     monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", None)
     frontend = CosyVoice3TextFrontend()
     text = sentences * 6
-    assert _tokens(frontend.normalize(text)) > 1.3 * _tokens(text), "the example no longer grows when spelled out"
+    assert frontend.normalize(text) == text
     pieces = adapters.CosyVoice3Adapter().split_speech_text(text)
-    assert all(_tokens(frontend.normalize(p)) <= 80 for p in pieces)
+    assert all(frontend.normalize(p) == p and _tokens(p) <= 80 for p in pieces)
     assert re.sub(r"\s", "", "".join(pieces)) == re.sub(r"\s", "", text)
+
+
+@pytest.mark.parametrize(
+    "text, spoken",
+    [
+        ("Café 12 opens at 9:45.", "Café twelve opens at nine forty five."),
+        ("Größe 12 kostet 4 Euro.", "Größe twelve kostet four Euro."),
+        ("Room 2024.", "Room twenty twenty four."),
+        ("2024.", "twenty twenty four."),
+    ],
+)
+def test_latin_script_text_reads_its_digits(text, spoken):
+    assert CosyVoice3TextFrontend().normalize(text) == spoken
+
+
+@pytest.mark.parametrize(
+    "text, spoken",
+    [
+        # most letters decide: an English word in kana or Cyrillic text keeps the digits
+        ("かいぎは Zoomで 3じに はじまります。", "かいぎは Zoomで 3じに はじまります。"),
+        ("Встреча с Microsoft в 19:30.", "Встреча с Microsoft в 19:30."),
+        # and a kana or Hangul word in English text does not
+        ("Say ありがとう 3 times.", "Say ありがとう three times."),
+        ("The word 안녕 has 2 syllables.", "The word 안녕 has two syllables."),
+    ],
+)
+def test_mixed_scripts_follow_most_of_their_letters(text, spoken):
+    assert CosyVoice3TextFrontend().normalize(text) == spoken
 
 
 @pytest.mark.parametrize(
@@ -545,13 +573,9 @@ def test_pieces_of_other_scripts_are_sized_on_their_spelled_out_tokens(monkeypat
         "rest should be done by June 30. Phase 2 will add 36 engineers at a cost of $1,299 each per week. "
         "Flight 247 leaves Gate 12 at 9:45, and order numbers 48213907, 55120934 and 61028711 ship on "
         "the 3rd. For questions, call 555-0199.",
-        "회의는 2024년 3월 15일 오후 7시 30분에 시작합니다. 참석자는 125명이고 예산은 4,500,000원입니다. "
-        "모두 10분 전까지 도착해 주시고 신분증을 지참해 주세요. 1단계 작업은 80% 완료되었고, 나머지는 "
-        "6월 30일까지 끝낼 예정입니다. 2단계에는 엔지니어 36명이 투입됩니다. 문의 사항은 02-555-0199로 "
-        "연락해 주세요.",
         _IDS,
     ],
-    ids=["english", "hangul", "ids"],
+    ids=["english", "ids"],
 )
 def test_spelled_out_pieces_are_even_and_keep_numbers_whole(monkeypatch, text):
     """A re-split piece is neither a short tail ("3rd.") nor a cut number ("9:" and "45")."""
