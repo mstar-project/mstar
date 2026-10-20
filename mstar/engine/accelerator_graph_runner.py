@@ -2033,6 +2033,7 @@ class PiecewiseAcceleratorGraphRunner:
         self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ):
         """The region's step over the padded batch, addressed at its slot.
 
@@ -2044,7 +2045,12 @@ class PiecewiseAcceleratorGraphRunner:
         """
         if self._config.declare_step is None:
             return None
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        if label_seq_lens is None:
+            step = self._config.declare_step(list(request_ids), list(seq_lens))
+        else:
+            step = self._config.declare_step(
+                list(request_ids), list(seq_lens), label_seq_lens=label_seq_lens,
+            )
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2153,6 +2159,7 @@ class PiecewiseAcceleratorGraphRunner:
         request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured region for these real inputs.
 
@@ -2163,7 +2170,20 @@ class PiecewiseAcceleratorGraphRunner:
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
+
+        ``label_seq_lens`` is for a region whose step plans several ragged
+        layouts over the same tokens (windows and whole frames): label ->
+        spans, handed to ``declare_step`` as is. Its total must be ``seq_lens``'s
+        for every label, so the bucket is the one ``seq_lens`` picked.
         """
+        if label_seq_lens is not None and seq_lens is not None:
+            total = sum(seq_lens)
+            bad = {k: sum(v) for k, v in label_seq_lens.items() if sum(v) != total}
+            if bad:
+                raise ValueError(
+                    f"piecewise {self._label!r}: label_seq_lens totals {bad} differ from "
+                    f"seq_lens' {total}"
+                )
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)
@@ -2207,6 +2227,7 @@ class PiecewiseAcceleratorGraphRunner:
                 capture=False,
                 slot=self._current_slot,
                 real_bs=real_bs,
+                label_seq_lens=label_seq_lens,
             )
         try:
             self._plan(step, data.shape)

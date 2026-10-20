@@ -286,6 +286,10 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # This region's own resource work, declared over the padded batch. Separate
     # from the submodule's `declare_step` because the region's shape is its
     # own: the runner admits, plans, and commits it per replay.
+    # A region whose step plans several ragged layouts also takes an optional
+    # keyword ``label_seq_lens`` (label -> spans), passed on a replay given
+    # one; capture passes none, so the declaration falls back to ``seq_lens``
+    # for every label then.
     declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
     # Take this region's slot before the outer `declare_step` runs, and report
     # it on the step context. The region still declares, plans and commits its
