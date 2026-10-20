@@ -1888,5 +1888,9 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            # at most the 1 ms a sleep here used to take, but a message ends it
-            self.communicator.poll_for_messages(timeout_ms=1)
+            # Between passes: at most 1 ms, ended early by a message.
+            try:
+                self.communicator.poll_for_messages(timeout_ms=1)
+            except Exception:
+                logger.exception("Conductor error waiting for messages")
+                time.sleep(0.01)

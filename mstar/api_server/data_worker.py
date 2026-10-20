@@ -163,8 +163,8 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
-        # The other direction: signalled when chunks land on output_queue, so
-        # the API server's message thread can poll on it instead of sleeping.
+        # The other direction: signalled when chunks land on output_queue,
+        # which ends the API server's message thread's wait between passes.
         self.results_wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}

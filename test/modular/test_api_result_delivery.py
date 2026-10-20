@@ -275,9 +275,13 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
         assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
 
 
-def test_collect_results_is_woken_by_the_completion():
+def test_collect_results_is_woken_by_the_completion(monkeypatch):
     """The non-streaming wait sleeps on the same event as the stream, set when
     the request completes; it does not ask to be woken for every chunk."""
+    from mstar.api_server import entrypoint
+
+    # a backstop far longer than the bound below: only the wake can meet it
+    monkeypatch.setattr(entrypoint, "WAKE_BACKSTOP_S", 5.0)
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request()
@@ -298,7 +302,7 @@ def test_collect_results_is_woken_by_the_completion():
     took = time.perf_counter() - seen["t"]
     assert [c.data for c in chunks] == [b"done"]
     assert seen["per_chunk"] is False
-    assert took < 0.04, f"completion took {1000 * took:.1f} ms"  # the backstop is 50 ms
+    assert took < 0.05, f"completion took {1000 * took:.1f} ms"
 
 
 def test_the_message_thread_polls_on_the_socket_and_the_data_worker():

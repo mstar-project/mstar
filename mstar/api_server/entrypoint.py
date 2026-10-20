@@ -192,6 +192,11 @@ def _shutdown_conductor_process(
 #: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
 DUPLICATE_ID_GRACE_S = 0.5
 
+#: The longest a handler waiting for its request sleeps before it rechecks
+#: the disconnect and deadline itself; the message thread wakes it as soon as
+#: a chunk or the completion lands.
+WAKE_BACKSTOP_S = 0.05
+
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
     """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
@@ -880,18 +885,18 @@ class APIServer:
                 with self.request_lock:
                     if len(self.recently_completed) > 0:
                         self._prune_recently_completed()
+                wait()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            wait()
 
     def _pass_wait(self):
-        """How the message thread waits between passes: at most 1 ms, as a
-        sleep used to, but ended early by a message on the socket or by the
-        data worker queueing result chunks, so a finished request is not held
-        for the rest of the millisecond. getattr: tests build the server
-        around fakes without either."""
+        """How the message thread waits between passes: at most 1 ms, ended
+        early by a message on the socket or by the data worker queueing result
+        chunks, so a finished request is not held for the rest of the
+        millisecond. getattr: tests build the server around fakes without
+        either."""
         register = getattr(self.communicator, "register_event_for_poll", None)
         poll = getattr(self.communicator, "poll_for_messages", None)
         results_wakeup = getattr(self.preprocess_worker, "results_wakeup", None)
@@ -1042,7 +1047,7 @@ class APIServer:
                 if new_chunks:
                     continue  # more may already be waiting
                 try:
-                    await asyncio.wait_for(wake.wait(), timeout=0.05)
+                    await asyncio.wait_for(wake.wait(), timeout=WAKE_BACKSTOP_S)
                 except asyncio.TimeoutError:
                     pass
         finally:
@@ -1156,7 +1161,7 @@ class APIServer:
                 self.abort_submission(key)
                 return []
             try:
-                await asyncio.wait_for(wake.wait(), timeout=0.05)
+                await asyncio.wait_for(wake.wait(), timeout=WAKE_BACKSTOP_S)
             except asyncio.TimeoutError:
                 pass
 
