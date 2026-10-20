@@ -374,6 +374,8 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
     for arm_json in sorted(run_dir.glob("*/*/arm.json")):
         arm_dir = arm_json.parent
         info = json.loads(arm_json.read_text())
+        if arm_dir.name != info.get("arm"):
+            continue  # an arm run set aside (e.g. voided by its health check); its score would replace the live one's
         corr = arm_dir / "correctness"
         if not (corr / "pass.json").is_file():
             for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
