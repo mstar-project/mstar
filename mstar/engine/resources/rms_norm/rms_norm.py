@@ -8,6 +8,8 @@ PyTorch implementation.
 
 import torch
 
+from mstar.engine.node_dtype import warn_implicit_downcast
+
 
 def _prepare_inputs(
     x: torch.Tensor,
@@ -22,6 +24,7 @@ def _prepare_inputs(
     elif torch.is_autocast_enabled(device_type):
         x = x.to(torch.get_autocast_dtype(device_type))
     elif x.dtype == torch.float32 and device_type == "cuda":
+        warn_implicit_downcast("rms_norm", x.dtype, torch.bfloat16)
         x = x.to(torch.bfloat16)
     if weight.dtype != x.dtype:
         weight = weight.to(x.dtype)

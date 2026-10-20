@@ -788,15 +788,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return None
 
     def get_autocast_dtype(self) -> torch.dtype | None:
-        """Per-submodule autocast dtype override for the engine's forward
-        wrap. The engine consults this on each ``execute_batch`` and uses
-        the returned dtype instead of its own when non-``None``.
+        """This node's dtype in place of the model's: the engine manager casts
+        the node's params to it, and every forward, warm-up and capture runs
+        under autocast in it. Read once at load (``resolve_node_dtype``).
 
-        Default: ``None`` (inherit the engine's autocast dtype). To turn
-        autocast off for one specific submodule whose engine otherwise has
-        it enabled, wrap the submodule's forward with
-        ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic
-        and doesn't need this surface.
+        Default: ``None`` (inherit the model's dtype). Ignored when
+        ``disable_autocast`` is set; to run a node without autocast, in the
+        dtype it was built in, set that instead.
         """
         return None
 
@@ -811,9 +809,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
-        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
-        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
-        the captured region runs under (avoids a copy-time upcast at replay).
+        ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
+        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
+        allocate the hidden-state buffer in the dtype the captured region runs
+        under (avoids a copy-time upcast at replay).
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

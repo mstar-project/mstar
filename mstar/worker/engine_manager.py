@@ -6,6 +6,7 @@ import torch
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
+from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -213,13 +214,9 @@ class EngineManager:
         _refuse_unknown_walks(model)
         _refuse_unservable_walks(specs, model)
 
-        # Resolve autocast dtype: explicit YAML config wins; otherwise we
-        # fall back to the Model's own preference (so models that need to
-        # match a reference numerically can override get_autocast_dtype
-        # without forcing every config file to set the same value).
-        autocast_dtype = model.get_autocast_dtype()
-        if "autocast_dtype" in model_config:
-            autocast_dtype = model_config["autocast_dtype"]
+        # YAML autocast_dtype over the model's own, but never re-enabling
+        # autocast for a model that pinned its numerics (see node_dtype)
+        autocast_dtype = resolve_model_dtype(model, model_config)
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
@@ -227,6 +224,7 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
+        node_dtypes: dict[str, torch.dtype | None] = {}
         for name in sorted(node_names):
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
@@ -242,13 +240,9 @@ class EngineManager:
             )
             if submodule is None:
                 continue
-            if submodule.disable_autocast:
-                # keeps the dtype it was built in; the engine won't autocast it
-                submodules[name] = submodule.to(device=device)
-                continue
-            # A submodule that must run in its own dtype (an audio codec in
-            # fp32, say) says so; otherwise it takes the engine's.
-            node_dtype = submodule.get_autocast_dtype() or autocast_dtype
+            # the one dtype the load cast and every forward and capture use;
+            # None keeps the dtype the node was built in
+            node_dtype = node_dtypes[name] = resolve_node_dtype(submodule, autocast_dtype)
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
 
@@ -268,6 +262,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            node_dtypes=node_dtypes,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
