@@ -4,7 +4,7 @@ The diffusers pipeline is the model's own implementation, so there's nothing ind
 compare against. The server returns the video as an mp4 and the audio as separate interleaved
 16-bit PCM. Both are saved and checked for sanity (frames, size, flat frames; audio length against
 the clip, silence, clipping), and each item runs on two server instances with the same seed:
-frame PSNR and audio SNR between them, with byte identity reported.
+frame PSNR and audio SNR between them, with identical decoded frames and identical PCM counted.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import numpy as np
 
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
-from benchmark.correctness.families.base import Family, failed_items, self_consistency_check
+from benchmark.correctness.families.base import Family, failed_items, frame_identity, self_consistency_check
 from benchmark.correctness.families.video import read_video
 from benchmark.correctness.report import FamilyScore, band
 from benchmark.correctness.sets import SampleSet
@@ -132,8 +132,8 @@ class AudioVideoFamily(Family):
             if len(runs) > 1:
                 other = runs[1] / "outputs"
                 if frames is not None and (other / f"{it.id}.mp4").is_file():
-                    row["mp4_identical"] = mp4.read_bytes() == (other / f"{it.id}.mp4").read_bytes()
                     g = read_video(other / f"{it.id}.mp4")
+                    row["frames_identical_r1_r2"] = M.frames_equal(frames, g)
                     if g.shape == frames.shape:
                         row["r1_r2_frame_psnr_min"] = min(M.frame_psnrs(frames, g))
                         video_repro.append(row["r1_r2_frame_psnr_min"])
@@ -152,14 +152,13 @@ class AudioVideoFamily(Family):
                  ", ".join(bad_audio[:8]))
         self_consistency_check(sc, video_repro, "same-seed min frame PSNR, two server instances (dB)", len(runs),
                                lambda v: v >= 40, lambda v: v >= 25,
-                               ">=40 PASS (inf = identical after the same encode), >=25 WARN (provisional)")
+                               ">=40 PASS (inf = identical decoded frames), >=25 WARN (provisional)")
         self_consistency_check(sc, audio_repro, "same-seed min audio SNR, two server instances (dB)", len(runs),
                                lambda v: v >= 40, lambda v: v >= 20, ">=40 PASS (inf = identical), >=20 WARN "
                                                                      "(provisional)")
         if len(runs) > 1:
-            sc.metrics["byte_identical_r1_r2"] = {
-                "mp4": sum(bool(r.get("mp4_identical")) for r in rows), "pcm": sum(bool(r.get("pcm_identical"))
-                                                                                   for r in rows), "n": n}
+            frame_identity(sc, rows, encoded=True)
+            sc.metrics["byte_identical_r1_r2"] = {"pcm": sum(bool(r.get("pcm_identical")) for r in rows), "n": n}
         if sheet:
             M.contact_sheet(sheet, labels, work / "contact_sheet.png")
             sc.artifacts.append(str(work / "contact_sheet.png"))
