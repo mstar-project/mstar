@@ -191,7 +191,10 @@ def render(data: dict) -> str:
     if meta.get("note"):
         lines.append(f"- {meta['note']}")
     for r in meta.get("resumed") or []:
-        lines.append(f"- resumed {r.get('at')} on {r.get('host')} (job {r.get('job')}); finished arms and cells kept")
+        where = f", GPUs {r['gpus']}, lanes {r.get('lanes')}" if r.get("gpus") else ""
+        ran = f"; measured {', '.join(r['measured'])}" if r.get("measured") else ""
+        lines.append(f"- resumed {r.get('at')} on {r.get('host')} (job {r.get('job')}){where}{ran}; finished arms "
+                     "and cells kept")
     for name, h in data["health"].items():
         v = h["verdict"]
         lines.append(f"- node health {name}: {v['status']}")
