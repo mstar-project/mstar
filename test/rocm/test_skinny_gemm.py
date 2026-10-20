@@ -8,6 +8,8 @@ of that bucket must replay to the same result.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -107,7 +109,7 @@ def test_small_bucket_compiles_to_the_skinny_op(rows):
     with torch.no_grad():
         out, code = run_and_get_code(fn, x)
         ref = model(x)
-    calls = sum(c.count("= torch.ops.mstar.skinny_gemm.default(") for c in code)
+    calls = sum(len(re.findall(r"= torch\.ops\.mstar\.skinny_gemm(_any)?\.default\(", c)) for c in code)
     assert calls == 3
     assert not any("extern_kernels.mm(" in c or "extern_kernels.addmm(" in c for c in code)
     _close(out, ref.float())
@@ -119,7 +121,26 @@ def test_larger_bucket_keeps_hipblaslt(rows):
     x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         _, code = run_and_get_code(_compiled(model, rows), x)
-    assert not any("mstar.skinny_gemm" in c for c in code)
+    assert not any("mstar.skinny_gemm" in c for c in code)  # neither op
+
+
+def test_one_row_gated_norm_feeding_the_gemm_is_one_kernel():
+    """The layout-free op lets inductor finish the norm in a single kernel."""
+    from mstar.model.components.norm import RMSNormGated
+
+    norm = RMSNormGated(128).cuda()
+    w = torch.randn(1024, 32 * 128, device="cuda", dtype=torch.bfloat16) / 64
+
+    def fn(core, z):
+        return F.linear(norm(core, z).reshape(1, 32 * 128), w)
+
+    core = torch.randn(1, 32, 128, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn(1, 2 * 32 * 128, device="cuda", dtype=torch.bfloat16)[:, 32 * 128:].reshape(1, 32, 128)
+    with torch.no_grad():
+        out, code = run_and_get_code(_compiled(fn, 1), core, z)
+    kernels = set(re.findall(r"def (triton_\w+)\(", "\n".join(code)))
+    assert len(kernels) == 1, kernels
+    _close(out, F.linear(norm(core, z).reshape(1, -1), w).float())
 
 
 def test_captured_bucket_replays():

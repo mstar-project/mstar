@@ -26,13 +26,19 @@ def _targets(graph):
     return [n.target for n in graph.nodes if n.op == "call_function"]
 
 
+def _skinny_calls(graph):
+    """one-row GEMMs go to the layout-free twin of the op"""
+    ops = (torch.ops.mstar.skinny_gemm.default, torch.ops.mstar.skinny_gemm_any.default)
+    return sum(t in ops for t in _targets(graph))
+
+
 @pytest.mark.parametrize("rows", [1, 2])
 @pytest.mark.parametrize("bias", [False, True])
 def test_small_linears_are_rewritten(rows, bias):
     graph = _linear_graph(rows, bias=bias)
     SkinnyGemmPass()(graph)
     targets = _targets(graph)
-    assert targets.count(torch.ops.mstar.skinny_gemm.default) == 1
+    assert _skinny_calls(graph) == 1
     assert torch.ops.aten.mm.default not in targets
     assert torch.ops.aten.addmm.default not in targets
     graph.lint()
@@ -44,7 +50,7 @@ def test_residual_folded_into_addmm_is_rewritten():
         2, 64, dtype=torch.bfloat16)
     graph = make_fx(lambda h, w, x: torch.addmm(x, h, w.t()), tracing_mode="fake")(h, w, x).graph
     SkinnyGemmPass()(graph)
-    assert torch.ops.mstar.skinny_gemm.default in _targets(graph)
+    assert _skinny_calls(graph) == 1
 
 
 @pytest.mark.parametrize(
@@ -95,9 +101,8 @@ def _torch_level_graph(rows, **kwargs):
 def test_pre_grad_pass_rewrites_small_linears(rows, bias):
     graph = _torch_level_graph(rows, bias=bias)
     SkinnyLinearPrePass()(graph)
-    targets = _targets(graph)
-    assert targets.count(torch.ops.mstar.skinny_gemm.default) == 2
-    assert F.linear not in targets
+    assert _skinny_calls(graph) == 2
+    assert F.linear not in _targets(graph)
     graph.lint()
 
 
