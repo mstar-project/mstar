@@ -917,7 +917,7 @@ class _ForwardingLeader:
         self._tp_broadcast_seq = broadcast_seq
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
-        self._pending_removes: set[int] = set()
+        self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
         self.streaming_buffers: dict = {}
         self._stream_buffer_rids: set[int] = set()

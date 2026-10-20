@@ -468,7 +468,7 @@ def test_a_held_or_removed_backlog_row_waits_without_a_readiness_check(park):
     if park == "held":
         sched.hold_requests(["r0"])
     else:
-        sched.pending_removes.add("r0")
+        sched.pending_removes["r0"] = None
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
     batch = _next_batch(sched, _Manager([]))

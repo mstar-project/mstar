@@ -1,14 +1,15 @@
 """Every rank of a TP instance tears a request down after its admit of the step rank 0
-stamped the teardown with.
+stamped the teardown with, and in the order rank 0 did.
 
 A teardown releases pages, so the side of an admit it lands on decides what that admit finds
-free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last step it
-has broadcast. A follower holds it until it has popped that step, and reads no message
-between popping a step and the admit fence at the top of the next pass, so it lands after
-that admit. Rank 0 lands it there too. A removal deferred behind step N is retried once N
-is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
+free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last
+step it has broadcast. A follower holds it until it has popped that step, and reads no
+message between popping a step and the admit fence at the top of the next pass, so it lands
+after that admit. Rank 0 lands it there too. A removal deferred behind step N is retried
+once N is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
 ``_remove_request`` defers it again while N is still the step in flight, and the next pass
-tears it down behind N+1's admit fence.
+tears it down behind N+1's admit fence. The order matters as well: the free list hands pages
+back out in the order they were freed.
 
 Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
 a request is torn down, or a while.
@@ -23,14 +24,17 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
-# wire id -> handle. All three run in step N (seq 0); only "kept" goes on into N+1 (seq 1)
-HANDLES = {"gone": 1, "kept": 2, "also": 3}
+# wire id -> handle. All but "idle" run in step N (seq 0); only "kept" goes on into N+1
+# (seq 1)
+HANDLES = {"gone": 1, "kept": 2, "also": 3, "idle": 4}
+STEP_N = [HANDLES[rid] for rid in ("gone", "kept", "also")]
 # how long the GPU thread holds N+1's admit back for a teardown that would jump it
 HOLD_S = 0.25
 
@@ -62,19 +66,21 @@ def _speculation(seq: int, rids: list[int]):
 
 
 class _Scheduler:
-    """N comes off the serial path; N+1 is the speculative head rank 0 sends from N."""
+    """N comes off the serial path. N+1 is the speculative head rank 0 sends from N, or
+    with ``serial`` a step it sends after N, off the serial path too."""
 
-    def __init__(self):
-        self.heads = [SimpleNamespace(
+    def __init__(self, serial: bool = False):
+        self.heads = [] if serial else [SimpleNamespace(
             node_name=NODE, graph_walk=WALK, speculative=True, spec_seq=1, spec_from_seq=0,
         )]
+        self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
         self.last_consumed_tp_seq = -1
 
     def get_next_batch(self, request_state, **kwargs):
-        if self.last_consumed_tp_seq >= 0:
+        if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None
-        self.last_consumed_tp_seq = 0
-        return _batch(0, list(HANDLES.values()))[0]
+        self.last_consumed_tp_seq += 1
+        return _batch(self.last_consumed_tp_seq, self.steps[self.last_consumed_tp_seq])[0]
 
     def peek_tp_follow(self):
         return self.heads[0] if self.heads else None
@@ -92,8 +98,11 @@ class _Scheduler:
         pass
 
 
-def _rank(monkeypatch, *, tp_rank: int, inbox: list[list[RemoveRequest]]):
-    """A worker at TP rank ``tp_rank`` that runs N and then N+1. Each pass of
+def _rank(
+    monkeypatch, *, tp_rank: int, inbox: list[list[RemoveRequest]], serial: bool = False,
+):
+    """A worker at TP rank ``tp_rank`` that runs N and then N+1, speculated or, with
+    ``serial``, sent after rank 0 marked N as not speculated from. Each pass of
     ``_process_messages`` takes the next entry of ``inbox``. Returns the worker and its
     log of admits, teardowns and forwarded removals, in the order they happened."""
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
@@ -106,12 +115,14 @@ def _rank(monkeypatch, *, tp_rank: int, inbox: list[list[RemoveRequest]]):
     w.is_tp_follower = tp_rank > 0
     w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
     w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
-    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), set(), {}
+    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
-    w.scheduler = _Scheduler()
+    if serial:
+        w._tp_nospec.add(0)
+    w.scheduler = _Scheduler(serial)
 
     group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
     wire = {handle: rid for rid, handle in HANDLES.items()}
@@ -243,3 +254,44 @@ def test_a_follower_tears_down_in_the_order_rank_0_did(monkeypatch):
     _run(w)
 
     assert [entry[1] for entry in log if entry[0] == "teardown"] == ["gone", "also"], log
+
+
+def test_a_follower_tears_down_what_it_deferred_in_the_order_rank_0_did(monkeypatch):
+    """Rank 0 had nothing in flight and tore "also" down, then "gone", after N; here N
+    still runs both, so both wait on it. Handles are this rank's own, so an order kept by
+    handle is not rank 0's, and the free list would come out other than rank 0's."""
+    pages = {HANDLES["gone"]: [1, 2], HANDLES["also"]: [3, 4], HANDLES["kept"]: [5]}
+    also, gone = (
+        RemoveRequest(request_id=rid, source=MessageSource.TP_RANK_0, after_tp_seq=0)
+        for rid in ("also", "gone")
+    )
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [also, gone]], serial=True)
+    freed, on_rank_0 = PageAllocator(6), PageAllocator(6)
+    for allocator in (freed, on_rank_0):
+        allocator.allocate(6)
+    tear_down = w.engine_manager.remove_request
+
+    def _release(handle):
+        tear_down(handle)
+        freed.free(pages[handle])
+
+    w.engine_manager.remove_request = _release
+    _run(w)
+
+    for rid in ("also", "gone"):
+        on_rank_0.free(pages[HANDLES[rid]])
+    assert [entry[1] for entry in log if entry[0] == "teardown"] == ["also", "gone"], log
+    assert list(freed.free_pages.queue) == list(on_rank_0.free_pages.queue)
+
+
+def test_a_follower_tears_down_nothing_ahead_of_one_it_deferred(monkeypatch):
+    """Rank 0 tore "gone" down, then "idle", after N. Here N still runs "gone", so it waits
+    on N; "idle" runs in no step, but waits behind it, as on rank 0."""
+    gone, idle = (
+        RemoveRequest(request_id=rid, source=MessageSource.TP_RANK_0, after_tp_seq=0)
+        for rid in ("gone", "idle")
+    )
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [gone, idle]], serial=True)
+    _run(w)
+
+    assert [entry[1] for entry in log if entry[0] == "teardown"] == ["gone", "idle"], log

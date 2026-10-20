@@ -592,7 +592,7 @@ def test_pending_rows_are_the_backlog_and_the_ready_rows_not_in_a_step():
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 4
 
     sched.fail_rids({"r2"})
-    sched.pending_removes.add("r5")
+    sched.pending_removes["r5"] = None
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 2
 
 

@@ -45,7 +45,7 @@ def _worker(
     w._pending_drains = set(pending_drains)
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
-    w._pending_removes = set()
+    w._pending_removes = {}
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
     w._graph_runtime = SimpleNamespace(
@@ -231,7 +231,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
 def test_draining_and_pending_removal_rids_are_not_published():
     w = _worker(known_rids=("healthy", "draining", "pending", "failed"))
     w._draining_rids.add("draining")
-    w._pending_removes.add("pending")
+    w._pending_removes["pending"] = None
     w.scheduler.failed_rids.add("failed")
     batch = SimpleNamespace(
         request_ids=["healthy", "draining", "pending", "failed"],
@@ -339,7 +339,7 @@ def test_speculation_stops_for_a_rid_being_torn_down():
     assert "X" in w._draining_rids and "X" in w.scheduler.failed_rids
     assert w._is_tearing_down("X")
 
-    w._pending_removes.add("Y")
+    w._pending_removes["Y"] = None
     assert w._is_tearing_down("Y")
 
 
