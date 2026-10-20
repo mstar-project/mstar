@@ -238,6 +238,14 @@ def run_client(cmd: list[str], env: dict, log_path: Path) -> tuple[int, float]:
     return p.returncode, usage.ru_utime + usage.ru_stime
 
 
+def input_seconds_of(row: Row, wl: tables.Workload) -> list[float] | None:
+    """Audio seconds of each item of an ASR row's sample set, for RTFx."""
+    if row.family != "asr" or not wl.prompts.startswith("set:"):
+        return None
+    man = json.loads((SETS_ROOT / "sets" / wl.prompts[4:] / "manifest.json").read_text())
+    return [float(it["params"]["duration_s"]) for it in man["items"]]
+
+
 def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path,
              gpus: list[int], numa: int | None = None, request_kwargs: dict | None = None) -> dict:
     cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
@@ -245,10 +253,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
     if plan.resume and done.is_file() and json.loads(done.read_text()).get("status") != "error":
         return json.loads(done.read_text())
     cell_dir.mkdir(parents=True, exist_ok=True)
-    input_seconds = None
-    if row.family == "asr" and wl.prompts.startswith("set:"):
-        man = json.loads((SETS_ROOT / "sets" / wl.prompts[4:] / "manifest.json").read_text())
-        input_seconds = [float(it["params"]["duration_s"]) for it in man["items"]]
+    input_seconds = input_seconds_of(row, wl)
     attempts = []
     for attempt in (1, 2):
         reps = []
