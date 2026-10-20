@@ -9,6 +9,7 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+!examples/observability/grafana/dashboards/*.json
 profiler/
 traces/
 

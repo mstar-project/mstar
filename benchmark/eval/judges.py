@@ -14,6 +14,9 @@ ASR judge is never compared with a WER from another by accident.
   tables; compare runs scored with the same judge id.
 * ``utmos22_strong``: UTMOS22 strong learner via ``tarepan/SpeechMOS`` on
   torch.hub (predicted MOS on a 1 to 5 scale, 16 kHz).
+* ``clip:<hf id>``: CLIP score of an image against its prompt, 100 times the
+  cosine similarity of the two embeddings floored at 0 (default
+  ``openai/clip-vit-base-patch32``).
 """
 
 from __future__ import annotations
@@ -120,6 +123,27 @@ class MosJudge:
             return float(self.model(wav, RATE).item())
 
 
+class ClipJudge:
+    def __init__(self, model_id: str = "openai/clip-vit-base-patch32", device: str | None = None):
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+
+        self.id = f"clip:{model_id}"
+        self.device = _device(device)
+        self.processor = CLIPProcessor.from_pretrained(model_id)
+        self.model = CLIPModel.from_pretrained(model_id).to(self.device).eval()
+        self.torch = torch
+
+    def score(self, images: Sequence, text: str) -> float:
+        """Mean CLIP score of ``images`` (PIL images, e.g. a video's sampled frames) against ``text``."""
+        inputs = self.processor(text=[text], images=list(images), return_tensors="pt", padding=True, truncation=True)
+        with self.torch.inference_mode():
+            out = self.model(**{k: v.to(self.device) for k, v in inputs.items()})
+        img = self.torch.nn.functional.normalize(out.image_embeds.float(), dim=-1)
+        txt = self.torch.nn.functional.normalize(out.text_embeds.float(), dim=-1)
+        return float((100 * (img @ txt.T)).clamp(min=0).mean().item())
+
+
 @cache
 def asr_judge(model_id: str, device: str | None = None) -> WhisperJudge:
     return WhisperJudge(model_id, device)
@@ -133,3 +157,8 @@ def sim_judge(model_id: str, device: str | None = None) -> SpeakerSimJudge:
 @cache
 def mos_judge(device: str | None = None) -> MosJudge:
     return MosJudge(device)
+
+
+@cache
+def clip_judge(model_id: str, device: str | None = None) -> ClipJudge:
+    return ClipJudge(model_id, device)

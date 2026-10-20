@@ -77,6 +77,11 @@ audio = [
     "soundfile",
 ]
 
+# Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
+metrics = [
+    "prometheus-client>=0.20",
+]
+
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
@@ -99,6 +104,13 @@ eval = [
 # 0.3 may change the streaming layers mstar.model.audio_watermark drives.
 audioseal = [
     "audioseal>=0.2,<0.3",
+]
+
+# Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
+# its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+vad = [
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend
@@ -340,6 +352,8 @@ all = [
     "ruff",
     "pytest>=8.2",
     "soundfile",
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
     "av",
     "diffusers>=0.39",
     "fa3-fwd",

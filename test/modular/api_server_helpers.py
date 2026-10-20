@@ -29,6 +29,7 @@ def make_test_api_server(**overrides) -> APIServer:
     server.enable_nvtx = False
     server.log_stats = False
     server.log_stats_file = None
+    server.metrics = None
     server.model = None
     server.model_name = "dummy"
     server.preprocess_worker = None

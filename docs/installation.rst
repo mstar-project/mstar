@@ -118,6 +118,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
        Qwen3-TTS notes in :doc:`models`). Not part of ``.[all]``; a deployment that
        enables the watermark without it fails at startup with this install hint.
        The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
+   * - ``.[metrics]``
+     - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
+       ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
+       model's runtime, so not part of ``.[all]``.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``
