@@ -992,12 +992,11 @@ class Engine:
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                     has_loopback=loopback is not None and loopback[i],
                 )
-                if req_inputs is not None:
-                    if probe_prefix:
-                        req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
-                    if probe_prefix or mixed:
-                        # the submodule reads a mixed step's rows by their own walk
-                        req_inputs.graph_walk = row_walk
+                if req_inputs is not None and probe_prefix:
+                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                if req_inputs is not None and (probe_prefix or mixed):
+                    # the submodule reads a mixed step's rows by their own walk
+                    req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
