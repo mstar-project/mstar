@@ -1,0 +1,231 @@
+"""Every rank of a TP instance tears a request down after its admit of the step rank 0
+stamped the teardown with.
+
+A teardown releases pages, so the side of an admit it lands on decides what that admit finds
+free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last step it
+has broadcast. A follower holds it until it has popped that step, and reads no message
+between popping a step and the admit fence at the top of the next pass, so it lands after
+that admit. Rank 0 lands it there too. A removal deferred behind step N is retried once N
+is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
+``_remove_request`` defers it again while N is still the step in flight, and the next pass
+tears it down behind N+1's admit fence.
+
+Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
+a request is torn down, or a while.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from mstar.utils.containers import RecentSet  # noqa: E402
+from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
+from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
+
+NODE, WALK = "LLM", "decode"
+# wire id -> handle. All three run in step N (seq 0); only "kept" goes on into N+1 (seq 1)
+HANDLES = {"gone": 1, "kept": 2, "also": 3}
+# how long the GPU thread holds N+1's admit back for a teardown that would jump it
+HOLD_S = 0.25
+
+
+class _Stop(BaseException):
+    """Ends ``run`` at the pass after N+1 went out."""
+
+
+def _batch(seq: int, rids: list[int]):
+    """A step's scheduled and executing halves."""
+    scheduled = SimpleNamespace(
+        node_name=NODE, graph_walk=WALK, tp_seq=seq,
+        request_to_worker_graph={rid: 0 for rid in rids},
+    )
+    executing = SimpleNamespace(
+        node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
+        launch_started_event=None,
+    )
+    return scheduled, executing
+
+
+def _speculation(seq: int, rids: list[int]):
+    scheduled, executing = _batch(seq, rids)
+    return SimpleNamespace(
+        scheduled_batch=scheduled, node_batch=executing, is_yield_away=False,
+        plan_future=None, partition="p", is_new_iter=False, loop_name=None,
+        tp_seq=seq, dropped=set(),
+    )
+
+
+class _Scheduler:
+    """N comes off the serial path; N+1 is the speculative head rank 0 sends from N."""
+
+    def __init__(self):
+        self.heads = [SimpleNamespace(
+            node_name=NODE, graph_walk=WALK, speculative=True, spec_seq=1, spec_from_seq=0,
+        )]
+        self.last_consumed_tp_seq = -1
+
+    def get_next_batch(self, request_state, **kwargs):
+        if self.last_consumed_tp_seq >= 0:
+            return None
+        self.last_consumed_tp_seq = 0
+        return _batch(0, list(HANDLES.values()))[0]
+
+    def peek_tp_follow(self):
+        return self.heads[0] if self.heads else None
+
+    def pop_tp_follow_head(self):
+        self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+
+    def take_admit_errors(self):
+        return {}
+
+    def clear_rid(self, rid, wire_rid):
+        pass
+
+    def clear_wire_rid(self, wire_rid):
+        pass
+
+
+def _rank(monkeypatch, *, tp_rank: int, inbox: list[list[RemoveRequest]]):
+    """A worker at TP rank ``tp_rank`` that runs N and then N+1. Each pass of
+    ``_process_messages`` takes the next entry of ``inbox``. Returns the worker and its
+    log of admits, teardowns and forwarded removals, in the order they happened."""
+    monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
+        collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0,
+    ))
+    log: list[tuple] = []
+    torn_down = threading.Event()
+    w = Worker.__new__(Worker)
+    w.worker_id = f"rank{tp_rank}"
+    w.is_tp_follower = tp_rank > 0
+    w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
+    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
+    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), set(), {}
+    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
+    w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
+    w._tp_broadcast_seq = 0
+    w._tp_nospec = RecentSet(16)
+    w.scheduler = _Scheduler()
+
+    group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
+    wire = {handle: rid for rid, handle in HANDLES.items()}
+    w._graph_runtime = SimpleNamespace(
+        get_rid_handle=HANDLES.get, get_rid_string=wire.get,
+        get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+        remove_request=lambda rid: None,
+    )
+
+    def _tear_down(handle):
+        log.append(("teardown", wire[handle]))
+        torn_down.set()
+
+    def _send(worker, msg):
+        if msg.message_type == WorkerMessageType.REMOVE_REQUEST:
+            log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
+
+    w.engine_manager = SimpleNamespace(
+        warmup_all=lambda: None, remove_request=_tear_down, evictable_nodes=lambda: (),
+    )
+    w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
+    w.request_state = SimpleNamespace(
+        remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
+    )
+    w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
+    w.parallel_groups = SimpleNamespace(
+        barrier_all=lambda: None, restore_default_timeout=lambda: None,
+    )
+    w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
+
+    def _broadcast(node_batch, **kwargs):
+        if tp_rank:
+            return -1
+        w._tp_broadcast_seq += 1
+        return w._tp_broadcast_seq - 1
+
+    def _build_speculation(pending, consecutive, fair):
+        if pending is not None and pending.tp_seq == 1:
+            raise _Stop
+        if pending is None or tp_rank:
+            return None, None  # a follower takes N+1 off its FIFO instead
+        spec = _speculation(1, [HANDLES["kept"]])
+        spec.tp_seq = _broadcast(spec.node_batch, speculative=True, spec_from_seq=0)
+        return spec, None
+
+    def _follow(pending):
+        w.scheduler.pop_tp_follow_head()
+        w._in_flight_rids |= {HANDLES["kept"]}
+        return _speculation(1, [HANDLES["kept"]])
+
+    def _gpu(batch, node_batch, plan_future=None):
+        if plan_future is not None:
+            plan_future.result()
+        if batch.tp_seq == 1:
+            torn_down.wait(HOLD_S)
+        log.append(("admit", batch.tp_seq))
+        node_batch.launch_started_event.set()
+        return {}
+
+    passes = iter(inbox)
+
+    def _process_messages():
+        for body in next(passes, []):
+            w._remove_request(body)
+
+    w._process_messages = _process_messages
+    w._build_executing_batch = lambda batch: _batch(
+        batch.tp_seq, list(batch.request_to_worker_graph))[1]
+    w.maybe_send_zmq_to_tp_followers = _broadcast
+    w._build_speculation = _build_speculation
+    w._try_follow_speculation = _follow
+    w._is_tp_follow_pending = lambda pending: bool(tp_rank)
+    w._execute_on_gpu_thread = _gpu
+    w._preplan_spec = lambda pending, spec: False
+    for name in (
+        "_verify_tp_async_sched_agrees", "_init_engine_thread", "_fail_requests",
+        "_check_ready_tensors", "_poll_stream_buffers", "_set_in_flight_flag",
+        "_clear_in_flight_flag", "_thread_outputs_to_speculative", "_settle_speculation",
+        "_postprocess_batch",
+    ):
+        setattr(w, name, lambda *a, **k: None)
+
+    def _fail_loudly(error, *args):
+        raise error
+
+    w._handle_main_loop_error = _fail_loudly
+    return w, log
+
+
+def _run(w) -> None:
+    try:
+        w.run()
+    except _Stop:
+        return
+    raise AssertionError("run returned")
+
+
+def test_rank_0_tears_down_after_admitting_the_step_its_stamp_names(monkeypatch):
+    """The removal arrives while N runs, so it waits on N, and N+1 goes out without the
+    request. The teardown is stamped with N+1, so it lands after N+1's admit, though N is
+    post-processed before that admit can have run."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[[], [RemoveRequest(request_id="gone")]])
+    _run(w)
+
+    assert ("forward", "gone", 1) in log
+    assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
+
+
+def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
+    """Here before this rank has even popped N+1: held until it has, then torn down behind
+    the admit fence of the next pass."""
+    removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
+    _run(w)
+
+    assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
