@@ -178,6 +178,14 @@ class OneShotAllReduce(SymmMemAllReduce):
 
     mode = "symm_oneshot"
 
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Inductor gives one_shot_all_reduce's input a persistent symmetric buffer
+        # of its own, sized by the first call, so a forward compiled for dynamic
+        # batch sizes fails at the next size; compiled code stays on NCCL.
+        if torch.compiler.is_compiling():
+            return AllReduce.all_reduce(self, input_)
+        return super().all_reduce(input_)
+
     def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
         out.copy_(torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.group_name))
 

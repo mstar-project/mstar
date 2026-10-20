@@ -266,7 +266,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
-       Larger messages stay on NCCL. Both are CUDA-graph capturable. Reduction order
+       Larger messages stay on NCCL, and so does one-shot inside a
+       ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
        differs from NCCL's, so bf16 results can differ at the last bit. Falls back
        to NCCL, with a warning, where symmetric memory cannot be set up on every
        rank of the group.
