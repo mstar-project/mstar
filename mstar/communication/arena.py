@@ -846,7 +846,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     def _start_read_tensors(self, request_id, graph_edges, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
-        read_edges: list[tuple[GraphEdge, float]] = []
+        stats = self.transfer_stats
+        # one per edge read; the future is filled in once every copy is queued
+        reads: list[FutureAndPointers] = []
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
@@ -857,6 +859,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 if len(graph_edge.tensor_info) == 0:
                     continue
                 rx_t0 = time.perf_counter()
+                fp = FutureAndPointers(
+                    future=None, graph_edges=[graph_edge], request_id=request_id,
+                )
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
@@ -887,8 +892,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
                     self.tensor_store.increment_ref(info.uuid, 2)
-                read_edges.append(
-                    (graph_edge, time.perf_counter() - rx_t0))
+                    if stats is not None:
+                        fp.count_read(info)
+                fp.rx_time = time.perf_counter() - rx_t0
+                reads.append(fp)
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
@@ -901,13 +908,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             # queued on the h2d stream in program order. get_ready_tensors
             # polls it — no host block here.
             future = _CudaEventFuture(self._h2d_stream)
-        for graph_edge, rx_time in read_edges:
-            self.pending.append(
-                FutureAndPointers(
-                    future=future, graph_edges=[graph_edge],
-                    request_id=request_id, rx_time=rx_time,
-                )
-            )
+        for fp in reads:
+            fp.future = future
+        self.pending.extend(reads)
         if future is None:
             return []
         # A real Future for the worker's eventfd (EventWakeup.register_

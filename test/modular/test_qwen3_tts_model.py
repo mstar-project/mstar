@@ -1533,7 +1533,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
             stream.put(f"t{i}", frames[i])
         stream.signal_done()
         streams[rid] = stream
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule)})
+    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule, piecewise_runners={})})
     engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
     finals = 0
     with torch.no_grad():
@@ -1597,6 +1597,26 @@ def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
         assert (got.int() - expected.int()).abs().max() <= 1
     submodule.cleanup_request("a")
     assert "a" not in submodule.request_states
+
+
+def test_qwen3_tts_codec_declares_a_watermark_capture_per_schedule_length():
+    """Watermark on, the codec asks the engine to capture the generator per
+    chunk length of its schedule and batch bucket; off, nothing. Lengths that
+    are not whole 320-sample watermark frames (the tiny codec's) stay eager."""
+    from test_audio_watermark import _watermarker
+
+    # The engine looks up only this name; a misnamed override inherits the base's {}.
+    assert "get_piecewise_accelerator_graph_configs" in CodecSubmodule.__dict__
+    config = _tiny_model_config()
+    assert CodecSubmodule(_FakeCodecDecoder(4), config).get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.float32) == {}
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config, watermarker=_watermarker())
+    assert submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
+    submodule.total_upsample = 1920   # the real 12 Hz codec's samples per frame
+    configs = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32, 1)
+    frames = sorted({*config.codec.chunk_schedule, config.codec.chunk_frames})
+    assert sorted(configs) == sorted(f"watermark_{f * 1920}" for f in frames)
+    assert all(c.capture_batch_sizes == CodecSubmodule.CAPTURE_BATCH_SIZES for c in configs.values())
 
 
 def test_qwen3_tts_clone_reference_tail_is_the_first_windows_context():
