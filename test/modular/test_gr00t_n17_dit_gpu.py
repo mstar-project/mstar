@@ -57,6 +57,8 @@ from __future__ import annotations
 import glob
 import importlib.util
 import json
+import os
+import shutil
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -91,9 +93,32 @@ _REFERENCE = Path.home() / "ref/Isaac-GR00T/gr00t/model/modules/dit.py"
 _CKPT_PREFIX = "action_head.model."
 _CKPT_TENSORS = 456
 
+def _toolchain() -> bool:
+    """Whether FlashInfer can build its kernels here.
+
+    Its kernels are JIT-compiled, so a machine with a GPU but no compiler fails at
+    ``write_ninja`` rather than skipping -- three of these tests did exactly that when the
+    suite was run the way `CLAUDE.md` prescribes, which would put three environment
+    failures into PR-Deploy's baseline comparison and hide a real one among them.
+    ``CUDA_HOME`` alone is not enough: ``ninja`` lives in the venv's ``bin``, and running
+    pytest as ``.venv/bin/python`` does not put it on PATH.
+    """
+    cuda_home = os.environ.get("CUDA_HOME")
+    nvcc = shutil.which("nvcc") or (cuda_home and (Path(cuda_home) / "bin/nvcc").exists())
+    return bool(nvcc and shutil.which("ninja"))
+
+
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and _GR00T.exists() and bool(_BACKBONE) and _REFERENCE.exists()),
-    reason="the full DT on the ragged kernels needs CUDA, the cached checkpoint and the reference",
+    not (
+        torch.cuda.is_available() and _GR00T.exists() and bool(_BACKBONE)
+        and _REFERENCE.exists() and _toolchain()
+    ),
+    reason=(
+        "the full DT on the ragged kernels needs CUDA, the cached checkpoint, the reference "
+        "and FlashInfer's build toolchain: "
+        "CUDA_HOME=$HOME/.local/cuda-home PATH=$HOME/mstar/.venv/bin:$CUDA_HOME/bin:$PATH "
+        "(see tools/setup/wsl/flashinfer_jit.sh)"
+    ),
 )
 
 _DEVICE = torch.device("cuda:0")
