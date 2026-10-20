@@ -162,6 +162,8 @@ class GlmReplyParser:
     Content is stripped at both ends, as the template strips it on the way back.
     ``forced_call`` says the prompt opened a call (a forced ``tool_choice``):
     the reply starts inside it, after the name if the prompt gave one.
+    ``single_call`` (``parallel_tool_calls: false``) ends the reply at the end
+    of its first call: ``done`` turns true, and what follows drops.
 
     A call streams as it is written: its id and name once the name ends (at
     the first ``<arg_key>`` or ``</tool_call>``), then its ``arguments`` JSON
@@ -175,8 +177,11 @@ class GlmReplyParser:
     the name ends, the call is text, as is a call to a function not offered.
     """
 
-    def __init__(self, *, thinking: bool, tools: dict[str, dict] | None, forced_call: str | None = None):
+    def __init__(self, *, thinking: bool, tools: dict[str, dict] | None, forced_call: str | None = None,
+                 single_call: bool = False):
         self._thinking = thinking
+        self._single_call = single_call
+        self.done = False
         self._state = "reasoning" if thinking else "content"
         self._tools = tools
         self._buf = ""
@@ -203,6 +208,8 @@ class GlmReplyParser:
         return "tool_calls" if self._calls and not self._cut else "stop"
 
     def feed(self, text: str) -> list[dict]:
+        if self.done:
+            return []
         self._buf += text
         return self._drain(final=False)
 
@@ -313,6 +320,9 @@ class GlmReplyParser:
                 self._close_value(out)  # the call closed it
             self._args(out, "}" if self._nargs else "{}")
             self._state = "content"
+            if self._single_call:
+                self.done, self._buf = True, ""
+                return False
         return True
 
     def _take(self, out: list[dict], text: str) -> None:

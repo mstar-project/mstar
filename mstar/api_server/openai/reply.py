@@ -147,13 +147,14 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     Bound to the submission when called: a stream's body is iterated later,
     by Starlette.
 
-    A stop string ends the reply where it starts, and the request stops in
-    the engine: closing the chunk iterator early aborts it. Usage counts every
-    token read until then, the stop's own included, as vLLM counts them. It
-    can count more: the tokens that arrived in one chunk with the stop's last
-    (up to k under MTP, k drafts a step), and those read while the parser
-    held the stop's end, when it may start a tag, or is the answer's trailing
-    whitespace (held until text follows it).
+    A stop string ends the reply where it starts, and a parser that is
+    ``done`` (one call, under ``parallel_tool_calls: false``) ends it too; the
+    request stops in the engine: closing the chunk iterator early aborts it.
+    Usage counts every token read until then, the stop's own included, as
+    vLLM counts them. It can count more: the tokens that arrived in one chunk
+    with the stop's last (up to k under MTP, k drafts a step), and those read
+    while the parser held the stop's end, when it may start a tag, or is the
+    answer's trailing whitespace (held until text follows it).
     """
     return _events(api.iter_result_chunk_batches(request_id), parser, stops)
 
@@ -177,6 +178,8 @@ async def _events(batches, parser, stops):
                     deltas = [{"content": piece}] if parser is None else parser.feed(piece)
                     if (stop := _passed(deltas, matcher, events)) is not None:
                         break
+                    if parser is not None and parser.done:
+                        break
                 elif c.modality == "error":
                     # The request failed after the stream opened (an engine error
                     # mid generation, a preprocess error). The error is the
@@ -191,7 +194,7 @@ async def _events(batches, parser, stops):
                         yield events
                         events = []
                     yield [Media(c.modality, c.data)]
-            if stop is not None:
+            if stop is not None or parser is not None and parser.done:
                 yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
                 return
             if events:

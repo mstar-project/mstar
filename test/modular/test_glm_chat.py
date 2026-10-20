@@ -132,6 +132,16 @@ def test_a_string_value_streams_with_a_partial_tag_held():
     assert p.feed("alue></tool_call>") == [{"tool_calls": [{"index": 0, "function": {"arguments": '"}'}}]}]
 
 
+def test_a_single_call_parser_is_done_at_the_end_of_its_call():
+    p = glm_chat.GlmReplyParser(thinking=True, tools=TOOLS, single_call=True)
+    deltas = p.feed("Plan</think>" + CALL[:-3])
+    assert not p.done
+    deltas += p.feed(CALL[-3:] + "\nMore text" + CALL)
+    assert p.done and p.feed("x") == [] and p.finish() == []
+    assert [c["function"]["name"] for c in _calls(deltas)] == ["get_weather"] and p.finish_reason == "tool_calls"
+    assert not any("content" in d for d in deltas)
+
+
 def test_two_calls_take_indices_and_drop_the_space_between():
     reasoning, content, calls, finish = _streamed("Plan</think>\n" + CALL + "\n" + CALL + "\n", 5)
     assert [c["index"] for c in calls] == [0, 1] and content == "" and finish == "tool_calls"
@@ -323,6 +333,8 @@ def test_tool_choice_none_leaves_the_tools_out(tmp_path):
     {"tools": [WEATHER], "tool_choice": {"type": "function", "name": "get_weather"}},
     {"tools": [WEATHER], "tool_choice": "required", "enable_thinking": True},
     {"reply_prefix": "<tool_call>get_weather"},
+    {"tools": [WEATHER], "parallel_tool_calls": "no"},
+    {"tools": [WEATHER], "parallel_tool_calls": 0},
     {"tools": [{"type": "function"}]},
     {"tools": "get_weather"},
     {"tools": [{"type": "function", "function": {"name": "f", "parameters": "{}"}}]},
@@ -590,12 +602,13 @@ def test_any_reply_parses_alike_in_any_chunking_and_whole_calls_are_json():
         deltas += p.finish()
         reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
         content = "".join(d.get("content", "") for d in deltas)
-        return reasoning, content, [c["function"] for c in _calls(deltas)], p.finish_reason
+        return reasoning, content, [c["function"] for c in _calls(deltas)], p.finish_reason, p.done
 
     rng = random.Random(0)
     for _ in range(1500):
         text = "".join(rng.choice(frags) for _ in range(rng.randint(0, 40)))
-        kw = {"thinking": rng.random() < 0.5, "forced_call": rng.choice([None, None, "", "f", "h"])}
+        kw = {"thinking": rng.random() < 0.5, "single_call": rng.random() < 0.3,
+              "forced_call": rng.choice([None, None, "", "f", "h"])}
         whole = run(text, max(1, len(text)), **kw)
         for size in (1, 2, 3, 7):
             assert run(text, size, **kw) == whole, (text, size, kw)

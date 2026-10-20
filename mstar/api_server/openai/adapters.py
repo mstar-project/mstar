@@ -1166,6 +1166,9 @@ class GlmChatAdapter(TextChatAdapter):
     as with thinking off, GLM-5.3's closes the empty ``<think>``, and an
     explicit ``enable_thinking`` with it is a 400.
 
+    ``parallel_tool_calls: false`` ends the reply, and the request, when its
+    first call ends.
+
     ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always reasons, and turning it
     off is a 400), ``reasoning_effort`` and ``clear_thinking`` reach the
     template, flat in ``extra_body`` or under ``chat_template_kwargs``; other
@@ -1199,11 +1202,14 @@ class GlmChatAdapter(TextChatAdapter):
         return args
 
     def make_output_parser(self, req: ChatCompletionRequest):
-        tools, template_kwargs, forced = self._options(_passthrough(req))
+        mk = _passthrough(req)
+        single_call = mk.get("parallel_tool_calls") is False
+        tools, template_kwargs, forced = self._options(mk)
         # truthiness, as the GLM-5.2 template reads it
         thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
         return glm_chat.GlmReplyParser(
             thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None, forced_call=forced,
+            single_call=single_call,
         )
 
     def _options(self, mk: dict) -> tuple[list | None, dict, str | None]:
@@ -1212,6 +1218,10 @@ class GlmChatAdapter(TextChatAdapter):
         the function's name, or ``""`` for the model to name one."""
         if "reply_prefix" in mk:
             raise ValueError("reply_prefix is not a request field; tool_choice sets it")
+        # false ends the reply at its first call (the parser's single_call); read, not sent on
+        parallel = mk.pop("parallel_tool_calls", None)
+        if parallel is not None and not isinstance(parallel, bool):
+            raise ValueError(f"parallel_tool_calls must be a boolean, got {parallel!r}")
         tools = mk.pop("tools", None) or None
         choice = mk.pop("tool_choice", None)
         names = list(glm_chat.tool_parameters(tools)) if tools is not None else []
