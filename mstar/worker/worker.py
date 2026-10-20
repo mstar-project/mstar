@@ -3180,7 +3180,7 @@ class Worker:
             # stopping one would finalize state the drop just removed
             for rid in failed:
                 stops.pop(rid, None)
-            if not batch_N.node_batch.request_ids:
+            if not batch_N.node_batch.request_ids and not batch_N.node_batch.cached_rids:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 return
