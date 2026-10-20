@@ -1,0 +1,26 @@
+# Qwen3-TTS-12Hz-1.7B-CustomVoice with the Codec on a second worker that
+# shares GPU 0 (rank_devices), decoding in bf16: the Talker's decode steps
+# never wait for codec windows, and the codec runs about twice as fast as in
+# float32 (which matches the reference decoder bit for bit). Whisper WER stays
+# inside the reference's range. The recommended deployment on AMD GPUs; see
+# the Qwen3-TTS section of docs/models.rst.
+model: "qwen3_tts_1p7b"
+max_seq_len: 32768
+model_kwargs:
+  codec_dtype: bfloat16
+resources:
+  talker_attn:
+    flashinfer_backend: fa2
+  # Two workers share the GPU: cap the KV pool at 1024 pages x 128 tokens
+  # (16 GB; 32 concurrent requests of a few hundred tokens use ~300 pages)
+  # so the Talker's weights, graphs and pool fit next to the codec worker's.
+  talker_kv:
+    max_num_pages: 1024
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_decode]
+  - node_names: [Codec]
+    ranks: [1]
+    graph_walks: [codec_chunk]
+rank_devices: {1: 0}
