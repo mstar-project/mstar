@@ -1844,27 +1844,36 @@ class Worker:
             )
             return None
 
-        # prefer evicting requests that aren't currently executing
+        # prefer evicting requests that aren't currently executing. A victim
+        # that frees nothing refuses for reasons of its own (its streams don't
+        # fit what is left of the host pool, or a step is admitted against its
+        # pages) and nothing about it changes before the retry, so try the next
+        # one instead of re-picking it every time
         external = [rid for rid in candidates if rid not in batch_ids]
-        victim_id = self._select_eviction_victim(node_name, graph_walk, external or candidates)
-        freed = engine.offload_request(node_name, victim_id)
-        if freed <= 0:
-            # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.place``) - different
-            # from having no candidate, and fixed by a larger
-            # ``cpu_offload_pages`` rather than by scheduling less.
-            logger.warning(
-                "Eviction victim %s on %s freed nothing — the host pool is "
-                "most likely full. Raise cpu_offload_pages for the resource "
-                "that ran out.", victim_id, node_name,
-            )
-            return None
-        logger.info(
-            "Offloaded request %s from %s (%d reclaimed, policy=%s, in_batch=%s)",
-            victim_id, node_name, freed, self.eviction_policy.value,
-            victim_id in batch_ids,
+        internal = [rid for rid in candidates if rid in batch_ids]
+        for group in (external, internal):
+            while group:
+                victim_id = self._select_eviction_victim(node_name, graph_walk, group)
+                group.remove(victim_id)
+                freed = engine.offload_request(node_name, victim_id)
+                if freed > 0:
+                    logger.info(
+                        "Offloaded request %s from %s (%d reclaimed, policy=%s, "
+                        "in_batch=%s)",
+                        victim_id, node_name, freed, self.eviction_policy.value,
+                        victim_id in batch_ids,
+                    )
+                    return victim_id
+
+        # Every candidate refused. The usual cause is the host pool being full
+        # (see ``CPUPagePool.place``) - different from having no candidate, and
+        # fixed by a larger ``cpu_offload_pages`` rather than by scheduling less.
+        logger.warning(
+            "None of the %d eviction candidates on %s freed anything — the "
+            "host pool is most likely full. Raise cpu_offload_pages for the "
+            "resource that ran out.", len(candidates), node_name,
         )
-        return victim_id
+        return None
 
     def _select_eviction_victim(
         self, node_name: str, graph_walk: str, candidates: list[int],
