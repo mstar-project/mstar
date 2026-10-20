@@ -8,6 +8,7 @@ device.
 from __future__ import annotations
 
 import threading
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -40,6 +41,7 @@ class PlatformDispatch:
         self._default = default
         self._impl: Callable[..., Any] | None = None
         self._lock = threading.Lock()
+        _instances.add(self)
 
     def __call__(self, *args, **kwargs):
         impl = self._impl
@@ -59,6 +61,13 @@ class PlatformDispatch:
                 self._impl = factory()
             return self._impl
 
+    @staticmethod
+    def reset_all() -> None:
+        """Drop every instance's cached implementation, for tests that switch
+        the platform."""
+        for dispatch in list(_instances):
+            dispatch.reset()
+
     def reset(self) -> None:
         """Drop the cached implementation so the next call picks again."""
         with self._lock:
@@ -66,3 +75,6 @@ class PlatformDispatch:
 
     def __repr__(self) -> str:
         return f"PlatformDispatch({self.name!r})"
+
+
+_instances: weakref.WeakSet[PlatformDispatch] = weakref.WeakSet()
