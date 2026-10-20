@@ -302,6 +302,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     server.recently_completed = collections.OrderedDict()
     server._recently_completed_ttl = 3600.0
     server.log_stats = False
+    server.metrics = None
     server.enable_nvtx = False
     server.preprocess_worker = worker
     req = PendingRequest(streaming=False, input_modalities=["text", "image", "text"],

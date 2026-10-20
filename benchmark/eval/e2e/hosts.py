@@ -4,7 +4,8 @@ A slot is one GPU that serves one model at a time (both arms, back to back). Slo
 shared queue, longest first, so an idle slot always takes whatever is still queued; a flagged model's ABBA rerun
 goes to the front. A slot whose host stops answering is retired and its model requeued for the others.
 
-``--hosts user@a,user@b:1`` names SSH targets (``:N`` picks GPU N, default 0; repeat a host for more GPUs). Hosts
+``--hosts user@a,user@b:1`` names SSH targets (``:N`` picks GPU N, default 0; ``:0-7`` GPUs 0 to 7; repeat a host
+for more GPUs). A model that needs N GPUs (``gpus`` in cases.yaml) runs on N slots of one host at once. Hosts
 need key-based ``ssh`` and ``rsync``, an M* Python environment (``--host-python``), and the Hugging Face Hub (with
 a login for gated repos) or a warm cache. Machines that must be started first (cloud VMs) are a launcher's job, not
 ``compare``'s: implement ``HostProvider`` and pass ``--host-provider module:factory``; ``factory(args)`` returns
@@ -18,7 +19,7 @@ import shlex
 import subprocess
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -110,21 +111,73 @@ class Slot:
     host_dir: str = ""           # absolute work directory on the host, set by compare's setup
     gpu_name: str = ""
     ready: bool = False
+    devices: list[int] = field(default_factory=list)   # every GPU of the job it runs (its own first); set by run_slots
 
     @property
     def name(self) -> str:
         return f"{self.transport.name}:{self.gpu if self.gpu is not None else 'all'}"
 
 
+class GpuBook:
+    """Which GPUs of each host are free. A model that needs N GPUs runs on N GPU slots of one host at once: the slot
+    that takes it borrows N - 1 idle siblings, which take no work of their own until it is done."""
+
+    def __init__(self, slots: list[Slot]):
+        self.lock = threading.Lock()
+        self.free: dict[str, set[int]] = {}
+        self.size: dict[str, int] = {}
+        for s in slots:
+            if s.gpu is not None:
+                self.free.setdefault(s.transport.name, set()).add(s.gpu)
+                self.size[s.transport.name] = self.size.get(s.transport.name, 0) + 1
+
+    def largest(self) -> int:
+        return max(self.size.values(), default=1)
+
+    def claim(self, slot: Slot, need: int) -> bool | None:
+        """Reserve the slot's own GPU and ``need - 1`` free siblings (lowest index first) into ``slot.devices``.
+        True: reserved; None: not now (the slot's GPU is lent to a sibling's job, or too few are free yet);
+        False: never on this host (it has fewer than ``need`` GPUs)."""
+        if slot.gpu is None:   # a slot that is the whole machine
+            if need > 1:
+                return False
+            slot.devices = []
+            return True
+        with self.lock:
+            host = slot.transport.name
+            free = self.free.get(host, set())
+            if need > self.size.get(host, 0):
+                return False
+            if slot.gpu not in free or len(free) < need:
+                return None
+            slot.devices = [slot.gpu] + sorted(free - {slot.gpu})[:need - 1]
+            free.difference_update(slot.devices)
+            return True
+
+    def give(self, slot: Slot) -> None:
+        with self.lock:
+            if slot.transport.name in self.free:
+                self.free[slot.transport.name].update(slot.devices)
+            slot.devices = []
+
+    def retire(self, host: str) -> None:
+        with self.lock:
+            self.free.pop(host, None)
+            self.size.pop(host, None)
+
+
 def parse_hosts(spec: str) -> list[tuple[str, int]]:
-    """``user@a,user@b:1`` -> [("user@a", 0), ("user@b", 1)]."""
+    """``user@a,user@b:1,user@c:0-3`` -> [("user@a", 0), ("user@b", 1), ("user@c", 0), ..., ("user@c", 3)]."""
     out = []
     for term in (t.strip() for t in spec.split(",")):
         if not term:
             continue
         host, sep, gpu = term.rpartition(":")
+        lo, dash, hi = gpu.partition("-")
         if sep and gpu.isdigit():
             out.append((host, int(gpu)))
+        elif sep and dash and lo.isdigit() and hi.isdigit() and int(lo) <= int(hi):
+            out += [(host, g) for g in range(int(lo), int(hi) + 1)]
         else:
             out.append((term, 0))
     if len(set(out)) != len(out):
@@ -172,19 +225,33 @@ class WorkQueue:
         self.attempts: dict[str, int] = {}
         self.stopped = False
 
-    def take(self, live_slots: Callable[[], int]) -> str | None:
-        """The next model, waiting while other slots run jobs that may queue a rerun; None when all is done."""
+    def take(self, live_slots: Callable[[], int], claim: Callable[[str], bool | None] | None = None) -> str | None:
+        """The next model, waiting while other slots run jobs that may queue a rerun; None when all is done.
+
+        ``claim(name)`` reserves what the model needs (its GPUs) under the queue's lock: True takes it, False skips
+        it for a later item (it never fits this slot), None waits (it fits once running jobs give GPUs back), so a
+        multi-GPU model at the front is not starved by smaller ones behind it."""
         with self.cv:
             while True:
                 if self.stopped:
                     return None
-                if self.items:
-                    name = self.items.pop(0)
-                    self.running.add(name)
-                    return name
+                waiting = False
+                for name in list(self.items):
+                    ok = True if claim is None else claim(name)
+                    if ok:
+                        self.items.remove(name)
+                        self.running.add(name)
+                        return name
+                    if ok is None:
+                        waiting = True
+                        break
                 if not self.running or live_slots() == 0:
-                    return None
-                self.cv.wait(timeout=5)
+                    return None   # nothing runs that could free GPUs or queue a rerun: what is left never fits here
+                self.cv.wait(timeout=5 if not waiting else 1)
+
+    def notify(self) -> None:
+        with self.cv:
+            self.cv.notify_all()
 
     def finish(self, name: str, rerun: str | None = None) -> None:
         with self.cv:
@@ -226,13 +293,16 @@ def run_slots(slots: list[Slot], queue: WorkQueue, run_one: Callable[[Slot, str]
               on_lost: Callable[[Slot, str, Exception], None] = lambda s, n, e: None,
               on_error: Callable[[Slot, str, Exception], None] = lambda s, n, e: None,
               on_given_up: Callable[[str], None] = lambda n: None,
-              stop: threading.Event | None = None) -> dict[str, list[str]]:
+              stop: threading.Event | None = None,
+              need: Callable[[str], int] = lambda n: 1) -> dict[str, list[str]]:
     """One thread per slot pulling from ``queue``. ``run_one(slot, model)`` returns the name of a rerun to queue
     (or None) and raises HostLostError when the slot's host is gone; any other exception is that model's error and the
-    slot carries on. Returns {slot name: models it finished}."""
+    slot carries on. ``need(model)`` is how many GPUs of one host the model takes (``slot.devices`` during its job).
+    Returns {slot name: models it finished}."""
     live = {s.name for s in slots}
     lock = threading.Lock()
     finished: dict[str, list[str]] = {s.name: [] for s in slots}
+    book = GpuBook(slots)
 
     def n_live() -> int:
         with lock:
@@ -254,10 +324,11 @@ def run_slots(slots: list[Slot], queue: WorkQueue, run_one: Callable[[Slot, str]
 
     def work(slot: Slot) -> None:
         while True:
-            name = queue.take(n_live)
+            name = queue.take(n_live, lambda n: book.claim(slot, need(n)))
             if name is None:
                 break
             if slot.transport.name in dead_hosts:   # another GPU of this host lost it: leave the model to others
+                book.give(slot)
                 queue.give_back(name)
                 return
             try:
@@ -266,14 +337,17 @@ def run_slots(slots: list[Slot], queue: WorkQueue, run_one: Callable[[Slot, str]
                 with lock:   # every GPU slot of that host retires, so a retry lands on another host
                     dead_hosts.add(slot.transport.name)
                     live.difference_update(s.name for s in slots if s.transport.name == slot.transport.name)
+                book.retire(slot.transport.name)
                 on_lost(slot, name, e)
                 if not queue.requeue(name):
                     on_given_up(name)
                 return
             except Exception as e:  # noqa: BLE001 - one model's failure must not stop the slot
+                book.give(slot)
                 queue.finish(name)
                 on_error(slot, name, e)
                 continue
+            book.give(slot)   # before finish(), whose notify wakes slots waiting for these GPUs
             finished[slot.name].append(name)
             queue.finish(name, rerun)
 
