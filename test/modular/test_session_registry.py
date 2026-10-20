@@ -504,6 +504,23 @@ def test_a_tombstone_that_is_never_acked_releases_its_id():
     assert reg.snapshot() == []
 
 
+
+def test_a_running_end_session_request_is_not_torn_down_by_the_sweep():
+    reg, clock, torn_down = _registry()
+    _start(reg, request_id="r0", session_id="s")
+    reg.finish_request("r0")
+    _resume(reg, "s", "r1", end_session=True)
+    reg.note_ending("s")
+
+    clock.advance(2 * reg._tombstone_grace_s + 1)
+    reg.sweep()
+    assert torn_down == []
+    assert reg.describe("s")["active_request_ids"] == ["r1"]
+
+    clock.advance(2 * reg._tombstone_grace_s + 1)
+    reg.sweep()
+    assert reg.describe("s") is not None, "id released under a running request"
+
 def test_a_failed_end_session_request_still_asks_once():
     reg, _, torn_down = _registry()
     _start(reg, request_id="r0", session_id="s")

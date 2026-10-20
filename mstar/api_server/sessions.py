@@ -400,6 +400,9 @@ class SessionRegistry:
         with self._lock:
             for record in list(self._sessions.values()):
                 if record.closing:
+                    if record.active_request_ids:
+                        # its last request is still running; it asks on its own
+                        continue
                     since = record.closing_since
                     if since is None or now - since <= self._tombstone_grace_s:
                         continue
