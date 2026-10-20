@@ -21,6 +21,7 @@ import torch
 import torchaudio
 import yaml
 
+from mstar.model.components import media_io as model_media
 from mstar.model.omnilingual_asr import audio
 from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC, attention_mask
 from mstar.model.omnilingual_asr.config import (
@@ -795,6 +796,12 @@ def route(tiny_model, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "soundfile", None)
     monkeypatch.setitem(sys.modules, "torchcodec", None)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    # nor PyAV, which media_io decodes with where torchcodec does not load
+    monkeypatch.setitem(sys.modules, "av", None)
+    monkeypatch.setattr(
+        model_media, "_decoders",
+        lambda: model_media._Decoders(model_media._FallbackAudio(), model_media._PyAVVideo()),
+    )
     from mstar.api_server.openai.router import router
 
     app = FastAPI()
@@ -848,7 +855,7 @@ def test_transcription_route_end_to_end(route, tiny_model, tmp_path):
 
 
 def test_transcription_route_rejects_an_over_cap_clip_it_cannot_window(route):
-    # without soundfile/torchcodec the route cannot read the duration to window
+    # without soundfile, torchcodec or PyAV the route cannot read the duration to window
     # the upload, so the model sees all 41 s and refuses it rather than cutting it
     client, api = route
     r = client.post(
