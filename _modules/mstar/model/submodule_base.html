@@ -1988,6 +1988,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">outputs</span><span class="p">:</span> <span class="n">BatchedModelOutput</span><span class="p">,</span>
         <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+        <span class="n">piecewise_runners</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseAcceleratorGraphRunner</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Once per step, for work that batches across the step's requests</span>
 <span class="sd">        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on</span>
@@ -1996,7 +1997,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        every request's ``postprocess``, for the requests whose</span>
 <span class="sd">        ``postprocess`` succeeded (``request_infos``' keys, in the order of</span>
 <span class="sd">        ``inputs``); a raise then fails every one of them. Optional; only</span>
-<span class="sd">        called when overridden."""</span></div>
+<span class="sd">        called when overridden.</span>
+
+<span class="sd">        ``piecewise_runners`` are this node's captured regions</span>
+<span class="sd">        (``get_piecewise_accelerator_graph_configs``), as ``engine_inputs`` hands</span>
+<span class="sd">        them to the forward, so this work can replay a capture too."""</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.check_stop">

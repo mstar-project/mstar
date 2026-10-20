@@ -642,7 +642,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.apply()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply_pcm16"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.apply_pcm16()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.build"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.cache_size"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.cache_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.capture_label"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.capture_label()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.offline"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.offline()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.piecewise_configs"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.piecewise_configs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioWatermarkConfig"><code class="docutils literal notranslate"><span class="pre">AudioWatermarkConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -700,9 +703,11 @@ AudioSeal 0.2.0’s <code class="docutils literal notranslate"><span class="pre"
 state propagation walks <code class="docutils literal notranslate"><span class="pre">named_children()</span></code> and stops at the
 <code class="docutils literal notranslate"><span class="pre">nn.Sequential</span></code> holding the layers, so no conv caches anything and every
 chunk is watermarked as if it began the stream (upstream issue #105). This
-module keeps each request’s stream state itself, as plain tensors, and
-installs it in the generator’s streaming layers around each call. That also
-lets requests at the same point share one batched call.</p>
+module keeps each request’s stream state itself, as one flat row of tensors,
+and runs the generator’s layers as a function of it: the same ops AudioSeal’s
+streaming layers run, with the state passed in and out. That lets requests
+at the same point share one batched call, and lets the engine capture that
+call per (batch, chunk length) bucket.</p>
 <p>The generator works on whole 320-sample frames (its total stride). A chunk
 that is not a whole number of frames leaves its tail pending until the next
 chunk, or until the final chunk zero-pads it, so streamed output equals the
@@ -734,7 +739,7 @@ samples per codec frame) never hold anything back and never pad.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs.audio_watermark</span></code>: per deployment, off by default.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.audio_watermark.WatermarkStream" title="mstar.model.audio_watermark.WatermarkStream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WatermarkStream</span></code></a>([caches, pending, finished])</p></td>
-<td><p>One request's watermark state: the generator's layer caches (batch 1) and the samples of a partial frame not yet watermarked.</p></td>
+<td><p>One request's watermark state: the generator's layer caches as one flat row (<code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.cache_size</span></code> floats) and the samples of a partial frame not yet watermarked.</p></td>
 </tr>
 </tbody>
 </table>
@@ -791,6 +796,12 @@ added at, so other rates are resampled to <code class="docutils literal notransl
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.audio_watermark.</span></span><span class="sig-name descname"><span class="pre">AudioSealWatermarker</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">generator</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_compile</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>AudioSeal generator plus per-request streaming, on one device.</p>
+<p>The generator runs as a plain function of the audio and every stream’s
+caches (<code class="docutils literal notranslate"><span class="pre">_mark</span></code>): the same convolutions, LSTM and adds AudioSeal’s
+streaming layers would run, with each layer’s state passed in and out
+instead of kept on the module. Its shapes depend on the batch and chunk
+length only, so the engine can capture it per (batch, length) bucket
+(<code class="docutils literal notranslate"><span class="pre">piecewise_configs</span></code>) and <code class="docutils literal notranslate"><span class="pre">apply_pcm16</span></code> replays those captures.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -823,14 +834,23 @@ Streams at the same frame count run as one batch.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.audio_watermark.AudioSealWatermarker.apply_pcm16">
-<span class="sig-name descname"><span class="pre">apply_pcm16</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">streams</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">finals</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker.apply_pcm16"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply_pcm16" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">apply_pcm16</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">streams</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">finals</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">runners</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker.apply_pcm16"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply_pcm16" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">apply</span></code> for PCM16 chunks, quantized back the way the codecs do.</p>
+<p>Chunks of whole frames with nothing pending (every Qwen3-TTS chunk)
+run as one call per length, the conversion to float and back
+included; with <code class="docutils literal notranslate"><span class="pre">runners</span></code> (the engine’s captures of
+<code class="docutils literal notranslate"><span class="pre">piecewise_configs</span></code>) a call whose length was captured replays it,
+and a final chunk is zero-padded to the next captured length (the
+generator is causal and the stream’s caches are dropped, so its
+samples change by float rounding only). Anything else goes through
+<code class="docutils literal notranslate"><span class="pre">apply</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>chunks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
 <li><p><strong>streams</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.audio_watermark.WatermarkStream" title="mstar.model.audio_watermark.WatermarkStream"><em>WatermarkStream</em></a><em>]</em>)</p></li>
 <li><p><strong>finals</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>runners</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -855,6 +875,25 @@ Streams at the same frame count run as one batch.</p>
 </dl>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.audio_watermark.AudioSealWatermarker.cache_size">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">cache_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.cache_size" title="Link to this definition">#</a></dt>
+<dd><p>Floats of state per stream.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.audio_watermark.AudioSealWatermarker.capture_label">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">capture_label</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">samples</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker.capture_label"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.capture_label" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.audio_watermark.AudioSealWatermarker.offline">
 <span class="sig-name descname"><span class="pre">offline</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker.offline"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.offline" title="Link to this definition">#</a></dt>
@@ -866,6 +905,26 @@ stream must equal. Zero-pads to whole frames like a final chunk.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.audio_watermark.AudioSealWatermarker.piecewise_configs">
+<span class="sig-name descname"><span class="pre">piecewise_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_sizes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#AudioSealWatermarker.piecewise_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.AudioSealWatermarker.piecewise_configs" title="Link to this definition">#</a></dt>
+<dd><p>One <code class="docutils literal notranslate"><span class="pre">PiecewiseBatchedConfig</span></code> per chunk length (samples, whole
+frames), for <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs</span></code>: the
+engine captures <code class="docutils literal notranslate"><span class="pre">_mark_pcm16</span></code> per (batch, length) bucket, with the
+PCM rows and the streams’ caches as static inputs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>lengths</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>batch_sizes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -937,12 +996,13 @@ stream must equal. Zero-pads to whole frames like a final chunk.</p>
 <dt class="sig sig-object py" id="mstar.model.audio_watermark.WatermarkStream">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.audio_watermark.</span></span><span class="sig-name descname"><span class="pre">WatermarkStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">caches</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pending</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">finished</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/audio_watermark.html#WatermarkStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.audio_watermark.WatermarkStream" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>One request’s watermark state: the generator’s layer caches (batch 1)
-and the samples of a partial frame not yet watermarked.</p>
+<p>One request’s watermark state: the generator’s layer caches as one
+flat row (<code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.cache_size</span></code> floats) and the samples of
+a partial frame not yet watermarked.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>caches</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>caches</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>pending</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>finished</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
@@ -950,7 +1010,7 @@ and the samples of a partial frame not yet watermarked.</p>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.audio_watermark.WatermarkStream.caches">
-<span class="sig-name descname"><span class="pre">caches</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.audio_watermark.WatermarkStream.caches" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">caches</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.audio_watermark.WatermarkStream.caches" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1028,7 +1088,10 @@ and the samples of a partial frame not yet watermarked.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.apply()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.apply_pcm16"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.apply_pcm16()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.build"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.cache_size"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.cache_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.capture_label"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.capture_label()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.offline"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.offline()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioSealWatermarker.piecewise_configs"><code class="docutils literal notranslate"><span class="pre">AudioSealWatermarker.piecewise_configs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.audio_watermark.AudioWatermarkConfig"><code class="docutils literal notranslate"><span class="pre">AudioWatermarkConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
