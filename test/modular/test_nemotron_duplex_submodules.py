@@ -32,7 +32,6 @@ from mstar.model.nemotron_duplex.config import (
 )
 from mstar.model.nemotron_duplex.submodules import (
     NO_PROMPT,
-    AudioCodecDecoderSubmodule,
     ConformerEncoderSubmodule,
     NemotronHLLMSubmodule,
 )
@@ -673,23 +672,17 @@ def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
         assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
 
 
-def test_encoder_and_codec_take_no_batch_wider_than_their_graphs():
-    """Their graphs are piecewise regions, which the engine's batch cap does not
-    see: a wider step would run every call eagerly, so each node caps its batch
+def test_encoder_takes_no_batch_wider_than_its_graphs():
+    """Its graphs are piecewise regions, which the engine's batch cap does not
+    see: a wider step would run every call eagerly, so the node caps its batch
     at its widest capture and the scheduler splits the rest."""
     from mstar.engine.engine import Engine
 
-    nodes = {
-        "conformer_encoder": ConformerEncoderSubmodule(nn.Identity(), nn.Identity(), nn.Identity(),
-                                                       config=NemotronDuplexConfig()),
-        "audio_codec": AudioCodecDecoderSubmodule(codec=nn.Identity(), config=NemotronDuplexConfig()),
-    }
+    node = ConformerEncoderSubmodule(nn.Identity(), nn.Identity(), nn.Identity(), config=NemotronDuplexConfig())
     engine = Engine.__new__(Engine)
-    engine._submodules = {name: SimpleNamespace(submodule=node, accelerator_graph_runner=None,
-                                                capture_runner=None)
-                          for name, node in nodes.items()}
-    for (name, node), walk in zip(nodes.items(), ("encode", "codec_chunk"), strict=True):
-        assert engine.get_max_batch_size(name, walk) == max(node.CAPTURE_BATCH_SIZES), name
+    engine._submodules = {"conformer_encoder": SimpleNamespace(submodule=node, accelerator_graph_runner=None,
+                                                               capture_runner=None)}
+    assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.CAPTURE_BATCH_SIZES)
 
 
 @pytest.mark.parametrize("n_fft", [512, 1024])

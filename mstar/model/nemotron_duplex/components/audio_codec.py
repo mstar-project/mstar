@@ -318,6 +318,11 @@ class AudioCodec(nn.Module):
         self.max_magnitude = cfg.max_magnitude
         # on the host: the model builds the codec under torch.device("meta")
         check_window_envelope(torch.hann_window(cfg.n_fft, device="cpu"), cfg.hop_length)
+        if (cfg.n_fft - cfg.hop_length) % 2:
+            # the stream trims half the overlap at each end, as the full decode does
+            raise ValueError(
+                f"the codec's stream needs an even overlap; n_fft {cfg.n_fft} - hop {cfg.hop_length} is odd"
+            )
 
     # ---- autoencoder halves -------------------------------------------------
     def ae_encode(self, x: torch.Tensor) -> torch.Tensor:

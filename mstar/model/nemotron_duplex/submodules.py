@@ -7,15 +7,15 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
     nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
                        nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
-    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -> 31 RVQ codes per frame; two KV
-                       talker_pos                 labels per session (cond / uncond) in one plan
-    audio_codec        codec_state               RVQ codes -> 22.05 kHz PCM, one frame a step; per
-                                                 session, its decoder's stream state
+    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -> 31 RVQ codes per frame (two KV
+                       talker_pos, codec_state    labels per session, cond / uncond, in one plan),
+                                                  decoded in the same step to 80 ms of 22.05 kHz
+                                                  PCM against the call's codec stream state
 
 Both autoregressive nodes keep their whole state in engine resources and capture
-their decode step as a CUDA graph. The encoder keeps a call's state in its two
-pools, and a live step (or its layer stack) replays a piecewise CUDA graph; the
-codec replays one for its per-frame decode.
+their decode step as a CUDA graph (the talker's with its codec decode). The
+encoder keeps a call's state in its two pools, and a live step (or its layer
+stack) replays a piecewise CUDA graph.
 """
 from __future__ import annotations
 
@@ -728,6 +728,13 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     own seeded generator, in ``preprocess`` -- so a session's speech does not
     depend on its batch mates and the whole step is a CUDA graph replay for
     all-decode batches.
+
+    The same step decodes each session's new codes to its 80 ms of PCM
+    (``codec_step``): the codec is causal, so the call's decoder stream state in
+    ``CODEC_STATE`` is all a frame needs, and a frame's audio leaves with the
+    step that made its codes. A call's PCM equals the full decode of its frames:
+    its first frame drops the overlap-add's trimmed left edge, and its last step
+    emits the right edge (``postprocess``).
     """
 
     disable_torch_compile = True
@@ -738,10 +745,11 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     SPEAKER = "Aria"
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
-    def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
+    def __init__(self, talker: nn.Module, config: NemotronDuplexConfig, codec: AudioCodec,
                  subword_to_char: dict | None = None, char_pad_idx: int | None = None):
         super().__init__()
         self.talker = talker
+        self.codec = codec
         self.config = config
         self._s2c = subword_to_char
         self._char_pad = char_pad_idx
@@ -823,8 +831,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
         first = self._is_first_step(fwd_info.rid_handle)
         span = self.warmup_len + 1 if first else 1
+        final = bool(is_final_stream_chunk)
         return ARNodeInputs(input_ids=tok, input_seq_len=span,
-                            kwargs={"first": first, "ends_loop": bool(is_final_stream_chunk) and not chunk})
+                            kwargs={"first": first, "final": final, "ends_loop": final and not chunk})
 
     def declare_step(
         self,
@@ -851,6 +860,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
                 TALKER_KV: KVStep(combined_labels={("main", "uncond"): TALKER_CFG_LABEL}),
                 TALKER_ATTN: AttentionStep(causal=True),
                 TALKER_POS: PositionStep(),
+                # one decoded frame per session, a slot each
+                CODEC_STATE: RecurrentStep(segments=tuple(
+                    Segment(request_id=rid, label="main", span=1) for rid in request_ids)),
             },
         )
 
@@ -925,24 +937,46 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
             noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
         ).squeeze(1)                                                      # [N, Q]
-        # One copy out of the graph for the batch, a [1, Q] view per request.
-        # Nothing for check_stop, the stream's end stops the loop.
-        return BatchedModelOutput(row_outputs={"codec_tokens": codes}, check_stop_buffers={})
+        pool = engine_inputs.resources[CODEC_STATE]
+        audio = codec_step(self.codec, pool, pool.addressing("main"), codes.unsqueeze(1))
+        # One copy out of the graph per name, a row view per request. Nothing
+        # for check_stop, the stream's end stops the loop.
+        return BatchedModelOutput(row_outputs={
+            "codec_tokens": codes,                                        # the next frame's prev_codes
+            "audio_chunk": pcm16(audio.final),                            # [N, wav_to_token_ratio]
+            # a call's last samples, had it ended before / after this frame
+            "audio_end": pcm16(torch.cat([audio.end_before, audio.end_after], dim=1)),
+        }, check_stop_buffers={})
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
         return _first_row(self.forward_batched(graph_walk, engine_inputs, **kwargs))
 
     def postprocess(self, request_id, request_info, outputs, **kwargs):
         inputs = kwargs.get("inputs")
-        if inputs is not None and inputs.kwargs.get("ends_loop"):
-            # one audio frame per text token, as offline: the codec flushes on
-            # the empty final chunk this leaves
+        flags = inputs.kwargs if inputs is not None else {}
+        if flags.get("ends_loop"):
+            # The empty final chunk's PAD frame only ends the loop (one audio
+            # frame per text token, as offline): it emits the call's right
+            # edge as it stood before this frame, or nothing for a call that
+            # never had a frame.
+            end = outputs.get("audio_end")
             outputs.clear()
+            if end and not flags.get("first"):
+                outputs["audio_chunk"] = [end[0][..., :self.codec.stream_edge]]
             return
         # This frame's codes are the next frame's ``prev_codes`` (metadata only:
         # the tensor is already a copy out of the graph's output buffer).
         if "codec_tokens" in outputs:
             self.request_state(request_id).add(self.PREV_CODES_KEY, outputs["codec_tokens"][0])
+        if "audio_chunk" in outputs and (flags.get("first") or flags.get("final")):
+            # the full decode trims the overlap-add's left edge, and ends on the
+            # samples after the last frame's final ones
+            pcm, edge = outputs["audio_chunk"][0], self.codec.stream_edge
+            if flags.get("first"):
+                pcm = pcm[..., edge:]
+            if flags.get("final"):
+                pcm = torch.cat([pcm, outputs["audio_end"][0][..., edge:]], dim=-1)
+            outputs["audio_chunk"] = [pcm]
 
 
 def codec_step(codec: AudioCodec, pool, rows, codes: torch.Tensor) -> CodecStreamAudio:
@@ -968,143 +1002,3 @@ def codec_step(codec: AudioCodec, pool, rows, codes: torch.Tensor) -> CodecStrea
 
 def pcm16(wav: torch.Tensor) -> torch.Tensor:
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)
-
-
-class AudioCodecDecoderSubmodule(NodeSubmodule):
-    """RVQ codec decoder: talker codes -> 22.05 kHz int16 PCM, one frame a step.
-
-    The decoder is causal, so a call's stream state (``CODEC_STATE``: each
-    ConvNeXt block's last 6 inputs and the inverse STFT's overlap, see
-    ``codec_step``) is all a frame needs: a step decodes only its new frame and
-    the stream equals the full decode of the call's frames. A step's samples
-    are final except the window's last ``stream_edge``, which a call's empty
-    final chunk emits (the full decode's right edge). A step of calls with a
-    frame each replays the ``DECODE_REGION`` graph.
-    """
-
-    # No autocast: the codec runs in the dtype it was loaded in (the engine's).
-    disable_torch_compile = True
-    disable_autocast = True
-
-    DECODE_REGION = "codec_decode"
-    CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
-
-    STARTED_KEY = "codec_started"        # the call has decoded a frame, so it holds a slot
-    END_KEY = "codec_end"                # the stream's last samples had it ended after the last step, int16
-
-    def __init__(self, codec: nn.Module, config: NemotronDuplexConfig):
-        super().__init__()
-        self.codec = codec
-        self.config = config
-
-    def prepare_inputs(
-        self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs,
-    ) -> NodeInputs | None:
-        # ``codec_tokens`` is this chunk's one new frame (a [1, num_q] talker row)
-        flush = bool(is_final_stream_chunk)
-        started = bool(self.request_state(fwd_info.rid_handle).get(self.STARTED_KEY)) if fwd_info else False
-        chunk = inputs.get("codec_tokens")
-        if not chunk:
-            # an empty final chunk emits the held edge; skipping it hangs a batched stream
-            return NodeInputs(kwargs={"flush": True, "started": started}) if flush else None
-        codes = chunk[0].reshape(-1, chunk[0].shape[-1])                # (T_new, num_q)
-        return NodeInputs(tensor_inputs={"codes": codes}, kwargs={"flush": flush, "started": started},
-                          input_seq_len=codes.shape[0])
-
-    def preprocess(self, graph_walk, engine_inputs, inputs):
-        return {
-            "codes": [inp.tensor_inputs.get("codes") for inp in inputs],
-            "flush": [inp.kwargs.get("flush", False) for inp in inputs],
-        }
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return True
-
-    def max_batch_size(self, graph_walk: str) -> int:
-        # as the encoder's: the region's widest capture, which the engine's cap does not see
-        return self.CAPTURE_BATCH_SIZES[-1]
-
-    @staticmethod
-    def _declare(request_ids, spans) -> SubmoduleStep:
-        return SubmoduleStep(steps={CODEC_STATE: RecurrentStep(segments=tuple(
-            Segment(request_id=rid, label="main", span=span) for rid, span in zip(request_ids, spans, strict=True)
-        ))})
-
-    def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
-                     **kwargs) -> SubmoduleStep | None:
-        # Calls that already hold a slot leave the pool to the region, which
-        # declares its own rows. A call's first frame reserves its slot here, so
-        # a full pool is backpressure on admit, not an error in the region.
-        decoding = [inp for inp in inputs if "codes" in inp.tensor_inputs]
-        if self.DECODE_REGION in (piecewise_leases or {}) and all(inp.kwargs["started"] for inp in decoding):
-            return None
-        return self._declare(request_ids, [inp.input_seq_len for inp in inputs])
-
-    def get_piecewise_accelerator_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
-    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        del autocast_dtype, tp_world_size
-        num_q = self.config.eartts.num_quantizers
-
-        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
-            return {"codes": torch.zeros(shape.bs, 1, num_q, dtype=torch.long, device=device)}
-
-        return {
-            self.DECODE_REGION: PiecewiseBatchedConfig(
-                capture_fn=self._decode_region, make_static_inputs=make_static_inputs,
-                declare_step=self._declare,
-                seq_len=1, capture_batch_sizes=self.CAPTURE_BATCH_SIZES, compile=False, lease_before_step=True,
-            ),
-        }
-
-    def _decode_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        pool = call.resources[CODEC_STATE]
-        audio = codec_step(self.codec, pool, pool.addressing("main"), call.static_inputs["codes"])
-        return {"final": pcm16(audio.final), "end": pcm16(audio.end_after)}
-
-    def forward_batched(self, graph_walk, engine_inputs, codes=None, flush=None,
-                        **kwargs) -> dict[str, NameToTensorList]:
-        rids = list(engine_inputs.request_ids)
-        flush = flush or [False] * len(rids)
-        rows = [i for i, c in enumerate(codes) if c is not None]
-        out: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(rids):
-            if codes[i] is None:
-                # an empty final chunk: the right edge the last step held
-                end = self.request_state(rid).get(self.END_KEY)
-                out[rid] = {"audio_chunk": [end if end is not None else torch.zeros(0, dtype=torch.int16)]}
-        if not rows:
-            return out
-        runner = (engine_inputs.piecewise_runners or {}).get(self.DECODE_REGION)
-        if engine_inputs.step is None or (runner is not None and runner.can_run(len(rows))):
-            # declare_step left the pool to the region (see there)
-            batch = torch.stack([codes[i] for i in rows]).long()       # (G, 1, num_q)
-            res = runner.run(static_inputs={"codes": batch}, request_ids=[rids[i] for i in rows])
-            final, end = res["final"], res["end"]
-        else:
-            # eagerly over the step's own plan, every row in its order: a flush
-            # row decodes a zero frame into the sink (it declared no span)
-            pad = torch.zeros_like(codes[rows[0]])
-            batch = torch.stack([pad if c is None else c for c in codes]).long()
-            pool = engine_inputs.resources[CODEC_STATE]
-            audio = codec_step(self.codec, pool, pool.addressing("main"), batch)
-            final, end = pcm16(audio.final)[rows], pcm16(audio.end_after)[rows]
-        edge = self.codec.stream_edge
-        for row, i in enumerate(rows):
-            state = self.request_state(rids[i])
-            # a call's first frame: the full decode trims the overlap-add's left edge
-            pcm = final[row] if state.get(self.STARTED_KEY) else final[row, edge:]
-            state.add(self.STARTED_KEY, True)
-            if flush[i]:
-                pcm = torch.cat([pcm, end[row]])
-            else:
-                state.add(self.END_KEY, end[row])
-            out[rids[i]] = {"audio_chunk": [pcm]}
-        return out
-
-    def forward(self, graph_walk, engine_inputs, codes=None, flush=None, **kwargs) -> NameToTensorList:
-        if isinstance(codes, torch.Tensor):                              # one request's frames
-            codes = [codes.reshape(-1, codes.shape[-1])]
-        if isinstance(flush, bool):
-            flush = [flush]
-        return self.forward_batched(graph_walk, engine_inputs, codes=codes, flush=flush)[engine_inputs.request_ids[0]]
