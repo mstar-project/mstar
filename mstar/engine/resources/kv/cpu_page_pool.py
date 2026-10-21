@@ -46,14 +46,15 @@ class CPUPagePool:
         self.page_allocator = PageAllocator(max_cpu_pages)
 
         # same layout as the device cache, on pinned memory so the copies can
-        # be async
-        self.cpu_kv_cache = torch.zeros(
+        # be async. Left unfilled: a host page is read only after a copy writes it.
+        self.cpu_kv_cache = torch.empty(
             config.num_layers,
             max_cpu_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
-        ).pin_memory()
+            pin_memory=True,
+        )
 
         # {request_id: {label: OffloadedStream}}
         self.offloaded: dict[str, dict[str, OffloadedStream]] = {}
