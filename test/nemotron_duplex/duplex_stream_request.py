@@ -13,11 +13,10 @@ the request server-side).
     python test/nemotron_duplex/duplex_stream_request.py --silence 15 --output agent.wav
     python test/nemotron_duplex/duplex_stream_request.py --audio user.wav --silence 20
 
-Note on the transport: the M* engine's /generate takes a fixed audio buffer and
-streams the OUTPUT back (there is no incremental-audio-input / WebSocket path in
-the engine — that lives in the model's standalone realtime_api.py). So the
-"silence until the agent finishes" is a fixed pre-padded window (``--silence``,
-the cap the user asked for); the realtime part is the streamed reply we watch.
+Note on the transport: this sends one fixed audio buffer to /generate and streams
+the OUTPUT back, so the "silence until the agent finishes" is a fixed pre-padded
+window (``--silence``). To stream the input live as well, over /generate/ws, use
+live_ws_request.py.
 """
 import argparse
 import sys

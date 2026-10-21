@@ -88,13 +88,28 @@ def test_pre_drawn_noise_reproduces_generator_sampling():
 
 
 def test_empty_chunk_runs_a_pad_frame():
-    """A very short clip ends the token stream on an empty chunk. The talker runs
-    a PAD frame rather than raising or skipping: either drops the rid from its
-    stream-ended loop, and the worker's stop then fails the whole batch."""
+    """The token stream ends on an empty chunk when its last token was taken
+    before its end arrived. The talker runs a PAD frame rather than raising or
+    skipping: either drops the rid from its stream-ended loop, and the worker's
+    stop then fails the whole batch."""
     sub = make_sub()
     for inputs in ({"new_token": []}, {}):
         out = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=True)
         assert out.input_ids.tolist() == [sub.config.text_pad_id] and out.kwargs["first"] is True
+
+
+@pytest.mark.parametrize("final,token", [(True, False), (True, True), (False, False)])
+def test_only_the_empty_final_chunk_step_emits_no_codes(final, token):
+    """The PAD frame of the empty final chunk only ends the loop: it emits no
+    codes, so the call gets one audio frame per text token, as offline. A final
+    chunk carrying a token emits as usual."""
+    sub = make_sub()
+    sub.request_state("a").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
+    inputs = {"new_token": [torch.tensor([5])] if token else []}
+    ni = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=final)
+    out = {"codec_tokens": [torch.arange(TINY.num_quantizers)]}
+    sub.postprocess("a", None, out, inputs=ni)
+    assert bool(out) == (token or not final)
 
 
 def test_step_declares_both_streams_in_one_combined_plan():

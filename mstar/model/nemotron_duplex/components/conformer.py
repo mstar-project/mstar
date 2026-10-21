@@ -320,3 +320,260 @@ class Perception(nn.Module):
         from mstar.model.loader import load_hf_weights
 
         return load_hf_weights(self, weights, stacked_params=[], name_remapper=self.remap)
+
+
+# ---------------------------------------------------------------------------
+# Streaming: the same encoder, one chunk of a call at a time
+# ---------------------------------------------------------------------------
+
+class StreamState:
+    """One call's place in its audio stream, and the encoder state that carries
+    it across chunks. Host counters drive every slice, so a step needs no sync.
+
+    ``signal`` is the preemphasized audio, laid out as ``torch.stft(center=True)``
+    pads it: ``n_fft // 2`` reflected samples in front, then the call. ``mel``
+    holds every mel frame so far; ``k``/``v`` the last ``att_context`` keys and
+    values of each layer's attention, ``conv`` the last ``kernel - 1`` inputs of
+    each layer's depthwise conv.
+    """
+
+    def __init__(self, config: ConformerSTTConfig, max_samples: int, device, dtype):
+        c = config
+        self.pad = c.n_fft // 2
+        self.signal = torch.zeros(max_samples + 2 * self.pad, dtype=torch.float32, device=device)
+        self.mel = torch.zeros(max_samples // c.hop_length + 1, c.n_mels, dtype=torch.float32, device=device)
+        ctx = c.att_context_size[0]
+        self.k = torch.zeros(c.num_layers, c.num_heads, ctx, c.head_dim, dtype=dtype, device=device)
+        self.v = torch.zeros_like(self.k)
+        self.conv = torch.zeros(c.num_layers, c.d_model, c.conv_kernel_size - 1, dtype=dtype, device=device)
+        self.last_sample = torch.zeros(1, dtype=torch.float32, device=device)
+        self.samples = 0        # samples of the call so far
+        self.mels = 0           # mel frames computed
+        self.frames = 0         # encoder frames emitted (= frames in the attention / conv state)
+
+
+def final_mel_frames(config: ConformerSTTConfig, samples: int, final: bool) -> int:
+    """Mel frames whose 512-sample window is complete, for a call of more than
+    ``n_fft/2`` samples: frame m spans ``[m * hop - n_fft/2, m * hop + n_fft/2)``.
+    At the end of the call every frame counts, the last ones over the reflected
+    right edge, as offline."""
+    if final:
+        return samples // config.hop_length + 1
+    return (samples - config.n_fft // 2) // config.hop_length + 1
+
+
+def final_encoder_frames(config: ConformerSTTConfig, mels: int, samples: int, final: bool) -> int:
+    """Encoder frames that no later audio can change, given at least one mel
+    frame: frame ``j`` reads mel frames up to ``8 * j``. At the end, every frame
+    offline would produce."""
+    if final:
+        return config.num_frames(samples)
+    return (mels - 1) // config.subsampling_factor + 1
+
+
+class ConformerStreamer:
+    """Runs a ``Perception`` incrementally over a batch of calls, matching what it
+    computes over each whole call up to float rounding: about 1e-6 in fp32, about
+    1% relative in bf16, where each chunking takes different kernel shapes.
+
+    - Mel: frames are computed once their window is complete, from the padded
+      preemphasized signal, with the featurizer's own ops.
+    - Subsampling: the strided convs are recomputed over a window that starts
+      16 mel frames before the first new output frame. An output frame reads
+      15 mel frames, so the first two outputs of the window are discarded and
+      the rest are exact; the window starts on a multiple of 8 so the strides
+      line up with the offline ones.
+    - Layers: attention reads the cached keys/values of the last 70 frames,
+      the depthwise conv its cached last 8 inputs.
+    """
+
+    def __init__(self, perception: "Perception"):
+        self.p = perception
+        self.c = perception.config
+        enc = perception.encoder
+        self._ctx = self.c.att_context_size[0]
+        # sinusoids of relative positions 0..ctx, row d = position d: all a query can see
+        device = enc.layers[0].self_attn.linear_pos.weight.device
+        pe = ConformerEncoder._rel_pos_emb(self._ctx + 1, self.c.d_model, device, torch.float32)
+        self._pe = pe[0, : self._ctx + 1].flip(0)
+        self._pos: dict = {}    # each layer's linear_pos(_pe), by layer, dtype and autocast: fixed weights
+
+    # -- front end -----------------------------------------------------------
+
+    def append(self, st: StreamState, chunk: torch.Tensor) -> None:
+        n = chunk.numel()
+        x = chunk.to(torch.float32).reshape(-1)
+        # last_sample starts at 0: the featurizer's preemphasis keeps the first sample
+        y = x - self.c.preemph * torch.cat([st.last_sample, x[:-1]])
+        st.signal[st.pad + st.samples: st.pad + st.samples + n] = y
+        st.last_sample = x[-1:].clone()
+        st.samples += n
+
+    def _mel_frames(self, sts: list[StreamState], lo: list[int], hi: list[int], final: list[bool]) -> None:
+        """Fill ``st.mel[lo:hi]`` for each call, batched."""
+        c, pad, hop = self.c, self.c.n_fft // 2, self.c.hop_length
+        rows, idx = [], []
+        for i, st in enumerate(sts):
+            if hi[i] <= lo[i]:
+                continue
+            if lo[i] == 0:      # the reflected left edge, as torch.stft pads it
+                st.signal[:pad] = st.signal[pad + 1: 2 * pad + 1].flip(0)
+            if final[i]:        # and the right edge at the end of the call
+                end = pad + st.samples
+                st.signal[end: end + pad] = st.signal[end - pad - 1: end - 1].flip(0)
+            rows.append(st.signal[lo[i] * hop: (hi[i] - 1) * hop + c.n_fft])
+            idx.append(i)
+        if not rows:
+            return
+        width = max(r.numel() for r in rows)
+        batch = torch.stack([F.pad(r, (0, width - r.numel())) for r in rows])
+        feat = self.p.preprocessor.featurizer
+        spec = torch.stft(batch, n_fft=c.n_fft, hop_length=hop, win_length=c.win_length, center=False,
+                          window=feat.window.to(torch.float32), return_complex=True)
+        spec = torch.view_as_real(spec)
+        mag = torch.sqrt(spec.pow(2).sum(-1))
+        if c.mag_power != 1.0:
+            mag = mag.pow(c.mag_power)
+        mel = torch.log(torch.matmul(feat.fb.to(mag.dtype), mag) + LOG_GUARD)      # (B, n_mels, T)
+        for row, i in enumerate(idx):
+            sts[i].mel[lo[i]:hi[i]] = mel[row, :, : hi[i] - lo[i]].transpose(0, 1).to(torch.float32)
+
+    def _subsample(self, sts: list[StreamState], first: list[int], last: list[int],
+                   mels: list[int]) -> list[torch.Tensor]:
+        """Encoder-input frames ``first..last`` (inclusive) of each call, from a
+        window of its mel frames."""
+        f = self.c.subsampling_factor
+        starts = [max(0, f * j - 2 * f) for j in first]
+        windows = [sts[i].mel[starts[i]: mels[i]] for i in range(len(sts))]
+        lens = [w.shape[0] for w in windows]
+        width = max(lens)
+        out = torch.stack([F.pad(w, (0, 0, 0, width - w.shape[0])) for w in windows]).unsqueeze(1)  # (B, 1, T, n_mels)
+        # A strided stage reads one frame past a row's end, where a row on its own
+        # reads the conv's zero padding: zero each stage's input past each row.
+        n = torch.tensor(lens, pin_memory=out.is_cuda).to(out.device, non_blocking=True).view(-1, 1, 1, 1)
+        for m in self.p.encoder.pre_encode.conv:
+            if isinstance(m, _CausalConv2d):
+                t = torch.arange(out.shape[2], device=out.device).view(1, 1, -1, 1)
+                out = out * (t < n).to(out.dtype)
+                n = n // 2 + 1
+            out = m(out)                                                                     # -> (B, C, T', F')
+        b, ch, t, fr = out.shape
+        out = self.p.encoder.pre_encode.out(out.transpose(1, 2).reshape(b, t, -1))          # (B, T', D)
+        return [out[i, first[i] - starts[i] // f: last[i] - starts[i] // f + 1] for i in range(len(sts))]
+
+    # -- layers --------------------------------------------------------------
+
+    def _window(self, sts: list[StreamState], n: list[int], t: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Which keys each new frame may attend to, and their relative positions.
+        Keys are the ``ctx`` cached frames (slot s holds frame ``frames - ctx + s``)
+        then the ``t`` new ones; the same for every layer of a step."""
+        ctx = self._ctx
+        qi = torch.arange(t, device=device).view(t, 1)
+        kj = torch.arange(ctx + t, device=device).view(1, ctx + t)
+        dist = qi + ctx - kj                                                  # (t, ctx + t)
+        host = torch.tensor([[st.frames for st in sts], n], dtype=torch.long)
+        frames, valid = host.to(device, non_blocking=True).view(2, -1, 1, 1)
+        outside = ((dist < 0) | (dist > ctx)).view(1, t, ctx + t)
+        mask = outside | (frames - ctx + kj.view(1, 1, -1) < 0) | (kj.view(1, 1, -1) - ctx >= valid)
+        return mask.unsqueeze(1), dist.clamp(0, ctx)
+
+    def _attend(self, layer: "ConformerLayer", x: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                mask: torch.Tensor, dist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn = layer.self_attn
+        b, t, _ = x.shape
+        h, dk, ctx = attn.n_heads, attn.head_dim, self._ctx
+        q = attn.linear_q(x).view(b, t, h, dk)
+        k_new = attn.linear_k(x).view(b, t, h, dk).transpose(1, 2)
+        v_new = attn.linear_v(x).view(b, t, h, dk).transpose(1, 2)
+        k = torch.cat([k_cache.to(k_new.dtype), k_new], dim=2)                # (B, h, ctx+t, dk)
+        v = torch.cat([v_cache.to(v_new.dtype), v_new], dim=2)
+        key = (attn, x.dtype, torch.is_autocast_enabled(x.device.type))
+        p = self._pos.get(key)
+        if p is None:                                                         # (h, ctx+1, dk)
+            p = self._pos[key] = attn.linear_pos(self._pe.to(x.dtype)).view(ctx + 1, h, dk).transpose(0, 1)
+        q_u = (q + attn.pos_bias_u).transpose(1, 2)
+        q_v = (q + attn.pos_bias_v).transpose(1, 2)
+        ac = torch.matmul(q_u, k.transpose(-2, -1))                           # (B, h, t, ctx+t)
+        bd_all = torch.matmul(q_v, p.transpose(-2, -1))                       # (B, h, t, ctx+1)
+        bd = torch.gather(bd_all, 3, dist.view(1, 1, t, ctx + t).expand(b, h, t, ctx + t))
+        scores = ((ac + bd) / attn.s_d_k).masked_fill(mask, -INF_VAL)
+        w = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+        out = torch.matmul(w, v).transpose(1, 2).reshape(b, t, h * dk)
+        return attn.linear_out(out), k, v
+
+    def _conv(self, layer: "ConformerLayer", x: torch.Tensor,
+              conv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        conv = layer.conv
+        z = conv.pointwise_conv1(x.transpose(1, 2))
+        z = F.glu(z, dim=1)                                                     # (B, D, t)
+        z = torch.cat([conv_cache.to(z.dtype), z], dim=2)                       # (B, D, kernel-1+t)
+        tails = z
+        z = conv.depthwise_conv(z)
+        z = conv.batch_norm(z.transpose(1, 2)).transpose(1, 2)
+        z = F.silu(z)
+        return conv.pointwise_conv2(z).transpose(1, 2), tails
+
+    def _layers(self, x: torch.Tensor, sts: list[StreamState], n: list[int]) -> torch.Tensor:
+        mask, dist = self._window(sts, n, x.shape[1], x.device)
+        k_all = torch.stack([st.k for st in sts])                              # (B, L, h, ctx, dk)
+        v_all = torch.stack([st.v for st in sts])
+        c_all = torch.stack([st.conv for st in sts])                           # (B, L, D, kernel-1)
+        ks, vs, cs = [], [], []
+        for li, layer in enumerate(self.p.encoder.layers):
+            r = x + layer.FC_FACTOR * layer.feed_forward1(layer.norm_feed_forward1(x))
+            a, k, v = self._attend(layer, layer.norm_self_att(r), k_all[:, li], v_all[:, li], mask, dist)
+            r = r + a
+            cv, tails = self._conv(layer, layer.norm_conv(r), c_all[:, li])
+            r = r + cv
+            r = r + layer.FC_FACTOR * layer.feed_forward2(layer.norm_feed_forward2(r))
+            x = layer.norm_out(r)
+            ks.append(k)
+            vs.append(v)
+            cs.append(tails)
+        # each call keeps the newest ctx keys/values and kernel-1 conv inputs:
+        # positions n_i .. n_i + keep of each concatenation
+        ctx, keep = self._ctx, self.c.conv_kernel_size - 1
+        k_cat, v_cat, c_cat = torch.stack(ks, 1), torch.stack(vs, 1), torch.stack(cs, 1)
+        for i, st in enumerate(sts):
+            st.k = k_cat[i, :, :, n[i]: n[i] + ctx].to(st.k.dtype)
+            st.v = v_cat[i, :, :, n[i]: n[i] + ctx].to(st.v.dtype)
+            st.conv = c_cat[i, :, :, n[i]: n[i] + keep].to(st.conv.dtype)
+        return x
+
+    # -- one step -------------------------------------------------------------
+
+    def step(self, sts: list[StreamState], chunks: list[torch.Tensor | None],
+             final: list[bool]) -> list[torch.Tensor]:
+        """Append each call's chunk and return its newly final frames, ``(n_i, output_dim)``."""
+        c = self.c
+        for st, chunk in zip(sts, chunks, strict=True):
+            if chunk is not None and chunk.numel():
+                self.append(st, chunk)
+        # a call's first mel frame reflects n_fft/2 samples past its first, as
+        # the featurizer's padding does, so it needs more than that to start
+        live = [i for i, st in enumerate(sts) if st.samples > st.pad]
+        out: list[torch.Tensor] = [torch.zeros(0, c.output_dim) for _ in sts]
+        if not live:
+            return out
+        L = [sts[i] for i in live]
+        fin = [final[i] for i in live]
+        mel_hi = [final_mel_frames(c, st.samples, f) for st, f in zip(L, fin, strict=True)]
+        self._mel_frames(L, [st.mels for st in L], mel_hi, fin)
+        for st, hi in zip(L, mel_hi, strict=True):
+            st.mels = hi
+        enc_hi = [final_encoder_frames(c, st.mels, st.samples, f) for st, f in zip(L, fin, strict=True)]
+        ready = [k for k, st in enumerate(L) if enc_hi[k] > st.frames]
+        if not ready:
+            return out
+        R = [L[k] for k in ready]
+        first = [st.frames for st in R]
+        last = [enc_hi[k] - 1 for k in ready]
+        n = [b - a + 1 for a, b in zip(first, last, strict=True)]
+        new = self._subsample(R, first, last, [st.mels for st in R])
+        width = max(n)
+        x = torch.stack([F.pad(e, (0, 0, 0, width - e.shape[0])) for e in new])          # (B, t, D)
+        y = self.p.proj(self._layers(x, R, n))
+        for k, st in enumerate(R):
+            st.frames += n[k]
+            out[live[ready[k]]] = y[k, : n[k]]
+        return out
