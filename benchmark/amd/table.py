@@ -289,7 +289,8 @@ def render(data: dict) -> str:
                 flags = " ".join(c.get("flags", []) + (["error"] if c.get("errors") else [])
                                  + (["HEALTH-FAIL"] if h.get("status") == "FAIL" else [])
                                  + (["moe-untuned"] if arm_rec and _moe_status(arm_rec)[1] else []))
-                corr = data["correctness"].get(f"{row}/{c['arm']}") or {}
+                corr = (data["correctness"].get(f"{row}/{c['arm']}/{wl_name}")
+                        or data["correctness"].get(f"{row}/{c['arm']}") or {})
                 corr_txt = _correctness_text(corr)
                 why = "; ".join(_comparability(data, row, c["arm"], wl_name, wl.family))
                 lines.append(f"| {c['arm']} | {c['concurrency']} | " + " | ".join(vals) + f" | {flags} | {corr_txt} | "
