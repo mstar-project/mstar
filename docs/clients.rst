@@ -107,22 +107,27 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
    with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
        ws.send(msgpack.packb({
-           "text": "pick up the mug",
-           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "text": prompt,  # task + view, duration and resolution text
+           "files": [{"name": "obs.png", "data": open("obs.png", "rb").read()}],  # 736x544 composite
            "output_modalities": ["action"],
            "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 8, "action_chunk_size": 32},
+                            "raw_action_dim": 8, "action_chunk_size": 33, "num_frames": 33,
+                            "fps": 15, "size": "736x544",
+                            "action": [joints + [1 - gripper]]},  # current state
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
            reply = msgpack.unpackb(ws.recv(), raw=False)
            if reply.get("modality") == "action":
-               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)[:, :8].copy()
+               actions[:, 7] = 1 - actions[:, 7]
            if reply.get("finish") or reply.get("error"):
                break
 
-``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
-loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+The reply leaves out the state row. ``examples/cosmos3_action_ws_client.py`` is a complete
+openpi-style client that builds the observation image and prompt the way NVIDIA's RoboLab
+server does for the DROID policies, runs this loop at a fixed observation rate and reports
+chunks/s, actions/s and latency percentiles.
 
 Python SDK
 ----------
