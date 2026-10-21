@@ -353,6 +353,44 @@ class RetentionPolicy:
 
 
 @dataclass(frozen=True)
+class StreamLayout:
+    """Everything a request writes into one stream, known when its prompt is preprocessed.
+
+    ``spans`` are the committed writes, in walk order. Each ``(loop, slots)`` in
+    ``growth`` writes ``slots`` per iteration of ``loop``. ``scratch`` is the most one
+    non-committing step writes past the committed length.
+    """
+    spans: tuple[PrefixSpan, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()
+    scratch: int = 0
+    retention: RetentionPolicy | None = None
+
+    def pages(self, caps: Mapping[str, int], page_size: int) -> int:
+        """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.
+
+        Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves
+        less than a page over the budget, so the window peaks at the protected prefix plus
+        the budget, or at the prefix rounded up to a page if that is larger. The bound adds
+        a page of overrun and the largest step past the prefix to that peak.
+        """
+        written = sum(span.length for span in self.spans) + sum(
+            slots * caps[loop] for loop, slots in self.growth
+        )
+        pages = -(-(written + self.scratch) // page_size)
+        if self.retention is None:
+            return pages
+        prefix = self.retention.protected_prefix
+        step, end = self.scratch, 0
+        for span in self.spans:
+            end += span.length
+            if end > prefix:
+                step = max(step, span.length)
+        step = max([step, *(slots for _, slots in self.growth)])
+        window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
+        return min(pages, -(-(window + page_size - 1 + step) // page_size))
+
+
+@dataclass(frozen=True)
 class KVStep(ResourceStep):
     # write: bool # @nsagan: opting to remove this for now bc it's dead code
     commit: bool = True
