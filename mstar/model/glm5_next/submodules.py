@@ -300,7 +300,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         ]
         if self.mtp_k > 0:
             # a verify step with a sampled request in it: speculative sampling
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=SAMPLED,
                 single_request_inputs=ARNodeInputs(

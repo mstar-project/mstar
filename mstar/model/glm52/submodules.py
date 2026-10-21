@@ -392,7 +392,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 **flags,
             ),
             # a verify step with a sampled request in it: speculative sampling
-            *([BatchedCudaGraphConfig(
+            *([BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=SAMPLED,
                 single_request_inputs=ARNodeInputs(
