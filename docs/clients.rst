@@ -136,10 +136,13 @@ streaming back:
 
 Every field of the record is optional, but an append needs text, files or ``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
-name the model doesn't have is rejected), and ``model_kwargs`` are this append's own; the
-opening message's still hold for the request. ``"append": [files]`` is short for
-``"append": {"files": [files]}``. What a model takes in an append is its own: an append
-with text, to a model that takes none, is rejected. ``{"request_id", "end_input": true}``
+name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
+reach only the model's ``process_stream_chunk``, so they mean what that model reads from
+them, and the opening message's still hold for the request (its sampling settings, say).
+``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
+in an append is its own. An append of text alone that the model turns into no stream item
+is rejected; text sent with files reaches the model, and if it ignores the text, the text
+is dropped without an error. ``{"request_id", "end_input": true}``
 ends the input, alone or on an append (or on the opening message, for a one-shot
 request). The request then finishes as usual. A model may take several client streams
 (audio and video, say); ``end_input`` may then name the ones it ends, as a list
@@ -178,11 +181,12 @@ Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/
    for chunk in microphone_chunks():  # e.g. 80 ms WAV files
        ws.send(msgpack.packb({"request_id": "call",
                               "append": [{"name": "chunk.wav", "data": chunk}]}))
-   # the record form: text, files aimed at a stream, and settings for this append
+   # the record form: text, files aimed at a stream, and settings for this append,
+   # which only the model's process_stream_chunk reads
    ws.send(msgpack.packb({"request_id": "call", "append": {
        "text": "and now in French",
        "files": [{"name": "chunk.wav", "data": chunk, "stream": "audio_in"}],
-       "model_kwargs": {"temperature": 0.7},
+       "model_kwargs": {"gain": 2.0},  # what this model's hook reads, not a sampling setting
    }}))
    ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
 
