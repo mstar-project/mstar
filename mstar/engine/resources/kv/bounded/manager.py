@@ -203,11 +203,13 @@ class BoundedKVManager(Resource):
                 pos = step.positions.get(seg.request_id)
                 if pos is None:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                        f"bounded KV step declares no position for {seg.request_id!r}"))
+                        f"bounded KV step declares no position for {seg.request_id!r}",
+                        request_ids=frozenset({seg.request_id})))
                 if not self.config.min_source_len <= pos.source_len <= self.config.max_source_len:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} has a {pos.source_len}-token source; the slots "
-                        f"take {self.config.min_source_len} to {self.config.max_source_len}"))
+                        f"take {self.config.min_source_len} to {self.config.max_source_len}",
+                        request_ids=frozenset({seg.request_id})))
                 req = self._requests.get(seg.request_id)
                 if req is None:
                     if not self._free:
@@ -218,7 +220,7 @@ class BoundedKVManager(Resource):
                 if pos.written != req.written:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} declares {pos.written} written tokens; "
-                        f"{req.written} were committed"))
+                        f"{req.written} were committed", request_ids=frozenset({seg.request_id})))
         return ADMIT_OK
 
     def plan(self, step: BoundedKVStep, ctx: StepContext) -> BoundedPlan:
