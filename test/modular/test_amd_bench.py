@@ -374,8 +374,10 @@ def test_table_render(tmp_path):
     for arm, tok, out_tok in (("mstar", 1000.0, 256), ("vllm-aiter", 900.0, 300)):
         d = run / "qwen3_5_0.8b" / arm
         (d / "cells/text-chat-256/c8").mkdir(parents=True)
+        first = {"image-gen": {"1024x1024": 35.2, "1344x768": "failed (HTTP 500, see x)"}} if arm == "mstar" else None
         (d / "arm.json").write_text(json.dumps({"arm": arm, "row": "qwen3_5_0.8b", "status": "done",
-                                                "startup": {"ready_s": 100.0, "first_request_s": 1.5}}))
+                                                "startup": {"ready_s": 100.0, "first_request_s": 1.5},
+                                                "first_size": first}))
         if arm == "mstar":
             (d / "server").mkdir()
             (d / "server" / "versions.json").write_text(json.dumps(
@@ -404,6 +406,8 @@ def test_table_render(tmp_path):
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
     assert "| mstar HEAD 6e6474b62, configs/qwen3_5_0.8b.yaml | torch 2.12.1 mstar_rust from the venv |" in md
     assert "\n- note: HIP 4 runs hot on this node.\n" in md
+    assert "| 100.0, 1.5; first request per size: image-gen 1024x1024 35.2 s, 1344x768 failed |" in md
+    assert md.count("first request per size") == 1
     assert "| client-bound rerun |" in md and md.count("client-bound") == 1
     assert "resumed 2026-10-19T09:00:00-0500 on h (job 1); finished" in md and "node health check_resume1: PASS" in md
     assert ("resumed 2026-10-20T03:00:00-0500 on h (job 2), GPUs [0, 1, 4], lanes 2; measured qwen3_5_4b/mstar, "
