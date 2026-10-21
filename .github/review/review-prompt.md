@@ -68,7 +68,7 @@ On re-review, read `pr-comments.json` and `pr-conversation.json` first. Don't re
 
 Finish verifying everything before you post anything.
 
-**Inline comments.** Post one per finding with `mcp__github_inline_comment__create_inline_comment`, setting `confirmed: true` and `commit_id` to the head commit given in the message that invoked you, so a push during the review can't shift your line numbers. Anchor it on the changed lines that cause the problem: `side: RIGHT` for added or kept lines in `pr-head/`, `side: LEFT` for deleted lines, and `startLine` with `line` for a range. The line must appear in `pr.diff`, because GitHub rejects comments on lines outside it. If the cause is outside the diff, don't post it: list it in `findings` with `inline: false` and, as its `detail`, the paragraph its inline comment would have had. The summary shows it in full. Write the body as follows:
+**Inline comments.** Post one per finding with `mcp__github_inline_comment__create_inline_comment`, setting `confirmed: true` and `commit_id` to the head commit given in the message that invoked you, so a push during the review can't shift your line numbers. Anchor it on the changed lines that cause the problem: `side: RIGHT` for added or kept lines in `pr-head/`, `side: LEFT` for deleted lines, and `startLine` with `line` for a range. The line must appear in `pr.diff`, because GitHub rejects comments on lines outside it. If the cause is outside the diff, don't post it: list it in `outside_diff` with, as its `detail`, the paragraph its inline comment would have had. The summary shows it in full. Write the body as follows:
 
 ```markdown
 **[P1]** <the claim in one line>
@@ -78,9 +78,9 @@ Finish verifying everything before you post anything.
 
 Keep the body to one short paragraph that names the triggering inputs or state; don't narrate how you traced it. Add a ```` ```suggestion ```` block only when the fix is a small, exact replacement for the anchored lines. The block replaces the whole range, so it must work as a drop-in.
 
-**Summary.** After all inline comments are posted, return the summary as fields of your structured output. The workflow renders them into a comment that opens with a status line (the findings by priority, the head commit and the mode), posts it below the earlier summaries and hides those as outdated. You have no shell and can't post it yourself. Write each item as one plain sentence. Don't restate what the PR does: the description says that, and the reader has it open.
+**Summary.** After all inline comments are posted, return the summary as fields of your structured output. The workflow renders them into a comment that opens with a status line (the open findings by priority, the head commit and the mode), posts it below the earlier summaries and hides those as outdated. You have no shell and can't post it yourself. Write each item as one plain sentence. Don't restate what the PR does: the description says that, and the reader has it open.
 
-- `findings`: every finding that holds at the head commit, with its priority, its claim in one line, its `path:line`, and whether it has an inline comment. On a re-review, also list the earlier findings this mode reports that are still open, without posting them again: the code still has the problem, and nobody answered it with a reason. The status line then describes the PR as it stands.
+- `outside_diff`: the findings whose cause is outside the diff, as above. The workflow counts your inline findings, and earlier ones whose threads are still open, from the PR itself.
 - `since_last`: on a re-review, one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. Empty on a first review.
 - `description_problems`: inaccuracies first, including anything the code does that the description doesn't say, then what's missing.
 - `questions`: each question with what its answer would change. A second sentence is fine for that.

@@ -479,8 +479,17 @@ jobs:
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
         run: |
+          # Read after the review posted its inline comments, so the status line
+          # counts them along with earlier ones still open.
+          gh api graphql --paginate --slurp -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+                reviewThreads(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { isResolved isOutdated comments(first: 1) { nodes { author { login } body } } }
+                } } } }' > threads-now.json
           printf '%s' "$OUTPUT" | python3 .github/review/render_summary.py --head "$HEAD_SHA" --mode "$MODE" \
-            | sed -E "$REDACT" > summary.md
+            --threads threads-now.json | sed -E "$REDACT" > summary.md
           # A summary the script can't render leaves the file empty.
           grep -q '[^[:space:]]' summary.md || { echo "::warning::The review returned no summary to render."; exit 1; }
           if [ "$SALVAGED" = "true" ]; then
