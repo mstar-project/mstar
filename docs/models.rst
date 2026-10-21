@@ -313,7 +313,11 @@ Meta's Muse Glimmer 30B: text-and-image chat (video is refused), on ``POST
 
 Three in four layers attend a 2048-token sliding window; every layer writes the
 one paged KV cache, and the sliding layers attend it through a windowed
-attention resource. Sampling defaults to the checkpoint's (temperature 1,
+attention resource. The paged KV cache has no per-layer-group retention yet (a
+group of sliding-window layers releasing the pages behind its window; see #855
+and #379), so the sliding layers hold their whole history: at 32k tokens about
+3.4x the KV the model needs, which costs concurrent requests, not
+correctness. Sampling defaults to the checkpoint's (temperature 1,
 top_p 0.95, top_k 64). ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
