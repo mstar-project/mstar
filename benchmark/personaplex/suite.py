@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import csv
 import fcntl
 import hashlib
 import html
@@ -161,8 +162,43 @@ def report(root):
         "",
     ]
     players = []
+    numeric_rows, benchmark_rows = [], []
     for name, row in results.items():
         lines += [f"{name}: {row['status']}", f"  {row.get('reason', row.get('log', ''))}"]
+        comparison = root / name / "comparison.json"
+        if comparison.exists():
+            values = json.loads(comparison.read_text())
+            numeric_rows.append(
+                {
+                    "case": name,
+                    "status": row["status"],
+                    "agent_differences": values["agent_code_differences"],
+                    "agent_frames": values["agent_frame_count"],
+                    **values["float_audio"],
+                }
+            )
+            lines.append(f"  Numerical metrics: {json.dumps(numeric_rows[-1], sort_keys=True)}")
+            if values.get("first_decision"):
+                lines.append(f"  First decision: {json.dumps(values['first_decision'], sort_keys=True)}")
+        cells = root / name / "cells.json"
+        if cells.exists():
+            for cell in json.loads(cells.read_text()):
+                values = {"clip": cell["clip"], "concurrency": cell["concurrency"], "status": cell["status"]}
+                if cell.get("attempts"):
+                    raw_path = Path(cell["attempts"][-1]["results"])
+                    if raw_path.exists():
+                        raw = json.loads(raw_path.read_text())
+                        aggregate = raw.get("aggregate", {})
+                        values.update(
+                            samples=raw.get("completed"),
+                            failed=raw.get("failed"),
+                            latency_p50_s=aggregate.get("e2e_latency_s", {}).get("p50"),
+                            rtf_p50=(aggregate.get("rtf") or {}).get("p50"),
+                            audio_seconds_throughput=aggregate.get("audio_seconds_throughput"),
+                            source=str(raw_path),
+                        )
+                benchmark_rows.append(values)
+                lines.append(f"  Repository benchmark: {json.dumps(values, sort_keys=True)}")
         for label in ("input", "nvidia", "mstar"):
             path = root / name / (label + ".wav")
             if path.is_file():
@@ -178,6 +214,12 @@ def report(root):
         "A completed comparison does not approve numerical divergence or establish quality.",
     ]
     (root / "REPORT.rst").write_text("\n".join(lines) + "\n")
+    for filename, rows in (("numerical.csv", numeric_rows), ("benchmarks.csv", benchmark_rows)):
+        if rows:
+            with (root / filename).open("w", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=list(dict.fromkeys(k for row in rows for k in row)))
+                writer.writeheader()
+                writer.writerows(rows)
     (root / "listen.html").write_text(
         "<!doctype html><meta name='viewport' content='width=device-width'><title>PersonaPlex evidence</title>"
         "<style>body{font:17px system-ui;max-width:850px;margin:auto;padding:20px}audio{width:100%}</style>"
