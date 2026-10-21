@@ -433,6 +433,7 @@ def test_decoder_align_walk_uses_the_detected_language():
         {"text_inputs": [detected], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
     )
     detected.fill_(EN)  # the input's memory is reused once the walk is done
+    sub.request_state(7).add("decoded", [])  # what the decode walk recorded
     row = sub.prepare_inputs(ALIGN_WALK, fwd, {
         "transcript": [torch.tensor([7]), torch.tensor([EOT])],
         "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
@@ -446,6 +447,7 @@ def test_decoder_align_walk_fits_the_position_table():
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     sub.request_state(8).add("language", EN)
+    sub.request_state(8).add("decoded", [])
     # more text than fits after the forced prompt
     row = sub.prepare_inputs(ALIGN_WALK, _fwd(8), {
         "transcript": [torch.tensor([7])] * cfg.max_target_positions + [torch.tensor([EOT])],
@@ -453,6 +455,46 @@ def test_decoder_align_walk_fits_the_position_table():
         "audio_frames": [torch.tensor([cfg.num_frames])],
     })
     assert row.input_seq_len == cfg.max_target_positions and row.input_ids.tolist()[-1] == EOT
+
+
+def test_align_without_the_decode_walks_tokens_is_an_error():
+    """The decode walk records its tokens on the worker that ran it; an
+    align walk that finds none would otherwise time a single token."""
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    with pytest.raises(RuntimeError, match="no decoded tokens"):
+        sub.prepare_inputs(ALIGN_WALK, _fwd(3), {
+            "transcript": [torch.tensor([7])],
+            "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
+            "audio_frames": [torch.tensor([cfg.num_frames])],
+        })
+
+
+@pytest.mark.parametrize("groups,ok", [
+    # one group serving every walk
+    ([{"node_names": ["audio_encoder", "decoder"], "ranks": [0]}], True),
+    # walks split, but decode and align together
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill"]},
+      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["decode", "align"]}], True),
+    # align on another rank than decode
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
+      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["align"]}], False),
+    # align on no group at all
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]}], False),
+])
+def test_decode_and_align_must_share_ranks(groups, ok):
+    assert DECODE_WALK == "decode" and ALIGN_WALK == "align"
+    config = {"max_concurrent_requests": 64, "node_groups": groups}
+    model = _make_model()
+    if ok:
+        model.validate_config_yaml(config, "x.yaml")
+    else:
+        with pytest.raises(ValueError, match="must run on the same ranks"):
+            model.validate_config_yaml(config, "x.yaml")
 
 
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
@@ -903,6 +945,7 @@ def test_decoder_align_walk_emits_word_timings_in_the_timestamp_vocabulary():
     # forced English prompt recorded at prefill, then two text tokens and end-of-text generated
     sub.request_state(5).add("language", EN)
     sub.request_state(5).add("task", TRANSCRIBE)
+    sub.request_state(5).add("decoded", [])
     row = sub.prepare_inputs(ALIGN_WALK, fwd, {
         "transcript": [torch.tensor([7]), torch.tensor([33]), torch.tensor([EOT])],
         "encoder_states": [enc], "audio_frames": [torch.tensor([cfg.num_frames])],

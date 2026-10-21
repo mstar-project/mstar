@@ -453,8 +453,16 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         device = self.get_device()
         state = self.request_state(fwd_info.rid_handle)
         # the persisted first token, then what the decode steps recorded
+        decoded = state.get("decoded", None)
+        if decoded is None:
+            # the decode loop always runs a step first, on this worker
+            # (`WhisperModel.validate_config_yaml`)
+            raise RuntimeError(
+                f"request {fwd_info.request_id!r}: the align walk found no decoded tokens; "
+                "it must run on the worker that ran the decode walk"
+            )
         generated = [int(t) for part in inputs["transcript"] for t in part.reshape(-1).tolist()]
-        generated += state.get("decoded", None) or []
+        generated += decoded
         language = state.get("language")
         if isinstance(language, torch.Tensor):
             language = int(language.item())

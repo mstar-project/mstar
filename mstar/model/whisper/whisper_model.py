@@ -283,11 +283,26 @@ class WhisperModel(Model):
         ``max_concurrent_requests`` requests at full length must fit in each
         cache next to its sink page; the conductor queues the rest.
         """
-        self._decoder_tp_size = max(
-            (int(group.get("tp_size", 1)) for group in config.get("node_groups") or []
-             if DECODER_NODE in (group.get("node_names") or [])),
-            default=1,
-        )
+        decoder_groups = [
+            group for group in config.get("node_groups") or []
+            if DECODER_NODE in (group.get("node_names") or [])
+        ]
+        self._decoder_tp_size = max((int(group.get("tp_size", 1)) for group in decoder_groups), default=1)
+
+        def serving(walk: str) -> list:
+            return sorted(
+                tuple(group.get("ranks") or ()) for group in decoder_groups
+                if group.get("graph_walks") is None or walk in group["graph_walks"]
+            )
+
+        # the align walk reads the tokens the decode walk recorded in the
+        # decoder's worker-local request state
+        if serving(DECODE_WALK) != serving(ALIGN_WALK):
+            raise ValueError(
+                f"{config_path}: the {DECODER_NODE} node's {DECODE_WALK!r} and {ALIGN_WALK!r} "
+                f"walks must run on the same ranks (word timestamps align the tokens the decode "
+                f"walk kept on its worker); got {serving(DECODE_WALK)} and {serving(ALIGN_WALK)}"
+            )
         cap = config.get("max_concurrent_requests")
         if cap is None:
             logger.warning(
