@@ -533,6 +533,8 @@ class PreprocessWorkerThread:
         } if model is not None else {}
         # per request, what each of those streams has carried so far
         self._stream_items: dict[str, dict[str, int]] = {}
+        # per request, the client streams its client has ended
+        self._ended_streams: dict[str, set[str]] = {}
         self.in_queue = in_queue
         # Whether the API server still waits on a submission (see
         # _process_waiting_input); None (tests) takes everything.
@@ -614,6 +616,7 @@ class PreprocessWorkerThread:
             "request_model_kwargs",
             "request_output_state",
             "_stream_items",
+            "_ended_streams",
         ):
             state = getattr(self, state_name, None)
             if state is not None:
@@ -792,13 +795,30 @@ class PreprocessWorkerThread:
                     )
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
+                items = self._without_ended_streams(chunk, items)
                 self._charge_stream_items(request_id, items)
             if items or chunk.ends:
                 self._send_stream_input(
                     request_id, self._store_persisted(request_id, items), ended=chunk.ends,
                 )
+            if chunk.ends:
+                self._ended_streams.setdefault(request_id, set()).update(chunk.ends)
         finally:
             unlink_files(chunk.file_paths)
+
+    def _without_ended_streams(self, chunk: ClientAppend, items: NameToTensorList) -> NameToTensorList:
+        """``items`` less those for streams the client ended before this
+        append, which nothing reads any more: they are neither charged nor
+        sent, and the append is answered as late, as one that names an ended
+        stream is. The API server can't tell for a file that names no stream:
+        the model routes it."""
+        ended = self._ended_streams.get(chunk.request_id)
+        late = sorted(name for name, tensors in items.items() if tensors and ended and name in ended)
+        if not late:
+            return items
+        if chunk.on_late is not None:
+            chunk.on_late(f"the call's {', '.join(map(repr, late))} input has ended")
+        return {name: tensors for name, tensors in items.items() if name not in late}
 
     def _charge_stream_items(self, request_id: str, items: NameToTensorList) -> None:
         """Charge a call's new stream items to their streams' ``max_items``;

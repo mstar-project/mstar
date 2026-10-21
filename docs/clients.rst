@@ -145,7 +145,11 @@ request). The request then finishes as usual. A model may take several client st
 (audio and video, say); ``end_input`` may then name the ones it ends, as a list
 (``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
 An append that names a stream already ended, as a file's ``stream`` or in
-``end_input``, is answered as late, as one after ``end_input: true`` is (below).
+``end_input``, is answered as late, as one after ``end_input: true`` is (below). So is
+one whose files name no stream and that the model routes to a stream already ended:
+what it carried for that stream is dropped, uncounted, and the rest goes on. The opening
+message's files may name a ``stream`` too, which is checked the same way (a name the
+model doesn't have gets a 400), but the model routes the opening's files itself.
 
 A live call needs a ``request_id``; only the socket that opened it can append to it, and
 closing the socket aborts it. A message is an append if it carries ``append`` at its top

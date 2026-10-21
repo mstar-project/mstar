@@ -591,6 +591,7 @@ class APIServer:
         streaming: bool = True,
         request_id: str | None = None,
         end_input: bool | Collection[str] = True,
+        file_streams: dict[str, list[str | None]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -611,6 +612,11 @@ class APIServer:
         request's input open for :meth:`stream_input`, which takes the
         submission's key (:meth:`submission_key`); a list of client stream
         names ends only those at once. Other models ignore it.
+
+        ``file_streams`` are the client streams the opening's files name, as
+        in :meth:`stream_input`: one the model lacks is refused with a 400.
+        ``process_prompt`` routes the opening's files, so a name is only
+        checked.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -631,6 +637,13 @@ class APIServer:
                 "chunks cannot be returned as an aggregated response."
             )
 
+        if file_streams:
+            try:
+                self._check_streams(
+                    name for names in file_streams.values() for name in names if name is not None
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
         ending = open_streams = frozenset()
         if self.takes_stream_input:
             ending = self.client_streams if end_input is True else self._check_streams(end_input or ())
@@ -734,13 +747,16 @@ class APIServer:
         text: str | None = None,
         file_streams: dict[str, list[str | None]] | None = None,
         model_kwargs: dict | None = None,
+        on_late: Callable[[str], None] | None = None,
     ) -> bool:
         """Append text and files to a running request's client streams, then
         end them: all of them if ``end_input`` is True, or the client streams
         it names. The preprocess worker deletes the files once loaded.
         ``file_streams`` names, per modality in ``file_paths``' order, the
         client stream each file is for (None: the model decides);
-        ``model_kwargs`` are this append's own.
+        ``model_kwargs`` are this append's own. ``on_late`` answers the
+        append as late if the model routes any of it to a stream the client
+        already ended, which only the preprocess worker can tell.
 
         Takes the submission's key (:meth:`submission_key`), not its
         request_id: once a call has finished, its id may already name a newer
@@ -771,7 +787,7 @@ class APIServer:
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
                 key, file_paths=file_paths, ends=ending, text=text,
-                file_streams=file_streams, model_kwargs=model_kwargs,
+                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late,
             ))
         return True
 
@@ -1884,6 +1900,7 @@ async def generate_ws(websocket: WebSocket):
             file_paths, parts = await run_in_threadpool(
                 _decode_ws_files, message.get("files"), api_server.upload_dir,
             )
+            file_streams = _ws_file_streams(message.get("files"), parts)
             in_mods, parts = _ws_input_layout(
                 text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
             )
@@ -1899,6 +1916,7 @@ async def generate_ws(websocket: WebSocket):
                 streaming=True,
                 request_id=request_id,
                 end_input=end_input,
+                file_streams=file_streams,
             )
             key = api_server.submission_key(request_id)
             submitted.add(key)
@@ -1985,9 +2003,17 @@ async def generate_ws(websocket: WebSocket):
             file_streams = _ws_file_streams(record.get("files"), parts)
             if not file_paths and not text and not end_input:
                 raise ValueError("an append needs text, files or end_input")
+            loop = asyncio.get_running_loop()
+
+            def on_late(error: str) -> None:
+                try:
+                    loop.call_soon_threadsafe(reply, {**late, "error": error}, binary)
+                except RuntimeError:
+                    pass  # the socket's loop has closed, and the client with it
+
             if api_server.stream_input(
                 key, file_paths or None, end_input=end_input, text=text or None,
-                file_streams=file_streams, model_kwargs=model_kwargs,
+                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late,
             ):
                 file_paths = None  # the preprocess worker deletes them once loaded
             else:

@@ -384,6 +384,55 @@ def test_a_deployment_lowers_a_streams_max_items(tmp_path):
         _thread(_CappedModel(), model_config={"client_streams": {"audio_in": {"max_items": 6}}})
 
 
+class _TwoStreams(_ListeningModel):
+    """``audio_in`` and ``video_in``; a file that names no stream goes to video_in."""
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            Connection(from_partition=CLIENT, to_partition="Ear", edge_name=name,
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       limits=ClientStreamLimits(max_items=10))
+            for name in ("audio_in", "video_in")
+        ])
+
+    def process_stream_chunk(self, chunk):
+        self.chunk_calls.append(chunk)
+        items = {"audio_in": [], "video_in": []}
+        for tensor, name in zip(chunk.tensors.get("audio_inputs", []), chunk.streams.get("audio_inputs", []),
+                                strict=True):
+            items[name or "video_in"].append(tensor)
+        return items
+
+
+def test_items_the_model_routes_to_an_ended_stream_are_late_and_neither_charged_nor_sent(tmp_path):
+    """The API server can't tell where a file that names no stream goes; the
+    preprocess thread can. Such items are dropped and the append is answered
+    as late, while what it carried for an open stream goes on."""
+    wt, sent, _tm = _thread(_TwoStreams())
+    _open(wt)
+    late = []
+    # an append's own items go ahead of the end it carries
+    wt._process_stream_input(ClientAppend(
+        "r", file_paths={"audio": [_audio_file(tmp_path, "v.raw", 2)]}, ends=frozenset({"video_in"}),
+        on_late=late.append,
+    ))
+    assert late == []
+
+    wt._process_stream_input(ClientAppend(
+        "r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 3), _audio_file(tmp_path, "b.raw", 4)]},
+        file_streams={"audio": ["audio_in", None]}, on_late=late.append,
+    ))
+
+    assert late == ["the call's 'video_in' input has ended"]
+    first, second = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
+    assert [info.dims for info in first.signals["video_in"]] == [[2]] and first.ended == ["video_in"]
+    assert list(second.signals) == ["audio_in"] and [info.dims for info in second.signals["audio_in"]] == [[3]]
+    assert wt._stream_items["r"] == {"video_in": 1, "audio_in": 1}
+    assert list(tmp_path.iterdir()) == []
+    wt._hard_cleanup("r")
+    assert "r" not in wt._ended_streams  # dropped with the request's other state
+
+
 class _RecordingPreprocess:
     def __init__(self):
         self.items = []
@@ -548,7 +597,7 @@ class _StreamingFakeServer:
     def taking_input(self, key):
         return not any(c[0] == "append" and c[1] == key and c[-1] is True for c in self.calls)
 
-    def stream_input(self, key, file_paths=None, end_input=False, **append):
+    def stream_input(self, key, file_paths=None, end_input=False, on_late=None, **append):
         names = sorted(p.rsplit("_", 1)[-1] for ps in (file_paths or {}).values() for p in ps)
         self.appended.append(append)
         self.calls.append(("append", key, names, end_input))
@@ -747,6 +796,19 @@ def test_an_append_naming_a_stream_the_model_lacks_is_refused(tmp_path):
                                     file_streams={"audio": ["audio_in"]})
 
 
+def test_an_opening_file_naming_a_stream_the_model_lacks_is_refused_with_a_400():
+    """Checked as an append's file is; process_prompt routes the opening's
+    files, so a stream the model has is only checked."""
+    server = _server()
+    with pytest.raises(HTTPException) as refused:
+        _submit(server, end_input=False, file_streams={"audio": [None, "video_in"]})
+    assert refused.value.status_code == 400 and "no client stream named 'video_in'" in refused.value.detail
+    assert "r" not in server._live and server.preprocess_worker.items == []
+
+    _submit(server, end_input=False, file_streams={"audio": ["audio_in"]})
+    assert isinstance(server.preprocess_worker.items[0], PreprocessInput)
+
+
 def test_an_append_s_text_counts_against_the_input_budget():
     server = _server()
     server.max_call_input_bytes = 8
@@ -888,6 +950,41 @@ def test_generate_ws_refuses_an_append_to_a_stream_the_model_lacks(monkeypatch, 
 
     (error,) = ws.sent
     assert error["status"] == 400 and "no client stream named 'nope'" in error["error"]
+
+
+def test_generate_ws_refuses_an_opening_file_naming_a_stream_the_model_lacks(monkeypatch, tmp_path):
+    server = _real_ws_server(monkeypatch, tmp_path)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text",
+         "files": [{"name": "c.wav", "data": "UklGRg==", "stream": "nope"}]},
+    ])
+    asyncio.run(_serve(ws, until=lambda: ws.sent))
+
+    (error,) = ws.sent
+    assert error["status"] == 400 and "no client stream named 'nope'" in error["error"]
+    assert server.preprocess_worker.items == []
+
+
+def test_an_append_the_model_routes_to_an_ended_stream_is_answered_as_late(monkeypatch, tmp_path):
+    """The preprocess thread answers through the append's ``on_late``, from
+    its own thread; the call goes on."""
+
+    class _RoutedToAnEndedStream(_StreamingFakeServer):
+        def stream_input(self, key, file_paths=None, end_input=False, on_late=None, **append):
+            threading.Thread(target=on_late, args=("the call's 'video_in' input has ended",)).start()
+            return super().stream_input(key, file_paths, end_input, **append)
+
+    fake = _RoutedToAnEndedStream(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
+    ])
+    asyncio.run(_serve(ws, until=lambda: ws.sent))
+
+    (late,) = ws.sent
+    assert late == {"request_id": "call", "append": True, "error": "the call's 'video_in' input has ended"}
+    assert not any(c[0] == "abort" for c in fake.calls)
 
 
 def test_what_an_append_record_carries_never_opens_a_request(monkeypatch, tmp_path):
