@@ -48,7 +48,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.whisper.config import (
     ATTN,
@@ -383,7 +383,7 @@ class WhisperModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Extract the log-mel spectrogram and build the forced decoder prompt.
 
         The text ``prompt`` is unused — Whisper is conditioned via the
@@ -411,9 +411,30 @@ class WhisperModel(Model):
             task=kwargs.get("task", "transcribe"),
         )
 
-        return {
+        # the encoder takes the padded window whole, so its context is always this long
+        context = self.config.max_source_positions
+        kv_layout = {
+            KV_CACHE: {"main": LabelLayout(
+                spans=(Span("ids", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
+                growth=(("decode_loop", 1),),
+            )},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
+                spans=(Span("rows", "prefill", context, context, "encoder_states"),),
+            )},
+        }
+        return ProcessPromptOutput({
             "audio_features": [audio_features],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
+        }, {"kv_layout": kv_layout})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the decode stop check ends the loop after max_tokens iterations
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {
+            KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: KVLabel()},
         }
 
     # -------------------------------------------------------------------
