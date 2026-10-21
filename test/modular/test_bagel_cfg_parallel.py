@@ -92,7 +92,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model._has_llm_disaggregation = True
     args = {
         "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
         )
     }
 
