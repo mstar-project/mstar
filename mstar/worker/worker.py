@@ -4599,8 +4599,10 @@ class Worker:
                     _set_pending(None)
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held
-                        # here before it sent the next step, so this rank does too,
-                        # before it takes that step.
+                        # here, and what it stamped with a step this rank dropped,
+                        # before it sent the next step, so this rank does too, before
+                        # it takes that step.
+                        self._apply_removes_whose_step_landed()
                         self._apply_pending_removes_safe_to_drop(set())
 
                 if spec_pending is not None:
