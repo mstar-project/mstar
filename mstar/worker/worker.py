@@ -3284,6 +3284,8 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(route_output)
+        # Those sends were the last readers of this step's host copies.
+        self.tensor_manager.drop_host_copies()
         _pp_stage("register_outputs")
 
         # send outputs
@@ -3343,7 +3345,7 @@ class Worker:
         # share one (refuse_combined_walks_across_tp_groups).
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
-        # reuses; safe because the sends below are their last reader.
+        # reuses, so they are dropped once this step's sends are done.
         # Row views of one batch clone (a decode step) are described from one
         # row; anything else goes through the general per-tensor path. Both
         # take the real walk, not the combined label: the runtime keys the
@@ -3787,7 +3789,7 @@ class Worker:
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
         the store and sends in ``_register_outputs`` later in the same
-        ``_postprocess_batch``, never reading them after.
+        ``_postprocess_batch``, which then drops them from the store.
         """
         source = outputs.get_check_stop_input()
         # Rows are in forward order, which the engine stamped on the output.
