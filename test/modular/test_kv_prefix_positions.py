@@ -34,7 +34,7 @@ from mstar.engine.resources.position.config import PositionSpec, PositionStep, P
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.model.base import PrefixStream
+from mstar.model.base import KVLabel, PrefixKeys
 from mstar.worker.engine_manager import (
     _refuse_uncacheable_positions,
     _refuse_unknown_walks,
@@ -213,8 +213,9 @@ class _Model:
     def __init__(self, *keyed: str):
         self._keyed = keyed
 
-    def prefix_key_streams(self):
-        return {key: {} for key in self._keyed}
+    def kv_labels(self):
+        keyed = KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))
+        return {key: {"main": keyed} for key in self._keyed}
 
 
 def test_a_declared_node_over_a_block_scheme_is_refused_at_load():
@@ -311,8 +312,10 @@ class _Walking:
         self._walk = walk
         self._runs = runs
 
-    def prefix_key_streams(self):
-        return {KV: {"main": PrefixStream("text_inputs", "ids", self._walk, "decode")}}
+    def kv_labels(self):
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=PrefixKeys(
+            "text_inputs", (self._walk,), growth=True,
+        ))}}
 
     def get_graph_walk_graphs(self):
         return {walk: None for walk in self._runs}

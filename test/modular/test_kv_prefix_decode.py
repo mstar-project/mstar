@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -84,13 +84,21 @@ def _pages(tokens: list[int]) -> list[list[int]]:
     ]
 
 
-def _ingest(kv: KVManager, rid: str, prompt: list[int], chains: bool = True):
+def _layout(prompt: list[int]) -> StreamLayout:
+    """The prompt, then a slot per decode step."""
+    return StreamLayout(
+        spans=(PrefixSpan(len(prompt), len(prompt), WALK),), growth=(("decode_loop", 1),), keyed_spans=1,
+    )
+
+
+def _ingest(kv: KVManager, rid: str, prompt: list[int], chains: bool = True, decode: int = 0):
     whole = len(prompt) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain(_pages(prompt))},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR} if chains else None,
-        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
+        kv_layout={"main": _layout(prompt)},
+        loop_caps={"decode_loop": decode},
     ))
 
 
@@ -133,7 +141,7 @@ def _indexed(kv: KVManager) -> int:
 def test_a_generated_page_is_indexed_at_the_commit_that_fills_it():
     kv = _manager()
     prompt = list(range(PAGE_SIZE))
-    _ingest(kv, "r0", prompt)
+    _ingest(kv, "r0", prompt, decode=PAGE_SIZE + 1)
     _prefill(kv, "r0", prompt)
     assert _indexed(kv) == 1, "the prompt's own page was not indexed"
 
@@ -160,7 +168,7 @@ def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
     kv = _manager()
     prompt = list(range(100))
     generated = list(range(9000, 9000 + 28))
-    _ingest(kv, "r0", prompt)
+    _ingest(kv, "r0", prompt, decode=len(generated))
     _prefill(kv, "r0", prompt, sampled=generated[0])
     for token in generated[1:]:
         _decode(kv, "r0", token)
@@ -184,7 +192,7 @@ def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
 def test_a_stop_on_the_boundary_leaves_the_page_one_slot_short():
     kv = _manager()
     prompt = list(range(100))
-    _ingest(kv, "r0", prompt)
+    _ingest(kv, "r0", prompt, decode=27)
     _prefill(kv, "r0", prompt, sampled=9000)
 
     # the request stops here: its last two sampled ids, the one before the
@@ -207,7 +215,7 @@ def test_a_stop_on_the_boundary_leaves_the_page_one_slot_short():
 def test_a_node_whose_decode_ids_are_not_the_sampled_token_stops_at_its_prompt():
     kv = _manager()
     prompt = list(range(PAGE_SIZE))
-    _ingest(kv, "r0", prompt, chains=False)
+    _ingest(kv, "r0", prompt, chains=False, decode=PAGE_SIZE + 1)
     _prefill(kv, "r0", prompt)
     after_prompt = _indexed(kv)
 
@@ -232,7 +240,8 @@ def test_a_request_that_opted_out_chains_nothing():
         prefix_keys={"main": chain(_pages(prompt))},
         prefix_tail={"main": []},
         prefix_decode={"main": TENSOR},
-        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
+        kv_layout={"main": _layout(prompt)},
+        loop_caps={"decode_loop": PAGE_SIZE + 1},
         prefix_cache=False,
     ))
 
