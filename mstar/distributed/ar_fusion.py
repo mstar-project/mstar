@@ -5,10 +5,13 @@ FlashInfer's ``allreduce_fusion`` on NVIDIA (~4-6us vs ~11us unfused at decode
 sizes), AITER's custom all-reduce with fused RMSNorm on ROCm. Each is an
 ``ARFusion`` behind the ``mstar::allreduce_add_rmsnorm`` op, so dynamo and graph
 capture see one opaque node. Inputs a strategy doesn't accept go through
-``CommGroup``'s plain all-reduce + norm.
+``CommGroup``'s all-reduce (its ``AllReduce`` backend, see ``all_reduce.py``)
+and a separate norm.
 
-Setting one up is collective over the TP group. Anything that picks a code path
-either depends only on sizes and world size or is agreed across ranks first.
+``ARFusion.new`` sets one up for a group, as ``AllReduce.new`` does the
+all-reduce backend. It's collective over the TP group, and anything that picks
+a code path either depends only on sizes and world size or is agreed across
+ranks first.
 """
 from __future__ import annotations
 
@@ -18,11 +21,15 @@ import inspect
 import logging
 import os
 import re
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 from mstar.platforms.dispatch import PlatformDispatch
+
+if TYPE_CHECKING:
+    from mstar.distributed.communication import CommGroup
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +60,20 @@ class ARFusion:
     """A TP group's fused all-reduce + residual + RMSNorm kernel."""
 
     ws_id: int = -1
+
+    @classmethod
+    def new(
+        cls, group: CommGroup, hidden: int, dtype: torch.dtype, max_tokens: int,
+    ) -> ARFusion | None:
+        """The platform's kernel for ``group``, for up to ``max_tokens`` rows
+        of ``hidden``, or None where there is none and the caller stays
+        unfused. Collective over the group, like ``AllReduce.new``: every
+        member calls it at the same point."""
+        fusion = _create(group, max_tokens, hidden, dtype)
+        if fusion is not None:
+            fusion.ws_id = len(_FUSIONS)
+            _FUSIONS.append(fusion)
+        return fusion
 
     def accepts(
         self, x: torch.Tensor, residual: torch.Tensor, weight_bias: float,
@@ -88,12 +109,6 @@ class ARFusion:
 # --- NVIDIA: FlashInfer ------------------------------------------------------
 
 
-def _all_ranks(ok: bool, cpu_group) -> bool:
-    flag = torch.tensor([int(ok)], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=cpu_group)
-    return bool(flag.item())
-
-
 class FlashInferARFusion(ARFusion):
     """FlashInfer's one-shot ``allreduce_fusion``, up to ``max_tokens`` rows."""
 
@@ -110,8 +125,7 @@ class FlashInferARFusion(ARFusion):
 
     @classmethod
     def create(
-        cls, rank: int, world_size: int, cpu_group, max_tokens: int,
-        hidden: int, dtype: torch.dtype,
+        cls, group: CommGroup, max_tokens: int, hidden: int, dtype: torch.dtype,
     ) -> FlashInferARFusion | None:
         try:
             import flashinfer.comm as fc
@@ -124,9 +138,9 @@ class FlashInferARFusion(ARFusion):
             ws = None
             try:
                 ws = fc.create_allreduce_fusion_workspace(
-                    backend=backend, world_size=world_size, rank=rank,
+                    backend=backend, world_size=group.world_size, rank=group.rank,
                     max_token_num=max_tokens, hidden_dim=hidden, dtype=dtype,
-                    comm_backend=TorchDistBackend(group=cpu_group), group=cpu_group,
+                    comm_backend=TorchDistBackend(group=group.cpu_group), group=group.cpu_group,
                 )
             except Exception:
                 logger.warning("FlashInfer all-reduce fusion backend %r failed",
@@ -134,7 +148,7 @@ class FlashInferARFusion(ARFusion):
             # Every rank must use the same backend, or the next collective
             # deadlocks: keep one only if it built on all of them.
             try:
-                agreed = _all_ranks(ws is not None, cpu_group)
+                agreed = group.agree([int(ws is not None)])[0]
             except RuntimeError:
                 # A rank failed between FlashInfer's own collectives, so this vote
                 # met a different one; the gloo timeout closes the group on every
@@ -148,7 +162,7 @@ class FlashInferARFusion(ARFusion):
                 logger.info("all-reduce fusion workspace: %s (backend %r), up to "
                             "%d tokens x %d", type(ws).__name__, backend,
                             max_tokens, hidden)
-                return cls(ws, max_tokens, world_size)
+                return cls(ws, max_tokens, group.world_size)
             if ws is not None:
                 ws.destroy()
         logger.warning("no FlashInfer all-reduce fusion backend works here; "
@@ -342,9 +356,9 @@ class AiterARFusion(ARFusion):
 
     @classmethod
     def create(
-        cls, rank: int, world_size: int, cpu_group, max_tokens: int,
-        hidden: int, dtype: torch.dtype,
+        cls, group: CommGroup, max_tokens: int, hidden: int, dtype: torch.dtype,
     ) -> AiterARFusion | None:
+        rank, world_size, cpu_group = group.rank, group.world_size, group.cpu_group
         bound = cls.fused_token_bound(world_size, hidden, dtype, max_tokens)
         if bound == 0:
             # depends only on sizes, same on every rank
@@ -537,20 +551,6 @@ _create = PlatformDispatch(
     rocm=lambda: AiterARFusion.create,
     default=lambda: FlashInferARFusion.create,
 )
-
-
-def create_fusion(
-    rank: int, world_size: int, cpu_group, max_tokens: int, hidden: int,
-    dtype: torch.dtype,
-) -> ARFusion | None:
-    """Collective over the TP group, every member calls it in the same order.
-    Returns the strategy for ``allreduce_add_rmsnorm``, or None if there's none
-    here and the caller should stay unfused."""
-    fusion = _create(rank, world_size, cpu_group, max_tokens, hidden, dtype)
-    if fusion is not None:
-        fusion.ws_id = len(_FUSIONS)
-        _FUSIONS.append(fusion)
-    return fusion
 
 
 @torch.library.custom_op("mstar::allreduce_add_rmsnorm", mutates_args=())

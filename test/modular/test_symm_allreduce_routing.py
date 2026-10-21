@@ -562,10 +562,10 @@ def flashinfer(monkeypatch, fake_cuda):
 
     built, routed = [], []
 
-    def create(rank, world_size, cpu_group, max_tokens, hidden, dtype):
+    def create(group, max_tokens, hidden, dtype):
         nbytes = max_tokens * hidden * dtype.itemsize
-        built.append((cpu_group, nbytes))
-        return ar_fusion.FlashInferARFusion(_Workspace(nbytes), max_tokens, world_size)
+        built.append((group.cpu_group, nbytes))
+        return ar_fusion.FlashInferARFusion(_Workspace(nbytes), max_tokens, group.world_size)
 
     monkeypatch.setattr(ar_fusion, "_FUSIONS", [])
     monkeypatch.setattr(ar_fusion, "_create", create)

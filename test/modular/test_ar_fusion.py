@@ -72,8 +72,9 @@ def test_each_platform_builds_its_strategy(monkeypatch, on_platform, platform, e
     monkeypatch.setattr(AiterARFusion, "create",
                         classmethod(lambda cls, *a: _Tagged("aiter")))
 
-    first = ar_fusion.create_fusion(0, 2, None, 2048, 4096, BF16)
-    second = ar_fusion.create_fusion(0, 2, None, 2048, 4096, BF16)
+    group = CommGroup(0, 0, [0, 1])
+    first = ARFusion.new(group, 4096, BF16, 2048)
+    second = ARFusion.new(group, 4096, BF16, 2048)
 
     assert (first.tag, second.tag) == (expected, expected)
     assert (first.ws_id, second.ws_id) == (0, 1)
@@ -83,7 +84,7 @@ def test_each_platform_builds_its_strategy(monkeypatch, on_platform, platform, e
 def test_a_strategy_that_cannot_build_is_not_registered(monkeypatch, on_platform):
     on_platform(RocmPlatform())
     monkeypatch.setattr(AiterARFusion, "create", classmethod(lambda cls, *a: None))
-    assert ar_fusion.create_fusion(0, 2, None, 2048, 4096, BF16) is None
+    assert ARFusion.new(CommGroup(0, 0, [0, 1]), 4096, BF16, 2048) is None
     assert ar_fusion._FUSIONS == []
 
 
@@ -261,7 +262,8 @@ def _create(monkeypatch, peers=None, check=None, world=2, hidden=4096):
     peers = peers or _Peers()
     monkeypatch.setattr(ar_fusion, "_agree", peers)
     monkeypatch.setattr(AiterARFusion, "_check_kernel", staticmethod(lambda *a: check))
-    fusion = AiterARFusion.create(0, world, "gloo-group", 2048, hidden, BF16)
+    group = types.SimpleNamespace(rank=0, world_size=world, cpu_group="gloo-group")
+    fusion = AiterARFusion.create(group, 2048, hidden, BF16)
     return fusion, peers
 
 
@@ -627,7 +629,7 @@ def test_without_a_fusion_capture_scopes_are_plain(monkeypatch):
 
 def test_single_rank_groups_never_build_a_fusion(monkeypatch):
     built = []
-    monkeypatch.setattr(ar_fusion, "create_fusion", lambda *a: built.append(a))
+    monkeypatch.setattr(ARFusion, "new", classmethod(lambda cls, *a: built.append(a)))
     assert CommGroup.trivial().init_allreduce_fusion(4096, BF16) is False
     assert built == []
 
@@ -635,13 +637,26 @@ def test_single_rank_groups_never_build_a_fusion(monkeypatch):
 def test_init_builds_once_per_group(monkeypatch):
     calls = []
 
-    def create(*args):
+    def new(cls, *args):
         calls.append(args)
         return _Recording(accept=True)
 
-    monkeypatch.setattr(ar_fusion, "create_fusion", create)
+    monkeypatch.setattr(ARFusion, "new", classmethod(new))
     group = CommGroup(1, 1, [0, 1])
     group.cpu_group = "gloo"
     assert group.init_allreduce_fusion(4096, BF16, max_tokens=64)
     assert group.init_allreduce_fusion(4096, BF16, max_tokens=64)
-    assert calls == [(1, 2, "gloo", 64, 4096, BF16)]
+    assert calls == [(group, 4096, BF16, 64)]
+
+
+def test_new_hands_the_group_to_the_platforms_strategy(monkeypatch, on_platform):
+    """``ARFusion.new`` takes the CommGroup, as ``AllReduce.new`` does, and the
+    strategy reads the rank, size and gloo twin off it."""
+    on_platform(RocmPlatform())
+    seen = []
+    monkeypatch.setattr(AiterARFusion, "create",
+                        classmethod(lambda cls, *a: seen.append(a) or _Tagged("aiter")))
+    group = CommGroup(5, 1, [4, 5])
+    group.cpu_group = "gloo"
+    fusion = ARFusion.new(group, 4096, BF16, 64)
+    assert seen == [(group, 64, 4096, BF16)] and fusion.ws_id == 0
