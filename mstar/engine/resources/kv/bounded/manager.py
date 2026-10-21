@@ -248,6 +248,10 @@ class BoundedKVManager(Resource):
             return
         with self._lock:
             for seg in step.segments or ():
+                if seg.span == 0:
+                    # writes nothing; skipped so a step that only reads a row
+                    # (an outer step whose region writes it) can't undo the write
+                    continue
                 req = self._requests.get(seg.request_id)
                 pos = step.positions.get(seg.request_id)
                 if req is not None and pos is not None and not ctx.is_padding_row(seg.request_id):
