@@ -31,6 +31,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.model.whisper.components import alignment
 from mstar.model.whisper.components.alignment import word_timings
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.components.encoder import WhisperEncoderModel
@@ -248,6 +249,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
         self.timestamp_rules = TimestampRules(config)
+        alignment.warm_up()
 
     # -- logit rules ------------------------------------------------------
 
