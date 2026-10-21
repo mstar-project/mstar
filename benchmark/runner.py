@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import dataclasses
+import json
 import os
 import random
 import time
@@ -15,6 +17,7 @@ from benchmark.dataset import (
     DROIDDataset,
     Food101Dataset,
     LibriSpeechDataset,
+    SampleSetDataset,
     SeedTTSDataset,
     TxtFileDataset,
     UCF101Dataset,
@@ -24,10 +27,14 @@ from benchmark.dataset import (
 from benchmark.request import (
     AggregateMetrics,
     InferenceSystem,
+    OpenAIText,
+    OpenAITranscribe,
+    OrpheusVLLM,
     OursOpenAI,
     OurSystem,
     RequestInput,
     RequestMetrics,
+    SGLangDiffusion,
     SGLangOmni,
     VLLMOmni,
     VoxServe,
@@ -44,6 +51,7 @@ class DatasetType(Enum):
     DROID = "droid"
     VIDEO_MME = "video_mme"
     SEED_TTS = "seed_tts"
+    SAMPLE_SET = "sample_set"
 
 
 class InferenceSystemType(Enum):
@@ -52,6 +60,11 @@ class InferenceSystemType(Enum):
     VLLM_OMNI = "vllm_omni"
     VOX_SERVE = "vox_serve"
     SGLANG_OMNI = "sglang_omni"
+    VLLM = "vllm"
+    SGLANG = "sglang"
+    ORPHEUS_VLLM = "orpheus_vllm"
+    TRANSCRIBE = "openai_transcribe"
+    SGLANG_DIFFUSION = "sglang_diffusion"
 
     def instantiate(self) -> InferenceSystem:
         if self == InferenceSystemType.OURS:
@@ -64,6 +77,14 @@ class InferenceSystemType(Enum):
             return VoxServe()
         elif self == InferenceSystemType.SGLANG_OMNI:
             return SGLangOmni()
+        elif self in (InferenceSystemType.VLLM, InferenceSystemType.SGLANG):
+            return OpenAIText()
+        elif self == InferenceSystemType.ORPHEUS_VLLM:
+            return OrpheusVLLM()
+        elif self == InferenceSystemType.TRANSCRIBE:
+            return OpenAITranscribe()
+        elif self == InferenceSystemType.SGLANG_DIFFUSION:
+            return SGLangDiffusion()
 
 
 class ProfilingType(Enum):
@@ -108,6 +129,9 @@ class BenchmarkConfig:
     # text dataset args
     request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
 
+    # sample_set: a directory with a manifest.json (see SampleSetDataset)
+    sample_set_dir: Optional[str] = None
+
     # DROID (robotics) args — used by DROIDDataset for pi05 / vjepa2_ac.
     # rollout_horizon is only consumed by the vjepa2_ac task.
     droid_rollout_horizon: int = 4
@@ -122,11 +146,35 @@ class BenchmarkConfig:
     output_len_max: Optional[int] = None
     output_len_seed: int = 0
 
+    # Chat template arguments (e.g. {"enable_thinking": false}) for the OpenAI chat systems.
+    chat_template_kwargs: Optional[dict] = None
+    # Prefix every prompt with a tag unique to this run and send, so no request can reuse
+    # another's cached prefix (warmup sends the same prompts as the measured requests).
+    unique_prompts: bool = False
+    # Settings merged into every request (e.g. steps and frame count for a generator).
+    request_kwargs: Optional[dict] = None
+    # Audio format asked of chat replies with speech (vllm-omni sends WAV segments by default).
+    chat_audio_format: Optional[str] = None
+
 
 class Benchmark:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self.inference_system = config.inference_system.instantiate()
+        if config.chat_template_kwargs is not None:
+            if not hasattr(self.inference_system, "chat_template_kwargs"):
+                raise ValueError(f"--chat-template-kwargs is not supported by {config.inference_system.value}")
+            self.inference_system.chat_template_kwargs = config.chat_template_kwargs
+        if config.chat_audio_format is not None:
+            if not hasattr(self.inference_system, "chat_audio_format"):
+                raise ValueError(f"--chat-audio-format is not supported by {config.inference_system.value}")
+            self.inference_system.chat_audio_format = config.chat_audio_format
+        self._prompt_salt = os.urandom(4).hex()
+
+    def _tag_prompt(self, req: RequestInput, tag: str) -> RequestInput:
+        if not self.config.unique_prompts:
+            return req
+        return dataclasses.replace(req, prompt=f"[{self._prompt_salt}-{tag}] {req.prompt}")
 
     def _get_dataset(self) -> BaseDataset:
         if self.config.dataset == DatasetType.VBENCH:
@@ -186,6 +234,14 @@ class Benchmark:
                 data_dir=self.config.video_mme_dir,
                 cache_dir=self.config.local_cache_dir,
             )
+        elif self.config.dataset == DatasetType.SAMPLE_SET:
+            if not self.config.sample_set_dir:
+                raise ValueError("--dataset sample_set needs --sample-set-dir")
+            return SampleSetDataset(
+                set_dir=self.config.sample_set_dir,
+                num_requests=self.config.num_requests,
+                req_type=self.config.request_type,
+            )
         elif self.config.dataset == DatasetType.SEED_TTS:
             return SeedTTSDataset(
                 num_requests=self.config.num_requests,
@@ -230,7 +286,6 @@ class Benchmark:
         three system outputs uniformly. Only writes when ``--output-dir`` is
         set; opt-in to keep existing benchmark runs unchanged.
         """
-        import json
         output_dir = self.config.output_dir
         if output_dir is None:
             return
@@ -257,7 +312,12 @@ class Benchmark:
                 "output_bytes": dict(m.output_bytes),
                 # per-modality time to first chunk, seconds (TTFT / time to first audio)
                 "ttft_s": dict(m.ttft),
+                "output_text_tokens": m.output_text_tokens,
+                "input_tokens": m.input_tokens,
+                "response_chunks": dict(m.response_chunks),
             })
+        ok_ids = {id(m) for m in ok_metrics}
+        errors = [{"request_id": m.request_id, "error": m.error} for m in metrics if id(m) not in ok_ids]
 
         def _stats(stats):
             if stats is None:
@@ -266,6 +326,9 @@ class Benchmark:
 
         payload = {
             "system": "ours",
+            "inference_system": self.config.inference_system.value,
+            "max_concurrency": self.config.max_concurrency,
+            "unique_prompts_salt": self._prompt_salt if self.config.unique_prompts else None,
             "model": getattr(self.config.model, "__class__", type(self.config.model)).__name__,
             "request_type": self.config.request_type.value,
             "profiling_type": self.config.profiling_type.value,
@@ -274,6 +337,8 @@ class Benchmark:
             "completed": len(ok_metrics),
             "failed": len(metrics) - len(ok_metrics),
             "wall_time_s": wall_time,
+            "client_loop_cpu_s": getattr(self, "_client_cpu", (None, None))[0],
+            "client_process_cpu_s": getattr(self, "_client_cpu", (None, None))[1],
             "jct_mean_ms": (sum(jcts_ms) / len(jcts_ms)) if jcts_ms else 0.0,
             "jct_median_ms": jcts_ms[len(jcts_ms) // 2] if jcts_ms else 0.0,
             "jct_p90_ms": _pct(jcts_ms, 90),
@@ -289,8 +354,13 @@ class Benchmark:
                 "audio_seconds_throughput": agg.audio_seconds_throughput,
                 "audio_duration_mean_s": agg.audio_duration_mean_s,
                 "total_output_bytes": dict(agg.total_output_bytes),
+                "itl_s": {modality: _stats(stats) for modality, stats in agg.itl.items()},
+                "total_text_tokens": agg.total_text_tokens,
+                "total_input_tokens": agg.total_input_tokens,
+                "text_token_throughput": agg.text_token_throughput,
             },
             "per_request": per_request,
+            "errors": errors,
         }
 
         os.makedirs(output_dir, exist_ok=True)
@@ -415,7 +485,7 @@ class Benchmark:
             wave_size = 1
 
         warmup_total = wave_size * self.config.num_warmup
-        warmup_reqs = [requests[i % len(requests)] for i in range(warmup_total)]
+        warmup_reqs = [self._tag_prompt(requests[i % len(requests)], f"w{i}") for i in range(warmup_total)]
 
         if self.config.verbose:
             print(f"--- Warmup ({self.config.profiling_type.value}, {warmup_total} request(s), wave={wave_size}) ---")
@@ -463,7 +533,11 @@ class Benchmark:
             # make even multiple of batch size
             self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
         requests = dataset.get_requests()[: self.config.num_requests]
+        if self.config.request_kwargs:
+            requests = [dataclasses.replace(r, model_kwargs={**r.model_kwargs, **self.config.request_kwargs})
+                        for r in requests]
         self._assign_output_lengths(requests)
+        measured = [self._tag_prompt(r, f"m{i}") for i, r in enumerate(requests)]
 
         # Bump the connection-pool cap so closed-loop runs at high
         # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
@@ -476,15 +550,19 @@ class Benchmark:
             await self._warmup(session, requests)
 
             wall_start = time.monotonic()
+            loop_cpu_start, cpu_start = time.thread_time(), time.process_time()
 
             if self.config.profiling_type == ProfilingType.OFFLINE:
-                metrics = await self._run_concurrent_offline(session, requests)
+                metrics = await self._run_concurrent_offline(session, measured)
             elif self.config.profiling_type == ProfilingType.CLOSED_LOOP:
-                metrics = await self._run_concurrent_closed_loop(session, requests)
+                metrics = await self._run_concurrent_closed_loop(session, measured)
             else:
-                metrics = await self._run_concurrent_online(session, requests)
+                metrics = await self._run_concurrent_online(session, measured)
 
             wall_time = time.monotonic() - wall_start
+            # CPU of the event-loop thread (where every request and stream is handled) and of the whole process
+            # over the timed window: a loop busy for nearly all of wall_time means the client set the pace.
+            self._client_cpu = (time.thread_time() - loop_cpu_start, time.process_time() - cpu_start)
 
         agg = aggregate_metrics(
             metrics,
@@ -588,6 +666,12 @@ def parse_args() -> BenchmarkConfig:
         help="Text file with one line per prompt",
     )
 
+    parser.add_argument(
+        "--sample-set-dir",
+        default=None,
+        help="--dataset sample_set: directory with a manifest.json of items (prompt + media files).",
+    )
+
     # DROID (robotics) dataset args
     droid = parser.add_argument_group("droid")
     droid.add_argument(
@@ -626,6 +710,29 @@ def parse_args() -> BenchmarkConfig:
         type=int,
         default=0,
         help="Seed for per-request length sampling (same across systems for parity).",
+    )
+
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        default=None,
+        help='JSON chat template arguments for the OpenAI chat systems, e.g. \'{"enable_thinking": false}\'.',
+    )
+    parser.add_argument(
+        "--unique-prompts",
+        action="store_true",
+        help="Prefix each prompt with a tag unique to the run and send, so no request reuses a cached prefix.",
+    )
+    parser.add_argument(
+        "--request-kwargs",
+        type=json.loads,
+        default=None,
+        help='JSON settings merged into every request, e.g. \'{"num_inference_steps": 4}\'.',
+    )
+    parser.add_argument(
+        "--chat-audio-format",
+        default=None,
+        help="Audio format for chat replies with speech, e.g. pcm (vllm-omni defaults to WAV segments).",
     )
 
     args = parser.parse_args()
@@ -702,6 +809,7 @@ def parse_args() -> BenchmarkConfig:
         seed_tts_dir=args.seed_tts_dir,
         seed_tts_locale=args.seed_tts_locale,
         request_txt_file=txtfile,
+        sample_set_dir=args.sample_set_dir,
         local_cache_dir=args.local_cache,
         droid_rollout_horizon=args.droid_rollout_horizon,
         droid_hf_cache=args.droid_hf_cache,
@@ -709,6 +817,10 @@ def parse_args() -> BenchmarkConfig:
         output_len_min=args.output_len_min,
         output_len_max=args.output_len_max,
         output_len_seed=args.output_len_seed,
+        chat_template_kwargs=args.chat_template_kwargs,
+        unique_prompts=args.unique_prompts,
+        request_kwargs=args.request_kwargs,
+        chat_audio_format=args.chat_audio_format,
     )
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -14,7 +15,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Chatterbox, Kokoro, Model, Orpheus, Qwen3TTS, RequestType, Status
+from benchmark.base import Bagel, Chatterbox, DiffusionModel, Kokoro, Model, Orpheus, Qwen3TTS, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -122,6 +123,7 @@ class RequestMetrics:
     # Robotics outputs: raw float32 bytes per chunk
     _action_chunks: list[bytes] = field(default_factory=list, repr=False)
     _video_chunks: list[bytes] = field(default_factory=list, repr=False)
+    _video_file_chunks: list[bytes] = field(default_factory=list, repr=False)  # an encoded clip (mp4)
 
     def __post_init__(self):
         # `start_time` is intentionally NOT set here. The adapter must set it
@@ -178,6 +180,8 @@ class RequestMetrics:
             self._action_chunks.append(data)
         elif modality == "video":
             self._video_chunks.append(data)
+        elif modality == "video_file":
+            self._video_file_chunks.append(data)
 
     def record_token(self, modality: str, nbytes: int, arrival_time: float | None = None, n_tokens: int = 1):
         """
@@ -274,6 +278,10 @@ class RequestMetrics:
             arr = np.frombuffer(raw, dtype=np.float32)
             path = os.path.join(output_dir, f"req_{self.request_id}_actions.npy")
             np.save(path, arr)
+            n_outputs += 1
+        if self._video_file_chunks:
+            with open(os.path.join(output_dir, f"req_{self.request_id}.mp4"), "wb") as f:
+                f.write(b"".join(self._video_file_chunks))
             n_outputs += 1
         if self._video_chunks:
             # World-model outputs are latent float32 tensors, not renderable video.
@@ -994,7 +1002,173 @@ def _bytes_to_data_url(image_bytes: bytes, image_path: str | None) -> str:
         return f"data:{mime};base64,{encoded}"
 
 
-class VLLMOmni(InferenceSystem):
+class SpeechRoute:
+    """``/v1/audio/speech`` with streamed PCM16, for the OpenAI-style adapters."""
+
+    def _speech_fields(self) -> dict:
+        return {}
+
+    async def _send_request_audio_speech(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: "RequestInput",
+        base_url: str,
+        model: Model,
+        metrics: "RequestMetrics",
+        additional_model_kwargs: dict,
+    ) -> "RequestMetrics":
+        """TTS via OpenAI ``/v1/audio/speech`` (streaming PCM16).
+
+        ``response_format="pcm"`` asks for bare 16-bit PCM frames so every
+        server's bytes count the same audio. A server that answers with a WAV
+        anyway (M* before ``pcm`` streaming landed, Kokoro-FastAPI's muxer)
+        starts with ``RIFF``; that 44-byte header is stripped once, then each
+        read is recorded as a PCM16 audio chunk so timing/throughput match the
+        native path.
+        """
+        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
+        payload: dict = {
+            "model": model.get_served_model_name(),
+            "input": req_input.prompt,
+            "response_format": "pcm",
+            "stream": True,
+            **self._speech_fields(),
+            **kwargs,
+        }
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/audio/speech",
+                json=payload,
+                headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                header_skipped = False
+                pending = b""
+                async for raw in resp.content.iter_any():
+                    if not raw:
+                        continue
+                    if not header_skipped:
+                        pending += raw
+                        if len(pending) < 44:
+                            continue
+                        # drop a 44-byte streaming WAV header if the server sent one
+                        raw = pending[44:] if pending[:4] == b"RIFF" else pending
+                        pending = b""
+                        header_skipped = True
+                        if not raw:
+                            continue
+                    metrics.record_output_chunk(
+                        modality="audio",
+                        data_b64=base64.b64encode(raw),
+                        arrival_time=time.monotonic(),
+                        n_tokens=1,
+                    )
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
+def _media_fields(model: Model, req_input: RequestInput, additional_model_kwargs: dict) -> dict:
+    """Generation settings for the image and video routes. ``height``/``width`` become the OpenAI
+    ``size`` ("WxH") every engine here reads."""
+    fields = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
+    height, width = fields.pop("height", None), fields.pop("width", None)
+    if height and width:
+        fields["size"] = f"{width}x{height}"
+    return fields
+
+
+class MediaRoutes:
+    """Image generation over ``/v1/images/generations`` and video generation, either mstar's synchronous
+    ``/v1/videos/generations`` or the job API of vllm-omni and SGLang Diffusion (``POST /v1/videos``,
+    poll, ``GET /content``), as benchmark/flux2_klein/bench_images.py and
+    benchmark/wan22/video_bench_wan22.py send them to these engines."""
+
+    video_poll_s = 0.1
+
+    async def _send_request_image(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        body = {"model": model.get_served_model_name(), "prompt": req_input.prompt, "n": 1,
+                "response_format": "b64_json", **_media_fields(model, req_input, additional_model_kwargs)}
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/images/generations", json=body,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=1800)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                data = (await resp.json()).get("data") or []
+                b64 = data[0].get("b64_json") if data else None
+                if not b64:
+                    raise Exception("no image in the response")
+                metrics.record_output_chunk("image", b64, arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+    async def _send_request_video_sync(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        body = {"model": model.get_served_model_name(), "prompt": req_input.prompt,
+                **_media_fields(model, req_input, additional_model_kwargs)}
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/videos/generations", json=body,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=3600)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                data = (await resp.json()).get("data") or []
+                b64 = data[0].get("b64_json") if data else None
+                if not b64:
+                    raise Exception("no video in the response")
+                metrics.record_output_chunk("video_file", b64, arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+    async def _send_request_video_job(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        form = aiohttp.FormData()  # these servers reject a JSON body on /v1/videos
+        fields = {"model": model.get_hf_url(), "prompt": req_input.prompt,
+                  **_media_fields(model, req_input, additional_model_kwargs)}
+        for k, v in fields.items():
+            form.add_field(k, str(v))
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/videos", data=form) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                job = await resp.json()
+            vid = job.get("id") or job.get("video_id")
+            while True:
+                async with session.get(f"{base_url}/v1/videos/{vid}") as resp:
+                    info = await resp.json()
+                status = info.get("status")
+                if status == "completed":
+                    break
+                if status in ("failed", "error", "cancelled"):
+                    raise Exception(f"job {status}: {str(info.get('error'))[:200]}")
+                await asyncio.sleep(self.video_poll_s)
+            async with session.get(f"{base_url}/v1/videos/{vid}/content",
+                                   timeout=aiohttp.ClientTimeout(total=None, sock_read=600)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status} on /content")
+                mp4 = await resp.read()
+            metrics.record_output_chunk("video_file", base64.b64encode(mp4), arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
+class VLLMOmni(MediaRoutes, SpeechRoute, InferenceSystem):
     """
     Benchmark adapter for the vllm-omni OpenAI-compatible server.
 
@@ -1015,6 +1189,27 @@ class VLLMOmni(InferenceSystem):
     vllm-omni's expected behavior: `["audio"]` streams audio-only; absence
     streams text+audio because the talker runs unconditionally).
     """
+
+    # Chat template arguments (e.g. enable_thinking), set by the runner.
+    chat_template_kwargs: Optional[dict] = None
+    # Audio format asked of a chat reply with speech (vllm-omni's default sends WAV segments).
+    chat_audio_format: Optional[str] = None
+
+    def _extra_fields(self) -> dict:
+        return {"chat_template_kwargs": self.chat_template_kwargs} if self.chat_template_kwargs else {}
+
+    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
+        payload["modalities"] = [output_mod]
+        if output_mod == "audio" and self.chat_audio_format:
+            payload["audio"] = {"format": self.chat_audio_format}
+        return payload
+
+    def _speech_fields(self) -> dict:
+        # vllm-omni streams raw PCM only with stream_format=audio (benchmark/tts_speech_bench.py).
+        return {"stream_format": "audio"}
+
+    def _video_sender(self):
+        return self._send_request_video_job
 
     async def send_request(
         self,
@@ -1044,15 +1239,22 @@ class VLLMOmni(InferenceSystem):
                 metrics=metrics,
                 additional_model_kwargs=additional_model_kwargs,
             )
+        if output_mod == "audio" and isinstance(model, Qwen3TTS):
+            # A TTS checkpoint has no chat route on vllm-omni; it serves /v1/audio/speech.
+            return await self._send_request_audio_speech(
+                session=session,
+                req_input=req_input,
+                base_url=base_url,
+                model=model,
+                metrics=metrics,
+                additional_model_kwargs=additional_model_kwargs,
+            )
+        if isinstance(model, DiffusionModel):
+            send = self._send_request_image if output_mod == "image" else self._video_sender()
+            return await send(session, req_input, base_url, model, metrics, additional_model_kwargs)
 
         try:
             user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
-            # Always send `modalities` explicitly. Omitting the field makes
-            # vllm-omni's server fall back to text+audio output even for
-            # text-only requests (the talker runs unconditionally), inflating
-            # work and emitting unwanted audio chunks. Sending ["text"] tells
-            # the server to skip the talker.
-            modalities_arg = [output_mod]
 
             # Image outputs don't stream over /v1/chat/completions
             is_image_output = output_mod == "image"
@@ -1072,13 +1274,19 @@ class VLLMOmni(InferenceSystem):
                 # accepts ignore_eos and tolerates extra keys.
                 **req_input.model_kwargs,
                 **additional_model_kwargs,
+                **self._extra_fields(),
             }
             if is_image_output:
                 payload["stream"] = False
             else:
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
-            payload["modalities"] = modalities_arg
+            # Always send `modalities` explicitly. Omitting the field makes
+            # vllm-omni's server fall back to text+audio output even for
+            # text-only requests (the talker runs unconditionally), inflating
+            # work and emitting unwanted audio chunks. Sending ["text"] tells
+            # the server to skip the talker.
+            payload = self._finish_payload(payload, output_mod)
 
             # Match vllm-omni bench headers (`patch.py:354-358`).
             headers = {
@@ -1308,7 +1516,7 @@ class VLLMOmni(InferenceSystem):
         return metrics
 
 
-class SGLangOmni(InferenceSystem):
+class SGLangOmni(SpeechRoute, InferenceSystem):
     """
     Benchmark adapter for the sglang-omni OpenAI-compatible server.
 
@@ -1342,6 +1550,15 @@ class SGLangOmni(InferenceSystem):
             type=req_type,
             expected_output_modalities=[output_mod],
         )
+        if output_mod == "audio" and isinstance(model, Qwen3TTS):
+            return await self._send_request_audio_speech(
+                session=session,
+                req_input=req_input,
+                base_url=base_url,
+                model=model,
+                metrics=metrics,
+                additional_model_kwargs=additional_model_kwargs,
+            )
 
         try:
             # Same logic as VLLMOmni: audio output needs ["text", "audio"] so
@@ -1459,6 +1676,180 @@ class SGLangOmni(InferenceSystem):
         return metrics
 
 
+class SGLangDiffusion(MediaRoutes, InferenceSystem):
+    """SGLang Diffusion (``sglang serve``): images and the video job API, like vllm-omni."""
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        output_mod = req_input.req_type.get_output_modalities()
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type,
+                                 expected_output_modalities=[output_mod])
+        if output_mod == "image":
+            return await self._send_request_image(session, req_input, base_url, model, metrics,
+                                                  additional_model_kwargs)
+        if output_mod == "video_file":
+            return await self._send_request_video_job(session, req_input, base_url, model, metrics,
+                                                      additional_model_kwargs)
+        metrics.record_error(f"sglang_diffusion does not serve {output_mod} requests")
+        return metrics
+
+
+class OpenAIText(VLLMOmni):
+    """Plain OpenAI-compatible text servers (vLLM, SGLang).
+
+    Same chat request as :class:`VLLMOmni`, minus the fields these servers don't
+    know: no ``modalities`` and no mstar-only ``max_output_tokens`` (vLLM logs a
+    warning for every unknown field).
+    """
+
+    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
+        payload.pop("max_output_tokens", None)
+        return payload
+
+
+class OpenAITranscribe(InferenceSystem):
+    """ASR over OpenAI ``/v1/audio/transcriptions`` (vLLM's Whisper, mstar's ``/v1``). Not streamed,
+    so the time to the first text is the whole request."""
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type, expected_output_modalities=["text"])
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", req_input.get_bytes("audio"), filename=req_input.get_filename("audio") or "a.wav",
+                           content_type="audio/wav")
+            form.add_field("model", model.get_hf_url())
+            form.add_field("language", "en")
+            form.add_field("temperature", "0")
+            form.add_field("response_format", "json")
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/audio/transcriptions", data=form,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                text = (await resp.json()).get("text", "")
+                metrics.record_output_chunk("text", base64.b64encode(text.encode()).decode(),
+                                            arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
+class OrpheusVLLM(InferenceSystem):
+    """Orpheus the way the ``orpheus-speech`` package serves it. vLLM streams the LM's audio tokens
+    over ``/v1/completions``, and this client decodes them with the ``snac`` package, one 4-frame
+    window per new frame, keeping the middle 2048 samples (the same window as mstar's SNAC node).
+    SNAC runs on this process's GPU, one window at a time.
+    """
+
+    PROMPT_START = [128259]
+    PROMPT_END = [128009, 128260, 128261, 128257]
+    STOP_TOKEN = 128258
+    FIRST_CODE = 128266  # <custom_token_10>
+    # Orpheus's sampling defaults, the same as mstar/model/orpheus/config.py
+    SAMPLING = {"temperature": 0.6, "top_p": 0.8, "repetition_penalty": 1.3, "max_tokens": 4096}
+
+    def __init__(self, device: str = "cuda"):
+        self._device = device
+        self._tok = None
+        self._snac = None
+        self._pool = None
+
+    def _load(self):
+        if self._snac is not None:
+            return
+        import concurrent.futures
+
+        import torch
+        from transformers import AutoTokenizer
+
+        try:
+            from snac import SNAC
+        except ImportError as e:
+            raise RuntimeError("the orpheus_vllm client needs the snac package (pip install snac)") from e
+        self._tok = AutoTokenizer.from_pretrained("canopylabs/orpheus-3b-0.1-pretrained")
+        self._snac = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().to(self._device)
+        self._torch = torch
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _decode(self, codes: list[int]) -> bytes | None:
+        """28 codes (4 frames) -> the middle 2048 samples as int16 PCM, or None for an invalid window."""
+        torch = self._torch
+        if any(c < 0 or c > 4096 for c in codes):
+            return None
+        f = torch.tensor(codes, dtype=torch.int32).view(4, 7)
+        levels = [f[:, [0]].reshape(1, -1), f[:, [1, 4]].reshape(1, -1), f[:, [2, 3, 5, 6]].reshape(1, -1)]
+        with torch.inference_mode():
+            audio = self._snac.decode([lv.to(self._device) for lv in levels])
+        pcm = (audio[:, :, 2048:4096].float().cpu().numpy() * 32767).astype("<i2")
+        return pcm.tobytes()
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type, expected_output_modalities=["audio"])
+        try:
+            self._load()
+            kwargs = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
+            voice = kwargs.get("voice", "tara")
+            ids = self.PROMPT_START + self._tok(f"{voice}: {req_input.prompt}").input_ids + self.PROMPT_END
+            payload = {"model": model.get_hf_url(), "prompt": ids, **self.SAMPLING, "stop_token_ids": [self.STOP_TOKEN],
+                       "skip_special_tokens": False, "stream": True, "logprobs": 0, "return_tokens_as_token_ids": True,
+                       "seed": request_id}
+            loop = asyncio.get_running_loop()
+            codes: list[int] = []
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/completions", json=payload, read_bufsize=2**24,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=120)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                async for raw in resp.content:
+                    chunk = _parse_sse_chunk(raw)
+                    if not chunk or chunk.get("_done"):
+                        continue
+                    for choice in chunk.get("choices", []):
+                        tokens = (choice.get("logprobs") or {}).get("tokens") or []
+                        for t in tokens:
+                            if not t.startswith("token_id:"):
+                                continue
+                            code = int(t[9:]) - self.FIRST_CODE - (len(codes) % 7) * 4096
+                            if code <= 0:
+                                continue
+                            codes.append(code)
+                            if len(codes) % 7 == 0 and len(codes) > 27:
+                                pcm = await loop.run_in_executor(self._pool, self._decode, codes[-28:])
+                                if pcm:
+                                    metrics.record_output_chunk("audio", base64.b64encode(pcm),
+                                                                arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
 class OursOpenAI(VLLMOmni):
     """Benchmark adapter for M*'s own OpenAI-compatible ``/v1`` surface.
 
@@ -1469,6 +1860,16 @@ class OursOpenAI(VLLMOmni):
     is speech-only on M* (no chat path), so its TTS is served at
     ``/v1/audio/speech`` rather than ``/v1/chat/completions``.
     """
+
+    def _extra_fields(self) -> dict:
+        # M* takes chat template switches such as enable_thinking as top-level fields.
+        return dict(self.chat_template_kwargs or {})
+
+    def _speech_fields(self) -> dict:
+        return {}  # plain PCM, no vllm-omni stream_format
+
+    def _video_sender(self):
+        return self._send_request_video_sync
 
     async def send_request(
         self,
@@ -1609,71 +2010,6 @@ class OursOpenAI(VLLMOmni):
                 metrics.output_text_tokens = ct
             if (pt := usage.get("prompt_tokens")) is not None:
                 metrics.input_tokens = pt
-        except Exception as e:
-            metrics.record_error(str(e))
-        else:
-            metrics.record_completion()
-        return metrics
-
-    async def _send_request_audio_speech(
-        self,
-        session: aiohttp.ClientSession,
-        req_input: "RequestInput",
-        base_url: str,
-        model: Model,
-        metrics: "RequestMetrics",
-        additional_model_kwargs: dict,
-    ) -> "RequestMetrics":
-        """TTS via OpenAI ``/v1/audio/speech`` (streaming PCM16).
-
-        ``response_format="pcm"`` asks for bare 16-bit PCM frames so every
-        server's bytes count the same audio. A server that answers with a WAV
-        anyway (M* before ``pcm`` streaming landed, Kokoro-FastAPI's muxer)
-        starts with ``RIFF``; that 44-byte header is stripped once, then each
-        read is recorded as a PCM16 audio chunk so timing/throughput match the
-        native path.
-        """
-        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
-        payload: dict = {
-            "model": model.get_served_model_name(),
-            "input": req_input.prompt,
-            "response_format": "pcm",
-            "stream": True,
-            **kwargs,
-        }
-        try:
-            metrics.start_time = time.monotonic()
-            async with session.post(
-                f"{base_url}/v1/audio/speech",
-                json=payload,
-                headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
-                read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
-
-                header_skipped = False
-                pending = b""
-                async for raw in resp.content.iter_any():
-                    if not raw:
-                        continue
-                    if not header_skipped:
-                        pending += raw
-                        if len(pending) < 44:
-                            continue
-                        # drop a 44-byte streaming WAV header if the server sent one
-                        raw = pending[44:] if pending[:4] == b"RIFF" else pending
-                        pending = b""
-                        header_skipped = True
-                        if not raw:
-                            continue
-                    metrics.record_output_chunk(
-                        modality="audio",
-                        data_b64=base64.b64encode(raw),
-                        arrival_time=time.monotonic(),
-                        n_tokens=1,
-                    )
         except Exception as e:
             metrics.record_error(str(e))
         else:

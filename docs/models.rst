@@ -757,10 +757,11 @@ request at a time when outputs must be bitwise repeatable.
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
-``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8,
 "action_chunk_size": 32}``; the reply's ``action`` payload is float32
 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
-embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
+embodiment's actions (for the released DROID policies, 7 joint positions and the
+gripper). For a control loop use ``/generate/ws`` (one connection,
 pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
 reports chunks/s, actions/s and latency percentiles.
 

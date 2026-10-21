@@ -671,20 +671,29 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
 def test_rollout_harness_parses_and_filters_memory_telemetry(monkeypatch):
     harness = runpy.run_path(str(Path(__file__).parents[1] / "waypoint" / "serve_rollout.py"))
     assert harness["_parse_pss_kib"]("Rss: 12 kB\nPss: 7 kB\n") == 7
-    assert harness["_parse_nvidia_smi_processes"]("101, 512\n202, 128.5\n") == [
+    gpu_query = harness["gpu_query"]
+    assert gpu_query.parse_nvidia_processes("101, 512\n202, 128.5\n") == [
         (101, 512.0),
         (202, 128.5),
     ]
 
     completed = SimpleNamespace(returncode=0, stdout="101, 512\n202, 128\n", stderr="")
-    monkeypatch.setattr(harness["subprocess"], "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(gpu_query, "_tool", lambda: "nvidia-smi")
+    monkeypatch.setattr(gpu_query.subprocess, "run", lambda *args, **kwargs: completed)
     monkeypatch.setattr(harness["os"], "getpgid", lambda pid: 77 if pid == 101 else 88)
 
     assert harness["_process_group_gpu_mib"](77, 2) == 512.0
     with pytest.raises(RuntimeError, match="no compute process"):
         harness["_process_group_gpu_mib"](99, 2)
     with pytest.raises(ValueError, match="unusable"):
-        harness["_parse_nvidia_smi_processes"]("101, N/A\n")
+        gpu_query.parse_nvidia_processes("101, N/A\n")
+
+    amd = ('[{"gpu": 2, "process_list": [{"process_info": {"pid": 101, "memory_usage": '
+           '{"vram_mem": {"value": 1073741824, "unit": "B"}}}}]}]')
+    monkeypatch.setattr(gpu_query, "_tool", lambda: "amd-smi")
+    monkeypatch.setattr(gpu_query.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=amd, stderr=""))
+    assert harness["_process_group_gpu_mib"](77, 2) == 1024.0
 
 
 def test_rollout_harness_memory_plateau_excludes_warmup_and_rejects_growth():
