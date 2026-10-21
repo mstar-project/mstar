@@ -15,6 +15,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
+# A name ``check_stop`` may return besides loop names: the request's partition
+# ends when this pass completes, and the conductor starts no further walk. It
+# is for a stop no loop can carry yet, such as a prefill that sampled EOS
+# before its decode loop exists.
+END_PARTITION = "__end_partition__"
+
 
 class HostRows(NamedTuple):
     """A step's row-addressed outputs (``check_stop_buffers``) on the host.
@@ -982,6 +988,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         (already submitted under the assumption that the rid continues)
         will run for that rid and its output discarded — the standard
         1-wasted-step cost for any stop signal.
+
+        A row whose walk has no loop to stop returns ``END_PARTITION`` to end
+        the request's partition after this pass: a prefill whose sampled
+        token is a stop token, so the conductor never starts decode.
 
         Default: no stops.
         """

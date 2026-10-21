@@ -1589,6 +1589,11 @@ class Conductor:
             )
             return []
 
+        # Any report of the pass may carry it, not only the one that completes
+        # the pass: that can be another worker's (an encoder's, say).
+        if body.partition_done:
+            pstate.worker_reported_done = True
+
         # Persist signals: every rank contributes its shard (different uuid +
         # source_tp_rank); accumulate across ranks, do not dedup.
         if body.persist_signals:
@@ -1648,6 +1653,7 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
+        partition_done_from_worker = partition_done_from_worker or pstate.worker_reported_done
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
 
@@ -1666,17 +1672,19 @@ class Conductor:
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
-        # The worker's signal is authoritative for a stream-terminated
-        # partition: the pass that consumed the stream's final chunk has run.
-        # Treat it as the partition's own `request_done` so its downstream
-        # connections get `producer_done` and the chain closes. A model that
-        # inferred the end from the connection counters instead
-        # (`consumed_count >= token_count`) could race: `consumed_count` counts
-        # chunks popped for execution, and every worker-graphs-done report from
-        # a worker carries every buffer's count, so a colocated consumer's report
-        # could finish this partition while its last step was still running,
-        # and that step's output arrived for a request already gone.
-        if incoming_connections and partition_done_from_worker:
+        # The worker's signal is authoritative: the pass that consumed a
+        # stream's final chunk has run, or a stop check ended the partition
+        # before any loop could (a prefill that sampled EOS), so the walk the
+        # model just chose must not start. Treat it as the partition's own
+        # `request_done` so its downstream connections get `producer_done` and
+        # the chain closes. A model that inferred a stream's end from the
+        # connection counters instead (`consumed_count >= token_count`) could
+        # race: `consumed_count` counts chunks popped for execution, and every
+        # worker-graphs-done report from a worker carries every buffer's count,
+        # so a colocated consumer's report could finish this partition while its
+        # last step was still running, and that step's output arrived for a
+        # request already gone.
+        if partition_done_from_worker:
             fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
@@ -1716,6 +1724,7 @@ class Conductor:
         pstate.completed_worker_graph_ids = set()
         pstate.current_worker_graph_ids = set()
         pstate.wg_rank_completions = {}
+        pstate.worker_reported_done = False
         pstate.fwd_pass_number += 1
 
         self._set_partition_worker_graph_ids(

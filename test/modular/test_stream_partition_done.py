@@ -84,12 +84,14 @@ def test_counter_heuristics_are_not_needed_and_an_ordinary_pass_does_not_end_it(
     assert all_done is False
 
 
-def test_partition_without_incoming_connections_ignores_the_flag():
-    """A producer-only partition (no stream in) ends only through the model's answer."""
+def test_partition_without_incoming_connections_ends_on_the_flag():
+    """A producer-only partition (no stream in) gets the flag from a stop check
+    that ended it before any loop (a prefill that sampled EOS): it ends too,
+    and its consumers learn their producer is done."""
     c, req, rec = _conductor()
     c._process_done_forward("r", "A", partition_done_from_worker=True)
-    assert req.partition_states["A"].is_done is False
-    assert rec.producer_done == []
+    assert req.partition_states["A"].is_done is True
+    assert rec.producer_done == [("r", "A", "B")]
 
 
 def test_chain_closes_partition_by_partition():

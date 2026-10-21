@@ -53,7 +53,12 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.model.submodule_base import (
+    END_PARTITION,
+    BatchedModelOutput,
+    HostRows,
+    InputMetadata,
+)
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
@@ -3219,6 +3224,13 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
+        # A stop no loop of the row's walk can carry (a prefill that sampled
+        # EOS) ends the partition on this pass's report instead, below.
+        ended_rids = [rid for rid, loops in stops.items() if END_PARTITION in loops]
+        for rid in ended_rids:
+            loops = stops.pop(rid) - {END_PARTITION}
+            if loops:
+                stops[rid] = loops
 
         # Stop loops, if applicable. The runtime filters rids whose walk does
         # not contain the loop, snapshots the stop times, records the pending
@@ -3307,6 +3319,8 @@ class Worker:
         # The consuming pass (not the earlier ingest) reports the partition
         # done, so it rides the WGD that also counts this pass's last chunks.
         for rid in batch_N.node_batch.stream_partition_done_rids:
+            self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
+        for rid in ended_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 
         # set this before send_outputs so that we can send updated profiling info to the conductor
