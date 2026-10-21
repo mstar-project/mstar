@@ -428,7 +428,7 @@ def test_graph_resources_and_state_machine():
     assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
-    (attn,) = [s for s in specs if hasattr(s.config, "decode_tensor_cores")]
+    (attn,) = [s for s in specs if hasattr(getattr(s, "config", None), "decode_tensor_cores")]
     assert attn.config.decode_tensor_cores is False  # narrow GQA: the CUDA-core decode kernel
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
