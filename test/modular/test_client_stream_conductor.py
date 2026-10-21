@@ -374,9 +374,9 @@ def test_the_worker_buffers_client_chunks_and_closes_on_producer_done():
 
     Worker._process_new_inputs(stub, InputSignals(
         request_id="r", inputs=[], request_info=info, partition_name="Ear",
-        producer_done={CLIENT},
+        producer_done={CLIENT}, producer_done_items={"audio_in": 2},
     ))
-    assert sbuf.producer_done
+    assert sbuf.producer_done and sbuf._num_items_expected == 2
 
 
 def test_a_queued_call_that_sends_too_much_is_turned_away(tmp_path, monkeypatch):
@@ -545,9 +545,7 @@ def test_the_worker_acks_a_stream_it_has_no_buffer_for_unread(caplog, failed_her
 
 
 def test_a_client_end_closes_only_the_streams_it_counts():
-    """A client's producer_done names the streams it ends; a signal that
-    counts no edge (a producer partition's, as before per-edge ends) closes
-    every stream from that producer."""
+    """A client's producer_done names the streams it ends; the others stay open."""
     audio, video = (StreamBuffer(request_id=7, edge_name=name, from_partition=CLIENT,
                                  policy=FixedChunkPolicy(chunk_size=1)) for name in ("audio_in", "video_in"))
     stub, _reads = _stub_worker(audio)
@@ -561,11 +559,6 @@ def test_a_client_end_closes_only_the_streams_it_counts():
     ))
     assert video.producer_done and video._num_items_expected == 2
     assert not audio.producer_done
-
-    Worker._process_new_inputs(stub, InputSignals(
-        request_id="r", inputs=[], request_info=info, partition_name="Ear", producer_done={CLIENT},
-    ))
-    assert audio.producer_done and audio._num_items_expected == 0
 
 
 def test_a_producer_partitions_end_leaves_a_colocated_consumers_stream_open():
