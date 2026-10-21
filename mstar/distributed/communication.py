@@ -1,3 +1,4 @@
+import logging
 import socket
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -9,8 +10,10 @@ import torch.distributed as dist
 from torch.distributed.constants import default_pg_nccl_timeout, default_pg_timeout
 from torch.distributed.distributed_c10d import _set_pg_timeout
 
-from mstar.distributed.all_reduce import AllReduce
+from mstar.distributed.all_reduce import AllReduce, _all_ranks_agree
 from mstar.distributed.utils import resolve_dist_timeout
+
+logger = logging.getLogger(__name__)
 
 
 def default_group_timeout(backend: str) -> timedelta:
