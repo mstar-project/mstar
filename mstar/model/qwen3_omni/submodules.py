@@ -97,6 +97,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
+    # Runs eager as a layout walk's encoder. A dynamic=True compile takes minutes on the
+    # first clip, and marking its frame dimension dynamic still recompiles for each length.
+    eager_item_encoder = True
+
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
