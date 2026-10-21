@@ -869,8 +869,8 @@ def test_analysis_actions_and_latents(tmp_path):
     assert (run / "analysis" / "plots" / "ep00.png").is_file()
 
     run = _analysis_run(tmp_path, "vjepa2_ac", "vjepa2_ac", "robotics-vjepa2-ac", "droid_v1", items)
-    fp32 = _arm(tmp_path, "vjepa2-ac-upstream-fp32", "droid_v1")
-    bf16 = _arm(tmp_path, "vjepa2-ac-upstream-bf16", "droid_v1")
+    fp32 = _arm(tmp_path, "vjepa2-ac-upstream-droid-transform-fp32", "droid_v1")
+    bf16 = _arm(tmp_path, "vjepa2-ac-upstream-droid-transform-bf16", "droid_v1")
     for it in items:
         ref = rng.normal(size=(4, 8, 16))
         np.save(fp32 / f"{it.id}.npy", ref)
