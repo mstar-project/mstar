@@ -906,9 +906,10 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
                                           "model_kwargs": {"gain": 2}, "text": None}},
         {"request_id": "call", "append": {"model_kwargs": '{"gain": 3}', "text": "x"}, "end_input": True},
     ])
-    asyncio.run(_serve(ws, until=lambda: len(fake.calls) >= 6))
+    # until the call finishes: the socket's close aborts a call still running
+    asyncio.run(_serve(ws, until=lambda: any(reply.get("finish") for reply in ws.sent)))
 
-    assert not any("error" in reply for reply in ws.sent)
+    assert ws.sent == [{"request_id": "call", "finish": True}]
     assert [c[2:] for c in fake.calls[1:]] == [
         (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], True),
     ]
