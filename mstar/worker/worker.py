@@ -162,6 +162,20 @@ def _wait_ms(raw: str) -> float:
     return value
 
 
+def resolve_enable_pre_plan(model_config: dict | None, env) -> bool:
+    """Whether a worker runs the plan thread: ``pre_plan:`` in the serve yaml
+    (default true), with ``MSTAR_PRE_PLAN_SPEC`` overriding it so an A/B needs
+    no config edit. A ``pre_plan`` that is not a YAML boolean is refused: the
+    string "false" would otherwise read as true."""
+    env_value = env.get("MSTAR_PRE_PLAN_SPEC")
+    if env_value is not None:
+        return env_value == "1"
+    value = (model_config or {}).get("pre_plan", True)
+    if not isinstance(value, bool):
+        raise ValueError(f"pre_plan must be true or false, got {value!r}")
+    return value
+
+
 def _env_number(name: str, default, parse, minimum):
     """A numeric tuning knob from the environment.
 
@@ -391,11 +405,7 @@ class Worker:
         # (large-v3 32 layers, qwen3-asr 28) and loses on a shallow one
         # (turbo's 4), where the step is too short to hide in and the extra
         # thread is just GIL contention.
-        _env_pre_plan = os.environ.get("MSTAR_PRE_PLAN_SPEC")
-        self._enable_pre_plan = (
-            _env_pre_plan == "1" if _env_pre_plan is not None
-            else bool(model_config.get("pre_plan", True))
-        )
+        self._enable_pre_plan = resolve_enable_pre_plan(model_config, os.environ)
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads

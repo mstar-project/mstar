@@ -828,18 +828,6 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
 # --------------------------------------------------------------------------
 
 
-def _resolve_pre_plan(model_config: dict, env: dict) -> bool:
-    """``Worker.__init__``'s resolution, over an explicit env dict.
-
-    Kept in step with worker.py by the source check below.
-    """
-    env_value = env.get("MSTAR_PRE_PLAN_SPEC")
-    return (
-        env_value == "1" if env_value is not None
-        else bool(model_config.get("pre_plan", True))
-    )
-
-
 @pytest.mark.parametrize("config,env,expected", [
     # absent in most configs: pre-planning stays on, as it was before the key
     ({}, {}, True),
@@ -852,7 +840,17 @@ def _resolve_pre_plan(model_config: dict, env: dict) -> bool:
     ({}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
 ])
 def test_pre_plan_config_defers_to_an_explicit_env_var(config, env, expected):
-    assert _resolve_pre_plan(config, dict(env)) == expected
+    from mstar.worker.worker import resolve_enable_pre_plan
+
+    assert resolve_enable_pre_plan(config, dict(env)) == expected
+
+
+@pytest.mark.parametrize("value", ["false", "no", 0, None])
+def test_a_pre_plan_that_is_not_a_yaml_boolean_is_refused(value):
+    from mstar.worker.worker import resolve_enable_pre_plan
+
+    with pytest.raises(ValueError, match="pre_plan must be true or false"):
+        resolve_enable_pre_plan({"pre_plan": value}, {})
 
 
 def test_only_turbo_turns_pre_plan_off():
@@ -866,15 +864,3 @@ def test_only_turbo_turns_pre_plan_off():
         cfg = yaml.safe_load((root / f"configs/{name}.yaml").read_text())
         assert "pre_plan" not in cfg, f"{name} should stay on the pre_plan default"
 
-
-def test_the_resolution_under_test_matches_the_worker():
-    """Guards the duplicated logic above: if the worker's rule changes, this
-    fails rather than letting the test keep asserting the old one."""
-    root = Path(__file__).parents[2]
-    src = (root / "mstar/worker/worker.py").read_text()
-    assert '_env_pre_plan = os.environ.get("MSTAR_PRE_PLAN_SPEC")' in src
-    assert 'else bool(model_config.get("pre_plan", True))' in src
-    # and the engine takes the resolved answer rather than re-reading the env
-    engine = (root / "mstar/engine/engine.py").read_text()
-    assert "preplan_enabled = self.enable_pre_plan" in engine
-    assert 'os.environ.get("MSTAR_PRE_PLAN_SPEC"' not in engine
