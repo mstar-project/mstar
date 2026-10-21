@@ -273,6 +273,38 @@ LIBRISPEECH_AUDIO_PROMPTS = [
 ]
 
 
+def _librispeech_split(split: str, cache_dir: str | None):
+    """One split of librispeech_asr "clean", audio left encoded. Listing the
+    split's files stops load_dataset from downloading the ~30 GB train splits."""
+    from datasets import Audio, load_dataset
+
+    raw = load_dataset(
+        "openslr/librispeech_asr",
+        data_files={split: f"clean/{split}/*.parquet"},
+        split=split,
+        cache_dir=cache_dir,
+    )
+    return raw.cast_column("audio", Audio(decode=False))
+
+
+def _media_source(value: dict):
+    """Undecoded datasets Audio/Video value, as bytes or a path for media_io."""
+    return value["bytes"] if value.get("bytes") is not None else value["path"]
+
+
+def _write_pcm16_wav(value: dict, path: str) -> None:
+    """Write an undecoded datasets Audio value as 16-bit PCM WAV at its own rate."""
+    from mstar.model.components.media_io import decode_audio
+
+    samples = decode_audio(_media_source(value))
+    audio_np = (samples.data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(audio_np.shape[0])
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(samples.sample_rate)
+        wf.writeframes(audio_np.T.tobytes())  # interleaved (num_samples, num_channels)
+
+
 class LibriSpeechDataset(BaseDataset):
     """
     Dataset loader for openslr/librispeech_asr.
@@ -295,48 +327,21 @@ class LibriSpeechDataset(BaseDataset):
             f"LibriSpeechDataset requires an audio input RequestType, got {req_type}"
         )
 
-        from datasets import load_dataset
-        from torchcodec.decoders import AudioDecoder
-
         os.makedirs(local_file_dir, exist_ok=True)
 
         self._num_requests = num_requests
         self.prompt = prompt
         self.local_file_dir = local_file_dir
 
-        raw = load_dataset(
-            "openslr/librispeech_asr",
-            "clean",
-            split=split,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
+        raw = _librispeech_split(split, cache_dir)
         # Take first 100 rows before building items to avoid loading the whole dataset
         raw = raw.select(range(min(100, len(raw))))
 
         self.items: list[RequestInput] = []
 
         for i, row in enumerate(raw):
-            dec: AudioDecoder = row["audio"]
-
-            # Decode all frames → shape (num_channels, num_samples), float32
-            frames = dec.get_all_samples()
-            audio_data = frames.data  # torch.Tensor
-            sample_rate = frames.sample_rate
-
-            # Convert to int16 PCM for WAV
-            audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
-
-            # WAV expects interleaved (num_samples, num_channels), then flatten
-            audio_interleaved = audio_np.T.flatten()
-
-            # Write to disk
             audio_path = os.path.join(local_file_dir, f"librispeech_{i:05d}.wav")
-            with wave.open(audio_path, "wb") as wf:
-                wf.setnchannels(audio_np.shape[0])       # num channels
-                wf.setsampwidth(2)                        # 2 bytes = int16
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_interleaved.tobytes())
+            _write_pcm16_wav(row["audio"], audio_path)
 
             self.items.append(RequestInput(
                 req_type=req_type,
@@ -377,8 +382,6 @@ class LibriSpeechEvalDataset(LibriSpeechDataset):
         self.references: list[str] = []
         self._pending_refs: list[str] = []
 
-        from datasets import load_dataset
-
         os.makedirs(local_file_dir, exist_ok=True)
 
         self._num_requests = num_requests
@@ -389,36 +392,14 @@ class LibriSpeechEvalDataset(LibriSpeechDataset):
         # splits without the config suffix ("test", not "test.clean" —
         # the config already selects clean vs other).
         split = {"test.clean": "test", "validation.clean": "validation"}.get(split, split)
-        raw = load_dataset(
-            "openslr/librispeech_asr",
-            "clean",
-            split=split,
-            cache_dir=cache_dir,
-        )
+        raw = _librispeech_split(split, cache_dir)
         raw = raw.select(range(min(num_requests, len(raw))))
-
-        import wave
-
-        import numpy as np
-        from torchcodec.decoders import AudioDecoder
 
         self.items: list[RequestInput] = []
 
         for i, row in enumerate(raw):
-            dec: AudioDecoder = row["audio"]
-            frames = dec.get_all_samples()
-            audio_data = frames.data
-            sample_rate = frames.sample_rate
-
-            audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
-            audio_interleaved = audio_np.T.flatten()
-
             audio_path = os.path.join(local_file_dir, f"librispeech_eval_{i:05d}.wav")
-            with wave.open(audio_path, "wb") as wf:
-                wf.setnchannels(audio_np.shape[0])
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_interleaved.tobytes())
+            _write_pcm16_wav(row["audio"], audio_path)
 
             self.items.append(RequestInput(
                 req_type=req_type,
@@ -573,11 +554,11 @@ class UCF101Dataset(BaseDataset):
         assert req_type.get_input_modalities() == "video", (
             f"UCF101Dataset requires a video input RequestType, got {req_type}"
         )
-        import torch
-        from datasets import load_dataset
-        from torchcodec.decoders import VideoDecoder
-        from torchcodec.encoders import VideoEncoder
+        from datasets import Video, load_dataset
 
+        from mstar.model.components.media_io import decode_video, encode_video
+
+        os.makedirs(local_file_dir, exist_ok=True)
         self._num_requests = num_requests
         self.prompt = prompt
         self.local_file_dir = local_file_dir
@@ -586,34 +567,14 @@ class UCF101Dataset(BaseDataset):
             "sayakpaul/ucf101-subset",
             split=split,
             cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
+        ).cast_column("video", Video(decode=False))
         raw = raw.select(range(min(100, len(raw))))
 
         self.items: list[RequestInput] = []
         for i, row in enumerate(raw):
-            dec: VideoDecoder = row["video"]
-            fps = dec.metadata.average_fps
-            dec = iter(dec)
-
-            frames = []
-
-            while True:
-                try:
-                    frame = next(dec)
-                    frames.append(frame)
-                except RuntimeError as e:
-                    print("[WARNING]", e)
-                    break
-                except StopIteration:
-                    break
-            assert len(frames) > 0
-            frames = torch.stack(frames)
-
+            frames, metadata = decode_video(_media_source(row["video"]))
             video_path = os.path.join(self.local_file_dir, f"ucf101_{i:05d}.mp4")
-
-            encoder = VideoEncoder(frames=frames, frame_rate=fps)
-            encoder.to_file(video_path)
+            encode_video(frames, metadata["average_fps"], video_path)
 
             self.items.append(RequestInput(
                 req_type=req_type,
@@ -674,20 +635,17 @@ def _decode_frames_to_png_and_video(
     ``frame_indices`` are local positions within the chunk file (0-based).
     """
     from PIL import Image as PILImage
-    from torchcodec.decoders import VideoDecoder
 
-    dec = VideoDecoder(video_path)
-    batch = dec.get_frames_at(indices=frame_indices)
-    tensors = batch.data  # [T, C, H, W] uint8
+    from mstar.model.components.media_io import decode_video, encode_video
+
+    tensors = decode_video(video_path, indices=frame_indices).data  # [T, C, H, W] uint8
 
     if png_path is not None:
         arr = tensors[0].permute(1, 2, 0).numpy()  # [H, W, C]
         PILImage.fromarray(arr).save(png_path)
 
     if mp4_path is not None:
-        from torchcodec.encoders import VideoEncoder
-        # VideoEncoder expects [T, C, H, W] — same layout as get_frames_at output.
-        VideoEncoder(frames=tensors, frame_rate=fps).to_file(mp4_path)
+        encode_video(tensors, fps, mp4_path)
 
 
 class DROIDDataset(BaseDataset):

@@ -95,6 +95,45 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _fetch_video_without_torchcodec(filepath: str, image_patch_size: int) -> tuple[torch.Tensor, float]:
+    """qwen_omni_utils' fetch_video, decoding with media_io instead. Without
+    torchcodec, fetch_video falls back to decord and then to
+    torchvision.io.read_video, which torchvision 0.27 dropped. This picks the
+    same frames as its torchcodec reader and resizes them the same way."""
+    from qwen_omni_utils.v2_5 import vision_process as vp
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+
+    from mstar.model.components.media_io import sample_video
+
+    ele = {"video": filepath}
+    picked: dict = {}
+
+    def choose(metadata: dict) -> list[int]:
+        fps, total = metadata["average_fps"], metadata["num_frames"]
+        start, end, total = vp.calculate_video_frame_range(ele, total, fps)
+        nframes = vp.smart_nframes(ele, total_frames=total, video_fps=fps)
+        picked["sample_fps"] = nframes / max(total, 1e-6) * fps
+        return torch.linspace(start, end, nframes).round().long().tolist()
+
+    video = sample_video(filepath, choose, on_frames=VideoBudget().add).data
+    image_factor = image_patch_size * vp.SPATIAL_MERGE_SIZE
+    min_pixels = vp.VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
+    total_pixels = vp.MODEL_SEQ_LEN * image_factor * image_factor * 0.9
+    nframes, _, height, width = video.shape
+    max_pixels = max(
+        min(vp.VIDEO_MAX_TOKEN_NUM * image_factor * image_factor, total_pixels / nframes * vp.FRAME_FACTOR),
+        int(min_pixels * 1.05),
+    )
+    resized_height, resized_width = vp.smart_resize(
+        height, width, factor=image_factor, min_pixels=min_pixels, max_pixels=max_pixels,
+    )
+    video = TF.resize(
+        video, [resized_height, resized_width], interpolation=InterpolationMode.BICUBIC, antialias=True,
+    ).float()
+    return video, picked["sample_fps"]
+
+
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     """Download (or locate) a HuggingFace snapshot and return the local path."""
     from huggingface_hub import snapshot_download
@@ -1029,21 +1068,26 @@ class Qwen3OmniModel(Model):
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
         # TODO: support audio in video
-        from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+        from mstar.model.components.media_io import uses_torchcodec
 
-        install_budgeted_readers(VIDEO_READER_BACKENDS)
-        # the sampled readers decode the frames fetch_video samples, at full size before resizing them
-        probe = probe_video(filepath)
-        if probe is not None:
-            total, fps, height, width = probe
-            VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
-        with header_charged(probe is not None):
-            video_input, video_sample_fps = fetch_video(
-                {"video": filepath},
-                return_video_sample_fps=True,
-                image_patch_size=14,
-                return_video_metadata=False
-            )
+        if uses_torchcodec():
+            from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+
+            install_budgeted_readers(VIDEO_READER_BACKENDS)
+            # the sampled readers decode the frames fetch_video samples, at full size before resizing them
+            probe = probe_video(filepath)
+            if probe is not None:
+                total, fps, height, width = probe
+                VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
+            with header_charged(probe is not None):
+                video_input, video_sample_fps = fetch_video(
+                    {"video": filepath},
+                    return_video_sample_fps=True,
+                    image_patch_size=14,
+                    return_video_metadata=False
+                )
+        else:
+            video_input, video_sample_fps = _fetch_video_without_torchcodec(filepath, image_patch_size=14)
         return TensorAndMetadata(
             data=video_input.to(device),
             metadata=dict(
@@ -1578,6 +1622,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeAudioEncoder,
         )
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1591,15 +1636,13 @@ class Qwen3OmniModel(Model):
         audio_config = config.thinker_config.audio_config
 
         # Build the audio encoder from config.
-        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
-        # encoder uses the cu_seqlens FA2 path. With the HF default
-        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
-        # SDPA on the full packed sequence (no per-segment fusion),
-        # which is significantly slower than FA2's varlen path.
+        # IMPORTANT: the encoder must get a varlen attention implementation
+        # (FA2, or mstar's varlen kernel where flash_attn is not installed)
+        # so it uses the cu_seqlens path. With the HF default (which resolves
+        # to "sdpa"), Qwen3OmniMoeAudioAttention runs SDPA once per window,
+        # which is significantly slower than the varlen path.
         patch_hf_fa2_int_maxlen()
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
-        )
+        audio_encoder = build_hf_encoder(Qwen3OmniMoeAudioEncoder, audio_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
@@ -1619,6 +1662,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeVisionEncoder,
         )
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1632,19 +1676,18 @@ class Qwen3OmniModel(Model):
         vision_config = config.thinker_config.vision_config
 
         # Build the vision encoder.
-        # CRITICAL: pass attn_implementation="flash_attention_2". Without
-        # this, vision_config._attn_implementation defaults to None and is
+        # CRITICAL: give it a varlen attention implementation (FA2, or
+        # mstar's varlen kernel where flash_attn is not installed). Without
+        # one, vision_config._attn_implementation defaults to None and is
         # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
         # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
         # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
         # which issues N sequential attention calls per layer for an
-        # N-frame video and makes V2T/V2S TTFT far slower. With
-        # "flash_attention_2", a single varlen FA2 call
-        # per layer handles all frames at once via cu_seqlens.
+        # N-frame video and makes V2T/V2S TTFT far slower. With a varlen
+        # implementation, a single call per layer handles all frames at once
+        # via cu_seqlens.
         patch_hf_fa2_int_maxlen()
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
-        )
+        vision_encoder = build_hf_encoder(Qwen3OmniMoeVisionEncoder, vision_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
