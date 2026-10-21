@@ -163,6 +163,10 @@ class Arm:
     tree: str = ""
     # Families whose requests to this engine carry the row's generator_device (where its protocol has the field).
     generator_device_for: tuple[str, ...] = ()
+    # mstar arms: entries merged into the row's serving config's model_kwargs: section (model constructor args).
+    model_kwargs: dict = field(default_factory=dict)
+    # Runs right after the named arm on each row, outside the per-row rotation of arm order.
+    follows: str = ""
 
 
 SGLANG_NO_OFFLOAD = ("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false")
@@ -186,6 +190,12 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
     Arm("mstar-colocated", "mstar", ("tts",), client="ours_openai", rows=("qwen3tts_1p7b",),
         env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the single-worker config"),
+    # The Thinker's and Talker's routed experts on AITER's fused MoE instead of mstar's Triton kernels
+    # (MoEBackend in mstar/utils/fused_moe/backend.py), right after the mstar arm on the same GPUs.
+    Arm("mstar-aitermoe", "mstar", ("omni",), client="ours_openai", env={"MSTAR_SHM_ARENA": "1"},
+        tp_env={"GLOO_SOCKET_IFNAME": "lo"}, model_kwargs={"moe_backend": "aiter"}, follows="mstar",
+        recipe="as the mstar arm, with model_kwargs moe_backend: aiter (AITER's fused MoE for the Thinker and "
+               "Talker experts; mstar's tuned Triton MoE tables don't apply)"),
     # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
     # change is measured in the same session. Each serves its own tree's configs.
     Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",

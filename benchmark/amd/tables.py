@@ -84,7 +84,8 @@ TABLES: dict[str, Table] = {t.name: t for t in [
            "sglang-omni"), ("tts-seed",),
           note="TTS: Kokoro and Orpheus against their reference implementations, Qwen3-TTS 1.7B (two mstar "
                "configs) against vllm-omni and sglang-omni"),
-    Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"), ("mstar", "mstar-base", "vllm-omni", "vllm-omni-tuned"),
+    Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"),
+          ("mstar", "mstar-aitermoe", "mstar-base", "vllm-omni", "vllm-omni-tuned"),
           ("omni-text-speech", "omni-image-speech", "omni-audio-speech"),
           note="Qwen3-Omni, spoken answers to text, image and audio questions"),
     Table("image", ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "cosmos3_nano_t2i"),
