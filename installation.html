@@ -642,6 +642,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requirements">Requirements</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-pypi">Install from PyPI</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-docker-image-on-intel-gpu">Using Docker image on Intel GPU</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
@@ -678,7 +679,9 @@
 <ul class="simple">
 <li><p><strong>Python 3.12+</strong>.</p></li>
 <li><p><strong>Linux with an NVIDIA GPU</strong> and a recent <strong>CUDA</strong> toolkit for the GPU model
-families. A CPU-only machine can exercise the graph/worker plumbing in <em>dummy mode</em>
+families, or <strong>Intel GPUs with XPU PyTorch</strong> for BAGEL
+(see <a class="reference internal" href="#using-docker-image-on-intel-gpu">Using Docker image on Intel GPU</a>).
+A CPU-only machine can exercise the graph/worker plumbing in <em>dummy mode</em>
 (submodules return <code class="docutils literal notranslate"><span class="pre">None</span></code>) for development and the modular tests, but not real model
 inference.</p></li>
 <li><p>Enough GPU memory for the model you intend to serve — several families (e.g.
@@ -721,8 +724,9 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 console scripts, <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>.</p>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
-<p><strong>Always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors PyTorch at 2.9
-(<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.9.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.24.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.9.1</span></code>). The flag tells
+<p><strong>For CUDA installs, always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors
+PyTorch at 2.9 (<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.9.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.24.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.9.1</span></code>).
+The flag tells
 <code class="docutils literal notranslate"><span class="pre">uv</span></code> to detect your driver’s CUDA version and fetch the <strong>matching</strong> torch build
 — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
 compiled extensions (<code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>) and the JIT-built MoE kernel for Qwen3-Omni
@@ -730,6 +734,31 @@ compile against your <em>system</em> CUDA toolkit, whose major version must matc
 Without the flag <code class="docutils literal notranslate"><span class="pre">uv</span></code> installs PyPI’s default (cu128) build. You can set it once
 with <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">UV_TORCH_BACKEND=auto</span></code> instead of repeating the flag. See <a class="reference internal" href="#matching-your-cuda-toolkit">Matching your
 CUDA toolkit</a> for details and the manual fallback.</p>
+</div>
+</section>
+<section id="using-docker-image-on-intel-gpu">
+<h2>Using Docker image on Intel GPU<a class="headerlink" href="#using-docker-image-on-intel-gpu" title="Link to this heading">#</a></h2>
+<p>Build the image using <code class="docutils literal notranslate"><span class="pre">docker/Dockerfile.xpu</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/mstar-project/mstar.git
+<span class="nb">cd</span><span class="w"> </span>mstar
+docker<span class="w"> </span>build<span class="w"> </span>-t<span class="w"> </span>mstar:xpu<span class="w"> </span>-<span class="w"> </span>&lt;<span class="w"> </span>docker/Dockerfile.xpu
+</pre></div>
+</div>
+<p>The host must have a working Intel GPU driver and expose <code class="docutils literal notranslate"><span class="pre">/dev/dri</span></code>. Run an
+interactive shell and check GPU access:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span>/dev/dri/by-path:/dev/dri/by-path:ro<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span><span class="s2">"</span><span class="nv">$HOME</span><span class="s2">/.cache/huggingface:/root/.cache/huggingface"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>mstar:xpu
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"</span>
+</pre></div>
+</div>
+<p>Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
+one for the encoders and decoder, and two for the LLM.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/mstar-workspace/mstar
+mstar<span class="w"> </span>serve<span class="w"> </span>bagel<span class="w"> </span>--config<span class="w"> </span>configs/bagel_xpu_tp2.yaml
+</pre></div>
 </div>
 </section>
 <section id="optional-dependencies">
@@ -1230,6 +1259,7 @@ Repeat the swap afterwards.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requirements">Requirements</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-pypi">Install from PyPI</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-docker-image-on-intel-gpu">Using Docker image on Intel GPU</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
