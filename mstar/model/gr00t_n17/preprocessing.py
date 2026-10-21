@@ -400,8 +400,10 @@ class Gr00tN17Preprocessor:
         # the unnormalise runs against float64 bounds -- but the reference *frame*
         # from the raw state, whose float32 it keeps, so its Gram-Schmidt runs in
         # float32 and only widens when scipy takes the matrix. Upcasting here is
-        # measurably worse: see `unapply`.
-        ref = np.asarray(state[state_key])
+        # measurably worse: see `unapply`. The cast is for the wire: JSON
+        # delivers the state as Python floats, which `asarray` makes float64,
+        # and that moves `eef_9d` by an ulp against the reference's float32.
+        ref = np.asarray(state[state_key], dtype=np.float32)
         if ref.ndim == 2:  # (T, D) -- one request, as the reference also allows
             ref = ref[None]
         # the reference frame is the state's **last** timestep
