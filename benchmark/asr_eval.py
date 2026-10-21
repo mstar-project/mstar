@@ -27,7 +27,10 @@ from benchmark.base import Model, ModelType, RequestType
 from benchmark.dataset import LibriSpeechEvalDataset
 from benchmark.request import RequestInput
 
-_ASR_MODELS = {ModelType.WHISPER_LARGE, ModelType.HIGGS_AUDIO}
+_ASR_MODELS = {
+    ModelType.WHISPER_LARGE, ModelType.WHISPER_LARGE_V3_TURBO, ModelType.QWEN3_ASR,
+    ModelType.QWEN3_ASR_REALTIME, ModelType.HIGGS_AUDIO,
+}
 
 
 async def _transcribe(

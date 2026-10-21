@@ -275,6 +275,65 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
         assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
 
 
+def test_collect_results_is_woken_by_the_completion(monkeypatch):
+    """The non-streaming wait sleeps on the same event as the stream, set when
+    the request completes; it does not ask to be woken for every chunk."""
+    from mstar.api_server import entrypoint
+
+    # a backstop far longer than the bound below: only the wake can meet it
+    monkeypatch.setattr(entrypoint, "WAKE_BACKSTOP_S", 5.0)
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    _register(server, "r5", req)
+    seen = {}
+
+    def producer():
+        time.sleep(0.2)
+        with server.request_lock:
+            seen["per_chunk"] = req.wake_per_chunk
+            req.chunks.append(ResultChunk(request_id="r5", modality="text", data=b"done"))
+            req.event.set()
+            req.notify()
+        seen["t"] = time.perf_counter()
+
+    threading.Thread(target=producer, daemon=True).start()
+    chunks = asyncio.run(server.collect_results("r5"))
+    took = time.perf_counter() - seen["t"]
+    assert [c.data for c in chunks] == [b"done"]
+    assert seen["per_chunk"] is False
+    assert took < 0.05, f"completion took {1000 * took:.1f} ms"
+
+
+def test_the_message_thread_polls_on_the_socket_and_the_data_worker():
+    """Between passes the message thread waits at most 1 ms, ended early by
+    the communicator (a message, or the data worker's chunk signal)."""
+    from mstar.communication.event import EventWakeup
+
+    class _Comm:
+        def __init__(self):
+            self.registered, self.polls = [], []
+
+        def register_event_for_poll(self, event):
+            self.registered.append(event)
+
+        def poll_for_messages(self, timeout_ms):
+            self.polls.append(timeout_ms)
+
+    pw = _StubPreprocessWorker()
+    pw.results_wakeup = EventWakeup()
+    server = _api_server_stub(pw)
+    server.communicator = _Comm()
+    server._pass_wait()()
+    assert server.communicator.registered == [pw.results_wakeup]
+    assert server.communicator.polls == [1]
+    # without a poll to block on, the 1 ms sleep stays
+    server.communicator = object()
+    t0 = time.perf_counter()
+    server._pass_wait()()
+    assert time.perf_counter() - t0 >= 0.001
+
+
 def test_notify_many_wakes_every_handler_with_one_loop_call():
     """A pass that delivered chunks to many requests wakes their handlers
     through one call into the loop, and skips requests with no handler."""

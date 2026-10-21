@@ -326,6 +326,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.enable_nvtx = False
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
+    w._enable_pre_plan = False  # what Worker.__init__ resolves from MSTAR_PRE_PLAN_SPEC=0 above
     w.tp_async_sched = False
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)

@@ -202,6 +202,11 @@ def _shutdown_conductor_process(
 #: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
 DUPLICATE_ID_GRACE_S = 0.5
 
+#: The longest a handler waiting for its request sleeps before it rechecks
+#: the disconnect and deadline itself; the message thread wakes it as soon as
+#: a chunk or the completion lands.
+WAKE_BACKSTOP_S = 0.05
+
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
     """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
@@ -242,16 +247,19 @@ class PendingRequest:
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
+    # collect_results registers them too but only needs the completion, so it
+    # turns off the per-chunk wake (one per decoded token for inline emitters).
     wake: Any | None = None
     loop: Any | None = None
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
+    wake_per_chunk: bool = True
     # Output modality -> perf_counter of its first chunk; kept only with metrics on.
     first_chunk_times: dict[str, float] = field(default_factory=dict)
 
     def notify(self) -> None:
-        """Wake the streaming handler, from any thread."""
+        """Wake the waiting handler, from any thread."""
         loop, wake = self.loop, self.wake
         if loop is None or wake is None:
             return
@@ -714,6 +722,7 @@ class APIServer:
         Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
         next_liveness_check = 0.0
+        wait = self._pass_wait()
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -723,10 +732,6 @@ class APIServer:
                     self._fail_pending_for_dead_conductor(exited)
                     return
             try:
-                with self.request_lock:
-                    if len(self.recently_completed) > 0:
-                        self._prune_recently_completed()
-
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
@@ -895,7 +900,8 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
-                        to_wake[id(req)] = req
+                        if req.wake_per_chunk or result_chunk.modality == "error":
+                            to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -918,11 +924,32 @@ class APIServer:
                         )
                 if to_wake:
                     notify_many(to_wake.values())
+
+                # after this pass's messages and chunks, so a request whose
+                # completion and final chunk both just landed is released now
+                # rather than a pass later
+                with self.request_lock:
+                    if len(self.recently_completed) > 0:
+                        self._prune_recently_completed()
+                wait()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
+
+    def _pass_wait(self):
+        """How the message thread waits between passes: at most 1 ms, ended
+        early by a message on the socket or by the data worker queueing result
+        chunks, so a finished request is not held for the rest of the
+        millisecond. getattr: tests build the server around fakes without
+        either."""
+        register = getattr(self.communicator, "register_event_for_poll", None)
+        poll = getattr(self.communicator, "poll_for_messages", None)
+        results_wakeup = getattr(self.preprocess_worker, "results_wakeup", None)
+        if not callable(register) or not callable(poll) or results_wakeup is None:
+            return lambda: time.sleep(0.001)
+        register(results_wakeup)
+        return lambda: poll(timeout_ms=1)
 
     # ----------------------------------------------------------
     # Streaming helper
@@ -1066,7 +1093,7 @@ class APIServer:
                 if new_chunks:
                     continue  # more may already be waiting
                 try:
-                    await asyncio.wait_for(wake.wait(), timeout=0.05)
+                    await asyncio.wait_for(wake.wait(), timeout=WAKE_BACKSTOP_S)
                 except asyncio.TimeoutError:
                     pass
         finally:
@@ -1156,7 +1183,18 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread when the request completes or fails;
+        # the timeout is the backstop for the disconnect and deadline checks.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
+                req.wake_per_chunk = False
         while True:
+            # cleared before the read, so a completion landing after it stays set
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
@@ -1168,7 +1206,10 @@ class APIServer:
             if raw_request is not None and await raw_request.is_disconnected():
                 self.abort_submission(key)
                 return []
-            await asyncio.sleep(0.005)
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=WAKE_BACKSTOP_S)
+            except asyncio.TimeoutError:
+                pass
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)

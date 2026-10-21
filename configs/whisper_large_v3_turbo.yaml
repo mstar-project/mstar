@@ -1,0 +1,20 @@
+model: "whisper_large_v3_turbo"
+max_seq_len: 448
+# The decoder caches hold 64 requests at once (12 cross-attention and 4
+# self-attention pages each; checked at startup). Capped, further requests
+# queue; uncapped, the worker would offload decoding requests to admit them.
+max_concurrent_requests: 64
+# Turbo has 4 decoder layers, so a step is too short to hide host planning
+# behind: the pre-plan thread costs more in contention than the planning it
+# overlaps (measured +11% RTFx at c=1, +6% at c=32 with it off). large-v3 and
+# qwen3_asr are deep enough to want it on, which is why this is per-config
+# and not a changed default.
+pre_plan: false
+resources:
+  kv_cache:
+    cpu_offload_pages: 128
+  cross_kv_cache:
+    cpu_offload_pages: 128
+node_groups:
+  - node_names: [audio_encoder, decoder]
+    ranks: [0]

@@ -30,7 +30,10 @@ Long uploads
 
     ``parallel`` cuts fixed windows, each at the quietest moment shortly
     before its nominal boundary, with no conditioning, and keeps up to
-    :data:`PARALLEL_INFLIGHT` of them on the engine at once.
+    :data:`PARALLEL_INFLIGHT` of them on the engine at once. With timestamps
+    (a non-streamed timed format), a window that stopped inside a segment
+    keeps its closed segments as in sequential mode, and the audio from the
+    last of them to the cut is decoded as one more window.
 
     Uploads longer than :data:`MAX_DURATION_SECONDS` are rejected. Every
     window still on the engine when the request ends (error, disconnect) is
@@ -76,6 +79,8 @@ TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 PROMPT_RESET_TEMPERATURE = 0.5
 # a seek shorter than this re-hears too much for too little, so take the window
 MIN_SEEK_SECONDS = 1.0
+# parallel mode: a window's unfinished tail shorter than this is not decoded again
+MIN_TAIL_SECONDS = 0.5
 # parallel mode: how far before a fixed boundary to look for the quietest cut,
 # and the frame length compared
 CUT_SEARCH_SECONDS = 2.0
@@ -231,6 +236,12 @@ class WindowPlanner:
         stop = media_io.window_stop(start, len(audio), int(round(self.max_seconds * SAMPLE_RATE)), self.balanced)
         return self._write(audio[start:stop], offset)
 
+    def cut(self, offset: float, duration: float) -> Window:
+        """``duration`` seconds of the upload from ``offset`` on, as a window."""
+        audio = self._decoded()
+        start = int(round(offset * SAMPLE_RATE))
+        return self._write(audio[start:start + int(round(duration * SAMPLE_RATE))], offset)
+
     def _decoded(self):
         if self._audio is None:
             self._audio = media_io.decode_audio(self.audio_path, SAMPLE_RATE, MAX_DURATION_SECONDS)
@@ -350,15 +361,19 @@ def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[st
     return request_id
 
 
-async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str:
-    """The window's raw text; collect_results releases the request on every
-    path but cancellation, which the caller's ``_release`` covers."""
+async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str | None:
+    """The window's raw text, or None once the client is gone (collect_results
+    aborted the window and returned nothing). collect_results releases the
+    request on every path but cancellation, which the caller's ``_release``
+    covers."""
     try:
         chunks = await api.collect_results(window.request_id, raw_request)
     except HTTPException:
         inflight.discard(window.request_id)
         raise
     inflight.discard(window.request_id)
+    if not chunks and raw_request is not None and await raw_request.is_disconnected():
+        return None
     return _text_of(chunks)
 
 
@@ -400,6 +415,25 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
+def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window | None:
+    """The unfinished tail of a parallel window decoded with timestamps, as a
+    window of its own, or None. Near its end Whisper writes the next segment's
+    start and ends the window, leaving that speech to the next window, which in
+    parallel mode starts at the fixed cut instead. As in sequential mode, such a
+    window keeps its closed segments, and the audio from the last of them to
+    the cut is decoded again."""
+    if not adapter.seeks_by_timestamps or planner.single:
+        return None
+    parsed = adapter.parse_transcript(window.raw_text, req)
+    if not (parsed.unfinished and parsed.segments):
+        return None
+    end = parsed.segments[-1]["end"]
+    if not MIN_SEEK_SECONDS <= end <= window.duration - MIN_TAIL_SECONDS:
+        return None
+    window.transcript = _closed(parsed)
+    return planner.cut(window.offset + end, window.duration - end)
+
+
 async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[str], raw_request=None):
     """openai-whisper's loop over the upload; yields each window once its
     transcript is accepted (see the module docstring)."""
@@ -416,7 +450,10 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[s
             if temperature != (req.temperature or 0.0):
                 attempt = attempt.model_copy(update={"temperature": temperature})
             _submit(api, adapter, attempt, window, streaming=False, inflight=inflight)
-            window.raw_text = await _collect(api, window, inflight, raw_request)
+            text = await _collect(api, window, inflight, raw_request)
+            if text is None:
+                return  # the client is gone, submit nothing more
+            window.raw_text = text
             parsed = adapter.parse_transcript(window.raw_text, attempt)
             window.temperature = temperature
             window.compression_ratio = compression_ratio(parsed.text)
@@ -444,7 +481,8 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
     """Stitch the windows: texts joined by a space, segments/words shifted by
     the window's start time (segments also carry the temperature and
     compression ratio their window was accepted at), the language from the
-    first window that reported one."""
+    first window that reported one, and the text as the adapter finishes it
+    (``final_text``)."""
     texts: list[str] = []
     segments: list[dict] = []
     words: list[dict] = []
@@ -463,7 +501,8 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
         language = language or t.language
     for idx, seg in enumerate(segments):
         seg["id"] = idx
-    return Transcript(text=" ".join(texts), language=language or req.language, segments=segments, words=words)
+    text = adapter.final_text(" ".join(texts))
+    return Transcript(text=text, language=language or req.language, segments=segments, words=words)
 
 
 async def create_transcription(
@@ -517,8 +556,27 @@ async def create_transcription(
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed()
-            async for _ in _parallel(api, adapter, req, windows, inflight, raw_request):
-                pass
+            # each tail goes to the engine as soon as its window is in, beside
+            # the windows still decoding
+            tails: dict[int, Window] = {}
+            collected = 0
+            async for window in _parallel(api, adapter, req, windows, inflight, raw_request):
+                tail = _tail(adapter, req, planner, window)
+                if tail is not None:
+                    _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
+                    tails[collected] = tail
+                collected += 1
+            # fewer than all means the client is gone: the tails in flight are released below
+            if collected == len(windows) and tails:
+                for tail in tails.values():
+                    text = await _collect(api, tail, inflight, raw_request)
+                    if text is None:
+                        break
+                    tail.raw_text = text
+                merged = []
+                for index, window in enumerate(windows):
+                    merged += [window, tails[index]] if index in tails else [window]
+                windows = merged
         else:
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
@@ -613,7 +671,10 @@ async def _parallel(api, adapter, req, windows: list[Window], inflight: set[str]
         while submitted < min(len(windows), index + PARALLEL_INFLIGHT):
             _submit(api, adapter, req, windows[submitted], streaming=False, inflight=inflight)
             submitted += 1
-        window.raw_text = await _collect(api, window, inflight, raw_request)
+        text = await _collect(api, window, inflight, raw_request)
+        if text is None:
+            return  # the client is gone, submit nothing more
+        window.raw_text = text
         yield window
 
 
@@ -634,10 +695,15 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed()
+            # The stream carries text only, and a window decoded with timestamps
+            # can stop early and leave its tail to the next one (see _tails).
+            window_req = req if planner.single else req.model_copy(
+                update={"response_format": "json", "timestamp_granularities": None},
+            )
             submitted = 0
             for i, window in enumerate(windows):
                 while submitted < min(len(windows), i + PARALLEL_INFLIGHT):
-                    _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
+                    _submit(api, adapter, window_req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
                 raw, emitted = "", ""
                 # holds back a character split across tokens until its last byte

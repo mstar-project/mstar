@@ -207,6 +207,19 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
+   * - ``MSTAR_ASR_DATA``
+     - ``data/asr``
+     - ``test/asr`` (GPU parity tests): the set ``benchmark.asr_data`` built.
+   * - ``MSTAR_WHISPER_REPO``
+     - ``openai/whisper-large-v3-turbo``
+     - ``test/asr/test_whisper_parity.py``: the Whisper checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REPO``
+     - ``Qwen/Qwen3-ASR-1.7B``
+     - ``test/asr/test_qwen3_asr_parity.py``: the Qwen3-ASR checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REF``
+     - ``refs/Qwen3-ASR``
+     - ``test/asr/test_qwen3_asr_parity.py``: a checkout of the qwen-asr SDK,
+       the reference transcripts come from.
 
 Serving (Python frontend)
 -------------------------
@@ -428,7 +441,8 @@ Worker scheduling
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread.
+       thread. Unset, the serve config's ``pre_plan:`` decides (default on);
+       set, it overrides it. Read in ``Worker.__init__``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
