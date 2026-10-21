@@ -1668,18 +1668,9 @@ class Conductor:
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
-        # The worker's signal is authoritative: the pass that consumed a
-        # stream's final chunk has run, or a stop check ended the partition
-        # before any loop could (a prefill that sampled EOS), so the walk the
-        # model just chose must not start. Treat it as the partition's own
-        # `request_done` so its downstream connections get `producer_done` and
-        # the chain closes. A model that inferred a stream's end from the
-        # connection counters instead (`consumed_count >= token_count`) could
-        # race: `consumed_count` counts chunks popped for execution, and every
-        # worker-graphs-done report from a worker carries every buffer's count,
-        # so a colocated consumer's report could finish this partition while its
-        # last step was still running, and that step's output arrived for a
-        # request already gone.
+        # The worker's flag is authoritative: the partition is done, so treat it
+        # as `request_done` (downstream gets `producer_done`) whatever walk the
+        # model chose. Only the worker knows the pass that ended it has run.
         if pstate.worker_reported_done:
             fwd_args.request_done = True
 
