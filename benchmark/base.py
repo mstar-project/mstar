@@ -186,6 +186,30 @@ class Kokoro(Model):
         return "kokoro"
 
 
+class PersonaPlex(Model):
+    """Offline prerecorded audio replay; concurrency is independent B=1 requests."""
+
+    # NVIDIA/personaplex@3428dfd95309a7f3c84fd93259ded0f810d1ff91 offline.py:335.
+    DEFAULT_PERSONA = (
+        "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way."
+    )
+
+    def get_hf_url(self):
+        return "nvidia/personaplex-7b-v1"
+
+    def get_supported_modalities(self):
+        return {RequestType.A2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"voice": "NATF2", "greedy": True}
+
+    def get_tokenizer(self):
+        return None
+
+    def get_served_model_name(self):
+        return "personaplex"
+
+
 class Chatterbox(Model):
     """Chatterbox (Resemble AI) zero-shot TTS; the Turbo checkpoint shares the
     request shape and is served under the ``chatterbox_turbo`` registry key."""
@@ -419,6 +443,7 @@ class HiggsAudio(Model):
 
 
 class ModelType(Enum):
+    PERSONAPLEX = "personaplex"
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
@@ -435,6 +460,8 @@ class ModelType(Enum):
     QWEN3_8 = "qwen3.8"
 
     def inst(self, **kwargs) -> Model:
+        if self == ModelType.PERSONAPLEX:
+            return PersonaPlex(**kwargs)
         if self == ModelType.BAGEL:
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:
