@@ -45,8 +45,11 @@ def _worker(rank, store_path, fails, out_dir):
     built: list = []
     _install_fake_flashinfer(fails, rank, built)
     from mstar.distributed import ar_fusion
+    from mstar.distributed.communication import CommGroup
 
-    fusion = ar_fusion.FlashInferARFusion.create(rank, WORLD, dist.group.WORLD, 128, 64, None)
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(WORLD)))
+    group.cpu_group = dist.group.WORLD
+    fusion = ar_fusion.FlashInferARFusion.create(group, 128, 64, None)
     chosen = None if fusion is None else fusion._workspace.backend
     leaked = [ws.backend for ws in built if not ws.destroyed and ws.backend != chosen]
     with open(os.path.join(out_dir, str(rank)), "w") as f:
