@@ -58,7 +58,6 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -416,30 +415,23 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
-class _Tail(NamedTuple):
-    after: int       # index of the window whose unfinished tail this is
-    window: Window
-
-
-def _tails(adapter, req, planner: WindowPlanner, windows: list[Window]) -> list[_Tail]:
-    """Parallel windows decoded with timestamps that stopped inside a segment.
-    Near its end Whisper writes the next segment's start and ends the window,
-    leaving that speech to the next window, which in parallel mode starts at
-    the fixed cut instead. As in sequential mode, such a window keeps its closed
-    segments, and the audio from the last of them to the cut becomes a window
-    of its own."""
+def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window | None:
+    """The unfinished tail of a parallel window decoded with timestamps, as a
+    window of its own, or None. Near its end Whisper writes the next segment's
+    start and ends the window, leaving that speech to the next window, which in
+    parallel mode starts at the fixed cut instead. As in sequential mode, such a
+    window keeps its closed segments, and the audio from the last of them to
+    the cut is decoded again."""
     if not adapter.seeks_by_timestamps or planner.single:
-        return []
-    tails = []
-    for index, window in enumerate(windows):
-        parsed = adapter.parse_transcript(window.raw_text, req)
-        if not (parsed.unfinished and parsed.segments):
-            continue
-        end = parsed.segments[-1]["end"]
-        if MIN_SEEK_SECONDS <= end <= window.duration - MIN_TAIL_SECONDS:
-            window.transcript = _closed(parsed)
-            tails.append(_Tail(index, planner.cut(window.offset + end, window.duration - end)))
-    return tails
+        return None
+    parsed = adapter.parse_transcript(window.raw_text, req)
+    if not (parsed.unfinished and parsed.segments):
+        return None
+    end = parsed.segments[-1]["end"]
+    if not MIN_SEEK_SECONDS <= end <= window.duration - MIN_TAIL_SECONDS:
+        return None
+    window.transcript = _closed(parsed)
+    return planner.cut(window.offset + end, window.duration - end)
 
 
 async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[str], raw_request=None):
@@ -564,15 +556,26 @@ async def create_transcription(
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed()
-            collected = [w async for w in _parallel(api, adapter, req, windows, inflight, raw_request)]
-            # fewer than all means the client is gone: submit nothing more
-            tails = _tails(adapter, req, planner, windows) if len(collected) == len(windows) else []
-            if tails:
-                async for _ in _parallel(api, adapter, req, [t.window for t in tails], inflight, raw_request):
-                    pass
-                after, merged = {t.after: t.window for t in tails}, []
+            # each tail goes to the engine as soon as its window is in, beside
+            # the windows still decoding
+            tails: dict[int, Window] = {}
+            collected = 0
+            async for window in _parallel(api, adapter, req, windows, inflight, raw_request):
+                tail = _tail(adapter, req, planner, window)
+                if tail is not None:
+                    _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
+                    tails[collected] = tail
+                collected += 1
+            # fewer than all means the client is gone: the tails in flight are released below
+            if collected == len(windows) and tails:
+                for tail in tails.values():
+                    text = await _collect(api, tail, inflight, raw_request)
+                    if text is None:
+                        break
+                    tail.raw_text = text
+                merged = []
                 for index, window in enumerate(windows):
-                    merged += [window, after[index]] if index in after else [window]
+                    merged += [window, tails[index]] if index in tails else [window]
                 windows = merged
         else:
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
