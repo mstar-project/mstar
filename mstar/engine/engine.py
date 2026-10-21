@@ -299,10 +299,6 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[int] = field(default_factory=set)
 
-    # Rank 0 of a TP node: each request's cached prefix, decided as the step was sent to
-    # the followers. Prepare applies exactly this, though a commit since may hold more.
-    cached_prefix: dict[int, int] | None = None
-
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
@@ -1129,19 +1125,22 @@ class Engine:
     def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, PrefixHit]:
         """Rank 0's hits for a step it is about to send its TP followers, by wire id.
 
-        Probed as the step is scheduled, so the followers can take the same pages before
-        they build it. A miss is decided too: ``prepare_inputs`` applies the batch's
-        lengths, where a probe after this rank's next commit could hit.
+        Probed as the step is scheduled, before it is prepared (no inputs yet), so the
+        followers can take the same pages before they build it. A miss is decided too:
+        under TP the resources answer the step's prepare with what this probe decided,
+        where a probe after this rank's next commit could hit. Each row under its own
+        walk, as a combined walk's step is prepared.
         """
-        node, walk = batch.node_name, batch.graph_walk
-        if walk not in self._keyed_walks.get(node, ()):
-            return {}
+        node, walk_of = batch.node_name, batch.step_context.walk_of
+        keyed = self._keyed_walks.get(node, ())
         hits = {}
-        batch.cached_prefix = {}
         for rid in batch.request_ids:
+            walk = walk_of(rid)
+            if walk not in keyed:
+                continue
+            prefix = self._runner.resolve_cached_prefix(rid, node, walk, None)
             # plain ints: the wire refuses a numpy or torch scalar, after the leases are taken
-            matched = int(self._runner.resolve_cached_prefix(rid, node, walk))
-            batch.cached_prefix[rid] = matched
+            matched = int(prefix.tokens) if prefix is not None else 0
             if matched > 0:
                 pages = self._runner.cached_prefix_pages(rid, node, walk, matched)
                 hits[self._graph_runtime.get_rid_string(rid)] = PrefixHit(
@@ -1150,11 +1149,13 @@ class Engine:
 
     def adopt_cached_prefix(
         self, node_name: str, graph_walk: str, hits: dict[str, PrefixHit],
+        walks: Mapping[str, str] | None = None,
     ) -> bool:
         """A TP follower takes rank 0's hits before it builds the step.
 
-        False until every page is here: a request this rank has not ingested yet, or
-        pages its own commit of an earlier step has not indexed yet.
+        ``walks`` names a combined walk's rows' own walks, by wire id. False until every
+        page is here: a request this rank has not ingested yet, or pages its own commit
+        of an earlier step has not indexed yet.
         """
         ready = True
         for wire_rid, hit in hits.items():
@@ -1162,8 +1163,9 @@ class Engine:
             if rid is None:
                 ready = False
                 continue
+            walk = walks.get(wire_rid, graph_walk) if walks else graph_walk
             ready &= self._runner.adopt_cached_prefix(
-                rid, node_name, graph_walk, hit.tokens, hit.pages,
+                rid, node_name, walk, hit.tokens, hit.pages,
             )
         return ready
 

@@ -421,8 +421,15 @@ class MicroScheduler:
         if not head.prefix_hits:
             return True
         engine = self.engine_manager.get_engine(head.node_name)
+        # a combined walk's rows each probed under their own walk
+        walks = (
+            {rid: head.walks[w] for rid, w in zip(head.request_ids, head.walk_idx, strict=True)}
+            if head.walks else None
+        )
         try:
-            return engine.adopt_cached_prefix(head.node_name, head.graph_walk, head.prefix_hits)
+            return engine.adopt_cached_prefix(
+                head.node_name, head.graph_walk, head.prefix_hits, walks,
+            )
         except RuntimeError as exc:
             # a divergence never heals, and the other ranks already run this step:
             # failing its requests here leaves them in its collective for good
