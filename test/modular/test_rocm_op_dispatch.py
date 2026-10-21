@@ -289,6 +289,27 @@ def test_amd_rope_takes_the_cache_only_for_its_own_arguments(monkeypatch):
     assert [args[3] for args in calls[1:]] == [None, None]
 
 
+def test_amd_rope_rotates_from_a_rope_table_dtype_table(monkeypatch):
+    """A config that asks for a rounded table (rope_table_dtype) gets it on AMD
+    GPUs too, in place of the fp32 cache."""
+    rocm = RocmPlatform()
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: rocm)
+    build = _CacheRecorder()
+    monkeypatch.setattr(RopeManager, "_build_rope_cache", build)
+    calls = []
+    monkeypatch.setattr(
+        torch.ops.mstar, "rope_apply_qk_inplace", lambda *args, **kwargs: calls.append(args),
+    )
+    config = PositionConfig(kv_cache="kv", rope_theta=1e6, rotary_dim=8, rope_table_dtype=torch.bfloat16)
+    manager = RopeManager(config, torch.device("cuda"), max_seq_len=4, head_dim=8)
+    assert manager._rope_cache is None
+    assert [call[3] for call in build.calls] == [torch.bfloat16]
+    manager._current_pos_ids["text"] = torch.arange(3)
+    q, k = torch.ones(3, 1, 8, dtype=torch.bfloat16), torch.ones(3, 1, 8, dtype=torch.bfloat16)
+    manager.apply_qk(q, k, "text")
+    assert [args[3] is manager._rope_table for args in calls] == [True]
+
+
 def test_amd_rope_off_the_cache_runs_flashinfers_on_the_fly_kernels(stack):
     rec = stack(RocmPlatform())
     q, k, pos = torch.ones(2, 4, 8), torch.ones(2, 2, 8), torch.arange(2)
