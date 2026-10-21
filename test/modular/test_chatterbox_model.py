@@ -296,10 +296,10 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
 
 def test_process_prompt_builtin_voice_emits_text_only():
     model = _make_model()
-    out = model.process_prompt("hello", ["text"], ["audio"], voice="default")
+    out = model.process_prompt("hello", ["text"], ["audio"], voice="default").new_input_tensors
     assert set(out) == {TEXT_INPUTS}
     assert out[TEXT_INPUTS][0].tolist() == [1, 2, 3, 4, 5]
-    out = model.process_prompt("hello", ["text"], ["audio"])
+    out = model.process_prompt("hello", ["text"], ["audio"]).new_input_tensors
     assert set(out) == {TEXT_INPUTS}
 
 
@@ -308,7 +308,7 @@ def test_process_prompt_reference_audio_is_keyed_and_capped():
     wav = torch.rand(40 * 24000) - 0.5
     out = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [wav]},
-    )
+    ).new_input_tensors
     assert set(out) == {TEXT_INPUTS, REF_AUDIO, VOICE_KEY}
     assert out[REF_AUDIO][0].numel() == 30 * 24000  # capped at 30 s
     assert out[VOICE_KEY][0].dtype == torch.long
@@ -353,7 +353,7 @@ def test_process_prompt_rejects_unusable_reference(wav, message):
 def test_process_prompt_accepts_short_but_usable_reference():
     out = _make_model().process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_tone(0.6)]},
-    )
+    ).new_input_tensors
     assert out[REF_AUDIO][0].numel() == int(0.6 * 24000)
 
 
@@ -522,7 +522,7 @@ def test_generation_kwargs_accept_boundary_values():
     assert top_ks == [vocab - 1, vocab, vocab]
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
-    assert set(out) == {TEXT_INPUTS}
+    assert set(out.new_input_tensors) == {TEXT_INPUTS}
 
 
 def test_max_new_tokens_limit_bounds_requests_and_the_default():
