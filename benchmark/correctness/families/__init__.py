@@ -242,6 +242,7 @@ CONFIG_FAMILIES: dict[str, type[Family]] = {
 _OMNILINGUAL = "no family yet, its reference (omnilingual-asr on fairseq2) needs its own venv"
 
 UNSUPPORTED: dict[str, str] = {
+    "fish_s2_pro": "no family yet, it needs a reference build of Fish Audio's S2-Pro",
     "lingbot_world_1_3b": "no family yet, its camera-controlled world video needs its own reference",
     "omnilingual_asr_ctc_300m": _OMNILINGUAL,
     "omnilingual_asr_ctc_1b": _OMNILINGUAL,
