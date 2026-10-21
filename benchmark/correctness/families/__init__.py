@@ -116,11 +116,12 @@ class Cosmos3Video(Cosmos3Reference, VideoFamily):
 
 
 class Cosmos3WindowedVideo(Cosmos3Video):
-    """Windowed autoregressive t2v: every request sets window_mode, so the walk a windowed config is
-    served for runs (the plain video family never sends it). diffusers has no windowed sampler, so the
-    verdict is two server instances agreeing and the t2v reference is scored for information.
-    --family-opt window_mode=kv|chained (default kv), window_frames=N (default 9: two windows of the
-    17-frame clip)."""
+    """Windowed autoregressive t2v. Its requests set window_mode, which the plain video family never
+    sends, so the walk the config serves runs. diffusers has no windowed sampler, so the verdict is two
+    server instances agreeing and PSNR against the t2v reference is only a note.
+    --family-opt window_mode=kv|chained (default kv), window_frames=N (default 13, two windows of four
+    latent frames for the 17-frame clip; three-latent-frame clips come out smeared even from plain t2v
+    and diffusers)."""
 
     default_restarts = 2
     self_consistency_only = True
@@ -128,7 +129,7 @@ class Cosmos3WindowedVideo(Cosmos3Video):
 
     @property
     def request_extra(self) -> dict:
-        return {"window_mode": self.opt("window_mode", "kv"), "window_frames": self.opt("window_frames", 9, int)}
+        return {"window_mode": self.opt("window_mode", "kv"), "window_frames": self.opt("window_frames", 13, int)}
 
     def reference_description(self) -> str:
         return super().reference_description() + " (whole clip at once, not windowed)"
