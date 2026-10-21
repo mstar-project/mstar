@@ -518,10 +518,12 @@ class KVManager(AttentionResource):
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         # A read-only step (every segment span 0, e.g. a decoder attending an
         # encoder context it wrote at prefill) plans the same as the last one
-        # while its segments are the same and nothing touched the streams:
-        # (key, plan), bumped like `_plan_epoch` plus by any commit that wrote.
+        # while its segments are the same and nothing touched their streams:
+        # (key, plan). The epoch moves with `_plan_epoch`, and when a stream of
+        # one of the cached step's real rows changes (`_readonly_rows`).
         self._readonly_epoch = 0
         self._readonly_plan: tuple | None = None
+        self._readonly_rows: frozenset | None = None
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple, KVPlanOutput] = {}
@@ -1832,9 +1834,11 @@ class KVManager(AttentionResource):
 
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
-        commit: the plan cache no longer describes the streams if it holds
-        that request."""
-        self._readonly_epoch += 1
+        commit: the plan caches no longer describe the streams if they hold
+        that request. A padding row's reset after a replay holds nothing."""
+        rows = self._readonly_rows
+        if rows is not None and (rid is None or rid in rows):
+            self._readonly_epoch += 1
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2200,6 +2204,10 @@ class KVManager(AttentionResource):
                     self._remember_decode_plan(step, ctx, res)
         self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         if self._is_readonly(step, ctx):
+            # the rows first: a touch from here on invalidates the entry
+            self._readonly_rows = frozenset(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
             self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
@@ -2270,7 +2278,8 @@ class KVManager(AttentionResource):
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
-        if any(seg.span for seg in step.segments):
+        rows = self._readonly_rows
+        if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
             self._readonly_epoch += 1
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
