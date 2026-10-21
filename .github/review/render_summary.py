@@ -71,7 +71,7 @@ def status(review, inline, head, mode):
     elif found or any(review[k] for k in ("description_problems", "questions", "skipped")):
         icon = "🟡"
     else:
-        icon = "✅"
+        icon = "🟢"
     text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No findings"
     return f"{icon} **{text}** on `{head[:7]}`, {mode} review"
 
