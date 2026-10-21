@@ -34,6 +34,10 @@ class BoundedPlan(NamedTuple):
     table: torch.Tensor  # [>= rows, ROW_INTS] int32
     # (slot, layout, source) per row, padding included; what the table holds
     rows: tuple[tuple[int, RowLayout, int], ...]
+    # host facts ``attend`` checks its arguments against
+    max_retained: int = 0
+    reads_source: bool = False
+    reads_row_source: bool = False
 
     def retained(self) -> torch.Tensor:
         """Each row's retained keys before its step, ``[rows]`` int32 on the device."""
@@ -115,6 +119,7 @@ class BoundedKVManager(Resource):
         slots [>= B])``, e.g. another resource's per-request entries."""
         plan = plan or self.current
         cache = self._cache[layer_idx]
+        self._check_attend(q, k, v, cache, source, plan, rel_bias, row_source)
         if not q.is_cuda:
             return self._attend_torch(q, k, v, cache, source, plan, rel_bias, row_source)
         from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
@@ -124,6 +129,19 @@ class BoundedKVManager(Resource):
                                 self.config.query_window)
         bounded_store(k, v, cache, plan.table, self.config.reverse_step_order)
         return out
+
+    def _check_attend(self, q, k, v, cache, source, plan: BoundedPlan, rel_bias, row_source) -> None:
+        if not q.dtype == k.dtype == v.dtype == cache.dtype:
+            raise ValueError(f"bounded KV holds {cache.dtype}; q, k, v are {q.dtype}, {k.dtype}, {v.dtype}")
+        if plan.reads_source and source is None:
+            raise ValueError("a row of this step reads its source prefix, and attend was given no source")
+        if plan.reads_row_source and row_source is None:
+            raise ValueError("a row of this step reads its row_source entry, and attend was given no row_source")
+        if rel_bias is not None:
+            t, window = q.shape[2], self.config.query_window
+            need = plan.max_retained + 2 * t - 1 if window is None else window + 1
+            if rel_bias.shape[-1] < need:
+                raise ValueError(f"rel_bias holds {rel_bias.shape[-1]} distances; this step needs {need}")
 
     def _attend_torch(
         self, q, k, v, cache, source, plan: BoundedPlan, rel_bias=None, row_source=None,
@@ -250,6 +268,7 @@ class BoundedKVManager(Resource):
         c = self.config
         values: list[int] = []
         rows = []
+        max_retained, reads_source, reads_row_source = 0, False, False
         for seg in step.segments or ():
             req = None if ctx.capture or ctx.is_padding_row(seg.request_id) else self._requests.get(seg.request_id)
             if req is None:
@@ -257,13 +276,20 @@ class BoundedKVManager(Resource):
                 rows.append((0, EMPTY_ROW, 0))
             else:
                 pos = step.positions[seg.request_id]
-                rows.append((req.slot, row_layout(pos.source_len, pos.written, seg.span,
-                                                  c.retention_for(pos.source_len), c.sink_capacity,
-                                                  c.reverse_step_order), pos.source))
+                layout = row_layout(pos.source_len, pos.written, seg.span, c.retention_for(pos.source_len),
+                                    c.sink_capacity, c.reverse_step_order)
+                rows.append((req.slot, layout, pos.source))
+                reads = layout.reads
+                max_retained = max(max_retained, sum(count for _, count in reads))
+                if reads[0][1] or reads[2][1]:      # the source's ranges (READ_FROM_SOURCE)
+                    if pos.source < 0:
+                        reads_row_source = True
+                    else:
+                        reads_source = True
             values += flatten_row(*rows[-1])
         table = self._table(ctx, len(rows))
         self._stager.copy_(table, values, pad_value=0)
-        self._current = BoundedPlan(table, tuple(rows))
+        self._current = BoundedPlan(table, tuple(rows), max_retained, reads_source, reads_row_source)
         return self._current
 
     def commit(self, step: BoundedKVStep, ctx: StepContext) -> None:

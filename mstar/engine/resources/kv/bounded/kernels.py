@@ -218,6 +218,10 @@ def bounded_attention(
     ``R = window + 1``. Returns ``[B * rows, T, H, D]``."""
     n, h, t, d = q.shape
     rows = cache.shape[1]
+    if d < 16 or d & (d - 1):
+        raise ValueError(f"the kernel tiles head_dim, so it must be a power of two >= 16, got {d}")
+    if not q.dtype == k.dtype == v.dtype == cache.dtype:
+        raise ValueError(f"the cache holds {cache.dtype}; q, k, v are {q.dtype}, {k.dtype}, {v.dtype}")
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert cache.stride(-1) == 1 and table.shape[-1] == ROW_INTS
     has_row_source = row_source is not None
@@ -237,7 +241,8 @@ def bounded_attention(
     has_bias = rel_bias is not None
     if has_bias:
         assert rel_bias.shape[:3] == (n, h, t) and rel_bias.stride(-1) == 1
-        assert window is None or rel_bias.shape[3] > window, "a per-query band holds window + 1 distances"
+        if window is not None and rel_bias.shape[3] <= window:
+            raise ValueError(f"a per-query band holds window + 1 = {window + 1} distances, got {rel_bias.shape[3]}")
         s_bias = (rel_bias.stride(0), rel_bias.stride(1), rel_bias.stride(2))
     else:
         rel_bias, s_bias = q, (0, 0, 0)
