@@ -65,20 +65,6 @@ class RecurrentAddressing:
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
 
-    def narrow(self, start: int, length: int = 1) -> RecurrentAddressing:
-        """Rows ``start .. start + length`` of the step, for a forward that runs
-        them apart from the rest (a long row that would pad the others). Views
-        of this plan: valid exactly as long as it is."""
-        end = start + length
-        assert 0 <= start < end <= self.num_rows, f"rows {start}..{end} of a step of {self.num_rows}"
-        return RecurrentAddressing(
-            slot_indices=self.slot_indices[start:end],
-            has_state=self.has_state[start:end],
-            num_rows=length,
-            host_slot_indices=None if self.host_slot_indices is None else self.host_slot_indices[start:end],
-            host_has_state=None if self.host_has_state is None else self.host_has_state[start:end],
-        )
-
 
 class RecurrentStatePool(Resource):
     @classmethod

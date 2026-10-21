@@ -442,8 +442,7 @@ The spec types are:
        caches store); ``max_slots`` (one more than the requests, for
        the sink that padding rows address) is deployment-tunable. A recurrent kernel
        reads the step's ``addressing``; plain torch reads and writes a block through
-       ``gather`` / ``scatter_`` with that addressing (or its ``narrow``, for rows a
-       forward runs apart from the rest), so eager and captured forwards
+       ``gather`` / ``scatter_`` with that addressing, so eager and captured forwards
        address the same slots. Those two need the sink: a pool built with
        ``disable_sink_slot`` refuses them for a padded step.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``

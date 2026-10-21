@@ -211,24 +211,3 @@ def test_gather_reads_with_the_planned_indices_as_they_are():
         pool.gather("conv", rows)
     ops = {event.name for event in prof.events()}
     assert "aten::index_select" in ops and not ops & {"aten::to", "aten::_to_copy"}, ops
-
-
-def test_narrow_addresses_some_rows_of_the_step():
-    """``narrow`` is a run of the step's rows, as views of its plan: a forward
-    that runs one row apart reads and writes that row's slot and no other."""
-    pool = build_pool(max_slots=6)
-    rids = ["a", "b", "c"]
-    for rid in rids:
-        pool.ingest_request(rid)
-    step = decode_step(rids)
-    ctx = StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False)
-    assert pool.admit(step, ctx).ok
-    rows = pool.plan(step, ctx)["main"]
-    one = rows.narrow(1)
-    assert one.num_rows == 1 and one.slot_indices.tolist() == rows.slot_indices[1:2].tolist()
-    assert list(one.host_slot_indices) == list(rows.host_slot_indices[1:2])
-    before = pool.block("conv", 0).clone()
-    pool.scatter_("conv", one, torch.ones(1, 96, 3))
-    changed = [i for i in range(6) if not torch.equal(pool.block("conv", 0)[i], before[i])]
-    assert changed == [pool._slots["b"]["main"].index]
-    torch.testing.assert_close(pool.gather("conv", rows)[1:2], pool.gather("conv", one))

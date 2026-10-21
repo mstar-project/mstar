@@ -538,8 +538,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   the call's start: an opening clip or append that is not a multiple of 1280
   samples keeps the call off it for good); other calls take the front end
   eagerly, then the layer stack as a graph when each got at most one frame (a
-  live step, the call's end), or eagerly (a one-shot upload, a large append,
-  run in a pass of its own). Appends of other sizes are served the same,
+  live step, the call's end), or eagerly (a one-shot upload, a large append:
+  a chunk over a second is not batched with other calls, so the engine runs
+  each call of that step on its own). Appends of other sizes are served the same,
   without the whole-step graph.
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the

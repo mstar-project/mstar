@@ -436,9 +436,9 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     Audio arrives as the client streams it, one chunk per step, and the live
     calls' chunks run in one batched streamer pass (``ConformerStreamer``, which
     describes the state a call carries across chunks and its numerics), except
-    that a chunk of more than a second (an upload, a large append) runs in a
-    pass of its own within the same engine step, on its own row of the step's
-    plan. A call's state is bounded whatever its length: its newest audio and
+    that a step holding a chunk of more than a second (an upload, a large
+    append) is not batched (``can_batch``): the engine then runs each call of
+    it on its own. A call's state is bounded whatever its length: its newest audio and
     mel frames (the ``ENCODER_FRONT`` pool), and the last 70 frames of each
     layer's attention keys and values plus the conv tails (``ENCODER_STATE``);
     its host counters live in its per-request state.
@@ -502,6 +502,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             # whether the whole-step region serves the call: decided here, once,
             # for the declaration and the forward to share
             kwargs={"final": final, "steady": st is not None and self.streamer.is_steady(st, wav, final)},
+            input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
@@ -512,7 +513,12 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
-        return True
+        # A pass pads every call to its longest chunk, so a chunk of more than
+        # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
+        # each call's step on its own (declare, admit, plan, forward, commit).
+        # Such chunks are uploads and large appends, so it is a rare step.
+        longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
+        return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
 
     def max_batch_size(self, graph_walk: str) -> int:
         # The engine caps a batch at its whole-forward graphs only; past the
@@ -633,7 +639,6 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         streamer = self.streamer
         states = [self._stream_state(rid) for rid in rids]
         chunks = self._to_device(chunk, device)
-        final = list(final)
         runners = engine_inputs.piecewise_runners or {}
         frames: list[torch.Tensor | None] = [None] * len(rids)
 
@@ -650,21 +655,9 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             chunks[i] = None            # the eager pass leaves these calls as they are
 
         # The rest: the same math eagerly, reading this step's plans where it
-        # uses them, before any region plans its own. A pass pads every call to
-        # its longest chunk, so a chunk of more than a second (an upload, a large
-        # append) runs alone, on its own row of the plan, and the batched pass
-        # leaves that call as it is.
-        longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
-        for i, c in enumerate(chunks):
-            if c is not None and c.numel() > longest:
-                front, front_rows = self._pool(engine_inputs, ENCODER_FRONT)
-                enc = streamer.front([states[i]], [c], [final[i]], front, front_rows.narrow(i))
-                if enc is not None:
-                    pool, rows = self._pool(engine_inputs, ENCODER_STATE)
-                    frames[i] = self._eager_layers(enc, pool, rows.narrow(i), device)[0]
-                    streamer.advance([states[i]], enc)
-                chunks[i], final[i] = None, False
-        # the batched pass: its layers as a graph when no call got more than a frame
+        # uses them, before any region plans its own; its layers as a graph when
+        # no call got more than a frame. A chunk of more than a second comes in
+        # a step of its own (see can_batch).
         enc = None
         if len(steady) < len(rids):
             enc = streamer.front(states, chunks, final, *self._pool(engine_inputs, ENCODER_FRONT))

@@ -632,6 +632,16 @@ class _Encoder:
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
 
     def step(self, rids, inputs) -> BatchedModelOutput:
+        """One engine step over ``rids``: batched when the node can batch them,
+        else each call's own step, as the engine's per-request path runs it."""
+        if len(rids) > 1 and not self.node.can_batch(None, inputs):
+            out = BatchedModelOutput(per_rid_outputs={})
+            for rid, inp in zip(rids, inputs, strict=True):
+                out.per_rid_outputs.update(self._step([rid], [inp]).per_rid_outputs)
+            return out
+        return self._step(rids, inputs)
+
+    def _step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
             self.pool.ingest_request(rid)
             self.front.ingest_request(rid)
@@ -770,7 +780,7 @@ def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
     """Every read and write of a pool's state, eager or in a region, uses the
     plan the pool holds at that moment, never one held across another plan:
     the eager path runs on this step's plan before a region plans its own. A
-    call with a chunk over a second runs on a narrow of that plan."""
+    call with a chunk over a second runs in a step of its own."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
     for pool in enc.resources.values():
@@ -833,31 +843,40 @@ def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, 
     assert torch.allclose(torch.stack(got_b), want, atol=1e-5)
 
 
-def test_encoder_runs_a_chunk_over_a_second_in_a_pass_of_its_own():
-    """A pass pads every call to its longest chunk: an upload or a large append
-    runs alone, on its own row of the step's plan, and only the calls with a
-    second or less share a pass, whose layers then take at most a second of
-    frames per call."""
+def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
+    """A pass pads every call to its longest chunk, so a step holding an upload
+    or a large append is not batched: can_batch refuses it, by the chunk length
+    prepare_inputs reports, and the engine runs each call's step on its own.
+    Calls with a second or less share one pass. The frames are the offline
+    ones either way."""
     enc = _Encoder()
-    streamer, fronts, layers = enc.node.streamer, [], []
-    front, layer_stack = streamer.front, streamer.layers
+    streamer, fronts = enc.node.streamer, []
+    front = streamer.front
 
     def spy_front(sts, chunks, final, *rest):
         fronts.append(sorted(c.numel() for c in chunks if c is not None))
         return front(sts, chunks, final, *rest)
 
-    def spy_layers(x, pool, rows, *rest):
-        layers.append((x.shape[0], x.shape[1], rows.num_rows))
-        return layer_stack(x, pool, rows, *rest)
-
-    streamer.front, streamer.layers = spy_front, spy_layers
+    streamer.front = spy_front
     wav = {1: torch.randn(16000 * 5) * 0.1, 2: torch.randn(1280) * 0.1, 3: torch.randn(16001) * 0.1,
            4: torch.randn(16000) * 0.1}
+    prepared = {h: enc.prepare(h, w, final=True) for h, w in wav.items()}
+    assert {h: inp.input_seq_len for h, inp in prepared.items()} == {h: w.numel() for h, w in wav.items()}
+    assert not enc.node.can_batch(None, list(prepared.values()))
+    assert not enc.node.can_batch(None, [prepared[2], prepared[3]])
+    assert enc.node.can_batch(None, [prepared[2], prepared[4]])
+    assert enc.node.can_batch(None, [prepared[1]])                       # alone, it is its own step
+
     out = _encode_batch(enc, [(h, w, True) for h, w in wav.items()])
-    assert sorted(fronts) == [[1280, 16000], [16001], [16000 * 5]]
-    assert all(b == rows for b, _t, rows in layers)
-    assert max(t for b, t, _rows in layers if b > 1) == len(out[4])     # the widest call of a second or less
+    assert sorted(fronts) == [[1280], [16000], [16001], [16000 * 5]]    # every call on its own
     for h, w in wav.items():
+        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
+
+    fronts.clear()
+    short = {5: torch.randn(1280) * 0.1, 6: torch.randn(16000) * 0.1}
+    out = _encode_batch(enc, [(h, w, True) for h, w in short.items()])
+    assert fronts == [[1280, 16000]]                                      # one pass
+    for h, w in short.items():
         assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
 
 

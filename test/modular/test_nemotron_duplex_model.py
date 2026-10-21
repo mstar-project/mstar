@@ -503,7 +503,7 @@ def test_duplex_appended_audio_becomes_stream_items_in_order():
 
 def test_duplex_an_upload_or_append_is_one_stream_item():
     """A file streams whole, so a one-file upload is one encoder step, as the
-    offline encoder ran it (the encoder runs a long item in a pass of its own)."""
+    offline encoder ran it (a long item is not batched with other calls')."""
     model = _make_model()
     long = torch.rand(20 * model.config.stt.sample_rate + 777) - 0.5
     for items in (
