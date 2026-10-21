@@ -221,15 +221,14 @@ class FlashInferAllReduce(AllReduce):
     mode = "flashinfer"
 
     def __init__(self, group: "CommGroup", max_bytes: int):
-        from mstar.distributed.ar_fusion import create_fusion
+        from mstar.distributed.ar_fusion import ARFusion
         from mstar.platforms import current_platform
 
         super().__init__(group.device_group)
         if not current_platform.is_cuda():
             raise RuntimeError("tp_allreduce='flashinfer' needs FlashInfer's comm module (NVIDIA GPUs)")
-        self._fusion = create_fusion(
-            group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,
-        )
+        # the workspace is sized in bytes: one row of max_bytes // 2 bf16 columns
+        self._fusion = ARFusion.new(group, max_bytes // 2, torch.bfloat16, 1)
         if self._fusion is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")
 
