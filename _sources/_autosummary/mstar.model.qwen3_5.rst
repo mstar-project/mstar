@@ -31,5 +31,6 @@ mstar.model.qwen3\_5
    config
    qwen3_5_model
    submodules
+   video
    weight_loader
 

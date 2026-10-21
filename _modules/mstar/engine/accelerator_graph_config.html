@@ -700,6 +700,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -1282,6 +1283,13 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># own work; the lease only tells the outer declaration which resources are</span>
     <span class="c1"># already spoken for, so it can leave them out.</span>
     <span class="n">lease_before_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># For a `lease_before_step` region: whether this batch may take a slot at</span>
+    <span class="c1"># all, beyond fitting a captured bucket. For a limit the bucket key does</span>
+    <span class="c1"># not express, such as how many attention segments a replay's plan holds.</span>
+    <span class="c1"># A batch it rejects gets no lease, so its forward runs the region eagerly</span>
+    <span class="c1"># (`ModelInputsFromEngine.step` is the declaration that tells it so).</span>
+    <span class="c1"># None: every batch that fits a bucket.</span>
+    <span class="n">can_lease</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)</span>
     <span class="n">forward_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># None =&gt; defer to the runner's default batch-size buckets</span>

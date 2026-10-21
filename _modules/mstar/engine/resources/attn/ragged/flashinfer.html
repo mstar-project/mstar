@@ -700,6 +700,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -991,6 +992,12 @@ window.runMermaid = runMermaid;</script>
             <span class="n">sm_scale</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">sm_scale</span><span class="p">,</span>
             <span class="n">backend</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
         <span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_segments_per_request</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Segments one request may bring to a captured plan, as configured</span>
+<span class="sd">        (after YAML overrides); a captured wrapper holds this many per row."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">max_segments_per_request</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>

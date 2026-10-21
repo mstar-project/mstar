@@ -700,6 +700,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -1753,6 +1754,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.can_gc">(mstar.communication.tensor_store.TensorStore method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.can_lease">can_lease (mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner.can_lease">can_lease() (mstar.engine.accelerator_graph_runner.PiecewiseAcceleratorGraphRunner method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.can_reload">can_reload() (mstar.engine.resources.base.Resource method)</a>
 
       <ul>
@@ -3227,10 +3232,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.omnivoice.components.codec.html#mstar.model.omnivoice.components.codec.encode_reference">encode_reference() (in module mstar.model.omnivoice.components.codec)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.waypoint.components.taehv.html#mstar.model.waypoint.components.taehv.encode_seed_clip">encode_seed_clip() (in module mstar.model.waypoint.components.taehv)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.waypoint.components.taehv.html#mstar.model.waypoint.components.taehv.encoded_size_for_latent">encoded_size_for_latent() (in module mstar.model.waypoint.components.taehv)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.components.wav2vec2.html#mstar.model.omnilingual_asr.components.wav2vec2.Encoder">Encoder (class in mstar.model.omnilingual_asr.components.wav2vec2)</a>
@@ -3316,6 +3321,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.utils.orphan.html#mstar.utils.orphan.exit_when_orphaned">exit_when_orphaned() (in module mstar.utils.orphan)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.reasoner.html#mstar.model.cosmos3.components.reasoner.expand_placeholders">expand_placeholders() (in module mstar.model.cosmos3.components.reasoner)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.expand_video_pads">expand_video_pads() (in module mstar.model.qwen3_5.video)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.expand_video_parts">expand_video_parts() (in module mstar.model.qwen3_5.video)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION">EXPECTED_MSTAR_RUST_VERSION (in module mstar.communication.communicator)</a>
 </li>
@@ -3414,6 +3423,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig.ff_dim">ff_dim (mstar.model.nemotron_duplex.config.ConformerSTTConfig property)</a>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig.ff_expansion_factor">ff_expansion_factor (mstar.model.nemotron_duplex.config.ConformerSTTConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ffmpeg_unavailable">ffmpeg_unavailable() (in module mstar.model.qwen3_5.video)</a>
 </li>
       <li><a href="_autosummary/mstar.model.lingbot_world.config.html#mstar.model.lingbot_world.config.LingBotWorldConfig.ffn_dim">ffn_dim (mstar.model.lingbot_world.config.LingBotWorldConfig attribute)</a>
 
@@ -3863,6 +3874,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.RingKVStep.frames">(mstar.engine.resources.RingKVStep attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.SampledVideo.frames">(mstar.model.qwen3_5.video.SampledVideo attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.frames_per_clip">frames_per_clip (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
@@ -4355,11 +4368,17 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry">GraphStateRegistry (class in mstar.graph.base)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ProcessedVideo.grid">grid (mstar.model.qwen3_5.video.ProcessedVideo attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.grid_depth">grid_depth (mstar.model.vjepa2.config.VJepa2Config property)</a>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.grid_size">grid_size (mstar.model.vjepa2.config.VJepa2Config property)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.group_by_plan_label">group_by_plan_label() (in module mstar.engine.resources.kv.plan)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.group_owners">group_owners() (in module mstar.model.qwen3_5.video)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.group_timestamps">group_timestamps() (in module mstar.model.qwen3_5.video)</a>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.CodecConfig.groups">groups (mstar.model.nemotron_duplex.config.CodecConfig attribute)</a>
 </li>
@@ -5784,6 +5803,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.PartitionState.metadata">(mstar.conductor.request_info.PartitionState attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.SampledVideo.metadata">(mstar.model.qwen3_5.video.SampledVideo attribute)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ConductorStatus.metrics">metrics (mstar.api_server.request_types.ConductorStatus attribute)</a>
 
@@ -6214,6 +6235,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.qwen3_5.components.vision.html#module-mstar.model.qwen3_5.components.vision">mstar.model.qwen3_5.components.vision</a>
 </li>
         <li><a href="_autosummary/mstar.model.qwen3_5.config.html#module-mstar.model.qwen3_5.config">mstar.model.qwen3_5.config</a>
+</li>
+        <li><a href="_autosummary/mstar.model.qwen3_5.video.html#module-mstar.model.qwen3_5.video">mstar.model.qwen3_5.video</a>
 </li>
         <li><a href="_autosummary/mstar.model.submodule_base.html#module-mstar.model.submodule_base">mstar.model.submodule_base</a>
 </li>
@@ -7428,6 +7451,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.model.qwen3_5.config.html#module-mstar.model.qwen3_5.config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.qwen3_5.video
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.qwen3_5.video.html#module-mstar.model.qwen3_5.video">module</a>
 </li>
       </ul></li>
       <li>
@@ -8893,6 +8923,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.taehv.html#mstar.model.waypoint.components.taehv.pixel_size_for_latent">pixel_size_for_latent() (in module mstar.model.waypoint.components.taehv)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ProcessedVideo.pixel_values">pixel_values (mstar.model.qwen3_5.video.ProcessedVideo attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.attn.cross.html#mstar.engine.resources.attn.cross.FlashInferCrossManager.plan">plan() (mstar.engine.resources.attn.cross.FlashInferCrossManager method)</a>
 
       <ul>
@@ -9322,6 +9354,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.probe_audio_seconds">probe_audio_seconds() (in module mstar.model.media_limits)</a>
 </li>
       <li><a href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.probe_video">probe_video() (in module mstar.model.media_limits)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ProcessedVideo">ProcessedVideo (class in mstar.model.qwen3_5.video)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.StreamingConnectionState.producer_done">producer_done (mstar.conductor.request_info.StreamingConnectionState attribute)</a>
 
@@ -10687,6 +10721,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.lingbot_world.config.html#mstar.model.lingbot_world.config.LingBotWorldConfig.sample_shift">sample_shift (mstar.model.lingbot_world.config.LingBotWorldConfig attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.sample_video">sample_video() (in module mstar.model.qwen3_5.video)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.SampledVideo">SampledVideo (class in mstar.model.qwen3_5.video)</a>
+</li>
       <li><a href="_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_ingraph_scatter">sampler_ingraph_scatter() (in module mstar.utils.knobs)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_slots">sampler_slots() (in module mstar.utils.knobs)</a>
@@ -11894,7 +11932,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.TranscriptionRequest.timestamp_granularities">timestamp_granularities (mstar.api_server.openai.protocol.TranscriptionRequest attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.reasoner.html#mstar.model.cosmos3.components.reasoner.MediaGrid.timestamps">timestamps (mstar.model.cosmos3.components.reasoner.MediaGrid attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ProcessedVideo.timestamps">(mstar.model.qwen3_5.video.ProcessedVideo attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.timestep_max_period">timestep_max_period (mstar.model.pi05.config.Pi05Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.timestep_min_period">timestep_min_period (mstar.model.pi05.config.Pi05Config attribute)</a>
