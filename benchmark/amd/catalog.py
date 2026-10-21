@@ -41,6 +41,14 @@ class Row:
     moe_shapes: tuple[str, ...] = ()
     # Deployment configs (configs/<name>.yaml) of mstar arms that serve this row with another one, by arm name.
     mstar_configs: dict = field(default_factory=dict)
+    # Media rows: the device the reference draws its noise on, sent to engines that take ``generator_device`` so
+    # their outputs can match the reference pixel for pixel ("cpu" for diffusers' FLUX, Z-Image and Wan, "cuda" for
+    # Cosmos3).
+    generator_device: str | None = None
+    # Workloads of the table this row runs (empty: every workload of its family), and per-workload concurrency
+    # where the row's differs from the workload's.
+    workloads: tuple[str, ...] = ()
+    concurrency: dict = field(default_factory=dict)
 
 
 def mstar_config_name(row: Row, arm: str) -> str:
@@ -90,12 +98,17 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0, startup_timeout=5400,
         moe_shapes=QWEN3_OMNI_MOE),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
-    Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein"),
-    Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo"),
-    Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0),
+    Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein", generator_device="cpu"),
+    Row("flux2_klein_9b", "image", "black-forest-labs/FLUX.2-klein-9B", "flux2_klein_9b", generator_device="cpu"),
+    Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo", generator_device="cpu"),
+    Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0, generator_device="cpu",
+        concurrency={"video-t2v": (1, 2, 4)}),
     # vllm-omni's Cosmos3 recipe serves without the guardrail models (recipes/cosmos3/Cosmos3-Nano.md).
-    Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0,
-        engine_args={"vllm-omni": ("--no-guardrails",)}),
+    Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0, generator_device="cuda",
+        engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
+    Row("cosmos3_edge", "video", "nvidia/Cosmos3-Edge", "cosmos3_edge", cost=3.0, generator_device="cuda",
+        workloads=("video-t2v",),
+        engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
 ]}
 
 
@@ -128,8 +141,12 @@ class Arm:
     # A named mstar tree from the sweep's --tree NAME=PATH instead of its --worktree; the sweep skips the arm when
     # that tree isn't given.
     tree: str = ""
+    # Families whose requests to this engine carry the row's generator_device (where its protocol has the field).
+    generator_device_for: tuple[str, ...] = ()
 
 
+SGLANG_NO_OFFLOAD = ("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false")
+SGLANG_DIFFUSION_MODELS = ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22", "cosmos3_nano", "cosmos3_edge")
 VLLM_GUIDE = ("AMD vLLM guide https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/"
               "vllm-optimization.html; vllm/platforms/rocm.py in the image")
 SGLANG_COOKBOOK = "sglang v0.5.22 docs/cookbook/autoregressive/Qwen/Qwen3.5.mdx, AMD section"
@@ -187,15 +204,30 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="sglang v0.5.22: aiter attention named explicitly, since its auto-selector picks FlashInfer for "
                "Whisper (DESIGN.md section 11; research/competitors_matrix.md 2.2)"),
     Arm("sglang-diffusion", "sglang-diffusion", ("image", "video"), client="sglang_diffusion", image="sglang",
-        models=("flux2_klein", "z_image_turbo"),
-        args=("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false"),
+        models=SGLANG_DIFFUSION_MODELS, args=SGLANG_NO_OFFLOAD, generator_device_for=("image", "video"),
         recipe="SGLang Diffusion with every CPU offload off (DESIGN.md section 11; benchmark/wan22/reproduce.sh)"),
+    # SGLang Diffusion's own speedups that keep the output: breakable CUDA graphs for the image DiTs (validated on
+    # CUDA), with both image_v1 sizes warmed at startup, and torch.compile for video.
+    Arm("sglang-diffusion-bcg", "sglang-diffusion", ("image",), client="sglang_diffusion", image="sglang",
+        models=("flux2_klein", "flux2_klein_9b", "z_image_turbo"), generator_device_for=("image",),
+        args=SGLANG_NO_OFFLOAD + ("--enable-breakable-cuda-graph", "--warmup-resolutions", "1024x1024", "1344x768"),
+        recipe="as sglang-diffusion, plus --enable-breakable-cuda-graph and --warmup-resolutions for image_v1's sizes"),
+    Arm("sglang-diffusion-compile", "sglang-diffusion", ("video",), client="sglang_diffusion", image="sglang",
+        models=("wan22", "cosmos3_nano", "cosmos3_edge"), generator_device_for=("video",),
+        args=SGLANG_NO_OFFLOAD + ("--enable-torch-compile",),
+        recipe="as sglang-diffusion, plus --enable-torch-compile"),
     Arm("vllm-omni", "vllm-omni", ("tts", "omni", "image", "video"), client="vllm_omni", image="vllm-omni",
-        models=("qwen3_tts", "qwen3_tts_1p7b", "qwen3omni", "flux2_klein", "z_image_turbo", "wan22", "cosmos3_nano"),
-        args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
+        models=("qwen3_tts", "qwen3_tts_1p7b", "qwen3omni", "flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22",
+                "cosmos3_nano", "cosmos3_edge"),
+        args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"), generator_device_for=("image",),
         recipe="vllm-omni v0.30.0 defaults on ROCm: the model's deploy YAML with its platforms.rocm section "
                "(AR stages on TRITON_ATTN, Code2Wav eager)",
         differs_for={"tts": "Code2Wav runs eager on ROCm", "omni": "Code2Wav runs eager on ROCm"}),
+    # v0.32.0rc1 for the Cosmos3 rows: its Cosmos3 loop keeps the sampling state in fp32 (v0.30.0's is bf16).
+    Arm("vllm-omni-rc", "vllm-omni", ("image", "video"), client="vllm_omni", image="vllm-omni-rc",
+        models=("cosmos3_nano", "cosmos3_edge"), generator_device_for=("image",),
+        args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
+        recipe="vllm-omni v0.32.0rc1 (rocm/vllm-omni:da572cdd...) defaults on ROCm, as the vllm-omni arm"),
     Arm("vllm-omni-tuned", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
         models=("qwen3_tts", "qwen3_tts_1p7b", "qwen3omni"),
         env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
@@ -214,6 +246,17 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="sglang-omni v0.1.8 defaults with the model's examples/configs pipeline, built on "
                "lmsysorg/sglang:v0.5.21-rocm724-mi30x (sha256:d139bdfc); on ROCm it picks AITER attention and "
                "breakable prefill graphs (AITER cannot capture a full one)"),
+    # In-process references at c=1, each request timed alone: no HTTP, no output encoding, no batching.
+    Arm("ref-diffusers", "reference", ("image", "video"),
+        models=("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22", "cosmos3_nano", "cosmos3_edge"),
+        recipe="the correctness family's diffusers reference pipeline (bf16, the family's attention and generator), "
+               "timed in-process",
+        differs="in-process reference: c=1 only, no HTTP, base64 or output encoding"),
+    Arm("ref-xdit", "reference", ("image", "video"), image="xdit",
+        models=("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22", "cosmos3_nano"),
+        recipe="xDiT (rocm/pytorch-xdit:v26.9) with --use_torch_compile --attention_backend aiter, bf16, timed "
+               "in-process",
+        differs="in-process reference: c=1 only, no HTTP, base64 or output encoding"),
     Arm("ref-kokoro", "reference", ("tts",), models=("kokoro",),
         recipe="`kokoro` 0.9.4 KPipeline, eager, one sentence at a time",
         differs="reference implementation: single stream, no server"),
