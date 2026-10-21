@@ -27,8 +27,9 @@ Request state machine:
     language given:  prefill -> decode -> done
     language absent: detect_language -> prefill_prompt -> decode -> done
 
-The transcript is streamed as Whisper's own token stream rendered to text:
-spoken words as bytes, plus the language token (``<|en|>``) and, when
+The client gets each window's transcript in one message when its decode loop
+ends, as Whisper's own token stream rendered to text: spoken words as bytes,
+plus the language token (``<|en|>``) and, when
 timestamps were requested, the ``<|s.ss|>`` markers. The OpenAI layer's
 adapter lifts those into ``language`` / ``segments``.
 """
