@@ -45,6 +45,7 @@ jobs:
         with:
           client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
           private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
           permission-pull-requests: write
       - name: Label
         env:
