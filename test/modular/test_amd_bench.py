@@ -773,6 +773,21 @@ def test_long_prompt_cuts_phase_records_by_cell_window():
     assert names == ["prefill-long", "prefill-short", "burst-long", "burst-short"]
 
 
+def test_phase_server_runs_mstar_from_the_tree_under_test(tmp_path):
+    import shlex
+
+    from benchmark.amd import long_prompt
+
+    wt = tmp_path / "base tree"
+    (wt / "configs").mkdir(parents=True)
+    (wt / "configs" / "whisper_large.yaml").write_text("model: whisper\n")
+    launch = Launch(catalog.ARMS["mstar"], catalog.ROWS["whisper_large"], [0], 8710, tmp_path / "run", worktree=wt)
+    cmd = long_prompt.served_command(launch)
+    cd, rest = cmd.split(" && ", 1)
+    assert shlex.split(cd) == ["cd", str(wt.resolve())]
+    assert shlex.split(rest)[1:4] == ["-m", "mstar.cli.main", "serve"]
+
+
 def test_phase_cells_cuts_one_window_per_concurrency(tmp_path, monkeypatch):
     import contextlib
     import datetime
