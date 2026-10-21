@@ -3,6 +3,7 @@ UNSUPPORTED (a test checks this)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -54,9 +55,35 @@ class Wan22Video(VideoFamily):
 
 
 class Wan22I2V(Wan22Video):
-    """Image-to-video on the same TI2V-5B checkpoint, conditioned on video_v1's first frames."""
+    """Wan2.2-TI2V-5B image-to-video with diffusers' WanImageToVideoPipeline (expand_timesteps).
+
+    The set's first frames are 320x180 and mstar's wan22 refuses an image that isn't the request's size, so the
+    reference conditions on frames resized to 480x832 by diffusers' own VideoProcessor (PIL lanczos, what the
+    pipeline would do itself) and keeps them in <ref_dir>/conditioning/ for the served runs to send.
+    """
 
     image_to_video = True
+
+    def load_pipeline(self, device: str):
+        import torch
+        from diffusers import WanImageToVideoPipeline
+
+        return WanImageToVideoPipeline.from_pretrained(self.hf_id, torch_dtype=torch.bfloat16).to(device)
+
+    def make_reference(self, sset, ref_dir: Path, device: str) -> None:
+        from diffusers.video_processor import VideoProcessor
+        from PIL import Image
+
+        cond = ref_dir / "conditioning"
+        cond.mkdir(parents=True, exist_ok=True)
+        vp = VideoProcessor(vae_scale_factor=16)
+        items = []
+        for it in sset.items:
+            img = vp.resize(Image.open(sset.path(it.files["image"])).convert("RGB"), self.height, self.width)
+            path = cond / f"{it.id}.png"
+            img.save(path)
+            items.append(dataclasses.replace(it, files={**it.files, "image": str(path.resolve())}))
+        super().make_reference(dataclasses.replace(sset, items=items), ref_dir, device)
 
 
 class Cosmos3Reference:
