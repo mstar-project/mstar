@@ -9,6 +9,7 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 from __future__ import annotations
 
 import base64
+import codecs
 
 from fastapi import HTTPException
 
@@ -39,18 +40,19 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
 
 
 def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
-    text_parts: list[str] = []
+    text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
     for c in chunks:
         if c.modality == "text":
-            text_parts.append(c.data.decode("utf-8", "replace"))
+            text_parts.append(c.data)
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
             images.append(c.data)
 
-    text = "".join(text_parts)
+    # a byte-level BPE token can end mid-character, so decode the joined bytes
+    text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
 
     if audio_pcm:
@@ -102,6 +104,8 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
 
     yield chunk({"role": "assistant"})
     failed = False
+    # holds back a character split across chunks until its last byte
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         # One yield per batch of text chunks: the tokens a request had waiting
         # when its handler ran go out as one body frame (one write), which is
@@ -111,7 +115,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
-                    text_events.append(chunk({"content": c.data.decode("utf-8", "replace")}))
+                    text = decoder.decode(c.data)
+                    if text or not c.data:
+                        text_events.append(chunk({"content": text}))
                     continue
                 if text_events:
                     yield "".join(text_events)
@@ -140,5 +146,8 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield chunk({"content": tail})
         yield chunk({}, finish="stop")
     yield SSE_DONE

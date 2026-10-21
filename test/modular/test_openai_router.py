@@ -705,3 +705,28 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+def test_chat_keeps_a_character_split_across_chunks():
+    """Text chunks are decoded as one byte stream: a character whose UTF-8
+    bytes span two chunks arrives whole, streamed or not."""
+    from mstar.api_server.openai.serving_chat import _build_response, _stream
+
+    data = "a😀b".encode()
+    pieces = [_Chunk("text", data[:3]), _Chunk("text", data[3:])]
+    reply = _build_response("bagel", "rid", pieces, 24000)
+    assert reply["choices"][0]["message"]["content"] == "a😀b"
+
+    class _Batches:
+        async def iter_result_chunk_batches(self, request_id):
+            yield pieces[:1]
+            yield pieces[1:] + [_Chunk("text", b"\xe2\x82")]  # a cut-off last character
+
+    async def _collect():
+        return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
+
+    frames = asyncio.run(_collect())
+    events = [json.loads(l[6:]) for f in frames[:-1] for l in f.splitlines() if l.startswith("data: ")]
+    content = [e["choices"][0]["delta"].get("content") for e in events]
+    assert "".join(c for c in content if c) == "a😀b�"
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"

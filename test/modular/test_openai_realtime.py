@@ -1006,3 +1006,28 @@ def test_stream_resampler_is_split_invariant_and_keeps_time():
         alias = np.sin(2 * np.pi * hz * np.arange(n) / 24000).astype(np.float32)
         out = np.concatenate([r.push(alias), r.flush()])
         assert np.sqrt((out[100:-100] ** 2).mean()) < 1e-3, hz
+
+
+def test_a_character_split_across_token_chunks_survives_a_step():
+    """Qwen3-ASR emits one byte-level BPE token per chunk, so a CJK character
+    or an emoji can arrive split across chunks: the step decodes the joined
+    bytes, not each chunk."""
+    import asyncio
+
+    text = "真正的存在😀"
+
+    class _ByteChunks(_StubAPI):
+        def submit_request(self, **kw):
+            super().submit_request(**kw)
+            data = self._chunks[kw["request_id"]][0].data
+            self._chunks[kw["request_id"]] = [_Chunk("text", data[i:i + 1]) for i in range(len(data))]
+            return kw["request_id"]
+
+    api = _ByteChunks()
+    api.answers = [text]
+    session = types.SimpleNamespace(
+        session_id="s", request=serving_realtime.TranscriptionRequest(model="rt_test"),
+        audio_so_far=lambda: np.zeros(1600, dtype=np.float32),
+    )
+    out = asyncio.run(serving_realtime._run_step(api, _ContinuingAdapter(), session, "pre "))
+    assert out == "pre " + text
