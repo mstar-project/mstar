@@ -1034,3 +1034,39 @@ def test_cosmos3_t2i_row_settings():
     assert ours["flow_shift"] == 1.0 and "flow_shift" not in theirs and theirs["generator_device"] == "cuda"
     names = [a.name for a in catalog.arms_for(row, list(tables.TABLES["image"].arms))]
     assert "vllm-omni-rc" in names and "sglang-diffusion-bcg" not in names and "ref-diffusers" in names
+
+
+def test_video_job_poll_gives_up(monkeypatch):
+    import asyncio
+
+    from benchmark.base import ModelType, RequestType
+    from benchmark.request import MediaRoutes, RequestInput, RequestMetrics
+
+    class Resp:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return self.body
+
+    class Session:
+        def post(self, url, data=None, json=None, timeout=None):
+            return Resp({"id": "v1"})
+
+        def get(self, url, timeout=None):
+            return Resp({"status": "in_progress"})
+
+    routes = MediaRoutes()
+    routes.video_poll_s, routes.video_job_timeout_s = 0.001, 0.01
+    req = RequestInput(req_type=RequestType.T2V, prompt="p")
+    metrics = RequestMetrics(request_id=0, type=RequestType.T2V, expected_output_modalities=["video_file"])
+    asyncio.run(routes._send_request_video_job(Session(), req, "http://x", ModelType.WAN22.inst(), metrics, {}))
+    assert metrics.error and "still in_progress" in metrics.error
