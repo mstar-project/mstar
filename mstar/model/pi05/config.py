@@ -65,6 +65,14 @@ class Pi05Config:
     state_token_bins: int = 256  # number of discretization bins for robot state
     state_token_offset: int = 0  # vocab offset where state-bin tokens start
 
+    # ----- Deployment normalization -----
+    # Quantile stats of the robot a deployment serves, as in openpi's
+    # norm_stats.json: a mapping with "state" and/or "actions" entries holding
+    # q01/q99 lists, or the path of such a file. With "state" set, clients send
+    # the raw robot state; with "actions", the first dims of the reply are in
+    # robot units. Unset, both are the model's normalized values.
+    norm_stats: dict | str | None = None
+
     # ----- Tokenization / sequence limits -----
     max_lang_tokens: int = 200
     max_position_embeddings: int = 2048
