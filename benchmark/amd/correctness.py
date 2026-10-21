@@ -407,23 +407,30 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
             continue  # an arm run set aside (e.g. voided by its health check); its score would replace the live one's
         corr = arm_dir / "correctness"
         tree = _arm_tree(arm_dir, worktree)
-        if not (corr / "pass.json").is_file():
-            row = catalog.ROWS.get(info["row"])
-            for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
-                cell = arm_dir / "cells" / wl / "c1"
-                if (cell / "a1r1" / "results.json").is_file():
-                    pass_from_cell(C, tree, info["row"], info["arm"], cell, corr, ext,
-                                   dict(row.correctness_opts) if row else None)
-                    break
-        if (corr / "pass.json").is_file():
-            results[f"{info['row']}/{info['arm']}"] = score_dir(C, tree, corr, device)
+        key = f"{info['row']}/{info['arm']}"
+        try:  # one arm's failure (e.g. a cell without outputs) leaves the others' scores in place
+            if not (corr / "pass.json").is_file():
+                row = catalog.ROWS.get(info["row"])
+                for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
+                    cell = arm_dir / "cells" / wl / "c1"
+                    if (cell / "a1r1" / "results.json").is_file():
+                        pass_from_cell(C, tree, info["row"], info["arm"], cell, corr, ext,
+                                       dict(row.correctness_opts) if row else None)
+                        break
+            if (corr / "pass.json").is_file():
+                results[key] = score_dir(C, tree, corr, device)
+        except Exception as e:
+            results[key] = {"verdict": "ERROR", "error": f"{type(e).__name__}: {e}"}
         # Image-to-video cells have their own pass, scored against the family's i2v reference.
         cell = arm_dir / "cells" / "video-i2v" / "c1"
         corr_i2v = arm_dir / "correctness-video-i2v"
-        if (cell / "a1r1" / "results.json").is_file() and not (corr_i2v / "pass.json").is_file():
-            pass_from_cell(C, tree, info["row"], info["arm"], cell, corr_i2v, "mp4", {"mode": "i2v"})
-        if (corr_i2v / "pass.json").is_file():
-            results[f"{info['row']}/{info['arm']}/video-i2v"] = score_dir(C, tree, corr_i2v, device)
+        try:
+            if (cell / "a1r1" / "results.json").is_file() and not (corr_i2v / "pass.json").is_file():
+                pass_from_cell(C, tree, info["row"], info["arm"], cell, corr_i2v, "mp4", {"mode": "i2v"})
+            if (corr_i2v / "pass.json").is_file():
+                results[f"{key}/video-i2v"] = score_dir(C, tree, corr_i2v, device)
+        except Exception as e:
+            results[f"{key}/video-i2v"] = {"verdict": "ERROR", "error": f"{type(e).__name__}: {e}"}
     (run_dir / "correctness.json").write_text(json.dumps(results, indent=1, default=str))
     return results
 
