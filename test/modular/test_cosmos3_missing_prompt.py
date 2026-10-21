@@ -61,6 +61,9 @@ def test_generate_form_turns_empty_text_into_none(monkeypatch) -> None:
     seen = {}
 
     class Server:
+        async def wait_for_request_id(self, request_id):
+            return None
+
         def submit_request(self, **kwargs):
             seen.update(kwargs)
             raise HTTPException(status_code=418)
