@@ -32,6 +32,7 @@
    chatterbox
    components
    cosmos3
+   fish_s2_pro
    flux2_klein
    higgs_audio
    kokoro

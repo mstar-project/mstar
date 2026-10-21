@@ -92,6 +92,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[fish_s2_pro]``
+     - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
    * - ``.[omnivoice]``
      - OmniVoice TTS. The extra is empty on purpose: the runtime is the
        ``omnivoice`` package, installed separately from git —
