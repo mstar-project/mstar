@@ -23,7 +23,10 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
 
 
 def _sub():
-    return SimpleNamespace(config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})))
+    return SimpleNamespace(
+        config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})),
+        _token_is_real=LLMSubmodule._token_is_real,
+    )
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
