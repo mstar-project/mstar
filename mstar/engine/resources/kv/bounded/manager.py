@@ -269,7 +269,7 @@ class BoundedKVManager(Resource):
             table = self._cg_tables[key] = torch.zeros(size, ROW_INTS, dtype=torch.int32, device=self._device)
         return table
 
-    def build_cuda_graph_buffers(self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int) -> None:
+    def build_accelerator_graph_buffers(self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int) -> None:
         del slots, max_seq_len
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
