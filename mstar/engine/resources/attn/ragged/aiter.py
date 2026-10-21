@@ -22,7 +22,7 @@ import torch
 
 from mstar.engine.resources.attn.aiter import _PlanImage
 from mstar.engine.resources.attn.base import EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager, RaggedCrossAttnManager
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -274,6 +274,10 @@ def _round(n: int) -> int:
 class AiterRaggedManager(_AiterRaggedBase, RaggedAttnManager):
     """Self-attention. Each label in the step is its own layout, and each
     segment attends within itself."""
+
+    def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
+        super().plan(step, ctx)
 
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plans) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
