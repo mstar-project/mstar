@@ -1219,12 +1219,28 @@ Validation status:
    * - Check
      - Status
    * - Delayed token cache vs NVIDIA ``LMGen`` integer trace (CPU)
-     - Passing
+     - Recorded passing with externally generated reference fixtures
    * - Temporal transformer + depformer vs NVIDIA ``LMGen``, tiny random fp32 weights, greedy (CPU)
-     - Passing
+     - Recorded passing with externally generated reference fixtures; not real-checkpoint parity
    * - Mimi (HF submodules + ring-faithful mask) vs NVIDIA streaming Mimi, tiny random weights (CPU)
-     - Passing
+     - Recorded passing with externally generated reference fixtures; not real-checkpoint parity
    * - Graph walks, accumulated outputs and request validation (CPU, dummy mode)
-     - Passing
-   * - Real checkpoint load (LM and Mimi), bf16 numerics, GPU parity, serving, audio quality
-     - **Not run** (gated checkpoint and GPU access pending)
+     - Ordering, persistence and final loop-output ownership pass targeted regressions;
+       bounded Python/Rust GPU worker cleanup checks also passed
+   * - Offline numerical component replay (CPU, tiny random weights)
+     - Recorded passing after substituting NVIDIA user codes at an encoder quantizer near-tie;
+       uninterrupted M* encoder-to-output parity is not established
+   * - Real checkpoint loading and eager single-GPU serving
+     - Exercised on GH200 with audio-only and audio-plus-text requests;
+       output format and duration checked
+   * - Real-checkpoint numerical comparisons and bounded request lifecycle checks
+     - Dense real-checkpoint control closely matches the reference; production paged
+       attention changes the greedy audio trajectory. Repeated, concurrent and
+       cancelled requests passed bounded checks. Sustained memory stability,
+       performance and audio quality remain unestablished
+
+Reference fixtures are generated outside Git by
+``test/scratch/personaplex_reference_oracle.py`` (see
+``test/modular/fixtures/personaplex/README.rst``). Their tests skip when fixtures
+are unavailable. The current path runs eagerly without CUDA graphs; an 80 ms
+audio frame is model timing, not an achieved processing-latency claim.
