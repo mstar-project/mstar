@@ -252,7 +252,7 @@ class ARSubmodule(ARNodeSubmodule):
         logits = self.slow_ar.semantic_logits(last_hidden)
         logits[:, self.eos_code].masked_fill_(suppress_eos, float("-inf"))
         sampler: SamplerResource = engine_inputs.resources[AR_SAMPLER]
-        head_index = sampler.sample(engine_inputs.request_ids, logits).reshape(-1)
+        head_index = sampler.sample(logits).reshape(-1)
         is_eos = head_index >= self.eos_code
         semantic = torch.where(is_eos, torch.zeros_like(head_index), head_index)
         codes = self.fast_ar(last_hidden, semantic, self._get_fast_kv(semantic.shape[0]))
