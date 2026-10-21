@@ -232,8 +232,6 @@ class MicroScheduler:
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
-        self._max_bs: dict[tuple[str, str], int | None] = {}
-        self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
         self.batch_builder = make_batch_builder(batch_builder_type)
         self.batch_number = 0
@@ -1055,12 +1053,8 @@ class MicroScheduler:
     def _walk_caps(self, key: tuple[str, str]) -> dict[str, int | None]:
         """``BatchBuildRequest.walk_caps`` for ``key``: its walk's cap, or a
         combined key's walks' caps and its own under its label."""
-        caps = self._walk_caps_of_key.get(key)
-        if caps is None:
-            walks = self._walks_of_key.get(key, ())
-            caps = {walk: self._max_batch_size(key[0], walk) for walk in walks}
-            caps[key[1]] = self._max_batch_size(*key)
-            self._walk_caps_of_key[key] = caps
+        caps = {walk: self._max_batch_size(key[0], walk) for walk in self._walks_of_key.get(key, ())}
+        caps[key[1]] = self._max_batch_size(*key)
         return caps
 
     def _walk_row_caps(self, key: tuple[str, str]) -> dict[str, int]:
@@ -1080,13 +1074,11 @@ class MicroScheduler:
     def _max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """The engine's cap for this (node, walk), if it has one. A combined
         walk's cap is the model's to declare, via its captures or max_batch_size.
-        Fixed once the graphs are captured, so asked once."""
-        key = (node_name, graph_walk)
-        if key not in self._max_bs:
-            self._max_bs[key] = self.engine_manager.get_engine(node_name).get_max_batch_size(
-                node_name, graph_walk
-            )
-        return self._max_bs[key]
+        Asked every pass, not cached: a cap can follow free state (GLM-5.3's
+        prefill takes only the KDA slots free now), and a stale one overfills the step."""
+        return self.engine_manager.get_engine(node_name).get_max_batch_size(
+            node_name, graph_walk
+        )
 
     def _assemble_batch(
         self,

@@ -124,3 +124,19 @@ def test_a_full_caller_batch_still_takes_nothing():
     sched, _, state = _setup(dict.fromkeys(("d0", "d1"), "decode"), max_bs=2)
 
     assert sched.get_next_batch(state, target=(NODE, "decode"), pre_existing_batch_size=2) is None
+
+
+def test_a_cap_that_moves_is_read_on_every_pass():
+    """A cap can follow free state (GLM-5.3's prefill takes only the KDA slots free
+    now). A pass that kept an earlier pass's cap would hand prefill rows it has no
+    slot for: refused on one rank, a divergence error on a TP follower."""
+    max_bs = {"prefill": 2}
+    sched, _, state = _setup({f"p{i}": "prefill" for i in range(4)}, max_bs=max_bs)
+
+    assert _rids(sched.get_next_batch(state)) == ["p0", "p1"]
+    max_bs["prefill"] = 1
+    assert _rids(sched.get_next_batch(state)) == ["p2"]
+    max_bs["prefill"] = 0
+    assert sched.get_next_batch(state) is None
+    max_bs["prefill"] = 1  # a slot frees
+    assert _rids(sched.get_next_batch(state)) == ["p3"]
