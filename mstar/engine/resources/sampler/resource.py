@@ -512,7 +512,7 @@ class SamplerResource(Resource):
             self._keep_last_token and bufs is not None
             and all(bufs.has_slot(rid) for rid in request_ids)
         ):
-            bufs.write_last_tokens(request_ids, tokens)
+            bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
         return tokens
 
     def enable_device_loopback_reader(self) -> None:
