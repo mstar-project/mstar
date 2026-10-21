@@ -15,7 +15,13 @@ from dataclasses import dataclass
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
+from mstar.engine.resources.base import (
+    CachedPrefix,
+    CGSlotKey,
+    CGSlotSpec,
+    EngineResourceInfo,
+    Resource,
+)
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
@@ -155,10 +161,8 @@ class RecurrentStatePool(Resource):
         # rid -> label -> the first of them rooted, hashed once for a TP follower's adopt polls
         self._prefix_rooted: dict[str, dict[str, list[bytes]]] = {}
         # under TP rank 0 decides each hit (`adopt_cached_prefix`)
-        self._follower = (
-            comm_group is not None and comm_group.world_size > 1
-            and getattr(comm_group, "rank", 0) != 0
-        )
+        self._tp = comm_group is not None and comm_group.world_size > 1
+        self._follower = self._tp and getattr(comm_group, "rank", 0) != 0
         # rid -> (label, snapshot slot, tokens): a hit held from the probe until admit
         self._leases: dict[str, tuple[str, int, int]] = {}
         # (rid, label) -> (snapshot slot, tokens) the request's first step copies in at plan
@@ -528,7 +532,7 @@ class RecurrentStatePool(Resource):
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         self._keyed = {
             label: frozenset(walk for walk in named if walk is not None)
@@ -587,22 +591,31 @@ class RecurrentStatePool(Resource):
         if lease is not None:
             self._unref(lease[1])
 
+    @staticmethod
+    def _held(label: str, tokens: int) -> CachedPrefix:
+        """A snapshot keys a prompt's ids, whose positions are their count."""
+        return CachedPrefix(label, tokens, tokens)
+
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """The longest prefix a snapshot holds for this request, held until admit."""
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """The longest prefix a snapshot holds for this request, held until admit.
+
+        Under TP only rank 0 looks, as it sends the step (``inputs`` None); the step's
+        prepare answers what it decided, which the other ranks adopted.
+        """
         del node_name
         with self._lock:
             label = self._keyed_label(rid, graph_walk)
             if label is None:
                 return None
             if rid in self._leases:
-                return self._leases[rid][2]
+                return self._held(label, self._leases[rid][2])
             slot = self._slots.get(rid, {}).get(label)
             if (slot is not None and slot.has_state) or (rid, label) in self._restores:
                 return None
-            if self._prefix_root is None or self._follower:
-                return 0
+            if self._prefix_root is None or (self._tp and (self._follower or inputs is not None)):
+                return self._held(label, 0)
             keys = list(self._prefix_keys[rid][label])
         rooted = self._rooted(keys)
         with self._lock:
@@ -611,36 +624,41 @@ class RecurrentStatePool(Resource):
             # one key short, as the KV cache: a fully cached prompt still runs a token
             found = self._find_snapshot(rooted, (len(rooted) - 1) * self.config.prefix_page_size)
             if found is None:
-                return 0
+                return self._held(label, 0)
             self._lease(rid, label, *found)
-            return found[1]
+            return self._held(label, found[1])
 
     def cap_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, length: int,
-    ) -> int:
-        """Snapshots sit at some page boundaries only: the longest at or under ``length``."""
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """Snapshots sit at some page boundaries only: the longest at or under the agreed
+        length. A shorter one moves the position back as far (a resource that places
+        positions has the last word; see `StepRunner.resolve_cached_prefix`)."""
         del node_name, graph_walk
+        length = prefix.tokens
         with self._lock:
             lease = self._leases.get(rid)
-            if lease is None:
-                return length
-            if lease[2] <= length:
-                return lease[2]
+            if lease is None or lease[2] == length:
+                return prefix
+            if lease[2] < length:
+                return prefix._replace(tokens=lease[2], position=prefix.position - length + lease[2])
             label = lease[0]
             keys = list(self._prefix_keys[rid][label])
         rooted = self._rooted(keys)
         with self._lock:
             self._drop_lease(rid)
             found = self._find_snapshot(rooted, length)
-            if found is None:
-                return 0
-            self._lease(rid, label, *found)
-            return found[1]
+            tokens = 0 if found is None else found[1]
+            if found is not None:
+                self._lease(rid, label, *found)
+            return prefix._replace(tokens=tokens, position=prefix.position - length + tokens)
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
         del node_name, graph_walk, inputs
+        matched_len = prefix.tokens if prefix is not None else 0
         with self._lock:
             lease = self._leases.get(rid)
             if lease is None:
