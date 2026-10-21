@@ -982,7 +982,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">rope_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Rotate with a cos/sin table rounded to this dtype (math stays float32),</span>
     <span class="c1"># for checkpoints trained with a low-precision table (Fish S2-Pro:</span>
-    <span class="c1"># bfloat16). None computes the angles exactly, in the kernel.</span>
+    <span class="c1"># bfloat16). None computes the angles exactly, in the kernel. XPU rotates</span>
+    <span class="c1"># from a table in rope_dtype or the KV dtype and refuses any other value.</span>
     <span class="n">rope_table_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">low_freq_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>

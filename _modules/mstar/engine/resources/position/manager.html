@@ -1043,6 +1043,13 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"dependent KV cache's head_dim"</span>
                 <span class="p">)</span>
             <span class="n">cache_dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_dtype</span> <span class="ow">or</span> <span class="n">dtype</span>
+            <span class="c1"># XPU always rotates from this cache, so it already rounds the</span>
+            <span class="c1"># table to cache_dtype; another rope_table_dtype has no kernel here.</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_table_dtype</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">cache_dtype</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"rope_table_dtype=</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">rope_table_dtype</span><span class="si">}</span><span class="s2"> is not implemented for XPU, "</span>
+                    <span class="sa">f</span><span class="s2">"which rotates from a </span><span class="si">{</span><span class="n">cache_dtype</span><span class="si">}</span><span class="s2"> cos/sin table (rope_dtype or the KV dtype)"</span>
+                <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache_key</span> <span class="o">=</span> <span class="p">(</span>
                 <span class="n">rotary_dim</span><span class="p">,</span>
                 <span class="n">config</span><span class="o">.</span><span class="n">rope_scale</span><span class="p">,</span>
