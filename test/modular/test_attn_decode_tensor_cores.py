@@ -66,7 +66,7 @@ def _kv():
 def _info(kv):
     return SimpleNamespace(
         dependency=lambda name: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.bfloat16,
+        device=torch.device("cpu"), resolve_dtype=lambda declared, key: declared or torch.bfloat16,
         joint_comm_group=None, head_shards=1, max_rows_in_combined={},
     )
 

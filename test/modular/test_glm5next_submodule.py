@@ -173,7 +173,7 @@ class _Harness:
                 self.resources[SAMPLER] = _GreedySampler()
                 continue
             info = EngineResourceInfo(
-                device=DEVICE, kv_dtype=dtype,
+                device=DEVICE, compute_dtype=dtype,
                 dependencies={k: by_key[k] for k in spec.depends_on()},
             )
             self.resources[spec.resource_key] = build_resource(spec, info)

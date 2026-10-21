@@ -403,7 +403,6 @@ class EngineManager:
             parallel_groups=parallel_groups,
             device=device,
             transfer_engine_info=transfer_engine_info,
-            kv_cache_type=autocast_dtype,
             model=model,
             token_ladders=walk_ladders,
             region_ladders=region_ladders,

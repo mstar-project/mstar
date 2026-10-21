@@ -164,6 +164,13 @@ def _outside_steps(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+def _common_dtype(dtypes: Iterable[torch.dtype | None]) -> torch.dtype | None:
+    """The one dtype a resource's nodes were cast to and run in, or None if they differ
+    or one keeps its own (``disable_autocast``)."""
+    distinct = set(dtypes)
+    return distinct.pop() if len(distinct) == 1 else None
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -717,22 +724,26 @@ class Engine:
         parallel_groups: WorkerParallelGroups,
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
-        kv_cache_type=None,
         model: "Model | None" = None,
         token_ladders: Mapping[str, Any] | None = None,
         region_ladders: Mapping[str, Any] | None = None,
     ):
         """``token_ladders`` and ``region_ladders``: the serving config's
         ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
-        piecewise region label -> ladder, which the node's captures take at warmup."""
+        piecewise region label -> ladder, which the node's captures take at warmup.
+
+        A resource's dtype is its spec's, else its local nodes' common one."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
-        if kv_cache_type is None:
-            kv_cache_type = self._autocast_dtype
 
         node_names = set(submodules.keys())
+        # the dtype the engine manager cast each node to
+        resolved_dtypes = {
+            name: resolve_node_dtype(submodule, self._autocast_dtype)
+            for name, submodule in submodules.items()
+        }
         node_to_resources = {}
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
@@ -754,14 +765,15 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
+            local_dtypes = {node: resolved_dtypes[node] for node in relevant_nodes}
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
                     device=device,
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
-                    kv_dtype=kv_cache_type,
-                    compute_dtype=self._compute_dtype(submodules, relevant_nodes),
+                    compute_dtype=_common_dtype(local_dtypes.values()),
+                    node_dtypes=local_dtypes,
                     needs_remote_transfer=(
                         parallel_groups.resource_needs_remote_transfer(
                             spec.nodes, relevant_nodes
@@ -818,8 +830,7 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                # the dtype the engine manager cast this node to
-                node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
+                node_dtype=resolved_dtypes[node_name],
                 fp32_precision=node_fp32_precision(node_name, submodule),
                 token_ladders=(token_ladders or {}).get(node_name) or {},
                 region_ladders=(region_ladders or {}).get(node_name) or {},
@@ -962,14 +973,6 @@ class Engine:
                     "Engine: torch.compile failed for %s, using eager mode",
                     node_name, exc_info=True
                 )
-
-    def _compute_dtype(
-        self, submodules: Mapping[str, NodeSubmodule], nodes: Collection[str],
-    ) -> torch.dtype | None:
-        """The dtype ``nodes`` were cast to and run in, or None if they differ or one keeps
-        its own (``disable_autocast``)."""
-        dtypes = {resolve_node_dtype(submodules[n], self._autocast_dtype) for n in nodes}
-        return dtypes.pop() if len(dtypes) == 1 else None
 
     def _compile_regions(self) -> None:
         """Compile and warm each node's ``compile_regions`` with dynamic=True

@@ -120,7 +120,7 @@ class _Node:
                 spec,
                 EngineResourceInfo(
                     device=DEVICE, joint_comm_group=self.groups,
-                    transfer_engine_info=transfer, kv_dtype=DTYPE,
+                    transfer_engine_info=transfer, compute_dtype=DTYPE,
                     dependencies={key: by_key[key] for key in spec.depends_on()},
                 ),
             )

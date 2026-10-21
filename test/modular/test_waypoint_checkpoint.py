@@ -452,7 +452,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
     )
     try:
         assert manager.node_names == {DIT_NODE, VAE_ENCODER_NODE}
-        assert manager.engine._autocast_dtype is torch.bfloat16
+        assert manager.engine._autocast_dtype is None
         assert model.config.reference_compat is True
         assert model.config.compile_dit is True
         assert model.config.accelerator_graph is True

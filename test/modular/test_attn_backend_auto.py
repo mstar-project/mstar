@@ -60,7 +60,7 @@ def ring_config() -> RingKVConfig:
 
 def kv_info(kv_config) -> EngineResourceInfo:
     kv_spec = KVSpec(resource_key="kv", nodes={"node"}, config=kv_config)
-    return EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16, dependencies={"kv": kv_spec})
+    return EngineResourceInfo(device=CPU, compute_dtype=torch.bfloat16, dependencies={"kv": kv_spec})
 
 
 def attention_spec(**config) -> AttentionSpec:
@@ -184,7 +184,7 @@ def test_cross_attention_rejects_a_backend_it_does_not_implement():
 )
 def test_ragged_attention_builds_flashinfer(spec_class, manager_class, backend):
     spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config(backend=backend))
-    manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+    manager = build_resource(spec, EngineResourceInfo(device=CPU, compute_dtype=torch.bfloat16))
     assert type(manager) is manager_class
 
 
@@ -211,7 +211,7 @@ def test_explicit_ragged_dense_builds_when_the_kernel_is_present(spec_class, man
             resource_key="ragged", nodes={"node"},
             config=ragged_config(backend=RaggedAttnBackend.DENSE),
         )
-        manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+        manager = build_resource(spec, EngineResourceInfo(device=CPU, compute_dtype=torch.bfloat16))
     finally:
         _clear_fa3_caches()
     assert type(manager) is manager_class
@@ -235,7 +235,7 @@ def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
             config=ragged_config(backend=RaggedAttnBackend.DENSE),
         )
         with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.attn.ragged.dense"):
-            manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+            manager = build_resource(spec, EngineResourceInfo(device=CPU, compute_dtype=torch.bfloat16))
     finally:
         _clear_fa3_caches()
     assert type(manager) is manager_class
@@ -251,7 +251,7 @@ def test_block_causal_dense_falls_back_even_with_the_kernel_present(monkeypatch,
             config=ragged_config(backend=RaggedAttnBackend.DENSE),
         )
         with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.attn.ragged.dense"):
-            manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+            manager = build_resource(spec, EngineResourceInfo(device=CPU, compute_dtype=torch.bfloat16))
     finally:
         _clear_fa3_caches()
     assert type(manager) is FlashInferRaggedBlockCausalManager

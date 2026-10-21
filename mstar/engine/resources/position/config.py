@@ -46,7 +46,7 @@ class PositionConfig:
     # bfloat16). None computes the angles in the kernel with its fast sin/cos,
     # about a bf16 ulp from a float32 table. CUDA needs a rotary_dim that is a
     # multiple of 16 for a table. XPU rotates from a table in rope_dtype or the
-    # KV dtype and refuses any other value.
+    # nodes' dtype and refuses any other value.
     rope_table_dtype: torch.dtype | None = None
 
     low_freq_factor: float | None = None

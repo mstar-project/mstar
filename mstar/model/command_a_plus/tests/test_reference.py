@@ -149,7 +149,7 @@ class ReferenceTests(unittest.TestCase):
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 16}}})
         transfer = TransferEngineInfo("reference", "reference", LocalTransferEngine("localhost"))
         resources = {key: build_resource(spec, EngineResourceInfo(
-            device=torch.device("cuda"), kv_dtype=torch.bfloat16,
+            device=torch.device("cuda"), compute_dtype=torch.bfloat16,
             transfer_engine_info=transfer, needs_remote_transfer=False,
             joint_comm_group=JointGroups(group, CommGroup.trivial(), group) if group else None,
             dependencies={dependency: specs[dependency] for dependency in spec.depends_on()},

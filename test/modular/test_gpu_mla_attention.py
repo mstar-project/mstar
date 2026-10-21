@@ -33,7 +33,7 @@ def _build(specs, device=DEV):
     resources = {}
     transfer = TransferEngineInfo("local", "local", LocalTransferEngine("localhost"))
     for key, spec in by_key.items():
-        info = EngineResourceInfo(device=device, kv_dtype=torch.bfloat16, transfer_engine_info=transfer,
+        info = EngineResourceInfo(device=device, compute_dtype=torch.bfloat16, transfer_engine_info=transfer,
                                   dependencies={d: by_key[d] for d in spec.depends_on()})
         resources[key] = build_resource(spec, info)
     return resources, StepRunner(resources)

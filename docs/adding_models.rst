@@ -948,6 +948,33 @@ steps none of whose rows names an adapter, in every kind of capture; and a sampl
 ``SamplingReqConfig``), for steps whose rows all sample greedily, in batched captures. A
 model declares nothing for these.
 
+**Resource dtype.** ``KVConfig`` (paged and ring), ``BoundedKVConfig``,
+``AttentionConfig``, ``CrossAttentionConfig`` and ``RaggedAttentionConfig`` each take an
+optional ``dtype``, as does each ``RecurrentBlockConfig`` of a recurrent pool. For a cache
+or pool, ``dtype`` is the storage dtype. For an attention resource, it is the dtype the
+kernel is planned in. The engine resolves each resource's dtype once, at load:
+
+1. the spec's own ``dtype``, if set;
+2. for ``AttentionSpec`` and ``CrossAttentionSpec`` only, the ``dtype`` of the KV cache
+   they read, because the kernel is planned against those pages;
+3. otherwise, the dtype that every local node of the resource resolved to.
+
+If none of these gives a dtype, loading fails. This happens when the resource's nodes run
+without autocast (``disable_autocast``, or a model whose ``get_autocast_dtype`` returns
+``None``), or when they run in different dtypes. The engine never falls back to the
+model-wide dtype, and never silently allocates fp32. Declare the dtype on the spec in
+those cases. For example, Waypoint's DiT runs without autocast, so its ring declares
+``RingKVConfig(..., dtype=torch.bfloat16)``. Its attention, which declares nothing, then
+follows the ring.
+
+A resource can also store in a different dtype from the one its nodes compute in. A node
+in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
+attention is planned in bf16.
+
+RoPE has no storage dtype on CUDA. Its ``rope_dtype`` and ``rope_table_dtype`` set the
+rotation's math and table; on XPU, the cos/sin cache is stored in ``rope_dtype``, else in
+the nodes' dtype.
+
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
 
@@ -1721,7 +1748,9 @@ methods are:
    that is numerically sensitive. Such a submodule sets ``disable_autocast = True``. The
    engine then does not cast its parameters to the autocast dtype, does not wrap its
    forward in autocast, and explicitly disables any enclosing autocast. These two class
-   attributes replace the removed ``get_stateless_flavor`` method.
+   attributes replace the removed ``get_stateless_flavor`` method. Such a node has no
+   dtype for its resources to inherit, so every resource it uses must declare one (see
+   :ref:`Step 2a <Step 2a — Declare your resources>`).
 
    The engine runs float32 matmuls as TF32 in every process
    (``torch.set_float32_matmul_precision("high")``). A node that needs full fp32, for
@@ -2717,9 +2746,9 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``
+       ``prefix_cache``, ``prefix_cache_salt``, ``dtype``
    * - ``KVSpec`` with ``RingKVConfig``
-     - ``num_sessions``
+     - ``num_sessions``, ``dtype``
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``SamplerSpec``
@@ -2734,16 +2763,17 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``), ``dtype``
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
+       (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``),
+       ``dtype``
    * - ``RaggedAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``cudnn``), ``flashinfer_backend``
        (unset by default: a self-attention reads the ``ragged_attention`` kernel table; any name,
        ``auto`` / ``fa2`` / ``fa3`` / ``cudnn`` / ``cutlass``, runs that FlashInfer backend and no
        table), ``max_segments_per_request``,
-       ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
+       ``max_segments_per_step``, ``max_tokens_per_request``, ``dtype``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
    * - ``LoraSpec``
@@ -2760,6 +2790,11 @@ that a misspelled setting is never silently ignored:
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
        worker to answer one before giving up on it). The one ``lora:`` block sizes the
        pool of every node the model's spec reaches
+
+``dtype`` takes a torch dtype name, such as ``bfloat16`` or ``torch.bfloat16``, and sets
+the resource's dtype as if the model had declared it on the spec (see
+:ref:`Step 2a <Step 2a — Declare your resources>`). A name that is not a torch dtype is a
+load error.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

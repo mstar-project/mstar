@@ -39,7 +39,7 @@ class LinearAttnManager(AttentionResource):
                 config=spec.config,
                 geometry=Mamba2Geometry.from_blocks(pool_config.blocks),
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["ssm"].resolved_dtype(info.kv_dtype),
+                state_dtype=pool_config.blocks["ssm"].resolved_dtype(info, spec.resource_key),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )
@@ -63,10 +63,10 @@ class LinearAttnManager(AttentionResource):
                 config=spec.config,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
+                state_dtype=pool_config.blocks["state"].resolved_dtype(info, spec.resource_key),
                 device=info.device,
                 speculative_tokens=DeltaNetGeometry.speculative_tokens_of(pool_config.blocks),
-                conv_dtype=pool_config.blocks["conv"].resolved_dtype(info.kv_dtype),
+                conv_dtype=pool_config.blocks["conv"].resolved_dtype(info, spec.resource_key),
             )
 
         if backend is not LinearAttnBackend.FLASHINFER:
@@ -79,7 +79,7 @@ class LinearAttnManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
+                state_dtype=pool_config.blocks["state"].resolved_dtype(info, spec.resource_key),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )

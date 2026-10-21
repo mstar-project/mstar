@@ -167,7 +167,7 @@ def test_a_dropped_manager_leaves_the_op_registry():
         resource_key="dropped", nodes={"encoder"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
     )
-    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16)
+    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=torch.bfloat16)
     mgr, other = build_resource(spec, info), build_resource(spec, info)
     assert _MANAGERS[mgr._key] is mgr and _MANAGERS[other._key] is other
     key = mgr._key

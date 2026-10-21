@@ -166,7 +166,7 @@ class _Harness:
         self.resources = {}
         for spec in specs:
             info = EngineResourceInfo(
-                device=torch.device("cpu"), kv_dtype=dtype,
+                device=torch.device("cpu"), compute_dtype=dtype,
                 dependencies={k: by_key[k] for k in spec.depends_on()},
             )
             self.resources[spec.resource_key] = build_resource(spec, info)
@@ -452,7 +452,7 @@ def test_glm5next_model_constructs_from_config():
     by_key = resolve_spec_dependencies(list(reduced.values()))
     for spec in reduced.values():
         info = EngineResourceInfo(
-            device=torch.device("cpu"), kv_dtype=torch.float32,
+            device=torch.device("cpu"), compute_dtype=torch.float32,
             dependencies={k: by_key[k] for k in spec.depends_on()},
         )
         assert isinstance(build_resource(spec, info), spec.resource_class)

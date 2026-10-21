@@ -92,6 +92,12 @@ class AttentionManager(AttentionResource):
                     f"(KV resource {spec.config.kv_cache!r})"
                 )
 
+    @staticmethod
+    def _planned_dtype(spec: AttentionSpec, info: EngineResourceInfo, kv_config) -> torch.dtype:
+        # planned against the pages, so the cache's dtype before the nodes'
+        declared = spec.config.dtype if spec.config.dtype is not None else kv_config.dtype
+        return info.resolve_dtype(declared, spec.resource_key)
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
@@ -160,7 +166,7 @@ class AttentionManager(AttentionResource):
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
-                    dtype=info.kv_dtype,
+                    dtype=cls._planned_dtype(spec, info, kv_config),
                     kv_config=kv_config,
                     wrapper_class=dense_or_flashinfer(
                         info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
@@ -176,7 +182,7 @@ class AttentionManager(AttentionResource):
             return FlashInferMLAManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=cls._planned_dtype(spec, info, kv_config),
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
                 sm_scale=spec.config.sm_scale,
@@ -187,7 +193,7 @@ class AttentionManager(AttentionResource):
             return FlashInferManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=cls._planned_dtype(spec, info, kv_config),
                 kv_config=kv_config,
                 backend=flashinfer_backend,
                 splits=spec.config.splits,
@@ -205,7 +211,7 @@ class AttentionManager(AttentionResource):
             return FlexAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=cls._planned_dtype(spec, info, kv_config),
                 kv_config=kv_config,
             )
 

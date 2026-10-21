@@ -74,13 +74,18 @@ class CrossAttentionManager(AttentionResource):
         kv_config = info.dependency(spec.config.kv_cache).config
         backend = resolve_attn_backend(spec.config.backend, info.device)
         kv_config.shard(info.head_shards)
+        # planned against the context pages, so their dtype before the nodes'
+        dtype = info.resolve_dtype(
+            spec.config.dtype if spec.config.dtype is not None else kv_config.dtype,
+            spec.resource_key,
+        )
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
                 query_kv_cache=spec.config.query_kv_cache,
                 context_label=spec.config.context_label,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
                 decode_tensor_cores=spec.config.decode_tensor_cores,

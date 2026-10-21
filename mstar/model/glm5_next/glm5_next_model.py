@@ -191,6 +191,8 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
                     layout=KVLayout.MLA,
                     kv_lora_rank=self.config.kv_lora_rank,
                     qk_rope_head_dim=self.config.mla_cache_kpe,
+                    # the LLM runs outside autocast; its latents are in the trunk's dtype
+                    dtype=self.kda_conv_dtype,
                 ),
             ),
             AttentionSpec(

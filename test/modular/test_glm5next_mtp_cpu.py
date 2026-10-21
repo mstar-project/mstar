@@ -107,7 +107,6 @@ def _build_engine(k: int, seed: int = 0):
             my_entity_id="e", my_session_id="s",
             transfer_engine=LocalTransferEngine("localhost"),
         ),
-        kv_cache_type=torch.float32,
     )
     greedy = _GreedySampler()
     engine._resources[SAMPLER] = greedy

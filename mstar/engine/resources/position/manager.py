@@ -72,7 +72,11 @@ class PositionManager(Resource):
                 device=info.device,
                 max_seq_len=kv_spec.config.max_seq_len,
                 head_dim=kv_spec.config.head_dim,
-                dtype=info.kv_dtype,
+                # only XPU rotates from a cos/sin cache stored in a dtype
+                dtype=(
+                    info.resolve_dtype(spec.config.rope_dtype, spec.resource_key)
+                    if info.device.type == "xpu" else None
+                ),
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
@@ -93,8 +97,9 @@ class RopeManager(PositionManager):
         device: torch.device,
         max_seq_len: int = 32768,
         head_dim: int | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
     ):
+        """``dtype`` is the XPU cos/sin cache's when ``rope_dtype`` is unset."""
         self._config = config
         self._device = device
         self._kv_cache_name = config.kv_cache
@@ -113,12 +118,14 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
+            if cache_dtype is None:
+                raise ValueError("XPU RoPE needs PositionConfig.rope_dtype or a dtype for its cos/sin cache")
             # XPU always rotates from this cache, so it already rounds the
             # table to cache_dtype; another rope_table_dtype has no kernel here.
             if config.rope_table_dtype not in (None, cache_dtype):
                 raise NotImplementedError(
                     f"rope_table_dtype={config.rope_table_dtype} is not implemented for XPU, "
-                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the KV dtype)"
+                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the nodes' dtype)"
                 )
             self._rope_cache_key = (
                 rotary_dim,

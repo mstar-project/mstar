@@ -101,7 +101,6 @@ def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
             my_entity_id="e", my_session_id="s",
             transfer_engine=LocalTransferEngine("localhost"),
         ),
-        kv_cache_type=torch.float32,
     )
     # swap the kernel sampler for the greedy stand-in everywhere the engine
     # handed it out

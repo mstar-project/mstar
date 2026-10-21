@@ -285,7 +285,7 @@ def manager(**config_overrides) -> FlashInferRaggedManager:
         resource_key=ATTN, nodes={"encoder"}, config=RaggedAttentionConfig(**kwargs),
     )
     return build_resource(
-        spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE),
+        spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE),
     )
 
 
@@ -754,7 +754,7 @@ def cross_manager() -> FlashInferRaggedCrossManager:
         resource_key="cross", nodes={"dit"},
         config=RaggedAttentionConfig(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM),
     )
-    return build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    return build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
 
 
 def av_segments(video, text, audio):

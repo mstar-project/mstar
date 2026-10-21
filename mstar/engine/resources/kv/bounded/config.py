@@ -47,8 +47,8 @@ class BoundedKVConfig:
     # the shortest source prefix a request may have: the slots also hold the part
     # of a sink its source doesn't cover, which is largest for the shortest source
     min_source_len: int = 0
-    # None is the engine's KV dtype (``EngineResourceInfo.kv_dtype``), settled when
-    # the resource is built
+    # None is its nodes' common dtype (``EngineResourceInfo.resolve_dtype``), settled
+    # when the resource is built
     dtype: torch.dtype | None = torch.float32
     # A step's tokens join the stream last-first. Only for attention that
     # ignores key order, where it decides which of the oldest step's tokens are
