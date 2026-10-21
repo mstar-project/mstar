@@ -1457,6 +1457,42 @@ def _decoding_model() -> Gr00tN17Model:
     return model
 
 
+class _BytesProcessor:
+    """A backbone processor whose ``input_ids`` are the instruction's own bytes, so
+    two requests tokenize alike only if the model handed it the same text."""
+
+    tokenizer = type("Tokenizer", (), {"padding_side": "right"})()
+
+    def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+        return "<user>" + conversation[0]["content"][-1]["text"]
+
+    def __call__(self, text, images, **kwargs):
+        return {"input_ids": torch.tensor([list(t.encode()) for t in text]),
+                "pixel_values": torch.stack(images).float()}
+
+
+def test_no_instruction_is_served_as_the_empty_instruction():
+    """FastAPI turns an empty ``text`` form field into ``None``, and 8 of the 20
+    recorded DROID requests carry an empty instruction. Refusing ``None`` answered
+    real robot data with a 400; it is the empty instruction, tokenized as such.
+    A real instruction is the control: the stub does see the text."""
+    model = _model()
+    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
+    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
+    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
+
+    def same_as_empty(prompt):
+        out = model.process_prompt(prompt, ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                                   embodiment_tag="bot", state=state)
+        empty = model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                                     embodiment_tag="bot", state=state)
+        assert out.keys() == empty.keys()
+        return all(torch.equal(a, b) for k in out for a, b in zip(out[k], empty[k], strict=True))
+
+    assert same_as_empty(None)
+    assert not same_as_empty("Pick up the cup")
+
+
 def test_postprocess_names_every_joint_group_the_way_the_reference_does():
     """[[D09]]: the payload is one entry per joint group, keyed as NVIDIA keys it.
 

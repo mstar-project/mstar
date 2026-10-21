@@ -506,8 +506,6 @@ class Gr00tN17Model(Model):
         (:meth:`request_kwargs`) and selects the normalisation stats, the
         video keys and the per-robot weights ([[D06]]).
         """
-        if prompt is None:
-            raise ValueError("gr00t_n17 needs a language instruction")
         tag = kwargs.get("embodiment_tag")
         if tag is None:
             raise ValueError(
@@ -525,7 +523,11 @@ class Gr00tN17Model(Model):
         out = self.processor(
             embodiment_tag=tag,
             video=self._views_from_frames(tag, (tensors or {}).get("image_inputs")),
-            language=[prompt],
+            # An empty instruction is a real observation (8 of the 20 recorded DROID
+            # requests carry one) and the wire cannot send it: FastAPI turns an empty
+            # form field into None. So no text is the empty instruction, which the
+            # reference tokenizes like any other.
+            language=[prompt or ""],
             state=kwargs["state"],
         )
         return {name: [tensor] for name, tensor in out.items()}
