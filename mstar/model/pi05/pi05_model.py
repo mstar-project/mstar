@@ -55,9 +55,10 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
+from mstar.model.pi05.components.flow_matching import discretize_state
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+from mstar.model.pi05.components.tokenization import Pi05Tokenizer, pi05_prompt
 from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
@@ -517,17 +518,14 @@ class Pi05Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
-        Pi0.5's production preprocessor (lerobot's
-        ``Pi05PrepareStateTokenizerProcessorStep``) builds a prompt of the
-        form::
+        openpi's PaligemmaTokenizer (and lerobot's
+        ``Pi05PrepareStateTokenizerProcessorStep``) put the state into the
+        prompt as text::
 
-            "Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "
+            "Task: <text>, State: <bin0> <bin1> ...;\\nAction: "
 
-        where each ``<bin_i>`` is the integer index (0–255) obtained by
-        digitizing the normalized state into 256 bins. The PaliGemma
-        tokenizer then encodes the whole string. We mirror that exactly
-        here so the resulting ``text_inputs`` stream matches the production
-        format.
+        with one bin per state value (see :func:`discretize_state`), and the
+        PaliGemma tokenizer encodes the whole string.
         """
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
@@ -539,24 +537,12 @@ class Pi05Model(Model):
                 }
             return {}
 
-        cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
-
+        state_bins = None
         robot_state = kwargs.get("robot_state")
         if robot_state is not None:
-            if not isinstance(robot_state, torch.Tensor):
-                robot_state = torch.tensor(robot_state, dtype=torch.float32)
-            from mstar.model.pi05.components.flow_matching import discretize_state
-
-            bins = discretize_state(
-                robot_state.to(torch.float32),
-                num_bins=self.config.state_token_bins,
-            ).tolist()
-            state_str = " ".join(str(b) for b in bins)
-            full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
-        else:
-            full_prompt = cleaned
-
-        text_ids = self.tokenizer.encode_prompt(full_prompt)
+            state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
+            state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
+        text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
         cfg = self.config
         # a captured SigLIP step encodes all num_cameras slots, however many images the request has
         images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
