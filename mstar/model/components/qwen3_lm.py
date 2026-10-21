@@ -42,11 +42,9 @@ class Qwen3Attention(ParallelAttention):
         super().bind_resources(resources)
         # the kernel is plain non-interleaved RoPE over the whole head dim;
         # anything else the position resource would apply stays unfused
-        cfg = getattr(self.pos, "_config", None)
+        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
         self._fuse_qk = (
-            cfg is not None and self.q_norm is not None and self.rope_scale == 1.0
-            and cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
-            and cfg.rotary_dim in (None, self.head_dim)
+            self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -66,7 +64,7 @@ class Qwen3Attention(ParallelAttention):
         kernel (``qk_norm_rope_kv_write``) rather than a launch of its own."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
-        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), float(self.rope_theta))
+        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), self._rope_theta)
         attend = self.attend
         if not attend.attn.requires_kv_write:
             qk_norm_rope_inplace(q, k, self.q_norm.weight, self.k_norm.weight, pos_ids, *eps)
@@ -110,11 +108,9 @@ class Qwen3DenseLM(nn.Module):
         kv_key: str,
         pos_key: str,
         comm_group: CommGroup | None = None,
-        fused_qk_norm_rope: bool = False,
     ):
         super().__init__()
         self.config = config
-        attention_cls = Qwen3Attention if fused_qk_norm_rope else ParallelAttention
         comm_group = comm_group or CommGroup.trivial()
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -123,7 +119,7 @@ class Qwen3DenseLM(nn.Module):
         )
         self.layers = nn.ModuleList([
             DecoderLayer(
-                self_attn=attention_cls(
+                self_attn=Qwen3Attention(
                     comm_group=comm_group,
                     hidden_size=config.num_attention_heads * config.head_dim,
                     num_heads=config.num_attention_heads,

@@ -78,6 +78,9 @@ class _FakeRope:
     def __init__(self):
         self.next_pos = 0
 
+    def fusable_rope_theta(self, head_dim):
+        return None  # applies RoPE itself: the layer stays on the unfused path
+
     def apply_qk(self, q, k, label, rope_theta, **kwargs):
         del label, kwargs
         n, _, d = q.shape
@@ -162,3 +165,23 @@ def test_prefill_and_decode_logits_match_hf():
             step = ours.logits(ours(ours.embed(nxt), label="main"))
         assert torch.allclose(step[0], expected[-1], atol=1e-4), (step[0] - expected[-1]).abs().max()
         rope.next_pos += 1
+
+
+@pytest.mark.parametrize("overrides,head_dim,fusable", [
+    ({}, 128, True),
+    ({"rotary_dim": 128}, 128, True),
+    ({"rotary_dim": 64}, 128, False),  # partial rotary
+    ({"interleave": True}, 128, False),
+    ({"rope_scale": 2.0}, 128, False),
+    ({"rope_dtype": torch.float32}, 128, False),
+    ({"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192}, 128, False),
+])
+def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, head_dim, fusable):
+    from mstar.engine.resources.position.config import PositionConfig
+    from mstar.engine.resources.position.manager import RopeManager
+
+    rope = RopeManager(
+        config=PositionConfig(kv_cache="kv", rope_theta=1e6, **overrides),
+        device=torch.device("cpu"), head_dim=head_dim,
+    )
+    assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
