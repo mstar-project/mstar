@@ -197,6 +197,7 @@ class Plan:
     expect_gpus: int | None = None
     measured: list[str] = field(default_factory=list)  # row/arm of every arm this invocation ran
     trees: dict = field(default_factory=dict)  # named mstar trees (--tree) for arms that serve one
+    fixed_concurrency: bool = False  # --concurrency given: it wins over a row's own per-workload concurrency
     log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str) -> None:
@@ -370,7 +371,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
         else:
             for wl in workloads:
                 request_kwargs = kwargs_by_wl.get(wl.name)
-                for c in row.concurrency.get(wl.name, wl.concurrency):
+                for c in wl.concurrency if plan.fixed_concurrency else row.concurrency.get(wl.name, wl.concurrency):
                     cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa, request_kwargs)
                     s = cell["summary"].get(wl.primary[0], {})
                     plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
@@ -576,6 +577,8 @@ def main(argv=None) -> int:
     ap.add_argument("--correctness-src", default=None,
                     help="checkout or git ref with benchmark/correctness (default: this tree)")
     ap.add_argument("--skip-health", action="store_true", help="dry runs only")
+    ap.add_argument("--requests", type=int, default=None,
+                    help="dry runs only: every cell sends this many requests, with no warmup")
     ap.add_argument("--tree", action="append", default=[], metavar="NAME=PATH",
                     help="a named mstar tree for the arms that serve one (base=TREE for the mstar-base arms)")
     args = ap.parse_args(argv)
@@ -587,6 +590,11 @@ def main(argv=None) -> int:
     if args.concurrency:
         conc = tuple(int(x) for x in args.concurrency.split(","))
         wls = [dataclasses.replace(w, concurrency=conc) for w in wls]
+    if args.requests:
+        if not args.dry:
+            raise SystemExit("--requests is for --dry runs only")
+        wls = [dataclasses.replace(w, min_requests=args.requests, waves=0, warmup_waves_first=0,
+                                   warmup_waves_next=0) for w in wls]
     gpus = gpu_list(args.gpus)
     if args.skip_health and not args.dry:
         raise SystemExit("--skip-health is for --dry runs only")
@@ -600,7 +608,7 @@ def main(argv=None) -> int:
                 worktree=Path(args.worktree).resolve(), port_base=args.port_base,
                 repeats=args.repeats or table.repeats, lanes=args.lanes, dry=args.dry,
                 correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
-                expect_gpus=args.expect_gpus, trees=tree_list(args.tree))
+                expect_gpus=args.expect_gpus, trees=tree_list(args.tree), fixed_concurrency=bool(args.concurrency))
     skipped = sorted({a for a in arms if catalog.ARMS[a].tree and catalog.ARMS[a].tree not in plan.trees})
     if skipped:
         plan.log(f"no --tree for {', '.join(skipped)}; those arms are skipped")
