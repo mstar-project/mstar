@@ -1,10 +1,12 @@
-"""Robotics and video-latent models on DROID episodes: droid_v1 (10 episodes of lerobot/droid_100), and
-droid_v2 (6 DROID 1.0.1 episodes with joint positions) for the Cosmos3 DROID policies.
+"""Robotics and video-latent models on DROID episodes: droid_v1 (10 episodes of lerobot/droid_100) for
+pi05, vjepa2 and vjepa2_ac, and droid_v2 (6 DROID 1.0.1 episodes with joint positions) for the Cosmos3
+DROID policies and pi05_droid.
 
-Only V-JEPA2 has a reference here (HF VJEPA2Model in fp32). Its embeddings are gated on how far they
-sit from fp32 compared with HF's own bf16 when that copy exists, else on cosine >= 0.999. lerobot,
-openpi and the upstream vjepa2 repo aren't installed, so the rest are checked for sane output and
-same-seed repeatability across two server instances.
+V-JEPA2 is scored against HF VJEPA2Model in fp32 (gated on its distance from fp32 compared with HF's own
+bf16 when that copy exists, else on cosine >= 0.999), and V-JEPA2-AC and the pi0.5 rows against reference
+builds stored under data/references when present (upstream vjepa2, lerobot). The Cosmos3 policies have no
+runnable reference on ROCm, so they are checked for sane output and same-seed repeatability across two
+server instances.
 """
 
 from __future__ import annotations
