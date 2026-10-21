@@ -1913,7 +1913,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   how many items its consumer may have been sent and not consumed, with
   ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"keep_newest"``
   (what fits is sent; of the rest the newest item waits for room and the others are
-  dropped). A call past
+  dropped). The consumer's worker reports what it has taken after each step that took
+  any, so a consumer reading inside a loop makes room as it reads. A call past
   ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
