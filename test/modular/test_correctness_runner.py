@@ -449,6 +449,21 @@ def test_cosmos3_droid_sends_the_robolab_request(tmp_path, config):
     assert fam.to_array(raw).shape == (32, 8)
 
 
+def test_pi05_droid_sends_the_raw_joint_state_and_two_cameras(tmp_path):
+    """Like openpi's DroidInputs: exterior then wrist, and the recorded 7 joints + gripper as they are."""
+    fam = family_for_config("pi05_droid", "pi05", {}, {})
+    assert (fam.set_name, family_for_config("pi05", "pi05", {}, {}).set_name) == ("droid_v2", "droid_v1")
+    states = np.arange(40, dtype=np.float32).reshape(5, 8) / 10
+    np.save(tmp_path / "s.npy", states)
+    files = {"exterior_1_left": "e.png", "exterior_2_left": "x.png", "wrist_left": "w.png", "joint_states": "s.npy"}
+    sset = sets.SampleSet("droid_v2", tmp_path, {}, [sets.Item(id="ep00", prompt="p", files=files,
+                                                              params={"seed": 3, "step": 2})])
+    (req,) = fam.requests(sset)
+    assert [Path(f).name for f in req.files] == ["e.png", "w.png"]
+    assert req.model_kwargs == {"robot_state": states[2].tolist(), "seed": 3}
+    assert fam.to_array(np.zeros(15 * 32, dtype=np.float32)).shape == (15, 32)
+
+
 def test_robotics_can_skip_episodes_without_a_task():
     items = [sets.Item(id="ep00", prompt="Put the marker in the pot"), sets.Item(id="ep05", prompt="")]
     fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {"skip_empty_prompt": "1"})
