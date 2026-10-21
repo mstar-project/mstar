@@ -120,10 +120,13 @@ class Pi05Actions(ArrayOutputFamily):
     name = "robotics-pi05"
     cams = ("exterior_image_1_left", "exterior_image_2_left", "wrist_image_left")
 
+    def robot_state(self, sset: SampleSet, it) -> list[float]:
+        return _robot_state(sset, it)
+
     def requests(self, sset: SampleSet) -> list[Request]:
         return [Request(it.id, text=it.prompt, files=[sset.path(it.files[c]) for c in self.cams],
                         input_modalities="image,text", output_modalities="action",
-                        model_kwargs={"robot_state": _robot_state(sset, it), "seed": it.params["seed"]})
+                        model_kwargs={"robot_state": self.robot_state(sset, it), "seed": it.params["seed"]})
                 for it in sset.items]
 
     def to_array(self, raw, resp=None):
@@ -381,3 +384,24 @@ class Vjepa2Embedding(ArrayOutputFamily):
         sc.check("embedding distance from fp32 vs HF bf16's (larger of the median and worst-item ratios)",
                  round(ratio, 3), band(ratio, lambda v: v <= 2, lambda v: v <= 4),
                  f"<=2x PASS, <=4x WARN; raw min cosine {worst:.6f} (fixed bar for fp32 serving: {raw_rule})")
+
+
+class Pi05DroidActions(Pi05Actions):
+    """pi05_droid on droid_v2, as openpi's pi05_droid policy takes its inputs: the exterior and wrist
+    frames, the task, and the raw state, 7 joint positions and the gripper. The server applies openpi's
+    DROID norm stats, so the first 8 dims of each [15, 32] chunk are joint velocities and the gripper
+    position in robot units.
+    """
+
+    name = "robotics-pi05-droid"
+    set_name = "droid_v2"
+    cams = ("exterior_1_left", "wrist_left")
+
+    def robot_state(self, sset: SampleSet, it) -> list[float]:
+        return [float(v) for v in np.load(sset.path(it.files["joint_states"]))[it.params["step"]]]
+
+    def reference_id(self) -> str:
+        return "lerobot-pi05-droid"
+
+    def reference_description(self) -> str:
+        return "lerobot PI05Policy lerobot/pi05_droid with openpi's DROID norm stats (not installed in the ROCm env)"
