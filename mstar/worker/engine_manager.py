@@ -11,6 +11,7 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     apply_yaml_overrides,
 )
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
@@ -120,12 +121,16 @@ def refuse_combined_walks_across_tp_groups(
 
 
 def _refuse_unknown_walks(model: Model) -> None:
-    """Refuse a declared label that names a walk the model never runs.
+    """Refuse a declared label that names a walk the model never runs, or a
+    growth loop its walk doesn't run.
 
     Only the named walks may file pages or be probed, so a name that matches
-    nothing leaves that cache empty for good, and nothing says why.
+    nothing leaves that cache empty for good, and nothing says why. A loop takes
+    its cap by name, and a loop built without a name gets a different one in every
+    process, so no declaration can refer to it.
     """
-    walks = set(model.get_graph_walk_graphs())
+    graphs = model.get_graph_walk_graphs()
+    walks = set(graphs)
     for key, by_label in model.kv_labels().items():
         for label, kv_label in by_label.items():
             named = {walk for walk, _ in kv_label.growth}
@@ -138,6 +143,28 @@ def _refuse_unknown_walks(model: Model) -> None:
                     f"{unknown}, which it never runs; its walks are "
                     f"{sorted(walks)}"
                 )
+            for walk, loop in kv_label.growth:
+                loops = graphs[walk].get_loops()
+                if loop not in loops:
+                    raise ValueError(
+                        f"{type(model).__name__} declares {key!r}/{label!r} growing on "
+                        f"{loop!r}, which {walk!r} doesn't run; its loops are {sorted(loops)}"
+                    )
+
+
+def _refuse_undeclared_pools(specs: list[NodeResourceSpec], model: Model) -> None:
+    """Refuse a paged pool the model declares no labels for, since no request
+    could lay out its pages there. A ring pool needs none: its size is fixed
+    per request.
+    """
+    declared = model.kv_labels()
+    for spec in specs:
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and not declared.get(spec.resource_key):
+            raise ValueError(
+                f"{type(model).__name__} declares no labels for its paged pool "
+                f"{spec.resource_key!r}; add them to `kv_labels`, and return each "
+                "request's layout for them from `process_prompt`"
+            )
 
 
 def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
@@ -212,6 +239,7 @@ class EngineManager:
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
         _refuse_unknown_walks(model)
+        _refuse_undeclared_pools(specs, model)
         _refuse_unservable_walks(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we

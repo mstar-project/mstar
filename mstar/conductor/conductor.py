@@ -32,7 +32,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import without_layouts
+from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -603,7 +603,7 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        for key, labels in self.model.kv_labels().items():
+        for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
 
@@ -647,6 +647,9 @@ class Conductor:
         for worker_graph in self.worker_graphs.values():
             for name, loop in worker_graph.section.get_loops().items():
                 self._loop_max_iters[name] = max(loop.max_iters, self._loop_max_iters.get(name, 0))
+        self._kv_labels: dict[str, tuple[str, ...]] = {
+            key: tuple(labels) for key, labels in self.model.kv_labels().items()
+        }
 
         # set each group's _tp_rank (the worker's instance rank) per worker
         self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
@@ -1212,6 +1215,7 @@ class Conductor:
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
         kv_layout = kwargs.get("kv_layout") or {}
+        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,

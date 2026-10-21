@@ -328,6 +328,21 @@ class KVReqConfig(ResourceReqConfig):
         return mapping.get((node, walk), [])
 
 
+
+def refuse_undeclared_labels(
+    model: str, declared: Mapping[str, tuple[str, ...]], kv_layout: Mapping[str, Mapping],
+    configs: Mapping[str, ResourceReqConfig],
+) -> None:
+    """Refuse a request whose layout leaves out a label the request opens, or lays
+    out one ``model`` doesn't declare. The model is at fault and not the client, so
+    this raises RuntimeError, which fails the request with a 500."""
+    for key in declared.keys() | kv_layout.keys():
+        laid_out = set(kv_layout.get(key, ()))
+        if extra := sorted(laid_out - set(declared.get(key, ()))):
+            raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
+        if missing := sorted(configs[key].opened_labels() - laid_out):
+            raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
+
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
     """``configs`` with each KV config's layouts and caps left out. Only the KV manager's ingest
     reads them, and the request's info that carries the configs rides every frame between workers."""

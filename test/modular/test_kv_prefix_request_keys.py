@@ -364,8 +364,9 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     """The configs a request is opened with, as the conductor resolves them:
     the model's own, a default for anything it declared a stream for, and then
     each handed its own chain."""
+    declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
