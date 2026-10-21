@@ -78,10 +78,14 @@ class DepformerAttention(nn.Module):
         q, k, v = F.linear(x, weight).unflatten(-1, (3, self.num_heads, -1)).unbind(-3)
         kv[:, 0, :, step] = k
         kv[:, 1, :, step] = v
-        start = depth_attention_start(step, self.steps)
-        keys = kv[:, 0, :, start : step + 1]
-        values = kv[:, 1, :, start : step + 1]
-        out = F.scaled_dot_product_attention(q[:, :, None], keys, values)[:, :, 0]
+        # NVIDIA passes the entire 16-slot ring plus a validity mask to SDPA
+        # ([PP] modules/transformer.py:263-299, 426-434). Slicing valid keys is
+        # mathematically equivalent but changes BF16 kernel rounding: trained
+        # depth logits differed by 0.125 and could change argmax. Keep the
+        # source's physical cache shape as well as its visibility semantics.
+        positions = torch.arange(self.steps, device=x.device)
+        visible = (positions >= depth_attention_start(step, self.steps)) & (positions <= step)
+        out = F.scaled_dot_product_attention(q[:, :, None], kv[:, 0], kv[:, 1], visible[None])[:, :, 0]
         return F.linear(out.flatten(-2), self.out_proj.weight.view(self.steps, dim, dim)[step])
 
 

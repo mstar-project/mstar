@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -513,11 +514,16 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True, help="output directory for the fixture")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--user-frames", type=int, default=20)
+    parser.add_argument(
+        "--allow-unsupported-torch", action="store_true",
+        help="record a supplementary same-runtime comparison outside NVIDIA's torch range; labels provenance",
+    )
     args = parser.parse_args()
     if args.user_frames < 20:
         parser.error("trace acceptance requires at least 20 user frames")
     major, minor = map(int, torch.__version__.split(".")[:2])
-    if major != 2 or not 2 <= minor < 5:
+    supported_torch = major == 2 and 2 <= minor < 5
+    if not supported_torch and not args.allow_unsupported_torch:
         parser.error(f"NVIDIA's reference requires torch>=2.2,<2.5; found {torch.__version__}")
     package, hashes = _verify_source(args.source.resolve())
     sys.path.insert(0, str(package.parent))
@@ -532,6 +538,11 @@ def main() -> None:
     provenance = {
         "source": "NVIDIA/personaplex", "source_sha": PIN, "source_hashes": hashes,
         "torch_version": str(torch.__version__), "python_version": sys.version, "seed": args.seed,
+        "torch_supported_by_reference": supported_torch,
+        "platform": platform.platform(), "machine": platform.machine(),
+        "torch_build_config": torch.__config__.show(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "num_threads": torch.get_num_threads(),
     }
     args.out.mkdir(parents=True, exist_ok=True)
     if args.mode == "manifest":
@@ -607,8 +618,7 @@ def main() -> None:
             for batch in (1, 2) for mode in ("token_priming", "embedding_replay")
         ]
     fixture = {
-        "schema_version": 2, "source": "NVIDIA/personaplex", "source_sha": PIN,
-        "source_hashes": hashes, "torch_version": torch.__version__, "python_version": sys.version,
+        "schema_version": 2, **provenance,
         "argv": sys.argv[1:], "seed": args.seed, "use_sampling": False, "device": "cpu",
         "lm_kwargs": config, "user_frames": args.user_frames, "cases": cases,
     }

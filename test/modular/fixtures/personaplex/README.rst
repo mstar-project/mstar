@@ -135,3 +135,25 @@ which it checks, and later stages use NVIDIA's codes so a tie cannot cascade.
 This compares each stage against the recorded reference; it does not establish
 an uninterrupted M* encoder-to-LM-to-decoder result. A separate deterministic
 case with well-separated codebook choices is still needed for that claim.
+
+Runtime controls and fixture portability
+---------------------------------------
+
+Record and test on the same machine and PyTorch build when applying tight
+numerical gates. A pinned NVIDIA source revision and matching weights do not
+make floating-point outputs portable between CPU libraries, operating systems
+or PyTorch versions. Keep older fixtures and their failing results when
+regenerating a local control; a passing regeneration does not validate the
+older environment or the production GPU path.
+
+New fixtures record the platform, architecture, PyTorch build configuration,
+float32 matrix-multiplication precision and thread count, in addition to the
+source hashes and Python/PyTorch versions. Their content digest covers this
+provenance as well as the recorded values.
+
+The recorder defaults to NVIDIA's declared ``torch>=2.2,<2.5`` constraint.
+For a supplementary comparison on the serving runtime, explicitly pass
+``--allow-unsupported-torch``. These fixtures set
+``torch_supported_by_reference`` to false and must be reported separately from
+supported-runtime reference results. This flag does not modify NVIDIA's
+implementation or make that runtime officially supported.

@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from personaplex_fixture_utils import load_binary_fixture, verify_reference_fixt
 
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
-from mstar.model.personaplex.components.depformer import depth_attention_start
+from mstar.model.personaplex.components.depformer import DepformerAttention, depth_attention_start
 from mstar.model.personaplex.components.temporal import (
     ActivationGating,
     DenseTemporalCache,
@@ -212,6 +213,23 @@ def test_t6_depth_attention_masks_step_zero_only_at_the_last_step():
     assert [depth_attention_start(step) for step in range(16)] == [0] * 15 + [1]
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("step", [0, 7, 14, 15])
+def test_t6_depth_attention_ignores_unwritten_and_expired_slots(step):
+    """The fixed-capacity reference mask must hide dirty future slots and expired step 0."""
+    torch.manual_seed(24)
+    attention = DepformerAttention(dim=16, num_heads=2, steps=16).eval()
+    x = torch.randn(2, 16)
+    scratch = torch.randn(2, 2, 2, 16, 8)
+    dirty = scratch.clone()
+    dirty[:, :, :, step + 1:] = 1e4
+    if step == 15:
+        dirty[:, :, :, 0] = -1e4
+    expected = attention(x, step, scratch)
+    actual = attention(x, step, dirty)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _frame_inputs(batch=2, seed=3):
     g = torch.Generator().manual_seed(seed)
     hidden = torch.randn(batch, TINY.dim, generator=g)
@@ -293,6 +311,35 @@ def reference_lm():
 
 def _close(actual, expected, what):
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5, msg=lambda m: f"{what}: {m}")
+
+
+@torch.no_grad()
+def test_t13_temporal_reference_cache_shape_preserves_shared_prefix_bits(reference_lm):
+    """Isolate temporal numerics using NVIDIA inputs and a matching runtime.
+
+    This is a component check, not a free-running trajectory comparison. A
+    shorter physical SDPA key tensor changes rounding despite the same mask.
+    """
+    data, lm = reference_lm
+    if (data.get("torch_version") != str(torch.__version__)
+            or data.get("platform") != platform.platform()
+            or data.get("torch_build_config") != torch.__config__.show()):
+        pytest.skip("bitwise component check needs fixtures from this platform and PyTorch build")
+    previous_threads = torch.get_num_threads()
+    previous_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_num_threads(data["num_threads"])
+        torch.set_float32_matmul_precision(data["float32_matmul_precision"])
+        case = next(c for c in data["cases"] if c["batch_size"] == 1 and c["mode"] == "token_priming")
+        cache = DenseTemporalCache(lm.config.num_layers, lm.config.rope_theta)
+        for record in case["records"][:4]:
+            hidden, logits = lm.temporal.forward_embeddings(lm.temporal.embed_codes(record["input"]), cache)
+            cache.advance()
+            torch.testing.assert_close(hidden, record["transformer_out"], rtol=0, atol=0)
+            torch.testing.assert_close(logits[:, None], record["text_logits"], rtol=0, atol=0)
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+        torch.set_num_threads(previous_threads)
 
 
 @pytest.mark.parametrize("batch", [1, 2])

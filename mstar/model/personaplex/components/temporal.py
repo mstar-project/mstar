@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..config import NUM_AUDIO_CODEBOOKS, ZERO_TOKEN_ID, LMArchConfig
+from ..config import CONTEXT_FRAMES, MAX_TEMPORAL_FORWARDS, NUM_AUDIO_CODEBOOKS, ZERO_TOKEN_ID, LMArchConfig
 
 
 class RMSNormF32(nn.Module):
@@ -118,9 +118,11 @@ class TemporalAttentionBackend(Protocol):
 class DenseTemporalCache:
     """Pure-torch reference backend for ``[B, T, H, D]`` (or token-major ``[B, H, D]``) inputs.
 
-    Keeps every key, so it is exact causal attention; this equals NVIDIA's
-    3000-slot ring for at most ``MAX_TEMPORAL_FORWARDS`` positions
-    (worklog §11 3.1-a). For CPU tests and parity work, not serving.
+    Keeps occupied keys and pads SDPA inputs to NVIDIA's physical 3000-slot
+    ring ([PP] modules/transformer.py:263-299, 426-434). A shorter key tensor
+    has the same visibility but changes floating-point kernel rounding.
+    Valid for at most ``MAX_TEMPORAL_FORWARDS`` positions, before the ring
+    expires its first key. For reference comparisons, not serving.
     """
 
     def __init__(self, num_layers: int, rope_theta: float):
@@ -145,11 +147,15 @@ class DenseTemporalCache:
         if self.keys[layer_idx] is not None:
             k = torch.cat((self.keys[layer_idx], k), dim=-3)
             v = torch.cat((self.values[layer_idx], v), dim=-3)
-        self.keys[layer_idx], self.values[layer_idx] = k, v
         T, S = q.shape[-3], k.shape[-3]
+        if S > MAX_TEMPORAL_FORWARDS:
+            raise ValueError(f"dense reference cache supports at most {MAX_TEMPORAL_FORWARDS} positions")
+        self.keys[layer_idx], self.values[layer_idx] = k, v
         pos_q = torch.arange(S - T, S, device=q.device).view(-1, 1)
-        mask = torch.arange(S, device=q.device).view(1, -1) <= pos_q
-        out = F.scaled_dot_product_attention(q.transpose(-3, -2), k.transpose(-3, -2), v.transpose(-3, -2), mask)
+        mask = torch.arange(CONTEXT_FRAMES, device=q.device).view(1, -1) <= pos_q
+        keys = F.pad(k.transpose(-3, -2), (0, 0, 0, CONTEXT_FRAMES - S))
+        values = F.pad(v.transpose(-3, -2), (0, 0, 0, CONTEXT_FRAMES - S))
+        out = F.scaled_dot_product_attention(q.transpose(-3, -2), keys, values, mask)
         return out.transpose(-3, -2)
 
     def advance(self) -> None:
