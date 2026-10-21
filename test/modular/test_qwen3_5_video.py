@@ -383,7 +383,7 @@ IMAGE_MARK, VIDEO_MARK = -1.0, -2.0
 def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout):
     """The schedule and the LLM's `prefill_vision` row, against transformers:
     the row's token order and its 3D positions, plus where decode resumes."""
-    from mstar.model.qwen3_5.config import ROPE
+    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     _, out, ref = run_both(model, processor, layout)
@@ -435,6 +435,10 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     assert torch.equal(row.custom_pos_ids.long(), positions[:, 0])
     # decode resumes where transformers' rope delta puts it
     assert row.tensor_inputs["mrope_advance"] == int(positions.max()) + 1
+    # the layout's spans cover the rows the walk writes and advance the position as far as the walk does
+    spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    assert sum(span.length for span in spans) == row.input_seq_len
+    assert sum(span.advance for span in spans) == row.tensor_inputs["mrope_advance"]
 
 
 def test_mp4_matches_processor(model, processor, tmp_path):
