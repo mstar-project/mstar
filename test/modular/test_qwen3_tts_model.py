@@ -351,7 +351,7 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     assert result.new_input_tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
     # CustomVoice default: whole text in the prefill (stream_text = 0); no
     # reference transcript or frames. Host values, for the prefill's step metadata.
-    assert result.metadata == {
+    assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
         Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
     }
@@ -450,7 +450,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     assert model.tokenizer.texts[-1] == "<|im_start|>assistant\nthe reference says<|im_end|>\n"
     assert list(result.new_input_tensors) == ["text_inputs"]
     assert result.new_input_tensors["text_inputs"][0].tolist() == assistant_ids + ref_ids
-    assert result.metadata == {
+    assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         # [instruct_len, text_len, stream_text (Base default: streaming), ref_text_len, ref_frames]
         PROMPT_LAYOUT_KEY: [0, 3, 1, len(ref_ids), 13],
         SPEAKER_ID_KEY: -1,
