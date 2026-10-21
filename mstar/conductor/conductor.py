@@ -568,14 +568,14 @@ class Conductor:
             isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
         ):
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {requested!r}")
-        limit = self.model.get_max_output_tokens_limit()
-        if requested is not None and limit is not None and requested > limit:
-            raise ValueError(
-                f"max_output_tokens is {requested}; this model produces at most {limit}"
-            )
         cap = self.model.get_max_output_tokens(**model_kwargs)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
+        limit = self.model.get_max_output_tokens_limit()
+        if limit is not None and cap > limit:
+            raise ValueError(
+                f"max_output_tokens is {cap}; this model produces at most {limit}"
+            )
         return cap
 
     def _resource_specs(self) -> dict:

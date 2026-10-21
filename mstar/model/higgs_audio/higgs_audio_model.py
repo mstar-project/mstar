@@ -171,6 +171,9 @@ class HiggsAudioModel(Model):
         # Reference transcribe.py generates up to 1024 new tokens.
         return model_kwargs.get("max_output_tokens", 1024)
 
+    def get_max_output_tokens_limit(self) -> int:
+        return self.get_max_output_tokens() + 1
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [
             GraphEdge(

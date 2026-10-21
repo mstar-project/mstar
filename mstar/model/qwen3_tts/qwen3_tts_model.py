@@ -1079,6 +1079,9 @@ class Qwen3TTSModel(Model):
             model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
         )
 
+    def get_max_output_tokens_limit(self) -> int:
+        return self.get_max_output_tokens() + 1
+
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.output_sample_rate
 

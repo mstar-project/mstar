@@ -855,8 +855,9 @@ class Model(ABC):
         is no published limit.
 
         A model whose decode Loop is built with ``max_iters`` from the
-        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
-        ends there whatever the request asked.
+        kwarg-less ``get_max_output_tokens()`` must return the most tokens a
+        request can get: ``max_iters``, plus one if a prefill samples the first
+        token.
         """
         return None
 
