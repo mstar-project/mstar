@@ -557,12 +557,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _build_action_static(
         self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int,
-        mode: str, fps: float, action_fps: float, action_offset: int, device,
+        mode: str, fps: float, action_fps: float, action_offset: int, device, state_rows: int = 0,
     ) -> dict:
         latent_shape = self._latent_shape(height, width, num_frames)
         static = build_action_static_inputs(
             list(ids), latent_shape, action_chunk, mode,
             self.config, self.config.vae.scale_factor_temporal, fps, action_fps, action_offset, device,
+            state_rows=state_rows,
         )
         assert static["num_vision_tokens"] == latent_shape[2] * frame_tokens(height, width, self.config), (
             f"packing made {static['num_vision_tokens']} vision tokens of {latent_shape}, "
@@ -1079,14 +1080,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         domain_id = int(md.get("domain_id", 0))
         action_fps = float(md.get("action_fps", fps))
         action_offset = action_start_frame_offset(action_chunk, num_frames)
+        state_rows = int(md.get("action_state_rows", 0))
 
         cond = self._build_action_static(
-            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+            state_rows,
         )
         uncond = None
         if uncond_ids is not None:
             uncond = self._build_action_static(
-                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+                state_rows,
             )
 
         latent_shape = self._latent_shape(height, width, num_frames)
@@ -1099,6 +1103,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_clean = torch.zeros((1, action_chunk, 1), device=device, dtype=dtype)
         if mode == "forward_dynamics":
             action_clean[:] = 1.0
+        elif state_rows:
+            action_clean[:, :state_rows] = 1.0
 
         # The visual conditioning (inverse-dynamics: the whole observed video;
         # forward-dynamics / policy: the conditioning frame) is VAE-encoded by
@@ -1107,7 +1113,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # latent frames are kept clean from it.
 
         # Forward-dynamics conditions on a clean action chunk supplied with the
-        # request; the other modes predict the action (clean values are zero).
+        # request, and a policy request may send the robot's current state as
+        # its first row. Everything else is predicted (clean values are zero).
         clean_action = torch.zeros((1, action_chunk, action_dim), device=device, dtype=dtype)
         action_inputs = (inputs or {}).get("action_inputs")
         raw_act = action_inputs[0] if action_inputs else None
@@ -1120,6 +1127,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             elif act.shape[0] > action_chunk:
                 act = act[:action_chunk]
             clean_action[:, :, :raw_action_dim] = act[:, :raw_action_dim]
+        elif state_rows and raw_act is not None:
+            act = torch.as_tensor(raw_act, device=device, dtype=dtype).reshape(state_rows, -1)
+            clean_action[:, :state_rows, :raw_action_dim] = act[:, :raw_action_dim]
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
@@ -1127,6 +1137,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond=cond,
             uncond=uncond,
             gs=gs,
+            guidance_interval=md.get("guidance_interval"),
             scheduler=self._new_scheduler(
                 steps, device, flow_shift=md.get("flow_shift"),
                 use_karras_sigma=md.get("use_karras_sigma")
@@ -1651,12 +1662,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _cfg_active(self, st, step_index: int) -> bool:
         """Whether this eager denoise step runs classifier-free guidance (both
         branches combined). False ⇒ the conditional branch runs alone — the
-        guidance_scale==1 case and, for the t2i recipe, steps whose timestep
-        falls outside the guidance_interval [lo, hi].
+        guidance_scale==1 case and steps whose timestep falls outside the
+        guidance_interval [lo, hi] (the t2i recipe's default, or the request's).
 
-        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen``
-        call this for the same step, so the declared attention (batched vs
-        cond-only) matches the forward that runs.
+        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen`` /
+        ``_forward_action_gen`` call this for the same step, so the declared
+        attention (batched vs cond-only) matches the forward that runs.
 
         The captured path does not consult it at all: its graph is fixed at
         both branches and ``postprocess`` combines unconditionally, so an
@@ -1881,7 +1892,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ats = torch.full((st["cond"]["num_noisy_action_tokens"],), t.item(), device=device)
         domain = st["domain_t"]
 
-        if st["uncond"] is None:
+        if not self._cfg_active(st, step_index):
             video_v, action_v = self._denoise_action(
                 attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
             )
@@ -2143,20 +2154,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 unc = st["uncond"]
                 req["position_ids_uncond"] = unc["position_ids"][:, unc["und_len"]:]
             reqs.append(req)
-            meta.append((rid, st, lat, act, ti, t))
+            meta.append((rid, st, lat, act, ti, t, step_index))
 
         results = self.transformer.denoise_step_action_batched(
             reqs, CFG_BATCHED_LABEL, attn, with_cfg
         )
 
         out = {}
-        for (rid, st, lat, act, ti, t), branches in zip(meta, results, strict=True):
-            if with_cfg:
-                (cond_video, cond_action), (uncond_video, uncond_action) = branches
-                video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
-                action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
-            else:
-                (video_v, action_v), = branches
+        for (rid, st, lat, act, ti, t, step_index), branches in zip(meta, results, strict=True):
+            video_v, action_v = branches[0]
+            # The batch runs both branches, but a step outside the request's
+            # guidance_interval keeps the conditional one, as the single path does.
+            if with_cfg and self._cfg_active(st, step_index):
+                uncond_video, uncond_action = branches[1]
+                video_v = uncond_video + st["gs"] * (video_v - uncond_video)
+                action_v = uncond_action + st["gs"] * (action_v - uncond_action)
             new_latents, new_action = self._action_scheduler_step(st, lat, act, video_v, action_v, t)
             out[rid] = {
                 "latents": [new_latents],
