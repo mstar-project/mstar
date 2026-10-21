@@ -12,6 +12,8 @@ import argparse
 import json
 import sys
 
+# Lets the workflow find earlier summaries to hide as outdated.
+MARKER = "<!-- claude-review-summary -->"
 PRIORITIES = ("P0", "P1", "P2", "P3")
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
@@ -55,7 +57,7 @@ def status(review, head, mode):
 
 
 def render(review, head, mode):
-    parts = ["### Automated review", status(review, head, mode)]
+    parts = [f"{MARKER}\n### Automated review", status(review, head, mode)]
     if review["since_last"]:
         parts.append(review["since_last"])
     # Inline findings are counted in the status line, not repeated here.
