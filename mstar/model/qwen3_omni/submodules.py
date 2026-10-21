@@ -60,6 +60,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
     Qwen3OmniModelConfig,
 )
+from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -540,7 +541,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
-            end_pos_base = float(vision_pos_ids.max().item()) + 1
+            if seconds_per_grid is None:
+                # from the helper the prompt's layout uses, so the cache and this walk agree on the advance
+                end_pos_base = start_pos + image_span(grid_thw, self.config.vision.spatial_merge_size).advance - 1
+            else:
+                end_pos_base = float(vision_pos_ids.max().item()) + 1
             end_pos_ids = get_rope_index_text(1, end_pos_base, device)
 
             pos_ids = torch.cat(
