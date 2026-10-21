@@ -32,6 +32,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources.kv.config import without_layouts
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -604,6 +605,8 @@ class Conductor:
         )
         for key, streams in self.model.prefix_key_streams().items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        for key in model_kwargs.get("kv_layout") or {}:
+            configs.setdefault(key, KVReqConfig())
         return configs
 
     def _derive_worker_info(self):
@@ -1211,6 +1214,7 @@ class Conductor:
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        kv_layout = kwargs.get("kv_layout") or {}
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
@@ -1220,6 +1224,8 @@ class Conductor:
                 prefix_decode=prefix_decode.get(key),
                 prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
+                kv_layout=kv_layout.get(key),
+                loop_caps=loop_caps,
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
@@ -1266,6 +1272,9 @@ class Conductor:
                         body=message,
                     ),
                 )
+
+        # each worker's KV resource opens with the layouts on its NewRequest, so later messages go without them
+        request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.

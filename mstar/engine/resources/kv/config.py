@@ -6,7 +6,7 @@ without pulling FlashInfer in behind it.
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -248,6 +248,10 @@ class KVReqConfig(ResourceReqConfig):
     # label -> the layout its keys were chained over, one span per write
     prefix_layout: dict[str, list[PrefixSpan]] | None = None
     prefix_cache: bool = True
+    # label -> everything the request writes there
+    kv_layout: dict[str, "StreamLayout"] | None = None
+    # loop -> the most iterations it runs, for each loop a layout grows on
+    loop_caps: dict[str, int] | None = None
 
     def apply_conductor_config(
         self,
@@ -256,6 +260,8 @@ class KVReqConfig(ResourceReqConfig):
         prefix_decode: dict[str, str] | None=None,
         prefix_layout: dict[str, list[list]] | None=None,
         prefix_cache: bool | None=None,
+        kv_layout: dict[str, list] | None=None,
+        loop_caps: Mapping[str, int] | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -272,6 +278,20 @@ class KVReqConfig(ResourceReqConfig):
             }
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
+        if kv_layout is not None:
+            self.kv_layout = {
+                label: StreamLayout(
+                    spans=tuple(PrefixSpan(*row) for row in spans),
+                    growth=tuple((loop, slots) for loop, slots in growth),
+                    scratch=scratch,
+                    retention=None if retention is None else RetentionPolicy(*retention),
+                )
+                for label, (spans, growth, scratch, retention) in kv_layout.items()
+            }
+            self.loop_caps = {
+                loop: loop_caps[loop]
+                for layout in self.kv_layout.values() for loop, _ in layout.growth
+            }
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -304,6 +324,14 @@ class KVReqConfig(ResourceReqConfig):
             return []
         return mapping.get((node, walk), [])
 
+
+def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
+    """``configs`` with each KV config's layouts and caps left out. Only the KV manager's ingest
+    reads them, and the request's info that carries the configs rides every frame between workers."""
+    return {
+        key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
+        for key, config in configs.items()
+    }
 
 @dataclass
 class KVSpec(NodeResourceSpec):

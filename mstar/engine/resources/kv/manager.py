@@ -234,6 +234,8 @@ class CacheStream:
     # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
     # miss (a refused admit prepares the step again) is not counted twice
     prefix_counted: bool = False
+    # the most pages the request's layout lets this stream hold; None without a layout
+    footprint: int | None = None
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -1266,8 +1268,14 @@ class KVManager(AttentionResource):
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
+                stream.footprint = self._footprint(rid, label)
                 if stream.chain is None:
                     self._seed_keys(rid, label, stream)
+
+    def _footprint(self, rid: str, label: str) -> int | None:
+        overrides = self._overrides.get(rid)
+        layout = (overrides.kv_layout or {}).get(label) if overrides is not None else None
+        return None if layout is None else layout.pages(overrides.loop_caps, self.config.page_size)
 
     def admit_retrieve(
         self, rid: str,
@@ -2975,8 +2983,8 @@ class KVManager(AttentionResource):
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
-                self._streams[rid][label] = CacheStream()
-                self._seed_keys(rid, label, self._streams[rid][label])
+                stream = self._streams[rid][label] = CacheStream(footprint=self._footprint(rid, label))
+                self._seed_keys(rid, label, stream)
             return self._streams[rid][label]
 
     def _check_ready(
