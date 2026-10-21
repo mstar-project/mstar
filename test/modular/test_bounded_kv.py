@@ -404,6 +404,28 @@ def test_admit_refusal_names_the_request():
     assert not outcome.ok and outcome.reason.request_ids == frozenset({2})
 
 
+def test_rollback_admit_frees_only_fresh_slots():
+    """A refused step gives back the slots its admit took, not one a request
+    already held."""
+    from mstar.engine.resources.kv.bounded.config import StreamPosition
+
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4, slots=3)
+    first, ctx = _step([1], [0], [1])
+    assert mgr.admit(first, ctx).ok
+    mgr.plan(first, ctx)
+    mgr.commit(first, ctx)
+    # 2 takes a slot, then 3 (a fresh request declaring written tokens) is refused
+    bad, ctx = _step([1, 2, 3], [1, 0, 0], [1, 1, 1])
+    bad = type(bad)(segments=bad.segments, positions={**bad.positions, 3: StreamPosition(0, 5)})
+    assert not mgr.admit(bad, ctx).ok
+    mgr.rollback_admit(bad, ctx)
+    # both slots are free again, and 1 kept its slot and count
+    fresh, ctx = _step([4, 5], [0, 0], [1, 1])
+    assert mgr.admit(fresh, ctx).ok
+    again, ctx = _step([1], [1], [1])
+    assert mgr.admit(again, ctx).ok
+
+
 def test_per_query_window_config():
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
 

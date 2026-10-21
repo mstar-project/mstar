@@ -70,6 +70,8 @@ class BoundedKVManager(Resource):
         self._requests: dict[str, _Request] = {}
         self._free = list(reversed(range(c.max_slots)))
         self._lock = threading.RLock()
+        # rid -> slot the live admit took fresh, for ``rollback_admit``
+        self._admit_taken: dict[str, int] = {}
 
         self._stager = PinnedStager(torch.int32)
         self._cg_max_bs = 0
@@ -188,6 +190,7 @@ class BoundedKVManager(Resource):
                 return
             if free:
                 del self._requests[rid]
+                self._admit_taken.pop(rid, None)
                 self._free.append(req.slot)
             else:
                 req.written = 0
@@ -198,6 +201,9 @@ class BoundedKVManager(Resource):
         if ctx.capture:
             return ADMIT_OK
         with self._lock:
+            taken = self._admit_taken
+            for rid in [r for r in taken if ctx.is_real_row(r)]:
+                del taken[rid]
             for seg in step.segments or ():
                 if ctx.is_padding_row(seg.request_id):
                     continue
@@ -218,11 +224,27 @@ class BoundedKVManager(Resource):
                             message=f"bounded KV is full: {self.config.max_slots} slots",
                             pages_short=1, label=seg.label, request_id=seg.request_id))
                     req = self._requests[seg.request_id] = _Request(self._free.pop())
+                    taken[seg.request_id] = req.slot
                 if pos.written != req.written:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} declares {pos.written} written tokens; "
                         f"{req.written} were committed", request_ids=frozenset({seg.request_id})))
         return ADMIT_OK
+
+    def rollback_admit(self, step: BoundedKVStep, ctx: StepContext) -> None:
+        """Free the slots this step's admit took fresh; a slot a request already
+        held stays with it."""
+        del step
+        if ctx.capture or not self._admit_taken:
+            return
+        with self._lock:
+            taken = self._admit_taken
+            for rid in [r for r in taken if ctx.is_real_row(r)]:
+                slot = taken.pop(rid)
+                req = self._requests.get(rid)
+                if req is not None and req.slot == slot:
+                    del self._requests[rid]
+                    self._free.append(slot)
 
     def plan(self, step: BoundedKVStep, ctx: StepContext) -> BoundedPlan:
         c = self.config
