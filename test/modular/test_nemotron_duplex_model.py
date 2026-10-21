@@ -258,18 +258,20 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     assert out_p["text_inputs"][0].tolist() == [5, 6, 7] and "has_prompt" in out_p
 
 
-def test_duplex_process_prompt_caps_the_call_not_the_file():
+def test_duplex_process_prompt_leaves_the_session_cap_to_audio_in():
     """Any length of upload is a first chunk (the encoder waits for enough audio,
-    and fails a call that ends without it); the session cap counts every
-    uploaded sample, as the encoder does."""
+    and fails a call that ends without it). Files that together pass the session
+    pass through: audio_in's max_items, which the data worker charges every
+    uploaded sample to, refuses them."""
     model = _make_model()
     sr = model.config.stt.sample_rate
     out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(320)]})
     assert out["audio_in"][0].numel() == 320
     half = int(model.max_session_s * sr / 2) + 1
-    with pytest.raises(ValueError, match="longest session"):
-        model.process_prompt(None, ["audio"], ["audio", "text"],
-                             tensors={"audio_inputs": [torch.zeros(half), torch.zeros(half)]})
+    out = model.process_prompt(None, ["audio"], ["audio", "text"],
+                               tensors={"audio_inputs": [torch.zeros(half), torch.zeros(half)]})
+    limits = client_stream_limits(model.get_partition_topology(), None)["audio_in"]
+    assert sum(limits.item_size(w) for w in out["audio_in"]) > limits.max_items
 
 
 def test_duplex_process_prompt_rejects_bad_requests():

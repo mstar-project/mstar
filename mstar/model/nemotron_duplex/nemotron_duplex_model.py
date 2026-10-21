@@ -725,11 +725,8 @@ class NemotronDuplexModel(Model):
             peak = max((w.abs().max() for w in wav if w.numel()), default=0.0)
             if peak > 1.0:      # float files can exceed full scale, and loud input silences the agent
                 wav = [w / peak for w in wav]
-            # past the cap the talker KV and the decode loops run out. Checked
-            # here for the upload's own message; audio_in's max_items counts the
-            # same samples as a live call grows
-            if sum(w.numel() for w in wav) > self.max_session_samples:
-                raise session_too_long(self.max_session_s)
+            # The session cap is audio_in's max_items, which the data worker
+            # charges these samples to as the stream's first chunk.
             out[AUDIO_IN] = wav
         # Seed the decode loop's iteration-0 fed-back tokens. The frame-
         # synchronous nano step lists prev_text / prev_func as inputs, so
