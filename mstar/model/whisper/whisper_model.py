@@ -27,9 +27,9 @@ Request state machine:
     language given:  prefill -> decode -> done
     language absent: detect_language -> prefill_prompt -> decode -> done
 
-The transcript is streamed as Whisper's own token stream rendered to text:
-spoken words as bytes, plus the language token (``<|en|>``) and, when
-timestamps were requested, the ``<|s.ss|>`` markers. The OpenAI layer's
+The transcript is streamed token by token as Whisper's own token stream
+rendered to text: spoken words as bytes, plus the language token (``<|en|>``)
+and, when timestamps were requested, the ``<|s.ss|>`` markers. The OpenAI layer's
 adapter lifts those into ``language`` / ``segments``.
 """
 
@@ -137,6 +137,9 @@ class WhisperModel(Model):
     # Requests the default decoder caches hold at once, each at full length.
     # A deployment retunes the page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64
+    # Set from the deployment by validate_config_yaml: the align walk re-runs
+    # the decoder unsharded, so word timestamps need tp_size 1.
+    _decoder_tp_size = 1
 
     def __init__(
         self,
@@ -270,6 +273,11 @@ class WhisperModel(Model):
         ``max_concurrent_requests`` requests at full length must fit in each
         cache next to its sink page; the conductor queues the rest.
         """
+        self._decoder_tp_size = max(
+            (int(group.get("tp_size", 1)) for group in config.get("node_groups") or []
+             if DECODER_NODE in (group.get("node_names") or [])),
+            default=1,
+        )
         cap = config.get("max_concurrent_requests")
         if cap is None:
             logger.warning(
@@ -427,6 +435,12 @@ class WhisperModel(Model):
         # Detection leaves the language token unknown by construction; the
         # decoder keeps the sampled one from the prompt walk instead.
         language = kwargs.get("language")
+        if kwargs.get("timestamps") == "word" and self._decoder_tp_size > 1:
+            # a 400 now, rather than a failure after the whole decode has run
+            raise ValueError(
+                "word timestamps need the decoder on one GPU; this deployment shards it "
+                f"(tp_size {self._decoder_tp_size})"
+            )
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,

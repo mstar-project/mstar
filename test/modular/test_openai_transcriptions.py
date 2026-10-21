@@ -461,9 +461,10 @@ def test_parallel_unfinished_window_keeps_its_text_when_there_is_no_tail_to_deco
 
 
 @requires_audio_duration
-def test_client_gone_before_a_parallel_tail_submits_no_tail(client_and_stub, monkeypatch):
-    """The tail pass runs only once every window is in: a window left
-    unfinished does not get its tail decoded for a client that has gone."""
+def test_client_gone_after_a_parallel_tail_releases_it_and_submits_nothing_more(client_and_stub, monkeypatch):
+    """A window's tail is submitted as soon as that window is in. Once the
+    client is found gone, nothing more is submitted and every request still
+    on the engine, the tail included, is released."""
     from starlette.requests import Request
 
     client, stub = client_and_stub
@@ -488,7 +489,11 @@ def test_client_gone_before_a_parallel_tail_submits_no_tail(client_and_stub, mon
     r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
                        "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
     assert r.status_code == 200, r.text
-    assert len(stub.submits) == 1 + serving_transcriptions.PARALLEL_INFLIGHT
+    # the first window's tail went out when that window came back, before the disconnect
+    assert len(stub.submits) == 2 + serving_transcriptions.PARALLEL_INFLIGHT
+    # the tail's file is cut after every fixed window's, so it has the highest _wNNNN
+    tail = max(stub.submits, key=lambda sub: sub["file_paths"]["audio"][0])["request_id"]
+    assert tail in stub.released
     assert not list(stub.upload_dir.iterdir())
 
 

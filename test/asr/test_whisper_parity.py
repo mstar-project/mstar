@@ -22,10 +22,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 REPO = os.environ.get("MSTAR_WHISPER_REPO", "openai/whisper-large-v3-turbo")
-DATA = Path(os.environ.get(
-    "MSTAR_ASR_DATA",
-    os.path.join(os.environ.get("MSTAR_WS_ROOT", "/nonexistent"), "commons/bench/data/asr"),
-))
+DATA = Path(os.environ.get("MSTAR_ASR_DATA", "data/asr"))
 
 
 def _snapshot():

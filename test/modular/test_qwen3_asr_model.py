@@ -190,23 +190,34 @@ def test_prompt_layout_matches_reference_template():
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
     wave = torch.randn(16_000 * 3 + 40)
-    out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
+    result = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
+    out = result.new_input_tensors
     assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder makes the mel
     n_tokens = model.config.audio.tokens_for_frames(wave.numel() // 160)  # one frame per hop, unpadded
     ids = out["text_inputs"][0].tolist()
     assert ids.count(AUDIO_PAD) == n_tokens and ids[-1] == ASR_TEXT
+    # prefill splices the audio in at the run process_prompt reports
+    slot, count = result.metadata["audio_slot"], result.metadata["audio_tokens"]
+    assert count == n_tokens and ids[slot:slot + count] == [AUDIO_PAD] * count
+    assert set(result.metadata) <= set(model.INTERNAL_KWARGS)
 
     free = model.process_prompt("hot words", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
-    assert free["text_inputs"][0].tolist()[-1] != ASR_TEXT  # model reports the language itself
-    assert model.tokenizer.encode("hot words")[0] in free["text_inputs"][0].tolist()
+    free_ids = free.new_input_tensors["text_inputs"][0].tolist()
+    assert free_ids[-1] != ASR_TEXT  # model reports the language itself
+    assert model.tokenizer.encode("hot words")[0] in free_ids
+    slot = free.metadata["audio_slot"]
+    assert free_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens and free_ids[slot - 1] != AUDIO_PAD
 
     prefixed = model.process_prompt(
         None, ["audio"], ["text"], {"audio_inputs": [wave]}, assistant_prefix="language English<asr_text> hi",
     )
-    assert prefixed["text_inputs"][0].tolist()[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
+    prefixed_ids = prefixed.new_input_tensors["text_inputs"][0].tolist()
+    assert prefixed_ids[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
+    slot = prefixed.metadata["audio_slot"]
+    assert prefixed_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens
 
     short = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.randn(1600)]})
-    assert short["audio"][0].numel() == 8000  # padded to 0.5 s
+    assert short.new_input_tensors["audio"][0].numel() == 8000  # padded to 0.5 s
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt(None, ["audio"], ["text"],
                              {"audio_inputs": [torch.zeros(model.config.max_audio_samples + 16_000)]})
@@ -283,7 +294,8 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     sub = _llm_submodule(cfg)
     ids = torch.tensor([IM_START, 1001, AUDIO_START, AUDIO_PAD, AUDIO_PAD, AUDIO_PAD, AUDIO_END, 1002])
     audio = torch.arange(3 * cfg.text.hidden_size, dtype=torch.float32).view(3, -1)
-    fwd = type("F", (), {"request_id": "r"})()
+    # where process_prompt put the placeholder run, carried in the prefill's step_metadata
+    fwd = type("F", (), {"request_id": "r", "step_metadata": {"audio_slot": 3, "audio_tokens": 3}})()
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [ids], "audio_embeds": [audio]})
     assert row.input_seq_len == 8 and row.input_embeds.shape == (8, cfg.text.hidden_size)
     assert torch.equal(row.input_embeds[3:6], audio)
@@ -369,15 +381,20 @@ def test_graph_resources_and_state_machine():
     specs = model.get_node_resources()
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16
-    assert ragged.config.max_segments_per_request == model.MAX_WINDOWS_PER_REQUEST
+    cfg = model.config
+    frames = cfg.max_audio_samples // cfg.hop_length
+    expected = -(-frames // cfg.audio.n_window_infer)  # windows, rounded up
+    assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
+        model_kwargs={"audio_slot": 5, "audio_tokens": 37},
     )
     assert args.full_metadata.graph_walk == PREFILL_WALK
+    assert args.step_metadata == {"is_prefill": True, "audio_slot": 5, "audio_tokens": 37}
     assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")]
     nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
     assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill

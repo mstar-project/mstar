@@ -13,6 +13,7 @@ from pathlib import Path
 
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: F401 - the model's modules import it from here
 
 # ---------------------------------------------------------------------------
 # Resource keys and graph names
@@ -34,7 +35,6 @@ DECODE_LOOP = "decode_loop"
 # The model writes ``language {Name}<asr_text>{transcript}``. A forced
 # language is pre-filled into the assistant turn in that same form.
 LANGUAGE_PREFIX = "language "
-ASR_TEXT_TAG = "<asr_text>"
 
 # ISO-639-1/-3 codes (what OpenAI clients send) -> the canonical names the
 # model was trained on (``support_languages`` in config.json).

@@ -78,6 +78,22 @@ def test_dtw_follows_a_diagonal_band_and_is_monotonic():
     assert alignment.token_start_frames(matrix).tolist() == [0, 8, 16, 24, 32]
 
 
+
+def test_warm_up_compiles_or_falls_back_and_the_dtw_still_agrees(monkeypatch):
+    """warm_up compiles the DTW at load; a compile failure falls back to the
+    plain-Python loop rather than failing the first word-timestamp request."""
+    cost = np.random.default_rng(0).random((6, 20))
+    expected = alignment._dtw_trace(np.ascontiguousarray(cost))
+    alignment.warm_up()
+    assert np.array_equal(alignment._dtw_trace_fast(np.ascontiguousarray(cost)), expected)
+
+    def broken(_cost):
+        raise RuntimeError("cannot compile")
+
+    monkeypatch.setattr(alignment, "_dtw_trace_fast", broken)
+    alignment.warm_up()
+    assert alignment._dtw_trace_fast is alignment._dtw_trace
+
 def test_median_filter_reflects_edges():
     x = torch.arange(10.0).view(1, 1, 10)
     assert alignment.median_filter(x, 3).flatten().tolist() == [1, 1, 2, 3, 4, 5, 6, 7, 8, 8]

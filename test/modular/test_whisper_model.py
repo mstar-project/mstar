@@ -664,6 +664,29 @@ def test_state_machine_aligns_words_after_decoding():
     assert model.get_partition_forward_pass_args("default", align.full_metadata, {}).request_done
 
 
+
+def test_word_timestamps_on_a_sharded_decoder_are_refused_at_ingest():
+    """The align walk re-runs the decoder unsharded: a TP deployment answers a
+    word-timestamp request with a 400 (ValueError at ingest) instead of
+    failing it after the whole decode."""
+    signals = {"audio": [object()], "text_inputs": [object()]}
+    model = _make_model()
+    tp2 = {"max_concurrent_requests": 64, "node_groups": [
+        {"node_names": ["audio_encoder"], "ranks": [0]},
+        {"node_names": ["decoder"], "ranks": [0, 1], "tp_size": 2},
+    ]}
+    model.validate_config_yaml(tp2, "tp2.yaml")
+    with pytest.raises(ValueError, match="word timestamps need the decoder on one GPU"):
+        model.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "word"})
+    # segment timestamps and plain transcripts are fine there
+    model.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "segment"})
+
+    single = _make_model()
+    single.validate_config_yaml({"max_concurrent_requests": 64, "node_groups": [
+        {"node_names": ["audio_encoder", "decoder"], "ranks": [0]},
+    ]}, "x.yaml")
+    single.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "word"})
+
 def test_state_machine_language_detection():
     model = _make_model()
     tail = object()
@@ -882,18 +905,6 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
 # --------------------------------------------------------------------------
 
 
-def _resolve_pre_plan(model_config: dict, env: dict) -> bool:
-    """``Worker.__init__``'s resolution, over an explicit env dict.
-
-    Kept in step with worker.py by the source check below.
-    """
-    env_value = env.get("MSTAR_PRE_PLAN_SPEC")
-    return (
-        env_value == "1" if env_value is not None
-        else bool(model_config.get("pre_plan", True))
-    )
-
-
 @pytest.mark.parametrize("config,env,expected", [
     # absent in most configs: pre-planning stays on, as it was before the key
     ({}, {}, True),
@@ -906,7 +917,17 @@ def _resolve_pre_plan(model_config: dict, env: dict) -> bool:
     ({}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
 ])
 def test_pre_plan_config_defers_to_an_explicit_env_var(config, env, expected):
-    assert _resolve_pre_plan(config, dict(env)) == expected
+    from mstar.worker.worker import resolve_enable_pre_plan
+
+    assert resolve_enable_pre_plan(config, dict(env)) == expected
+
+
+@pytest.mark.parametrize("value", ["false", "no", 0, None])
+def test_a_pre_plan_that_is_not_a_yaml_boolean_is_refused(value):
+    from mstar.worker.worker import resolve_enable_pre_plan
+
+    with pytest.raises(ValueError, match="pre_plan must be true or false"):
+        resolve_enable_pre_plan({"pre_plan": value}, {})
 
 
 def test_only_turbo_turns_pre_plan_off():
@@ -919,20 +940,6 @@ def test_only_turbo_turns_pre_plan_off():
     for name in ("whisper_large", "whisper_large_tp2", "qwen3_asr", "qwen3_asr_realtime"):
         cfg = yaml.safe_load((root / f"configs/{name}.yaml").read_text())
         assert "pre_plan" not in cfg, f"{name} should stay on the pre_plan default"
-
-
-def test_the_resolution_under_test_matches_the_worker():
-    """Guards the duplicated logic above: if the worker's rule changes, this
-    fails rather than letting the test keep asserting the old one."""
-    root = Path(__file__).parents[2]
-    src = (root / "mstar/worker/worker.py").read_text()
-    assert '_env_pre_plan = os.environ.get("MSTAR_PRE_PLAN_SPEC")' in src
-    assert 'else bool(model_config.get("pre_plan", True))' in src
-    # and the engine takes the resolved answer rather than re-reading the env
-    engine = (root / "mstar/engine/engine.py").read_text()
-    assert "preplan_enabled = self.enable_pre_plan" in engine
-    assert 'os.environ.get("MSTAR_PRE_PLAN_SPEC"' not in engine
-
 
 
 def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():

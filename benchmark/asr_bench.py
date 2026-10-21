@@ -16,7 +16,7 @@ Results go to ``--output-json`` with the engine label, git SHA and GPU
 clocks, and a markdown row for the PR table is printed.
 
     python -m benchmark.asr_bench --url http://localhost:8000 --model whisper_large_v3_turbo \\
-        --system "M* <sha>" --data-dir $MSTAR_WS_ROOT/commons/bench/data/asr \\
+        --system "M* <sha>" --data-dir data/asr \\
         --concurrency 1 8 32 --long-form --output-json results/asr_mstar.json
 """
 
@@ -205,7 +205,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--url", required=True)
     p.add_argument("--model", required=True, help="model id sent in the request")
     p.add_argument("--system", required=True, help='engine label for the table, e.g. "vLLM 0.29.0"')
-    p.add_argument("--data-dir", default=os.path.join(os.environ.get("MSTAR_WS_ROOT", "."), "commons/bench/data/asr"))
+    p.add_argument("--data-dir", default="data/asr", help="the set benchmark.asr_data built")
     p.add_argument("--short-set", default="test_clean_200")
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--repeats", type=int, default=3)

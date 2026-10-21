@@ -112,7 +112,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        in the transcript is collapsed as the reference SDK does.
    * - ``qwen3_asr_realtime``
      - ``Qwen/Qwen3-ASR-0.6B``
-     - The 0.6B Qwen3-ASR checkpoint trained for chunked streaming; same class.
+     - The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the
+       short steps of ``/v1/realtime`` sessions.
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.

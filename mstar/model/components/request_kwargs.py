@@ -35,7 +35,7 @@ def checked_request_kwargs(kwargs: dict | None) -> dict:
             if isinstance(value, bool) or int(value) != float(value):
                 raise ValueError
             out[key] = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"{key} must be an integer, got {value!r}") from None
         if key == "max_output_tokens" and out[key] < 1:
             raise ValueError(f"max_output_tokens must be at least 1, got {out[key]}")

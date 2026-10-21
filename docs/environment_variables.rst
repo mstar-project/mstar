@@ -207,6 +207,19 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
+   * - ``MSTAR_ASR_DATA``
+     - ``data/asr``
+     - ``test/asr`` (GPU parity tests): the set ``benchmark.asr_data`` built.
+   * - ``MSTAR_WHISPER_REPO``
+     - ``openai/whisper-large-v3-turbo``
+     - ``test/asr/test_whisper_parity.py``: the Whisper checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REPO``
+     - ``Qwen/Qwen3-ASR-1.7B``
+     - ``test/asr/test_qwen3_asr_parity.py``: the Qwen3-ASR checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REF``
+     - ``refs/Qwen3-ASR``
+     - ``test/asr/test_qwen3_asr_parity.py``: a checkout of the qwen-asr SDK,
+       the reference transcripts come from.
 
 Serving (Python frontend)
 -------------------------

@@ -24,11 +24,14 @@ submodule's ``align`` walk on the GPU.
 """
 from __future__ import annotations
 
+import logging
 import string
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 # encoder positions per second: a 30 s window is 1500 positions
 FRAMES_PER_SECOND = 50
@@ -71,12 +74,31 @@ def _dtw_trace(cost: np.ndarray) -> np.ndarray:
     return trace
 
 
-try:  # the double loop is ~60k cells for a full window; numba makes it ~1 ms
+# The double loop is ~60k cells for a full window: ~1 ms compiled by numba
+# (the asr extra), far longer as plain Python on the GPU thread.
+try:
     from numba import njit
 
     _dtw_trace_fast = njit(cache=True, nogil=True)(_dtw_trace)
-except Exception:  # noqa: BLE001 — numba missing or unable to compile: plain Python
+except ImportError:
+    logger.warning(
+        "numba is not installed: word timestamps run the DTW in plain Python on the "
+        "GPU thread, far slower. Install mstar[asr]."
+    )
     _dtw_trace_fast = _dtw_trace
+
+
+def warm_up() -> None:
+    """Compile the DTW now, at load, rather than inside the first word-timestamp
+    request; fall back to plain Python, loudly, if numba cannot compile it."""
+    global _dtw_trace_fast
+    if _dtw_trace_fast is _dtw_trace:
+        return
+    try:
+        _dtw_trace_fast(np.zeros((2, 2), dtype=np.float64))
+    except Exception as exc:  # noqa: BLE001 — any compile failure: keep serving
+        logger.warning("numba could not compile the DTW (%s): word timestamps fall back to plain Python", exc)
+        _dtw_trace_fast = _dtw_trace
 
 
 def dtw(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
