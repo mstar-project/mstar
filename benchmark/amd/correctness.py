@@ -142,7 +142,7 @@ def chunks_from_chat(body: bytes, tok, eos_ids: set[int]) -> tuple[list[str], in
 
 def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = None) -> dict:
     C = load(plan.correctness_src)
-    config = catalog.mstar_config_name(row, arm.name)
+    config = catalog.family_config_name(row, arm.name)
     tree = worktree or plan.worktree
     fam, cfg = _family(C, tree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
@@ -229,7 +229,7 @@ def omni_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = 
     """The omni family's set, answered in text and speech. mstar gets the family's own /generate
     requests; vllm-omni gets the same questions as chat completions with text and PCM audio."""
     C = load(plan.correctness_src)
-    config = catalog.mstar_config_name(row, arm.name)
+    config = catalog.family_config_name(row, arm.name)
     tree = worktree or plan.worktree
     fam, cfg = _family(C, tree, config)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
@@ -277,7 +277,7 @@ def media_request_kwargs(plan, row, arm=None, wl=None, worktree: Path | None = N
     request_extra (mstar serving knobs) goes to mstar arms only, and the row's generator_device to arms whose
     protocol takes it."""
     C = load(plan.correctness_src or REPO)
-    config = catalog.mstar_config_name(row, arm.name) if arm is not None else row.name
+    config = catalog.family_config_name(row, arm.name if arm is not None else "mstar")
     fam, _ = _family(C, worktree or plan.worktree, config, family_opts(wl, row))
     if row.family == "image":
         guidance = fam.guidance if fam.guidance is not None else (fam.ref_extra or {}).get("guidance_scale")
@@ -304,7 +304,7 @@ def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Pa
     """The correctness pass of a TTS (wav), ASR (txt), image (png) or video (mp4) arm: its first timed
     run at concurrency 1, which sends every item of the set once, in order."""
     row = catalog.ROWS.get(row_name)
-    config = catalog.mstar_config_name(row, arm_name) if row else row_name
+    config = catalog.family_config_name(row, arm_name) if row else row_name
     fam, cfg = _family(C, worktree, config, opts)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     run = cell_dir / "a1r1"
