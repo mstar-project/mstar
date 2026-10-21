@@ -45,6 +45,7 @@ from mstar.model.lingbot_world.config import (
     WAN21_VAE_DIFFUSERS_REPO,
 )
 from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -258,14 +259,14 @@ class LingBotWorldModel(Model):
         return torch.nn.functional.interpolate(image[None], size=size, mode="bicubic")[0]
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        """uint8 ``[3, H, W]``: the resize and normalization are process_prompt's."""
-        import torchvision
+        """uint8 ``[3, H, W]`` as the reference reads it, with Pillow's ``convert("RGB")``
+        (alpha dropped, not composited); the resize and normalization are process_prompt's."""
+        from PIL import Image
 
-        image = torchvision.io.decode_image(filepath, mode=torchvision.io.ImageReadMode.RGB)
-        if image.dtype == torch.uint16:
-            # a 16-bit PNG: keep the high byte, which is what PIL reads for the reference
-            image = (image.to(torch.int32) >> 8).to(torch.uint8)
-        return TensorAndMetadata(image)
+        check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
+        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as image:
+            rgb = np.array(image.convert("RGB"))
+        return TensorAndMetadata(torch.from_numpy(rgb).permute(2, 0, 1).contiguous())
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "video_frame":

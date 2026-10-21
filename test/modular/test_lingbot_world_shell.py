@@ -218,6 +218,18 @@ def test_a_16_bit_png_loads_as_the_8_bit_image_the_reference_reads(model, tmp_pa
     assert torch.equal(image, expected)
 
 
+def test_an_rgba_png_drops_its_alpha_as_the_reference_reads_it(model, tmp_path):
+    """The reference drops the alpha channel rather than compositing on white."""
+    from PIL import Image
+
+    rgba = np.random.default_rng(0).integers(0, 256, size=(24, 40, 4), dtype=np.uint8)
+    path = tmp_path / "rgba.png"
+    Image.fromarray(rgba, mode="RGBA").save(path)
+    image = model.load_image(str(path), "cpu").data
+    assert image.dtype == torch.uint8 and image.shape == (3, 24, 40)
+    assert torch.equal(image, torch.from_numpy(rgba[..., :3].copy()).permute(2, 0, 1))
+
+
 def test_prompt_clean_is_the_reference_tokenizers_whitespace_clean(model):
     # ftfy straightens curly quotes; the reference T5 tokenizer cleans every prompt this way.
     assert model.prompt_clean("  A \u201ctree\u201d &amp;amp; its\u00a0 reflection\n") == 'A "tree" & its reflection'
