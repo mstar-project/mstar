@@ -700,6 +700,16 @@ Two flags cover retention rules that are not quite a token FIFO.
 only makes sense for attention that ignores key order; it decides which of the oldest
 step's tokens leave first.
 
+By default the window is per step: every query of a step sees the same keys, the retained
+ones and all of the step's own. A streaming encoder whose frames each see a fixed left
+context (a conformer's ``att_context_size=[left, 0]``) sets ``SinkWindow(0, left, right=0)``
+instead: each query attends the keys at distances ``0..left`` from it, so a step of several
+frames is causal within itself and matches the offline mask. ``rel_bias`` is then indexed
+by that distance, ``[rows, H, T, left + 1]``, and passed unscaled (the kernel scales the
+sum by ``head_dim ** -0.5``). Only a right context of 0, with no sink, is supported so far.
+``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
+compute in it.
+
 Step 3 — Declare the computation graph
 --------------------------------------
 
