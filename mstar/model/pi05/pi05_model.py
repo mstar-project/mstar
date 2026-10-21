@@ -56,6 +56,7 @@ from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, Proce
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import discretize_state
+from mstar.model.pi05.components.normalization import Pi05NormStats, load_norm_stats
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer, pi05_prompt
@@ -180,6 +181,7 @@ class Pi05Model(Model):
         self._yaml_config_overrides: dict = dict(kwargs)
 
         self.config: Pi05Config = self._load_config()
+        self.norm_stats: Pi05NormStats | None = load_norm_stats(self.config.norm_stats)
         self.tokenizer: Pi05Tokenizer | None = self._load_tokenizer()
 
         self._repo_dir: Path | None = None
@@ -525,7 +527,9 @@ class Pi05Model(Model):
             "Task: <text>, State: <bin0> <bin1> ...;\\nAction: "
 
         with one bin per state value (see :func:`discretize_state`), and the
-        PaliGemma tokenizer encodes the whole string.
+        PaliGemma tokenizer encodes the whole string. With ``norm_stats``
+        configured, ``robot_state`` is the raw state and is normalized first,
+        as openpi's policy does; without, it is binned as given.
         """
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
@@ -541,6 +545,8 @@ class Pi05Model(Model):
         robot_state = kwargs.get("robot_state")
         if robot_state is not None:
             state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
+            if self.norm_stats is not None:
+                state = self.norm_stats.normalize_state(state)
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
         text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
         cfg = self.config
@@ -560,7 +566,10 @@ class Pi05Model(Model):
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
-            return output.detach().to(torch.float32).cpu().numpy().tobytes()
+            actions = output.detach().cpu()
+            if self.norm_stats is not None:
+                actions = self.norm_stats.unnormalize_actions(actions)
+            return actions.to(torch.float32).numpy().tobytes()
         raise ValueError(f"Unsupported modality for Pi0.5: {modality!r}")
 
     # ------------------------------------------------------------------
