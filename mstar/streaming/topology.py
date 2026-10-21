@@ -29,7 +29,7 @@ CLIENT = "client"
 
 
 # What a client stream past its max_pending_items does with the next item.
-PENDING_OVERFLOW = ("refuse", "drop_oldest")
+PENDING_OVERFLOW = ("refuse", "keep_newest")
 
 
 class ClientStreamLimits(NamedTuple):
@@ -40,11 +40,13 @@ class ClientStreamLimits(NamedTuple):
     # What the stream may carry over the call's life, each item counting
     # item_size(item): a call past it ends with a 400.
     max_items: int | None = None
-    # Items the consumer has been sent and not consumed yet, at once.
+    # Items (not item_size units) the consumer has been sent and not consumed
+    # yet, at once.
     max_pending_items: int | None = None
     # "refuse": an item past max_pending_items ends the call with a 400.
-    # "drop_oldest": it waits in the conductor instead, and replaces an older
-    # item waiting there, which is dropped.
+    # "keep_newest": the items that fit are sent; of the rest the conductor
+    # holds only the newest, in one slot, until the consumer has room or the
+    # stream ends, and drops the others (and any item the slot held before).
     pending_overflow: str = "refuse"
     # How much of max_items one item uses: 1 when None. A stream of
     # variable-length chunks counts their frames or samples.

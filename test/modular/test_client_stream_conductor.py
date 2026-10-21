@@ -619,12 +619,12 @@ def test_a_call_too_far_ahead_of_its_consumer_is_refused_with_a_400(tmp_path, mo
     assert "client_streams.audio_in.max_pending_items" in drain.failure_error
 
 
-def test_drop_oldest_keeps_the_newest_item_waiting_for_room(tmp_path, monkeypatch):
-    """Past the limit the newest item waits in the conductor and replaces
-    any older one waiting, which is freed at once; room (a consumption
-    report) or the stream's end sends the one waiting."""
+def test_keep_newest_sends_what_fits_and_holds_the_newest_item_for_room(tmp_path, monkeypatch):
+    """What fits is sent; past the limit the newest item waits in the
+    conductor and the others, and any older one waiting, are freed at once;
+    room (a consumption report) or the stream's end sends the one waiting."""
     c = _conductor(tmp_path, monkeypatch, model=_Bounded(
-        ClientStreamLimits(max_pending_items=2, pending_overflow="drop_oldest"),
+        ClientStreamLimits(max_pending_items=2, pending_overflow="keep_newest"),
     ))
     _run(c, [
         [_new_request("r")],
@@ -651,9 +651,9 @@ def test_client_stream_limits_take_deployment_overrides():
 
     assert client_stream_limits(topology, None)["audio_in"].max_items == 10
     limits = client_stream_limits(topology, {"client_streams": {"audio_in": {
-        "max_items": 6, "max_pending_items": 8, "pending_overflow": "drop_oldest",
+        "max_items": 6, "max_pending_items": 8, "pending_overflow": "keep_newest",
     }}})["audio_in"]
-    assert (limits.max_items, limits.max_pending_items, limits.pending_overflow) == (6, 8, "drop_oldest")
+    assert (limits.max_items, limits.max_pending_items, limits.pending_overflow) == (6, 8, "keep_newest")
 
 
 @pytest.mark.parametrize("max_items", [11, None])
@@ -704,6 +704,7 @@ def test_max_pending_items_cannot_bound_chunks_that_grow_without_a_cap():
     ({"audio_in": {"max_items": 0}}, "positive integer"),
     ({"audio_in": {"max_pending_items": True}}, "positive integer"),
     ({"audio_in": {"pending_overflow": "block"}}, "pending_overflow"),
+    ({"audio_in": {"pending_overflow": "drop_oldest"}}, "pending_overflow"),
     ({"audio_in": 5}, "takes"),
 ])
 def test_a_bad_client_streams_block_fails_loading(block, match):

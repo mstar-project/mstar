@@ -112,7 +112,7 @@ class StreamingConnectionState:
     # producer_done carries so the consumer waits for the last of them
     items_sent: dict[str, int] = field(default_factory=dict)
     # A client stream's newest item, held back while its consumer is
-    # max_pending_items behind (pending_overflow "drop_oldest").
+    # max_pending_items behind (pending_overflow "keep_newest").
     waiting: TensorPointerInfo | None = None
 
 

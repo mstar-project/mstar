@@ -2021,8 +2021,9 @@ class Conductor:
         """Of a client chunk's items, those its consumer may be sent now: at
         most ``max_pending_items`` sent and not consumed, by the counts the
         consumer last reported (so a step's worth late). Past it, ``refuse``
-        ends the call; ``drop_oldest`` holds the newest item back until there
-        is room and drops what it replaces."""
+        ends the call; ``keep_newest`` sends what fits, holds the newest of the
+        rest back until there is room and drops the others, along with any
+        item it held before."""
         room = max(limits.max_pending_items - (conn.token_count - conn.consumed_count), 0)
         if limits.pending_overflow == "refuse":
             if len(infos) > room:
@@ -2042,7 +2043,7 @@ class Conductor:
         self, request_id: str, request_data: RequestData, conn: StreamingConnectionState,
         at_end: bool = False,
     ):
-        """Send the client item held back under ``drop_oldest`` once its
+        """Send the client item held back under ``keep_newest`` once its
         consumer has room, or ahead of its stream's end regardless."""
         if request_data.partition_states[conn.to_partition].is_done:
             return  # nothing reads it any more; freed with the request

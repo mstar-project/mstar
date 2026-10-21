@@ -162,7 +162,7 @@ say) ends the call with its error (``status`` 400), and no finish follows, since
 it carried is lost. So does an append the server then fails to load or process (a corrupt
 file, say), with that failure's status, as for a request's own files, and so does input
 past a limit the model or the deployment sets on a stream (how much a call may send, or
-how far it may run ahead of the model, unless the stream drops its oldest input instead;
+how far it may run ahead of the model, unless the stream keeps only its newest input instead;
 ``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after
 ``end_input``, or after the model has ended the call, or to a request this socket has no
 live call under, gets ``{"request_id", "append": true, "error"}``: a reply to that append,

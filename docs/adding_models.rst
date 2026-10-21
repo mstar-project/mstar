@@ -1909,8 +1909,9 @@ streams (audio and video, say): each has its own buffer and its own end.
   each item counting ``item_size(item)`` (1 by default; a stream of variable-length
   chunks counts their frames or samples, named by ``unit``); and ``max_pending_items``,
   how many items its consumer may have been sent and not consumed, with
-  ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"drop_oldest"``
-  (the newest item waits for room and older ones waiting are dropped). A call past
+  ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"keep_newest"``
+  (what fits is sent; of the rest the newest item waits for room and the others are
+  dropped). A call past
   ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise

@@ -257,13 +257,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        stream may carry over a call's life, in the model's units (items, or the frames
        or samples a model counts per item); a call past it ends with a 400.
        ``max_pending_items``: how many items the model may have been sent and not yet
-       consumed at once, as the model last reported (a step late). It must be at least
-       the widest chunk the stream's chunk policy waits for, or loading fails: the
-       model would never take a chunk, so it would never make room.
-       ``pending_overflow``: what an item past that does, ``refuse`` (the default: the
-       call ends with a 400) or ``drop_oldest`` (it waits in the conductor until the
-       model has room, replacing an older item waiting there, which is dropped). A
-       deployment may set a bound the model leaves open (``null`` is none) or lower one it
+       consumed at once, as the model last reported (a step late). It counts items, not
+       the frames or samples ``max_items`` may count per item, and must be at least the
+       widest chunk the stream's chunk policy waits for, or loading fails: the model
+       would never take a chunk, so it would never make room.
+       ``pending_overflow``: what input past that does, ``refuse`` (the default: the
+       call ends with a 400) or ``keep_newest``: the items that fit are sent, in order;
+       of the rest the conductor keeps only the newest, in one slot, until the model
+       reports room or the stream ends, and drops the others, as well as any item the
+       slot held before. The model so gets the oldest input that fits and then the
+       latest, without what came between: for a stream where only the latest input
+       matters. A deployment may set a bound the model leaves open (``null`` is none) or lower one it
        declares, which is the most the model can take, but not raise or lift it: a
        model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
        ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
