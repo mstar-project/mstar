@@ -2,17 +2,18 @@
 stamped the teardown with, before its admit of the next, and in the order rank 0 did.
 
 A teardown releases pages, so the side of an admit it lands on decides what that admit finds
-free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last
-step it has broadcast. A follower holds it until it has popped that step, and reads no
-message between popping a step and the admit fence at the top of the next pass, so it lands
-after that admit. Rank 0 lands it there too. When the follower drops a step it popped, it
-tears the held ones down before it takes the next. A removal deferred behind step N is retried
-once N is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
-``_remove_request`` defers it again while N is still the step in flight, and the next pass
-tears it down behind N+1's admit fence. A removal that reaches rank 0 once N is done, with
-nothing in flight, lands before N+1 is sent; a follower still running N defers it, and tears
-it down once N is done, before it takes N+1. The order matters as well: the free list hands
-pages back out in the order they were freed.
+free, and once the pool is full a follower can refuse an admit rank 0 grants. Rank 0
+forwards each teardown stamped with the last step it has broadcast. A follower holds it
+until it has popped that step, and reads no message between popping a step and the admit
+fence at the top of the next pass, so it lands after that admit. Rank 0 lands it there too.
+When the follower drops a step it popped, it tears the held ones down before it takes the
+next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
+speculated, broadcast and maybe not yet admitted; but ``_remove_request`` defers it again
+while N is still the step in flight, and the next pass tears it down behind N+1's admit
+fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
+N+1 is sent; a follower still running N defers it, and tears it down once N is done, before
+it takes N+1. The order matters as well: the free list hands pages back out in the order
+they were freed, so another order gives a follower other page ids than rank 0's.
 
 Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
 a request is torn down, or a while.
