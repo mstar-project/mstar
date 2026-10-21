@@ -432,6 +432,16 @@ def skipped(plan: Plan, row: Row, arm: Arm, wl: tables.Workload | None = None) -
     return False
 
 
+def _runs(plan: Plan, row: Row, arm: Arm) -> bool:
+    """Whether an arm runs on a row: its tree was given, and --skip leaves it at least one workload."""
+    if arm.tree and arm.tree not in plan.trees:
+        return False
+    if not getattr(plan, "skips", None):
+        return True
+    wls = row_workloads(plan, row)
+    return not skipped(plan, row, arm) and not (wls and all(skipped(plan, row, arm, wl) for wl in wls))
+
+
 def row_workloads(plan: Plan, row: Row) -> list[tables.Workload]:
     """The run's workloads this row takes: its family's, limited to Row.workloads when the row names some."""
     return [wl for wl in plan.workloads if wl.family == row.family and (not row.workloads or wl.name in row.workloads)]
@@ -476,8 +486,7 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
 
 def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
     """Every arm of one row, back to back on the same GPUs."""
-    arms = [a for a in catalog.arms_for(row, plan.arms) if (not a.tree or a.tree in plan.trees)
-            and not skipped(plan, row, a) and not all(skipped(plan, row, a, wl) for wl in row_workloads(plan, row))]
+    arms = [a for a in catalog.arms_for(row, plan.arms) if _runs(plan, row, a)]
     # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
     k = index % len(arms) if arms else 0
     # Each arm gets its own port: right after a server stops, its port can sit in TIME_WAIT, and a server that
