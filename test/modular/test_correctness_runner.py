@@ -425,13 +425,27 @@ def test_i2v_floor_takes_the_larger_move_per_video(tmp_path):
     assert Cosmos3I2V("cosmos3_nano", {}, {"ref_anchor": "fp32"}).anchor_reference_dir(ref) is None
 
 
-def test_cosmos3_droid_asks_for_the_policy_s_8_dims(tmp_path):
-    fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {})
-    sset = sets.SampleSet("droid_v1", tmp_path, {}, [sets.Item(id="ep00", prompt="p", params={"seed": 0},
-                                                              files={"exterior_image_1_left": "f.png"})])
+@pytest.mark.parametrize("config", ["cosmos3_droid", "cosmos3_edge_droid"])
+def test_cosmos3_droid_sends_the_robolab_request(tmp_path, config):
+    """The 8 action dims, the composite, the joint state with 1 - gripper as a state row (33 rows and frames,
+    15 fps), and the prompt the RoboLab server builds: plain for Nano, JSON plus the cookbook interval for Edge."""
+    fam = family_for_config(config, config, {}, {})
+    states = np.zeros((10, 8), dtype=np.float32)
+    states[4] = [0.1, -0.2, 0.3, -2.0, 0.05, 1.9, 0.8, 0.25]
+    np.save(tmp_path / "s.npy", states)
+    sset = sets.SampleSet("droid_v2", tmp_path, {}, [sets.Item(
+        id="ep00", prompt="Put the marker in the pot", params={"seed": 0, "step": 4},
+        files={"composite": "c.png", "joint_states": "s.npy"})])
     (req,) = fam.requests(sset)
-    assert req.model_kwargs["raw_action_dim"] == 8
-    raw = np.arange(32 * 16, dtype=np.float32)  # the server pads to the model's action width
+    kw = req.model_kwargs
+    assert kw["raw_action_dim"] == 8 and kw["action_chunk_size"] == kw["num_frames"] == 33
+    assert kw["fps"] == 15.0 and kw["size"] == "736x544" and req.files == [tmp_path / "c.png"]
+    assert np.allclose(kw["action"], [[0.1, -0.2, 0.3, -2.0, 0.05, 1.9, 0.8, 0.75]])
+    edge = config == "cosmos3_edge_droid"
+    assert ("guidance_interval" in kw) == edge
+    assert req.text.startswith("{") == edge
+    assert "This video is of 544x736 resolution." in req.text or edge
+    raw = np.arange(32 * 16, dtype=np.float32)  # the server drops the state row and pads the action width
     assert fam.to_array(raw).shape == (32, 8)
 
 
