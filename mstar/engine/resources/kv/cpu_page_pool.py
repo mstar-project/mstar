@@ -4,18 +4,27 @@ When device pages run out, a cold request's pages move here, into pinned host
 memory, freeing device pages for the requests that are actually running. They
 move back when it is scheduled again.
 
+A page the prefix index names is filed here under the same key, in a host index
+of its own, so a prefix that several requests share is stored and copied once.
+The rest of a stream's pages belong to its request alone.
+
 The pool stores pages and the stream metadata that has to survive the round
 trip; which request to evict, and when, is the worker's decision.
 """
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator, PagedKVConfig
+from mstar.engine.resources.kv.cache import KVCache, PagedKVConfig
 from mstar.engine.resources.kv.page_copier import make_page_copier
+from mstar.engine.resources.kv.prefix_index import PrefixIndex
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import PageArena
 
 logger = logging.getLogger(__name__)
 
@@ -26,30 +35,44 @@ _EXHAUSTED_LOG_INTERVAL = 5.0
 @dataclass
 class OffloadedStream:
     """One (request, label) stream living on the host."""
+    # Every host page of the stream, in order. The first len(keys) are filed
+    # under those keys in the host index, and this stream retains them.
     cpu_page_indices: list[int]
     stored_len: int
     position: int
     released: int = 0
     protected_prefix: int = 0
+    keys: list[bytes] = field(default_factory=list)
+
+
+class PageCopies(NamedTuple):
+    """Device page ``gpu[i]`` copied to or from host page ``cpu[i]``."""
+    gpu: list[int]
+    cpu: list[int]
 
 
 class CPUPagePool:
-    """Host mirror of the paged KV cache, holding whatever is offloaded."""
+    """Host mirror of the paged KV cache, holding whatever is offloaded.
+
+    ``arena`` and ``index`` take no lock of their own, so every call that
+    changes them holds the manager's lock. The copies run without it.
+    """
 
     def __init__(
         self,
         config: PagedKVConfig,
         kv_cache: KVCache,
-        max_cpu_pages: int,
+        arena: "PageArena",
     ):
         self.config = config
-        self.page_allocator = PageAllocator(max_cpu_pages)
+        self.arena = arena
+        self.index = PrefixIndex(arena)
 
         # same layout as the device cache, on pinned memory so the copies can
         # be async. Left unfilled: a host page is read only after a copy writes it.
         self.cpu_kv_cache = torch.empty(
             config.num_layers,
-            max_cpu_pages,
+            arena.allocator.max_num_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
@@ -77,45 +100,53 @@ class CPUPagePool:
     def labels(self, rid: str) -> list[str]:
         return list(self.offloaded.get(rid, {}))
 
-    def offload_stream(
+    def retain_run(self, keys: list[bytes]) -> list[int]:
+        """The host pages ``keys`` name from the root, each retained for the caller to release."""
+        pages = self.index.lookup(keys)
+        self.arena.retain(pages)
+        return pages
+
+    def place(
         self,
         rid: str,
         label: str,
-        gpu_kv_cache: torch.Tensor,
         gpu_page_indices: list[int],
+        keys: list[bytes],
         stored_len: int,
         position: int,
         released: int = 0,
         protected_prefix: int = 0,
-    ) -> bool:
-        """Copy device pages to the host. False when the host pool is full,
-        in which case nothing moved and the caller keeps its device pages."""
-        n_pages = len(gpu_page_indices)
-        if n_pages == 0:
-            return False
-
-        cpu_pages = self.page_allocator.try_allocate(n_pages)
+    ) -> PageCopies | None:
+        """File a stream here and return the copies its offload has to queue.
+        The leading pages that ``keys`` name are copied only where the host
+        index lacks the key. None when the host can't hold the stream even by
+        evicting cached pages.
+        """
+        # retained before evicting, so the eviction passes over them
+        found = self.retain_run(keys)
+        n_pages = len(gpu_page_indices) - len(found)
+        cpu_pages = self.arena.acquire(n_pages)
         if cpu_pages is None:
+            self.index.evict(n_pages - self.arena.num_free)
+            cpu_pages = self.arena.acquire(n_pages)
+        if cpu_pages is None:
+            self.arena.release(found)
             self._log_refusal(rid, label, n_pages)
-            return False
-
-        stream = self._get_stream()
-        # The compute stream may still be running the step that last touched
-        # these pages (a commit hands pages on right after the launch). Queue
-        # the copies behind it, or they could read a page mid-write.
-        stream.wait_stream(torch.cuda.current_stream())
-        self._copier.copy(
-            self.cpu_kv_cache, cpu_pages, gpu_kv_cache, gpu_page_indices, stream
-        )
-
+            return None
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
-            cpu_page_indices=cpu_pages,
+            cpu_page_indices=found + cpu_pages,
             stored_len=stored_len,
             position=position,
             released=released,
             protected_prefix=protected_prefix,
+            keys=list(keys),
         )
-        return True
+        return PageCopies(gpu=gpu_page_indices[len(found):], cpu=cpu_pages)
+
+    def insert_keys(self, rid: str, label: str) -> None:
+        """Name a placed stream's keyed pages in the host index, once their copies are queued."""
+        state = self.offloaded[rid][label]
+        self.index.insert_run(state.keys, state.cpu_page_indices[:len(state.keys)], None)
 
     def _log_refusal(self, rid: str, label: str, n_pages: int) -> None:
         now = time.monotonic()
@@ -127,52 +158,46 @@ class CPUPagePool:
             "CPU page pool exhausted: cannot offload %d pages for %s/%s "
             "(%d of %d pages free; %d more offloads refused since the last "
             "warning)",
-            n_pages, rid, label, self.page_allocator.num_free,
-            self.cpu_kv_cache.shape[1], self._refused_unlogged,
+            n_pages, rid, label, self.arena.num_free,
+            self.arena.allocator.max_num_pages, self._refused_unlogged,
         )
         self._refused_logged_at = now
         self._refused_unlogged = 0
 
-    def reload_stream(
-        self,
-        rid: str,
-        label: str,
-        gpu_kv_cache: torch.Tensor,
-        gpu_page_indices: list[int],
-    ) -> OffloadedStream:
-        """Copy the host pages back onto ``gpu_page_indices`` and release them.
+    def copy_out(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+        if not copies.gpu:
+            return
+        stream = self._get_stream()
+        # The compute stream may still be running the step that last touched
+        # these pages (a commit hands pages on right after the launch). Queue
+        # the copies behind it, or they could read a page mid-write.
+        stream.wait_stream(torch.cuda.current_stream())
+        self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
 
-        Returns the stream metadata saved at offload, for the caller to
-        restore.
-        """
-        state = self.offloaded[rid].pop(label)
-        if not self.offloaded[rid]:
-            del self.offloaded[rid]
-
+    def copy_in(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+        if not copies.gpu:
+            return
         stream = self._get_stream()
         # Same ordering as the offload: the device pages we write may have
         # been released by a commit whose kernels are still reading them.
         stream.wait_stream(torch.cuda.current_stream())
-        self._copier.copy(
-            gpu_kv_cache, gpu_page_indices,
-            self.cpu_kv_cache, state.cpu_page_indices, stream,
-        )
+        self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
 
-        self.page_allocator.free(state.cpu_page_indices)
+    def pop(self, rid: str, label: str) -> OffloadedStream | None:
+        state = self.offloaded.get(rid, {}).pop(label, None)
+        if state is not None and not self.offloaded[rid]:
+            del self.offloaded[rid]
         return state
 
     def discard(self, rid: str, label: str) -> None:
-        """Drop a stream that was copied here but never committed to.
+        """Drop a stream that was placed here but never committed to.
 
         The offload aborted after the copy, so the device pages stay live and
         these host pages go back to the pool.
         """
-        state = self.offloaded.get(rid, {}).pop(label, None)
-        if state is None:
-            return
-        if not self.offloaded[rid]:
-            del self.offloaded[rid]
-        self.page_allocator.free(state.cpu_page_indices)
+        state = self.pop(rid, label)
+        if state is not None:
+            self.arena.release(state.cpu_page_indices)
 
     def num_pages(self, rid: str, label: str) -> int:
         state = self.offloaded.get(rid, {}).get(label)
@@ -190,8 +215,8 @@ class CPUPagePool:
 
     def remove_request(self, rid: str) -> None:
         for state in self.offloaded.pop(rid, {}).values():
-            self.page_allocator.free(state.cpu_page_indices)
+            self.arena.release(state.cpu_page_indices)
 
     @property
     def num_free_pages(self) -> int:
-        return self.page_allocator.num_free
+        return self.arena.num_free

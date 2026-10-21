@@ -28,7 +28,7 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     RetentionPolicy,
 )
-from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -72,7 +72,8 @@ class PageArena:
     freeing clears the seal. Every caller holds the manager's `_lock`, so the
     counts and seals need none of their own.
     """
-    kv_cache: KVCache
+    # None for the host pool's arena, since `CPUPagePool` makes the host copies
+    kv_cache: KVCache | None
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
@@ -277,6 +278,8 @@ class ClaimedStream:
     position: int
     released: int
     protected_prefix: int
+    # the chain's keys for the pages below its cursor, not yet rooted
+    keys: list[bytes]
 
 
 LabelToStream = dict[str, CacheStream]
@@ -458,7 +461,7 @@ class KVManager(AttentionResource):
         if cfg.cpu_offload_pages > 0:
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
-                max_cpu_pages=cfg.cpu_offload_pages,
+                arena=PageArena(kv_cache=None, allocator=PageAllocator(cfg.cpu_offload_pages)),
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
@@ -2412,7 +2415,9 @@ class KVManager(AttentionResource):
             )
 
     def offload(self, rid: str) -> int:
-        """Move every stream of ``rid`` to host memory. Returns pages freed.
+        """Move every stream of ``rid`` to host memory. Returns the device pages
+        it made reusable: pages that reach the free list, and pages then held
+        only by the index.
 
         A stream whose pages don't fit on the host keeps them, so a partial
         offload still frees whatever did fit.
@@ -2428,19 +2433,14 @@ class KVManager(AttentionResource):
             return 0
         released: set[str] = set()
         try:
-            # blocking work OUTSIDE the lock: drain the in-flight reads, then
-            # copy each claimed stream to host
+            # blocking work OUTSIDE the lock: drain the in-flight reads, hash
+            # the keys, then copy each claimed stream to host
             if read_futures:
                 wait(read_futures)
             moved = [
                 claim for claim in claimed
-                if self._cpu_pool.offload_stream(
-                    rid=rid, label=claim.label,
-                    gpu_kv_cache=self.kv_cache.tensor,
-                    gpu_page_indices=claim.pages,
-                    stored_len=claim.stored_len, position=claim.position,
-                    released=claim.released,
-                    protected_prefix=claim.protected_prefix,
+                if self._offload_stream(
+                    rid, claim, [fingerprint(self._prefix_root, key) for key in claim.keys],
                 )
             ]
             if not moved:
@@ -2453,6 +2453,31 @@ class KVManager(AttentionResource):
             self._abandon_claims(
                 rid, [c.label for c in claimed if c.label not in released]
             )
+
+    def _offload_stream(
+        self, rid: str, claim: ClaimedStream, rooted: list[bytes],
+    ) -> bool:
+        """Place one claimed stream on the host and queue its copies. False
+        when the host can't hold it."""
+        with self._lock:
+            # Only the stream's leading pages that the index names are filed by
+            # key. A page that lost the insert race is a private copy, so the
+            # host keeps it with the rest of the stream, not under its key.
+            keyed = 0
+            for key, page in zip(rooted, claim.pages, strict=False):
+                if self._index.page_for(key) != page:
+                    break
+                keyed += 1
+            copies = self._cpu_pool.place(
+                rid=rid, label=claim.label, gpu_page_indices=claim.pages,
+                keys=rooted[:keyed],
+                stored_len=claim.stored_len, position=claim.position,
+                released=claim.released, protected_prefix=claim.protected_prefix,
+            )
+        if copies is None:
+            return False
+        self._cpu_pool.copy_out(self.kv_cache.tensor, copies)
+        return True
 
     def _claim_for_offload(
         self, rid: str
@@ -2479,6 +2504,7 @@ class KVManager(AttentionResource):
                 if stream.offloaded or not stream.page_indices:
                     continue
                 stream.offloaded = True
+                chain = stream.chain
                 claimed.append(ClaimedStream(
                     label=label,
                     pages=list(stream.page_indices),
@@ -2487,6 +2513,12 @@ class KVManager(AttentionResource):
                     position=stream.position,
                     released=stream.released,
                     protected_prefix=stream.protected_prefix,
+                    # past a front release `page_indices[k]` is no longer page k of the chain
+                    keys=(
+                        chain.keys[:chain.cursor]
+                        if self._index is not None and chain is not None and not stream.released
+                        else []
+                    ),
                 ))
                 if stream.read_future is not None:
                     read_futures.append(stream.read_future)
@@ -2511,15 +2543,26 @@ class KVManager(AttentionResource):
                     # removed, or written to behind us. Releasing nothing here
                     # leaves every claim for `_abandon_claims` to undo.
                     return 0, set()
-            freed = 0
+            # counted under the lock, since a probe on another thread can retain
+            # index pages
+            freed = sum(self._reusable(page) for claim in moved for page in claim.pages)
+            if not freed:
+                return 0, set()
             for claim in moved:
                 stream = streams[claim.label]
-                freed += len(claim.pages)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
                 # Offload changes residency, not logical stream contents.
                 stream.reset(content_reset=False)
+                if claim.keys:
+                    self._cpu_pool.insert_keys(rid, claim.label)
             return freed, {claim.label for claim in moved}
+
+    def _reusable(self, page: int) -> bool:
+        """Whether ``page`` reaches the free list, or is left to the index alone,
+        once the request releases it."""
+        owners = self._arena.num_owners[page]
+        return owners == 1 or (owners == 2 and self._index is not None and self._index.holds(page))
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
         """Undo claims that never became an offload.
@@ -2572,49 +2615,51 @@ class KVManager(AttentionResource):
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            labels = self._cpu_pool.labels(rid)
-            needed = self._reload_pages_needed(rid)
+            states = dict(self._cpu_pool.offloaded[rid])
+            needed = sum(len(state.cpu_page_indices) for state in states.values())
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
                 self._index.evict(needed - self._arena.num_free)
-            if needed > self._arena.num_free:
+            pages = self._arena.acquire(needed)
+            if pages is None:
                 return False
-            for label in labels:
+            copies = PageCopies(gpu=pages, cpu=[])
+            for label, state in states.items():
                 stream = self._ensure_label(rid, label)
-                pages = self._arena.acquire(
-                    self._cpu_pool.num_pages(rid, label)
-                )
-                if pages is None:
-                    # lost the race for pages against another consumer
-                    return False
-                state = self._cpu_pool.reload_stream(
-                    rid=rid, label=label,
-                    gpu_kv_cache=self.kv_cache.tensor,
-                    gpu_page_indices=pages,
-                )
-                stream.page_indices = pages
+                at = len(copies.cpu)
+                stream.page_indices = pages[at:at + len(state.cpu_page_indices)]
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
                 stream.protected_prefix = state.protected_prefix
-                stream.offloaded = False
-        # sync outside the lock: orders the reload H2D copies before attention
-        # reads them, but the pages are already assigned so it touches no
-        # shared state
+                copies.cpu.extend(state.cpu_page_indices)
+        # The streams stay marked offloaded while the copies are queued outside
+        # the lock, so nothing extends or claims their pages.
+        self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
+        # orders the copies before attention reads the pages
         self._cpu_pool.sync()
+        with self._lock:
+            for label in states:
+                # released with the copy still queued, since the next write to a host page queues behind it
+                self._cpu_pool.arena.release(self._cpu_pool.pop(rid, label).cpu_page_indices)
+                self._streams[rid][label].offloaded = False
         return True
 
     def reclaimable(self, rid: str) -> int:
-        """Device pages the request is holding; 0 once offloaded, and for one
-        admitted but not yet run."""
-        streams = self._streams.get(rid)
-        if streams is None:
+        """The device pages ``rid`` holds, or 0 when offloading it would make
+        none of them reusable. An upper bound on what `offload` returns. 0
+        once offloaded, and for one admitted but not yet run."""
+        with self._lock:
+            streams = self._streams.get(rid, {})
+            for stream in streams.values():
+                # the newest pages are the likeliest to be the request's own
+                if any(self._reusable(page) for page in reversed(stream.page_indices)):
+                    return sum(len(stream.page_indices) for stream in streams.values())
             return 0
-        return sum(len(stream.page_indices) for stream in streams.values())
 
     def get_offload_priority(self, rid: str) -> float:
-        """Device pages the request is holding — the most reclaimable first."""
+        """What `reclaimable` counts, the most reclaimable first."""
         return float(self.reclaimable(rid))
 
     def _own_transfer_info(
@@ -2821,6 +2866,9 @@ class KVManager(AttentionResource):
                 wait([stream.read_future])
         with self._lock:
             for stream in self._streams.get(rid, {}).values():
+                assert not stream.offloaded, (
+                    f"KV {self.name}: reset {rid}, whose pages are on their way to or from the host"
+                )
                 # a rewind would put the next write on the stream's first page,
                 # over a sealed one its other owners still read. drop the pages
                 # and let the next write allocate; `free` asks for the same

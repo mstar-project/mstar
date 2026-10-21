@@ -71,9 +71,25 @@ class PrefixIndex:
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
+    def insert_run(self, keys: Sequence[bytes], pages: Sequence[int], parent: int | None) -> int:
+        """Name ``pages`` by ``keys``, each under the one before and the first
+        under ``parent``. A key already indexed keeps its page, and the next key
+        goes under that page. Returns how many pages were inserted."""
+        inserted = 0
+        for key, page in zip(keys, pages, strict=True):
+            if self.insert(key, page, parent):
+                inserted += 1
+            else:
+                page = self._by_key[key]
+            parent = page
+        return inserted
+
     def page_for(self, key: bytes) -> int | None:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
+
+    def holds(self, page: int) -> bool:
+        return self._key[page] is not None
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
