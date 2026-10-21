@@ -73,9 +73,9 @@ class _ListeningModel:
             out["audio_in"] = tensors["audio_inputs"]
         return out
 
-    def process_stream_chunk(self, tensors, input_metadata, **kwargs):
-        self.chunk_calls.append((tensors, input_metadata, kwargs))
-        return {"audio_in": tensors["audio_inputs"]}
+    def process_stream_chunk(self, chunk):
+        self.chunk_calls.append(chunk)
+        return {"audio_in": chunk.tensors.get("audio_inputs", [])}
 
 
 class _TensorManager:
@@ -162,9 +162,10 @@ def test_an_append_becomes_one_persisted_stream_input(tmp_path):
     (info,) = body.signals["audio_in"]
     assert body.done is False and info.dims == [4]
     assert info.uuid in tm.persisted and info.uuid in tm.registered
-    tensors, _meta, kwargs = wt.model.chunk_calls[0]
-    assert torch.equal(tensors["audio_inputs"][0], torch.arange(4, dtype=torch.float32))
-    assert kwargs["voice"] == "a"
+    (chunk,) = wt.model.chunk_calls
+    assert torch.equal(chunk.tensors["audio_inputs"][0], torch.arange(4, dtype=torch.float32))
+    assert chunk.request_kwargs["voice"] == "a" and chunk.model_kwargs == {}
+    assert chunk.text is None and chunk.streams == {"audio_inputs": [None]}
     assert not (tmp_path / "c.raw").exists()  # the thread owns an append's files
 
 
@@ -175,6 +176,62 @@ def test_the_end_of_input_travels_on_its_own(tmp_path):
 
     (body,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
     assert body.signals == {} and body.done is True
+
+
+def test_an_append_s_text_settings_and_target_streams_reach_the_hook(tmp_path):
+    wt, sent, _tm = _thread()
+    _open(wt)
+    paths = [_audio_file(tmp_path, "a.raw", 2), _audio_file(tmp_path, "b.raw", 3)]
+
+    wt._process_stream_input(ClientAppend(
+        "r", file_paths={"audio": paths}, text="louder", model_kwargs={"gain": 2},
+        file_streams={"audio": ["audio_in", None]},
+    ))
+
+    (chunk,) = wt.model.chunk_calls
+    assert chunk.text == "louder" and chunk.model_kwargs == {"gain": 2}
+    assert chunk.request_kwargs == {"voice": "a"}  # the opening's, beside the append's own
+    assert chunk.streams == {"audio_inputs": ["audio_in", None]}
+    assert [t.numel() for t in chunk.tensors["audio_inputs"]] == [2, 3]
+    (body,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
+    assert [info.dims for info in body.signals["audio_in"]] == [[2], [3]]
+
+
+class _Transcribing(_ListeningModel):
+    """Takes text appends too: each becomes one item of its byte values."""
+
+    def process_stream_chunk(self, chunk):
+        items = super().process_stream_chunk(chunk)
+        if chunk.text:
+            items["audio_in"] = [*items["audio_in"], torch.tensor(list(chunk.text.encode()), dtype=torch.float32)]
+        return items
+
+
+def test_a_text_only_append_reaches_a_model_that_takes_text():
+    wt, sent, _tm = _thread(_Transcribing())
+    _open(wt)
+
+    wt._process_stream_input(ClientAppend("r", text="hi"))
+
+    (chunk,) = wt.model.chunk_calls
+    assert chunk.text == "hi" and chunk.tensors == {} and chunk.streams == {}
+    (body,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
+    assert body.signals["audio_in"][0].dims == [2]
+
+
+def test_a_text_only_append_to_a_model_that_takes_none_is_refused_with_a_400():
+    """The hook returns nothing for the text: dropped silently, the client
+    would never learn its words went nowhere."""
+    wt, sent, _tm = _thread()
+    _open(wt)
+
+    wt._process_waiting_input(ClientAppend("r", text="hello?"))
+
+    error = wt.out_queue.get_nowait()
+    assert error.modality == "error" and error.metadata["status"] == 400
+    assert b"takes no text" in error.data
+    assert _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT) == []
+    assert [b.request_id for b in _bodies(sent, ConductorMessageType.ABORT_REQUEST)] == ["r"]
 
 
 def test_prompt_tensors_named_after_a_client_stream_are_its_first_chunk(tmp_path):
@@ -200,8 +257,8 @@ def test_an_append_for_a_finished_request_is_dropped(tmp_path):
 
 def test_a_bad_append_fails_and_aborts_the_request(tmp_path):
     class _Confused(_ListeningModel):
-        def process_stream_chunk(self, tensors, input_metadata, **kwargs):
-            return {"not_a_stream": tensors["audio_inputs"]}
+        def process_stream_chunk(self, chunk):
+            return {"not_a_stream": chunk.tensors["audio_inputs"]}
 
     wt, sent, _tm = _thread(_Confused())
     _open(wt)
@@ -270,6 +327,7 @@ def _server(takes_stream_input=True, timeout_seconds=600.0):
     return make_test_api_server(
         timeout_seconds=timeout_seconds,
         takes_stream_input=takes_stream_input,
+        client_streams=frozenset({"audio_in"} if takes_stream_input else ()),
         max_call_input_bytes=1 << 30,
         preprocess_worker=_RecordingPreprocess(),
     )
@@ -393,6 +451,7 @@ class _StreamingFakeServer:
     def __init__(self, upload_dir):
         self.upload_dir = upload_dir
         self.calls = []
+        self.appended = []  # each append's text, file_streams and model_kwargs
         self.finish = asyncio.Event()
 
     def submit_request(self, **kwargs):
@@ -408,8 +467,9 @@ class _StreamingFakeServer:
     def taking_input(self, key):
         return not any(c[0] == "append" and c[1] == key and c[-1] is True for c in self.calls)
 
-    def stream_input(self, key, file_paths=None, end_input=False):
+    def stream_input(self, key, file_paths=None, end_input=False, **append):
         names = sorted(p.rsplit("_", 1)[-1] for ps in (file_paths or {}).values() for p in ps)
+        self.appended.append(append)
         self.calls.append(("append", key, names, end_input))
         return True
 
@@ -591,6 +651,112 @@ def test_a_call_cannot_send_past_its_input_budget(tmp_path):
     assert "big" not in server._live
 
 
+def test_an_append_naming_a_stream_the_model_lacks_is_refused(tmp_path):
+    server = _server()
+    key = _submit(server, end_input=False)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF")
+
+    with pytest.raises(ValueError, match="no client stream named 'video_in'"):
+        server.stream_input(key, {"audio": [str(wav)]}, file_streams={"audio": ["video_in"]})
+    assert server.stream_input(key, {"audio": [str(wav)]}, file_streams={"audio": ["audio_in"]}) is True
+
+    appended = server.preprocess_worker.items[-1]
+    assert appended == ClientAppend(key, file_paths={"audio": [str(wav)]},
+                                    file_streams={"audio": ["audio_in"]})
+
+
+def test_an_append_s_text_counts_against_the_input_budget():
+    server = _server()
+    server.max_call_input_bytes = 8
+    key = _submit(server, end_input=False)
+    assert server.stream_input(key, text="four") is True                 # 4 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, text="fives")                           # 9 of 8
+    assert server.preprocess_worker.items[-1] == ClientAppend(key, text="four")
+
+
+def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch, tmp_path):
+    fake = _StreamingFakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    wav = {"name": "chunk.wav", "data": "UklGRg=="}
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "append": [wav]},                                 # the shorthand
+        {"request_id": "call", "append": {"files": [wav]}},                      # the same, as a record
+        {"request_id": "call", "append": {"text": "hello"}},                     # text only
+        {"request_id": "call", "append": {"files": [{**wav, "stream": "audio_in"}],
+                                          "model_kwargs": {"gain": 2}, "text": None}},
+        {"request_id": "call", "append": {"model_kwargs": '{"gain": 3}', "text": "x"}, "end_input": True},
+    ])
+    asyncio.run(_serve(ws, until=lambda: len(fake.calls) >= 6))
+
+    assert not any("error" in reply for reply in ws.sent)
+    assert [c[2:] for c in fake.calls[1:]] == [
+        (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], True),
+    ]
+    assert fake.appended == [
+        {"text": None, "file_streams": None, "model_kwargs": None},
+        {"text": None, "file_streams": None, "model_kwargs": None},
+        {"text": "hello", "file_streams": None, "model_kwargs": None},
+        {"text": None, "file_streams": {"audio": ["audio_in"]}, "model_kwargs": {"gain": 2}},
+        {"text": "x", "file_streams": None, "model_kwargs": {"gain": 3}},
+    ]
+
+
+@pytest.mark.parametrize("append", [
+    {"request_id": "call", "append": {"files": [{"name": "c.wav", "data": "UklGRg==", "stream": 3}]}},
+    {"request_id": "call", "append": {"text": 5}},
+    {"request_id": "call", "append": {"volume": 2}},
+    {"request_id": "call", "append": "c.wav"},
+    {"request_id": "call", "append": {"model_kwargs": [1], "text": "x"}},
+    {"request_id": "call", "append": {}},
+    {"request_id": "call", "append": {"text": "x"}, "text": "y"},
+    {"request_id": "call", "append": {"text": "x"}, "model_kwargs": {"gain": 2}},
+], ids=["stream-type", "text-type", "unknown-field", "not-a-record", "kwargs-type", "empty",
+        "text-beside", "kwargs-beside"])
+def test_a_malformed_append_record_ends_the_call_with_a_400(monkeypatch, tmp_path, append):
+    server = _real_ws_server(monkeypatch, tmp_path)
+    ws = _QueuedFramesSocket([{"request_id": "call", "output_modalities": "text"}, append])
+    asyncio.run(_serve(ws, until=lambda: ws.sent))
+
+    (error,) = ws.sent
+    assert error["status"] == 400 and "append rejected" in error["error"]
+    assert not any(isinstance(i, ClientAppend) for i in server.preprocess_worker.items)
+    assert list(tmp_path.iterdir()) == []  # a file decoded before the refusal is gone
+
+
+def test_generate_ws_refuses_an_append_to_a_stream_the_model_lacks(monkeypatch, tmp_path):
+    server = _real_ws_server(monkeypatch, tmp_path)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "append": {"files": [{"name": "c.wav", "data": "UklGRg==", "stream": "nope"}]}},
+    ])
+    asyncio.run(_serve(ws, until=lambda: ws.sent))
+
+    (error,) = ws.sent
+    assert error["status"] == 400 and "no client stream named 'nope'" in error["error"]
+
+
+def test_what_an_append_record_carries_never_opens_a_request(monkeypatch, tmp_path):
+    """Routing reads the top level only: text, files and settings inside a
+    record feed the call, whatever else the message holds."""
+    server = _real_ws_server(monkeypatch, tmp_path)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text",
+         "append": {"text": "more", "files": [{"name": "c.wav", "data": "UklGRg=="}],
+                    "model_kwargs": {"gain": 2}}},
+    ])
+    appends = lambda: [i for i in server.preprocess_worker.items if isinstance(i, ClientAppend)]  # noqa: E731
+    asyncio.run(_serve(ws, until=appends))
+
+    assert ws.sent == []
+    assert [type(i).__name__ for i in server.preprocess_worker.items] == ["PreprocessInput", "ClientAppend"]
+    (append,) = appends()
+    assert append.text == "more" and append.model_kwargs == {"gain": 2} and append.file_paths["audio"]
+
+
 def _wait(predicate, timeout=5.0):
     deadline = time.time() + timeout
     while not predicate() and time.time() < deadline:
@@ -645,7 +811,7 @@ def test_a_failed_append_does_not_release_a_read_still_in_flight(tmp_path):
     output, so it may report the call drained while its last read runs: the
     ACK still waits for that read."""
     class _Corrupt(_ListeningModel):
-        def process_stream_chunk(self, tensors, input_metadata, **kwargs):
+        def process_stream_chunk(self, chunk):
             raise ValueError("corrupt append")
 
     wt, sent, tm = _thread(_Corrupt())
@@ -823,7 +989,7 @@ def test_a_bad_append_racing_the_end_of_the_call_is_answered_as_late(monkeypatch
     was late, and the call (which reject_input leaves alone) isn't failed."""
 
     class _EndsMeanwhile(_StreamingFakeServer):
-        def stream_input(self, key, file_paths=None, end_input=False):
+        def stream_input(self, key, file_paths=None, end_input=False, **append):
             raise ValueError("the call's input passed its limit")
 
         def reject_input(self, key, error, status):
@@ -846,7 +1012,7 @@ def test_an_append_the_call_stops_taking_meanwhile_is_answered_as_late(monkeypat
     is answered as late, and the call is left alone."""
 
     class _EndsMeanwhile(_StreamingFakeServer):
-        def stream_input(self, key, file_paths=None, end_input=False):
+        def stream_input(self, key, file_paths=None, end_input=False, **append):
             return False  # the model ended the call meanwhile
 
         def reject_input(self, key, error, status):
@@ -925,7 +1091,7 @@ def test_refusals_never_hold_up_reading(monkeypatch, tmp_path, frames):
 
 def test_an_append_file_that_cannot_be_deleted_does_not_end_the_socket(monkeypatch, tmp_path):
     class _Refuses(_StreamingFakeServer):
-        def stream_input(self, key, file_paths=None, end_input=False):
+        def stream_input(self, key, file_paths=None, end_input=False, **append):
             raise ValueError("over the input budget")
 
         def reject_input(self, key, error, status):
@@ -1090,9 +1256,9 @@ def test_one_failing_release_leaves_the_rest_of_the_pass_to_run(tmp_path):
     abort that cannot be sent, released while the first is processed, is
     that abort's failure alone: the others still reach the conductor."""
     class _Hooked(_ListeningModel):
-        def process_stream_chunk(self, tensors, input_metadata, **kwargs):
+        def process_stream_chunk(self, chunk):
             wt.abort_request_queue.put("unsendable")
-            return super().process_stream_chunk(tensors, input_metadata, **kwargs)
+            return super().process_stream_chunk(chunk)
 
     def encode(msg):
         if msg.body.request_id == "unsendable":

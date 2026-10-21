@@ -264,3 +264,66 @@ def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
     assert scheduled == [fake.submitted[0]["file_paths"]]
     saved = sorted(f.name.split("_", 1)[1] for f in tmp_path.iterdir())
     assert saved == ["a.png", "b.wav"], saved
+
+
+class _ListeningFakeServer(_FakeServer):
+    """A model with a client stream: requests stay open unless they end their input."""
+    takes_stream_input = True
+
+    def __init__(self, upload_dir):
+        super().__init__(upload_dir, chunks_per_request=1)
+        self.appends = []
+
+    def taking_input(self, key):
+        return True
+
+    def stream_input(self, key, file_paths=None, end_input=False, **append):
+        self.appends.append((key, sorted(file_paths or {}), end_input, append))
+        return True
+
+    async def iter_result_chunks(self, request_id):
+        # a call finishes once its input has ended, at its opening or by an append
+        while not (
+            any(s["request_id"] == request_id and s["end_input"] is True for s in self.submitted)
+            or any(a[0] == request_id and a[2] is True for a in self.appends)
+        ):
+            await asyncio.sleep(0.01)
+        async for chunk in super().iter_result_chunks(request_id):
+            yield chunk
+
+
+def test_an_opening_with_input_and_settings_is_never_an_append(monkeypatch, tmp_path):
+    """Routing is by shape at the top level: text or files open a request even
+    with ``end_input`` and settings beside them, and an ``append`` key alone
+    makes an append, whatever its record holds."""
+    fake = _ListeningFakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "one", "text": "hi", "end_input": True,
+                                 "model_kwargs": {"gain": 2}}))
+        assert _recv_until_finish(ws, binary=False)[-1] == {"request_id": "one", "finish": True}
+        ws.send_text(json.dumps({"request_id": "stray", "append": {"text": "hi", "model_kwargs": {}}}))
+        stray = json.loads(ws.receive_text())
+
+    assert [s["request_id"] for s in fake.submitted] == ["one"]
+    assert fake.submitted[0]["model_kwargs"] == {"gain": 2} and fake.submitted[0]["end_input"] is True
+    assert stray["append"] is True and "not taking input on this socket" in stray["error"]
+    assert fake.appends == []
+
+
+@pytest.mark.parametrize("record", [
+    [{"name": "c.wav", "data": base64.b64encode(b"RIFF").decode()}],
+    {"files": [{"name": "c.wav", "data": base64.b64encode(b"RIFF").decode()}]},
+], ids=["shorthand", "record"])
+def test_a_live_call_takes_both_append_forms(monkeypatch, tmp_path, record):
+    fake = _ListeningFakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "call", "append": record, "end_input": True}))
+        msgs = _recv_until_finish(ws, binary=False)
+
+    assert not any("error" in m for m in msgs)
+    assert fake.appends == [
+        ("call", ["audio"], True, {"text": None, "file_streams": None, "model_kwargs": None}),
+    ]

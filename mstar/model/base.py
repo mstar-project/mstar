@@ -50,6 +50,20 @@ class ProcessPromptOutput(NamedTuple):
     metadata: dict
 
 
+class ClientChunk(NamedTuple):
+    """One append the client sends to a running request, as
+    ``Model.process_stream_chunk`` sees it."""
+    text: str | None
+    # the append's files, loaded as a request's are (``audio_inputs`` and so on)
+    tensors: NameToTensorList
+    input_metadata: dict[str, list[dict]]
+    # per ``tensors`` list, the client stream each file names, None where it names none
+    streams: dict[str, list[str | None]]
+    # this append's model_kwargs, and the opening message's
+    model_kwargs: dict
+    request_kwargs: dict
+
+
 class PrefixStream(NamedTuple):
     """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
     tensor: str
@@ -762,20 +776,19 @@ class Model(ABC):
         ``MSTAR_MAX_MEDIA_FILES``."""
         return {}
 
-    def process_stream_chunk(
-        self,
-        tensors: NameToTensorList,
-        input_metadata: dict[str, list[dict]],
-        **kwargs,
-    ) -> NameToTensorList:
-        """Turn one chunk the client appends to a running request into items of
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        """Turn one append the client sends to a running request into items of
         the model's client streams (``Connection(from_partition=CLIENT, ...)``).
 
-        Called by the API server data worker for each append, after it has
-        loaded the chunk's files the way it loads a request's
-        (``audio_inputs``, ``image_inputs``, ``video_inputs``). ``kwargs`` are
-        the request's ``model_kwargs``. Returns items by client edge name; each
-        list entry is one item of that stream.
+        Called by the API server data worker for each append that carries text
+        or files, after it has loaded the files the way it loads a request's
+        (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
+        ``video_inputs``). ``chunk.streams`` names the stream the client meant
+        each file for, where it named one; ``chunk.model_kwargs`` are the
+        append's own, beside the opening's ``chunk.request_kwargs``. Returns
+        items by client edge name; each list entry is one item of that stream.
+        Raise ``ValueError`` for an append the model can't take (the client
+        gets a 400); an append with text that yields no item is refused.
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the

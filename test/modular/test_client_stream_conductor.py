@@ -102,8 +102,8 @@ class _DuplexToy(Model):
     def process_prompt(self, *a, **k):
         return {}
 
-    def process_stream_chunk(self, tensors, input_metadata, **kwargs):
-        return {"audio_in": tensors["audio_inputs"]}
+    def process_stream_chunk(self, chunk):
+        return {"audio_in": chunk.tensors["audio_inputs"]}
 
     def postprocess(self, *a, **k):
         return b""

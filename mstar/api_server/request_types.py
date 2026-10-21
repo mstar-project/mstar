@@ -140,3 +140,8 @@ class ClientAppend:
     request_id: str
     file_paths: dict[str, list[str]] | None = None
     done: bool = False
+    text: str | None = None
+    # per modality, in file_paths' order, the client stream each file names (None: unnamed)
+    file_streams: dict[str, list[str | None]] | None = None
+    # this append's own model_kwargs; the opening's stay the request's
+    model_kwargs: dict | None = None

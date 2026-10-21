@@ -1892,10 +1892,15 @@ the only one, in any walk, that takes the edge, and a partition takes at most on
 stream; the conductor checks both at startup, and that the model implements
 ``process_stream_chunk``.
 
-- ``process_stream_chunk(tensors, input_metadata, **model_kwargs)`` turns each chunk the
-  client appends into stream items, keyed by client edge name. ``tensors`` holds the
-  append's files, loaded as for a request (``audio_inputs`` and so on). Keep it stateless;
-  the consuming node keeps its own state, in its resources or ``request_state``.
+- ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
+  keyed by client edge name. ``chunk`` is a ``ClientChunk`` (``mstar.model.base``):
+  ``text``; ``tensors`` and ``input_metadata``, the append's files loaded as for a request
+  (``audio_inputs`` and so on); ``streams``, per ``tensors`` list the client stream each
+  file names (``None`` where the client named none, so the model decides);
+  ``model_kwargs``, the append's own; and ``request_kwargs``, the opening message's.
+  Raise ``ValueError`` for an append the model doesn't take (the client gets a 400); an
+  append whose text yields no item is refused rather than dropped. Keep it stateless; the
+  consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
 - The stream ends when the client ends its input: the consumer gets ``producer_done`` and

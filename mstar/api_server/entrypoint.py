@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -258,8 +258,8 @@ class PendingRequest:
     error_status: int = 500
     # Whether the client may still append to the request's client streams, and
     # when it last did; the request timeout runs from the later of that and
-    # the request's start. input_bytes: the file bytes a live call has sent so
-    # far, opening included, against max_call_input_bytes.
+    # the request's start. input_bytes: the file and append-text bytes a live
+    # call has sent so far, opening included, against max_call_input_bytes.
     input_open: bool = False
     last_input_time: float = 0.0
     input_bytes: int = 0
@@ -410,9 +410,10 @@ class APIServer:
         self.model_name = model_name
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
-        self.takes_stream_input = bool(
-            model is not None and model.get_partition_topology().client_connections()
-        )
+        self.client_streams = frozenset(
+            conn.edge_name for conn in model.get_partition_topology().client_connections()
+        ) if model is not None else frozenset()
+        self.takes_stream_input = bool(self.client_streams)
         # The most file bytes one live call may send over its life. A cap on a
         # call's input, not on memory: decoded input is larger than its files,
         # and how much waits in buffers depends on how fast the model reads.
@@ -725,9 +726,16 @@ class APIServer:
         key: str,
         file_paths: dict[str, list[str]] | None = None,
         end_input: bool = False,
+        *,
+        text: str | None = None,
+        file_streams: dict[str, list[str | None]] | None = None,
+        model_kwargs: dict | None = None,
     ) -> bool:
-        """Append files to a running request's client streams, then end them
-        if ``end_input``. The preprocess worker deletes the files once loaded.
+        """Append text and files to a running request's client streams, then
+        end them if ``end_input``. The preprocess worker deletes the files
+        once loaded. ``file_streams`` names, per modality in ``file_paths``'
+        order, the client stream each file is for (None: the model decides);
+        ``model_kwargs`` are this append's own.
 
         Takes the submission's key (:meth:`submission_key`), not its
         request_id: once a call has finished, its id may already name a newer
@@ -735,23 +743,36 @@ class APIServer:
 
         False, changing nothing, if the request is not taking input (unknown,
         finished, or already ended); raises ``ValueError`` for input past the
-        call's budget (``max_call_input_mb``).
+        call's budget (``max_call_input_mb``) or a stream the model doesn't
+        have.
         """
+        self._check_streams(
+            name for names in (file_streams or {}).values() for name in names if name is not None
+        )
         with self.request_lock:
             req = self.pending_requests.get(key)
             if req is None or not req.input_open or req.event.is_set():
                 return False
-            size = req.input_bytes + _file_bytes(file_paths)
+            size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
             self._check_call_input(size)
             req.input_bytes = size
             req.last_input_time = time.time()
             if end_input:
                 req.input_open = False
             # under the lock: an append can't land behind its call's end
-            self.preprocess_worker.stream_input(
-                ClientAppend(key, file_paths=file_paths, done=end_input)
-            )
+            self.preprocess_worker.stream_input(ClientAppend(
+                key, file_paths=file_paths, done=end_input, text=text,
+                file_streams=file_streams, model_kwargs=model_kwargs,
+            ))
         return True
+
+    def _check_streams(self, names: Iterable[str]) -> None:
+        unknown = set(names) - self.client_streams
+        if unknown:
+            raise ValueError(
+                f"no client stream named {', '.join(map(repr, sorted(unknown)))}; "
+                f"this model takes {sorted(self.client_streams) or 'none'}"
+            )
 
     def _check_call_input(self, size: int) -> None:
         if size > self.max_call_input_bytes:
@@ -1705,10 +1726,54 @@ _WS_INPUT_FIELDS = frozenset({"text", "files"})
 
 def _ws_is_append(message: dict) -> bool:
     """Whether a ``/generate/ws`` message feeds a live call rather than opening
-    a request: it carries ``append``, or ends the input and carries none."""
+    a request: it carries ``append``, or ends the input and carries none.
+    Only the top level counts: what an append record holds never opens one."""
     return "append" in message or (
         message.get("end_input") is True and not _WS_INPUT_FIELDS & message.keys()
     )
+
+
+# What an append record may carry; ``"append": [files]`` is short for ``{"files": [files]}``.
+_WS_APPEND_FIELDS = frozenset({"text", "files", "model_kwargs"})
+
+
+def _ws_append_record(value) -> dict:
+    """An append's record with its null fields dropped, as a null field
+    anywhere else is."""
+    if isinstance(value, list):
+        return {"files": value}
+    if not isinstance(value, dict):
+        raise ValueError("append must be an object or a list of files")
+    record = {k: v for k, v in value.items() if v is not None}
+    unknown = record.keys() - _WS_APPEND_FIELDS
+    if unknown:
+        raise ValueError(f"an append carries only {sorted(_WS_APPEND_FIELDS)}; got {sorted(unknown)}")
+    return record
+
+
+def _ws_model_kwargs(value) -> dict | None:
+    """``model_kwargs`` as a message may carry it: an object, or one as JSON text."""
+    if isinstance(value, str):
+        value = json.loads(value)
+    if value is not None and not isinstance(value, dict):
+        raise ValueError("model_kwargs must be a JSON object")
+    return value
+
+
+def _ws_file_streams(
+    files: list | None, parts: list[PromptPart],
+) -> dict[str, list[str | None]] | None:
+    """Per modality, in ``_decode_ws_files``' order, the client stream each
+    file names (``{"name", "data", "stream"}``); None when none names one."""
+    streams: dict[str, list[str | None]] = {}
+    for entry, part in zip(files or [], parts, strict=True):
+        stream = entry.get("stream")
+        if stream is not None and not isinstance(stream, str):
+            raise ValueError("a file's stream must be a client stream's name")
+        streams.setdefault(part.modality, []).append(stream)
+    if not any(name is not None for names in streams.values() for name in names):
+        return None
+    return streams
 
 
 @app.websocket("/generate/ws")
@@ -1731,9 +1796,11 @@ async def generate_ws(websocket: WebSocket):
     whatever is still in flight.
 
     A request to a model with client streams keeps its input open until the
-    client ends it: ``{"request_id", "append": [{"name", "data"}]}`` feeds the
-    files to the request's streams, and ``{"request_id", "end_input": true}``
-    (alone or on an append, or on the opening message) ends them. A live call
+    client ends it: ``{"request_id", "append": {"text", "files",
+    "model_kwargs"}}`` feeds the request's streams (each file may name its
+    ``stream``; ``"append": [files]`` is short for ``{"files": [files]}``), and
+    ``{"request_id", "end_input": true}`` (alone or on an append, or on the
+    opening message) ends them. A live call
     needs a ``request_id``, and only the socket that opened it can append to
     it. A message with ``append``, or with ``end_input: true`` and no ``text``
     or ``files``, is an append; one that opens a request under a live call's
@@ -1805,11 +1872,7 @@ async def generate_ws(websocket: WebSocket):
             in_mods, parts = _ws_input_layout(
                 text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
             )
-            model_kwargs = message.get("model_kwargs")
-            if isinstance(model_kwargs, str):
-                model_kwargs = json.loads(model_kwargs)
-            if model_kwargs is not None and not isinstance(model_kwargs, dict):
-                raise ValueError("model_kwargs must be a JSON object")
+            model_kwargs = _ws_model_kwargs(message.get("model_kwargs"))
             await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
@@ -1892,15 +1955,25 @@ async def generate_ws(websocket: WebSocket):
             reply(late, binary)
             return
         try:
-            if "files" in message:
-                raise ValueError("an append carries its files under 'append', not 'files'")
+            misplaced = sorted(_WS_APPEND_FIELDS & message.keys()) if "append" in message else []
+            if misplaced:
+                raise ValueError(f"an append carries {', '.join(misplaced)} under 'append'")
+            record = _ws_append_record(message.get("append", {}))
             end_input = _flag(message, "end_input")
-            file_paths, _ = await run_in_threadpool(
-                _decode_ws_files, message.get("append"), api_server.upload_dir,
+            text = record.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("text must be a string")
+            model_kwargs = _ws_model_kwargs(record.get("model_kwargs"))
+            file_paths, parts = await run_in_threadpool(
+                _decode_ws_files, record.get("files"), api_server.upload_dir,
             )
-            if not file_paths and not end_input:
-                raise ValueError("an append needs files or end_input")
-            if api_server.stream_input(key, file_paths or None, end_input=end_input):
+            file_streams = _ws_file_streams(record.get("files"), parts)
+            if not file_paths and not text and not end_input:
+                raise ValueError("an append needs text, files or end_input")
+            if api_server.stream_input(
+                key, file_paths or None, end_input=end_input, text=text or None,
+                file_streams=file_streams, model_kwargs=model_kwargs,
+            ):
                 file_paths = None  # the preprocess worker deletes them once loaded
             else:
                 reply(late, binary)  # the call ended meanwhile: leave it be

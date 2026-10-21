@@ -39,7 +39,7 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.base import ClientChunk, Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -772,23 +772,38 @@ class PreprocessWorkerThread:
             if request_id not in self.in_flight_requests or request_id in self._draining_rids:
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
-            if chunk.file_paths:
-                tensors, input_metadata = self._load_media(chunk.file_paths)
-                items = self.model.process_stream_chunk(
-                    tensors, input_metadata, **self.request_model_kwargs.get(request_id, {}),
-                )
+            if chunk.file_paths or chunk.text:
+                items = self.model.process_stream_chunk(self._client_chunk(chunk))
                 unknown = set(items) - self._client_edges
                 if unknown:  # the model's bug, not the client's: a 500
                     raise RuntimeError(
                         f"process_stream_chunk returned {sorted(unknown)}, which are "
                         f"not client streams ({sorted(self._client_edges)})"
                     )
+                if chunk.text and not any(items.values()):
+                    raise ValueError("this model takes no text in an append")
             if items or chunk.done:
                 self._send_stream_input(
                     request_id, self._store_persisted(request_id, items), done=chunk.done,
                 )
         finally:
             unlink_files(chunk.file_paths)
+
+    def _client_chunk(self, chunk: ClientAppend) -> ClientChunk:
+        """``chunk`` as ``process_stream_chunk`` takes it: its files loaded."""
+        tensors, input_metadata = self._load_media(chunk.file_paths)
+        named = chunk.file_streams or {}
+        return ClientChunk(
+            text=chunk.text or None,
+            tensors=tensors,
+            input_metadata=input_metadata,
+            streams={
+                f"{modality}_inputs": list(named.get(modality) or [None] * len(paths))
+                for modality, paths in (chunk.file_paths or {}).items()
+            },
+            model_kwargs=chunk.model_kwargs or {},
+            request_kwargs=self.request_model_kwargs.get(chunk.request_id, {}),
+        )
 
     def _store_persisted(
         self, request_id: str, tensors: NameToTensorList,
