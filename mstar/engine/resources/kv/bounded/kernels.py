@@ -118,7 +118,7 @@ def _bounded_attention_kernel(
         alpha = tl.exp(m_i - m_off)
         p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
         m_i = m_new
 
     for j0 in range(old_lo, total, BLOCK_N):
@@ -147,7 +147,7 @@ def _bounded_attention_kernel(
         alpha = tl.exp(m_i - m_off)
         p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
         m_i = m_new
 
     out = acc / l_i[:, None]
