@@ -111,7 +111,7 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
            "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
            "output_modalities": ["action"],
            "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 10, "action_chunk_size": 32},
+                            "raw_action_dim": 8, "action_chunk_size": 32},
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
