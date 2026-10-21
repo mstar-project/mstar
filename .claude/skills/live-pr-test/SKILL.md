@@ -9,7 +9,15 @@ The job: say whether a PR does what it claims on real hardware, and whether it b
 
 Read alongside this:
 
-- [benchmarking](../benchmarking/SKILL.md) for every perf number and every server start/stop. Its traps apply unchanged, especially "Repeats must span server restarts" and "Report a delta only from arms run back to back in one allocation".
+- **[benchmarking](../benchmarking/SKILL.md): load it at the start of every live test, before planning.** Don't wait for a perf row: it covers functional and correctness checks too, and every server start and stop. A subagent that runs the PR loads it as well. Its traps apply unchanged. These are the pointers that would have changed earlier live-test verdicts:
+  - "Kernel selection changes across server processes" (trap 1). On #642 we blamed the torch version for an exactness failure that came from which kernel autotune picked.
+  - "Output-equivalence checks need a same-code control", and "Byte-identical repeats are not evidence of determinism".
+  - "Repeats must span server restarts", and "Report a delta only from arms run back to back in one allocation".
+  - "When the expected effect is smaller than the noise, time the mechanism directly". Several of our "not separable" and "didn't fire" rows needed this.
+  - "Verify what the client actually sent" (probe reach). Also "Check `failed` in `results.json`" and "Prefer output-length-agnostic metrics".
+  - "The first request of a new shape pays compilation" (trap 2), and "Slow eager steps are often recompiles" (`TORCH_LOGS=recompiles`), before calling a tail or a stall a regression.
+  - "CPU-bound or GPU-bound" via `benchmark.worker_phases`, whenever a throughput row moves.
+  - "Match the configuration before comparing" for any reference or competitor arm: sampling defaults, state dtype, prefix caching.
 - [AGENTS.md](../../../AGENTS.md) for the invariants a PR can break: invariant 4 (one model's change must not degrade others) and invariant 5 (Python/Rust drift) drive most regression choices.
 - [references/test-matrix.md](references/test-matrix.md) for touched paths → suites, the worker A/B set, concurrency and sizing.
 - [references/report.md](references/report.md) for the report and the PR-comment rules.
@@ -42,10 +50,25 @@ gh pr diff <n>
 - A PR based on another feature branch (stacked) is compared against its base branch, not `main`. Say so in the plan.
 - Extract the claims: every behavior or number the description asserts. Each becomes a check. For each claimed number, note the GPU, harness and metric it came from, so the report can say when yours isn't comparable.
 - A case the description hands to another open PR is that PR's: test it there (or on both merged) if it matters, otherwise mark it "owned by #N" in the report.
-- Map touched files to suites with the test matrix. Add the edge cases the diff branches on.
-- Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget.
-- If nothing needs a GPU (docs, CPU-only tests, benchmark scripts without a claimed number), say so and stop.
-- Reference (transformers) parity is for new model code or changes to a model's forward. A PR that serves a new checkpoint on an existing architecture's code inherits that architecture's parity; list it under "Not tested" with that reason.
+- **Map what could break, and test each risk directly.** The claims table checks what the author thought of. The risk map checks what they didn't, and it is where human reviewers found most of the bugs our runs missed. Read the whole diff, not the description.
+  - For every changed function, find its callers and the paths that reach it: eager and captured, TP leader and follower, the Python and Rust runtimes and frontends, streaming and not, the first request of a shape and steady state, and failure, abort and teardown.
+  - For each path, write down what would go wrong if the change were subtly wrong, and plan a test that fails if it is.
+  - Run that test on a model, config and layout that actually take that path, with the input or fault that provokes it.
+  - Put the risk map in the plan, one line per risk: path → what could break → the test. [test-matrix.md](references/test-matrix.md) lists, by layer, the probes that have found bugs.
+- **Reach before results.** Before trusting a pass, show that the test reached the changed code: a log line, a counter, a probe hit, or an injected fault firing there. A pass on a setup that never takes the changed branch is ➖, not ✅. On #440 the bug was on the default Rust runtime and we ran only Python. On #557 the race needs the two stages on different workers.
+- **Never CPU tests alone.** Unless the PR changes only tests, docs or comments, it gets a served run with a real checkpoint that goes through the changed code. CPU suites are a gate, not a verdict. Code that only non-CUDA workers or the API server run still gets a served run that reaches it.
+- **Both runtimes when they apply, Rust otherwise.** When the change touches code that has both a Python and a Rust implementation (graph runtime, control transport, wire codec, API server frontend), run every functional and risk check on both. That means `MSTAR_RUST_GRAPH`/`MSTAR_RUST_ZMQ` at their default and at `0`, and `mstar-serve` with and without `--rust-frontend` (AGENTS.md invariant 5). Otherwise run the default Rust runtime and confirm in the server log that it ran. `MSTAR_RUST_GRAPH=0` is never the only arm.
+- **Real checkpoints only.** Use the real released weights for every served check: no dummy-mode models, random weights, or edited and truncated copies of a checkpoint. If the PR's case only exists in a checkpoint no one ships, say so in the plan and ask. On #658, the real checkpoint already showed the bug that we had built an artificial copy to show.
+- **Test on the merged tree too.** Run the CPU gate and the risk checks once more on the PR merged into the current base, and on top of its stacked neighbours when it has them. Bugs on #346 and #519 only showed up there. Label each row with the tree it came from.
+- Map touched files to regression suites with the test matrix.
+- Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget. When the code branches on architecture (`has_cuda_capability`, sm80 paths, ROCm), list the architectures you couldn't run under "Not tested".
+- If the PR changes only docs, tests or comments and claims no number, say so and stop.
+- **Correctness is checked against the reference, never only against main.** A check that compares PR with main shows the outputs moved or didn't; it can't show that either side is right. #452 shipped noise because every check compared Orpheus with itself.
+  - The reference is the official implementation (transformers, or the model's own package or `trust_remote_code` files), pinned, in its own venv.
+  - Compare at the lowest level that both sides expose: logits or hidden states for the same inputs, then greedy tokens, then decoded output.
+  - For speech, also run an objective check against the intended content, such as ASR word error rate on the transcript, and speaker similarity when the PR touches voice.
+  - A new checkpoint on an existing architecture still gets the reference row.
+  - **When the output is media and the metrics can't decide** (garble, artifacts, timbre or prosody, an image that looks off), don't give a verdict. Save reference, PR and main for the same prompt and seed side by side, mark the row "needs human review", and say what to listen or look for.
 - Fetching the reference implementation or a competitor engine is allowed, so a model-add PR gets a parity row and a perf claim gets its competitor arm. Use the official repository, pinned to a commit or release (the one the PR's description used, if it names one); a checkpoint's own `trust_remote_code` files count as its reference. Read the code that will run for network access, file writes outside its directory and environment reads before running it. Install it in a venv of its own, never the shared environment, and record the repository and commit in `harness-notes.md`. Fetch it once into the work directory, outside the timed runs.
 
 Show the plan before provisioning: claims → checks, suites, concurrency, the box, the estimated hours and cost. Then proceed without waiting unless the run would exceed the budget (below) or the trust check failed.
@@ -103,7 +126,14 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
 - Run anything longer than a couple of minutes detached on the box (`nohup ... > log 2>&1 &`, or tmux if present), then poll its log. An ssh drop must not kill a sweep.
 - Record the PR head you test. Before a follow-up run, and again before posting, compare it with `gh pr view <n> --json headRefOid`: if the head moved, rerun what the new commits touch or label those rows "old head `<sha>`".
 - Timing-dependent bugs (stalls, races, hangs) depend on the host: when the base arm fails for you and not for the author, or the reverse, put host load on the row, and try reproducing under deliberate CPU load (a busy-loop per core) or with SM clocks locked before calling either side.
-- Order: functional checks of the claims first, cheapest suites before expensive ones, so an early failure is found before an hour of benchmarks.
+- Order: functional checks of the claims and the risk map first, cheapest before expensive, so an early failure is found before an hour of benchmarks.
+- **Explain inconclusive results.** When a rate doesn't separate, or a fix "didn't fire", don't stop at the counts.
+  - Make the bug deterministic: inject a delay or fault at the code the PR changes, shrink the pool, or force the setting that reaches the rare path.
+  - Or trace the mechanism in the logs. On #461 a reviewer traced the refusals to a circular wait and reached p=0.014, where our counts had stopped at p=0.19.
+  - Only then call it ➖ or not separable.
+- **Watch resources as well as status codes.** For input handling, uploads, decoding or anything that buffers, record the API server's RSS and event-loop latency during the check. A 200 that stalls the loop for seconds, or a request that allocates gigabytes, is a finding (#631, #639).
+- **Close your own "Not tested" list.** Before writing the report, go through every "not tested" line: anything the box can reach (another model, the other runtime, a fault you could inject) gets run, not listed.
+- **Idle GPUs get killed on the cluster.** A process that holds GPUs at 0% SM for about 30 minutes is killed. mstar workers turn the SIGTERM into exit code 0, so all ranks exit together with no traceback. A checkpoint that takes longer than that to load, such as GLM-5.2-FP8 at 756 GB over NFS, dies before it is ready. Ask how to exempt the job before spending an 8-GPU slot on it.
 - Each A/B model: main and PR back to back, restart the server between repeats, then the next model. When nothing is being timed, the two arms may run in parallel on disjoint GPUs.
 - `MSTAR_TP_ASYNC_SCHED=1` on any TP/SP config; `MSTAR_SHM_ARENA=1` always (from `env.sh`). Check each server log for `control mesh transport: rust` and `graph runtime: rust`, and on TP configs for `all-reduce fusion workspace:`. On cloud containers without NVSwitch multicast, FlashInfer's MNNVL backend fails, and before #563 mstar fell back to NCCL all-reduce, 1.4–1.6x slower on a 27B TP4 model. The same hosts need `NCCL_NVLS_ENABLE=0` for competitors whose NCCL tries NVLS. Note either in the report when it applies.
 - One `--output-dir` per cell under `$LIVE_RESULTS/bench/<suite>/<arm>/c<conc>.r<rep>/`, stdout tee'd to `bench.log` inside it. Check `failed` in every `results.json` before using a number.

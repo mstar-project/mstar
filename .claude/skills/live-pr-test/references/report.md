@@ -21,13 +21,19 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 **<verdict in one or two sentences, e.g. "Works; no regressions outside noise." / "The port works, but claim 2 doesn't hold.">**
 
-<N>x <GPU>, <TP/config>, <tensor transport> · PR head `<sha>` vs <base> `<sha>` · <only if any: a dependency below the repo's floor, e.g. "Mooncake 0.3.8.post1, below the 0.3.13.post1 floor">
+<N>x <GPU>, <TP/config>, <tensor transport>, <runtime(s): Rust / Python; frontend(s)> · PR head `<sha>` vs <base> `<sha>`, <and merged with base `<sha>` if run> · <only if any: a dependency below the repo's floor, e.g. "Mooncake 0.3.8.post1, below the 0.3.13.post1 floor">
 
 ### Claims
 
 | Claim | Result |
 | --- | --- |
-| <claim, paraphrased short> | ✅ / ❌ / ⚠️ / ➖ <the number or a few words of evidence> |
+| <claim, paraphrased short> | ✅ / ❌ / ⚠️ / ➖ / 👂 <the number or a few words of evidence> |
+
+### Risks
+
+| What could break | Probe | Result |
+| --- | --- | --- |
+| <path → failure mode, from the risk map> | <the input, fault or layout used, and how reach was shown> | ✅ / ❌ / ⚠️ / ➖ <evidence> |
 
 ### Performance
 
@@ -41,7 +47,6 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 ### Other
 
 - **Regressions:** <one line, or a small table only when something moved>
-- **Edge cases:** <one line each, only ones the PR's code is responsible for>
 - **Failures caused by the PR:** <only failures on the PR arm that the base arm doesn't have under the same setup; omit otherwise>
 - **Not tested:** <comma-separated, a few words of reason each>
 - **Media:** <links when there is media; omit otherwise>
@@ -52,7 +57,10 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 - ✅ held, ❌ failed on the setup it was measured on, ⚠️ held only partly (some cells, some restarts).
 - Any mark that rests on a measurement that varies run to run (throughput, latency, output identity, a fault-injection outcome) needs repeats, a ✅ included: at least two per arm, three by default. A ⚠️ or ❌ especially: before reporting one, rerun until each arm has at least three, since a negative on one or two runs is the result most often overturned. A deterministic result (a refusal, a crash with a traceback, a test, a token count) needs no repeats; say which it is. A rate that still doesn't separate after the repeats is "not separable", not ❌.
 - ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
-- ➖ inconclusive, too, when an output changes by no more than base's own run-to-run variation and there is no reference to say which side is right. Better: add a reference arm when one is cheap (fp32, `'highest'` matmul precision, or the reference implementation).
+- ➖ also when the check never reached the changed code (wrong runtime, a layout that doesn't take the branch, a probe that died upstream). Say what would reach it.
+- A correctness ✅ needs the reference arm. PR matching main is "unchanged vs main", not "correct". If the reference couldn't run, the mark is ➖ with the reason.
+- 👂 **needs human review**: media output whose correctness the metrics can't decide. List the side-by-side files (reference, PR, main) and what to listen or look for. Never ✅ or ❌ on your own judgement of how media sounds or looks.
+- A verdict of "Works" needs a served run through the changed code. A report with only CPU results says "Partial" in its verdict line.
 - Before marking a parity claim ❌ that the author reports passing, rerun it in the author's library versions, or diff the defaults that changed between them (transformers 5 loads UMT5 with SDPA, 4.x eager). Before any ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
 - A case the description hands to another open PR is "owned by #N" with a link, not a ⚠️ here. Test it on that PR, or on both merged, if it matters to the verdict.
 - The same goes for a failure that matches a known open issue or another PR's fix, even when the description doesn't hand it over: search the issues for the error text before marking ⚠️, and write "owned by #N".

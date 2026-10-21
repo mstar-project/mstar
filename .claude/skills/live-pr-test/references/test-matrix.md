@@ -1,10 +1,29 @@
 # Choosing what to run
 
-The plan has three parts, in this order of priority. Size the hardware for the largest config the plan needs, so every arm of every A/B runs in one allocation.
+The plan has four parts, in this order of priority. Size the hardware for the largest config the plan needs, so every arm of every A/B runs in one allocation.
 
 1. **The PR's claims.** Every behavior or number the description asserts gets a live check that would fail if the claim were false. A "fixes X" PR reproduces X on `main` first, then shows it gone on the PR.
-2. **Regression suites** for what the touched paths can break, from the table below.
-3. **Edge cases specific to the diff**: the inputs and request mixes the changed code branches on (empty/long prompts, mixed modalities in one batch, cancellation mid-stream, eviction under KV pressure, TP rank disagreement, the first request of a new shape). Read the diff for these; they vary per PR.
+2. **The risk map** (SKILL.md step 1): one direct test for each way the changed code could break, run on a setup that reaches it. Use the probes by layer below, and add the inputs and request mixes the diff itself branches on. These vary per PR, and they are where most missed bugs were.
+3. **Correctness against the reference** for anything that changes what a model outputs (SKILL.md step 1). Media that metrics can't judge goes to a human.
+4. **Regression suites** for what the touched paths can break, from the table below.
+
+Every served check uses a real checkpoint. Where both a Python and a Rust implementation exist, the check runs on both; otherwise it runs on the default Rust runtime.
+
+## Risk probes by layer
+
+Probes that found bugs our earlier runs missed, from human reviews of the same PRs. Pick the ones the diff can reach, and say on each row which probe it was.
+
+| Layer touched | Probes |
+| --- | --- |
+| API server, input handling, uploads | Adversarial inputs: headers that lie (FLAC with no sample count), odd or coprime sample rates, 16-bit and RGBA/transparent images, 4K video, emoji-only or 100 kB+ digit text, empty and path-like ids (`a/b`, `..`), NaN and negative numbers, int64 overflow. Watch API RSS and event-loop latency, not just the status. Run on both frontends (`--rust-frontend`), since they parse differently (#403, #419, #471, #645). Also: a client that sends the whole body before reading the reply (#641), and a second user on the same host (#617, #619). |
+| Request lifecycle, conductor, abort | Client abuse under load: abort-and-resubmit storms, drop-and-retry, reuse of a finished request id, late arrivals into a full decode set, a disconnect mid-stream. Afterwards, check that nothing stays parked, that memory doesn't grow, and that the id works again (#362, #419, #557). |
+| Worker, scheduler, admission | Tiny KV pools and full decode chains (starvation, `KeyError`s under pressure), mixed shapes in one batch, the first request of a new shape, injected delays around NEW_REQUEST and admit (#362, #400, #461). |
+| TP / lockstep | A failure on each rank role (leader and follower), delayed failures, and degenerate inputs (zero-filled shape tensors such as `image_grid_thw`) on a model that is really TP (#628). For anything that offloads, evicts or adopts state: an exhaustion phase that forces offload, and a per-rank comparison of the action sequences (#346). |
+| Streaming partitions, multi-node graphs | Split the producer and consumer onto different workers (#557). Use the models with the real cross-worker streams, such as Qwen3-Omni thinker TP2, Orpheus split LLM/SNAC and Nemotron duplex (#559, #616). |
+| Transport, arena, Mooncake | Injected registration and read failures, with the registration/unregistration counts checked to balance (#629). Also the `--no-deps` CI install (#618), and a producer stream that isn't synchronized (#544). |
+| Sampling, generation defaults | Seeded sampling at T>0 on both arms. Compare each model's effective defaults before and after, since a change of source can silently move other models' `top_p` or CFG (#401, #404). |
+| Model numerics, kernels | Against the reference: logits, then greedy tokens, then output, for 3–5 seeds (#622). For speech, an ASR word error rate on the transcript (#452). Captured against eager, and byte determinism across processes (#437, #538, #660). |
+| Anything a sibling PR also touches | The PR merged into the current base, and stacked with its neighbours (#346, #453, #519, #561). |
 
 ## Touched paths → regression suites
 
@@ -15,9 +34,10 @@ The plan has three parts, in this order of priority. Size the hardware for the l
 | `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/cuda_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
 | `mstar/engine/resources/<kind>` | the worker A/B rows whose models declare that resource (grep `get_node_resources` for the class), plus the PR's own model |
 | `mstar/distributed/`, `mstar/model/components/distributed/`, anything TP/SP | the TP rows of the worker A/B set |
-| `mstar/communication/`, `rust/` | worker A/B set, plus a functional smoke over `--tensor-comm-protocol TCP` (untimed) and one with `MSTAR_RUST_ZMQ=0 MSTAR_RUST_GRAPH=0` (Python runtime) so both implementations are exercised (AGENTS.md invariant 5) |
-| `mstar/api_server/` | functional suite for each modality family it routes (text, image, speech, video), including streaming and the OpenAI routes the change touches; the CPU-overhead row if it sits on the request path |
-| `benchmark/`, `docs/`, `test/` only | no GPU run needed unless the PR claims a number; say so and stop before provisioning |
+| `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set. Every functional and risk check runs on both the Rust and the Python runtime (`MSTAR_RUST_ZMQ=0 MSTAR_RUST_GRAPH=0`), plus a functional smoke over `--tensor-comm-protocol TCP` (untimed) (AGENTS.md invariant 5) |
+| `mstar/api_server/` | functional suite for each modality family it routes (text, image, speech, video), including streaming and the OpenAI routes the change touches, on both the Python and the Rust frontend (`--rust-frontend`); the CPU-overhead row if it sits on the request path |
+| `docs/`, `test/` or comments only | no served run unless the PR claims a number; run the changed tests on the arms they target, then say so and stop |
+| `benchmark/` | run the changed script end to end, with a real checkpoint, on the hardware it's meant for |
 
 ## Worker A/B set
 
@@ -64,7 +84,8 @@ Save outputs for every functional check that produces them, so they can be revie
 - `benchmark.runner --output-dir` writes `req_<id>.{txt,png,wav}`; copy a handful per cell, not all of them, into `results/media/<suite>/<arm>/`.
 - `MStarClient`: `tts(...).to_wav(path)`, `generate_image(...)` returns PNG bytes, `GenerateResult.save_image` / `save_audio`. Video has no helper: write the mp4 bytes from the `result.raw` entries whose modality is `video`.
 - Name files so the PR/main pair sits side by side: `<suite>/<prompt-id>.<arm>.<ext>`, with the prompt text in `<suite>/prompts.txt`.
-- For a PR that changes a numerical path, put PR and main outputs for the same prompt and seed next to each other, and include a main-vs-main pair from two server processes as the noise floor (benchmarking skill: "Output-equivalence checks need a same-code control").
+- For a PR that changes a numerical path, put the reference, PR and main outputs for the same prompt and seed next to each other. Include a main-vs-main pair from two server processes as the noise floor (benchmarking skill: "Output-equivalence checks need a same-code control").
+- When the metrics can't tell whether a media output is right, the row says "needs human review". List the files and what to listen or look for in `media/README.md`.
 
 ## Hardware sizing
 
