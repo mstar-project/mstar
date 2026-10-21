@@ -434,6 +434,7 @@ class PythonGraphRuntime(GraphRuntime):
         return FreedTensors.none()
 
     def mark_stream_partition_done(self, rid: int, partition: str):
+        """Sticky: see ``GraphRuntime.mark_stream_partition_done``."""
         info = self._request_info.get(rid)
         if info is not None and partition in info.partition_info:
             info.partition_info[partition].stream_partition_done = True
