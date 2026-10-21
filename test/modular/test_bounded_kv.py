@@ -76,7 +76,7 @@ def test_slots_hold_the_sink_of_the_shortest_source(source_len):
     )
     assert config.sink_capacity == 30 and config.max_retained == 50
     source = [("s", i) for i in range(source_len)]
-    sim = SlotSim(source, config.retention(source_len), config.sink_capacity)
+    sim = SlotSim(source, config.retention_for(source_len), config.sink_capacity)
     stream = list(source)
     for step in range(8):
         fresh = [("g", len(stream) - source_len + j) for j in range(7)]
@@ -269,9 +269,9 @@ def _manager(window: int, per_query: bool, dtype, device, heads: int = 2, head_d
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 
-    policy = SinkWindow(0, window, right=0 if per_query else None)
     config = BoundedKVConfig(num_layers=1, num_heads=heads, head_dim=head_dim, rows_per_request=1,
-                             max_source_len=0, retention=lambda n: policy, max_slots=4, dtype=dtype)
+                             max_source_len=0, retention=SinkWindow(0, window), max_slots=4, dtype=dtype,
+                             query_window=window if per_query else None)
     return BoundedKVManager(config, torch.device(device))
 
 
@@ -387,18 +387,28 @@ def test_per_query_window_config():
         return BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1,
                                max_source_len=4, retention=retention, **kw)
 
-    assert config(lambda n: SinkWindow(0, 70, right=0)).query_window == 70
-    assert config(lambda n: SinkWindow(4, 70)).query_window is None
-    for bad in (SinkWindow(0, 70, right=1), SinkWindow(2, 70, right=0),
-                SinkWindow(0, 70, window_includes_step=True, right=0)):
+    assert config(lambda n: SinkWindow(0, 70), query_window=70).query_window == 70
+    # a longer retained window than the query's is allowed (its far keys are masked)
+    config(lambda n: SinkWindow(0, 70 + n), query_window=70)
+    for bad in (SinkWindow(2, 70), SinkWindow(0, 70, window_includes_step=True), SinkWindow(0, 69)):
         with pytest.raises(ValueError):
-            config(lambda n, bad=bad: bad)
+            config(bad, query_window=70)
     with pytest.raises(ValueError):
-        config(lambda n: SinkWindow(0, 70, right=0), reverse_step_order=True)
-    with pytest.raises(ValueError):    # one kernel scalar for every source length
-        config(lambda n: SinkWindow(0, 70 + n, right=0))
-    with pytest.raises(ValueError):
-        config(lambda n: SinkWindow(0, 70, right=0 if n else None))
+        config(SinkWindow(0, 70), query_window=70, reverse_step_order=True)
+
+
+def test_constant_retention_compares_by_value():
+    """A constant policy works like the callable form, and two configs built from
+    equal ones are equal (a model's spec compared against another's)."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+
+    def config(retention):
+        return BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1,
+                               max_source_len=4, retention=retention, query_window=70)
+
+    assert config(SinkWindow(0, 70)) == config(SinkWindow(0, 70))
+    assert config(SinkWindow(0, 70)) != config(SinkWindow(0, 71))
+    assert config(SinkWindow(0, 70)).retention_for(3) == config(lambda n: SinkWindow(0, 70)).retention_for(3)
 
 
 def test_dtype_none_is_the_engines_kv_dtype():
@@ -407,7 +417,7 @@ def test_dtype_none_is_the_engines_kv_dtype():
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 
     config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
-                             retention=lambda n: SinkWindow(0, 8, right=0), dtype=None)
+                             retention=SinkWindow(0, 8), dtype=None)
     spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
     mgr = BoundedKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
     assert mgr.layer(0).dtype == torch.bfloat16

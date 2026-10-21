@@ -25,19 +25,11 @@ if TYPE_CHECKING:
 class SinkWindow(NamedTuple):
     """Keep the stream's first ``sink`` and last ``window`` entries. With
     ``window_includes_step`` the window counts the step's own tokens, so a step
-    that writes ``span`` attends only the last ``window - span`` retained ones.
-
-    By default the window is per step: every query of a step attends the same
-    keys, the retained ones and all of the step's own. With ``right`` set it is
-    per query: each query attends the keys at distances ``[-right, window]``
-    from it, so a step of several tokens is causal within itself and each of
-    them sees exactly ``window`` back (a streaming conformer's
-    ``att_context_size``). Only ``right=0``, with no sink, is supported so far."""
+    that writes ``span`` attends only the last ``window - span`` retained ones."""
 
     sink: int
     window: int
     window_includes_step: bool = False
-    right: int | None = None
 
 
 @dataclass
@@ -49,8 +41,8 @@ class BoundedKVConfig:
     rows_per_request: int
     # the longest source prefix a request may have; sizes the slots
     max_source_len: int
-    # source length -> what that request keeps
-    retention: Callable[[int], SinkWindow]
+    # source length -> what that request keeps, or one policy for every length
+    retention: Callable[[int], SinkWindow] | SinkWindow
     max_slots: int = 32
     # the shortest source prefix a request may have: the slots also hold the part
     # of a sink its source doesn't cover, which is largest for the shortest source
@@ -62,34 +54,38 @@ class BoundedKVConfig:
     # ignores key order, where it decides which of the oldest step's tokens are
     # evicted first: Step-Audio2's flow decoder keeps the front of each chunk.
     reverse_step_order: bool = False
+    # None: the window is per step, every query of a step attending the same keys
+    # (the retained ones and all of the step's own). Set, it is per query: each
+    # query attends the keys at distances [0, query_window] from it, so a step of
+    # several tokens is causal within itself (a streaming conformer's
+    # ``att_context_size=[left, 0]``). Needs no sink and the stream in order.
+    query_window: int | None = None
 
     def __post_init__(self):
         if self.max_slots < 1:
             raise ValueError(f"max_slots must be >= 1, got {self.max_slots}")
         if not 0 <= self.min_source_len <= self.max_source_len:
             raise ValueError(f"source lengths {self.min_source_len}..{self.max_source_len} are not a range")
+        q_window = self.query_window
+        if q_window is not None and (q_window < 0 or self.reverse_step_order):
+            raise ValueError(f"query_window={q_window} needs to be >= 0, with the stream in order")
         sink = window = retained = 0
-        query_windows = set()
         for n in range(self.min_source_len, self.max_source_len + 1):
-            policy = self.retention(n)
+            policy = self.retention_for(n)
             if policy.sink < 0 or policy.window < 0:
                 raise ValueError(f"retention for {n} source tokens is {policy}")
-            if policy.right is not None and (
-                policy.right != 0 or policy.sink or policy.window_includes_step or self.reverse_step_order
-            ):
-                raise ValueError(f"retention for {n} source tokens is {policy}: a per-query window "
-                                 "takes right=0, no sink, and the stream in order")
-            query_windows.add(None if policy.right is None else policy.window)
+            if q_window is not None and (policy.sink or policy.window_includes_step or policy.window < q_window):
+                raise ValueError(f"retention for {n} source tokens is {policy}: a per-query window of "
+                                 f"{q_window} takes no sink and a window of at least {q_window}")
             sink = max(sink, policy.sink - n)
             window = max(window, policy.window)
             retained = max(retained, policy.sink + policy.window)
-        # the kernel takes a per-query window as one scalar for the whole step
-        if len(query_windows) > 1:
-            raise ValueError(f"retention mixes windows {sorted(query_windows, key=str)}; a per-query "
-                             "window must be the same for every source length")
         # fixed once here: a plan reads them for every row
         self._sink_capacity, self._window_capacity, self._max_retained = sink, window, retained
-        self._query_window = next(iter(query_windows))
+
+    def retention_for(self, source_len: int) -> SinkWindow:
+        r = self.retention
+        return r if isinstance(r, SinkWindow) else r(source_len)
 
     @property
     def sink_capacity(self) -> int:
@@ -99,11 +95,6 @@ class BoundedKVConfig:
     @property
     def window_capacity(self) -> int:
         return self._window_capacity
-
-    @property
-    def query_window(self) -> int | None:
-        """Each query's window when retention is per query (``SinkWindow.right``), else None."""
-        return self._query_window
 
     @property
     def max_retained(self) -> int:
