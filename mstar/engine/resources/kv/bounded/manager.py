@@ -104,7 +104,9 @@ class BoundedKVManager(Resource):
         each row's picked by its ``StreamPosition.source``) and this
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
         ``plan`` defaults to the step's. ``rel_bias`` is a per-distance score term
-        (``kernels.bounded_attention``), for relative-position attention. Rows whose
+        (``kernels.bounded_attention``), for relative-position attention; with a
+        per-query window (``SinkWindow.right``) it is indexed by distance,
+        ``[B * rows, H, T, window + 1]``. Rows whose
         source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
         slots [>= B])``, e.g. another resource's per-request entries."""
         plan = plan or self.current
@@ -114,7 +116,8 @@ class BoundedKVManager(Resource):
         from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out = bounded_attention(q, k, v, cache, source, plan.table, rel_bias, ieee, row_source)
+        out = bounded_attention(q, k, v, cache, source, plan.table, rel_bias, ieee, row_source,
+                                self.config.query_window)
         bounded_store(k, v, cache, plan.table, self.config.reverse_step_order)
         return out
 
@@ -124,6 +127,7 @@ class BoundedKVManager(Resource):
         """The kernels' semantics row by row, from the host layouts (CPU)."""
         n, h, t, d = q.shape
         rows = self.config.rows_per_request
+        window = self.config.query_window
         out = q.new_empty(n, t, h, d)
         own = row_source[1].tolist() if row_source is not None else None
         for i in range(n):
@@ -139,11 +143,16 @@ class BoundedKVManager(Resource):
                 values.append(kv[..., d:])
             keys, values = torch.cat([*keys, k[i]], 1), torch.cat([*values, v[i]], 1)
             scores = q[i] @ keys.transpose(-1, -2)
-            if rel_bias is not None:
-                total = keys.shape[1] - t
-                # query i sits at total + i, key j at j
-                rel = total + torch.arange(t)[:, None] - torch.arange(keys.shape[1])[None, :] + t - 1
-                scores = scores + rel_bias[i].gather(-1, rel.to(q.device).expand(h, -1, -1))
+            # query i sits at total + i, key j at j
+            total = keys.shape[1] - t
+            dist = (total + torch.arange(t)[:, None] - torch.arange(keys.shape[1])[None, :]).to(q.device)
+            if window is None:
+                if rel_bias is not None:
+                    scores = scores + rel_bias[i].gather(-1, (dist + t - 1).expand(h, -1, -1))
+            else:
+                if rel_bias is not None:
+                    scores = scores + rel_bias[i].gather(-1, dist.clamp(0, window).expand(h, -1, -1))
+                scores = scores.masked_fill((dist < 0) | (dist > window), float("-inf"))
             att = torch.softmax(scores * d ** -0.5, dim=-1)
             out[i] = (att @ values).transpose(0, 1)
         for i in range(n):
