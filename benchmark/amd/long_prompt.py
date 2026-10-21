@@ -108,6 +108,13 @@ def readout(cut: dict[str, dict], refusals: int) -> dict:
     return res
 
 
+def served_command(launch: Launch) -> str:
+    """The server command for the phase wrapper's shell, run from the launch's tree. `python -m mstar.cli.main`
+    imports mstar from its working directory first, so from the harness tree it would serve the harness's mstar
+    (and whatever mstar_rust that finds) instead of the tree under test."""
+    return f"cd {shlex.quote(str(launch.worktree))} && {shlex.join(launch.command())}"
+
+
 @contextlib.contextmanager
 def phase_server(launch: Launch, out: Path, period: int, timeout_s: float = 3600):
     """The launch's server under benchmark.worker_phases.server (MSTAR_PHASE_TIMING every ``period``
@@ -119,7 +126,7 @@ def phase_server(launch: Launch, out: Path, period: int, timeout_s: float = 3600
         launch.check_free()
         for d in (launch.ipc_dir, launch.upload_dir):
             d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        wrapper = [sys.executable, "-m", "benchmark.worker_phases.server", "--command", shlex.join(launch.command()),
+        wrapper = [sys.executable, "-m", "benchmark.worker_phases.server", "--command", served_command(launch),
                    "--period", str(period), "--server-log", str(out / "server.log"),
                    "--out", str(out / "phases_live.txt"), "--skip-warmup", "1"]
         (out / "command.txt").write_text(shlex.join(wrapper) + "\n")
