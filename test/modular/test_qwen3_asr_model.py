@@ -348,7 +348,10 @@ def test_graph_resources_and_state_machine():
     specs = model.get_node_resources()
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16
-    assert ragged.config.max_segments_per_request == model.MAX_WINDOWS_PER_REQUEST
+    cfg = model.config
+    frames = cfg.max_audio_samples // cfg.hop_length
+    expected = -(-frames // cfg.audio.n_window_infer)  # windows, rounded up
+    assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8

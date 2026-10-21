@@ -102,7 +102,6 @@ class Qwen3ASRModel(Model):
     # mix (1024 pages of 128 = 131k tokens). Deployments retune under
     # ``resources:`` in their YAML.
     KV_PAGES = 1024
-    MAX_WINDOWS_PER_REQUEST = 160  # 20 min / 8 s, rounded up
 
     def __init__(
         self,
@@ -135,6 +134,13 @@ class Qwen3ASRModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
+    @property
+    def max_windows_per_request(self) -> int:
+        """Attention windows (``n_window_infer`` mel frames, 8 s) in the longest
+        clip a request may carry: 150 for 20 minutes."""
+        frames = self.config.max_audio_samples // self.config.hop_length
+        return -(-frames // self.config.audio.n_window_infer)
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         text = self.config.text
         audio = self.config.audio
@@ -154,7 +160,7 @@ class Qwen3ASRModel(Model):
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
                     # every 8 s window of a request is its own segment
-                    max_segments_per_request=self.MAX_WINDOWS_PER_REQUEST,
+                    max_segments_per_request=self.max_windows_per_request,
                 ),
             ),
             KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
