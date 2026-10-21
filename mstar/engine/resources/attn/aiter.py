@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.cross import CrossAttentionManager
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -455,6 +455,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         return self._fallback
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
@@ -642,6 +643,7 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
