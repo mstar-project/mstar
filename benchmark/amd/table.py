@@ -352,6 +352,8 @@ def _correctness_text(c: dict) -> str:
         parts.append(f"exact {c['exact_vs_reference']}")
     if c.get("unexplained_divergences") is not None:
         parts.append(f"{c['unexplained_divergences']} non-tie div")
+    if c.get("near_tie_divergences") is not None:
+        parts.append(f"{c['near_tie_divergences']} near-tie div")
     if c.get("wer_percent"):
         w = c["wer_percent"]
         parts.append(f"WER {w[0] if isinstance(w, list) else w}%")
