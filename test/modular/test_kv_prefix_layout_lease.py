@@ -209,7 +209,7 @@ def test_a_repeat_with_another_question_is_served_the_whole_image_and_the_slots_
 def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached_since(monkeypatch):
     # The cache is seeded with another prompt, so the first probe misses.
     node = _Node([TAIL], [TEXT, IMAGE, OTHER_ASK])
-    assert node.probe(TEXT_WALK, len(TEXT)) is None
+    assert node.probe(TEXT_WALK, len(TEXT)).tokens == 0
     node.runner.ingest_request("first", {"kv": _config([TEXT, IMAGE, ASK])})
     for walk, length in _walks([TEXT, IMAGE, ASK]):
         node.step("first", length, walk)
