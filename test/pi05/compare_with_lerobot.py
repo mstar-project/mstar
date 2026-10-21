@@ -186,16 +186,12 @@ def build_tokens(
     from transformers import AutoTokenizer
 
     from mstar.model.pi05.components.flow_matching import discretize_state
+    from mstar.model.pi05.components.tokenization import pi05_prompt
 
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REPO, use_fast=True)
-    state_t = torch.tensor(robot_state, dtype=torch.float32)
+    state_t = torch.tensor(robot_state, dtype=torch.float64)
     bins = discretize_state(state_t, num_bins=256).tolist()
-    state_str = " ".join(str(b) for b in bins)
-    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
-    full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
-    # Pi05Tokenizer.encode_prompt does .strip().lower() on top.
-    full_prompt = full_prompt.strip().lower()
-    ids = tokenizer(full_prompt, add_special_tokens=True).input_ids
+    ids = tokenizer(pi05_prompt(prompt, bins), add_special_tokens=True).input_ids
     ids = ids[:max_lang_tokens]
     return torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
