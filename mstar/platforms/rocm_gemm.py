@@ -1,8 +1,8 @@
 """Skinny GEMMs for decode-sized captured buckets on AMD GPUs.
 
-A linear with one or two rows is a weight stream. AITER's ``wvSpltK`` (the
-kernel vLLM calls ``wvSplitK``) reads the weight once across every CU and beats
-both hipBLASLt (10-30% on MI300X) and inductor's own one-row GEMV reduction;
+A linear with one or two rows is a weight stream. AITER's ``wvSpltK`` reads the
+weight once across every CU and beats both hipBLASLt (10-30% on MI300X) and
+inductor's own one-row GEMV reduction;
 from four rows on it loses, badly once K * rows outgrows its LDS tile. Inductor
 can't pick it, so two graph passes swap such linears for ``mstar::skinny_gemm``:
 one before inductor's decompositions (a one-row ``mm`` becomes a reduction
