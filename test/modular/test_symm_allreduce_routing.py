@@ -78,6 +78,7 @@ def _one_process(monkeypatch):
     monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_FakeSymm))
     # one process: every rank is this one
     monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: flag)
+    monkeypatch.setattr(comm_mod, "_all_ranks_agree", lambda flag, cpu_group: flag)
     _FakeSymm.instances.clear()
 
 
@@ -550,12 +551,12 @@ class _Rows:
         return self.dtype.itemsize
 
 
-def _oneshot_group(monkeypatch, calls: list, max_tokens: int = 128) -> CommGroup:
+def _oneshot_group(monkeypatch, symm_group, calls: list, max_tokens: int = 128) -> CommGroup:
     from mstar.distributed import ar_fusion
 
     monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
     monkeypatch.setattr(ar_fusion, "allreduce", lambda x, ws: calls.append((x, ws)) or x)
-    g, _ = _symm_group(max_bytes=1 << 20)
+    g, _ = symm_group(max_bytes=1 << 20)
     assert g.init_allreduce_fusion(4096, torch.bfloat16, max_tokens, all_reduce=True)
     return g
 
@@ -568,10 +569,10 @@ def _oneshot_group(monkeypatch, calls: list, max_tokens: int = 128) -> CommGroup
     ((4, 4096), torch.float16, False),  # another dtype
     ((4, 2, 4096), torch.bfloat16, False),
 ])
-def test_the_oneshot_kernel_takes_rows_of_its_shape(monkeypatch, nccl_calls, shape, dtype,
-                                                     oneshot):
+def test_the_oneshot_kernel_takes_rows_of_its_shape(monkeypatch, nccl_calls, symm_group, shape,
+                                                     dtype, oneshot):
     calls: list = []
-    g = _oneshot_group(monkeypatch, calls)
+    g = _oneshot_group(monkeypatch, symm_group, calls)
     t = _Rows(shape, dtype)
     g.all_reduce(t)
     assert calls == ([(t, 0)] if oneshot else [])
@@ -597,14 +598,14 @@ def test_the_all_reduce_buffer_is_a_new_tensor_for_the_oneshot_kernel(monkeypatc
     monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
     g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)
     buf = g.all_reduce_buffer((8, 4096), torch.bfloat16, torch.device("cpu"))
-    assert buf.data_ptr() != g._symm_ar._buf.data_ptr()
+    assert buf.data_ptr() != g._all_reduce._buf.data_ptr()
 
 
 def test_a_peer_without_a_workspace_keeps_every_rank_off_it(monkeypatch, caplog):
     from mstar.distributed import ar_fusion
 
     monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
-    monkeypatch.setattr(comm, "_all_ranks_agree", lambda flag, cpu_group: False)
+    monkeypatch.setattr(comm_mod, "_all_ranks_agree", lambda flag, cpu_group: False)
     g = _group()
     with caplog.at_level(logging.WARNING):
         assert not g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)

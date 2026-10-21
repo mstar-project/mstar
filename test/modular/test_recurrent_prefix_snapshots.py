@@ -180,7 +180,7 @@ def test_a_spare_takes_only_a_free_slot_and_is_evicted_first():
     _ingest(run, "a", a)
     _prefill(run, pool, "a", a, {8: 1.0, 16: 2.0}, spares={8})
     _ingest(run, "e", a[:8] + [77] * 9)
-    assert pool.resolve_cached_prefix("e", NODE, WALK) == 8  # a free slot took the spare
+    assert pool.resolve_cached_prefix("e", NODE, WALK, None).tokens == 8  # a free slot took the spare
     run.remove_request("e")
     # c's kept snapshot takes a's spare at 8, though a's kept one at 16 is older; c's spare
     # finds no free slot
@@ -189,9 +189,9 @@ def test_a_spare_takes_only_a_free_slot_and_is_evicted_first():
     assert sorted(meta[1] for meta in pool._snap_meta.values()) == [16, 16]
     for rid, prompt in (("b", a), ("d", c)):
         _ingest(run, rid, prompt[:16] + [99] * 5)
-        assert pool.resolve_cached_prefix(rid, NODE, WALK) == 16
+        assert pool.resolve_cached_prefix(rid, NODE, WALK, None).tokens == 16
     _ingest(run, "f", a[:8] + [77] * 9)
-    assert pool.resolve_cached_prefix("f", NODE, WALK) == 0
+    assert pool.resolve_cached_prefix("f", NODE, WALK, None).tokens == 0
 
 
 def test_a_refused_admit_gives_the_hit_back():

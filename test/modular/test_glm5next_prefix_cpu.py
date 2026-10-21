@@ -17,7 +17,7 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as kv_mod
-from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.recurrent.config import RecurrentStateConfig
@@ -128,8 +128,9 @@ def _build_engine(k: int, tmp_path, kv_cache: bool = True) -> tuple[Engine, list
     resolve = engine._runner.resolve_cached_prefix
 
     def logged(*args):
-        hits.append(resolve(*args))
-        return hits[-1]
+        prefix = resolve(*args)
+        hits.append(0 if prefix is None else prefix.tokens)
+        return prefix
 
     engine._runner.resolve_cached_prefix = logged
     return engine, hits
@@ -173,8 +174,10 @@ def _configs(prompt: list[int], keyed: bool = True) -> dict:
         whole = len(prompt) // PAGE
         keys = {"main": chain([prompt[at:at + PAGE] for at in range(0, len(prompt), PAGE)])}
         tail = {"main": prompt[whole * PAGE:]}
-        configs[KV_CACHE] = KVReqConfig(prefix_keys=keys, prefix_tail=tail)
-        configs[KDA_STATE] = KVReqConfig(prefix_keys=keys, prefix_tail=tail)
+        # the one ids span the preprocess worker lays a text prompt out as
+        layout = {"main": [PrefixSpan(len(prompt), len(prompt), "prefill")]}
+        for key in (KV_CACHE, KDA_STATE):
+            configs[key] = KVReqConfig(prefix_keys=keys, prefix_tail=tail, prefix_layout=layout)
     return configs
 
 
