@@ -53,7 +53,6 @@ from mstar.model.nemotron_duplex.config import (
     TALKER_KV,
     TALKER_POS,
     NemotronDuplexConfig,
-    session_too_long,
 )
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -462,14 +461,13 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         wav = chunk[0].reshape(-1) if chunk else None
         # the client stream releases one item per step; only its final flush is empty
         assert wav is not None or is_final_stream_chunk, "an empty chunk before the end of the stream"
-        # Read, not counted here: admit can refuse the step and run this again.
-        # The previous step's forward has returned, so the state is current.
+        # The session cap is audio_in's max_items, which the client stream
+        # enforces before a sample reaches here. Read, not counted here: admit
+        # can refuse the step and run this again. The previous step's forward
+        # has returned, so the state is current.
         st = self.request_state(fwd_info.rid_handle).get(self.STATE_KEY)
         samples = (st.samples if st is not None else 0) + (wav.numel() if wav is not None else 0)
         stt = self.perception.config
-        if samples > self.max_session_samples:
-            # past the cap the talker KV and the decode loops run out
-            raise session_too_long(self.max_session_samples / stt.sample_rate)
         if is_final_stream_chunk and samples <= stt.n_fft // 2:
             # too short to featurize (offline can't either): fail rather than reply to nothing
             raise ValueError(

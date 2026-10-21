@@ -40,6 +40,7 @@ from mstar.model.nemotron_duplex.config import (
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import client_stream_limits
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
@@ -324,10 +325,28 @@ def _append(tensors, input_metadata=None, text=None):
     )
 
 
+def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
+    """The client stream, not the encoder, enforces the session cap, so a live
+    call past it gets a 400 naming the limit; a deployment may lower the cap
+    there but not raise it past what the talker KV and the loops were sized for."""
+    model = _make_model()
+    model.max_session_s = 2.0
+    (client,) = model.get_partition_topology().client_connections()
+    limits = client_stream_limits(model.get_partition_topology(), None)["audio_in"]
+    assert limits == client.limits
+    assert (limits.max_items, limits.unit) == (2 * 16000, "samples")
+    assert limits.item_size(torch.zeros(1280)) == 1280 and limits.max_pending_items is None
+    lowered = client_stream_limits(model.get_partition_topology(),
+                                   {"client_streams": {"audio_in": {"max_items": 16000}}})["audio_in"]
+    assert lowered.max_items == 16000
+    with pytest.raises(ValueError, match="may lower"):
+        client_stream_limits(model.get_partition_topology(), {"client_streams": {"audio_in": {"max_items": None}}})
+
+
 def test_duplex_appended_audio_becomes_stream_items_in_order():
     """Each appended file streams as ``audio_in`` items, checked like an upload
     but with no length limit of its own: a live chunk can be shorter than a frame,
-    and the encoder enforces the session cap as the call grows."""
+    and audio_in's max_items caps the call's samples as it grows."""
     model = _make_model()
     short, loud = torch.zeros(320), torch.full((1280,), 4.0)
     items = model.process_stream_chunk(_append({"audio_inputs": [short, loud]}, {"audio_inputs": [{}, {}]}))["audio_in"]

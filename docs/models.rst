@@ -494,11 +494,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   two-channel conversations (user left, agent right); feed the left channel
   only.
 - Limits: a call is capped at ``max_session_s`` (160 s) of audio. An upload, or
-  any one file, past it gets a 400, as does one of more than two channels; a live call
-  whose appends pass it fails with a 500 (the encoder
-  raises it mid-call, and the worker reports a failure without a client
-  status), as does a call that ends with no more than 16 ms of audio, which the
-  encoder cannot featurize. Appends must be 16 kHz audio (they are neither
+  any one file, past it gets a 400, as does one of more than two channels, and so
+  does a live call whose appends pass it: ``audio_in`` declares the session's
+  samples as its ``max_items``, which the client stream counts before the encoder
+  sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
+  call that ends with no more than 16 ms of audio, which the encoder cannot
+  featurize, fails with a 500 (the worker reports it without a client status).
+  Appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append).
   Send appends of 80 ms or more: the encoder takes one append per step, so
   shorter appends need several steps per frame and fall behind once a step

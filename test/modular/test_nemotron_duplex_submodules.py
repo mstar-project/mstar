@@ -660,25 +660,6 @@ def test_encoder_fails_a_call_that_ends_without_enough_audio(chunks):
         _encode(enc, 1, None, final=True)
 
 
-def test_encoder_fails_the_call_past_the_session_cap():
-    enc = _make_encoder(max_session_samples=4000)
-    _encode(enc, 1, torch.zeros(3000))
-    with pytest.raises(ValueError, match="longest session"):
-        _encode(enc, 1, torch.zeros(1001))
-
-
-def test_encoder_session_cap_counts_a_retried_step_once():
-    """A step whose admit is refused runs prepare_inputs again on retry: the cap
-    check must not count that chunk twice."""
-    enc = _make_encoder(max_session_samples=4000)
-    chunk = torch.randn(3000) * 0.1
-    _prepare(enc, 1, chunk)                       # refused at admit, retried below
-    _encode(enc, 1, chunk)
-    _encode(enc, 1, torch.randn(1000) * 0.1)      # exactly the cap
-    with pytest.raises(ValueError, match="longest session"):
-        _prepare(enc, 1, torch.zeros(1))
-
-
 def test_encoder_state_is_per_call_and_cleaned_up():
     enc = _make_encoder()
     _encode(enc, 1, torch.randn(4000) * 0.1)

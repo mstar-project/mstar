@@ -84,7 +84,13 @@ from mstar.model.nemotron_duplex.config import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy
-from mstar.streaming.topology import CLIENT, Connection, PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import (
+    CLIENT,
+    ClientStreamLimits,
+    Connection,
+    PartitionTopology,
+    StreamingGraphEdge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,9 +451,8 @@ class NemotronDuplexModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within
-        # the session cap (process_prompt checks an upload's, the encoder a live
-        # call's as it grows). A client cap would cut the text loop short of its
-        # stream's end and hang the session.
+        # the session cap (audio_in's max_items, in samples). A client cap would
+        # cut the text loop short of its stream's end and hang the session.
         del model_kwargs
         return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
@@ -651,9 +656,12 @@ class NemotronDuplexModel(Model):
     def get_partition_topology(self) -> PartitionTopology:
         eartts = self.config.eartts
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
-            # the user's audio, one item per uploaded file or append
+            # the user's audio, one item per uploaded file or append, at most a
+            # session's samples: past them the talker KV and the decode loops run out
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       limits=ClientStreamLimits(max_items=self.max_session_samples,
+                                                 item_size=torch.numel, unit="samples")),
             # one audio frame per nano decode step. continue_after_done=False:
             # the duplex nano text loop is 1:1 with audio frames, so when the
             # encoder's frames are exhausted the decode loop must terminate
@@ -717,8 +725,9 @@ class NemotronDuplexModel(Model):
             peak = max((w.abs().max() for w in wav if w.numel()), default=0.0)
             if peak > 1.0:      # float files can exceed full scale, and loud input silences the agent
                 wav = [w / peak for w in wav]
-            # past the cap the talker KV and the decode loops run out; the
-            # encoder counts the same samples as a live call grows
+            # past the cap the talker KV and the decode loops run out. Checked
+            # here for the upload's own message; audio_in's max_items counts the
+            # same samples as a live call grows
             if sum(w.numel() for w in wav) > self.max_session_samples:
                 raise session_too_long(self.max_session_s)
             out[AUDIO_IN] = wav
@@ -743,8 +752,8 @@ class NemotronDuplexModel(Model):
         return out
 
     def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
-        # Each appended file is one stream item, in order; the encoder enforces
-        # the session cap as the call's audio grows. A piece of a stream can't
+        # Each appended file is one stream item, in order; audio_in's max_items
+        # caps the call's samples as its audio grows. A piece of a stream can't
         # be resampled or scaled alone without a seam at every append. The one
         # client stream is audio_in, so a file's named stream changes nothing.
         if chunk.text:
