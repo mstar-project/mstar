@@ -5,7 +5,8 @@ A teardown releases pages, so the side of an admit it lands on decides what that
 free (``test_kv_tp_teardown_order``). Rank 0 forwards each teardown stamped with the last
 step it has broadcast. A follower holds it until it has popped that step, and reads no
 message between popping a step and the admit fence at the top of the next pass, so it lands
-after that admit. Rank 0 lands it there too. A removal deferred behind step N is retried
+after that admit. Rank 0 lands it there too. When the follower drops a step it popped, it
+tears the held ones down before it takes the next. A removal deferred behind step N is retried
 once N is post-processed, when N+1 is speculated, broadcast and maybe not yet admitted; but
 ``_remove_request`` defers it again while N is still the step in flight, and the next pass
 tears it down behind N+1's admit fence. A removal that reaches rank 0 once N is done, with
@@ -308,3 +309,31 @@ def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(mo
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 1)), log
+
+def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch):
+    """N fails "also", so both ranks drop the speculative N+1 built on it. Rank 0 stamped
+    "gone" with N+1 and tore it down before it sent N+2. Here "gone" is held until this
+    rank pops N+1, which it does as it drops it, and goes before N+2's admit."""
+    removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
+    # N+1 is dropped, so the serial path's next step is N+2
+    w.scheduler.steps += [None, [HANDLES["kept"]]]
+    build_executing, build_speculation = w._build_executing_batch, w._build_speculation
+
+    def _executing(batch):
+        node_batch = build_executing(batch)
+        if batch.tp_seq == 0:
+            node_batch.failed_requests = {HANDLES["also"]: "failed"}
+        return node_batch
+
+    def _speculation_or_stop(pending, consecutive, fair):
+        if pending is not None and pending.tp_seq == 2:
+            raise _Stop
+        return build_speculation(pending, consecutive, fair)
+
+    w._build_executing_batch = _executing
+    w._build_speculation = _speculation_or_stop
+    w._drop_failed_rids = lambda *args: None
+    _run(w)
+
+    assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
