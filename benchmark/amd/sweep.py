@@ -253,12 +253,28 @@ def client_env(arm: Arm, row: Row, gpus: list[int]) -> dict:
     return env
 
 
-def run_client(cmd: list[str], env: dict, log_path: Path) -> tuple[int, float]:
-    """Run one benchmark.runner invocation; returns its exit code and CPU seconds (user + system)."""
+def run_client(cmd: list[str], env: dict, log_path: Path, timeout_s: float | None = None) -> tuple[int, float]:
+    """Run one benchmark.runner invocation; returns its exit code and CPU seconds (user + system). With
+    timeout_s, a runner still going after that long is killed and TimeoutError raised."""
+    fired = threading.Event()
+
+    def kill(pid: int) -> None:
+        fired.set()
+        os.kill(pid, 9)
+
     with open(log_path, "w") as log:
         p = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
-        _, status, usage = os.wait4(p.pid, 0)
+        timer = threading.Timer(timeout_s, kill, (p.pid,)) if timeout_s else None
+        if timer:
+            timer.start()
+        try:
+            _, status, usage = os.wait4(p.pid, 0)
+        finally:
+            if timer:
+                timer.cancel()
         p.returncode = os.waitstatus_to_exitcode(status)
+    if fired.is_set():
+        raise TimeoutError(f"the client was still waiting after {timeout_s:.0f} s")
     return p.returncode, usage.ru_utime + usage.ru_stime
 
 
@@ -388,6 +404,12 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 info["first_size"] = {wl.name: first_size_requests(plan, arm, row, wl, port, arm_dir, gpus, numa,
                                                                    kwargs_by_wl[wl.name]) for wl in workloads}
                 plan.log(f"{row.name}/{arm.name}: first request per size {info['first_size']}")
+                failed = {w: v for w, sizes in info["first_size"].items() for v in sizes.values() if isinstance(v, str)}
+                if failed:
+                    workloads = [wl for wl in workloads if wl.name not in failed]
+                    info["error"] = "first request failed, its cells left out: " + "; ".join(
+                        f"{w} {v}" for w, v in failed.items())
+                    plan.log(f"{row.name}/{arm.name}: {info['error'][:300]}")
         hlth.begin()
         if arm.engine == "reference":
             from benchmark.amd import reference
@@ -447,6 +469,11 @@ def row_workloads(plan: Plan, row: Row) -> list[tables.Workload]:
     return [wl for wl in plan.workloads if wl.family == row.family and (not row.workloads or wl.name in row.workloads)]
 
 
+# Generous for an engine's first request at a size (JIT, autotune, torch.compile of a video model), short of the
+# hour a video job may take before the client gives up on it.
+FIRST_SIZE_TIMEOUT_S = 1800.0
+
+
 def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, port: int, arm_dir: Path,
                         gpus: list[int], numa: int | None, request_kwargs: dict | None) -> dict:
     """One untimed request per size of the workload's set, after startup and before any cell: an engine's first
@@ -477,10 +504,16 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
         cmd[cmd.index("--sample-set-dir") + 1] = str(sdir)
         if numa is not None:
             cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
-        rc, _ = run_client(cmd, client_env(arm, row, gpus), d / "bench.log")
-        res = d / "results.json"
-        per = (json.loads(res.read_text()).get("per_request") or []) if res.is_file() else []
-        out[size] = round(per[0]["jct_ms"] / 1000.0, 2) if rc == 0 and per else f"failed (rc {rc}, see {d})"
+        try:
+            rc, _ = run_client(cmd, client_env(arm, row, gpus), d / "bench.log", timeout_s=FIRST_SIZE_TIMEOUT_S)
+        except TimeoutError:
+            # The server is most likely wedged on it, so the arm ends here rather than in its cells' timeouts.
+            raise RuntimeError(f"the first {wl.name} request at {size} did not finish in {FIRST_SIZE_TIMEOUT_S:.0f} s"
+                               f" (see {d})") from None
+        res = json.loads((d / "results.json").read_text()) if (d / "results.json").is_file() else {}
+        per, errs = res.get("per_request") or [], res.get("errors") or []
+        why = str(errs[0].get("error"))[:200] if errs else f"rc {rc}"
+        out[size] = round(per[0]["jct_ms"] / 1000.0, 2) if rc == 0 and per else f"failed ({why}, see {d})"
     return out
 
 
