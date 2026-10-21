@@ -639,6 +639,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S"><code class="docutils literal notranslate"><span class="pre">BRIDGE_RECV_WAIT_S</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV"><code class="docutils literal notranslate"><span class="pre">OPENAI_ADAPTER_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
@@ -646,6 +647,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.find_server_binary"><code class="docutils literal notranslate"><span class="pre">find_server_binary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.launch_rust_server"><code class="docutils literal notranslate"><span class="pre">launch_rust_server()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.openai_adapter_class"><code class="docutils literal notranslate"><span class="pre">openai_adapter_class()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -713,6 +715,9 @@ bridge socket is private to the pair.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S" title="mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BRIDGE_RECV_WAIT_S</span></code></a></p></td>
 <td><p>Upper bound on one blocking receive, so <code class="docutils literal notranslate"><span class="pre">stop()</span></code> is noticed promptly and the loop stays responsive to shutdown.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV" title="mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OPENAI_ADAPTER_ENV</span></code></a></p></td>
+<td><p>The model's adapter class in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>; <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> picks its OpenAI translation by it (<code class="docutils literal notranslate"><span class="pre">Adapter::from_python</span></code>).</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -724,6 +729,9 @@ bridge socket is private to the pair.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.launch_rust_server" title="mstar.api_server.rust_frontend.launch_rust_server"><code class="xref py py-obj docutils literal notranslate"><span class="pre">launch_rust_server</span></code></a>(binary, model_name, port, ...)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.openai_adapter_class" title="mstar.api_server.rust_frontend.openai_adapter_class"><code class="xref py py-obj docutils literal notranslate"><span class="pre">openai_adapter_class</span></code></a>(model_name)</p></td>
+<td><p>The class name of <code class="docutils literal notranslate"><span class="pre">model_name</span></code>'s OpenAI adapter, &quot;&quot; when it has none.</p></td>
 </tr>
 </tbody>
 </table>
@@ -743,6 +751,13 @@ bridge socket is private to the pair.</p>
 <dd><p>Upper bound on one blocking receive, so <code class="docutils literal notranslate"><span class="pre">stop()</span></code> is noticed promptly and
 the loop stays responsive to shutdown. Not a latency knob: an arriving
 message ends the wait immediately.</p>
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">OPENAI_ADAPTER_ENV</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'MSTAR_OPENAI_ADAPTER'</span></span><a class="headerlink" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV" title="Link to this definition">#</a></dt>
+<dd><p>The model’s adapter class in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>; <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> picks
+its OpenAI translation by it (<code class="docutils literal notranslate"><span class="pre">Adapter::from_python</span></code>).</p>
 </dd></dl>
 
 <dl class="py class">
@@ -813,6 +828,20 @@ message ends the wait immediately.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.openai_adapter_class">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">openai_adapter_class</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#openai_adapter_class"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.openai_adapter_class" title="Link to this definition">#</a></dt>
+<dd><p>The class name of <code class="docutils literal notranslate"><span class="pre">model_name</span></code>’s OpenAI adapter, “” when it has none.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>model_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -863,6 +892,7 @@ message ends the wait immediately.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S"><code class="docutils literal notranslate"><span class="pre">BRIDGE_RECV_WAIT_S</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV"><code class="docutils literal notranslate"><span class="pre">OPENAI_ADAPTER_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
@@ -870,6 +900,7 @@ message ends the wait immediately.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.find_server_binary"><code class="docutils literal notranslate"><span class="pre">find_server_binary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.launch_rust_server"><code class="docutils literal notranslate"><span class="pre">launch_rust_server()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.openai_adapter_class"><code class="docutils literal notranslate"><span class="pre">openai_adapter_class()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -313,6 +313,13 @@ Read by the ``mstar-server`` binary and its bridge
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_OPENAI_ADAPTER``
+     - set by the launcher
+     - The class name of the model's adapter in ``ADAPTER_REGISTRY``
+       (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
+       picks the OpenAI translation ``mstar-server`` uses
+       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend

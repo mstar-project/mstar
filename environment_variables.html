@@ -1038,7 +1038,15 @@ tokenizer only uses its thread pool while that variable reads true,
 and serving environments often export it false. <code class="docutils literal notranslate"><span class="pre">0</span></code> leaves the
 variable as it is (the chunked encode then runs serially).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OPENAI_ADAPTER</span></code></p></td>
+<td><p>set by the launcher</p></td>
+<td><p>The class name of the model’s adapter in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>
+(<code class="docutils literal notranslate"><span class="pre">openai_adapter_class</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/rust_frontend.py</span></code>), which
+picks the OpenAI translation <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> uses
+(<code class="docutils literal notranslate"><span class="pre">Adapter::from_python</span></code>). <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code> always sets it;
+a <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> started by hand without it answers 404 on <code class="docutils literal notranslate"><span class="pre">/v1/*</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Path to a HuggingFace <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code> enabling frontend
 tokenization. Leave unset with the Python backend — its preprocess

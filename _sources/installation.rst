@@ -489,6 +489,15 @@ The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 ``$PATH`` / the in-repo build. Its knobs are listed in
 :doc:`environment_variables`.
 
+The OpenAI routes take the model's adapter from the same registry as the Python
+frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
+``mstar-server`` ports adapter classes, not model names, so every model of a
+ported class is served. Chat is served for every model the Python frontend serves
+it for. Some speech, image and video adapters, and the transcription and realtime
+routes, are not ported yet (``NOT_PORTED`` in
+``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
+logs a warning at startup, and ``/generate`` still works.
+
 Troubleshooting
 ---------------
 

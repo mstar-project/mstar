@@ -10,6 +10,7 @@ mstar.api\_server.rust\_frontend
    .. autosummary::
    
       BRIDGE_RECV_WAIT_S
+      OPENAI_ADAPTER_ENV
    
    
 
@@ -21,6 +22,7 @@ mstar.api\_server.rust\_frontend
    
       find_server_binary
       launch_rust_server
+      openai_adapter_class
    
    
 

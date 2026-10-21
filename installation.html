@@ -1121,6 +1121,14 @@ mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class=
 <p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
 <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs are listed in
 <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>
+<p>The OpenAI routes take the model’s adapter from the same registry as the Python
+frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>):
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> ports adapter classes, not model names, so every model of a
+ported class is served. Chat is served for every model the Python frontend serves
+it for. Some speech, image and video adapters, and the transcription and realtime
+routes, are not ported yet (<code class="docutils literal notranslate"><span class="pre">NOT_PORTED</span></code> in
+<code class="docutils literal notranslate"><span class="pre">test/rust/test_rust_openai_adapters.py</span></code>); there <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> answers 404,
+logs a warning at startup, and <code class="docutils literal notranslate"><span class="pre">/generate</span></code> still works.</p>
 </section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
