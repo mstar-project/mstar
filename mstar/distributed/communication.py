@@ -70,8 +70,7 @@ class CommGroup:
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
-        self._ar_fusion_ws: int | None = None
-        self._ar_fusion_max_tokens = 0
+        self._ar_fusion = None
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -135,18 +134,26 @@ class CommGroup:
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
-        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available."""
-        if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None
-        from mstar.distributed.ar_fusion import create_workspace
+        """Sets up the fused kernel behind ``allreduce_add_rmsnorm`` for up to
+        ``max_tokens`` rows of ``hidden`` (the platform's kernel may take fewer,
+        the rest stay unfused). Collective like ``init_all_reduce``: every
+        member calls it at the same point. Returns whether it's available."""
+        if self.world_size == 1 or self._ar_fusion is not None:
+            return self._ar_fusion is not None
+        from mstar.distributed.ar_fusion import ARFusion
 
-        self._ar_fusion_ws = create_workspace(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
-        )
-        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
-        return self._ar_fusion_ws is not None
+        self._ar_fusion = ARFusion.new(self, hidden, dtype, max_tokens)
+        return self._ar_fusion is not None
+
+    def graph_capture(self):
+        """Scope for one graph capture that may contain ``allreduce_add_rmsnorm``
+        (see ``ar_fusion.GraphCaptureScope``). Every member enters it for every
+        capture, even one that fails."""
+        from mstar.distributed.ar_fusion import GraphCaptureScope
+
+        if self._ar_fusion is None:
+            return GraphCaptureScope()
+        return self._ar_fusion.graph_capture()
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -155,13 +162,12 @@ class CommGroup:
         """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
         scaling by ``weight + weight_bias``. ``x`` is a row-parallel
         projection's partial sum (its linear skipped ``reduce_results``)."""
-        if (self._ar_fusion_ws is not None
-                and x.shape[0] <= self._ar_fusion_max_tokens
-                and x.is_contiguous() and residual.is_contiguous()):
+        fusion = self._ar_fusion
+        if fusion is not None and fusion.accepts(x, residual, weight_bias):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
             return allreduce_add_rmsnorm(
-                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
+                x, residual, weight, eps, weight_bias, fusion.ws_id,
             )
         r = self.all_reduce(x) + residual
         v = r.float()

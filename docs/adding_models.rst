@@ -396,13 +396,19 @@ The spec types are:
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
-       paged backend, FlashInfer for now), ``AttnBackend.FLASHINFER``,
+       paged backend), ``AttnBackend.FLASHINFER``, ``AttnBackend.AITER``,
        ``AttnBackend.DENSE``, ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``.
-       Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
-       and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
-       ``RingKVConfig``.
-       ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"`` when the FlashInfer backend is selected. ``FLASHINFER_MLA`` is
+       Leave it at ``AUTO`` unless the model needs a specific kernel. ``AUTO`` is
+       FlashInfer on NVIDIA. On AMD GPUs it is AITER's unified attention, except at
+       power-of-two page sizes up to 64, where that kernel reads the tail of a page
+       unmasked and ``AUTO`` picks AMD's FlashInfer build if it is installed.
+       FlashInfer on ROCm runs its ``fa2`` kernels. The AITER kernel is causal only, so
+       a non-causal step with more than one query per row runs on AMD's FlashInfer
+       build, which then has to be installed. FlashInfer, AITER, dense and MLA attention
+       require a ``PagedKVConfig``, and FlexAttention requires a ``RingKVConfig``.
+       ``flashinfer_backend`` selects a
+       kernel generation: ``"auto"``, ``"fa2"`` or ``"fa3"`` when the FlashInfer
+       backend is selected. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
        the softmax scale of the model's original qk head dim, which the other backends
        refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
@@ -412,15 +418,17 @@ The spec types are:
        fallback, which cannot be captured in a CUDA graph.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
-       ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
-       See `Cross-attention (encoder-decoder models)`_.
+       ``backend`` defaults to ``AttnBackend.AUTO``, resolved as for
+       ``AttentionSpec``. FlashInfer and AITER are implemented. See
+       `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
-       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
-       default, or ``RaggedAttnBackend.FLASHINFER``), ``flashinfer_backend``, and the
+       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO`` by
+       default, which is FlashInfer on NVIDIA and AITER's varlen flash attention on
+       AMD GPUs, or ``FLASHINFER`` / ``AITER``), ``flashinfer_backend``, and the
        two CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
@@ -434,12 +442,31 @@ The spec types are:
        ``high_freq_factor`` and ``old_context_len``. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
+     - A pool of fixed-size recurrent-state slots (gated DeltaNet, Mamba-2), one per
+       request and label, with one block per kind of state (``DeltaNetGeometry`` /
+       ``Mamba2Geometry`` ``.to_blocks()``). Padding rows address its sink slot.
+   * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
+     - The linear-attention layers' kernels, planned against the named pool:
+       ``LinearAttnVariant.GDN`` or ``MAMBA2``. ``backend`` selects the GDN kernels:
+       ``LinearAttnBackend.AUTO`` (the default: AITER's on an AMD GPU, FlashInfer's
+       elsewhere), ``FLASHINFER`` or ``AITER``. Mamba-2 runs M*'s own Triton kernels
+       under every backend. AITER's chunked prefill builds its schedule on the host,
+       so a prefill capture bucket larger than ``max_captured_prefill_tokens`` (512
+       by default) runs eagerly; smaller ones capture a sequential kernel whose cost
+       grows with the longest row.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
+
+The ``backend`` fields above default to ``auto``. Leave them there unless the model
+needs a particular kernel. The engine picks the platform's kernels when it builds the
+resource, and :ref:`architecture:Hardware platforms` lists what ``auto`` turns into on
+NVIDIA and AMD GPUs. A deployment can still pin a backend in its YAML (see `Tuning
+resources per deployment`_).
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -1150,6 +1177,11 @@ BAGEL shows the case of two captures for one walk. It captures ``decode`` twice,
 with guidance enabled and a decode step with guidance disabled declare different segments
 over the same token count. BAGEL's ``cg_key_info`` reports which of the two a batch is.
 
+A resource can also turn a bucket down. If its kernel can't run some bucket inside a
+graph (AITER's chunked GDN prefill on AMD GPUs, for one), ``Resource.capture_refusal``
+returns the reason, the runner logs it and skips that capture, and the bucket runs
+eagerly. ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` counts a refused bucket as a failed one.
+
 Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1406,16 +1438,22 @@ that a misspelled setting is never silently ignored:
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``AttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
-       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter`` / ``dense`` / ``flex`` /
+       ``xpu_paged``), ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
    * - ``CrossAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``)
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``),
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
        memory-against-coverage trade the deployment makes, not the model.
+   * - ``RecurrentStateSpec``
+     - ``max_slots``, ``state_dtype`` (a torch dtype name, e.g. ``bfloat16``)
+   * - ``LinearAttnSpec``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``; ``auto`` is the platform's
+       default), ``max_captured_prefill_tokens`` (AITER only: the largest prefill
+       capture bucket; larger buckets run eagerly)
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

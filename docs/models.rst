@@ -155,6 +155,7 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
+- For AMD GPUs, see `Running on AMD GPUs`_.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~
@@ -213,6 +214,27 @@ Omnilingual ASR notes
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
 
+Qwen3-Omni notes
+~~~~~~~~~~~~~~~~
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
+  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
+  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
+  serving config's ``model_kwargs:`` block. It's read once when the model is
+  built, so a request's own ``model_kwargs`` can't change it::
+
+      model_kwargs:
+        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+
+  ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  output isn't bitwise reproducible (identical calls differ in the last bits),
+  so greedy decoding can flip near-tied tokens and repeated requests may not
+  match. The Triton kernels are reproducible.
+- The Triton kernels take launch configs tuned per GPU model from
+  ``mstar/utils/fused_moe/configs/`` when one matches the expert sizes.
+  ``benchmark/fused_moe/tune_fused_moe.py`` makes one on the local GPU.
+
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
@@ -232,6 +254,11 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
+auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
+buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by default) a
+sequential kernel; text and vision prefill buckets above that run eagerly.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
@@ -658,18 +685,21 @@ Cosmos3 environment requirements
 --------------------------------
 
 - ``flashinfer`` is required: it is the paged KV/attention backend used by the
-  prefill, the captured CUDA graphs, and multi-request batches.
+  prefill, the captured CUDA graphs, and multi-request batches. On AMD GPUs the
+  paged backend is AITER's, but the non-causal denoise steps run on AMD's
+  FlashInfer build, so both are needed.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
-  (AITER's varlen kernel on ROCm).
-  That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
-  exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  attention as one varlen kernel: FlashAttention-3 from the ``fa3-fwd`` wheel on
+  NVIDIA, AITER's ``flash_attn_varlen_func`` on AMD GPUs.
+  The ``fa3-fwd`` wheel is ABI-tied to the installed torch/CUDA build (Hopper
+  builds exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0). Install
+  the one matching your environment. On AMD GPUs install AITER's release wheel,
+  whose prebuilt kernels keep the first denoise request from waiting on a kernel
+  build. When neither kernel imports, the engine logs a warning at startup and
+  falls back to the paged backend. Serving still works, only the bs=1 dense fast
+  path is lost. ``model_kwargs.attention_backend: flashinfer`` in the config YAML
+  selects the paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -890,7 +920,7 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
 **The ÷32 rule.** Height and width must each be an exact multiple of **32**:
 a pixel dimension is downsampled 16x by the VAE and then patchified 2x by the
 DiT, and only exact multiples survive both. So ``720x1280`` is **not** a valid
-size for this model (720/32 = 22.5) — the 720p-class tier is **704**x1280. An
+size for this model (720/32 = 22.5) — the 720p-class tier is **704x1280**. An
 unaligned size is rejected at the request seam with a 400 naming the rule and
 the nearest valid sizes, because it has no clean failure deeper in: the two
 paths round the latent extent differently and the DiT dies mid-forward.
@@ -1081,3 +1111,61 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 ``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
 ``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
+
+Running on AMD GPUs
+-------------------
+
+Models use the same code and configs on AMD Instinct MI300X/MI325X (``gfx942``), and the
+engine picks ROCm kernels for them (see :ref:`architecture:Hardware platforms` and
+:ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`). The table lists what has
+been run on an MI300X and checked against a reference. "Not yet run" means nobody has
+checked, not that it fails.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 16 62
+
+   * - Model
+     - Status
+     - Notes
+   * - ``kokoro``
+     - Works
+     - ``kokoro.yaml``. On 40 TTS prompts the Whisper word error rate of its speech
+       matched the reference ``kokoro`` package's (1.97%).
+   * - ``orpheus``
+     - Works
+     - ``orpheus_colocated.yaml`` (one GPU). On 40 prompts its WER was 1.75%, against
+       1.97% for the Hugging Face reference. Attention runs on AITER, and norms, RoPE and
+       sampling on AMD's FlashInfer. ``orpheus.yaml`` (two GPUs) and ``orpheus_tp2.yaml``
+       haven't been run.
+   * - ``qwen3_tts``
+     - Works
+     - ``qwen3tts.yaml`` (0.6B CustomVoice). 96 requests at concurrency 16 all succeeded,
+       and Whisper got one word wrong across 10 sampled outputs. The 1.7B configs
+       haven't been run.
+   * - ``qwen3_5_{0.8,2,4,9}b``
+     - Works, text only
+     - One GPU. Greedy output matched Hugging Face transformers over the first 64 tokens
+       on 7, 7, 5 and 8 of 8 prompts (0.8B, 2B, 4B, 9B). Every mismatch started where
+       transformers' own bf16 logits for the top two tokens were tied. Image input,
+       ``qwen3_5_9b_tp2``, ``qwen3_5_27b_tp4`` and ``qwen3_8_27b`` haven't been run.
+   * - ``whisper_large``
+     - Not yet
+     - Transcription requests fail while decoding the audio, which needs ``torchcodec``.
+       torchcodec has no ROCm build.
+   * - ``cosmos3`` and its variants
+     - Not yet run
+     - Dense attention's AITER kernel matches an fp32 reference, but no full model run
+       has been checked yet.
+   * - ``bagel``, ``chatterbox``, ``flux2_klein``, ``higgs_audio``, ``nemotron_duplex``,
+       ``omnivoice``, ``pi05``, ``qwen3_omni``, ``vjepa2``, ``wan22``, ``waypoint``,
+       ``z_image_turbo``
+     - Not yet run
+     -
+
+A few things apply to every model on AMD GPUs:
+
+- Only single-GPU configs have been run so far. Tensor-parallel ones, including the fused
+  all-reduce + RMSNorm, haven't been checked on AMD GPUs yet.
+- The first start compiles a lot. With empty caches on a 16-vCPU MI300X VM it took about
+  4 minutes for Kokoro and 17 to 24 for Orpheus.

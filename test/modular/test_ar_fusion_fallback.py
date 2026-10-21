@@ -1,6 +1,6 @@
-"""create_workspace falls back from FlashInfer's "auto" backend to "trtllm",
-and every TP rank ends up with the same backend (or none), over a real gloo
-group with a stubbed ``flashinfer.comm``."""
+"""FlashInferARFusion.create falls back from FlashInfer's "auto" backend to
+"trtllm", and every TP rank ends up with the same backend (or none), over a
+real gloo group with a stubbed ``flashinfer.comm``."""
 import os
 import sys
 import types
@@ -46,8 +46,8 @@ def _worker(rank, store_path, fails, out_dir):
     _install_fake_flashinfer(fails, rank, built)
     from mstar.distributed import ar_fusion
 
-    ws_id = ar_fusion.create_workspace(rank, WORLD, dist.group.WORLD, 128, 64, None)
-    chosen = None if ws_id is None else ar_fusion._WORKSPACES[ws_id].backend
+    fusion = ar_fusion.FlashInferARFusion.create(rank, WORLD, dist.group.WORLD, 128, 64, None)
+    chosen = None if fusion is None else fusion._workspace.backend
     leaked = [ws.backend for ws in built if not ws.destroyed and ws.backend != chosen]
     with open(os.path.join(out_dir, str(rank)), "w") as f:
         f.write(f"{chosen}|{','.join(leaked)}")

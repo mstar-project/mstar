@@ -4,7 +4,8 @@ The fused MoE kernel expects tokens sorted by expert index and padded to
 multiples of ``BLOCK_SIZE_M`` per expert.  The sort / pad is produced by
 vLLM's ``moe_align_block_size`` CUDA op, vendored (Apache-2.0) as
 ``csrc/moe_align_block_size.cu`` and JIT-compiled on first use against the
-local CUDA toolkit -- no ``sgl_kernel`` / ``vllm`` dependency.
+local CUDA toolkit, or hipified and built with hipcc on ROCm -- no
+``sgl_kernel`` / ``vllm`` dependency.
 
 If the CUDA op cannot be built (no ``nvcc`` / no CUDA device) we fall back
 to a vectorized PyTorch implementation with identical output semantics.
@@ -103,8 +104,38 @@ def _jit_source() -> tuple[str, str]:
     return name, path
 
 
-@functools.lru_cache(maxsize=1)
+def _hip_runtime_ldflags() -> list[str]:
+    """Link flags pointing at the libamdhip64 this process already loaded.
+
+    torch links -lamdhip64 from ROCM_HOME. If that isn't torch's own runtime
+    (a different ROCm, or pip ROCm) the link fails or a second HIP runtime gets
+    loaded, which breaks device state.
+    """
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                path = line.rsplit(None, 1)[-1]
+                if os.path.basename(path).startswith("libamdhip64.so"):
+                    lib_dir = os.path.dirname(path)
+                    return [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"]
+    except OSError:
+        pass
+    return []
+
+
+@torch.compiler.assume_constant_result
 def _cuda_op_available() -> bool:
+    """Build the vendored op on first use and say whether it loaded.
+
+    Dynamo traces through lru_cache, so without this mark every compiled call
+    graph-broke in here and re-ran the build check eagerly. Marked constant,
+    dynamo calls it once while tracing.
+    """
+    return _build_cuda_op()
+
+
+@functools.lru_cache(maxsize=1)
+def _build_cuda_op() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
 
     Cached so compilation is attempted once per process.  A failure (missing
@@ -115,6 +146,11 @@ def _cuda_op_available() -> bool:
         return False
     from torch.utils.cpp_extension import load
 
+    from mstar.platforms import current_platform
+
+    # On ROCm torch hipifies the source. There are no warp-level
+    # intrinsics, and cub::BlockScan becomes hipcub's.
+    ldflags = _hip_runtime_ldflags() if current_platform.is_rocm() else []
     # TP workers building together can race on the stale-lock
     # sweep and fail a build that did write the .so. The fallback is not
     # graph-capturable, so one losing rank would run the whole group eager.
@@ -129,6 +165,7 @@ def _cuda_op_available() -> bool:
             load(
                 name=name,
                 sources=[source],
+                extra_ldflags=ldflags,
                 is_python_module=False,
                 verbose=False,
             )

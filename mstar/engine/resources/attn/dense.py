@@ -24,7 +24,7 @@ except Exception as _fa3_exc:  # noqa: BLE001
 else:
     _VARLEN_IMPORT_ERROR = None
 
-# ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
+# ROCm has no FA3; AITER's varlen FMHA takes this call, so dense runs on it
 # there instead of degrading to the paged backend
 if flash_attn_varlen_func is None and current_platform.is_rocm():
     try:
@@ -36,7 +36,7 @@ if flash_attn_varlen_func is None and current_platform.is_rocm():
 
 
 @functools.cache
-def _fa3_unavailable_reason() -> str | None:
+def _varlen_unavailable_reason() -> str | None:
     """why no varlen kernel imported: fa3-fwd, and AITER on ROCm"""
     return _VARLEN_IMPORT_ERROR
 
@@ -127,7 +127,6 @@ class DenseAttentionManager(AttentionManager):
         self._device = device
         self._dtype = dtype
         self._kv_config = kv_config
-        self._on_cuda = device.type == "cuda" and torch.cuda.is_available()
 
         # plan label -> this step's layout
         self._current_plans: dict[str, DensePlan] = {}
