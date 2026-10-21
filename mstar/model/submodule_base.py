@@ -606,8 +606,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        # Called per request per step (prepare_inputs); ``parameters()`` walks
-        # the module tree each time. ``_apply`` (to / cuda / to_empty) drops it.
+        # Cached rather than read off ``parameters()``, which walks the module
+        # tree; ``_apply`` (to / cuda / to_empty) drops it, so a moved module
+        # reports its new device.
         device = self.__dict__.get("_cached_device")
         if device is None:
             device = self.__dict__["_cached_device"] = next(self.parameters()).device
