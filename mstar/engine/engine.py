@@ -614,19 +614,25 @@ class Engine:
         A node in ``_item_encoders`` is compiled with dynamic=True instead. Under
         the default it recompiles on its second input shape and the new graph
         rounds differently, so the KV cached from its earlier outputs would no
-        longer match what it computes.
+        longer match what it computes. An item encoder whose submodule sets
+        ``eager_item_encoder`` runs eager, which keeps its outputs stable as well.
+        One whose submodule sets ``marks_dynamic_dims`` marks every dimension that
+        varies in `prepare_inputs`, so the default serves every size from one graph.
         """
         if not self.device_capability.is_available:
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
+            item_encoder = node_name in self._item_encoders
 
-            if getattr(submodule, "disable_torch_compile", False):
+            if getattr(submodule, "disable_torch_compile", False) or (
+                item_encoder and getattr(submodule, "eager_item_encoder", False)
+            ):
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
-            dynamic = True if node_name in self._item_encoders else None
+            dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
                 submodule_mgmt.forward = with_inductor_overrides(torch.compile(
