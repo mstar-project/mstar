@@ -1085,6 +1085,10 @@ def _media_fields(model: Model, req_input: RequestInput, additional_model_kwargs
     return fields
 
 
+def _image_mime(path: str) -> str:
+    return "image/jpeg" if str(path).lower().endswith((".jpg", ".jpeg")) else "image/png"
+
+
 class MediaRoutes:
     """Image generation over ``/v1/images/generations`` and video generation, either mstar's synchronous
     ``/v1/videos/generations`` or the job API of vllm-omni and SGLang Diffusion (``POST /v1/videos``,
@@ -1116,6 +1120,8 @@ class MediaRoutes:
     async def _send_request_video_sync(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
         body = {"model": model.get_served_model_name(), "prompt": req_input.prompt,
                 **_media_fields(model, req_input, additional_model_kwargs)}
+        if req_input.image_path:  # image-to-video: the first frame as a data URI
+            body["image"] = f"data:{_image_mime(req_input.image_path)};base64,{req_input._image_b64}"
         try:
             metrics.start_time = time.monotonic()
             async with session.post(f"{base_url}/v1/videos/generations", json=body,
@@ -1139,6 +1145,9 @@ class MediaRoutes:
                   **_media_fields(model, req_input, additional_model_kwargs)}
         for k, v in fields.items():
             form.add_field(k, str(v))
+        if req_input.image_path:  # image-to-video: the first frame as the multipart file both servers read
+            form.add_field("input_reference", req_input._image_bytes, filename=Path(req_input.image_path).name,
+                           content_type=_image_mime(req_input.image_path))
         try:
             metrics.start_time = time.monotonic()
             async with session.post(f"{base_url}/v1/videos", data=form) as resp:
