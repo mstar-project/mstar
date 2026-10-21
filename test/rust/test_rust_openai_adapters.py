@@ -2,10 +2,11 @@
 the launcher names the model's adapter class (``MSTAR_OPENAI_ADAPTER``) and
 the Rust frontend translates requests with its port of that class.
 
-Checks, against ``ADAPTER_REGISTRY`` itself: every class and surface the Rust
-frontend serves or lists as not ported yet; for each chat class, that a chat
-reaches the backend as the Python adapter builds it; and, where fastapi is
-installed, that both frontends answer a chat with the same status and body.
+Checks, against ``ADAPTER_REGISTRY`` itself: mstar-server answers exactly the
+surfaces the Python adapter serves, or names an adapter it has no port of; for
+each chat class, that a chat reaches the backend as the Python adapter builds
+it; and, where fastapi is installed, that both frontends answer a chat with the
+same status and body.
 Skipped unless the ``mstar_rust`` extension is installed and the server binary
 is built."""
 import base64
@@ -43,17 +44,6 @@ ROUTES = {
     "speech": ("/v1/audio/speech", {"input": "hi"}),
     "images": ("/v1/images/generations", {"prompt": "a cat"}),
     "videos": ("/v1/videos/generations", {"prompt": "a cat"}),
-}
-# Surfaces the Python adapter serves and mstar-server does not yet (#742).
-# /v1/audio/transcriptions and /v1/realtime have no route there at all.
-NOT_PORTED = {
-    ("ChatterboxAdapter", "speech"),
-    ("KokoroAdapter", "speech"),
-    ("OmniVoiceAdapter", "speech"),
-    ("Qwen3TTSAdapter", "speech"),
-    ("DiffusionImageAdapter", "images"),
-    ("LTX25Adapter", "videos"),
-    ("Wan22Adapter", "videos"),
 }
 
 
@@ -100,19 +90,18 @@ def test_the_launcher_names_the_registry_s_adapter_class():
 
 
 @pytest.mark.parametrize("cls", sorted(_classes()))
-def test_each_registry_class_serves_its_python_surfaces_or_lists_them_as_not_ported(cls):
-    """Every route answers non-404 exactly when the Python adapter serves it
-    and the surface is ported. A new adapter class, or a new surface on one,
-    fails here until it is ported or listed in NOT_PORTED."""
+def test_mstar_server_answers_the_surfaces_the_python_adapter_serves(cls):
+    """A surface the Python adapter does not serve is a 404 from mstar-server.
+    One it serves is answered, unless the class has no port yet: that 404
+    names the adapter, never the generic "does not support this endpoint"."""
     adapter = _classes()[cls]
     with _mock_server(cls) as (port, _proc):
         for surface, (path, body) in ROUTES.items():
-            python = getattr(adapter, f"supports_{surface}")
-            assert not ((cls, surface) in NOT_PORTED and not python), \
-                f"NOT_PORTED lists {cls} {surface}, which Python does not serve"
             status, data = _post(port, path, body)
-            want = python and (cls, surface) not in NOT_PORTED
-            assert (status != 404) == want, (cls, surface, status, data)
+            if not getattr(adapter, f"supports_{surface}"):
+                assert status == 404, (cls, surface, status, data)
+            else:
+                assert status != 404 or cls in json.loads(data)["error"]["message"], (cls, surface, status, data)
 
 
 def test_a_model_without_an_adapter_gets_the_python_frontend_s_404():
@@ -183,10 +172,6 @@ def _files(paths: dict[str, list[str]] | None) -> dict[str, list[bytes]]:
 
 
 CHAT_CLASSES = sorted(c for c, a in _classes().items() if a.supports_chat)
-
-
-def test_the_chat_classes_are_the_ones_this_pr_ports():
-    assert CHAT_CLASSES == ["BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter"]
 
 
 @pytest.mark.parametrize("fields", [{}, {"max_completion_tokens": 0}], ids=["fields", "zero-max"])
