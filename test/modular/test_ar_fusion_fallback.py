@@ -51,7 +51,9 @@ def _worker(rank, store_path, fails, out_dir):
                             rank=rank, world_size=WORLD)
     built: list = []
     _install_fake_flashinfer(fails, rank, built)
-    fusion = ar_fusion.FlashInferARFusion.create(rank, WORLD, dist.group.WORLD, 128, 64, None)
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(WORLD)))
+    group.cpu_group = dist.group.WORLD
+    fusion = ar_fusion.FlashInferARFusion.create(group, 128, 64, None)
     chosen = None if fusion is None else fusion._workspace.backend
     leaked = [ws.backend for ws in built if not ws.destroyed and ws.backend != chosen]
     with open(os.path.join(out_dir, str(rank)), "w") as f:
@@ -84,15 +86,15 @@ def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
 
     built, used = [], []
 
-    def create(rank, world_size, cpu_group, max_tokens, hidden, dtype):
+    def new(cls, group, hidden, dtype, max_tokens):
         built.append((dtype, hidden, max_tokens))
         if max_tokens > 16:
             return None
-        fusion = ar_fusion.FlashInferARFusion(None, max_tokens, world_size)
+        fusion = ar_fusion.FlashInferARFusion(None, max_tokens, group.world_size)
         fusion.ws_id = len(built) - 1
         return fusion
 
-    monkeypatch.setattr(ar_fusion, "create_fusion", create)
+    monkeypatch.setattr(ar_fusion.ARFusion, "new", classmethod(new))
     monkeypatch.setattr(
         ar_fusion, "allreduce_add_rmsnorm",
         lambda x, residual, weight, eps, bias, ws_id: used.append(ws_id) or (x, residual),
