@@ -16,6 +16,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
@@ -426,24 +427,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
-
-            # Compute 3D MRoPE position IDs for a pure-text span.  Each
-            # prefill graph walk is single-modality so we use the simple
-            # per-modality helper instead of the full HF parser.
-            #
-            # ``start_pos`` is the next MRoPE position for this request,
-            # carried forward across walks by the stream's position counter
-            # (advanced by the runner's commit of each declared step).
-            pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 self._get_talker_text_mask(text_ids) # text inclusion
             ])
+            # No custom_pos_ids: the plan places a text row's positions from the counter,
+            # which a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker
                 }
@@ -550,6 +543,29 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+    def split_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs,
+        start: int,
+        end: int,
+    ) -> ARNodeInputs:
+        """Also cuts the Talker masks and the deepstack rows.
+
+        A partly held image or audio clip leaves the counter at its start, so the
+        tail keeps its own positions.
+        """
+        tensors = inputs.tensor_inputs
+        cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
+        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        if graph_walk == "prefill_vision":
+            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
+            cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
+        elif graph_walk == "prefill_audio":
+            cut.tensor_inputs["mrope_pos_advance"] = inputs.input_seq_len
+        return cut
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
@@ -577,17 +593,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if "prefill_vision" in row_walks:
-            # A vision row's 3D-grid MRoPE span is larger than its token count,
-            # so it advances the counter by its own; other rows by their span.
+        if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
+            # A vision row's 3D-grid MRoPE span differs from its token count, and
+            # a cut audio row moves past its whole clip, so each advances the
+            # counter by its own `mrope_pos_advance`. Other rows advance it by their span.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", 0))
-                if walk == "prefill_vision" else inp.input_seq_len
-                for inp, walk in zip(inputs, row_walks, strict=True)
+                int(inp.tensor_inputs.get("mrope_pos_advance", inp.input_seq_len))
+                for inp in inputs
             )
         return SubmoduleStep(
             # must match `cg_key_info`, which picked the leased capture
-            cg_key_info=self.DEEPSTACK_KEY if pos_advance is not None else None,
+            cg_key_info=self.DEEPSTACK_KEY if "prefill_vision" in row_walks else None,
             segments=[
                 Segment(
                     request_id=rid,
@@ -621,9 +637,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         input_embeds = torch.cat([
             inp.input_embeds for inp in inputs
         ], dim=0)
-        position_ids_3d = torch.cat([
-            inp.custom_pos_ids for inp in inputs
-        ], dim=1)  # (3, total_tokens)
+        position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
@@ -660,6 +674,26 @@ class ThinkerSubmodule(ARNodeSubmodule):
             },
             **extra_inputs
         }
+
+    def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
+        """``[3, total_tokens]`` for the step, in packed request order.
+
+        A text row takes the position resource's planned positions on all three
+        grids. Audio, vision and decode rows place their own.
+        """
+        pos_ids = self.node_resources[THINKER_POS].pos_ids("main")
+        parts: list[torch.Tensor] = []
+        offset = 0
+        for inp in inputs:
+            if inp.custom_pos_ids is not None:
+                parts.append(inp.custom_pos_ids)
+            else:
+                assert pos_ids is not None, (
+                    "position resource has no plan for this step; `plan` must run before `preprocess`"
+                )
+                parts.append(pos_ids[offset:offset + inp.input_seq_len].float().unsqueeze(0).expand(3, -1))
+            offset += inp.input_seq_len
+        return torch.cat(parts, dim=1)
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
