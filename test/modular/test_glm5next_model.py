@@ -644,12 +644,12 @@ def test_glm5next_model_constructs_from_config():
     assert req.temperature == 0.0 and req.top_k == 3
     assert req.top_p == constructed.config.top_p
 
-    # long context needs index planes as wide as 3 index heads, and no MTP holes
+    # long context needs index planes as wide as 3 index heads; MTP there trims, no holes
     with pytest.raises(ValueError, match="index plane"):
         Glm5NextModel("x", config_variant="reduced", dsa_long_context=True)
-    with pytest.raises(ValueError, match="MTP"):
-        Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
-                      mtp_num_draft_tokens=1)
+    mtp = Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
+                        mtp_num_draft_tokens=1)
+    assert mtp.config.mtp_trims and mtp.config.kv_rows == mtp.config.max_seq_len
     long = Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
                          max_seq_len=4096)
     assert long.config.context_limit == 4096
