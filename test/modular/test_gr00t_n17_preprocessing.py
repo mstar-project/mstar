@@ -1,4 +1,5 @@
 import copy
+import json
 import types
 from pathlib import Path
 
@@ -565,6 +566,22 @@ def test_the_eef_reference_frame_is_the_states_last_timestep():
         pre.unapply("eefbot", chunk, {"pose": both})["pose"],
         pre.unapply("eefbot", chunk, {"pose": np.array([[_IDENTITY_POSE]], np.float32)})["pose"],
     )
+
+
+def test_an_eef_decode_is_the_same_whether_the_state_came_over_json_or_not():
+    """The wire delivers the state as Python floats, which ``np.asarray`` makes
+    float64. The reference keeps the state float32
+    (``gr00t_policy.py:319-321``), and so the frame's Gram-Schmidt runs in
+    float32. A float64 frame moves ``eef_9d`` by an ulp, with no error raised.
+
+    The frame's rot6d is not orthonormal, so the Gram-Schmidt has rounding to
+    do. Without the cast this differs by 1.5e-8.
+    """
+    pose = {"pose": np.array([[[0.1, 0.2, 0.3, 0.3, 0.7, 0.1, -0.7, 0.3, 0.2]]], np.float32)}
+    wire = json.loads(json.dumps({k: v.tolist() for k, v in pose.items()}))
+    chunk = _pose_chunk([0.1, 0.2, 0.3], [0.9, 0.1, 0.1, 0.1, 0.9, 0.1])
+    pre = _pre()
+    assert np.array_equal(pre.unapply("eefbot", chunk, wire)["pose"], pre.unapply("eefbot", chunk, pose)["pose"])
 
 
 @pytest.mark.parametrize("state, match", [
