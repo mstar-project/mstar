@@ -411,22 +411,35 @@ class WorkerParallelGroups:
         # iterates it identically; ``new_group`` is collective and
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
-        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        #
+        # The gloo twins are members only. With the default group bound to a
+        # device, a non-member's subgroup creation joins an ncclCommSplit
+        # that members never call for a gloo group, and blocks forever. But
+        # torch names a members-only group after its ranks and the number of
+        # groups this process has made so far, and a non-member makes none.
+        # So a rank outside the tuple makes a gloo group of just itself, which
+        # keeps that count equal on every rank and the members agreeing on the
+        # name (and the store prefix their rendezvous uses). A 2x2 TP x SP
+        # mesh hung at startup without it. The device subgroups go after,
+        # since they're only registered on their members and would skew it.
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        for rank_tuple in self.world_parallel_groups:
+            if device.type == "xpu":
+                continue  # the device group doubles as the cpu group below
+            member = self.global_rank in rank_tuple
+            cpu_pg = dist.new_group(
+                ranks=list(rank_tuple) if member else [self.global_rank],
+                backend="gloo", use_local_synchronization=True, **timeout_kwargs,
+            )
+            if member:
+                rank_tuple_to_cpu_pg[rank_tuple] = cpu_pg
+        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), **timeout_kwargs
             )
             if device.type == "xpu":
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
-            else:
-                # Members only: with the default group bound to a device, a
-                # non-member's subgroup creation joins an ncclCommSplit that
-                # members never call for a gloo group, and blocks forever.
-                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                    ranks=list(rank_tuple), backend="gloo",
-                    use_local_synchronization=True, **timeout_kwargs,
-                )
 
         seen: set[int] = set()
         for comm_group in (
