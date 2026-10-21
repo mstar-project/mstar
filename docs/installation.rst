@@ -490,7 +490,9 @@ with a constraints file so the extras can't replace it:
        --overrides rocm-overrides.txt -e ".[kokoro,orpheus,qwen3_tts,dev]"
 
 Pick the extras for the models you serve. From PyPI, install ``"mstar-ai[...]"`` the same
-way instead of ``-e``. The never-true marker drops a package from the resolution.
+way instead of ``-e``. The never-true marker drops a package from the resolution. Without
+torchcodec, audio and video are decoded with PyAV and soundfile, so add ``av`` and
+``soundfile`` for any model that reads media (``all`` already has both).
 
 .. list-table:: Packages left out on ROCm
    :header-rows: 1
@@ -614,6 +616,43 @@ MI325X. Copy back into the saved copy from one job at a time, and only from a jo
 started from it. MIOpen keeps one database file per architecture, so a cold job's copy
 would replace the saved one instead of adding to it.
 
+In practice that's an untar before the first server and a tar at the end of the job:
+
+.. code-block:: bash
+
+   # one saved copy per GPU model and torch / HIP / Triton version
+   SAVED=/shared/compile-cache/mi300x-torch2.12.1-hip7.2.53211-triton3.7.1
+   mkdir -p $SAVED
+
+   # job start
+   for d in inductor triton miopen; do
+       mkdir -p /tmp/$USER/$d
+       [ -f $SAVED/$d.tar ] && tar -xf $SAVED/$d.tar -C /tmp/$USER/$d
+   done
+
+   # job end, one job at a time
+   for d in inductor triton miopen; do
+       tar -cf $SAVED/$d.tar.new -C /tmp/$USER/$d . && mv $SAVED/$d.tar.new $SAVED/$d.tar
+   done
+
+The rename means a job that starts during a save gets the old copy or the new one, never
+half of one. AITER's, FlyDSL's and FlashInfer's caches aren't in it. They already persist
+where steps 3 and 4 put them.
+
+**Convolutions on a cold node.** The first time MIOpen sees a conv size it searches for the
+fastest kernel, and that search is slow. On an MI300X with an empty cache the first bf16 decode
+took 161 s for Wan2.2 (480x832, 33 frames), 82 s for a Cosmos3 720p image and 83 s for the
+FLUX.2 autoencoder. Qwen3-Omni's vocoder asks for the full search (``cudnn.benchmark``), and on
+an MI325X its capture took 645 s of a 1146 s cold start. The saved MIOpen database from the
+recipe above skips the search and keeps the fast kernels. The same Qwen3-Omni start took 223 s
+from a saved copy.
+
+``MIOPEN_FIND_MODE=FAST`` isn't a substitute. It doesn't skip a search the model asks for, so
+the Qwen3-Omni cold start got slower (1668 s), and the kernels it falls back to are slower in
+fp32, 35-48% per vocoder step and 3.6 s to 4.5 s for a Wan2.2 decode. It does cut a bf16 VAE's
+first decode (Wan2.2 161 s to 6.6 s, with later bf16 decodes within 4%), so it's an option for
+a bf16 VAE deployment on a node with no saved cache.
+
 **Picking GPUs.** On ROCm ``mstar serve --gpus 0,1`` sets both ``CUDA_VISIBLE_DEVICES``
 and ``HIP_VISIBLE_DEVICES``, since HIP and torch read ``HIP_VISIBLE_DEVICES`` first.
 Without ``--gpus``, ``mstar serve`` won't start if the two are set to different lists.
@@ -640,8 +679,8 @@ turns it off by default (see :ref:`environment_variables:Platform defaults`).
    curl -s localhost:8000/v1/audio/speech -H 'Content-Type: application/json' \
        -d '{"model": "kokoro", "input": "Hello from an MI300X.", "voice": "af_bella"}' -o hello.wav
 
-The first start compiles a lot (Inductor, Triton, FlyDSL, FlashInfer), so it takes
-several minutes even for Kokoro. A warm cache makes later starts faster.
+The first start compiles a lot (Inductor, Triton, FlyDSL, FlashInfer). Kokoro took 15 to
+21 minutes on an MI300X with empty caches, and about 3 from a saved one.
 
 Verify the install
 ------------------
