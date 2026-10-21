@@ -508,6 +508,41 @@ def test_video_identity_compares_decoded_frames(tmp_path):
     assert same.rows[0]["psnr_r1_r2_min"] == float("inf") > diff.rows[0]["psnr_r1_r2_min"]
 
 
+def _video_run(tmp_path, fam, ref_frames, served: dict[str, bytes]):
+    """One reference video (``00``) and a run per entry of ``served`` (mp4 bytes)."""
+    ref_dir = tmp_path / "references" / "ref" / "video_v1"
+    (ref_dir / "outputs").mkdir(parents=True)
+    np.save(ref_dir / "outputs" / "00.npy", ref_frames)
+    (ref_dir / "meta.json").write_text("{}")
+    runs = []
+    for name, data in served.items():
+        (tmp_path / name / "outputs").mkdir(parents=True)
+        (tmp_path / name / "outputs" / "00.mp4").write_bytes(data)
+        runs.append(tmp_path / name)
+    sset = sets.SampleSet("video_v1", tmp_path, {}, [sets.Item(id="00", prompt="p", params={"seed": 0})])
+    work = tmp_path / "work"
+    work.mkdir()
+    return fam.score(sset, runs, ref_dir, work, "cpu")
+
+
+def test_video_reference_goes_through_the_served_encode(tmp_path):
+    """A served video that is the reference's own frames scores inf once the reference takes the same
+    encode, where the raw frames would cap it at the encoder's own PSNR."""
+    pytest.importorskip("av")
+    from benchmark.correctness.families import video
+
+    fam = family_for_config("cosmos3_nano", "cosmos3", {}, {})
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 256, (5, 64, 96, 3), dtype=np.uint8)
+    served = video.server_mp4(frames, video.SERVER_X264["cosmos3"], fam.fps)
+    sc = _video_run(tmp_path, fam, frames, {"r1": served})
+    assert sc.rows[0]["psnr_median"] == float("inf")
+    raw = video.read_video(tmp_path / "r1" / "outputs" / "00.mp4")
+    assert np.isfinite(min(M.frame_psnrs(frames, raw)))
+    assert any("encode" in n for n in sc.notes)
+    assert video.SERVER_X264["wan22"] == {}  # Wan2.2 encodes with libx264's defaults
+
+
 def test_ltx2_5_audio_video_family(tmp_path):
     import io
     import struct
