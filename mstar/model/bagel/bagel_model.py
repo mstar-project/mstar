@@ -94,6 +94,7 @@ from mstar.model.base import (
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    prompt_spans,
 )
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
@@ -736,27 +737,24 @@ class BagelModel(Model):
         spans = []
         if think_mode and not understanding and segments:
             spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
-        texts = segments[len(spans):]
-        for step in prefill_plan(parts, leading_text=understanding):
-            if step.modality == TEXT:
-                if step.index >= len(texts):
-                    # no tensor for it: `_build_prefill_schedule` skips the step too
-                    continue
-                length = texts[step.index].numel()
-                spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
-                continue
-            _, image_height, image_width = images[step.index].shape
+
+        def image(step: PromptPart) -> list[Span]:
+            _, height, width = images[step.index].shape
             item = (("image", step.index), (image_preprocess,))
-            if not understanding:
-                latents = vae_latents(
-                    image_height, image_width, image_preprocess, cfg.latent_downsample, cfg.max_latent_size,
-                )
-                spans.append(Span("digest", "prefill_vae", latents + IMAGE_SENTINELS, IMAGE_ADVANCE, *item))
             patches = vit_patches(
-                image_height, image_width, image_preprocess,
-                cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
+                height, width, image_preprocess, cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
             )
-            spans.append(Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE, *item))
+            vit = Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE, *item)
+            if understanding:
+                return [vit]
+            latents = vae_latents(height, width, image_preprocess, cfg.latent_downsample, cfg.max_latent_size)
+            return [Span("digest", "prefill_vae", latents + IMAGE_SENTINELS, IMAGE_ADVANCE, *item), vit]
+
+        texts = segments[len(spans):]
+        # skip a text step the prompt has no tensor for, as `_build_prefill_schedule` does
+        plan = prefill_plan(parts, leading_text=understanding)
+        plan = [step for step in plan if step.modality != TEXT or step.index < len(texts)]
+        spans += prompt_spans(plan, texts, "prefill_text", image)
         keyed = int(bool(spans) and spans[0].kind == "ids")
         if understanding:
             main = LabelLayout(
