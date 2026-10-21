@@ -61,11 +61,13 @@ concatenation order that is the client's only handle on which float is which
 joint. It gets a processor built on a four-line synthetic ``statistics``, so this
 file still reads no checkpoint.
 
-Nothing here allocates a parameter. The walks and the specs are checked on a
-config alone, through ``object.__new__`` -- no checkpoint, no processor, no
-network -- and the five submodules are built under ``torch.device("meta")``,
-because ``denoise_step`` holds the real DT: 32 blocks of 1536 x 32 x 48, 1.12B
-parameters, 4.2 GiB per fp32 copy.
+The walks and the specs are checked on a config alone, through
+``object.__new__`` -- no checkpoint, no processor, no network. ``get_submodule``
+loads its own weights, so its tests serve the tiny config off a synthetic
+checkpoint in ``tmp_path`` under the real tensor names. At the checkpoint's own
+widths the five nodes are built under ``torch.device("meta")`` with the loader
+stubbed, because ``denoise_step`` holds the real DT: 32 blocks of 1536 x 32 x 48,
+1.12B parameters, 4.2 GiB per fp32 copy.
 
 Four of the claims here were ``xfail`` for one round, against a version whose
 carried edge was ``actions``, whose ``get_partition_forward_pass_args`` routed
@@ -79,12 +81,14 @@ from __future__ import annotations
 import dataclasses
 import glob
 import inspect
+import re
 from pathlib import Path
 
 import msgpack
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
@@ -103,6 +107,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
+from mstar.model.gr00t_n17 import gr00t_n17_model
 from mstar.model.gr00t_n17.config import (
     BRIDGE_ATTN,
     DT_ATTN,
@@ -1354,32 +1359,78 @@ _SUBMODULES = {
 }
 
 
-def test_get_submodule_builds_each_node_once_and_hands_back_the_same_object():
-    """One submodule per node, cached. The identity matters rather than just the
-    equality: the weight loader fills the object the model handed out, the engine
-    binds resources onto it, and a compiled region guards on the identity of the
-    callables it holds -- so a second build would be a module with no weights, no
-    resources and a retrace.
+# Each node's checkpoint root. The three nodes that wrap a component hold it as
+# `.model`, and the loader names their tensors relative to it; the vision tower is
+# the reference's `visual.` itself, beside GR00T's own DeepStack mergers.
+_ROOTS = {
+    VISION_ENCODER: "backbone.model.model.visual.",
+    LLM: "backbone.model.model.language_model.",
+    VL_BRIDGE: "action_head.", STATE_ENCODER: "action_head.", DENOISE_STEP: "action_head.",
+}
 
-    ``meta`` because ``denoise_step`` holds the real DT (32 blocks of
-    1536 x 32 x 48: 1.12B parameters, 4.2 GiB per fp32 copy). Here the config is
-    tiny as well, but the shape of the test is what has to be safe: ``meta``
-    allocates nothing whatever config it is handed.
-    """
+
+def _checkpoint_parts(config: Gr00tN17Config, node: str, name: str, shape) -> list[tuple[str, tuple]]:
+    """The checkpoint tensors one served parameter is made of, in row order: one
+    tensor, except the LLM's fused q/k/v and gate/up, which the checkpoint keeps apart."""
+    if node in (VISION_ENCODER, LLM, VL_BRIDGE):
+        name = name.removeprefix("model.")
+    if node == VISION_ENCODER:
+        name = name.removeprefix("tower.")
+    t = config.text
+    q, kv = t.num_attention_heads * t.head_dim, t.num_key_value_heads * t.head_dim
+    fused = {".qkv_proj": ((".q_proj", q), (".k_proj", kv), (".v_proj", kv)),
+             ".gate_up_proj": ((".gate_proj", t.intermediate_size), (".up_proj", t.intermediate_size))}
+    for target, parts in fused.items():
+        if node == LLM and target in name:
+            return [(_ROOTS[node] + name.replace(target, part), (rows, *shape[1:])) for part, rows in parts]
+    return [(_ROOTS[node] + name, tuple(shape))]
+
+
+def _unloaded(model: Gr00tN17Model, node: str):
+    """The node as ``_create_submodule`` builds it, before any tensor lands in it."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(gr00t_n17_model, "load_gr00t_n17_weights", lambda *args: None)
+        return model._create_submodule(node, "cpu")
+
+
+def _served(path: Path, drop: str | None = None) -> tuple[Gr00tN17Model, dict[str, torch.Tensor]]:
+    """``_model()`` over a synthetic checkpoint at ``path``: every tensor the five
+    nodes read, under the checkpoint's own names, each a different random draw, so
+    a parameter left at its init or fed its neighbour's tensor cannot match."""
     model = _model()
-    with torch.device("meta"):
-        built = {name: model.get_submodule(name) for name in _SUBMODULES}
+    model._repo_dir = path
+    generator = torch.Generator().manual_seed(0)
+    weights = {}
+    for node in _SUBMODULES:
+        for name, param in _unloaded(model, node).named_parameters():
+            for key, shape in _checkpoint_parts(model.config, node, name, param.shape):
+                weights[key] = torch.randn(shape, generator=generator)
+    if drop is not None:
+        del weights[drop]
+    save_file(weights, path / "model.safetensors")
+    return model, weights
 
-        for name, cls in _SUBMODULES.items():
-            assert type(built[name]) is cls
-            assert model.get_submodule(name) is built[name]
+
+def test_get_submodule_builds_each_node_once_and_hands_back_the_same_object(tmp_path):
+    """One submodule per node, cached. The identity matters rather than just the
+    equality: the model loads its weights into the object it hands out, the engine
+    binds resources onto it, and a compiled region guards on the identity of the
+    callables it holds -- so a second build would be a second load, a module with
+    no resources and a retrace.
+    """
+    model, _ = _served(tmp_path)
+    built = {name: model.get_submodule(name) for name in _SUBMODULES}
+
+    for name, cls in _SUBMODULES.items():
+        assert type(built[name]) is cls
+        assert model.get_submodule(name) is built[name]
 
     assert set(model._submodules) == set(_SUBMODULES) == set(model.nodes)
     assert all(model._submodules[name] is built[name] for name in _SUBMODULES)
     assert len({id(sub) for sub in built.values()}) == 5
 
 
-def test_every_submodule_comes_back_in_eval_mode():
+def test_every_submodule_comes_back_in_eval_mode(tmp_path):
     """Our modules hold ``Dropout(p=0.0)`` rather than relying on the flag, so
     nothing changes numerically today -- which is exactly why this has to be
     pinned rather than observed. Every parity number C05-C08 measured is an
@@ -1390,27 +1441,74 @@ def test_every_submodule_comes_back_in_eval_mode():
     ``nn.Module`` starts in training mode, so this is not a tautology: the flag
     has to be set by somebody.
     """
-    model = _model()
-    with torch.device("meta"):
-        for name in _SUBMODULES:
-            submodule = model.get_submodule(name)
-            assert submodule.training is False
-            assert all(not child.training for child in submodule.modules())
+    model, _ = _served(tmp_path)
+    for name in _SUBMODULES:
+        submodule = model.get_submodule(name)
+        assert submodule.training is False
+        assert all(not child.training for child in submodule.modules())
 
 
-def test_an_unknown_node_is_none_and_is_not_cached():
+def test_an_unknown_node_is_none_and_is_not_cached(tmp_path):
     """``None`` is the engine's "this worker does not host that node", so a typo in
     a node_group has to come back as a miss rather than as something plausible.
     And it must not be cached: ``get_submodule``'s cache is keyed by name, and a
     cached ``None`` would be indistinguishable from a built submodule on the
     second call were the miss ever to become a hit.
     """
-    model = _model()
-    with torch.device("meta"):
-        assert model.get_submodule("vlm") is None
-        assert model.get_submodule(VISION_ENCODER.upper()) is None
-        assert model.get_submodule("") is None
+    model, _ = _served(tmp_path)
+    assert model.get_submodule("vlm") is None
+    assert model.get_submodule(VISION_ENCODER.upper()) is None
+    assert model.get_submodule("") is None
     assert model._submodules == {}
+
+
+def test_every_served_parameter_is_the_checkpoint_tensor_it_maps_from(tmp_path):
+    """The served path loads its own weights. Until C10 nothing but the tests called
+    the loader, so a live server ran all five nodes on their random init -- and a DT
+    on random weights still returns plausible-looking actions, no error anywhere.
+
+    Values, not shapes: random init has every shape right. The LLM's q/k/v and
+    gate/up are checked as the checkpoint's separate tensors stacked in row order.
+    """
+    model, weights = _served(tmp_path)
+    used = set()
+    for node in _SUBMODULES:
+        for name, param in model.get_submodule(node).named_parameters():
+            parts = _checkpoint_parts(model.config, node, name, param.shape)
+            assert torch.equal(param, torch.cat([weights[key] for key, _ in parts])), (node, name)
+            used |= {key for key, _ in parts}
+    assert used == set(weights)
+
+
+@pytest.mark.parametrize("node, drop", [
+    (VISION_ENCODER, "backbone.model.model.visual.deepstack_merger_list.0.norm.bias"),
+    (LLM, "backbone.model.model.language_model.layers.1.mlp.down_proj.weight"),
+    (STATE_ENCODER, "action_head.state_encoder.layer2.b"),
+    (VL_BRIDGE, "action_head.vlln.weight"),
+    (DENOISE_STEP, "action_head.position_embedding.weight"),
+])
+def test_a_tensor_missing_from_the_checkpoint_fails_its_node_by_name(tmp_path, node, drop):
+    """Strict, per node: the parameter that would have served its random init
+    raises instead, and the message names the node, so a truncated or mismatched
+    checkpoint fails at startup rather than serving plausible actions."""
+    model, _ = _served(tmp_path, drop=drop)
+    with pytest.raises(ValueError, match=f"^{node}: 1 parameter"):
+        model.get_submodule(node)
+    assert node not in model._submodules
+
+
+@pytest.mark.parametrize("part", ["layers.1.self_attn.k_proj.weight", "layers.1.mlp.up_proj.weight"])
+def test_one_part_missing_from_a_fused_llm_parameter_fails_the_llm_by_name(tmp_path, part):
+    """A fused parameter counts as loaded once any of its parts lands, so a
+    checkpoint short of one of q/k/v or gate/up served those rows at random init
+    with no error. The part is named, since the fused parameter's name is not one
+    the checkpoint has."""
+    model, _ = _served(tmp_path, drop=_ROOTS[LLM] + part)
+    with pytest.raises(ValueError, match=rf"^LLM: 1 parameter.*{re.escape(part)}"):
+        model.get_submodule(LLM)
+    assert LLM not in model._submodules
+
+
 
 
 # ----------------------------------------------------------------------------
@@ -1622,13 +1720,17 @@ def test_the_five_nodes_build_at_the_checkpoints_widths_on_meta():
     is a dimension that only disagrees at the checkpoint's own numbers -- a stack
     whose width is read from the wrong field happens to line up at a square tiny
     config and raises here.
+
+    Built with the loader stubbed: loading reads the whole checkpoint into tensors
+    ``meta`` discards. What loading does is checked on the tiny checkpoint above.
     """
     model = _model(Gr00tN17Config.from_hf(_GR00T, _BACKBONE))
+    model._repo_dir = _GR00T
     with torch.device("meta"):
-        for name, cls in _SUBMODULES.items():
-            assert type(model.get_submodule(name)) is cls
+        built = {name: _unloaded(model, name) for name in _SUBMODULES}
+    assert {name: type(sub) for name, sub in built.items()} == _SUBMODULES
 
-    dt = model.get_submodule(DENOISE_STEP)
+    dt = built[DENOISE_STEP]
     assert len(dt.model.transformer_blocks) == 32
     assert sum(p.numel() for p in dt.parameters()) > 1_000_000_000
     assert all(p.device.type == "meta" for p in dt.parameters())
