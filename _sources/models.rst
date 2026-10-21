@@ -229,7 +229,7 @@ well as a KV allocation. Set ``gdn_state.max_slots`` in
 CUDA-graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint's
-``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
@@ -245,7 +245,7 @@ code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
 Its ``output_gate_type: swish`` names the gated DeltaNet norm's activation,
 which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
-the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
@@ -326,7 +326,7 @@ Qwen3-TTS notes
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
   own (first audio one Talker step after prefill), the next windows add 3, 8
   and 16 frames, then 25 new frames behind up to 72 frames of already decoded
-  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  left context, the decoder transformer's sliding window. The
   transformer stacks 8 such layers, so a window still differs slightly from a
   whole-utterance decode once an utterance outgrows the context; 25 frames of
   context differed far more. Each window size is a CUDA-graph bucket captured

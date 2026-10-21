@@ -938,7 +938,7 @@ well as a KV allocation. Set <code class="docutils literal notranslate"><span cl
 CUDA-graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint’s
-<code class="docutils literal notranslate"><span class="pre">mamba_ssm_dtype</span></code> (fp32 for the released checkpoints, as in vLLM);
+<code class="docutils literal notranslate"><span class="pre">mamba_ssm_dtype</span></code> (fp32 for the released checkpoints);
 <code class="docutils literal notranslate"><span class="pre">gdn_state.state_dtype:</span> <span class="pre">bfloat16</span></code> halves state traffic at some precision and
 needs FlashInfer’s fused bf16 decode kernel (K = V = 128).</p>
 <p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">seed</span></code> are the standard fields.
@@ -952,7 +952,7 @@ code, served from <code class="docutils literal notranslate"><span class="pre">c
 </div>
 <p>Its <code class="docutils literal notranslate"><span class="pre">output_gate_type:</span> <span class="pre">swish</span></code> names the gated DeltaNet norm’s activation,
 which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
-the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template’s new
 <code class="docutils literal notranslate"><span class="pre">reasoning_effort</span></code> and <code class="docutils literal notranslate"><span class="pre">preserve_thinking</span></code> are not forwarded: every
 request gets the template’s defaults (<code class="docutils literal notranslate"><span class="pre">xhigh</span></code> and preserved), whatever the
@@ -1034,7 +1034,7 @@ two kept in flight while the current one streams); set
 <li><p>Audio streams in a ramp of codec chunks: the first frame is decoded on its
 own (first audio one Talker step after prefill), the next windows add 3, 8
 and 16 frames, then 25 new frames behind up to 72 frames of already decoded
-left context, the decoder transformer’s sliding window (as vLLM-Omni). The
+left context, the decoder transformer’s sliding window. The
 transformer stacks 8 such layers, so a window still differs slightly from a
 whole-utterance decode once an utterance outgrows the context; 25 frames of
 context differed far more. Each window size is a CUDA-graph bucket captured

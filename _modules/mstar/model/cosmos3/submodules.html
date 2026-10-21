@@ -3540,8 +3540,8 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># deployment's conditioning_resize recipe: "stretch" is the</span>
             <span class="c1"># diffusers VideoProcessor resize-normalize the Nano/Super</span>
             <span class="c1"># checkpoints were validated against (also what the action modes</span>
-            <span class="c1"># use for their repeated frame), "aspect_crop" the diffusers 0.40 /</span>
-            <span class="c1"># vLLM-Omni cover-scale + center-crop recipe of the Edge yamls.</span>
+            <span class="c1"># use for their repeated frame), "aspect_crop" the diffusers 0.40</span>
+            <span class="c1"># cover-scale + center-crop recipe of the Edge yamls.</span>
             <span class="k">if</span> <span class="n">is_action</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">conditioning_resize</span> <span class="o">==</span> <span class="s2">"stretch"</span><span class="p">:</span>
                 <span class="n">frame</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_video_processor</span><span class="o">.</span><span class="n">preprocess</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">height</span><span class="o">=</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="n">width</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                     <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span>

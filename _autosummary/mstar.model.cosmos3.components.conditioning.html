@@ -660,8 +660,8 @@ resolution, and both are served:</p>
 a plain bilinear resize to <code class="docutils literal notranslate"><span class="pre">(height,</span> <span class="pre">width)</span></code>, aspect ratio not preserved,
 values mapped to [-1, 1] without 8-bit rounding. What the Nano checkpoints
 were validated against.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">aspect_crop</span></code> — the diffusers 0.40 pipeline (<code class="docutils literal notranslate"><span class="pre">_preprocess_conditioning_image</span></code>)
-and the vLLM-Omni recipe: scale so the image covers the target
+<li><p><code class="docutils literal notranslate"><span class="pre">aspect_crop</span></code> — the diffusers 0.40 pipeline (<code class="docutils literal notranslate"><span class="pre">_preprocess_conditioning_image</span></code>):
+scale so the image covers the target
 (<code class="docutils literal notranslate"><span class="pre">max(width</span> <span class="pre">/</span> <span class="pre">w,</span> <span class="pre">height</span> <span class="pre">/</span> <span class="pre">h)</span></code>), antialiased bilinear resize to the ceiled
 size, center crop, round to 8-bit, then <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">/</span> <span class="pre">127.5</span> <span class="pre">-</span> <span class="pre">1</span></code>. The Edge model
 card’s recipe.</p></li>

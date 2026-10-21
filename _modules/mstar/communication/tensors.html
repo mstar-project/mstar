@@ -1215,8 +1215,8 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">AsyncMooncakeReader</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Background thread for non-blocking mooncake READ operations.</span>
 
-<span class="sd">    Follows SGLang's pattern: caller records CUDA event on default stream,</span>
-<span class="sd">    submits write task to thread pool. Worker thread waits on event via</span>
+<span class="sd">    The caller records a CUDA event on the default stream and</span>
+<span class="sd">    submits the write task to a thread pool. Worker thread waits on event via</span>
 <span class="sd">    dedicated CUDA stream, then does blocking mooncake PUTs.</span>
 <span class="sd">    The default stream is never blocked by store writes.</span>
 <span class="sd">    """</span>

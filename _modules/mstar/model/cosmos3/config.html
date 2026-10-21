@@ -1398,8 +1398,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># How an image-to-video conditioning frame reaches the generation size:</span>
     <span class="c1"># "stretch" (plain bilinear resize; the diffusers 0.39 pipeline the Nano</span>
     <span class="c1"># checkpoints were validated against) or "aspect_crop" (cover-scale,</span>
-    <span class="c1"># antialiased resize, center crop, 8-bit rounding; the diffusers 0.40 /</span>
-    <span class="c1"># vLLM-Omni recipe, set by the Edge yamls). See components/conditioning.py.</span>
+    <span class="c1"># antialiased resize, center crop, 8-bit rounding; the diffusers 0.40</span>
+    <span class="c1"># recipe, set by the Edge yamls). See components/conditioning.py.</span>
     <span class="n">conditioning_resize</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"stretch"</span>
     <span class="c1"># ``model_index.json``: the pipeline sets the UniPC schedule from</span>
     <span class="c1"># explicitly linspaced flow sigmas (1 - 1/T ... 0) instead of the</span>
