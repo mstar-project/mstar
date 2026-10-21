@@ -237,6 +237,8 @@ def run_arm(plan, row, arm, gpus: list[int], arm_dir: Path) -> dict:
 
         out = {}
         for wl in sweep.row_workloads(plan, row):
+            if sweep.skipped(plan, row, arm, wl):
+                continue
             cmd = [sys.executable, "-m", "benchmark.amd.reference", "diffusers", "--config",
                    catalog.mstar_config_name(row, "mstar"), "--worktree", str(plan.worktree),
                    "--family-opts", json.dumps(correctness.family_opts(wl, row)), "--repeats", str(plan.repeats),
