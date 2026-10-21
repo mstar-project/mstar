@@ -55,26 +55,12 @@ def euler_step(
     return x + dt * velocity
 
 
-def discretize_state(
-    state: torch.Tensor,
-    num_bins: int = 256,
-    value_min: float = -1.0,
-    value_max: float = 1.0,
-) -> torch.Tensor:
-    """Map continuous robot state values in [value_min, value_max] to bin indices.
+def discretize_state(state: torch.Tensor, num_bins: int = 256) -> torch.Tensor:
+    """Bin a normalized robot state the way openpi's PaligemmaTokenizer does.
 
-    Used by Pi0.5 to tokenize proprioceptive state into language tokens that
-    PaliGemma can embed alongside image and language tokens.
-
-    Args:
-        state: 1D tensor of state values.
-        num_bins: number of discrete bins.
-        value_min / value_max: assumed range of normalized state values.
-
-    Returns:
-        1D ``torch.long`` tensor of bin indices in ``[0, num_bins)``.
+    That is ``np.digitize(state, np.linspace(-1, 1, num_bins + 1)[:-1]) - 1``:
+    equal bins over [-1, 1], with values below -1 giving -1 and values at or
+    above 1 giving ``num_bins - 1``. lerobot's pi0.5 processor bins the same way.
     """
-    clamped = state.clamp(value_min, value_max)
-    normalized = (clamped - value_min) / (value_max - value_min)
-    indices = (normalized * (num_bins - 1)).round().to(torch.long)
-    return indices.clamp(0, num_bins - 1)
+    edges = torch.linspace(-1.0, 1.0, num_bins + 1, dtype=torch.float64, device=state.device)[:-1]
+    return torch.bucketize(state.to(torch.float64), edges, right=True) - 1
