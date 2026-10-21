@@ -1,5 +1,6 @@
 import itertools
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from typing import NamedTuple, Type
@@ -29,7 +30,7 @@ from mstar.graph.base import (
     top_level_entities,
 )
 from mstar.model.media_limits import VideoBudget, read_image
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import TEXT, PromptPart
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -110,6 +111,22 @@ class LabelLayout(NamedTuple):
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
         ]
+
+
+def prompt_spans(
+    plan: Iterable[PromptPart], texts: Sequence[torch.Tensor], text_walk: str,
+    item_spans: Callable[[PromptPart], Iterable[Span]],
+) -> list[Span]:
+    """A prompt's prefill writes in ``plan`` order: a text step's ids from ``texts``, and an
+    attachment's from ``item_spans``."""
+    spans = []
+    for step in plan:
+        if step.modality != TEXT:
+            spans.extend(item_spans(step))
+            continue
+        length = texts[step.index].numel()
+        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+    return spans
 
 
 class PrefixKeys(NamedTuple):

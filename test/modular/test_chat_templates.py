@@ -45,7 +45,7 @@ def _qwen3_5(path, text, in_mods, parts):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
     model = Qwen3_5DenseModel(path)
-    [ids] = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
+    [ids] = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts).new_input_tensors["text_inputs"]
     rendered = model.tokenizer.apply_chat_template(
         CHAT, tokenize=False, add_generation_prompt=True, enable_thinking=True,
     )
