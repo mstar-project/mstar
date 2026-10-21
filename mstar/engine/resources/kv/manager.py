@@ -144,7 +144,8 @@ class PrefixChain:
     done: int = 0
     consumed: int = 0
     probed: int | None = None
-    # The prompt's keys hashed under the root, kept from the first probe so a repeated probe hashes nothing.
+    # The prompt's keys hashed under the root, kept from the first probe (or a TP follower's
+    # first adopt poll) so a repeated one hashes nothing.
     # `rooted` has one key per page.
     # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
     rooted: list[bytes] | None = None
@@ -154,8 +155,6 @@ class PrefixChain:
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
-    # the first keys under the cache's root, hashed once for a TP follower's adopt polls
-    rooted: list[bytes] = field(default_factory=list)
 
     @classmethod
     def seed(
@@ -641,16 +640,28 @@ class KVManager(AttentionResource):
                 return None
             stream = self._ensure_label(rid, label)
             chain = stream.chain
-            if chain is None or chain.done == len(chain.spans):
+            if chain is None:
+                # its layout was dropped. 0, not None, while it holds nothing: another
+                # keyed resource's hit must not skip tokens this one lacks
+                if stream.stored_len or stream.offloaded or stream.read_pending:
+                    return None
+                return CachedPrefix(label, 0, 0)
+            if chain.done == len(chain.spans):
                 return None
             span = chain.spans[chain.done]
-            self._check_positions(span, graph_walk, inputs)
-            if span.walk != graph_walk or span.length != inputs.input_seq_len:
-                self._drop_layout(rid, label, stream, (
-                    f"{graph_walk} writes {inputs.input_seq_len} slots where its "
-                    f"layout's span {chain.done} has {span.walk} write {span.length}"
-                ))
-                return None
+            if inputs is None:
+                # rank 0 of a TP node deciding the step before it is prepared: the checks
+                # that read the inputs run as it is prepared, on every rank alike
+                if span.walk != graph_walk:
+                    return CachedPrefix(label, 0, 0)
+            else:
+                self._check_positions(span, graph_walk, inputs)
+                if span.walk != graph_walk or span.length != inputs.input_seq_len:
+                    self._drop_layout(rid, label, stream, (
+                        f"{graph_walk} writes {inputs.input_seq_len} slots where its "
+                        f"layout's span {chain.done} has {span.walk} write {span.length}"
+                    ))
+                    return CachedPrefix(label, 0, 0)
             if stream.converted:
                 return self._answer(label, chain, stream.stored_len)
             if stream.lease is not None:
@@ -666,13 +677,7 @@ class KVManager(AttentionResource):
             spans, ends = chain.spans, chain.rooted_ends
         total = sum(span.length for span in spans)
         if rooted is None:
-            # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
-            rooted = [fingerprint(self._prefix_root, key) for key in keys]
-            ends, at = [], 0
-            for span in spans:
-                at += span.length
-                if span.end_key is not None:
-                    ends.append((at, fingerprint(self._prefix_root, span.end_key)))
+            rooted, ends = self._root(keys, spans)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
@@ -711,6 +716,21 @@ class KVManager(AttentionResource):
                     return CachedPrefix(label, 0, 0)
                 stream.lease, stream.lease_len = matched, held
             return self._answer(label, chain, stream.lease_len)
+
+    def _root(
+        self, keys: list[bytes], spans: list[PrefixSpan],
+    ) -> tuple[list[bytes], list[tuple[int, bytes]]]:
+        """A chain's keys under the root, and each image end with the token it ends at.
+
+        Outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it.
+        """
+        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+        ends, at = [], 0
+        for span in spans:
+            at += span.length
+            if span.end_key is not None:
+                ends.append((at, fingerprint(self._prefix_root, span.end_key)))
+        return rooted, ends
 
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (
@@ -763,13 +783,19 @@ class KVManager(AttentionResource):
         stream.chain = None
 
     def cap_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, length: int,
-    ) -> int:
-        """Down to a whole page; the lease past it goes now, so a request that fails
-        before its step holds only what rank 0 told the other ranks."""
-        length = length // self.config.page_size * self.config.page_size
-        self.apply_cached_prefix(rid, node_name, graph_walk, None, length)
-        return length
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """Down to a whole page of the lease, at this stream's position there; the lease
+        past it goes now, so a request that fails before its step holds only what rank 0
+        told the other ranks."""
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            stream = None if label is None else self._streams.get(rid, {}).get(label)
+            if (stream is None or stream.lease is None or stream.stored_len
+                    or stream.chain is None):
+                return prefix
+            self.apply_cached_prefix(rid, node_name, graph_walk, None, prefix)
+            return self._answer(label, stream.chain, stream.lease_len)
 
     def cached_prefix_pages(
         self, rid: str, node_name: str, graph_walk: str, matched_len: int,
@@ -802,20 +828,21 @@ class KVManager(AttentionResource):
             need = matched_len // self.config.page_size
             if stream.converted or stream.lease is not None:
                 return True
-            if stream.stored_len or stream.offloaded or stream.read_pending:
+            chain = stream.chain
+            if stream.stored_len or stream.offloaded or stream.read_pending or chain is None:
                 raise RuntimeError(
                     f"KV {self.name}: rank 0 hit {matched_len} cached tokens for "
-                    f"{rid}/{label}, whose stream here already holds tokens")
-            chain = stream.chain
-            rooted = chain.rooted
-            # polled until this rank's commit catches up: hash the keys once
-            keys = None if len(rooted) >= need else list(chain.keys)[:need]
-        if keys is not None:
-            rooted = [fingerprint(self._prefix_root, key) for key in keys]
+                    f"{rid}/{label}, whose stream here already holds tokens or keeps no keys")
+            # polled until this rank's commit catches up: the keys are rooted on the first poll
+            rooted, ends = chain.rooted, chain.rooted_ends
+            keys, spans = (list(chain.keys), chain.spans) if rooted is None else (None, None)
+        if rooted is None:
+            rooted, ends = self._root(keys, spans)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
-            chain.rooted = rooted
+            if chain.rooted is None:
+                chain.rooted, chain.rooted_ends = rooted, ends
             matched = self._index.lookup(rooted[:need], stamp=False)
             if len(matched) < need:
                 return False
@@ -824,7 +851,8 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: prefix index diverged from rank 0 for "
                     f"{rid}/{label}: pages {matched[:4]}... here, {list(pages)[:4]}... there")
             self._arena.retain(matched)
-            stream.lease = matched
+            # what `admit` converts: the stream then holds this many tokens
+            stream.lease, stream.lease_len = matched, need * self.config.page_size
             return True
 
     def apply_cached_prefix(
