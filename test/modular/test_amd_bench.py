@@ -834,3 +834,124 @@ def test_phase_cells_cuts_one_window_per_concurrency(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         phase_cells.main(["--row", "whisper_large", "--workload", "text-chat-256", "--concurrency", "1",
                           "--gpus", "0", "--out", str(out), "--worktree", str(wt)])
+
+
+def test_image_to_video_requests_carry_the_first_frame(tmp_path):
+    import asyncio
+
+    from benchmark.base import ModelType, RequestType
+    from benchmark.dataset import SampleSetDataset
+    from benchmark.request import MediaRoutes, RequestMetrics
+
+    assert RequestType.I2V.get_output_modalities() == "video_file"
+    assert RequestType.I2V.get_input_modalities() == "image"
+    (tmp_path / "f.png").write_bytes(b"\x89PNG frame")
+    (tmp_path / "manifest.json").write_text(json.dumps({"items": [
+        {"id": "00", "prompt": "a cat", "files": {"image": "f.png"}, "params": {"seed": 0}}]}))
+    req = SampleSetDataset(str(tmp_path), 1, RequestType.I2V).get_requests()[0]
+    assert req.image_path.endswith("f.png") and req.model_kwargs == {"seed": 0}
+
+    sent = {}
+
+    class Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return sent.pop("reply")
+
+        async def read(self):
+            return b"mp4"
+
+    class Session:
+        def post(self, url, json=None, data=None, timeout=None):
+            sent["url"], sent["json"], sent["data"] = url, json, data
+            sent["reply"] = {"data": [{"b64_json": "AAAA"}]} if json is not None else {"id": "v1"}
+            return Resp()
+
+        def get(self, url, timeout=None):
+            sent["reply"] = {"status": "completed"}
+            return Resp()
+
+    model = ModelType.WAN22.inst()
+    routes = MediaRoutes()
+    metrics = RequestMetrics(request_id=0, type=RequestType.I2V, expected_output_modalities=["video_file"])
+    asyncio.run(routes._send_request_video_sync(Session(), req, "http://x", model, metrics, {"num_frames": 33}))
+    assert sent["url"].endswith("/v1/videos/generations")
+    assert sent["json"]["image"].startswith("data:image/png;base64,") and sent["json"]["num_frames"] == 33
+    metrics = RequestMetrics(request_id=0, type=RequestType.I2V, expected_output_modalities=["video_file"])
+    asyncio.run(routes._send_request_video_job(Session(), req, "http://x", model, metrics, {}))
+    parts = {f[0]["name"]: f for f in sent["data"]._fields}
+    assert "input_reference" in parts and parts["input_reference"][0].get("filename") == "f.png"
+
+
+def test_media_rows_workloads_and_request_settings():
+    from benchmark.amd import correctness
+
+    wt = Path(__file__).resolve().parents[2]
+    plan = type("P", (), {"correctness_src": wt, "worktree": wt,
+                          "workloads": [tables.WORKLOADS[w] for w in tables.TABLES["video"].workloads]})()
+    assert [w.name for w in sweep.row_workloads(plan, catalog.ROWS["cosmos3_edge"])] == ["video-t2v"]
+    assert [w.name for w in sweep.row_workloads(plan, catalog.ROWS["wan22"])] == ["video-t2v", "video-i2v"]
+    assert catalog.ROWS["wan22"].concurrency["video-t2v"] == (1, 2, 4)
+    i2v, t2v = tables.WORKLOADS["video-i2v"], tables.WORKLOADS["video-t2v"]
+    assert correctness.family_opts(i2v) == {"mode": "i2v"} and correctness.family_opts(t2v) == {}
+    # generator_device only to engines whose protocol takes it for the family
+    flux = catalog.ROWS["flux2_klein"]
+    assert correctness.media_request_kwargs(plan, flux, catalog.ARMS["vllm-omni"])["generator_device"] == "cpu"
+    assert "generator_device" not in correctness.media_request_kwargs(plan, flux, catalog.ARMS["mstar"])
+    cosmos = catalog.ROWS["cosmos3_nano"]
+    sg = correctness.media_request_kwargs(plan, cosmos, catalog.ARMS["sglang-diffusion"], t2v)
+    assert sg["generator_device"] == "cuda"
+    assert "generator_device" not in correctness.media_request_kwargs(plan, cosmos, catalog.ARMS["vllm-omni"], t2v)
+    edge = correctness.media_request_kwargs(plan, catalog.ROWS["cosmos3_edge"], catalog.ARMS["vllm-omni"], t2v)
+    assert edge["flow_shift"] == 12.0 and edge["num_frames"] == 33 and edge["num_inference_steps"] == 20
+    names = [a.name for a in catalog.arms_for(cosmos, list(tables.TABLES["video"].arms))]
+    assert "vllm-omni-rc" in names and "sglang-diffusion-compile" in names and "sglang-diffusion-bcg" not in names
+    assert "vllm-omni-rc" not in [a.name for a in catalog.arms_for(catalog.ROWS["wan22"],
+                                                                   list(tables.TABLES["video"].arms))]
+
+
+def test_first_size_requests_one_per_size(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_client(cmd, env, log_path):
+        sdir = Path(cmd[cmd.index("--sample-set-dir") + 1])
+        item = json.loads((sdir / "manifest.json").read_text())["items"][0]
+        calls.append((item["params"], json.loads(cmd[cmd.index("--request-kwargs") + 1]),
+                      cmd[cmd.index("--num-requests") + 1], cmd[cmd.index("--num-warmup") + 1]))
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        (out / "results.json").write_text(json.dumps({"per_request": [{"request_id": 0, "jct_ms": 1500.0}]}))
+        return 0, 0.1
+
+    monkeypatch.setattr(sweep, "run_client", fake_client)
+    plan = type("P", (), {})()
+    got = sweep.first_size_requests(plan, catalog.ARMS["vllm-omni"], catalog.ROWS["flux2_klein"],
+                                    tables.WORKLOADS["image-gen"], 8400, tmp_path / "a", [3], None,
+                                    {"num_inference_steps": 4})
+    assert got == {"1024x1024": 1.5, "1344x768": 1.5}
+    assert all(n == "1" and w == "0" for _, _, n, w in calls)
+    calls.clear()
+    got = sweep.first_size_requests(plan, catalog.ARMS["mstar"], catalog.ROWS["wan22"],
+                                    tables.WORKLOADS["video-i2v"], 8400, tmp_path / "b", [3], None,
+                                    {"height": 480, "width": 832})
+    assert got == {"832x480": 1.5} and len(calls) == 1
+
+
+def test_diffusers_reference_runs_each_workload_with_its_family_mode(tmp_path, monkeypatch):
+    from benchmark.amd import reference
+
+    seen = []
+    monkeypatch.setattr(reference, "_cell", lambda plan, row, arm, wl, arm_dir, cmd, gpus: seen.append(
+        (wl.name, json.loads(cmd[cmd.index("--family-opts") + 1]), cmd[cmd.index("--config") + 1])) or {})
+    plan = type("P", (), {"workloads": [tables.WORKLOADS[w] for w in ("video-t2v", "video-i2v")], "repeats": 3,
+                          "worktree": tmp_path, "correctness_src": tmp_path})()
+    reference.run_arm(plan, catalog.ROWS["cosmos3_nano"], catalog.ARMS["ref-diffusers"], [5], tmp_path / "arm")
+    assert seen == [("video-t2v", {}, "cosmos3_nano"), ("video-i2v", {"mode": "i2v"}, "cosmos3_nano")]
+    assert reference.run_arm(plan, catalog.ROWS["cosmos3_nano"], catalog.ARMS["ref-xdit"], [5], tmp_path / "x")[
+        "skipped"]

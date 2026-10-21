@@ -70,9 +70,14 @@ def load(src: Path):
     return type("WSK", (), mods)
 
 
-def _family(C, worktree: Path, config_name: str):
+def _family(C, worktree: Path, config_name: str, opts: dict | None = None):
     cfg = yaml.safe_load((worktree / "configs" / f"{config_name}.yaml").read_text()) or {}
-    return C.families.family_for_config(config_name, cfg.get("model"), cfg, {}), cfg
+    return C.families.family_for_config(config_name, cfg.get("model"), cfg, opts or {}), cfg
+
+
+def family_opts(wl) -> dict:
+    """The correctness family's options for a workload: image-to-video cells use the family's i2v mode."""
+    return {"mode": "i2v"} if wl is not None and wl.request_type == "image_to_video" else {}
 
 
 def _write_pass(C, fam, sset, responses, out_dir: Path, header: dict, cfg: dict) -> dict:
@@ -262,30 +267,39 @@ def _flow_shift(hf_id: str) -> float | None:
     return cfg.get("flow_shift")
 
 
-def media_request_kwargs(plan, row) -> dict:
-    """Settings every image or video request of a row carries: those of the row's correctness family,
-    so the timed outputs can be scored against its diffusers reference."""
+def media_request_kwargs(plan, row, arm=None, wl=None, worktree: Path | None = None) -> dict:
+    """Settings every image or video request of a row carries: those of the row's correctness family (its i2v mode
+    for image-to-video cells), so the timed outputs can be scored against its diffusers reference. The family's
+    request_extra (mstar serving knobs) goes to mstar arms only, and the row's generator_device to arms whose
+    protocol takes it."""
     C = load(plan.correctness_src or REPO)
-    fam, _ = _family(C, plan.worktree, row.name)
+    config = catalog.mstar_config_name(row, arm.name) if arm is not None else row.name
+    fam, _ = _family(C, worktree or plan.worktree, config, family_opts(wl))
     if row.family == "image":
         guidance = fam.guidance if fam.guidance is not None else (fam.ref_extra or {}).get("guidance_scale")
         kw = {"num_inference_steps": fam.steps, "guidance_scale": guidance}
     else:
+        # Where the serving recipe sets its own flow shift (Cosmos3 Edge), every engine gets that one.
+        shift = (getattr(fam, "ref_scheduler_kwargs", None) or {}).get("flow_shift") or _flow_shift(row.hf_id)
         kw = {"height": fam.height, "width": fam.width, "num_frames": fam.num_frames,
               "num_inference_steps": fam.steps, "fps": fam.fps, "guidance_scale": fam.guidance,
-              "negative_prompt": fam.negative_prompt, "flow_shift": _flow_shift(row.hf_id)}
+              "negative_prompt": fam.negative_prompt, "flow_shift": shift}
+    if arm is not None and arm.engine == "mstar":
+        kw.update(getattr(fam, "request_extra", None) or {})
+    if arm is not None and row.generator_device and row.family in arm.generator_device_for:
+        kw["generator_device"] = row.generator_device
     return {k: v for k, v in kw.items() if v is not None}
 
 
 # --- outputs of a timed run ---------------------------------------------------------------------
 
 def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Path, out_dir: Path,
-                   ext: str) -> dict:
+                   ext: str, opts: dict | None = None) -> dict:
     """The correctness pass of a TTS (wav), ASR (txt), image (png) or video (mp4) arm: its first timed
     run at concurrency 1, which sends every item of the set once, in order."""
     row = catalog.ROWS.get(row_name)
     config = catalog.mstar_config_name(row, arm_name) if row else row_name
-    fam, cfg = _family(C, worktree, config)
+    fam, cfg = _family(C, worktree, config, opts)
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     run = cell_dir / "a1r1"
     results = json.loads((run / "results.json").read_text())
@@ -313,7 +327,7 @@ def pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Pa
     ok = sum(r.ok for r in responses)
     header = {"config": config, "model": cfg.get("model"), "arm": arm_name, "restarts": 1, "concurrency": 1,
               "set": sset.name, "n_items": len(sset.items), "ok": ok, "failed": len(responses) - ok,
-              "source": str(run)}
+              "source": str(run), "family_opts": opts or {}}
     (out_dir / "pass.json").write_text(json.dumps(header, indent=1))
     return header
 
@@ -344,7 +358,7 @@ def _arm_tree(arm_dir: Path, default: Path) -> Path:
 
 def score_dir(C, worktree: Path, corr_dir: Path, device: str) -> dict:
     header = json.loads((corr_dir / "pass.json").read_text())
-    fam, _ = _family(C, worktree, header["config"])
+    fam, _ = _family(C, worktree, header["config"], header.get("family_opts"))
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     ref_dir = SETS_ROOT / "references" / fam.reference_id() / fam.set_name
     ref = ref_dir if fam.ref_outputs(ref_dir) is not None else None
@@ -395,6 +409,13 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
                     break
         if (corr / "pass.json").is_file():
             results[f"{info['row']}/{info['arm']}"] = score_dir(C, tree, corr, device)
+        # Image-to-video cells have their own pass, scored against the family's i2v reference.
+        cell = arm_dir / "cells" / "video-i2v" / "c1"
+        corr_i2v = arm_dir / "correctness-video-i2v"
+        if (cell / "a1r1" / "results.json").is_file() and not (corr_i2v / "pass.json").is_file():
+            pass_from_cell(C, tree, info["row"], info["arm"], cell, corr_i2v, "mp4", {"mode": "i2v"})
+        if (corr_i2v / "pass.json").is_file():
+            results[f"{info['row']}/{info['arm']}/video-i2v"] = score_dir(C, tree, corr_i2v, device)
     (run_dir / "correctness.json").write_text(json.dumps(results, indent=1, default=str))
     return results
 

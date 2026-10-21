@@ -350,21 +350,27 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 except Exception:
                     info["correctness_pass"] = {"error": traceback.format_exc()[-3000:]}
                     plan.log(f"{row.name}/{arm.name}: correctness pass failed, see arm.json")
-        request_kwargs = None
+        workloads = row_workloads(plan, row)
+        kwargs_by_wl: dict = {}
         if row.family in ("image", "video"):
             from benchmark.amd import correctness
             # The same steps, guidance, size and frames the correctness reference was made with.
-            request_kwargs = correctness.media_request_kwargs(plan, row)
-            info["request_kwargs"] = request_kwargs
+            for wl in workloads:
+                kwargs_by_wl[wl.name] = correctness.media_request_kwargs(plan, row, arm, wl,
+                                                                         arm_worktree(arm, plan.worktree, plan.trees))
+            info["request_kwargs"] = kwargs_by_wl
+            if arm.engine != "reference":
+                info["first_size"] = {wl.name: first_size_requests(plan, arm, row, wl, port, arm_dir, gpus, numa,
+                                                                   kwargs_by_wl[wl.name]) for wl in workloads}
+                plan.log(f"{row.name}/{arm.name}: first request per size {info['first_size']}")
         hlth.begin()
         if arm.engine == "reference":
             from benchmark.amd import reference
             info["reference"] = reference.run_arm(plan, row, arm, gpus, arm_dir)
         else:
-            for wl in plan.workloads:
-                if wl.family != row.family:
-                    continue
-                for c in wl.concurrency:
+            for wl in workloads:
+                request_kwargs = kwargs_by_wl.get(wl.name)
+                for c in row.concurrency.get(wl.name, wl.concurrency):
                     cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa, request_kwargs)
                     s = cell["summary"].get(wl.primary[0], {})
                     plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
@@ -389,6 +395,48 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
         info["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         summary_path.write_text(json.dumps(info, indent=1, default=str))
     return info
+
+
+def row_workloads(plan: Plan, row: Row) -> list[tables.Workload]:
+    """The run's workloads this row takes: its family's, limited to Row.workloads when the row names some."""
+    return [wl for wl in plan.workloads if wl.family == row.family and (not row.workloads or wl.name in row.workloads)]
+
+
+def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, port: int, arm_dir: Path,
+                        gpus: list[int], numa: int | None, request_kwargs: dict | None) -> dict:
+    """One untimed request per size of the workload's set, after startup and before any cell: an engine's first
+    request at a new size can pay minutes of JIT, autotune and VAE builds, which would otherwise land in the first
+    cell's warmup. Each is the row's first-size cost at that size (client e2e seconds, or the error)."""
+    set_dir = SETS_ROOT / "sets" / wl.prompts[4:]
+    manifest = json.loads((set_dir / "manifest.json").read_text())
+    pinned = bool(request_kwargs and request_kwargs.get("height") and request_kwargs.get("width"))
+    need = "image" if wl.request_type == "image_to_video" else None
+    picks: dict = {}
+    for it in manifest["items"]:
+        if need and need not in (it.get("files") or {}):
+            continue
+        p = it.get("params") or {}
+        size = (f"{request_kwargs['width']}x{request_kwargs['height']}" if pinned
+                else f"{p.get('width')}x{p.get('height')}")
+        picks.setdefault(size, it)
+    out = {}
+    for k, (size, it) in enumerate(picks.items()):
+        d = arm_dir / "first_size" / wl.name / f"s{k}"
+        sdir = d / "set"
+        sdir.mkdir(parents=True, exist_ok=True)
+        files = {m: str((set_dir / f).resolve()) for m, f in (it.get("files") or {}).items()}
+        (sdir / "manifest.json").write_text(json.dumps({"name": f"first-size-{wl.name}",
+                                                       "items": [{**it, "files": files}]}))
+        one = dataclasses.replace(wl, min_requests=1, waves=1)
+        cmd = runner_command(arm, row, one, 1, port, d, 0, request_kwargs=request_kwargs)
+        cmd[cmd.index("--sample-set-dir") + 1] = str(sdir)
+        if numa is not None:
+            cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
+        rc, _ = run_client(cmd, client_env(arm, row, gpus), d / "bench.log")
+        res = d / "results.json"
+        per = (json.loads(res.read_text()).get("per_request") or []) if res.is_file() else []
+        out[size] = round(per[0]["jct_ms"] / 1000.0, 2) if rc == 0 and per else f"failed (rc {rc}, see {d})"
+    return out
 
 
 def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
