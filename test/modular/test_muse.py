@@ -23,7 +23,6 @@ from mstar.model.loader.base import _apply_stacked
 from mstar.model.muse.components.text import (
     GatedQKVParallelLinear,
     MuseGlimmerForCausalLM,
-    unit_rms,
 )
 from mstar.model.muse.components.vision import (
     _interpolation,
@@ -45,6 +44,12 @@ from mstar.model.muse.weight_loader import (
 )
 
 N_LAYERS = 8
+
+
+def unit_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """The reference's weightless RMSNorm, in fp32 (the test's own copy)."""
+    xf = x.float()
+    return (xf * torch.pow(xf.pow(2).mean(-1, keepdim=True) + eps, -0.5)).to(x.dtype)
 SLIDING = ["sliding_attention"] * 3 + ["full_attention"]
 
 
@@ -86,6 +91,83 @@ def ckpt_dir(tmp_path):
 # --- config -------------------------------------------------------------------
 
 
+def _write(tmp_path, raw):
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    return tmp_path
+
+
+@pytest.mark.parametrize("key", ["num_experts", "n_routed_experts", "moe_intermediate_size"])
+def test_a_mixture_of_experts_config_is_refused(tmp_path, key):
+    raw = _raw_config()
+    raw["text_config"][key] = 8
+    with pytest.raises(ValueError, match="MoE"):
+        MuseGlimmerConfig.from_hf(_write(tmp_path, raw))
+
+
+@pytest.mark.parametrize("change", ["rotated full layer", "other theta"])
+def test_rope_off_the_sliding_layers_or_at_another_theta_is_refused(tmp_path, change):
+    raw = _raw_config()
+    thetas = raw["text_config"]["layer_rope_theta"]
+    if change == "rotated full layer":
+        thetas[3] = 5e5
+    else:
+        thetas[0] = 1e4
+    with pytest.raises(ValueError, match="rope theta"):
+        MuseGlimmerConfig.from_hf(_write(tmp_path, raw))
+
+
+@pytest.mark.parametrize("change, match", [
+    ({"projector_hidden_act": "silu"}, "adapter's activation"),
+    # the 30B's name for it
+    ({"text_config": {"hidden_activation": "gelu"}}, "MLP's activation"),
+    ({"text_config": {"layer_types": ["sliding_attention"] * N_LAYERS, "layer_rope_theta": [5e5] * N_LAYERS}},
+     "sliding and full attention layers, both"),
+    ({"text_config": {"rope_parameters": {"rope_theta": 5e5, "rope_type": "yarn", "factor": 8.0}}},
+     "rope is a default one"),
+    ({"vision_config": {"layer_types": ["window_attention"] * 3 + ["sliding_attention"]}},
+     "window and full attention layers"),
+], ids=["projector act", "mlp act", "all sliding", "scaled rope", "vision layer kind"])
+def test_a_checkpoint_fact_the_port_builds_in_is_checked(tmp_path, change, match):
+    raw = _raw_config()
+    for key, value in change.items():
+        raw[key] = {**raw[key], **value} if isinstance(value, dict) else value
+    path = _write(tmp_path, raw)
+    with pytest.raises(ValueError, match=match):
+        MuseGlimmerVisionConfig.from_hf(path)
+        MuseGlimmerConfig.from_hf(path)
+
+
+def test_the_root_adapter_and_image_token_fields_are_required(tmp_path):
+    for key in ("out_hidden_size", "projector_hidden_size", "image_token_id"):
+        raw = _raw_config()
+        del raw[key]
+        with pytest.raises(KeyError, match=key):
+            (MuseGlimmerVisionConfig if key != "image_token_id" else MuseGlimmerConfig).from_hf(
+                _write(tmp_path, raw)
+            )
+
+
+def test_a_config_reads_as_the_reference_s(tmp_path, caplog):
+    """An absent softcap, logit multiplier or query scale takes the reference
+    config's default, the vision tower's last norm the text stack's eps, and
+    a key this port does not read is named."""
+    raw = _raw_config()
+    for key in ("final_logit_softcapping", "output_multiplier", "qk_scale_factor"):
+        del raw["text_config"][key]
+    raw["text_config"]["rms_norm_eps"] = 1e-6
+    raw["text_config"]["attn_logit_softcapping"] = 50.0
+    with caplog.at_level("WARNING", logger="mstar.model.muse.config"):
+        cfg = MuseGlimmerConfig.from_hf(_write(tmp_path, raw))
+    assert "attn_logit_softcapping" in caplog.text
+    assert cfg.attn_scale == pytest.approx(3.87 / 4)
+    lm = MuseGlimmerForCausalLM(cfg)
+    torch.nn.init.normal_(lm.lm_head.weight)
+    x = torch.randn(3, 64)
+    head = lm.lm_head(x).float() * 0.19611613513818404
+    torch.testing.assert_close(lm.logits(x), 20.0 * torch.tanh(head / 20.0))
+    assert MuseGlimmerVisionConfig.from_hf(tmp_path).text_rms_norm_eps == 1e-6
+
+
 def test_config_reads_the_checkpoint(ckpt_dir):
     cfg = MuseGlimmerConfig.from_hf(ckpt_dir)
     assert cfg.sliding_layers == [True, True, True, False] * 2
@@ -95,14 +177,6 @@ def test_config_reads_the_checkpoint(ckpt_dir):
     assert cfg.stop_token_ids == {1, 7}
     vision = MuseGlimmerVisionConfig.from_hf(ckpt_dir)
     assert (vision.head_dim, vision.window_patches, vision.text_hidden_size) == (8, 4, 64)
-
-
-def test_a_rotated_full_layer_is_refused(ckpt_dir):
-    raw = _raw_config()
-    raw["text_config"]["layer_rope_theta"][3] = 5e5
-    (ckpt_dir / "config.json").write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="rotates exactly its sliding layers"):
-        MuseGlimmerForCausalLM(MuseGlimmerConfig.from_hf(ckpt_dir))
 
 
 # --- text stack against the reference layer -------------------------------------
@@ -392,6 +466,35 @@ def test_every_vision_parameter_has_a_checkpoint_tensor():
     assert vision_name_remapper("model.language_model.norm.weight") is None
 
 
+def test_a_checkpoint_tensor_with_no_parameter_here_is_refused(tmp_path):
+    """A weighted norm or a bias this port lacks would otherwise be dropped,
+    and the tower would run without it."""
+    from safetensors.torch import save_file
+
+    from mstar.model.muse.components.vision import MuseGlimmerVisionModel
+    from mstar.model.muse.weight_loader import load_vision_weights
+
+    tower = MuseGlimmerVisionModel(_vision_config())
+    prefixes = {
+        "adapter_fc1.": "model.vision_adapter.fc1.", "adapter_fc2.": "model.vision_adapter.fc2.",
+        "projection.": "model.vision_projection.",
+    }
+
+    def checkpoint_name(ours: str) -> str:
+        for prefix, theirs in prefixes.items():
+            if ours.startswith(prefix):
+                return theirs + ours[len(prefix):]
+        return "model.vision_tower." + ours
+
+    tensors = {checkpoint_name(n): p.detach().clone() for n, p in tower.named_parameters()}
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    load_vision_weights(tower, tmp_path)
+    tensors["model.vision_tower.layers.0.attn.q_norm.weight"] = torch.ones(8)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    with pytest.raises(ValueError, match="no parameter here"):
+        load_vision_weights(tower, tmp_path)
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_the_fused_gate_is_sharded_with_its_queries(rank):
     heads, kv_heads, hd, hidden = 4, 2, 3, 5
@@ -446,6 +549,47 @@ def model_dir(ckpt_dir):
     }))
     (ckpt_dir / "chat_template.jinja").write_text(TEMPLATE)
     return ckpt_dir
+
+
+@pytest.mark.parametrize("processor, match", [
+    ({"image_processor": {"merge_size": 3}}, "processor_config.json's merge_size"),
+    ({"image_processor": {"patch_size": 16}}, "processor_config.json's patch_size"),
+    # flat, not under "image_processor"
+    ({"temporal_patch_size": 1}, "processor_config.json's temporal_patch_size"),
+    # a renamed token cap would fall back to 4096
+    ({"image_processor": {"max_tokens": 1024}}, "processor_config.json's max_tokens"),
+    # no processor change: a tokenizer without <|image_start|>
+    (None, r"tokenizer has no \['<\|nope\|>'\]"),
+], ids=str)
+def test_a_checkpoint_intake_would_misread_is_refused(model_dir, monkeypatch, processor, match):
+    from mstar.model.muse import glimmer_model
+
+    if processor is None:
+        monkeypatch.setattr(glimmer_model, "IMAGE_START", "<|nope|>")
+    else:
+        (model_dir / "processor_config.json").write_text(json.dumps(processor))
+    with pytest.raises(ValueError, match=match):
+        glimmer_model.MuseGlimmerModel(str(model_dir))
+
+
+def test_the_tokenizer_s_eot_stops_without_a_generation_config(model_dir):
+    from mstar.model.muse import glimmer_model
+
+    (model_dir / "generation_config.json").unlink()
+    # the config's eos and the tokenizer's <|eot|>
+    assert glimmer_model.MuseGlimmerModel(str(model_dir)).config.stop_token_ids == {1, SPECIALS.index("<|eot|>")}
+
+
+def test_a_processor_config_naming_its_classes_is_read(model_dir):
+    """``processor_class`` and ``auto_map`` name the transformers classes, not
+    a setting intake builds in."""
+    from mstar.model.muse import glimmer_model
+
+    (model_dir / "processor_config.json").write_text(json.dumps({
+        "processor_class": "MuseGlimmerProcessor", "auto_map": {"AutoProcessor": "x.MuseGlimmerProcessor"},
+        "max_image_tokens": 1024,
+    }))
+    assert glimmer_model.MuseGlimmerModel(str(model_dir))._processor["max_tokens"] == 1024
 
 
 # `enable_thinking: false`, which the chat clients send, is the template's "low"

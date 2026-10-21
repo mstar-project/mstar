@@ -20,12 +20,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.components.vit import (
     AxialVisionRope,
     RaggedVisionAttention,
     bilinear_table_taps,
 )
-from mstar.model.muse.components.text import unit_rms
 from mstar.model.muse.config import (
     VISION_FULL,
     VISION_WINDOW,
@@ -151,7 +151,7 @@ class VisionMLP(nn.Module):
     def __init__(self, config: MuseGlimmerVisionConfig):
         super().__init__()
         if config.hidden_act != "gelu":
-            raise NotImplementedError(f"vision activation {config.hidden_act!r}")
+            raise ValueError(f"the vision MLP's activation is gelu here, not {config.hidden_act!r}")
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
@@ -206,8 +206,8 @@ class MuseGlimmerVisionModel(nn.Module):
         self.adapter_fc1 = nn.Linear(merged, config.projector_hidden_size, bias=False)
         self.adapter_fc2 = nn.Linear(config.projector_hidden_size, config.projector_hidden_size, bias=False)
         self.projection = nn.Linear(config.projector_hidden_size, config.text_hidden_size, bias=False)
-        # hard-coded in the reference, not `layer_norm_eps`
-        self.out_eps = 1e-5
+        # the text stack's eps, as in the reference
+        self.out_eps = config.text_rms_norm_eps
 
     def embed(
         self, pixel_values: torch.Tensor, interp_indices: torch.Tensor,
@@ -230,13 +230,14 @@ class MuseGlimmerVisionModel(nn.Module):
         return x
 
     def project(self, x: torch.Tensor, output_index: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
-        """``ln_post``, the 2x2 pixel shuffle and the adapter.
+        """``ln_post``, the ``merge_size`` x ``merge_size`` pixel shuffle and the adapter.
 
-        The shuffle interleaves channels (``out[c * 4 + k] = x_k[c]``), not
-        concatenates them, which is the layout the adapter was trained on.
+        The shuffle interleaves channels (``out[c * m + k] = x_k[c]``, ``m =
+        merge_size ** 2``), not concatenates them, which is the layout the
+        adapter was trained on.
         """
         x = self.ln_post(x)[output_index]
-        d = x.shape[-1]
-        x = x.view(-1, 4, d).transpose(1, 2).reshape(-1, 4 * d)
+        d, m = x.shape[-1], self.config.merge_size ** 2
+        x = x.view(-1, m, d).transpose(1, 2).reshape(-1, m * d)
         x = F.gelu(self.adapter_fc2(F.gelu(self.adapter_fc1(x))))
-        return unit_rms(self.projection(x), self.out_eps)
+        return rms_norm_no_weight(self.projection(x), self.out_eps)

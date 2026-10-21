@@ -29,6 +29,7 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
+from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.muse.config import (
     ATTN_FULL,
     ATTN_SLIDING,
@@ -36,12 +37,6 @@ from mstar.model.muse.config import (
     ROPE,
     MuseGlimmerConfig,
 )
-
-
-def unit_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """Weightless RMSNorm over the last dim, in fp32 as the reference does."""
-    xf = x.float()
-    return (xf * torch.pow(xf.pow(2).mean(-1, keepdim=True) + eps, -0.5)).to(x.dtype)
 
 
 class GatedQKVParallelLinear(QKVParallelLinear):
@@ -116,8 +111,8 @@ class MuseGlimmerAttention(nn.Module):
         q, gate, k, v = self.qkvg_proj(hidden_states).split(
             [q_dim, q_dim, kv_dim, kv_dim], dim=-1,
         )
-        q = unit_rms(q.reshape(n, self.num_heads, self.head_dim), self.eps)
-        k = unit_rms(k.reshape(n, self.num_kv_heads, self.head_dim), self.eps)
+        q = rms_norm_no_weight(q.reshape(n, self.num_heads, self.head_dim), self.eps)
+        k = rms_norm_no_weight(k.reshape(n, self.num_kv_heads, self.head_dim), self.eps)
         v = v.reshape(n, self.num_kv_heads, self.head_dim)
         if self.pos is not None:
             # plain NEOX rope; no llama-3.1 scaling arguments
@@ -149,12 +144,6 @@ class MuseGlimmerTextModel(nn.Module):
         if comm_group is None:
             comm_group = CommGroup.trivial()
         sliding = config.sliding_layers
-        for i, (is_sliding, theta) in enumerate(zip(sliding, config.layer_rope_theta, strict=True)):
-            if is_sliding != bool(theta):
-                raise ValueError(
-                    f"layer {i}: Muse Glimmer rotates exactly its sliding layers, "
-                    f"but it is {config.layer_types[i]} with rope theta {theta}"
-                )
         self.config = config
         self.comm_group = comm_group
         self.embed_tokens = VocabParallelEmbedding(
@@ -170,7 +159,7 @@ class MuseGlimmerTextModel(nn.Module):
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Token embeddings enter the stack at unit RMS, as image ones do."""
-        return unit_rms(self.embed_tokens(input_ids), self.config.rms_norm_eps)
+        return rms_norm_no_weight(self.embed_tokens(input_ids), self.config.rms_norm_eps)
 
     def forward(self, hidden: torch.Tensor, *, label: str) -> torch.Tensor:
         for idx in self._bind_through:
@@ -204,7 +193,7 @@ class MuseGlimmerForCausalLM(nn.Module):
             gather_output=True,
         )
         self._cap = config.final_logit_softcapping
-        self._scale = config.output_multiplier / self._cap
+        self._multiplier = config.output_multiplier
 
     # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
 
@@ -221,4 +210,5 @@ class MuseGlimmerForCausalLM(nn.Module):
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """``cap * tanh(lm_head(x) * output_multiplier / cap)``, in fp32."""
-        return self._cap * torch.tanh(self.lm_head(hidden).float() * self._scale)
+        x = self.lm_head(hidden).float() * self._multiplier
+        return self._cap * torch.tanh(x / self._cap)

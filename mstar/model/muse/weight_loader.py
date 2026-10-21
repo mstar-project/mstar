@@ -7,6 +7,7 @@ projection load into one module, as one node.
 """
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import torch
@@ -50,20 +51,15 @@ def vision_name_remapper(name: str) -> str | None:
 
 
 def _load(model, path, device, remapper, selectors, stacked=None) -> set[str]:
-    """Fill every parameter of ``model``, or raise: a half-loaded tower
-    produces plausible garbage."""
-    loaded: set[str] = set()
-    for selector in selectors:
-        loaded |= load_weights_into(
-            model,
-            iter_safetensors_shards(Path(path), device=device, **selector),
-            name_remapper=remapper,
-            stacked_params=stacked,
-        )
-    missing = sorted({n for n, _ in model.named_parameters()} - loaded)
-    if missing:
-        raise ValueError(f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
-    return loaded
+    """Fill every parameter of ``model`` from tensors that all have one, or
+    raise: a half-loaded tower, or a checkpoint tensor this port has no
+    parameter for (a weighted norm, a bias), produces plausible garbage."""
+    weights = itertools.chain.from_iterable(
+        iter_safetensors_shards(Path(path), device=device, **selector) for selector in selectors
+    )
+    return load_weights_into(
+        model, weights, stacked_params=stacked, name_remapper=remapper, strict=True,
+    )
 
 
 def load_text_weights(

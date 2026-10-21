@@ -23,6 +23,8 @@ IMAGE_START = "<|image_start|>"
 IMAGE_END = "<|image_end|>"
 # the template writes one per image; the prompt expands it to the image's tokens
 IMAGE_PAD = "<|patch|>"
+# ends the assistant's turn
+EOT = "<|eot|>"
 
 
 def load_tokenizer(local_dir: str | Path):

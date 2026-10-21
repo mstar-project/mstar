@@ -5,6 +5,7 @@ Two nodes, ``vision_encoder`` and ``LLM``. Text-only prompts prefill on
 encodes every image and prefills the whole interleaving as one row. Decode is a
 loop over the LLM.
 """
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from mstar.model.muse.config import (
     MuseGlimmerVisionConfig,
 )
 from mstar.model.muse.processing import (
+    EOT,
     IMAGE_END,
     IMAGE_PAD,
     IMAGE_START,
@@ -52,6 +54,13 @@ from mstar.utils.fast_tokenize import encode_ids
 logger = logging.getLogger(__name__)
 
 _REASONING_STRENGTHS = ("low", "medium", "high", "xhigh")
+# what `preprocess_image` builds in, besides the patch geometry: RGB, Lanczos
+# (PIL's 1), then (x / 255 - 0.5) / 0.5
+_IMAGE_PROCESSOR = {
+    "image_processor_type": "MuseGlimmerImageProcessor",
+    "do_convert_rgb": True, "do_resize": True, "do_rescale": True, "do_normalize": True,
+    "resample": 1, "rescale_factor": 1 / 255, "image_mean": [0.5] * 3, "image_std": [0.5] * 3,
+}
 
 
 class MuseGlimmerModel(MultimodalDecoderModel):
@@ -66,9 +75,14 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         self.config = MuseGlimmerConfig.from_hf(self.local_dir)
         self.vision_config = MuseGlimmerVisionConfig.from_hf(self.local_dir)
         self.tokenizer = load_tokenizer(self.local_dir)
-        self._image_pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD)
-        self._image_start_id = self.tokenizer.convert_tokens_to_ids(IMAGE_START)
-        self._image_end_id = self.tokenizer.convert_tokens_to_ids(IMAGE_END)
+        ids = {t: self.tokenizer.convert_tokens_to_ids(t) for t in (IMAGE_PAD, IMAGE_START, IMAGE_END)}
+        unknown = [t for t, i in ids.items() if i is None or i == self.tokenizer.unk_token_id]
+        if unknown:
+            raise ValueError(f"the tokenizer has no {unknown}; this checkpoint cannot take images")
+        self._image_pad_id, self._image_start_id, self._image_end_id = ids.values()
+        eot = self.tokenizer.convert_tokens_to_ids(EOT)
+        if eot is not None and eot != self.tokenizer.unk_token_id:
+            self.config.eot_token_id = eot
         # the vision tower, whose output fills the images' pads in prompt order
         self.media = (MediaIntake(
             "image", vision_encoder((self._image_pad_id,)), self._image_pad_id, self._image_intake,
@@ -87,16 +101,30 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         self._processor = self._read_processor_config()
 
     def _read_processor_config(self) -> dict:
-        import json
-
-        path = Path(self.local_dir) / "processor_config.json"
-        image = json.loads(path.read_text()).get("image_processor", {}) if path.exists() else {}
-        return {
-            "patch_size": image.get("patch_size", 14),
-            "merge_size": image.get("merge_size", 2),
-            "temporal_patch_size": image.get("temporal_patch_size", 2),
-            "max_tokens": image.get("max_image_tokens", 4096),
+        """`preprocess_image`'s arguments: the patch geometry is the tower's,
+        and the token cap the processor's, 4096 where it sets none. A
+        ``processor_config.json`` key that disagrees with what intake builds
+        in, or that it does not read, is refused."""
+        vision = self.vision_config
+        sizes = {
+            "patch_size": vision.patch_size,
+            "merge_size": vision.merge_size,
+            "temporal_patch_size": vision.patch_temporal,
         }
+        path = Path(self.local_dir) / "processor_config.json"
+        raw = json.loads(path.read_text()) if path.exists() else {}
+        # under "image_processor", or flat
+        image = raw.get("image_processor", raw)
+        ours = {**_IMAGE_PROCESSOR, **sizes}
+        for key, value in image.items():
+            # the token cap is read below; the others name the HF classes, not a setting
+            if key in ("max_image_tokens", "processor_class", "auto_map"):
+                continue
+            if key not in ours:
+                raise ValueError(f"processor_config.json's {key} is not one this port reads")
+            if value != ours[key]:
+                raise ValueError(f"processor_config.json's {key} is {value}, this port's {ours[key]}")
+        return {**sizes, "max_tokens": image.get("max_image_tokens", 4096)}
 
     # -----------------------------------------------------------------------
     # Resources
