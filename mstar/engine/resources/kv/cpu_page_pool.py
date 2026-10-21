@@ -180,6 +180,12 @@ class CPUPagePool:
         stream.wait_stream(torch.cuda.current_stream())
         self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
 
+    def record(self) -> torch.cuda.Event:
+        """An event that completes once every copy queued so far has landed."""
+        event = torch.cuda.Event()
+        event.record(self._get_stream())
+        return event
+
     def pop(self, rid: str, label: str) -> OffloadedStream | None:
         state = self.offloaded.get(rid, {}).pop(label, None)
         if state is not None and not self.offloaded[rid]:
