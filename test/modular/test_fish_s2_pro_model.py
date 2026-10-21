@@ -497,7 +497,7 @@ def test_eos_is_not_sampled_on_the_prefill_frame_or_with_ignore_eos():
     rows = torch.zeros(3, ar.eos_code + 1, dtype=torch.float64)
     rows[:, ar.eos_code], rows[:, 7] = 2.0, 1.0
     ar.slow_ar.semantic_logits = lambda hidden: rows.clone()
-    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
+    sampler = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
     engine_inputs = SimpleNamespace(request_ids=["p", "d", "i"], resources={AR_SAMPLER: sampler})
     packed = ar.preprocess("ar_decode", engine_inputs, [ignoring, decode, ignoring])
     out = ar._run_frame(
