@@ -80,6 +80,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--make-reference", action="store_true", help="build the reference first if it is missing")
     ap.add_argument("--reference-only", action="store_true", help="build the reference and exit (no server)")
     ap.add_argument("--rescore", type=Path, default=None, help="re-score an existing run dir (no server)")
+    ap.add_argument("--rescore-out", type=Path, default=None,
+                    help="with --rescore, write the report and scoring/ here instead of into the run dir")
     ap.add_argument("--no-node-health", action="store_true")
     return ap.parse_args(argv)
 
@@ -174,7 +176,12 @@ def main(argv=None) -> int:
                       protocol=fam.protocol(), rescored=_now(), family_opts=fam.opts)
         header["finished"] = _now()
         runs = [run_dir / name for name in (prev.get("runs") or {f"r{k}": None for k in range(1, restarts + 1)})]
-        return _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device)
+        out_dir = run_dir
+        if args.rescore_out:
+            out_dir = args.rescore_out.resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            header["rescored_from"] = str(run_dir)
+        return _score_and_report(fam, sset, runs, ref_dir, out_dir, header, device)
 
     restarts = args.restarts or fam.default_restarts
     concurrency = args.concurrency or fam.default_concurrency
