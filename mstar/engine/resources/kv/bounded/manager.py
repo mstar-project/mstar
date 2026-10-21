@@ -54,6 +54,8 @@ class BoundedKVManager(Resource):
     def build(cls, spec: BoundedKVSpec, info: EngineResourceInfo) -> "BoundedKVManager":
         if info.joint_comm_group is not None and info.joint_comm_group.world_size > 1:
             raise NotImplementedError("bounded KV does not shard across ranks yet")
+        if spec.config.dtype is None:
+            spec.config.dtype = info.kv_dtype if info.kv_dtype is not None else torch.get_default_dtype()
         return cls(spec.config, info.device)
 
     def __init__(self, config: BoundedKVConfig, device: torch.device):
