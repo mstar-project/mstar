@@ -20,11 +20,12 @@ name: Claude Review
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
-#   4. Write permission is pull-requests only, and the model has no shell and no
-#      mutation tools: it posts inline comments through the action's tool (which
-#      redacts secrets) and returns the summary as fields, which a workflow step
-#      renders, redacts and posts. The worst case for a prompt injection is a
-#      bad comment.
+#   4. The job's token can write only to pull requests, and the review app's
+#      token (below) only to pull requests and issues of this repository. The
+#      model has no shell and no mutation tools: it posts inline comments
+#      through the action's tool (which redacts secrets) and returns the summary
+#      as fields, which a workflow step renders, redacts and posts. The worst
+#      case for a prompt injection is a bad comment.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 
@@ -179,12 +180,29 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The bot posts as the mstar-review GitHub App, with the M* logo, rather
+      # than as github-actions. Until the app's client ID and key are set
+      # (README), the steps below post with the job's own token instead.
+      - name: Mint the review app's token
+        if: steps.pre.outputs.run == 'true' && vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          # Reacting to a conversation comment needs issues: write.
+          permission-issues: write
+          permission-pull-requests: write
+
       # Tell the commenter their /review was picked up; a comment-triggered run
       # is otherwise invisible from the PR.
       - name: Acknowledge the /review comment
         if: steps.pre.outputs.run == 'true' && github.event_name == 'issue_comment'
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           COMMENT_ID: ${{ github.event.comment.id }}
         run: gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null
 
@@ -240,7 +258,8 @@ jobs:
           name="claude-review-session-$PR"
           fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
           open_ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
+              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
             || fail "the PR's comments couldn't be read; try \`/review continue\` again"
           [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (sessions are kept for 7 days); comment \`/review\` for a new one"
           found=""
@@ -362,10 +381,10 @@ jobs:
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # The job's own token (pull-requests: write, above). Without it the
-          # action tries to mint a Claude GitHub App token over OIDC, which needs
-          # `id-token: write` and the app installed, and fails before reviewing.
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # The review app's token, or the job's own. Without a token the action
+          # tries to mint a Claude GitHub App token over OIDC, which needs
+          # `id-token: write` and that app installed, and fails before reviewing.
+          github_token: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           # Empty for anyone with write access. Otherwise the PR author alone,
           # set by the preflight; the action then also scrubs secrets from any
           # subprocess environment.
@@ -404,6 +423,7 @@ jobs:
         id: salvage
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           EVENT: ${{ github.event_name }}
         run: |
           f="$RUNNER_TEMP/claude-execution-output.json"
@@ -473,6 +493,7 @@ jobs:
         id: post
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
@@ -498,7 +519,8 @@ jobs:
           url=$(gh pr comment "$PR" --repo "$REPO" --body-file summary.md)
           echo "id=${url##*-}" >> "$GITHUB_OUTPUT"
           for id in $(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- claude-review-incomplete -->"))) | .id' 2> /dev/null); do
+              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id' 2> /dev/null); do
             printf '<!-- claude-review-incomplete-resolved -->\nAn earlier review run didn'"'"'t complete; a later run finished: %s\n' "$url" > resolved.md
             gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@resolved.md > /dev/null || true
           done
@@ -511,6 +533,7 @@ jobs:
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           NEW_ID: ${{ steps.post.outputs.id }}
         run: |
           gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
@@ -521,7 +544,7 @@ jobs:
                   nodes { id databaseId isMinimized author { login } body }
                 } } } }' > comments.json
           for node in $(jq -r --arg new "$NEW_ID" '.data.repository.pullRequest.comments.nodes[] |
-              select(.author.login == "github-actions" and (.isMinimized | not) and (.databaseId | tostring) != $new and
+              select((.author.login == "mstar-review" or .author.login == "github-actions") and (.isMinimized | not) and (.databaseId | tostring) != $new and
                 ((.body | startswith("<!-- claude-review-summary -->")) or (.body | startswith("### Automated review"))))
               | .id' comments.json); do
             gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
@@ -536,6 +559,7 @@ jobs:
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
         run: |
           types=()
@@ -620,6 +644,7 @@ jobs:
            (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why || 'a step failed' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
@@ -645,7 +670,7 @@ jobs:
             cat partial.md >> failed.md
           fi
           id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq ".[] |
-            select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" 2> /dev/null | tail -n 1)
+            select((.user.login == \"mstar-review[bot]\" or .user.login == \"github-actions[bot]\") and (.body | startswith(\"$marker\"))) | .id" 2> /dev/null | tail -n 1)
           if [ -n "$id" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@failed.md > /dev/null
           else

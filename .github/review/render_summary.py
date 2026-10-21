@@ -18,7 +18,8 @@ import sys
 
 # Lets the workflow find earlier summaries to hide as outdated.
 MARKER = "<!-- claude-review-summary -->"
-BOT = "github-actions"
+# The bot's GraphQL logins: the review app's, and github-actions', which it posted as before the app.
+BOTS = ("mstar-review", "github-actions")
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
@@ -58,7 +59,7 @@ def open_priorities(pages):
                 continue
             first = thread["comments"]["nodes"][0]
             match = TAG.match(first["body"])
-            if match and first["author"] and first["author"]["login"] == BOT:
+            if match and first["author"] and first["author"]["login"] in BOTS:
                 found.append(match[1])
     return found
 
