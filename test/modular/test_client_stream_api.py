@@ -65,6 +65,9 @@ class _ListeningModel:
     def max_input_files(self):
         return {}
 
+    def prefix_key_streams(self):
+        return {}
+
     def get_partition_topology(self):
         return PartitionTopology(partitions=["Ear"], connections=[
             Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
@@ -980,11 +983,20 @@ def test_an_append_the_model_routes_to_an_ended_stream_is_answered_as_late(monke
         {"request_id": "call", "output_modalities": "text"},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
     ])
-    asyncio.run(_serve(ws, until=lambda: ws.sent))
+    calls_at_the_reply = []
+
+    def answered():
+        if ws.sent and not calls_at_the_reply:
+            calls_at_the_reply.append(list(fake.calls))
+        return ws.sent
+
+    asyncio.run(_serve(ws, until=answered))
 
     (late,) = ws.sent
     assert late == {"request_id": "call", "append": True, "error": "the call's 'video_in' input has ended"}
-    assert not any(c[0] == "abort" for c in fake.calls)
+    # the late reply leaves the call running; only the socket's close, after it, aborts the call
+    assert not any(c[0] == "abort" for c in calls_at_the_reply[0])
+    assert [c for c in fake.calls if c[0] == "abort"] == [("abort", "call")] and fake.calls[-1] == ("abort", "call")
 
 
 def test_what_an_append_record_carries_never_opens_a_request(monkeypatch, tmp_path):

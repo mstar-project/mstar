@@ -324,6 +324,8 @@ def test_a_live_call_takes_both_append_forms(monkeypatch, tmp_path, record):
         msgs = _recv_until_finish(ws, binary=False)
 
     assert not any("error" in m for m in msgs)
-    assert fake.appends == [
-        ("call", ["audio"], True, {"text": None, "file_streams": None, "model_kwargs": None}),
-    ]
+    [(key, streams, end_input, append)] = fake.appends
+    assert callable(append.pop("on_late"))  # how the data worker answers a late append
+    assert (key, streams, end_input, append) == (
+        "call", ["audio"], True, {"text": None, "file_streams": None, "model_kwargs": None},
+    )
