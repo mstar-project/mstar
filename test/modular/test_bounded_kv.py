@@ -411,6 +411,29 @@ def test_constant_retention_compares_by_value():
     assert config(SinkWindow(0, 70)).retention_for(3) == config(lambda n: SinkWindow(0, 70)).retention_for(3)
 
 
+def test_plan_resolves_retention_once_per_source_len():
+    """The policy is resolved when the config is built, not per row per step."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+
+    calls = []
+
+    def retention(n):
+        calls.append(n)
+        return SinkWindow(0, WINDOW)
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
+                             retention=retention, max_slots=4)
+    mgr = BoundedKVManager(config, torch.device("cpu"))
+    built = len(calls)
+    for t in range(3):
+        step, ctx = _step([1, 2], [t, t], [1, 1])
+        assert mgr.admit(step, ctx).ok
+        mgr.plan(step, ctx)
+        mgr.commit(step, ctx)
+    assert len(calls) == built
+
+
 def test_dtype_none_is_the_engines_kv_dtype():
     from mstar.engine.resources.base import EngineResourceInfo, Resource
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec

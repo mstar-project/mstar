@@ -69,9 +69,12 @@ class BoundedKVConfig:
         q_window = self.query_window
         if q_window is not None and (q_window < 0 or self.reverse_step_order):
             raise ValueError(f"query_window={q_window} needs to be >= 0, with the stream in order")
+        r = self.retention
+        # resolved once here: a plan looks one up for every row
+        self._policies = tuple(r if isinstance(r, SinkWindow) else r(n)
+                               for n in range(self.min_source_len, self.max_source_len + 1))
         sink = window = retained = 0
-        for n in range(self.min_source_len, self.max_source_len + 1):
-            policy = self.retention_for(n)
+        for n, policy in enumerate(self._policies, self.min_source_len):
             if policy.sink < 0 or policy.window < 0:
                 raise ValueError(f"retention for {n} source tokens is {policy}")
             if q_window is not None and (policy.sink or policy.window_includes_step or policy.window < q_window):
@@ -80,12 +83,10 @@ class BoundedKVConfig:
             sink = max(sink, policy.sink - n)
             window = max(window, policy.window)
             retained = max(retained, policy.sink + policy.window)
-        # fixed once here: a plan reads them for every row
         self._sink_capacity, self._window_capacity, self._max_retained = sink, window, retained
 
     def retention_for(self, source_len: int) -> SinkWindow:
-        r = self.retention
-        return r if isinstance(r, SinkWindow) else r(source_len)
+        return self._policies[source_len - self.min_source_len]
 
     @property
     def sink_capacity(self) -> int:
