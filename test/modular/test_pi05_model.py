@@ -41,6 +41,7 @@ def _make_model() -> Pi05Model:
     model.cache_dir = None
     model.skip_weight_loading = True
     model.config = Pi05Config()
+    model.norm_stats = None
     model.tokenizer = None
     model._repo_dir = None
     model._submodule_cache = {}
@@ -420,6 +421,118 @@ def test_pi05_process_prompt_tokenizes_openpi_text():
     )
     assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
     assert result["text_inputs"][0].tolist() == [2, 7, 9]
+
+
+# ----------------------------------------------------------------------
+# Deployment norm stats (openpi's quantile normalization)
+# ----------------------------------------------------------------------
+
+# A 3-dim robot in openpi's norm_stats.json layout; mean/std are there but unused.
+_TINY_STATS = {
+    "norm_stats": {
+        "state": {"mean": [0.0, 0.0, 0.5], "std": [1.0, 1.0, 0.5],
+                  "q01": [-0.8, -2.7, 0.0], "q99": [0.9, -0.45, 0.99]},
+        "actions": {"mean": [0.0, 0.0], "std": [0.3, 0.3], "q01": [-0.45, 0.0], "q99": [0.44, 1.0]},
+    }
+}
+
+
+def _openpi_state_bins(raw, q01, q99):
+    """openpi: transforms.Normalize(use_quantiles=True), then PaligemmaTokenizer's np.digitize."""
+    import numpy as np
+
+    raw = np.asarray(raw, dtype=np.float64)
+    q01, q99 = np.asarray(q01)[: raw.shape[-1]], np.asarray(q99)[: raw.shape[-1]]
+    x = (raw - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+    return (np.digitize(x, bins=np.linspace(-1, 1, 257)[:-1]) - 1).tolist()
+
+
+def _model_with_stats(norm_stats):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    model = _make_model()
+    model.norm_stats = load_norm_stats(norm_stats)
+    model.tokenizer = _StubTokenizer()
+    return model
+
+
+def test_norm_stats_file_and_inline_mapping_agree(tmp_path):
+    import json
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    from_file = load_norm_stats(str(path))
+    inline = load_norm_stats({k: {"q01": v["q01"], "q99": v["q99"]} for k, v in _TINY_STATS["norm_stats"].items()})
+    for a, b in ((from_file.state, inline.state), (from_file.actions, inline.actions)):
+        assert torch.equal(a.q01, b.q01) and torch.equal(a.q99, b.q99)
+    assert from_file.state.q01.dtype == torch.float64
+    assert load_norm_stats(None) is None
+    assert load_norm_stats({"state": _TINY_STATS["norm_stats"]["state"]}).actions is None
+
+
+@pytest.mark.parametrize("bad", [
+    {}, {"states": {"q01": [0.0], "q99": [1.0]}}, {"state": {"mean": [0.0], "std": [1.0]}},
+    {"state": {"q01": [0.0, 1.0], "q99": [1.0]}}, {"actions": {"q01": [], "q99": []}},
+])
+def test_norm_stats_rejects_specs_it_cannot_apply(bad):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    with pytest.raises(ValueError):
+        load_norm_stats(bad)
+
+
+def test_pi05_process_prompt_normalizes_raw_state_like_openpi():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    stats = _TINY_STATS["norm_stats"]["state"]
+    rng = np.random.default_rng(0)
+    for raw in ([0.1, -1.0, 0.5], [0.95, -2.9, 0.0], *rng.uniform(-3, 3, size=(32, 3)).tolist(), [0.3, -1.2]):
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=raw)
+        bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+        assert [int(b) for b in bins] == _openpi_state_bins(raw, stats["q01"], stats["q99"])
+
+
+def test_pi05_process_prompt_rejects_state_wider_than_norm_stats():
+    model = _model_with_stats(_TINY_STATS)
+    with pytest.raises(ValueError, match="robot_state has 4 values"):
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.0] * 4)
+
+
+def test_pi05_postprocess_unnormalizes_the_dims_the_action_stats_cover():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim) * 2 - 1
+    out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+    q01 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q01"])
+    q99 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q99"])
+    a = actions.numpy().astype(np.float64)
+    np.testing.assert_allclose(out[:, :2], (a[:, :2] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
+
+
+def test_pi05_without_norm_stats_bins_state_and_returns_actions_as_given():
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.5, -0.25])
+    assert model.tokenizer.last_prompt == "Task: pick up the cup, State: 192 96;\nAction: "
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim)
+    assert model.postprocess(actions, modality="action") == actions.numpy().tobytes()
+
+
+def test_pi05_norm_stats_come_from_model_kwargs(tmp_path):
+    """The serving config's model_kwargs reach Pi05Config and are parsed at startup."""
+    import json
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    model = Pi05Model("unused", skip_weight_loading=True, norm_stats=str(path))
+    assert model.norm_stats.state.q01.tolist() == [-0.8, -2.7, 0.0]
+    with pytest.raises(FileNotFoundError):
+        Pi05Model("unused", skip_weight_loading=True, norm_stats=str(tmp_path / "missing.json"))
 
 
 # ----------------------------------------------------------------------
