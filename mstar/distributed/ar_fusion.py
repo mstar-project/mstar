@@ -302,11 +302,10 @@ def _compare(xs, res, w, gemma, out, r, tokens) -> str | None:
 class AiterARFusion(ARFusion):
     """AITER's custom all-reduce with its one-stage fused RMSNorm.
 
-    Used only where vLLM found the one-stage kernel faster than RCCL + norm
-    (``use_1stage_fused_ar_rms``). That's up to 80 tokens, at most 1024 16-byte
-    packs per row, and under 256 KiB on 4 GPUs or 128 KiB on 8. Everything else
-    stays on RCCL + norm. The two-stage fused kernel is slower than that and
-    is never used.
+    Used only for small inputs, where the one-stage kernel is faster than
+    RCCL + norm: up to 80 tokens, at most 1024 16-byte packs per row, and under
+    256 KiB on 4 GPUs or 128 KiB on 8. Everything else stays on RCCL + norm. The
+    two-stage fused kernel is slower than that and is never used.
 
     Builds that truncate to bf16 (the release wheels on gfx942) fail the startup
     check, since they bias the residual toward zero. A build with
