@@ -2322,7 +2322,10 @@ patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``). Its ``prepare_inputs`` returns the
 tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 ``SEGMENT_LABELS``' attending spans (frames, windows) over the same patches. The tower
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
-``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
+``project(encoded, **tensors)``. The replay's input buffers are in the node's autocast
+dtype unless ``BLOCK_LOOP_DTYPE`` names what ``embed`` returns (Muse Glimmer's ends on a
+LayerNorm, which autocast returns in fp32); the runner refuses an ``embed`` output its
+buffers may round. A prompt whose spans under some label exceed the
 ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
 A tower builds on the pieces in ``mstar/model/components/vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),

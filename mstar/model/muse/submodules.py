@@ -11,7 +11,6 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import PiecewiseAcceleratorGraphConfig
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import ResourceStep
@@ -48,10 +47,15 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
 
     The grid maths runs in `prepare_inputs`, and both attention layouts, the
     windows and the whole frames, are declared as step segments, so the
-    forward never sees a boundary.
+    forward never sees a boundary. The block loop replays as a captured
+    region, one prompt per replay, its windows and frames planned per replay;
+    patch embed and the 2x2 merge run eagerly around it.
     """
 
     SEGMENT_LABELS = (VISION_WINDOW, VISION_FULL)
+    # `embed` ends on `ln_pre`, which autocast runs and returns in fp32, so
+    # the block loop's residual stream and rope tables are fp32
+    BLOCK_LOOP_DTYPE = torch.float32
 
     def prepare_inputs(
         self,
@@ -74,10 +78,3 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
             },
             resource_step_info={VISION_WINDOW: ti.window_lengths, VISION_FULL: ti.frame_lengths},
         )
-
-    def get_piecewise_accelerator_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype,
-        tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        # eager for now
-        return {}
