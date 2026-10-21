@@ -413,9 +413,14 @@ def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 
         device=torch.device("cpu"), autocast_dtype=None, num_slots=1, node_name=label,
         memory_pool=AcceleratorGraphPool("cpu"), device_capability=SimpleNamespace(graph_backend=backend),
     )
-    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a: (_Replay(fn), fn())):
+    # a CPU device has no capture plan, so every bucket is warmed up and captured; the warm-up's
+    # memory readings are the accelerator's, which a CPU device has none of
+    no_memory_stats = dict(memory_allocated=lambda device=None: 0, max_memory_allocated=lambda device=None: 0,
+                           reset_peak_memory_stats=lambda device=None: None, empty_cache=lambda: None)
+    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a: (_Replay(fn), fn())), \
+            mock.patch.multiple(torch.accelerator, **no_memory_stats):
         runner.prepare_for_capture()
-        runner.warmup_and_capture()
+        runner.warmup_and_capture(None)
     assert runner.any_graphs and not runner.dropped_shapes
     runner.calls = 0
     run = runner.run
@@ -892,7 +897,8 @@ def test_encoder_and_codec_take_no_batch_wider_than_their_graphs():
         "audio_codec": AudioCodecDecoderSubmodule(codec=nn.Identity(), config=NemotronDuplexConfig()),
     }
     engine = Engine.__new__(Engine)
-    engine._submodules = {name: SimpleNamespace(submodule=node, accelerator_graph_runner=None)
+    engine._submodules = {name: SimpleNamespace(submodule=node, accelerator_graph_runner=None,
+                                                capture_runner=None)
                           for name, node in nodes.items()}
     for (name, node), walk in zip(nodes.items(), ("encode", "codec_chunk"), strict=True):
         assert engine.get_max_batch_size(name, walk) == max(node.CAPTURE_BATCH_SIZES), name
