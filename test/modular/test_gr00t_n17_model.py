@@ -81,6 +81,7 @@ import glob
 import inspect
 from pathlib import Path
 
+import msgpack
 import numpy as np
 import pytest
 import torch
@@ -1455,23 +1456,40 @@ def _decoding_model() -> Gr00tN17Model:
     return model
 
 
-def test_postprocess_hands_back_the_groups_in_modality_keys_order_as_flat_float32():
-    """The client gets bytes, so the order *is* the API: it chose the embodiment
-    tag, and the group names and widths follow from the tag, but nothing in the
-    payload says which float is which joint. Concatenating in any other order --
-    the ``dict`` the decode happened to build, say -- still returns the right
-    number of plausible floats and would drive the wrong actuator.
+def test_postprocess_names_every_joint_group_the_way_the_reference_does():
+    """[[D09]]: the payload is one entry per joint group, keyed as NVIDIA keys it.
 
-    float32, not the decode's float64: the groups come back float64 because the
-    statistics are, and the wire format is the same flat float32 pi05 promises.
-    Returning float64 would double the payload and silently halve the count a
-    client reading it as float32 sees.
+    This is the reference's own output shape, not a wire convention of ours:
+    ``Gr00tPolicy`` returns ``{joint_group: array}`` cast to float32
+    (``gr00t_policy.py:425-432``, via ``decode_action``, whose keys are bare --
+    the ``action.`` prefix comes only from its sim-compatibility wrapper). So a
+    client written against GR00T indexes this response by the same names.
+
+    The groups have **different widths** (9, 1, 7 on DROID), which is why
+    flattening them was wrong: nothing in a flat payload says which float drives
+    which actuator, so the caller would have to rebuild the layout from the
+    embodiment tag, and a wrong order returns the right number of plausible
+    floats and moves the wrong joint.
+
+    float32, not the decode's float64 -- the same cast the reference makes
+    (``gr00t_policy.py:430``). Each group carries its own dtype and shape, so a
+    client reconstructs it without knowing the embodiment at all.
     """
     raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": _RAW_STATE})
-    assert isinstance(raw, bytes) and len(raw) == 2 * 3 * 4
-    assert np.frombuffer(raw, np.float32).reshape(2, 3).tolist() == _DECODED
-    # the constant column is `grip`'s, which is last: grip-first would put it at 0
-    assert np.frombuffer(raw, np.float32).reshape(2, 3)[:, 2].tolist() == [5.0, 5.0]
+    assert isinstance(raw, bytes)
+    got = msgpack.unpackb(raw)
+    # the keys and their order are the embodiment's `modality_keys`
+    assert list(got) == ["arm", "grip"]
+    rebuilt = {
+        name: np.frombuffer(g["data"], g["dtype"]).reshape(g["shape"]) for name, g in got.items()
+    }
+    assert [g["dtype"] for g in got.values()] == ["float32", "float32"]
+    assert [g["shape"] for g in got.values()] == [[1, 2, 2], [1, 2, 1]]
+    # the same numbers the flat form carried, now attributable to a joint group
+    flat = np.concatenate([rebuilt["arm"], rebuilt["grip"]], axis=-1)
+    assert flat.reshape(2, 3).tolist() == _DECODED
+    # `grip` is the constant group, and it is named rather than positional now
+    assert rebuilt["grip"].reshape(-1).tolist() == [5.0, 5.0]
 
 
 def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
@@ -1502,7 +1520,12 @@ def test_postprocess_finds_the_tag_and_the_state_in_the_kwargs_the_data_worker_k
     assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
     moved = {"arm": _RAW_STATE["arm"] + 100.0}
     raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": moved})
-    assert np.frombuffer(raw, np.float32).reshape(2, 3).tolist() == [[111.0, 119.0, 5.0], [109.0, 121.0, 5.0]]
+    got = msgpack.unpackb(raw)
+    arm = np.frombuffer(got["arm"]["data"], "float32").reshape(got["arm"]["shape"])
+    grip = np.frombuffer(got["grip"]["data"], "float32").reshape(got["grip"]["shape"])
+    assert arm.reshape(2, 2).tolist() == [[111.0, 119.0], [109.0, 121.0]]
+    # `grip` is absolute, so moving the state must leave it alone
+    assert grip.reshape(-1).tolist() == [5.0, 5.0]
 
 
 @pytest.mark.parametrize("kwargs", [None, {}, {"state": _RAW_STATE}, {"embodiment_tag": None}])
