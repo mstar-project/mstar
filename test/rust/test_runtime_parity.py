@@ -171,12 +171,12 @@ def _info(uuid):
     )
 
 
-def _admit(rt, rid="r1"):
+def _admit(rt, rid="r1", loop_caps=None):
     return rt.add_request(
         request_id=rid, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
-        loop_caps={},
+        loop_caps=loop_caps or {},
     )
 
 
@@ -347,6 +347,120 @@ def test_loop_iters_agree(pair):
     got = rt.get_dynamic_loop_iters([rid], "default")
     assert got.keys == [rid]
     assert got.values == [{"ar_loop": 0}]
+
+
+def _decode_graph():
+    """prefill, then ``ar_loop`` for at most 4 iterations, emitting each token."""
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="token", next_node="ar_decode")],
+        ),
+        Loop(
+            name="ar_loop",
+            section=GraphNode(
+                name="ar_decode", input_names={"token"},
+                outputs=[GraphEdge(name="token", next_node="ar_decode")],
+            ),
+            outputs=[GraphEdge(name="token", next_node=EMIT_TO_CLIENT, output_modality="text")],
+            max_iters=4,
+        ),
+    ])
+
+
+@pytest.fixture(params=["python", "rust"])
+def decode(request):
+    wg = WorkerGraph(
+        section=_decode_graph(), graph_walks={WALK}, ranks=[0],
+        worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
+        all_wg_ids_to_nodes={WG_ID: NODES},
+        node_to_partition=dict.fromkeys(NODES, "default"),
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+        return rt, book
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book
+
+
+def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
+    """Feed ``rid`` a prompt and run each ready node until none is ready, calling
+    ``on_decode`` before each decode iteration completes."""
+    def fresh():
+        u = next(uuids)
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)  # the safety hold
+        return u
+
+    rt.ingest_inputs_batch(
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[fresh()])])
+    )
+    log = []
+    for _ in range(40):
+        ready = [r.node_name for r in rt.get_ready_nodes(set()) if rid in r.rids]
+        if not ready:
+            break
+        node = ready[0]
+        rt.pop_rids(node, WALK, [rid])
+        log.append(node)
+        if node == "ar_decode" and on_decode is not None:
+            on_decode()
+        signals = rt.get_output_signals(node, WALK)
+        rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name=node,
+                output_signals=signals,
+                wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[fresh() for _ in signals],
+                num_tensors=[1] * len(signals),
+            ),
+        )
+    return log
+
+
+def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
+    """A request's cap lowers only its own copy of the loop, and survives the
+    reset at the end of a pass. Another request keeps the graph's 4."""
+    rt, book = decode
+    uuids = iter(range(1, 500))
+    capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
+    free = _admit(rt, "r2")
+
+    first = _run_pass(rt, book, capped, uuids)
+    second = _run_pass(rt, book, capped, uuids)
+    other = _run_pass(rt, book, free, uuids)
+
+    assert first.count("ar_decode") == second.count("ar_decode") == 2
+    assert other.count("ar_decode") == 4, "the cap leaked to the next request"
+
+
+def test_speculation_stops_at_the_cap(decode):
+    """Speculating the iteration past a stop check writes KV the request
+    then drops, so a capped loop never speculates past its cap."""
+    rt, book = decode
+    rid = _admit(rt, loop_caps={"ar_loop": 2})
+    speculated = []
+
+    def prep():
+        out = rt.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name="ar_decode", curr_node_name="ar_decode",
+            graph_walk=WALK, rids=[rid], room_for_continuing=None,
+            streaming_edges=[], streaming_edges_per_rid=[0],
+        ))
+        speculated.append(out.ready_rids == [rid])
+
+    _run_pass(rt, book, rid, iter(range(1, 500)), on_decode=prep)
+
+    assert speculated == [True, False]
 
 
 def test_routing_agrees(pair):
