@@ -12,7 +12,13 @@ from benchmark.correctness.families.base import Family
 from benchmark.correctness.families.duplex import NemotronDuplex
 from benchmark.correctness.families.image import ImageFamily, NoReferenceImage
 from benchmark.correctness.families.omni import OmniFamily, OmniText
-from benchmark.correctness.families.robotics import Cosmos3DroidActions, Pi05Actions, Vjepa2AcLatents, Vjepa2Embedding
+from benchmark.correctness.families.robotics import (
+    Cosmos3DroidActions,
+    Pi05Actions,
+    Pi05DroidActions,
+    Vjepa2AcLatents,
+    Vjepa2Embedding,
+)
 from benchmark.correctness.families.text import TextFamily, TextImageFamily
 from benchmark.correctness.families.tts_models import ChatterboxTts, KokoroTts, OmniVoiceTts, OrpheusTts, Qwen3Tts
 from benchmark.correctness.families.video import NoReferenceVideo, VideoFamily
@@ -230,6 +236,7 @@ FAMILIES: dict[str, type[Family]] = {
 # Configs whose row sends a request mode their model's family doesn't.
 CONFIG_FAMILIES: dict[str, type[Family]] = {
     "cosmos3_nano_ar": Cosmos3WindowedVideo,
+    "pi05_droid": Pi05DroidActions,
 }
 
 _OMNILINGUAL = "no family yet, its reference (omnilingual-asr on fairseq2) needs its own venv"
