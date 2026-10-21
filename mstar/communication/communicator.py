@@ -243,7 +243,7 @@ class ZMQCommunicator(BaseCommunicator):
         return messages
 
 
-def make_communicator(*args, **kwargs) -> BaseCommunicator:
+def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
     """Construct the process's communicator, selecting the transport.
 
     ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
@@ -257,6 +257,11 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
     The two are wire-compatible (same endpoints, same codec), so the
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
+
+    ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,
+    which needs ``try_send_bytes``: an extension built before
+    ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and
+    raises under ``1``. Every other caller keeps such a build.
     """
     choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
     if choice not in ("0", "1", "AUTO"):
@@ -284,15 +289,15 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
                     "expected %s — a stale wheel may be shadowing the "
                     "vendored rust/ build (rebuild with `maturin develop "
                     "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
-            if hasattr(mstar_rust.ZmqCommunicator, "try_send"):
+            if not nonblocking_send or hasattr(mstar_rust.ZmqCommunicator, "try_send"):
                 return RustZMQCommunicator(*args, **kwargs)
-            # built before try_send, which OutboxCommunicator's sends need:
-            # every request would fail on its first send
+            # built before try_send: every send the outbox makes would fail.
+            # Only this process's outbox falls back; pyzmq shares the wire.
             stale = (f"mstar_rust {version} predates ZmqCommunicator.try_send; "
                      "rebuild it with `maturin develop --release` in rust/")
             if choice == "1":
                 raise RuntimeError(stale)
-            logger.warning("%s. Using pyzmq meanwhile", stale)
+            logger.warning("%s. Using pyzmq for this non-blocking sender meanwhile", stale)
     logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
     return ZMQCommunicator(*args, **kwargs)
 

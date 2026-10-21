@@ -213,24 +213,51 @@ def test_a_release_that_cannot_be_sent_does_not_lose_the_request_taken_with_it()
     ]
 
 
-@pytest.mark.parametrize("choice", ["AUTO", "1"])
-def test_a_rust_build_without_try_send_does_not_carry_the_mesh(monkeypatch, choice):
-    """An extension built before try_send would fail every send the outbox
-    makes: AUTO falls back to pyzmq, and 1 says to rebuild."""
+def _factory(monkeypatch, choice, *, has_try_send):
+    """``make_communicator`` over a fake ``mstar_rust`` build, with each
+    transport's constructor returning its name."""
     import sys
     from types import SimpleNamespace
 
-    from mstar.communication import communicator
+    # imported before the fake goes in: this module binds mstar_rust on import
+    from mstar.communication import communicator, rust_communicator
 
-    class _OldZmq:
+    class _Zmq:
         def send(self, peer_id, data):
             pass
 
-    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(ZmqCommunicator=_OldZmq, __version__="0.1.0"))
+    if has_try_send:
+        _Zmq.try_send = lambda self, peer_id, data: True
+    version = communicator.EXPECTED_MSTAR_RUST_VERSION if has_try_send else "0.1.0"
+    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(ZmqCommunicator=_Zmq, __version__=version))
+    monkeypatch.setattr(rust_communicator, "RustZMQCommunicator", lambda *args, **kwargs: "rust")
     monkeypatch.setattr(communicator, "ZMQCommunicator", lambda *args, **kwargs: "pyzmq")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", choice)
-    if choice == "1":
-        with pytest.raises(RuntimeError, match="rebuild"):
-            communicator.make_communicator("api_server", [])
-    else:
-        assert communicator.make_communicator("api_server", []) == "pyzmq"
+    return communicator.make_communicator
+
+
+@pytest.mark.parametrize("choice", ["AUTO", "1"])
+def test_a_rust_build_without_try_send_still_carries_the_other_senders(monkeypatch, choice):
+    """Only the outbox needs try_send: the conductor's and the workers'
+    communicators stay Rust, which a worker's Rust graph runtime requires."""
+    make = _factory(monkeypatch, choice, has_try_send=False)
+    assert make("conductor", []) == "rust"
+
+
+def test_a_rust_build_without_try_send_puts_the_outbox_on_pyzmq_under_auto(monkeypatch, caplog):
+    make = _factory(monkeypatch, "AUTO", has_try_send=False)
+    with caplog.at_level("WARNING"):
+        assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "pyzmq"
+    assert "try_send" in caplog.text
+
+
+def test_a_rust_build_without_try_send_fails_the_outbox_when_rust_is_required(monkeypatch):
+    make = _factory(monkeypatch, "1", has_try_send=False)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        make("api_server_preprocess_worker", [], nonblocking_send=True)
+
+
+@pytest.mark.parametrize("choice", ["AUTO", "1"])
+def test_a_rust_build_with_try_send_carries_the_outbox(monkeypatch, choice):
+    make = _factory(monkeypatch, choice, has_try_send=True)
+    assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "rust"
