@@ -37,7 +37,7 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults
+from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
@@ -648,8 +648,8 @@ class Conductor:
         ctx = mp.get_context("spawn")
         atexit.register(self.shutdown)
         if self._mps_requested:
-            if self.device_type != "cuda":
-                raise ValueError(f"mps: true needs CUDA, not {self.device_type}")
+            if not current_platform.is_cuda():
+                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
             self._mps = MpsDaemon()
             self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):

@@ -1,7 +1,11 @@
 """``mps: true``: the conductor's MPS control daemon, against a fake nvidia-cuda-mps-control."""
 
 import os
+import signal
 import stat
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -18,7 +22,8 @@ if [ "$1" = "-f" ]; then
 fi
 read cmd
 [ -e "$d/daemon" ] || exit 1
-[ "$cmd" = quit ] && touch "$d/quit"
+[ -n "$FAKE_MPS_HANG" ] && exec sleep 30
+[ "$cmd" = quit ] && [ -z "$FAKE_MPS_IGNORE_QUIT" ] && touch "$d/quit"
 exit 0
 """
 
@@ -57,3 +62,73 @@ def test_no_control_binary_is_an_error(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(RuntimeError, match="nvidia-cuda-mps-control"):
         MpsDaemon(str(tmp_path / "mps")).start()
+
+
+def test_a_daemon_that_ignores_quit_is_killed_and_its_directory_removed(fake_control, tmp_path, monkeypatch):
+    mps = MpsDaemon(str(tmp_path / "mps"))
+    mps.start()
+    proc = mps._proc
+    monkeypatch.setenv("FAKE_MPS_IGNORE_QUIT", "1")
+    mps.stop(timeout_s=0.5)
+    assert proc.poll() is not None
+    assert not os.path.exists(tmp_path / "mps")
+
+
+def test_a_control_command_that_hangs_fails_cleanly(fake_control, tmp_path, monkeypatch):
+    """A hung control client is a failed command, not an exception that
+    leaves the daemon running and its directory behind."""
+    real_run = subprocess.run
+
+    def run(*args, **kwargs):
+        kwargs["timeout"] = 0.2
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setenv("FAKE_MPS_HANG", "1")
+    mps = MpsDaemon(str(tmp_path / "mps"))
+    with pytest.raises(RuntimeError, match="did not come up"):
+        mps.start(timeout_s=1)
+    assert mps._proc is None
+    assert not os.path.exists(tmp_path / "mps")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the parent-death signal is Linux's")
+def test_the_daemon_does_not_outlive_a_killed_conductor(fake_control, tmp_path):
+    pid_file = tmp_path / "pid"
+    conductor = subprocess.Popen([sys.executable, "-c", f"""
+import time
+from mstar.conductor.mps import MpsDaemon
+mps = MpsDaemon({str(tmp_path / "mps")!r})
+mps.start()
+open({str(pid_file)!r}, "w").write(str(mps._proc.pid))
+time.sleep(60)
+"""])
+    try:
+        deadline = time.monotonic() + 20
+        while not (pid_file.exists() and pid_file.read_text()):
+            assert time.monotonic() < deadline, "the daemon did not start"
+            time.sleep(0.05)
+        daemon = int(pid_file.read_text())
+        conductor.send_signal(signal.SIGKILL)
+        conductor.wait()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.kill(daemon, 0)
+            except ProcessLookupError:
+                break
+            # reaped by init once it exits; a zombie still answers kill(0)
+            if _is_zombie(daemon):
+                break
+            assert time.monotonic() < deadline, "the MPS daemon outlived the conductor"
+            time.sleep(0.05)
+    finally:
+        conductor.kill()
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return False
