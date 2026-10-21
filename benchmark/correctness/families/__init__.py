@@ -115,6 +115,25 @@ class Cosmos3Video(Cosmos3Reference, VideoFamily):
     guidance = 6.0
 
 
+class Cosmos3WindowedVideo(Cosmos3Video):
+    """Windowed autoregressive t2v: every request sets window_mode, so the walk a windowed config is
+    served for runs (the plain video family never sends it). diffusers has no windowed sampler, so the
+    verdict is two server instances agreeing and the t2v reference is scored for information.
+    --family-opt window_mode=kv|chained (default kv), window_frames=N (default 9: two windows of the
+    17-frame clip)."""
+
+    default_restarts = 2
+    self_consistency_only = True
+    reference_is_gate = False
+
+    @property
+    def request_extra(self) -> dict:
+        return {"window_mode": self.opt("window_mode", "kv"), "window_frames": self.opt("window_frames", 9, int)}
+
+    def reference_description(self) -> str:
+        return super().reference_description() + " (whole clip at once, not windowed)"
+
+
 class Cosmos3I2V(Cosmos3Video):
     """Image-to-video. diffusers 0.41 resizes the frame by cover-scale and center crop, so serve with
     --override model_kwargs.conditioning_resize=aspect_crop (the Nano default is a plain stretch)."""
@@ -207,6 +226,11 @@ FAMILIES: dict[str, type[Family]] = {
     "ltx2_5": AudioVideoFamily,
 }
 
+# Configs whose row sends a request mode their model's family doesn't.
+CONFIG_FAMILIES: dict[str, type[Family]] = {
+    "cosmos3_nano_ar": Cosmos3WindowedVideo,
+}
+
 _OMNILINGUAL = "no family yet, its reference (omnilingual-asr on fairseq2) needs its own venv"
 
 UNSUPPORTED: dict[str, str] = {
@@ -228,6 +252,8 @@ def family_for_config(config_name: str, model_key: str, cfg: dict, opts: dict[st
         return OmniText(model_key, cfg, opts)
     if model_key == "cosmos3" and opts.get("mode") in ("t2i", "i2v"):
         return {"t2i": Cosmos3T2I, "i2v": Cosmos3I2V}[opts["mode"]](model_key, cfg, opts)
+    if config_name in CONFIG_FAMILIES:
+        return CONFIG_FAMILIES[config_name](model_key, cfg, opts)
     if opts.get("set") == "image" and issubclass(FAMILIES[model_key], TextFamily):
         hf_id = FAMILIES[model_key].hf_id
         cls = type(f"TextImage_{hf_id.rsplit('/', 1)[-1]}", (TextImageFamily,), {"hf_id": hf_id})
