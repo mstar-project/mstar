@@ -134,10 +134,9 @@ def _build_obs(req_input) -> dict:
     """Map our DROIDDataset RequestInput → openpi DroidInputs dict.
 
     DROIDDataset emits:
-      - image_path           → first camera (mapped to exterior_image_1_left)
-      - extra_image_paths[0] → second camera (mapped to wrist_image_left)
-      - extra_image_paths[1] → third camera (unused by openpi droid policy)
-      - model_kwargs["robot_state"] → 32-dim padded state vector
+      - image_path           → exterior_image_1_left
+      - extra_image_paths[0] → wrist_image_left
+      - model_kwargs["robot_state"] → the recorded state, unpadded
       - prompt → language instruction
 
     openpi DroidInputs (in droid_policy.py:make_droid_example) expects:
@@ -147,8 +146,8 @@ def _build_obs(req_input) -> dict:
       observation/gripper_position      : (1,) or scalar float
       prompt                            : str
 
-    The DROID 32-dim state convention: first 7 dims are joint positions,
-    dim 7 is gripper. Anything beyond is per-platform padding we ignore.
+    The first 7 values go in as joint positions and the 8th as the gripper,
+    zero-filled when the state is shorter.
     """
     state = np.asarray(req_input.model_kwargs.get("robot_state", []), dtype=np.float32)
     if state.size < 8:
