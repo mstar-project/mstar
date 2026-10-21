@@ -593,7 +593,10 @@ def test_ltx2_5_audio_video_family(tmp_path):
     cfg = yaml.safe_load((REPO / "configs/ltx2_5.yaml").read_text())
     geo = {"height": "32", "width": "32", "num_frames": "9", "fps": "9"}  # a 1 s clip
     fam = family_for_config("ltx2_5", "ltx2_5", cfg, geo)
-    assert isinstance(fam, AudioVideoFamily) and fam.self_consistency_only
+    assert isinstance(fam, AudioVideoFamily) and not fam.self_consistency_only
+    assert fam.reference_id() == "diffusers-Lightricks--LTX-2.5-Diffusers-32x32x9-9fps-distilled"
+    assert family_for_config("ltx2_5", "ltx2_5", cfg, {}).reference_id() == \
+        "diffusers-Lightricks--LTX-2.5-Diffusers-544x960x121-distilled"
     item = sets.Item(id="00", prompt="a cat", params={"seed": 0})
     sset = sets.SampleSet("video_v1", tmp_path, {}, [item])
     (req,) = fam.requests(sset)
@@ -627,12 +630,63 @@ def test_ltx2_5_audio_video_family(tmp_path):
     sc = fam.score(sset, runs, None, work, "cpu")
     by = {c.name: c for c in sc.checks}
     assert by["requests ok"].verdict == "PASS"
+    assert by["PSNR vs reference"].verdict == "NO_REFERENCE"
     assert by["videos with the requested frames and size, none flat"].verdict == "PASS"
     assert by["audio tracks failing sanity"].value == 0, sc.rows
     assert by["same-seed min frame PSNR, two server instances (dB)"].verdict == "PASS"  # same mp4 bytes
     assert by["same-seed min audio SNR, two server instances (dB)"].verdict == "PASS"  # one sample differs
     assert sc.metrics["frames_identical_r1_r2"] == {"identical": 1, "n": 1}
     assert sc.metrics["byte_identical_r1_r2"] == {"pcm": 0, "n": 1}
+
+
+def _tone_pcm(seconds: float, sr: int, freq: float, channels: int = 2) -> bytes:
+    t = np.arange(int(seconds * sr)) / sr
+    tone = (0.3 * np.sin(2 * np.pi * freq * t) * 32767).astype("<i2")
+    return np.stack([tone] * channels, axis=1).tobytes()
+
+
+def _ltx_reference(root: Path, rid: str, frames: np.ndarray, pcm: bytes, sr: int) -> Path:
+    from benchmark.correctness.families.av import write_pcm_wav
+
+    d = root / "references" / rid / "video_v1"
+    (d / "outputs").mkdir(parents=True)
+    np.save(d / "outputs" / "00.npy", frames)
+    write_pcm_wav(d / "outputs" / "00.wav", pcm, sr, 2)
+    (d / "meta.json").write_text("{}")
+    return d
+
+
+def test_ltx2_5_scores_against_its_reference(tmp_path):
+    """A served clip that is the reference's own frames and audio passes the raw and calibrated video gates
+    and the audio check, where the math-SDPA copy sets the spread."""
+    pytest.importorskip("av")
+    from benchmark.correctness.families import video
+    from benchmark.correctness.families.av import write_pcm_wav
+
+    geo = {"height": "32", "width": "32", "num_frames": "9", "fps": "9"}
+    fam = family_for_config("ltx2_5", "ltx2_5", {}, geo)
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 256, (9, 32, 32, 3), dtype=np.uint8)
+    moved = np.clip(frames.astype(int) + rng.integers(-20, 21, frames.shape), 0, 255).astype(np.uint8)
+    sr = 8000
+    pcm, other = _tone_pcm(1.0, sr, 220), _tone_pcm(1.0, sr, 330)
+    ref = _ltx_reference(tmp_path, fam.reference_id(), frames, pcm, sr)
+    _ltx_reference(tmp_path, fam.reference_id() + "-sdpa-math", moved, other, sr)
+    run = tmp_path / "run" / "r1"
+    (run / "outputs").mkdir(parents=True)
+    (run / "outputs" / "00.mp4").write_bytes(video.server_mp4(frames, video.SERVER_X264["ltx2_5"], 9))
+    write_pcm_wav(run / "outputs" / "00.wav", pcm, sr, 2)
+    sset = sets.SampleSet("video_v1", tmp_path, {}, [sets.Item(id="00", prompt="p", params={"seed": 0})])
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, [run], ref, work, "cpu")
+    by = {c.name: c for c in sc.checks}
+    assert sc.rows[0]["psnr_median"] == float("inf")
+    assert by["median per-frame PSNR vs reference (dB)"].verdict == "PASS"
+    assert sc.metrics["rocm_calibrated"]["verdict"] == "PASS"
+    assert sc.rows[0]["audio_log_mel_db"] == 0.0 < sc.rows[0]["ref_vs_math_ref_audio_log_mel_db"]
+    assert by["median audio log-mel distance to reference minus the reference's own (dB)"].verdict == "PASS"
+    assert "PSNR vs reference" not in by and sc.verdict == "PASS", sc.checks
 
 
 def test_gpu_check_uses_hip_indices(monkeypatch, capsys):
