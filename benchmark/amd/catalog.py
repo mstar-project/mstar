@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONTAINERS = "/work1/stephaniewang/atindra/amd/containers"
+REFERENCES = "/work1/stephaniewang/atindra/amd/results/correctness/data/references"
 # Deploy overlays for vllm-omni (the files inherit the model's deploy YAML inside the image).
 VLLM_OMNI_DEPLOY = Path(__file__).resolve().parent / "vllm_omni"
 # Packages the correctness runner installs outside the serving venv (kokoro, snac).
@@ -49,6 +50,9 @@ class Row:
     # where the row's differs from the workload's.
     workloads: tuple[str, ...] = ()
     concurrency: dict = field(default_factory=dict)
+    # A directory of first frames (<item id>.png) that image-to-video requests send instead of the set's own, so
+    # every arm conditions on the frames the reference used.
+    i2v_frames: str | None = None
 
 
 def mstar_config_name(row: Row, arm: str) -> str:
@@ -101,8 +105,10 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein", generator_device="cpu"),
     Row("flux2_klein_9b", "image", "black-forest-labs/FLUX.2-klein-9B", "flux2_klein_9b", generator_device="cpu"),
     Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo", generator_device="cpu"),
+    # mstar's wan22 takes only a frame of the request's size: i2v sends the reference's 480x832 conditioning frames.
     Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0, generator_device="cpu",
-        concurrency={"video-t2v": (1, 2, 4)}),
+        concurrency={"video-t2v": (1, 2, 4)},
+        i2v_frames=f"{REFERENCES}/diffusers-Wan-AI--Wan2.2-TI2V-5B-Diffusers-480x832x33-s20-i2v/video_v1/conditioning"),
     # vllm-omni's Cosmos3 recipe serves without the guardrail models (recipes/cosmos3/Cosmos3-Nano.md).
     Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0, generator_device="cuda",
         engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
