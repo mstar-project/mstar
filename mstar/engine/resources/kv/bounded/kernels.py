@@ -112,8 +112,11 @@ def _bounded_attention_kernel(
             rel = offs_m[:, None] - offs_n[None, :] + T - 1
         s = _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        # a query whose keys so far are all masked keeps m = -inf, and
+        # exp(-inf - -inf) is NaN: offset by 0 instead, so alpha and p are 0
+        m_off = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_off)
+        p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
         m_i = m_new
@@ -140,8 +143,9 @@ def _bounded_attention_kernel(
             rel = total + offs_m[:, None] - j[None, :] + T - 1
         s = _scores(q, k, bias_rows, rel, seen, sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        m_off = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_off)
+        p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
         m_i = m_new
