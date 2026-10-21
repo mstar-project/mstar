@@ -53,7 +53,15 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, video_metadata_dict
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    TensorAndMetadata,
+    video_metadata_dict,
+)
 from mstar.model.media_limits import VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
@@ -650,7 +658,7 @@ class VJepa2Model(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Pre-process raw video (and optional AC inputs) for the first forward pass.
 
         Expects the data worker to have populated ``tensors["video_inputs"]``
@@ -785,7 +793,30 @@ class VJepa2Model(Model):
                 if m is not None:
                     out[mask_name] = [torch.as_tensor(m, dtype=torch.long)]
 
-        return out
+        kv_layout = {}
+        if self.config.predictor_kind == "ac":
+            # only a rollout runs the AC predictor, one frame per iteration: its
+            # action, state (and extrinsics) tokens, then its spatial tokens
+            frame = (3 if self.config.ac_predictor.use_extrinsics else 2) + self.config.grid_size ** 2
+            rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
+            kv_layout[KV_CACHE] = {"main": LabelLayout(growth=((self.ROLLOUT_LOOP_NAME, frame),) if rollout else ())}
+        return ProcessPromptOutput(out, {"kv_layout": kv_layout})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the rollout's stop check ends it at its horizon
+        return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        if self.config.predictor_kind != "ac":
+            return {}
+        return {KV_CACHE: {"main": KVLabel(growth=(
+            (self.PREFILL_VIDEO_ROLLOUT, self.ROLLOUT_LOOP_NAME),
+            (self.PREFILL_VIDEO_ROLLOUT_STREAMING, self.ROLLOUT_LOOP_NAME),
+        ))}}
+
+    def _rollout_horizon(self, model_kwargs: dict) -> int:
+        requested = int(model_kwargs.get("rollout_horizon", 2) or 2)
+        return max(1, min(requested, self.config.max_rollout_horizon))
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "video":
@@ -901,8 +932,7 @@ class VJepa2Model(Model):
             # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``.
             # Streaming variant uses the same horizon logic — the submodule
             # doesn't distinguish walks.
-            requested = int((model_kwargs or {}).get("rollout_horizon", 2) or 2)
-            step_metadata["rollout_horizon"] = max(1, min(requested, self.config.max_rollout_horizon))
+            step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs or {})
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
