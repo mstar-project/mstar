@@ -119,7 +119,8 @@ def collect(run_dir: Path) -> dict:
         data["arms"][key] = {
             "row": info.get("row"), "arm": info.get("arm"), "status": info.get("status"), "gpus": info.get("gpus"),
             "error": (info.get("error") or "").strip().splitlines()[-1:] if info.get("error") else None,
-            "startup": info.get("startup"), "health": (info.get("health") or {}).get("verdict"),
+            "startup": info.get("startup"), "first_size": info.get("first_size"),
+            "health": (info.get("health") or {}).get("verdict"),
             "correctness_pass": {k: v for k, v in (info.get("correctness_pass") or {}).items() if k != "error"},
             "correctness_pass_error": bool((info.get("correctness_pass") or {}).get("error")),
             "image": versions.get("image"), "stack": versions.get("stack"), "env": versions.get("env"),
@@ -234,6 +235,10 @@ def render(data: dict) -> str:
                        and not k.endswith("_DIR"))
         st = a.get("startup") or {}
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
+        if a.get("first_size"):  # media rows: the untimed first request at each size (the error is in status)
+            cold += "; first request per size: " + "; ".join(
+                f"{wl} " + ", ".join(f"{size} {'failed' if isinstance(v, str) else f'{v} s'}" for size, v in s.items())
+                for wl, s in a["first_size"].items())
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
         backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if engine == "mstar" else "")
         moe_txt = _moe_status(a)[0]
