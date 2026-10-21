@@ -258,10 +258,11 @@ class BoundedKVManager(Resource):
                     # from the declared position, so committing a step twice is harmless
                     req.written = pos.written + seg.span
 
-    @property
-    def force_double_buffer(self):
-        return True
-
+    # No ``force_double_buffer``: neither half of its hazard exists here. The host
+    # side is a PinnedStager ring, which never rewrites a buffer whose copy is in
+    # flight. And with no pre-plan, ``plan`` runs only on the stream that then
+    # runs the step, so plan(N+1)'s copy into a table queues behind step N's
+    # reads of it. A second slot would only double the captured graphs.
     def _table(self, ctx: StepContext, rows: int) -> torch.Tensor:
         lease = ctx.slot_lease
         if lease is None:
