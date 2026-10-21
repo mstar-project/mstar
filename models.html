@@ -1136,6 +1136,10 @@ the saved WAVs with <code class="docutils literal notranslate"><span class="pre"
 research and non-commercial use only. M* downloads them at runtime and does
 not redistribute them; read the license before deploying.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[fish_s2_pro]'</span></code> then <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">fish_s2_pro</span> <span class="pre">--gpus</span> <span class="pre">0</span></code>.</p></li>
+<li><p>The voice-clone warmup at startup uses <code class="docutils literal notranslate"><span class="pre">samples/af_heart_0.wav</span></code> from
+<code class="docutils literal notranslate"><span class="pre">hexgrad/Kokoro-82M</span></code>. An offline deployment that pre-fills its HF cache
+needs that file as well; without it the warmup is skipped with a warning and
+the first clone request pays the one-time cost.</p></li>
 <li><p>Requests: <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> with <code class="docutils literal notranslate"><span class="pre">input</span></code>; inline <code class="docutils literal notranslate"><span class="pre">[tag]</span></code> prosody
 control is part of the text. Clone a voice with <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL,
 base64, or an http(s) URL when the server allows remote fetch) and its transcript in

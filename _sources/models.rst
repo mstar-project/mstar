@@ -427,6 +427,10 @@ Fish Audio S2-Pro notes
   research and non-commercial use only. M* downloads them at runtime and does
   not redistribute them; read the license before deploying.
 - ``pip install -e '.[fish_s2_pro]'`` then ``mstar serve fish_s2_pro --gpus 0``.
+- The voice-clone warmup at startup uses ``samples/af_heart_0.wav`` from
+  ``hexgrad/Kokoro-82M``. An offline deployment that pre-fills its HF cache
+  needs that file as well; without it the warmup is skipped with a warning and
+  the first clone request pays the one-time cost.
 - Requests: ``/v1/audio/speech`` with ``input``; inline ``[tag]`` prosody
   control is part of the text. Clone a voice with ``ref_audio`` (data URL,
   base64, or an http(s) URL when the server allows remote fetch) and its transcript in
