@@ -78,7 +78,9 @@ def _moe_status(a: dict) -> tuple[str, bool]:
     row = catalog.ROWS.get(a.get("row"))
     parts, untuned = [], bool(default)
     spec = catalog.ARMS.get(a.get("arm"))
-    if spec and spec.engine == "mstar" and row and row.moe_shapes:
+    if spec and (a.get("model_kwargs") or spec.model_kwargs).get("moe_backend") == "aiter":
+        parts.append("MoE: AITER fused MoE (mstar's tuned Triton tables don't apply)")
+    elif spec and spec.engine == "mstar" and row and row.moe_shapes:
         for shape in row.moe_shapes:
             hit = [t for t in tuned if t.startswith(shape + ",")]
             parts.append(f"MoE {shape}: {hit[0].rsplit('device_name=', 1)[-1].removesuffix('.json')} table" if hit
@@ -124,7 +126,9 @@ def collect(run_dir: Path) -> dict:
             "correctness_pass": {k: v for k, v in (info.get("correctness_pass") or {}).items() if k != "error"},
             "correctness_pass_error": bool((info.get("correctness_pass") or {}).get("error")),
             "image": versions.get("image"), "stack": versions.get("stack"), "env": versions.get("env"),
-            "command": versions.get("command"), "git": versions.get("git"), "config": versions.get("config"),
+            "command": versions.get("command"), "git": versions.get("git"),
+            "config": versions.get("config_base") or versions.get("config"),
+            "model_kwargs": versions.get("model_kwargs"),
             "rust_from_worktree": versions.get("rust_from_worktree"),
             "recipe": arm.recipe if arm else versions.get("recipe"),
             "differs": arm.differs if arm else versions.get("differs"),
@@ -222,6 +226,8 @@ def render(data: dict) -> str:
             if a.get("config"):
                 cfg = Path(a["config"])
                 what += f", {'configs/' + cfg.name if cfg.parent.name == 'configs' else cfg}"
+            if a.get("model_kwargs"):
+                what += " with model_kwargs " + ", ".join(f"{k}: {v}" for k, v in a["model_kwargs"].items())
             ver = " ".join(f"{k} {stack[k]}" for k in ("torch", "torch_hip", "amd-aiter", "amd-flashinfer", "triton",
                                                         "triton-rocm") if stack.get(k))
             if a.get("rust_from_worktree") is not None:

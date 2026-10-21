@@ -493,6 +493,52 @@ def test_moe_configs_reach_the_table(tmp_path):
     assert "MoE E=128,N=384,K=1024,topk=6: NO tuned table, default launch config" in md and "moe-untuned" in md
 
 
+def test_aitermoe_arm_serves_a_config_copy_with_its_model_kwargs_right_after_mstar(tmp_path, monkeypatch):
+    import yaml
+
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    (wt / "configs" / "qwen3omni_colocated.yaml").write_text("model: qwen3_omni\nmax_seq_len: 32768\n")
+    row = catalog.ROWS["qwen3omni_colocated"]
+    launch = Launch(catalog.ARMS["mstar-aitermoe"], row, [2], 8400, tmp_path / "run" / "server", worktree=wt)
+    cfg = launch.mstar_config()
+    data = yaml.safe_load(cfg.read_text())
+    assert cfg.parent == (tmp_path / "run" / "server").resolve()
+    assert data == {"model": "qwen3_omni", "max_seq_len": 32768, "model_kwargs": {"moe_backend": "aiter"}}
+    assert launch.mstar_base_config() == (wt / "configs" / "qwen3omni_colocated.yaml").resolve()
+    cmd = launch.command()
+    assert cmd[cmd.index("--config") + 1] == str(cfg) and cmd[cmd.index("serve") + 1] == "qwen3_omni"
+    plain = Launch(catalog.ARMS["mstar"], row, [2], 8401, tmp_path / "plain", worktree=wt)
+    assert plain.mstar_config() == (wt / "configs" / "qwen3omni_colocated.yaml").resolve()
+    # Back to back with mstar on each row, whatever the rotation puts first.
+    seen = []
+    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: seen.append(arm.name))
+    plan = type("P", (), {"arms": list(tables.TABLES["omni"].arms), "trees": {"base": tmp_path}})()
+    sweep.run_row(plan, row, 0, [2], 8400)
+    assert seen == ["mstar", "mstar-aitermoe", "mstar-base", "vllm-omni", "vllm-omni-tuned"]
+    seen.clear()
+    sweep.run_row(plan, catalog.ROWS["qwen3omni_2gpu"], 1, [0, 1], 8410)
+    assert seen == ["mstar-base", "vllm-omni", "vllm-omni-tuned", "mstar", "mstar-aitermoe"]
+    seen.clear()
+    sweep.run_row(type("P", (), {"arms": ["mstar-aitermoe", "vllm-omni"], "trees": {}})(), row, 1, [2], 8400)
+    assert seen == ["vllm-omni", "mstar-aitermoe"]
+    # The table names the config and the override, and the MoE kernels without a tuned-table flag.
+    run = tmp_path / "t"
+    d = run / "qwen3omni_colocated" / "mstar-aitermoe"
+    (d / "server").mkdir(parents=True)
+    (run / "sweep.json").write_text(json.dumps({"table": "omni", "run_id": "x", "rows": ["qwen3omni_colocated"],
+                                                "arms": ["mstar-aitermoe"], "workloads": ["omni-text-speech"]}))
+    (d / "arm.json").write_text(json.dumps({"arm": "mstar-aitermoe", "row": "qwen3omni_colocated",
+                                            "status": "done", "startup": {"moe_configs": {"tuned": [],
+                                                                                          "default": []}}}))
+    (d / "server" / "versions.json").write_text(json.dumps(
+        {"git": {"branch": "HEAD", "head": "66b263e08abc"}, "config": str(cfg),
+         "config_base": "/wt/configs/qwen3omni_colocated.yaml", "model_kwargs": {"moe_backend": "aiter"}}))
+    md = table.write(run).read_text()
+    assert "mstar HEAD 66b263e08, configs/qwen3omni_colocated.yaml with model_kwargs moe_backend: aiter" in md
+    assert "MoE: AITER fused MoE (mstar's tuned Triton tables don't apply)" in md and "moe-untuned" not in md
+
+
 def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
     from benchmark.amd import launch
 
