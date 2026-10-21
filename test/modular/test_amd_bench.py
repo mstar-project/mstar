@@ -955,3 +955,28 @@ def test_diffusers_reference_runs_each_workload_with_its_family_mode(tmp_path, m
     assert seen == [("video-t2v", {}, "cosmos3_nano"), ("video-i2v", {"mode": "i2v"}, "cosmos3_nano")]
     assert reference.run_arm(plan, catalog.ROWS["cosmos3_nano"], catalog.ARMS["ref-xdit"], [5], tmp_path / "x")[
         "skipped"]
+
+
+def test_dry_media_sweep_plan(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_rows(plan, rows, gpus, lanes, port_base):
+        seen["plan"], seen["rows"] = plan, [r.name for r in rows]
+
+    monkeypatch.setattr(sweep, "check_node", lambda plan, node_type: {"host": "h", "gpu_names": {}})
+    monkeypatch.setattr(sweep, "run_rows", fake_rows)
+    monkeypatch.setattr(sweep.health, "snapshot", lambda *a, **k: None)
+    import benchmark.amd.table as table_writer
+    monkeypatch.setattr(table_writer, "write", lambda run_dir: run_dir / "table.md")
+    base = tmp_path / "base"
+    base.mkdir()
+    rc = sweep.main(["--table", "video", "--node-type", "mi300x", "--gpus", "7", "--run-root", str(tmp_path),
+                     "--run-id", "dry", "--dry", "--skip-health", "--rows", "wan22", "--arms",
+                     "mstar,mstar-base,sglang-diffusion", "--concurrency", "1", "--repeats", "1", "--requests", "2",
+                     "--no-correctness", "--workloads", "video-i2v", "--tree", f"base={base}"])
+    plan = seen["plan"]
+    assert rc == 0 and seen["rows"] == ["wan22"] and plan.fixed_concurrency and plan.trees == {"base": base}
+    assert [(w.name, w.num_requests(1), w.warmup_waves_first) for w in plan.workloads] == [("video-i2v", 2, 0)]
+    with pytest.raises(SystemExit):
+        sweep.main(["--table", "video", "--node-type", "mi300x", "--gpus", "7", "--run-root", str(tmp_path),
+                    "--run-id", "timed", "--requests", "2"])
