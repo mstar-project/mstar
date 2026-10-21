@@ -135,6 +135,27 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
 
 
 @triton.jit
+def _rms_norm_rope(
+    x_first, x_second, w_ptr, pos, eps, rope_theta,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """One head, given as its two halves in fp32: RMSNorm by the weight at
+    ``w_ptr``, then rotate-half RoPE at position ``pos`` over the full head
+    dim. Returns the two rotated halves."""
+    offs_half = tl.arange(0, HALF_D)
+    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
+    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
+    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
+    angle = pos * inv_freq
+    cos = tl.cos(angle)
+    sin = tl.sin(angle)
+    return x_first * cos - x_second * sin, x_second * cos + x_first * sin
+
+
+@triton.jit
 def _qk_norm_rope_kernel(
     X_ptr, W_norm_ptr, Pos_ptr,
     eps, rope_theta,
@@ -153,24 +174,10 @@ def _qk_norm_rope_kernel(
     x_first  = tl.load(base + offs_half * sx_d).to(tl.float32)
     x_second = tl.load(base + (offs_half + HALF_D) * sx_d).to(tl.float32)
 
-    # RMS computed from both halves
-    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
-    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
-
-    w_first  = tl.load(W_norm_ptr + offs_half).to(tl.float32)
-    w_second = tl.load(W_norm_ptr + offs_half + HALF_D).to(tl.float32)
-
-    x_first  = x_first  * inv_rms * w_first
-    x_second = x_second * inv_rms * w_second
-
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
-    angle = pos * inv_freq
-    cos = tl.cos(angle)
-    sin = tl.sin(angle)
-
-    out_first  = x_first * cos - x_second * sin
-    out_second = x_second * cos + x_first * sin
+    out_first, out_second = _rms_norm_rope(
+        x_first, x_second, W_norm_ptr, pos, eps, rope_theta, D, HALF_D,
+    )
 
     tl.store(base + offs_half * sx_d,             out_first.to(X_ptr.dtype.element_ty))
     tl.store(base + (offs_half + HALF_D) * sx_d,  out_second.to(X_ptr.dtype.element_ty))
@@ -198,13 +205,10 @@ def fused_qk_norm_rope(x, w_norm, pos, eps, rope_theta):
 
 
 # ============================================================================
-# Per-head q/k RMSNorm + 1D RoPE for q and k together, in place, behind a
-# custom op. Same math as ``_qk_norm_rope_kernel``; one launch covers every q
-# and k head (grid M x (H_q + H_kv)). The custom op keeps inductor from
-# functionalizing the kernel's writes into strided slices of the qkv
-# projection itself: in Qwen3-ASR's compiled decoder graph, its
-# triton_kernel_wrapper_mutation path for the bare kernel built an as_strided
-# over a compacted copy of k and read past its end (torch 2.12).
+# Per-head q/k RMSNorm + 1D RoPE for q and k together, in place: one launch
+# over every q and k head (grid M x (H_q + H_kv)). Behind a custom op so
+# inductor does not functionalize the in-place writes into strided slices of
+# the qkv projection, which it gets wrong for a bare Triton kernel.
 # ============================================================================
 
 @triton.jit
@@ -230,20 +234,10 @@ def _qk_pair_norm_rope_kernel(
     offs_half = tl.arange(0, HALF_D)
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
-
-    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
-    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
-    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
-    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
-
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
-    angle = pos * inv_freq
-    cos = tl.cos(angle)
-    sin = tl.sin(angle)
-
-    tl.store(base + offs_half, (x_first * cos - x_second * sin).to(Q_ptr.dtype.element_ty))
-    tl.store(base + offs_half + HALF_D, (x_second * cos + x_first * sin).to(Q_ptr.dtype.element_ty))
+    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
+    tl.store(base + offs_half + HALF_D, out_second.to(Q_ptr.dtype.element_ty))
 
 
 @torch.library.custom_op("mstar::qk_norm_rope_inplace", mutates_args={"q", "k"})
@@ -314,18 +308,8 @@ def _qk_norm_rope_kv_kernel(
 
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
-    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
-    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
-    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
-    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
-
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
-    angle = pos * inv_freq
-    cos = tl.cos(angle)
-    sin = tl.sin(angle)
-    out_first = x_first * cos - x_second * sin
-    out_second = x_second * cos + x_first * sin
+    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
 
     if pid_h < H_Q:
         tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
