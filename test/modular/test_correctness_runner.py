@@ -550,7 +550,7 @@ def test_cosmos3_nano_ar_runs_the_windowed_walk(tmp_path):
     sset = sets.SampleSet("video_v1", tmp_path, {}, [sets.Item(id="00", prompt="p", params={"seed": 0})])
     ar = family_for_config("cosmos3_nano_ar", "cosmos3", cfg, {})
     assert isinstance(ar, Cosmos3WindowedVideo) and ar.self_consistency_only
-    assert {"window_mode": "kv", "window_frames": 9}.items() <= ar.requests(sset)[0].model_kwargs.items()
+    assert {"window_mode": "kv", "window_frames": 13}.items() <= ar.requests(sset)[0].model_kwargs.items()
     chained = family_for_config("cosmos3_nano_ar", "cosmos3", cfg, {"window_mode": "chained"})
     assert chained.requests(sset)[0].model_kwargs["window_mode"] == "chained"
     plain = family_for_config("cosmos3_nano", "cosmos3", cfg, {})
