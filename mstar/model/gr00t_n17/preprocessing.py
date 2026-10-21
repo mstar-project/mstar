@@ -154,6 +154,8 @@ class Gr00tN17Preprocessor:
             for tag, keys in self.state_keys.items()
         }
         self.action_horizon = {tag: len(mc["action"]["delta_indices"]) for tag, mc in modality_configs.items()}
+        # frames per view, 2 for every tag in this checkpoint
+        self.video_steps = {tag: len(mc["video"]["delta_indices"]) for tag, mc in modality_configs.items()}
         self.action_keys = {tag: mc["action"]["modality_keys"] for tag, mc in modality_configs.items()}
         # The decode's three tables, built to the reference's own rules
         # (`state_action_processor.py:156-204`), which are not the state's:
@@ -421,6 +423,17 @@ class Gr00tN17Preprocessor:
         return np.stack([
             _compose_eef(rel, frame) for rel, frame in zip(relative, ref, strict=True)
         ])
+
+    def frame_layout(self, embodiment_tag: str) -> tuple[tuple[str, ...], int]:
+        """This embodiment's camera views, in order, and its frames per view.
+
+        The order is the contract a request is sent in ([[D10]]): the engine's
+        media path keys loaded files by *modality*, not by name
+        (`data_worker.py:583`), so several cameras arrive as one positional list
+        and only this order says which frame is which camera.
+        """
+        tag = self._tag(embodiment_tag)
+        return tuple(self.video_keys[tag]), self.video_steps[tag]
 
     def warmup_chat_template(self) -> None:
         """Compile the backbone processor's jinja chat template once, up front.

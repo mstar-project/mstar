@@ -1425,7 +1425,8 @@ def test_an_unknown_node_is_none_and_is_not_cached():
 _DECODE_KWARGS = {
     "shortest_image_edge": 256, "crop_fraction": 0.95,
     "modality_configs": {
-        "bot": {"video": {"modality_keys": ["cam"]}, "state": {"modality_keys": ["arm", "grip"]},
+        "bot": {"video": {"modality_keys": ["cam"], "delta_indices": [0, 1]},
+                "state": {"modality_keys": ["arm", "grip"]},
                 "action": {"delta_indices": [0, 1], "modality_keys": ["arm", "grip"],
                            "action_configs": [
                                {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "arm"},
@@ -1627,8 +1628,12 @@ def test_the_model_constructs_from_its_two_checkpoints():
     # a frozenset, which is what `base.py:756` declares; GR00T is the only model
     # on `main` that overrides it at all, so there is no peer to copy the shape
     # from and it was a list until this assertion
-    assert model.request_kwargs() == frozenset({"embodiment_tag", "video", "state", "walk"})
-    # the three that `process_prompt` turns into tensors are kept off the control
+    # no `video`: camera frames travel the media path, not a control-wire kwarg
+    # ([[D10]]), so the only bulk data left in the kwargs is the state vector
+    assert model.request_kwargs() == frozenset({"embodiment_tag", "state", "walk"})
+    # the two that `process_prompt` turns into tensors are kept off the control
     # wire; `walk` is not, because the conductor chooses the schedule with it
     assert set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS) < model.request_kwargs()
     assert "walk" not in Gr00tN17Model.PREPROCESS_ONLY_KWARGS
+    # one frame per view per timestep, refused before any file is decoded
+    assert model.max_input_files() == {"image": 3 * 2}
