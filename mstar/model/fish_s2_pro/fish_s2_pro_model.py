@@ -56,7 +56,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.fish_s2_pro.config import (
     ALLOWED_TEXT_SPECIAL_TOKENS,
     AR_ATTN,
@@ -382,6 +382,12 @@ class FishS2ProModel(Model):
         metadata: dict[str, Any] = {PROMPT_LAYOUT_KEY: [prefix_len, ref_frames]}
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+        # a clone prefills on its own walk, which splices the reference frames into the prompt's rows
+        clone = "audio" in input_modalities
+        rows = len(ids) + ref_frames
+        walk = "ar_prefill_clone" if clone else "ar_prefill"
+        prefill = Span("rows" if clone else "ids", walk, rows, rows, "prompt_ids")
+        metadata["kv_layout"] = {AR_KV: {"main": LabelLayout(spans=(prefill,), growth=(("ar_decode_loop", 1),))}}
         return ProcessPromptOutput({"prompt_ids": [torch.tensor(ids, dtype=torch.long)]}, metadata)
 
     # -----------------------------------------------------------------------
@@ -520,6 +526,15 @@ class FishS2ProModel(Model):
                 f"Fish S2-Pro max_new_tokens must be in 1..{self.config.codec.max_frames}, got {requested}"
             )
         return requested
+
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        return {"ar_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {AR_KV: {"main": KVLabel(
+            growth=(("ar_decode", "ar_decode_loop"),),
+        )}}
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.sample_rate

@@ -609,10 +609,12 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
     ids, prefix_len = model.build_prompt("hi", "r", 21)
     assert list(out.new_input_tensors) == ["prompt_ids"]
     assert out.new_input_tensors["prompt_ids"][0].tolist() == ids
-    assert out.metadata == {"prompt_layout": [prefix_len, 21], "ref_clip_key": clip_digest(clip)}
+    assert {key: value for key, value in out.metadata.items() if key != "kv_layout"} == {
+        "prompt_layout": [prefix_len, 21], "ref_clip_key": clip_digest(clip),
+    }
 
     plain = model.process_prompt("hi", ["text"], ["audio"])
-    assert plain.metadata == {"prompt_layout": [0, 0]}
+    assert {key: value for key, value in plain.metadata.items() if key != "kv_layout"} == {"prompt_layout": [0, 0]}
     for prompt, inputs, outputs, tensors, match in [
         ("  ", ["text"], ["audio"], None, "non-empty"),
         ("hi", ["image"], ["audio"], None, "takes text input"),
