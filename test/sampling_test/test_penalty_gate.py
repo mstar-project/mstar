@@ -115,7 +115,7 @@ def _drive(res, rids, *, apply_penalty=True, prefill_tokens=None):
     ctx = _ctx(rids)
     res.admit(step, ctx)
     res.plan(step, ctx)
-    res.sample(list(rids), torch.zeros(len(rids), VOCAB))
+    res.sample(torch.zeros(len(rids), VOCAB))
     res.commit(step, ctx)
 
 

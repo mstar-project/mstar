@@ -565,11 +565,10 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         talker_sampler: SamplerResource = engine_inputs.resources[TALKER_SAMPLER]
         code_pred_sampler: SamplerResource = engine_inputs.resources[CODE_PRED_SAMPLER]
-        request_ids = engine_inputs.request_ids
 
         # The repetition penalty applies to group 0 only (its SamplerStep sets
         # apply_penalty); the depth loop's sampler declares no penalty.
-        layer0_codes = talker_sampler.sample(request_ids, logits)
+        layer0_codes = talker_sampler.sample(logits)
 
         piecewise = self._run_depth_loop_piecewise(
             engine_inputs, last_hidden, layer0_codes
@@ -579,7 +578,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         else:
             all_codes, codec_embed_sum = self._depth_loop(
                 last_hidden, layer0_codes,
-                lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
+                code_pred_sampler.sample,
             )
 
         return {
@@ -643,10 +642,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         hoisted out as a static input.
         """
         code_pred_sampler: SamplerResource = call.resources[CODE_PRED_SAMPLER]
-        request_ids = call.engine_inputs.request_ids
         all_codes, codec_embed_sum = self._depth_loop(
             call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"],
-            lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
+            code_pred_sampler.sample,
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 

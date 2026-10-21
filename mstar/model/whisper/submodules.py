@@ -273,7 +273,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         logits = self._apply_suppress(
             logits, is_first_token=graph_walk == "prefill",
         )
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,
