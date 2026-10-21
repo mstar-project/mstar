@@ -141,13 +141,17 @@ opening message's still hold for the request. ``"append": [files]`` is short for
 ``"append": {"files": [files]}``. What a model takes in an append is its own: an append
 with text, to a model that takes none, is rejected. ``{"request_id", "end_input": true}``
 ends the input, alone or on an append (or on the opening message, for a one-shot
-request). The request then finishes as usual.
+request). The request then finishes as usual. A model may take several client streams
+(audio and video, say); ``end_input`` may then name the ones it ends, as a list
+(``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
+An append that names a stream already ended, as a file's ``stream`` or in
+``end_input``, is answered as late, as one after ``end_input: true`` is (below).
 
 A live call needs a ``request_id``; only the socket that opened it can append to it, and
 closing the socket aborts it. A message is an append if it carries ``append`` at its top
-level, or ``end_input: true`` and no ``text`` or ``files``; the fields inside an append's
-record never open a request, and a message that opens a request under the call's id gets
-a 409 while the call goes on. An append carries its text, files and ``model_kwargs``
+level, or ``end_input`` (true or a list) and no ``text`` or ``files``; the fields inside
+an append's record never open a request, and a message that opens a request under the
+call's id gets a 409 while the call goes on. An append carries its text, files and ``model_kwargs``
 inside the record: beside it they are rejected. A ``null`` field counts as absent, inside
 the record too. Input resets the request timeout. A rejected append (an unknown file type,
 say) ends the call with its error (``status`` 400), and no finish follows, since the input

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -256,11 +256,11 @@ class PendingRequest:
     delivered: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
-    # Whether the client may still append to the request's client streams, and
-    # when it last did; the request timeout runs from the later of that and
-    # the request's start. input_bytes: the file and append-text bytes a live
-    # call has sent so far, opening included, against max_call_input_bytes.
-    input_open: bool = False
+    # The client streams the client may still append to, and when it last
+    # did; the request timeout runs from the later of that and the request's
+    # start. input_bytes: the file and append-text bytes a live call has sent
+    # so far, opening included, against max_call_input_bytes.
+    open_streams: frozenset[str] = frozenset()
     last_input_time: float = 0.0
     input_bytes: int = 0
     # Set by the streaming handler on its event loop; the message thread wakes
@@ -590,7 +590,7 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
-        end_input: bool = True,
+        end_input: bool | Collection[str] = True,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -609,7 +609,8 @@ class APIServer:
 
         For a model with client streams, ``end_input=False`` keeps the
         request's input open for :meth:`stream_input`, which takes the
-        submission's key (:meth:`submission_key`). Other models ignore it.
+        submission's key (:meth:`submission_key`); a list of client stream
+        names ends only those at once. Other models ignore it.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -630,9 +631,12 @@ class APIServer:
                 "chunks cannot be returned as an aggregated response."
             )
 
-        input_open = not end_input and self.takes_stream_input
+        ending = open_streams = frozenset()
+        if self.takes_stream_input:
+            ending = self.client_streams if end_input is True else self._check_streams(end_input or ())
+            open_streams = self.client_streams - ending
         input_bytes = 0
-        if input_open:
+        if open_streams:
             input_bytes = _file_bytes(file_paths)
             self._check_call_input(input_bytes)
 
@@ -654,7 +658,7 @@ class APIServer:
                     timing=RequestTiming(recv_time=time.perf_counter()),
                 ),
                 request_id=request_id,
-                input_open=input_open,
+                open_streams=open_streams,
                 input_bytes=input_bytes,
             )
         if self.metrics is not None:
@@ -670,8 +674,8 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
         ))
-        if self.takes_stream_input and end_input:
-            self.preprocess_worker.stream_input(ClientAppend(key, done=True))
+        if ending:
+            self.preprocess_worker.stream_input(ClientAppend(key, ends=ending))
 
         logger.info(
             "Request %s submitted as %s  in=%s  out=%s",
@@ -725,16 +729,17 @@ class APIServer:
         self,
         key: str,
         file_paths: dict[str, list[str]] | None = None,
-        end_input: bool = False,
+        end_input: bool | Collection[str] = False,
         *,
         text: str | None = None,
         file_streams: dict[str, list[str | None]] | None = None,
         model_kwargs: dict | None = None,
     ) -> bool:
         """Append text and files to a running request's client streams, then
-        end them if ``end_input``. The preprocess worker deletes the files
-        once loaded. ``file_streams`` names, per modality in ``file_paths``'
-        order, the client stream each file is for (None: the model decides);
+        end them: all of them if ``end_input`` is True, or the client streams
+        it names. The preprocess worker deletes the files once loaded.
+        ``file_streams`` names, per modality in ``file_paths``' order, the
+        client stream each file is for (None: the model decides);
         ``model_kwargs`` are this append's own.
 
         Takes the submission's key (:meth:`submission_key`), not its
@@ -742,37 +747,44 @@ class APIServer:
         submission, which its late appends must not reach.
 
         False, changing nothing, if the request is not taking input (unknown,
-        finished, or already ended); raises ``ValueError`` for input past the
-        call's budget (``max_call_input_mb``) or a stream the model doesn't
-        have.
+        finished, or every stream ended) or the append names a stream that has
+        ended; raises ``ValueError`` for input past the call's budget
+        (``max_call_input_mb``) or a stream the model doesn't have.
         """
-        self._check_streams(
+        named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
         )
+        ending = None if end_input is True else self._check_streams(end_input or ())
         with self.request_lock:
             req = self.pending_requests.get(key)
-            if req is None or not req.input_open or req.event.is_set():
+            if req is None or not req.open_streams or req.event.is_set():
                 return False
+            if ending is None:
+                ending = req.open_streams
+            if (named | ending) - req.open_streams:
+                return False  # late for a stream the client already ended
             size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
             self._check_call_input(size)
             req.input_bytes = size
             req.last_input_time = time.time()
-            if end_input:
-                req.input_open = False
+            req.open_streams -= ending
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
-                key, file_paths=file_paths, done=end_input, text=text,
+                key, file_paths=file_paths, ends=ending, text=text,
                 file_streams=file_streams, model_kwargs=model_kwargs,
             ))
         return True
 
-    def _check_streams(self, names: Iterable[str]) -> None:
-        unknown = set(names) - self.client_streams
+    def _check_streams(self, names: Iterable[str]) -> frozenset[str]:
+        """``names``, each a client stream of the model."""
+        names = frozenset(names)
+        unknown = names - self.client_streams
         if unknown:
             raise ValueError(
                 f"no client stream named {', '.join(map(repr, sorted(unknown)))}; "
                 f"this model takes {sorted(self.client_streams) or 'none'}"
             )
+        return names
 
     def _check_call_input(self, size: int) -> None:
         if size > self.max_call_input_bytes:
@@ -793,7 +805,7 @@ class APIServer:
         """Whether the submission ``key`` still takes :meth:`stream_input`."""
         with self.request_lock:
             req = self.pending_requests.get(key)
-            return req is not None and req.input_open and not req.event.is_set()
+            return req is not None and bool(req.open_streams) and not req.event.is_set()
 
     def reject_input(self, key: str, error: str, status: int) -> bool:
         """End a live call whose append was refused: its stream answers with
@@ -802,9 +814,9 @@ class APIServer:
         longer takes input: then the append was merely late."""
         with self.request_lock:
             req = self.pending_requests.get(key)
-            if req is None or not req.input_open or req.event.is_set():
+            if req is None or not req.open_streams or req.event.is_set():
                 return False
-            req.input_open = False
+            req.open_streams = frozenset()
             req.error, req.error_status = error, status
             req.event.set()
             # Released as a failed request is, once its handler lets go of
@@ -961,7 +973,7 @@ class APIServer:
                                 # Release the waiting client immediately: no
                                 # result is coming, so the alternative is the
                                 # blanket request timeout.
-                                req.input_open = False
+                                req.open_streams = frozenset()
                                 req.event.set()
                                 req.notify()
                                 # The conductor has already dropped this rid,
@@ -983,7 +995,7 @@ class APIServer:
                                 req = self.pending_requests[rid]
                                 # the model ended the call: later appends are
                                 # late, not rejected
-                                req.input_open = False
+                                req.open_streams = frozenset()
                                 req.output_chunk_counts = message.body.output_chunk_counts
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
@@ -1726,11 +1738,22 @@ _WS_INPUT_FIELDS = frozenset({"text", "files"})
 
 def _ws_is_append(message: dict) -> bool:
     """Whether a ``/generate/ws`` message feeds a live call rather than opening
-    a request: it carries ``append``, or ends the input and carries none.
-    Only the top level counts: what an append record holds never opens one."""
-    return "append" in message or (
-        message.get("end_input") is True and not _WS_INPUT_FIELDS & message.keys()
-    )
+    a request: it carries ``append``, or ends input and carries none. Only
+    the top level counts: what an append record holds never opens one."""
+    end_input = message.get("end_input")
+    ends = end_input is True or (isinstance(end_input, list) and bool(end_input))
+    return "append" in message or (ends and not _WS_INPUT_FIELDS & message.keys())
+
+
+def _ws_end_input(message: dict) -> bool | list[str]:
+    """A message's ``end_input``: true for all of the call's client streams,
+    or a list of the ones it ends; absent or null is false."""
+    value = message.get("end_input")
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, list) and all(isinstance(name, str) for name in value):
+        return value
+    raise ValueError("end_input must be true, false or a list of client stream names")
 
 
 # What an append record may carry; ``"append": [files]`` is short for ``{"files": [files]}``.
@@ -1800,10 +1823,10 @@ async def generate_ws(websocket: WebSocket):
     "model_kwargs"}}`` feeds the request's streams (each file may name its
     ``stream``; ``"append": [files]`` is short for ``{"files": [files]}``), and
     ``{"request_id", "end_input": true}`` (alone or on an append, or on the
-    opening message) ends them. A live call
+    opening message) ends them, or a list of stream names only those. A live call
     needs a ``request_id``, and only the socket that opened it can append to
-    it. A message with ``append``, or with ``end_input: true`` and no ``text``
-    or ``files``, is an append; one that opens a request under a live call's
+    it. A message with ``append``, or with ``end_input`` (true or a list) and
+    no ``text`` or ``files``, is an append; one that opens a request under a live call's
     id is refused with a 409. A null field counts as absent. A rejected
     append ends the call with its error (``status`` 400) and no finish; an
     append after the input or the call ended is answered with
@@ -1846,14 +1869,6 @@ async def generate_ws(websocket: WebSocket):
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    def _flag(message: dict, key: str) -> bool:
-        value = message.get(key)
-        if value is None:  # absent, or null
-            return False
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be true or false")
-        return value
-
     async def serve_one(message: dict, binary: bool, call: asyncio.Future | None) -> None:
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
@@ -1863,8 +1878,8 @@ async def generate_ws(websocket: WebSocket):
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
-            end_input = _flag(message, "end_input")
-            if not text and not message.get("files") and (end_input or not api_server.takes_stream_input):
+            end_input = _ws_end_input(message)
+            if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
                 raise ValueError("message carries neither text nor files")
             file_paths, parts = await run_in_threadpool(
                 _decode_ws_files, message.get("files"), api_server.upload_dir,
@@ -1959,7 +1974,7 @@ async def generate_ws(websocket: WebSocket):
             if misplaced:
                 raise ValueError(f"an append carries {', '.join(misplaced)} under 'append'")
             record = _ws_append_record(message.get("append", {}))
-            end_input = _flag(message, "end_input")
+            end_input = _ws_end_input(message)
             text = record.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")

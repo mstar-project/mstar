@@ -7,7 +7,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
 import torch
@@ -724,7 +724,7 @@ class PreprocessWorkerThread:
         )
         self.communicator.send("conductor", msg)
         if stream_signals:
-            self._send_stream_input(input.request_id, stream_signals, done=False)
+            self._send_stream_input(input.request_id, stream_signals, ended=())
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of
@@ -782,9 +782,9 @@ class PreprocessWorkerThread:
                     )
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
-            if items or chunk.done:
+            if items or chunk.ends:
                 self._send_stream_input(
-                    request_id, self._store_persisted(request_id, items), done=chunk.done,
+                    request_id, self._store_persisted(request_id, items), ended=chunk.ends,
                 )
         finally:
             unlink_files(chunk.file_paths)
@@ -823,11 +823,12 @@ class PreprocessWorkerThread:
         return signals
 
     def _send_stream_input(
-        self, request_id: str, signals: dict[str, list[TensorPointerInfo]], done: bool,
+        self, request_id: str, signals: dict[str, list[TensorPointerInfo]],
+        ended: Collection[str],
     ) -> None:
         self.communicator.send("conductor", ConductorMessage(
             message_type=ConductorMessageType.CLIENT_STREAM_INPUT,
-            body=ClientStreamInput(request_id=request_id, signals=signals, done=done),
+            body=ClientStreamInput(request_id=request_id, signals=signals, ended=sorted(ended)),
         ))
 
     def _prefix_keys(

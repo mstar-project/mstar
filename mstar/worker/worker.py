@@ -1078,14 +1078,15 @@ class Worker:
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
-        # Handle producer_done signal: mark all StreamBuffers for this request as done
-        if body.producer_done:
-            if req_info:
-                for edge_name, sbuf in req_info.stream_buffers.items():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
+        # Handle producer_done signal: end the producer's streams it counts.
+        # The conductor counts every edge it ends (with 0 items, too), so a
+        # producer partition's end names each of its edges into this consumer,
+        # and a client's names only the streams the client ended.
+        if body.producer_done and req_info:
+            counts = body.producer_done_items
+            for edge_name, sbuf in req_info.stream_buffers.items():
+                if sbuf.from_partition in body.producer_done and (not counts or edge_name in counts):
+                    sbuf.signal_done(counts.get(edge_name, 0))
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)

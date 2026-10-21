@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -896,9 +897,6 @@ class Conductor:
                 raise ValueError(f"client stream {name!r} is declared twice; one consumer per stream")
             if partition is None:
                 raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
-            if any(stream.partition == partition.name for stream in streams.values()):
-                # their chunks and their end would share one connection state
-                raise ValueError(f"partition {partition.name!r} takes more than one client stream")
             # Unique over every walk, as the worker resolves a streamed edge's
             # consumer (Worker._build_consumer_node_cache), so both agree.
             consumers = {
@@ -1875,9 +1873,10 @@ class Conductor:
 
     def _send_producer_done(
         self, request_id: str, producer_partition: str,
-        consumer_partition_name: str
+        consumer_partition_name: str, edges: Collection[str] | None = None,
     ):
-        """Send producer_done signal to the consumer partition's worker(s)."""
+        """Send producer_done signal to the consumer partition's worker(s): for
+        every stream between the two partitions, or only ``edges``."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[consumer_partition_name]
 
@@ -1889,12 +1888,13 @@ class Conductor:
             if walks & pdef.graph_walks:
                 consumer_workers.update(worker_ids)
 
-        # The signal ends every stream from the producer, so it carries the
-        # counts of every edge between the two partitions.
+        # The worker ends the streams the signal counts, so it names each edge
+        # it ends: every one between the two partitions, or ``edges``.
         conns = [
             conn for conn in request_data.streaming_connections.values()
             if conn.from_partition == producer_partition
             and conn.to_partition == consumer_partition_name
+            and (edges is None or conn.edge_name in edges)
         ]
         for worker_id in consumer_workers:
             message = WorkerMessage(
@@ -1943,15 +1943,19 @@ class Conductor:
         try:
             for name, infos in body.signals.items():
                 self._forward_client_chunk(request_id, request_data, name, infos)
-            if body.done:
-                ended: set[str] = set()
-                for name, stream in self._client_streams.items():
-                    conn = request_data.streaming_connections[CLIENT, stream.partition, name]
-                    if not conn.producer_done:
-                        conn.producer_done = True
-                        ended.add(stream.partition)
-                for partition in sorted(ended):
-                    self._send_producer_done(request_id, CLIENT, partition)
+            # each stream ends on its own; the call's input has ended once all have
+            ended: dict[str, list[str]] = {}
+            for name in body.ended:
+                stream = self._client_streams.get(name)
+                if stream is None:
+                    logger.warning("Request %s: %r is not a client stream; not ending it", request_id, name)
+                    continue
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                if not conn.producer_done:
+                    conn.producer_done = True
+                    ended.setdefault(stream.partition, []).append(name)
+            for partition in sorted(ended):
+                self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
         except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
             logger.exception("Client input for request %s failed", request_id)
             self._remove_request(request_id, request_data,

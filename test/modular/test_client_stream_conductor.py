@@ -164,9 +164,12 @@ def _info(uuid):
     )
 
 
-def _chunk(rid, *uuids, done=False):
-    signals = {"audio_in": [_info(u) for u in uuids]} if uuids else {}
-    return _msg(ConductorMessageType.CLIENT_STREAM_INPUT, ClientStreamInput(request_id=rid, signals=signals, done=done))
+def _chunk(rid, *uuids, done=False, edge="audio_in", ended=None):
+    """``uuids`` as items of ``edge``; ``done`` ends that stream, ``ended`` the ones it names."""
+    signals = {edge: [_info(u) for u in uuids]} if uuids else {}
+    ended = [edge] if done else list(ended or [])
+    return _msg(ConductorMessageType.CLIENT_STREAM_INPUT,
+                ClientStreamInput(request_id=rid, signals=signals, ended=ended))
 
 
 def _sends(c, *kinds):
@@ -312,12 +315,12 @@ def test_client_is_not_a_partition_name():
 
 
 def test_stream_input_encodes_without_pickle():
-    body = ClientStreamInput(request_id="r", signals={"audio_in": [_info(3)]}, done=True)
+    body = ClientStreamInput(request_id="r", signals={"audio_in": [_info(3)]}, ended=["audio_in"])
     msg = ConductorMessage(message_type=ConductorMessageType.CLIENT_STREAM_INPUT, body=body)
     # typed fields, not the pickle fallback; the envelope finds it by its tag
     assert wire._encoder(ClientStreamInput).__name__ == "_encode_dataclass"
     decoded = wire.decode(wire.encode(msg))
-    assert decoded.body.request_id == "r" and decoded.body.done is True
+    assert decoded.body.request_id == "r" and decoded.body.ended == ["audio_in"]
     assert decoded.body.signals["audio_in"][0].uuid == 3
 
 
@@ -432,18 +435,48 @@ def test_a_client_stream_into_no_partition_fails_at_startup():
         Conductor._find_client_streams(_Nowhere())
 
 
-def test_two_client_streams_into_one_partition_fail_at_startup():
-    class _AudioAndVideo(_DuplexToy):
-        def get_graph_walk_graphs(self):
-            return {"listen": GraphNode(name="ear", input_names=["audio_in", "video_in"], outputs=[])}
+class _AudioAndVideo(_DuplexToy):
+    """One partition whose loop consumes two client streams."""
 
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["Ear"], connections=[
-                _client_connection("audio_in"), _client_connection("video_in"),
-            ])
+    def get_graph_walk_graphs(self):
+        return {"listen": Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
+            name="ear", input_names=["audio_in", "video_in"], consumes_stream=True,
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")],
+        ))}
 
-    with pytest.raises(ValueError, match="more than one client stream"):
-        Conductor._find_client_streams(_AudioAndVideo())
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            _client_connection("audio_in"), _client_connection("video_in"),
+        ])
+
+
+def test_two_client_streams_into_one_partition_route_and_end_independently(tmp_path, monkeypatch):
+    """Connection state is per (from, to, edge): each stream keeps its own
+    items and its own end, and ending one leaves the other open."""
+    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo())
+    assert {name: s.partition for name, s in c._client_streams.items()} == {"audio_in": "Ear", "video_in": "Ear"}
+    _run(c, [
+        [_new_request("r")],
+        [_chunk("r", 1, 2), _chunk("r", 3, edge="video_in")],
+        [_chunk("r", ended=["video_in"])],
+        [_chunk("r", 4), _chunk("r", 5, edge="video_in")],      # video's is late: dropped
+        [_chunk("r", ended=["audio_in", "video_in"])],
+    ])
+
+    signals = [(body.inputs[0].name if body.inputs else None,
+                [info.uuid for edge in body.inputs for info in edge.tensor_info],
+                set(body.producer_done), dict(body.producer_done_items))
+               for _k, _e, body in _sends(c, "INPUT_SIGNALS") if body.request_id == "r"]
+    assert signals == [
+        ("audio_in", [1, 2], set(), {}),
+        ("video_in", [3], set(), {}),
+        (None, [], {CLIENT}, {"video_in": 1}),              # ends video only
+        ("audio_in", [4], set(), {}),
+        (None, [], {CLIENT}, {"audio_in": 3}),              # then audio, once
+    ]
+    conns = c.requests["r"].streaming_connections
+    assert conns[CLIENT, "Ear", "audio_in"].token_count == 3 and conns[CLIENT, "Ear", "video_in"].token_count == 1
+    assert conns[CLIENT, "Ear", "audio_in"].producer_done and conns[CLIENT, "Ear", "video_in"].producer_done
 
 
 def test_a_client_streams_consumer_must_be_its_partitions_and_the_only_one():
@@ -497,3 +530,46 @@ def test_the_worker_acks_a_stream_it_has_no_buffer_for_unread(caplog, failed_her
     assert reads == []
     assert acked == [(7, [chunk])]
     assert ("no stream buffer" in caplog.text) is not failed_here
+
+
+def test_a_client_end_closes_only_the_streams_it_counts():
+    """A client's producer_done names the streams it ends; a signal that
+    counts no edge (a producer partition's, as before per-edge ends) closes
+    every stream from that producer."""
+    audio, video = (StreamBuffer(request_id=7, edge_name=name, from_partition=CLIENT,
+                                 policy=FixedChunkPolicy(chunk_size=1)) for name in ("audio_in", "video_in"))
+    stub, _reads = _stub_worker(audio)
+    stub.request_state.per_request_info[7].stream_buffers = {"audio_in": audio, "video_in": video}
+    info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
+                                  max_tokens=8, partition_name="Ear")
+
+    Worker._process_new_inputs(stub, InputSignals(
+        request_id="r", inputs=[], request_info=info, partition_name="Ear",
+        producer_done={CLIENT}, producer_done_items={"video_in": 2},
+    ))
+    assert video.producer_done and video._num_items_expected == 2
+    assert not audio.producer_done
+
+    Worker._process_new_inputs(stub, InputSignals(
+        request_id="r", inputs=[], request_info=info, partition_name="Ear", producer_done={CLIENT},
+    ))
+    assert audio.producer_done and audio._num_items_expected == 0
+
+
+def test_a_producer_partitions_end_leaves_a_colocated_consumers_stream_open():
+    """Two consumer partitions on one worker, fed by one producer: the end
+    sent for one counts only its edges, so the other's stays open (and its
+    own end later brings its own count)."""
+    to_a = StreamBuffer(request_id=7, edge_name="to_a", from_partition="P", policy=FixedChunkPolicy(chunk_size=1))
+    to_b = StreamBuffer(request_id=7, edge_name="to_b", from_partition="P", policy=FixedChunkPolicy(chunk_size=1))
+    stub, _reads = _stub_worker(to_a)
+    stub.request_state.per_request_info[7].stream_buffers = {"to_a": to_a, "to_b": to_b}
+    info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
+                                  max_tokens=8, partition_name="A")
+
+    Worker._process_new_inputs(stub, InputSignals(
+        request_id="r", inputs=[], request_info=info, partition_name="A",
+        producer_done={"P"}, producer_done_items={"to_a": 4},
+    ))
+    assert to_a.producer_done and to_a._num_items_expected == 4
+    assert not to_b.producer_done

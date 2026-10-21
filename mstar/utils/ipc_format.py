@@ -240,10 +240,10 @@ class NewRequestConductor(MessageBody):
 class ClientStreamInput(MessageBody):
     """The next chunk of a running request's client streams (see
     ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
-    whether the client's input has ended. An ended stream takes no more chunks."""
+    the streams that end after it. An ended stream takes no more chunks."""
     request_id: str
     signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    done: bool = False
+    ended: list[str] = field(default_factory=list)
 
 
 @dataclass

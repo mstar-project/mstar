@@ -40,6 +40,9 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import CLIENT, Connection, PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
+# the end of every stream _ListeningModel takes
+END = frozenset({"audio_in"})
+
 
 @pytest.fixture(autouse=True)
 def _headerless_audio(monkeypatch):
@@ -160,7 +163,7 @@ def test_an_append_becomes_one_persisted_stream_input(tmp_path):
 
     (body,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
     (info,) = body.signals["audio_in"]
-    assert body.done is False and info.dims == [4]
+    assert body.ended == [] and info.dims == [4]
     assert info.uuid in tm.persisted and info.uuid in tm.registered
     (chunk,) = wt.model.chunk_calls
     assert torch.equal(chunk.tensors["audio_inputs"][0], torch.arange(4, dtype=torch.float32))
@@ -172,10 +175,10 @@ def test_an_append_becomes_one_persisted_stream_input(tmp_path):
 def test_the_end_of_input_travels_on_its_own(tmp_path):
     wt, sent, _tm = _thread()
     _open(wt)
-    wt._process_stream_input(ClientAppend("r", done=True))
+    wt._process_stream_input(ClientAppend("r", ends=END))
 
     (body,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
-    assert body.signals == {} and body.done is True
+    assert body.signals == {} and body.ended == ["audio_in"]
 
 
 def test_an_append_s_text_settings_and_target_streams_reach_the_hook(tmp_path):
@@ -250,7 +253,7 @@ def test_an_append_for_a_finished_request_is_dropped(tmp_path):
     wt, sent, _tm = _thread()
     path = _audio_file(tmp_path, "late.raw", 4)
 
-    wt._process_stream_input(ClientAppend("gone", file_paths={"audio": [path]}, done=True))
+    wt._process_stream_input(ClientAppend("gone", file_paths={"audio": [path]}, ends=END))
 
     assert sent == [] and not (tmp_path / "late.raw").exists()
 
@@ -288,7 +291,7 @@ def test_queued_appends_keep_their_order_behind_the_request(tmp_path):
     ))
     for i, samples in enumerate((2, 3, 4)):
         wt.in_queue.put(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, f"{i}.raw", samples)]}))
-    wt.in_queue.put(ClientAppend("r", done=True))
+    wt.in_queue.put(ClientAppend("r", ends=END))
     runner = threading.Thread(target=wt.run, daemon=True)
     runner.start()
     deadline = time.time() + 10
@@ -300,7 +303,7 @@ def test_queued_appends_keep_their_order_behind_the_request(tmp_path):
     assert sent[0][1].message_type == ConductorMessageType.NEW_REQUEST
     chunks = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
     assert [c.signals["audio_in"][0].dims for c in chunks[:3]] == [[2], [3], [4]]
-    assert chunks[3].done is True
+    assert chunks[3].ended == ["audio_in"]
 
 
 class _RecordingPreprocess:
@@ -348,7 +351,7 @@ def test_a_one_shot_request_ends_its_input_at_once(tmp_path):
 
     first, second = server.preprocess_worker.items
     assert isinstance(first, PreprocessInput) and first.request_id == key
-    assert second == ClientAppend(key, done=True)
+    assert second == ClientAppend(key, ends=END)
     assert server.stream_input(key, {"audio": ["a.wav"]}) is False
     assert len(server.preprocess_worker.items) == 2
 
@@ -363,7 +366,7 @@ def test_an_open_request_takes_appends_until_it_ends(tmp_path):
 
     assert server.preprocess_worker.items[1:] == [
         ClientAppend(key, file_paths={"audio": [str(wav)]}),
-        ClientAppend(key, done=True),
+        ClientAppend(key, ends=END),
     ]
     assert server.stream_input(key, {"audio": ["b.wav"]}) is False
     assert server.stream_input("unknown#9", {"audio": ["b.wav"]}) is False
@@ -396,7 +399,7 @@ def test_a_model_without_client_streams_ignores_end_input():
 
     (only,) = server.preprocess_worker.items
     assert isinstance(only, PreprocessInput)
-    assert server.pending_requests[key].input_open is False
+    assert server.pending_requests[key].open_streams == frozenset()
 
 
 def _pending(server, key="r#1"):
@@ -405,7 +408,7 @@ def _pending(server, key="r#1"):
     server._client_ids[key] = "r"
     server.pending_requests[key] = PendingRequest(
         streaming=True, input_modalities=["audio"], output_modalities=["text"],
-        profile=RequestProfile(rid="r", timing=RequestTiming(recv_time=0.0)), input_open=True,
+        profile=RequestProfile(rid="r", timing=RequestTiming(recv_time=0.0)), open_streams=END,
     )
     return key
 
@@ -674,6 +677,77 @@ def test_an_append_s_text_counts_against_the_input_budget():
     with pytest.raises(ValueError, match="max_call_input_mb"):
         server.stream_input(key, text="fives")                           # 9 of 8
     assert server.preprocess_worker.items[-1] == ClientAppend(key, text="four")
+
+
+def _two_stream_server():
+    server = _server()
+    server.client_streams = frozenset({"audio_in", "video_in"})
+    return server
+
+
+def test_end_input_can_end_some_streams_and_leave_the_rest_open(tmp_path):
+    server = _two_stream_server()
+    key = _submit(server, end_input=False)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF")
+
+    assert server.stream_input(key, end_input=["video_in"]) is True
+    assert server.pending_requests[key].open_streams == {"audio_in"} and server.taking_input(key)
+    # a stream already ended takes nothing more: late, not an error
+    assert server.stream_input(key, {"audio": [str(wav)]}, file_streams={"audio": ["video_in"]}) is False
+    assert server.stream_input(key, end_input=["video_in"]) is False
+    with pytest.raises(ValueError, match="no client stream named 'nope'"):
+        server.stream_input(key, end_input=["nope"])
+    assert server.stream_input(key, {"audio": [str(wav)]}, file_streams={"audio": ["audio_in"]}) is True
+    assert server.stream_input(key, end_input=True) is True          # the rest
+    assert not server.taking_input(key)
+
+    appends = [i for i in server.preprocess_worker.items if isinstance(i, ClientAppend)]
+    assert [i.ends for i in appends] == [{"video_in"}, frozenset(), {"audio_in"}]
+
+
+def test_an_opening_can_end_some_of_its_streams_at_once():
+    server = _two_stream_server()
+    key = _submit(server, end_input=["video_in"])
+
+    opening, end = server.preprocess_worker.items
+    assert isinstance(opening, PreprocessInput) and end == ClientAppend(key, ends=frozenset({"video_in"}))
+    assert server.pending_requests[key].open_streams == {"audio_in"}
+    with pytest.raises(ValueError, match="no client stream named 'nope'"):
+        _submit(server, "other", end_input=["nope"])
+
+
+def test_generate_ws_ends_the_streams_end_input_lists(monkeypatch, tmp_path):
+    server = _real_ws_server(monkeypatch, tmp_path)
+    server.client_streams = frozenset({"audio_in", "video_in"})
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "end_input": ["video_in"]},                     # an append: no input
+        {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}], "end_input": ["audio_in"]},
+        {"request_id": "call", "end_input": ["audio_in"]},                     # late now
+    ])
+    appends = lambda: [i for i in server.preprocess_worker.items if isinstance(i, ClientAppend)]  # noqa: E731
+    asyncio.run(_serve(ws, until=lambda: ws.sent))
+
+    assert [(bool(i.file_paths), i.ends) for i in appends()] == [
+        (False, {"video_in"}), (True, {"audio_in"}),
+    ]
+    (late,) = ws.sent
+    assert late["append"] is True and "not taking input" in late["error"]
+
+
+def test_generate_ws_refuses_ending_a_stream_the_model_lacks(monkeypatch, tmp_path):
+    server = _real_ws_server(monkeypatch, tmp_path)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "end_input": ["video_in"]},
+        {"request_id": "bad", "text": "x", "end_input": [7]},
+    ])
+    asyncio.run(_serve(ws, until=lambda: len(ws.sent) >= 2))
+
+    by_id = {reply["request_id"]: reply for reply in ws.sent}
+    assert by_id["call"]["status"] == 400 and "no client stream named 'video_in'" in by_id["call"]["error"]
+    assert "end_input must be" in by_id["bad"]["error"]
 
 
 def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch, tmp_path):
@@ -948,7 +1022,7 @@ def test_an_end_of_input_with_settings_or_null_fields_ends_the_call_s_input(monk
     asyncio.run(_serve(ws, until=lambda: len(appends()) == 2))
 
     assert ws.sent == []
-    assert [(bool(i.file_paths), i.done) for i in appends()] == [(True, False), (False, True)]
+    assert [(bool(i.file_paths), i.ends) for i in appends()] == [(True, frozenset()), (False, END)]
 
 
 def test_a_failed_request_cannot_take_over_the_next_calls_entry(monkeypatch, tmp_path):
@@ -1153,7 +1227,7 @@ def test_an_abort_drops_a_call_still_waiting_for_preprocessing(tmp_path):
             request_id=rid, text="hi", file_paths={"audio": [opening_file]} if rid == "r#1" else None,
             input_modalities=["text"], output_modalities=["text"], model_kwargs={},
         ))
-    wt.in_queue.put(ClientAppend("r#1", file_paths={"audio": [append_file]}, done=True))
+    wt.in_queue.put(ClientAppend("r#1", file_paths={"audio": [append_file]}, ends=END))
     abort("r#1")
     _run_until(wt, lambda: _bodies(sent, ConductorMessageType.NEW_REQUEST))
 
@@ -1172,7 +1246,7 @@ def test_an_abort_drops_a_running_calls_queued_appends(tmp_path):
     _open(wt)
     for i in range(2):
         wt.in_queue.put(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, f"{i}.raw", 2)]}))
-    wt.in_queue.put(ClientAppend("r", done=True))
+    wt.in_queue.put(ClientAppend("r", ends=END))
     abort("r")
     sent.clear()
     _run_until(wt, lambda: _bodies(sent, ConductorMessageType.ABORT_REQUEST))
@@ -1240,7 +1314,7 @@ def test_input_is_taken_in_arrival_order_up_to_one_request_per_pass():
     def take():
         return [(type(i).__name__, i.request_id) for i in wt._next_inputs()]
 
-    for item in (ClientAppend("r"), opening("u"), ClientAppend("r", done=True), ClientAppend("u")):
+    for item in (ClientAppend("r"), opening("u"), ClientAppend("r", ends=END), ClientAppend("u")):
         wt.in_queue.put(item)
     assert take() == [("ClientAppend", "r"), ("PreprocessInput", "u")]
     assert take() == [("ClientAppend", "r"), ("ClientAppend", "u")]
@@ -1273,7 +1347,7 @@ def test_one_failing_release_leaves_the_rest_of_the_pass_to_run(tmp_path):
             output_modalities=["text"], model_kwargs={},
         ))
     wt.in_queue.put(ClientAppend("a", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 2)]}))
-    wt.in_queue.put(ClientAppend("b", file_paths={"audio": [_audio_file(tmp_path, "b.raw", 3)]}, done=True))
+    wt.in_queue.put(ClientAppend("b", file_paths={"audio": [_audio_file(tmp_path, "b.raw", 3)]}, ends=END))
     wt.in_queue.put(PreprocessInput(
         request_id="d", text="hi", file_paths=None, input_modalities=["text"],
         output_modalities=["text"], model_kwargs={},
@@ -1285,8 +1359,8 @@ def test_one_failing_release_leaves_the_rest_of_the_pass_to_run(tmp_path):
     wt.stop_event.set()
     runner.join(timeout=10)
 
-    assert [(b.request_id, b.done) for b in _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)] == [
-        ("a", False), ("b", True),
+    assert [(b.request_id, b.ended) for b in _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)] == [
+        ("a", []), ("b", ["audio_in"]),
     ]
     assert [b.request_id for b in _bodies(sent, ConductorMessageType.NEW_REQUEST)] == ["d"]
     assert list(tmp_path.iterdir()) == []

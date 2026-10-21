@@ -135,11 +135,12 @@ class PreprocessInput:
 @dataclass
 class ClientAppend:
     """One append to a running request's client streams, queued behind the
-    request's own ``PreprocessInput`` so its chunks stay in order. ``done``
-    ends the streams after this chunk. Stays inside the API server process."""
+    request's own ``PreprocessInput`` so its chunks stay in order. The
+    streams in ``ends`` end after this chunk. Stays inside the API server
+    process."""
     request_id: str
     file_paths: dict[str, list[str]] | None = None
-    done: bool = False
+    ends: frozenset[str] = frozenset()
     text: str | None = None
     # per modality, in file_paths' order, the client stream each file names (None: unnamed)
     file_streams: dict[str, list[str | None]] | None = None

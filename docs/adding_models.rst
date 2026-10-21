@@ -1888,9 +1888,9 @@ producer ``CLIENT``:
 ``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
 chunk policy, exactly as it would a stream from another partition. Its partition
 self-triggers from the stream, so its forward-pass args send no inputs. That node must be
-the only one, in any walk, that takes the edge, and a partition takes at most one client
-stream; the conductor checks both at startup, and that the model implements
-``process_stream_chunk``.
+the only one, in any walk, that takes the edge; the conductor checks this at startup, and
+that the model implements ``process_stream_chunk``. A partition may take several client
+streams (audio and video, say): each has its own buffer and its own end.
 
 - ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
   keyed by client edge name. ``chunk`` is a ``ClientChunk`` (``mstar.model.base``):
@@ -1903,8 +1903,9 @@ stream; the conductor checks both at startup, and that the model implements
   consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
-- The stream ends when the client ends its input: the consumer gets ``producer_done`` and
-  a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
+- A stream ends when the client ends it: ``end_input: true`` ends all of the call's
+  streams, a list of names only those. The consumer gets ``producer_done`` for that edge
+  and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` the client appends and ends input explicitly (see
   :doc:`clients`); every other route ends the input as soon as the request is submitted.
   ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
