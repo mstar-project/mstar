@@ -15,7 +15,7 @@ downloaded once into ``--raw-dir``; no ``datasets`` dependency, so the set is
 the same wherever it is built. Every engine in the protocol table is
 measured on these files by ``benchmark/asr_bench.py``::
 
-    python -m benchmark.asr_data --out $MSTAR_WS_ROOT/commons/bench/data/asr
+    python -m benchmark.asr_data --out data/asr
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def build(out: Path, raw_dir: Path, num_utterances: int, long_form_minutes: floa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", required=True, help="dataset directory (commons/bench/data/asr)")
+    parser.add_argument("--out", required=True, help="dataset directory, e.g. data/asr")
     parser.add_argument("--raw-dir", default=None, help="where the openslr tarball is kept (default: <out>/raw)")
     parser.add_argument("--num-utterances", type=int, default=200)
     parser.add_argument("--long-form-minutes", type=float, default=10.0)

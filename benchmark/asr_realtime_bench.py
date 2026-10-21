@@ -216,7 +216,7 @@ def main() -> None:
     p.add_argument("--url", required=True, help="ws://host:port")
     p.add_argument("--model", required=True)
     p.add_argument("--system", required=True)
-    p.add_argument("--data-dir", default=os.path.join(os.environ.get("MSTAR_WS_ROOT", "."), "commons/bench/data/asr"))
+    p.add_argument("--data-dir", default="data/asr", help="the set benchmark.asr_data built")
     p.add_argument("--short-set", default="test_clean_200")
     p.add_argument("--num-utterances", type=int, default=50)
     p.add_argument("--sessions", type=int, nargs="+", default=[1, 8])

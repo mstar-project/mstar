@@ -27,11 +27,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 REPO = os.environ.get("MSTAR_QWEN_ASR_REPO", "Qwen/Qwen3-ASR-1.7B")
 KEY = "qwen3_asr_realtime" if REPO.endswith("0.6B") else "qwen3_asr"
-DATA = Path(os.environ.get(
-    "MSTAR_ASR_DATA",
-    os.path.join(os.environ.get("MSTAR_WS_ROOT", "/nonexistent"), "commons/bench/data/asr"),
-))
-SDK = os.environ.get("MSTAR_QWEN_ASR_REF", os.path.join(os.environ.get("MSTAR_WS", "."), "refs/Qwen3-ASR"))
+DATA = Path(os.environ.get("MSTAR_ASR_DATA", "data/asr"))
+SDK = os.environ.get("MSTAR_QWEN_ASR_REF", "refs/Qwen3-ASR")
 
 
 def _snapshot():

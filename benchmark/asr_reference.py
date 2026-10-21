@@ -8,7 +8,7 @@ WER can be compared against the same reference on the same files:
     python -m benchmark.asr_reference --model openai/whisper-large-v3-turbo \\
         --output-json results/2026-09-18/hf_reference_turbo.json
     # Qwen3-ASR: the Qwen3-ASR SDK's transformers backend (refs/Qwen3-ASR)
-    python -m benchmark.asr_reference --model Qwen/Qwen3-ASR-1.7B --sdk $MSTAR_WS/refs/Qwen3-ASR \\
+    python -m benchmark.asr_reference --model Qwen/Qwen3-ASR-1.7B --sdk refs/Qwen3-ASR \\
         --output-json results/2026-09-18/sdk_reference_qwen3_asr.json
 """
 
@@ -96,7 +96,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="reference-implementation transcripts + WER on the benchmark set")
     p.add_argument("--model", required=True, help="HF id or local dir")
     p.add_argument("--sdk", default=None, help="Qwen3-ASR SDK checkout (selects the Qwen3-ASR reference)")
-    p.add_argument("--data-dir", default=os.path.join(os.environ.get("MSTAR_WS_ROOT", "."), "commons/bench/data/asr"))
+    p.add_argument("--data-dir", default="data/asr", help="the set benchmark.asr_data built")
     p.add_argument("--short-set", default="test_clean_200")
     p.add_argument("--language", default="en")
     p.add_argument("--batch-size", type=int, default=16)
