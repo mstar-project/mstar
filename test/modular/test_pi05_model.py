@@ -385,6 +385,43 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     assert stub.last_prompt == "hello world"
 
 
+def test_discretize_state_matches_openpi_digitize():
+    """openpi's PaligemmaTokenizer: np.digitize(state, linspace(-1, 1, 257)[:-1]) - 1,
+    so -1 below the range, 255 at or above 1, and each bin edge starts its bin."""
+    import numpy as np
+
+    edges = np.linspace(-1, 1, 257)[:-1]
+    values = np.concatenate([
+        np.random.default_rng(0).uniform(-1.5, 1.5, 4096), edges, edges - 1e-12,
+        [-1.0, 1.0, -1.0000001, 0.99999, 2.0],
+    ])
+    got = discretize_state(torch.from_numpy(values), num_bins=256)
+    assert got.dtype == torch.long
+    np.testing.assert_array_equal(got.numpy(), np.digitize(values, bins=edges) - 1)
+
+
+def test_pi05_process_prompt_tokenizes_openpi_text():
+    """The task keeps its case and the space after "Action:" stays, as openpi
+    tokenizes the string it builds."""
+    from types import SimpleNamespace
+
+    from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+
+    seen = []
+
+    def hf_tokenizer(text, add_special_tokens):
+        seen.append(text)
+        return SimpleNamespace(input_ids=[2, 7, 9])
+
+    model = _make_model()
+    model.tokenizer = Pi05Tokenizer(hf_tokenizer, model.config)
+    result = model.process_prompt(
+        "Put_the Cup\naway", ["image", "text"], ["action"], robot_state=[0.5, -1.2, 1.0],
+    )
+    assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
+    assert result["text_inputs"][0].tolist() == [2, 7, 9]
+
+
 # ----------------------------------------------------------------------
 # Lerobot -> mstar weight remap (pure-function unit tests)
 # ----------------------------------------------------------------------
