@@ -101,12 +101,17 @@ def test_t9_lm_loop_backs_are_consumed_and_outputs_routed():
     assert [(e.name, e.next_node, e.persist) for e in cond.outputs] == [("lm_state", EMPTY_DESTINATION, True)]
     encode = walks[cfg.ENCODE_USER_AUDIO_WALK]
     assert [(e.name, e.persist) for e in encode.outputs] == [("user_audio_codes", True)]
-    for walk, accumulated in ((cfg.GENERATE_WALK, [("agent_frame", "MimiDecoder"), ("text_frame", EMIT_TO_CLIENT)]),
-                              (GENERATE_AUDIO_WALK, [("agent_frame", "MimiDecoder")])):
+    for walk in (cfg.GENERATE_WALK, GENERATE_AUDIO_WALK):
         seq = walks[walk]
         assert isinstance(seq, Sequential)
         loop, decoder = seq.sections
-        assert loop.outputs == [] and [(e.name, e.next_node) for e in loop.accumulated_outputs] == accumulated
+        assert loop.outputs == [] and [(e.name, e.next_node) for e in loop.accumulated_outputs] == [
+            ("agent_frame", "MimiDecoder")
+        ]
+        text_edges = [e for e in seq.get_nodes()["LM"].outputs if e.next_node == EMIT_TO_CLIENT]
+        assert [(e.name, e.output_modality) for e in text_edges] == (
+            [("text_frame", "text")] if walk == cfg.GENERATE_WALK else []
+        )
         assert [(e.name, e.next_node, e.output_modality) for e in decoder.outputs] == [
             ("audio_output", EMIT_TO_CLIENT, "audio")
         ]
@@ -167,7 +172,8 @@ def test_t9_data_worker_emits_requested_modalities(with_text, reverse_ready):
     """
     model = _model()
     walk = model.get_graph_walk_graphs()[cfg.GENERATE_WALK if with_text else GENERATE_AUDIO_WALK]
-    edges = ([walk.sections[0].accumulated_outputs[1]] if with_text else []) + [walk.sections[1].outputs[0]]
+    edges = [edge for edge in walk.get_nodes()["LM"].outputs if edge.next_node == EMIT_TO_CLIENT]
+    edges += [walk.sections[1].outputs[0]]
     edges = [edge.clone() for edge in edges]
     assert [(e.name, e.output_modality) for e in edges] == (
         [("text_frame", "text"), ("audio_output", "audio")] if with_text else [("audio_output", "audio")]
@@ -240,7 +246,7 @@ def test_t9_worker_graphs_from_yaml_keep_accumulated_edges():
     assert {walk for wg in graphs for walk in wg.graph_walks} == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS}
     loops = [loop for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks
              for loop in wg.section.get_loops().values()]
-    assert [[e.name for e in loop.accumulated_outputs] for loop in loops] == [["agent_frame", "text_frame"]]
+    assert [[e.name for e in loop.accumulated_outputs] for loop in loops] == [["agent_frame"]]
     assert all(wg.ranks == [0] for wg in graphs)
 
 
@@ -273,13 +279,25 @@ def test_t9_python_graph_runtime_admits_personaplex_generate_walk():
 
 
 def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
-    """Route two LM frames through the runtime for text emission and Mimi decode."""
+    """Do not defer text backed by the worker's reused stop-check host buffer.
+
+    Real Python graph routing and SHM: emulate the GPU worker's borrowed
+    CPU copy, then reuse it on the next step. Agent codes stay on device.
+    """
     manager = SharedMemoryCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
     )
     runtime, rid = _personaplex_runtime(manager)
     manager.register_request(rid, runtime.get_sharding_config(rid))
+    receiver = SharedMemoryCommunicationManager(
+        my_entity_id="api_server", hostname="localhost", device="cpu",
+        communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
+    )
+    receiver.register_request(rid, runtime.get_sharding_config(rid))
+    host_text = torch.empty(1, dtype=torch.int64)
+    received_text, emitted_text = [], []
+    registered = set()
     block = ColumnarEdgeSpecs.empty()
     for name in ("lm_state", "user_audio_codes", "agent_frame", "text_frame"):
         block.add_edge(rid, GraphEdge(next_node="LM", name=name))
@@ -292,12 +310,13 @@ def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
             runtime.stop_loops_batched(
                 "default", cfg.GENERATE_WALK, "LM", ParallelList([rid], [[cfg.DECODE_LOOP]]),
             )
+        host_text.fill_(frame + 4)
         stored = manager.store_and_return_tensor_info_batch(
             [rid], {rid: {
                 "lm_state": [torch.tensor([frame])],
                 "agent_frame": [torch.full((8,), frame)],
                 "text_frame": [torch.tensor([frame + 4])],
-            }}, outputs,
+            }}, outputs, cpu_tensors={rid: {"text_frame": [host_text]}},
         )
         manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
         agent_uuids.append(stored.flat_uuids[outputs.index("agent_frame")])
@@ -307,13 +326,22 @@ def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
             output_signals=outputs, wg_ids=ParallelList([rid], [lm_wg]),
             tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
         ))
+        registered.update(routed.register_uuids)
+        if routed.register_uuids:
+            manager.register_for_send_uuids(ParallelList([rid], [routed.register_uuids]))
+        completion = runtime._peek_completion(routed.completion_id).routing[rid]
+        for edge in completion.emit_to_client:
+            emitted_text.append((edge.name, [info.uuid for info in edge.tensor_info]))
+            receiver.start_read_tensors(rid, [edge], graph_walk=cfg.GENERATE_WALK)
+            receiver.get_ready_tensors(graph_walk=cfg.GENERATE_WALK)
+            received_text.extend(int(receiver.get_tensor(info.uuid).item()) for info in edge.tensor_info)
+    assert received_text == [4, 5], "deferred SHM sends must not read a later step's borrowed host copy"
     completion = runtime._peek_completion(routed.completion_id).routing[rid]
-    assert [(edge.name, [info.uuid for info in edge.tensor_info])
-            for edge in completion.emit_to_client] == [("text_frame", text_uuids)]
+    assert emitted_text == [("text_frame", [uuid]) for uuid in text_uuids]
     assert [(edge.name, [info.uuid for info in edge.tensor_info])
             for edge in completion.routed_to_this_worker_graph] == [("agent_frame", agent_uuids)]
     # Only the emitted text needs transport staging; agent frames stay local.
-    assert set(routed.register_uuids) == set(text_uuids)
+    assert registered == set(text_uuids)
     decoder_wg = runtime.get_worker_graph_id_for_node("MimiDecoder", cfg.GENERATE_WALK)
     decoder = runtime._queues[decoder_wg].per_request_queues[rid].get_node("MimiDecoder")
     assert [info.uuid for info in decoder.ready_signals.ready_inputs["agent_frame"].tensor_info] == agent_uuids
@@ -419,7 +447,7 @@ def _drive(walk, initial, *, finish_after=None, rid=1):
                 out["client"].append((e.name, [produced[i.uuid] for i in e.tensor_info]))
             elif e.persist:
                 out["persisted"].append((e.name, [produced[i.uuid] for i in e.tensor_info]))
-        comm.set_output_ref_counts(hold, routed)
+        comm.set_output_ref_counts(hold, routed, completion.transferred_refs)
         for e in outs:
             if e.next_node == EMIT_TO_CLIENT:
                 for i in e.tensor_info:
@@ -441,8 +469,10 @@ def test_t8_generate_accumulates_frames_in_order_and_completes(finish_after):
     out, runs, refs = _drive(walk, _generate_inputs(), finish_after=finish_after)
     assert runs == {"LM": finish_after, "MimiDecoder": 1}
     assert out["decoder_frames"] == [("agent_frame", i) for i in range(finish_after)]
-    assert out["client"] == [("text_frame", [("text_frame", i) for i in range(finish_after)]),
-                             ("audio_output", [("audio_output", 0)])]
+    assert out["client"] == [
+        *[("text_frame", [("text_frame", i)]) for i in range(finish_after)],
+        ("audio_output", [("audio_output", 0)]),
+    ]
     assert out["rejected"] == []
     assert all(r >= 0 for r in refs.values())
     # Every tensor of every non-final iteration, and the decoder output, is released.
@@ -460,10 +490,6 @@ def test_t8_generate_runs_to_max_iters_without_a_finish_signal():
     assert [name for name, _ in out["client"]] == ["audio_output"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "M* loop-output accounting: the final iteration's loop-output tensor keeps one reference "
-    "(worklog §11 3.1-c; same for ordinary Loop.outputs). Flips when graph/worker accounting changes."
-))
 def test_t8_final_iteration_accumulated_tensors_are_released():
     walk = _model().get_graph_walk_graphs()[cfg.GENERATE_WALK]
     _, _, refs = _drive(walk, _generate_inputs(), finish_after=7)
@@ -613,10 +639,11 @@ def test_t14_dummy_mode_builds_without_submodules_or_network():
     assert all(spec.nodes == {"LM"} for spec in specs.values())
     kv = specs[cfg.LM_KV].config
     assert (kv.num_layers, kv.num_kv_heads, kv.num_qo_heads, kv.head_dim, kv.max_seq_len) == (32, 32, 32, 128, 2999)
+    assert kv.max_num_pages == 128
     pos = specs[cfg.LM_POS].config
     assert pos.interleave is True and pos.rope_theta == 10000.0 and pos.kv_cache == cfg.LM_KV
     assert specs[cfg.TEXT_SAMPLER].vocab_size == 32000 and specs[cfg.DEPTH_SAMPLER].vocab_size == 2048
-    assert model.get_max_output_tokens() == 2999 and model.get_autocast_dtype() is None
+    assert model.get_max_output_tokens() == 2999 and model.get_autocast_dtype() is torch.bfloat16
 
 
 def test_t14_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():

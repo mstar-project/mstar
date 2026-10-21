@@ -92,6 +92,9 @@ class PersonaPlexModel(Model):
         kv = PagedKVConfig(
             num_layers=c.num_layers, num_kv_heads=c.num_heads, head_dim=c.head_dim,
             max_seq_len=cfg.MAX_TEMPORAL_FORWARDS, num_qo_heads=c.num_heads,
+            # 128 pages are 8 GiB at the checkpoint's bf16 KV geometry; the
+            # generic 2048-page default exceeds a GH200's usable VRAM.
+            max_num_pages=128,
         )
         lm = {cfg.LM_NODE}
         return [
@@ -121,10 +124,13 @@ class PersonaPlexModel(Model):
 
     def _generate_walk(self, with_text: bool) -> GraphSection:
         accumulated = [GraphEdge(next_node=cfg.MIMI_DECODER_NODE, name="agent_frame")]
+        lm = self._lm_node(cfg.GENERATE_WALK)
         if with_text:
-            accumulated.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
+            # Text is ready per frame. Deferred SHM sends can outlive the
+            # worker's reused host staging copy; only the codec needs a sequence.
+            lm.outputs.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
         decode_loop = Loop(
-            name=cfg.DECODE_LOOP, section=self._lm_node(cfg.GENERATE_WALK),
+            name=cfg.DECODE_LOOP, section=lm,
             max_iters=cfg.MAX_TEMPORAL_FORWARDS, outputs=[], accumulated_outputs=accumulated,
         )
         decoder = GraphNode(
@@ -276,8 +282,9 @@ class PersonaPlexModel(Model):
         return cfg.MAX_TEMPORAL_FORWARDS
 
     def get_autocast_dtype(self):
-        # Submodules load in their own dtypes: the LM in bf16, Mimi in fp32 like the reference.
-        return None
+        # EngineManager also uses this as the paged-KV allocation dtype. Each
+        # submodule disables engine autocast and keeps its own checkpoint dtype.
+        return torch.bfloat16
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,

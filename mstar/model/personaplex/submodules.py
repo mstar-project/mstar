@@ -74,6 +74,19 @@ class LMFrame:
     restore_cache: torch.Tensor | None = None  # voice preset cache, after the last embedding
 
 
+def _sampled_token_ids(tokens: torch.Tensor, expected: torch.Tensor, source: str) -> torch.Tensor:
+    """Adapt eager FlashInfer's int32 IDs to the cache's strict int64 contract."""
+    if not isinstance(tokens, torch.Tensor):
+        raise ValueError(f"{source} must return a tensor")
+    if tokens.shape != expected.shape:
+        raise ValueError(f"{source} must return shape {tuple(expected.shape)}, got {tuple(tokens.shape)}")
+    if tokens.device != expected.device:
+        raise ValueError(f"{source} must return tokens on {expected.device}, got {tokens.device}")
+    if tokens.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"{source} must return int32 or int64 tokens, got {tokens.dtype}")
+    return tokens.to(torch.long)
+
+
 def _planned_frames(walk: str, meta: dict) -> tuple[int, int]:
     """(first, end) request frame indices covered by ``walk``."""
     conditioning = int(meta["conditioning_frames"])
@@ -85,6 +98,7 @@ def _planned_frames(walk: str, meta: dict) -> tuple[int, int]:
 class LMSubmodule(ARNodeSubmodule):
     """Temporal transformer + depformer + delayed token cache, batch size 1."""
 
+    disable_autocast = True
     disable_torch_compile = True
 
     def __init__(self, lm: PersonaPlexLM):
@@ -174,9 +188,12 @@ class LMSubmodule(ARNodeSubmodule):
                 raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target (worklog R15)")
             output = cache.commit(target[:, 0], target[:, 1:])
         else:
-            sampled_text = sample_text(text_logits.float())
+            sampled_text = _sampled_token_ids(sample_text(text_logits.float()), target[:, 0], "text sampler")
             next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
-            audio = self.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], sample_depth)
+            def sample_audio(logits: torch.Tensor, step: int) -> torch.Tensor:
+                return _sampled_token_ids(sample_depth(logits, step), target[:, 0], f"depth sampler step {step}")
+
+            audio = self.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio)
             output = cache.commit(sampled_text, audio)
             if output is None:
                 raise RuntimeError("generate frames always gather an output")
@@ -186,7 +203,9 @@ class LMSubmodule(ARNodeSubmodule):
         if not conditioning:
             # Delay-0 channels from the previous step, delay-1 from this one (R4).
             outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
-            outputs["text_frame"] = [output[:, 0, 0].contiguous()]
+            # B=1 column views can report contiguous while retaining stride 17;
+            # worker byte serialization requires a physical stride of one.
+            outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
         return outputs
 
     # ------------------------------------------------------------------ engine contract

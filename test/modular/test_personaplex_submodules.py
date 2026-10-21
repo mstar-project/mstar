@@ -16,6 +16,7 @@ import pytest
 import torch
 from personaplex_fixture_utils import load_binary_fixture
 
+from mstar.engine.engine import Engine
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
 from mstar.model.personaplex.components.temporal import DenseTemporalCache, apply_rope_adjacent
@@ -25,6 +26,7 @@ from mstar.model.personaplex.submodules import (
     MimiDecoderSubmodule,
     MimiEncoderSubmodule,
     ResourceTemporalBackend,
+    _sampled_token_ids,
 )
 from mstar.model.personaplex.weights import PersonaPlexLM, build_lm, reference_lm_key
 
@@ -125,6 +127,65 @@ def _random_inputs(n_emb=3, n_text=4, n_user=5, seed=1):
 
 
 @torch.no_grad()
+def test_shared_lm_interleaved_request_state_matches_isolated_runs():
+    """Check model-local state isolation; dense per-request KV is supplied explicitly.
+
+    This exercises real tiny LM/depth computation and packed cache transitions,
+    including different voice/persona lengths. It does not exercise production
+    engine admission, paged KV, cancellation or worker resource cleanup.
+    """
+    sub = _tiny_submodule(seed=31)
+    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=32),
+             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=33)]
+    expected = []
+    runs = []
+    for voice, persona, codes, meta in cases:
+        isolated = _Run(sub, meta, voice, persona, codes)
+        conditioning, state = isolated.walk(cfg.CONDITIONING_WALK, None)
+        generated, _ = isolated.walk(cfg.GENERATE_WALK, state)
+        expected.append(conditioning + generated)
+        runs.append(_Run(sub, meta, voice, persona, codes))
+
+    states = [None, None]
+    actual = [[], []]
+    # Alternate requests; the shorter one finishes while the other continues.
+    for index in range(max(len(outputs) for outputs in expected)):
+        for request, run in enumerate(runs):
+            if index >= len(expected[request]):
+                continue
+            walk = cfg.CONDITIONING_WALK if index < run.meta["conditioning_frames"] else cfg.GENERATE_WALK
+            frame = sub.prepare_frame(walk, run.meta, {
+                **run.static, "lm_state": [] if states[request] is None else [states[request]],
+            })
+            output = sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)
+            run.backend.advance()
+            states[request] = output["lm_state"][0]
+            actual[request].append(output)
+
+    for request in range(2):
+        for step, (got, want) in enumerate(zip(actual[request], expected[request], strict=True)):
+            assert got.keys() == want.keys(), (request, step)
+            for name in want:
+                for value, reference in zip(got[name], want[name], strict=True):
+                    assert torch.equal(value, reference), (request, step, name)
+
+
+@torch.no_grad()
+def test_generated_text_frame_serializes_for_worker_transfer():
+    """A B=1 text column must have byte-viewable strides for worker transfer."""
+    from mstar.communication.tensors import _serialize_tensor
+
+    sub = _tiny_submodule()
+    voice, persona, codes, meta = _random_inputs(n_user=1)
+    run = _Run(sub, meta, voice, persona, codes)
+    _, state = run.walk(cfg.CONDITIONING_WALK, None)
+    generated, _ = run.walk(cfg.GENERATE_WALK, state)
+    text = generated[0]["text_frame"][0]
+    assert text.shape == (1,) and text.dtype == torch.long
+    assert _serialize_tensor(text) == torch.tensor([text.item()], dtype=torch.long).numpy().tobytes()
+
+
+@torch.no_grad()
 def test_t12_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_frame():
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs()
@@ -151,6 +212,66 @@ def test_t12_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_ea
     for mask in masks[1:]:
         assert not mask[0, :8].any() and mask[0, 8:].all()
     assert DelayedTokenCache.from_state_tensor(state)[1] == meta["conditioning_frames"] + meta["num_user_frames"]
+
+
+@torch.no_grad()
+def test_t12_forward_accepts_eager_int32_sampler_tokens():
+    """Eager FlashInfer returns int32 IDs; both PersonaPlex samplers feed an int64 cache."""
+    class DenseForwardBackend(DenseTemporalCache):
+        def begin(self):
+            pass
+
+    class Int32Sampler:
+        def __init__(self):
+            self.calls = 0
+
+        def sample(self, request_ids, logits):
+            assert request_ids == ["request"] and logits.shape[0] == 1
+            self.calls += 1
+            return logits.argmax(-1).int()
+
+    sub = _tiny_submodule()
+    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=1)
+    run = _Run(sub, meta, voice, persona, codes)
+    run.backend = DenseForwardBackend(TINY.num_layers, TINY.rope_theta)
+    _, state = run.walk(cfg.CONDITIONING_WALK, None)
+    frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+    sub._backend = run.backend
+    text_sampler, depth_sampler = Int32Sampler(), Int32Sampler()
+    engine_inputs = SimpleNamespace(request_ids=["request"], resources={
+        cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
+    })
+    got = sub.forward(cfg.GENERATE_WALK, engine_inputs, frame)
+    assert (text_sampler.calls, depth_sampler.calls) == (1, 16)
+
+    reference = _Run(sub, meta, voice, persona, codes)
+    _, reference_state = reference.walk(cfg.CONDITIONING_WALK, None)
+    reference_frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {
+        **reference.static, "lm_state": [reference_state],
+    })
+    want = sub.run_frame(reference_frame, reference.backend, _greedy_text, _greedy_depth)
+    assert got.keys() == want.keys()
+    for name in got:
+        assert all(torch.equal(actual, expected) for actual, expected in zip(got[name], want[name], strict=True))
+
+
+def test_t12_sampler_adapter_rejects_malformed_tokens():
+    expected = torch.zeros(1, dtype=torch.long)
+    with pytest.raises(ValueError, match="text sampler must return shape \\(1,\\)"):
+        _sampled_token_ids(torch.zeros(1, 1, dtype=torch.int32), expected, "text sampler")
+    with pytest.raises(ValueError, match="depth sampler step 0 must return int32 or int64"):
+        _sampled_token_ids(torch.zeros(1), expected, "depth sampler step 0")
+
+
+def test_t12_bf16_kv_hint_does_not_autocast_lm_or_mimi():
+    model = PersonaPlexModel(skip_weight_loading=True)
+    # This checks autocast policy, independently of graph-runtime construction.
+    engine = Engine.__new__(Engine)
+    engine._autocast_dtype = model.get_autocast_dtype()
+    assert model.get_autocast_dtype() is torch.bfloat16
+    assert LMSubmodule.disable_autocast and MimiEncoderSubmodule.disable_autocast
+    assert MimiDecoderSubmodule.disable_autocast
+    assert engine._autocast_dtype_for(_tiny_submodule()) is None
 
 
 def test_t12_declare_step_declares_samplers_only_on_generate_walks():
@@ -255,7 +376,13 @@ class _FakePos:
 
 
 @torch.no_grad()
-def test_resource_backend_wires_label_layers_and_interleaved_rope():
+def test_resource_backend_wires_label_layers_and_interleaved_rope(monkeypatch):
+    # The Mac conftest stub lacks a type used by an upstream kernel signature
+    # imported through AttentionCallable. This test uses fake resources below;
+    # provide only that annotation, without changing the shared stub or kernels.
+    language = sys.modules.get("triton.language")
+    if language is not None and not hasattr(language, "int64"):
+        monkeypatch.setattr(language, "int64", int, raising=False)
     sub = _tiny_submodule()
     kv, pos = _FakeKV(), _FakePos()
     sub.bind_node_resources({cfg.LM_KV: kv, cfg.LM_ATTN: _FakeAttn(kv), cfg.LM_POS: pos})
