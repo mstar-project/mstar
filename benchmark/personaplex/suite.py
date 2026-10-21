@@ -21,6 +21,14 @@ from benchmark.personaplex.serving import write_json
 
 PIN = "3428dfd95309a7f3c84fd93259ded0f810d1ff91"
 STATUSES = {"PASS", "FAIL", "SKIP", "BLOCKED", "NOT RUN"}
+INTERRUPTED = False
+
+
+def interrupted(*_):
+    global INTERRUPTED
+
+    INTERRUPTED = True
+    raise InterruptedError("Allocation/controller interrupted")
 
 
 def git(*args):
@@ -113,7 +121,7 @@ def subprocess_case(command, output, logpath, deadline, timeout, env):
         try:
             code = process.wait(timeout=remaining)
             timed_out = False
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, InterruptedError):
             os.killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=40)
@@ -361,7 +369,7 @@ def main():
             continue
         if name in ("soak-rust", "warm-rust") and results.get("lifecycle-rust", {}).get("status") != "PASS":
             results[name] = {"status": "NOT RUN", "reason": "Rust lifecycle failed or incomplete; no escalation"}
-        elif time.time() + minimum >= deadline:
+        elif INTERRUPTED or time.time() + minimum >= deadline:
             results[name] = {"status": "NOT RUN", "reason": "Deadline reserve; insufficient time to launch"}
         else:
             target = root / name
@@ -382,4 +390,5 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupted)
     raise SystemExit(main())
