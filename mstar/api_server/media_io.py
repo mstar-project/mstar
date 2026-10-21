@@ -394,7 +394,9 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             frames += len(data)
             if frames > limit:
                 raise AudioTooLongError(max_seconds)
-            parts.append(data.mean(axis=1))
+            # a mono block is its own mean, and numpy's reduction over the
+            # length-1 axis costs ~10x the copy
+            parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 
