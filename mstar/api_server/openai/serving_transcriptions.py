@@ -193,6 +193,11 @@ class WindowPlanner:
     def whole(self) -> Window:
         return Window(path=self.audio_path, offset=0.0, duration=self.duration or 0.0)
 
+    @property
+    def decodes(self) -> bool:
+        """``prepare()`` decodes the upload (otherwise it does nothing)."""
+        return not self.single or self.duration is None
+
     def prepare(self) -> None:
         """Decode an upload that will be windowed, so a file the decoder
         refuses (e.g. an unsupported sample rate, or audio past
@@ -512,8 +517,10 @@ async def create_transcription(
         )
     try:
         # off the event loop: a windowed upload, or one with no duration in
-        # its header, decodes here
-        await asyncio.to_thread(planner.prepare)
+        # its header, decodes here; the rest skip the thread hop, which costs
+        # every short request event-loop time under load
+        if planner.decodes:
+            await asyncio.to_thread(planner.prepare)
     except media_io.AudioTooLongError:
         planner.cleanup()
         raise HTTPException(
