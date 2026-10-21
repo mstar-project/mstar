@@ -425,10 +425,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     for i, inp in enumerate(inputs)
                 ])
             elif routed:
-                ids.index_copy_(
-                    0, torch.tensor(routed, device=ids.device),
-                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
-                )
+                sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)

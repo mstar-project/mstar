@@ -57,6 +57,7 @@ from mstar.model.whisper.config import (
     PREFILL_PROMPT_WALK,
     PREFILL_WALK,
     SAMPLER,
+    TS_RULES,
     WhisperModelConfig,
 )
 
@@ -220,6 +221,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
 # ===================================================================
 
 
+_DECODE_LOOPBACK_WRITES = frozenset({TS_RULES})
+
+
 class WhisperDecoderSubmodule(ARNodeSubmodule):
     """Autoregressive Whisper decoder.
 
@@ -265,17 +269,14 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     # prefill steps are graph replays; the walks they don't cover run eagerly.
     disable_torch_compile = True
     # The decode walk reads its last token off the sampler's slot masters and
-    # keeps its timestamp rule state by slot beside it (`device_loopback_signals`).
+    # its timestamp rule state from the sampler's declared loop-back state
+    # beside it (`device_loopback_signals`).
     reads_device_loopback = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig, tokenizer=None):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        # [slot, rule state]: each request's timestamp rule state, by sampler
-        # slot, for the decode walk's loop-back (allocated on first use; a
-        # captured graph holds its address, so it never grows)
-        self._rules_by_slot: torch.Tensor | None = None
         # the align walk groups tokens into words and re-encodes them
         self.tokenizer = tokenizer
         self._startoflm_id = tokenizer.convert_tokens_to_ids("<|startoflm|>") if tokenizer is not None else None
@@ -543,7 +544,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 CROSS_ATTN: AttentionStep(
                     segments=context_segments, causal=False,
                 ),
-                SAMPLER: SamplerStep(apply_penalty=False),
+                SAMPLER: SamplerStep(
+                    apply_penalty=False,
+                    # the decode forward stores its rows' advanced rule state
+                    # (persisted only on the device loop-back path)
+                    loopback_writes=_DECODE_LOOPBACK_WRITES if graph_walk == DECODE_WALK else frozenset(),
+                ),
                 POS: PositionStep(),
             },
         )
@@ -609,32 +615,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         # already has on the host; the prefill's new_token edge is persisted
         return {"text_inputs": "new_token"} if graph_walk == DECODE_WALK else {}
 
-    def _rule_table(self, sampler: SamplerResource) -> torch.Tensor:
-        table = self._rules_by_slot
-        if table is None:
-            from mstar.utils.knobs import sampler_slots
-
-            rows = max(sampler_slots(), sampler.slot_capacity)
-            table = self._rules_by_slot = torch.tensor(
-                [inactive_state()], dtype=torch.long, device=self.get_device(),
-            ).repeat(rows, 1)
-        if sampler.slot_capacity > table.shape[0]:
-            raise RuntimeError(
-                f"the sampler holds {sampler.slot_capacity} slots but Whisper's rule "
-                f"table {table.shape[0]}; raise MSTAR_SAMPLER_SLOTS"
-            )
-        return table
-
-    @torch.compiler.disable
-    def _store_rules(self, engine_inputs: ModelInputsFromEngine, next_rules: torch.Tensor) -> None:
-        """The advanced rule state of every row to its slot, for the next step
-        to read (captured with the step: under a lease the slot index row is a
-        static buffer the sampler re-uploads every step)."""
-        if not self._device_loopback():
-            return
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        self._rule_table(sampler).index_copy_(0, sampler.loopback_slots(engine_inputs.request_ids), next_rules)
-
     def _loopback_inputs(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
@@ -644,12 +624,14 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         brings them routed and they override its slot's."""
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        rules = self._rule_table(sampler).index_select(0, sampler.loopback_slots(engine_inputs.request_ids))
+        rules = sampler.loopback_state(TS_RULES, engine_inputs.request_ids)
         routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
         if routed:
-            at = torch.tensor(routed, device=ids.device)
-            ids.index_copy_(0, at, torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype))
-            rules.index_copy_(0, at, torch.stack([inputs[i].tensor_inputs["ts_rules"] for i in routed]))
+            sampler.overwrite_rows(
+                routed,
+                (ids, torch.cat([inputs[i].input_ids for i in routed])),
+                (rules, torch.stack([inputs[i].tensor_inputs["ts_rules"] for i in routed])),
+            )
         return {"input_ids": ids, "ts_rules": rules}
 
     def _write_context(self, encoder_states: torch.Tensor) -> None:
@@ -774,8 +756,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         # persisted first token.
         if graph_walk == DECODE_WALK:
             rows = {"text_inputs": new_tokens}
-            if next_rules is not None:
-                self._store_rules(engine_inputs, next_rules)
+            if next_rules is not None and self._device_loopback():
+                engine_inputs.resources[SAMPLER].store_loopback_state(
+                    TS_RULES, engine_inputs.request_ids, next_rules,
+                )
         else:
             rows = {"new_token": new_tokens}
         if next_rules is not None:

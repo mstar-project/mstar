@@ -574,7 +574,12 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs(DECODE_WALK, has_loopback=True).input_seq_len == 1
     routed = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([7])]})
-    sampler = type("S", (), {"loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13]))})()
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = type("S", (), {
+        "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
+        "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
+    })()
     ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
         request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},
     ), [row, routed, row])["input_ids"]

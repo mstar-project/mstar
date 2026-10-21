@@ -429,10 +429,7 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
                 # rows whose last step ran elsewhere brought their token
                 routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
                 if routed:
-                    ids.index_copy_(
-                        0, torch.tensor(routed, device=ids.device),
-                        torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
-                    )
+                    sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
                 return {"input_ids": ids}
             return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}

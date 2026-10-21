@@ -6,15 +6,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 
 
 class _Sampler:
+    # the real row override: a routed row's token over the master's
+    overwrite_rows = SamplerResource.overwrite_rows
+
     def __init__(self, masters=True, tokens=None):
         self.has_slot_masters = masters
         self.tokens = tokens
         self.asked = None
+        self._row_stager = None
 
     def loopback_tokens(self, request_ids):
         self.asked = list(request_ids)
