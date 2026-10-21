@@ -831,8 +831,11 @@ class Cosmos3Model(Model):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
+        # The DiT prefill waits on text_inputs, so no prompt means the empty
+        # prompt (as in the reference), not a missing edge. /generate sends an
+        # empty text field as None.
         if prompt is None:
-            return self._action_prompt_output({}, kwargs)
+            prompt = ""
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
