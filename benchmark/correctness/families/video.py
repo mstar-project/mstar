@@ -1,7 +1,9 @@
 """Video generation: 5 prompts at fixed seeds (i2v models also get a first frame).
 
 Per-frame PSNR/SSIM vs diffusers, judged on the median frame against the repo's 30 dB bar
-(cosmos3 test_video.py), plus a contact sheet of first/middle/last frames.
+(cosmos3 test_video.py), plus a contact sheet of first/middle/last frames. A served video is an
+H.264 mp4, so the reference frames go through the same encode (SERVER_X264) before they are
+compared with it. The encode alone caps PSNR at 34-41 dB and darkens frames by about a luma level.
 """
 
 from __future__ import annotations
@@ -38,6 +40,51 @@ def write_video(frames: np.ndarray, path: Path, fps: int) -> None:
     from benchmark.correctness.sets import _write_mp4
 
     _write_mp4(np.asarray(frames, dtype=np.uint8), path, fps)
+
+
+# x264 options of each model's served mp4 (libx264, yuv420p), by model key. Cosmos3Model.postprocess uses
+# CRF 18, preset ultrafast (COSMOS3_X264_PRESET can change it) and threads 0. Wan22Model.postprocess keeps
+# libx264's defaults, CRF 23 and preset medium.
+_COSMOS3_X264 = {"crf": "18", "preset": "ultrafast", "threads": "0"}
+SERVER_X264: dict[str, dict[str, str]] = {
+    "cosmos3": _COSMOS3_X264,
+    "cosmos3_edge": _COSMOS3_X264,
+    "cosmos3_super": _COSMOS3_X264,
+    "cosmos3_super_i2v_4step": _COSMOS3_X264,
+    "wan22": {},
+}
+
+
+def server_mp4(frames: np.ndarray, options: dict[str, str], fps: int) -> bytes:
+    """``frames`` [T, H, W, 3] uint8 as an mp4 the way a server encodes them (libx264, yuv420p,
+    ``options``)."""
+    import io
+    from fractions import Fraction
+
+    import av
+
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="mp4") as c:
+        s = c.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
+        s.height, s.width = frames.shape[1:3]
+        s.pix_fmt = "yuv420p"
+        s.options = dict(options)
+        for f in np.asarray(frames, dtype=np.uint8):
+            for packet in s.encode(av.VideoFrame.from_ndarray(f, format="rgb24")):
+                c.mux(packet)
+        for packet in s.encode():
+            c.mux(packet)
+    return buf.getvalue()
+
+
+def server_mp4_roundtrip(frames: np.ndarray, options: dict[str, str], fps: int) -> np.ndarray:
+    """``frames`` through ``server_mp4`` and decoded again with PyAV, as the runner reads a served video."""
+    import io
+
+    import av
+
+    with av.open(io.BytesIO(server_mp4(frames, options, fps))) as c:
+        return np.stack([f.to_ndarray(format="rgb24") for f in c.decode(c.streams.video[0])])
 
 
 class VideoFamily(MathSdpaReference, Family):
@@ -134,6 +181,15 @@ class VideoFamily(MathSdpaReference, Family):
         """[T, H, W, 3] floats in [0, 1] from the pipeline output (output_type="np")."""
         return out.frames[0]
 
+    def comparable(self, path: Path, cache: dict) -> np.ndarray:
+        """A reference arm's saved frames as a served video would carry them: through the model's mp4
+        encode (SERVER_X264), or raw for a model with no entry there."""
+        if path not in cache:
+            frames = np.load(path)
+            options = SERVER_X264.get(self.model_key)
+            cache[path] = frames if options is None else server_mp4_roundtrip(frames, options, self.fps)
+        return cache[path]
+
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
               device: str) -> FamilyScore:
         sc = FamilyScore(self.name)
@@ -143,13 +199,14 @@ class VideoFamily(MathSdpaReference, Family):
         sc.check("requests ok", n - len(fails), "PASS" if not fails else "FAIL", f"all {n} requests return a video",
                  "; ".join(f"{k}: {v[:80]}" for k, v in list(fails.items())[:3]))
         medians, sheet, labels = [], [], []
+        encoded: dict[Path, np.ndarray] = {}
         for it in sset.items:
             p = runs[0] / "outputs" / f"{it.id}.mp4"
             row = {"id": it.id, "prompt": it.prompt[:60]}
             out = read_video(p) if p.is_file() else None
             ref = None
             if ref_out and (ref_out / f"{it.id}.npy").is_file():
-                ref = np.load(ref_out / f"{it.id}.npy")
+                ref = self.comparable(ref_out / f"{it.id}.npy", encoded)
             if out is not None:
                 row["frames"] = len(out)
                 row["dims"] = "x".join(map(str, out.shape[1:3]))
@@ -188,7 +245,8 @@ class VideoFamily(MathSdpaReference, Family):
             for r in sc.rows:
                 a, b = ref_out / f"{r['id']}.npy", arm_dir / "outputs" / f"{r['id']}.npy"
                 if a.is_file() and b.is_file():
-                    psnr = round(statistics.median(M.frame_psnrs(np.load(a), np.load(b))), 2)
+                    psnr = round(statistics.median(M.frame_psnrs(self.comparable(a, encoded),
+                                                                 self.comparable(b, encoded))), 2)
                     r[f"ref_vs_{arm}_ref_psnr_median"] = psnr
                     moves.setdefault(r["id"], []).append(psnr)
             sc.metrics[metric] = M.distribution([r[f"ref_vs_{arm}_ref_psnr_median"] for r in sc.rows
@@ -206,6 +264,9 @@ class VideoFamily(MathSdpaReference, Family):
                 tuple(used), "math-SDPA and fp32-anchor spreads (per video the larger move)")
             served = statistics.median(medians) if medians else None
             self.calibrated_verdict(sc, [min(v) for v in moves.values()], served, basis)
+        if ref_out and SERVER_X264.get(self.model_key) is not None:
+            sc.notes.append(f"The reference frames were compared after the served mp4's encode "
+                            f"(libx264 {SERVER_X264[self.model_key] or 'defaults'}) and a decode.")
         if medians:
             med = statistics.median(medians)
             sc.metrics["per_video_median_frame_psnr_db"] = M.distribution(medians)
