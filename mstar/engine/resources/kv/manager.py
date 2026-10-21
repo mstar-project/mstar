@@ -258,9 +258,12 @@ class CacheStream:
     # miss (a refused admit prepares the step again) is not counted twice
     prefix_counted: bool = False
     # the most pages the request's layout lets this stream hold, and how far through
-    # that layout it is; both None without a layout
+    # that layout it is. Both are None for a request with no layout. A label the
+    # request doesn't lay out gets a footprint of 0 and no cursor.
     footprint: int | None = None
     span_cursor: SpanCursor | None = None
+    # the most pages the stream has taken, kept only under `_DEBUG_ASSERTS`
+    peak: int = 0
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -518,6 +521,8 @@ class KVManager(AttentionResource):
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
         self._warned_unkeyed: set[str] = set()
+        # (label, whether the request opens it) for each overrun already reported
+        self._overran: set[tuple[str, bool]] = set()
         # streams whose lease still holds a cached image end for `plan` to copy
         self._image_ends: list[CacheStream] = []
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
@@ -1305,11 +1310,17 @@ class KVManager(AttentionResource):
                     self._seed_keys(rid, label, stream)
 
     def _lay_out(self, rid: str, label: str, stream: CacheStream) -> None:
-        """Set ``stream``'s footprint and span cursor from its request's layout for ``label``, if there is one."""
+        """Set ``stream``'s footprint and span cursor from its request's layout for ``label``, if there is one.
+
+        A laid-out request is held to no pages on a label it doesn't open, so a batch that
+        writes one for it anyway takes them past its footprint.
+        """
         layout = self._held_layout(rid, label)
         if layout is not None:
             stream.footprint = layout.pages(self._overrides[rid].loop_caps, self.config.page_size)
             stream.span_cursor = SpanCursor(layout.spans)
+        elif self._overrides.get(rid) is not None and self._overrides[rid].kv_layout:
+            stream.footprint = 0
 
     def _held_layout(self, rid: str, label: str) -> StreamLayout | None:
         overrides = self._overrides.get(rid)
@@ -1444,6 +1455,8 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
+        if _DEBUG_ASSERTS and not step.commit:
+            self._assert_scratch(step, ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -2292,9 +2305,11 @@ class KVManager(AttentionResource):
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
                     touched = []
-                    if stream.chain is not None:
+                    if stream.span_cursor is not None and (stream.chain is not None or _DEBUG_ASSERTS):
                         written = stream.stored_len + stream.released
                         touched = stream.span_cursor.advance(written - segment.span, written)
+                        if _DEBUG_ASSERTS:
+                            self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
                         self._index_filled_pages(segment, stream, ctx, touched)
                     # so a claim taken in a window the mark misses still fails
@@ -2317,6 +2332,26 @@ class KVManager(AttentionResource):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+
+    def _assert_layout(
+        self, segment: Segment, stream: CacheStream, touched: list[tuple[int, int]],
+        ctx: StepContext, policy: RetentionPolicy | None,
+    ) -> None:
+        """Check a commit against its request's layout. Debug only, since it looks the layout up per segment."""
+        overrides = self._overrides[segment.request_id]
+        layout = overrides.kv_layout[segment.label]
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
+        where = f"KV {self.name}: {segment.request_id}/{segment.label}"
+        for index, _ in touched:
+            assert stream.span_cursor.spans[index].walk == walk, (
+                f"{where}: {walk} wrote into span {index}, which its layout gives to "
+                f"{stream.span_cursor.spans[index].walk}"
+            )
+        written, bound = stream.stored_len + stream.released, layout.slots(overrides.loop_caps)
+        assert written <= bound, f"{where}: committed {written} slots, past its layout's spans and growth ({bound})"
+        assert policy is None or policy == layout.retention, (
+            f"{where}: a step declares {policy}, where its layout declares {layout.retention}"
+        )
 
     # Partial release behind a protected prefix (windowed generation): a
     # request that generates in windows commits each window's K/V and, once
@@ -2908,6 +2943,8 @@ class KVManager(AttentionResource):
                 if stream.read_future is not None:
                     wait([stream.read_future])
         with self._lock:
+            if _DEBUG_ASSERTS and rid in self._streams:
+                self._report_underuse(rid)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(stream)
@@ -2923,6 +2960,19 @@ class KVManager(AttentionResource):
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+
+    def _report_underuse(self, rid: str) -> None:
+        """Log each label whose stream stayed a page or more under its footprint, so an over-count shows. Debug only."""
+        overrides = self._overrides[rid]
+        for label, layout in (overrides.kv_layout or {}).items():
+            stream = self._streams[rid].get(label)
+            footprint = layout.pages(overrides.loop_caps, self.config.page_size)
+            peak = 0 if stream is None else stream.peak
+            if footprint > peak:
+                logger.warning(
+                    "KV %s: request %s held at most %d pages on label %s against a footprint of %d",
+                    self.name, rid, peak, label, footprint,
+                )
 
     def assert_pages_conserved(self) -> None:
         """Check the owner counts against the streams holding the pages.
@@ -3170,7 +3220,43 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
+                if stream.footprint is not None and len(stream.page_indices) > stream.footprint:
+                    self._report_overrun(request_id, label, stream)
+                if _DEBUG_ASSERTS:
+                    stream.peak = max(stream.peak, len(stream.page_indices))
         return AllocResult(new_pages=new_pages)
+
+    def _assert_scratch(self, step: KVStep, ctx: StepContext) -> None:
+        """Check that a step that commits nothing writes no more than its layout's scratch. Debug only."""
+        for segment in step.segments:
+            layout = self._held_layout(segment.request_id, segment.label)
+            if layout is None or self._on_sink(ctx, segment.request_id) or (
+                (segment.request_id, segment.label) in step.sink
+            ):
+                continue
+            assert segment.span <= layout.scratch, (
+                f"KV {self.name}: {segment.request_id}/{segment.label}: a step that commits nothing "
+                f"writes {segment.span} slots, past its layout's scratch of {layout.scratch}"
+            )
+
+    def _report_overrun(self, rid: str, label: str, stream: CacheStream) -> None:
+        """Log once per label that a request took more pages than its layout allows.
+
+        The pool would then promise room it doesn't have, and the request's
+        layout is the likely cause, so the line prints it. A label the request
+        doesn't open is reported on its own, so the pages a batch writes there
+        for every row don't hide a real overrun.
+        """
+        overrides = self._overrides[rid]
+        reported = (label, label in overrides.kv_layout)
+        if reported in self._overran:
+            return
+        self._overran.add(reported)
+        logger.error(
+            "KV %s: request %s took %d pages on label %s against a footprint of %d: layout %s, loop caps %s",
+            self.name, rid, len(stream.page_indices), label, stream.footprint,
+            overrides.kv_layout.get(label), overrides.loop_caps,
+        )
 
     ### Submodule-level functionality
     # Label / layer cursors come from `AttentionResource`; the readers resolve

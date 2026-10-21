@@ -392,6 +392,12 @@ class StreamLayout:
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
 
+    def slots(self, caps: Mapping[str, int]) -> int:
+        """Every slot the stream commits, its spans then its growth."""
+        return sum(span.length for span in self.spans) + sum(
+            slots * caps[loop] for loop, slots in self.growth
+        )
+
     def pages(self, caps: Mapping[str, int], page_size: int) -> int:
         """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.
 
@@ -400,10 +406,7 @@ class StreamLayout:
         the budget, or at the prefix rounded up to a page if that is larger. The bound adds
         a page of overrun and the largest step past the prefix to that peak.
         """
-        written = sum(span.length for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
-        pages = -(-(written + self.scratch) // page_size)
+        pages = -(-(self.slots(caps) + self.scratch) // page_size)
         if self.retention is None:
             return pages
         prefix = self.retention.protected_prefix
