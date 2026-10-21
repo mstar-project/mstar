@@ -673,3 +673,15 @@ class StepRunner:
             self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )
+
+    def capture_refusal(
+        self, spec: CGSlotSpec, node_name: str | None = None,
+    ) -> str | None:
+        """The first reason one of ``node_name``'s resources gives for not
+        capturing ``spec``'s bucket, or None if all of them can; swept over the
+        same resources as ``build_accelerator_graph_buffers``."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            reason = self._resources[key].capture_refusal(spec)
+            if reason is not None:
+                return f"{key}: {reason}"
+        return None
