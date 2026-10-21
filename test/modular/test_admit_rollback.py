@@ -71,6 +71,10 @@ class _HostPoolStub(CPUPagePool):
         self.arena = PageArena(kv_cache=None, allocator=PageAllocator(64))
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
+        self._refused_logged_at = None
+        self._refused_unlogged = 0
+        self.dropped = 0
+        self._dropped_logged_at = None
 
     def copy_out(self, gpu_kv_cache, copies):
         pass
