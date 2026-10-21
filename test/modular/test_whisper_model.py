@@ -613,6 +613,29 @@ def test_state_machine_aligns_words_after_decoding():
     assert model.get_partition_forward_pass_args("default", align.full_metadata, {}).request_done
 
 
+
+def test_word_timestamps_on_a_sharded_decoder_are_refused_at_ingest():
+    """The align walk re-runs the decoder unsharded: a TP deployment answers a
+    word-timestamp request with a 400 (ValueError at ingest) instead of
+    failing it after the whole decode."""
+    signals = {"audio": [object()], "text_inputs": [object()]}
+    model = _make_model()
+    tp2 = {"max_concurrent_requests": 64, "node_groups": [
+        {"node_names": ["audio_encoder"], "ranks": [0]},
+        {"node_names": ["decoder"], "ranks": [0, 1], "tp_size": 2},
+    ]}
+    model.validate_config_yaml(tp2, "tp2.yaml")
+    with pytest.raises(ValueError, match="word timestamps need the decoder on one GPU"):
+        model.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "word"})
+    # segment timestamps and plain transcripts are fine there
+    model.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "segment"})
+
+    single = _make_model()
+    single.validate_config_yaml({"max_concurrent_requests": 64, "node_groups": [
+        {"node_names": ["audio_encoder", "decoder"], "ranks": [0]},
+    ]}, "x.yaml")
+    single.get_initial_forward_pass_args("default", ["audio"], ["text"], signals, {"timestamps": "word"})
+
 def test_state_machine_language_detection():
     model = _make_model()
     tail = object()
