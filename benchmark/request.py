@@ -1113,10 +1113,13 @@ class MediaRoutes:
     video_poll_s = 0.1
     # A job that never reaches a final status fails its request instead of holding the cell (and the sweep) forever.
     video_job_timeout_s = 3600.0
+    # Engine-specific fields of an image request.
+    image_fields: dict = {}
 
     async def _send_request_image(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
         body = {"model": model.get_served_model_name(), "prompt": req_input.prompt, "n": 1,
-                "response_format": "b64_json", **_media_fields(model, req_input, additional_model_kwargs)}
+                "response_format": "b64_json", **self.image_fields,
+                **_media_fields(model, req_input, additional_model_kwargs)}
         try:
             metrics.start_time = time.monotonic()
             async with session.post(f"{base_url}/v1/images/generations", json=body,
@@ -1700,6 +1703,10 @@ class SGLangOmni(SpeechRoute, InferenceSystem):
 
 class SGLangDiffusion(MediaRoutes, InferenceSystem):
     """SGLang Diffusion (``sglang serve``): images and the video job API, like vllm-omni."""
+
+    # Its FLUX.2 images default to JPEG (SamplingParams.default_image_output_format); the other engines return PNG,
+    # and a lossy encode would show up in the comparison against the reference.
+    image_fields = {"output_format": "png"}
 
     async def send_request(
         self,
