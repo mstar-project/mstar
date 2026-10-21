@@ -980,3 +980,18 @@ def test_dry_media_sweep_plan(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         sweep.main(["--table", "video", "--node-type", "mi300x", "--gpus", "7", "--run-root", str(tmp_path),
                     "--run-id", "timed", "--requests", "2"])
+
+
+def test_i2v_rows_send_their_own_first_frames(tmp_path):
+    i2v, t2v = tables.WORKLOADS["video-i2v"], tables.WORKLOADS["video-t2v"]
+    wan = sweep.workload_set_dir(catalog.ROWS["wan22"], i2v, tmp_path / "wan")
+    items = json.loads((wan / "manifest.json").read_text())["items"]
+    assert wan == tmp_path / "wan" / "set-video-i2v" and len(items) == 5
+    assert all(it["files"]["image"] == f"{catalog.ROWS['wan22'].i2v_frames}/{it['id']}.png" for it in items)
+    own = sweep.workload_set_dir(catalog.ROWS["cosmos3_nano"], i2v, tmp_path / "cosmos")
+    assert own == sweep.SETS_ROOT / "sets" / "video_v1" and not (tmp_path / "cosmos").exists()
+    assert sweep.workload_set_dir(catalog.ROWS["wan22"], t2v, tmp_path / "t") == sweep.SETS_ROOT / "sets" / "video_v1"
+    cmd = sweep.runner_command(catalog.ARMS["mstar"], catalog.ROWS["wan22"], i2v, 1, 8400, tmp_path / "r", 0,
+                               set_dir=wan)
+    assert cmd[cmd.index("--sample-set-dir") + 1] == str(wan)
+    assert cmd[cmd.index("--request-type") + 1] == "image_to_video"
