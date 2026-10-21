@@ -50,6 +50,7 @@ from mstar.model.media_limits import (
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
+from mstar.streaming.topology import client_stream_limits
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
     AbortRequest,
@@ -524,6 +525,14 @@ class PreprocessWorkerThread:
         self._client_edges = frozenset(
             conn.edge_name for conn in model.get_partition_topology().client_connections()
         ) if model is not None else frozenset()
+        # the client streams with a max_items, which this thread charges as their items pass
+        self._item_limits = {
+            name: limits
+            for name, limits in client_stream_limits(model.get_partition_topology(), model_config).items()
+            if limits.max_items is not None
+        } if model is not None else {}
+        # per request, what each of those streams has carried so far
+        self._stream_items: dict[str, dict[str, int]] = {}
         self.in_queue = in_queue
         # Whether the API server still waits on a submission (see
         # _process_waiting_input); None (tests) takes everything.
@@ -604,6 +613,7 @@ class PreprocessWorkerThread:
             "tensor_uuid_to_metadata_per_request",
             "request_model_kwargs",
             "request_output_state",
+            "_stream_items",
         ):
             state = getattr(self, state_name, None)
             if state is not None:
@@ -701,9 +711,9 @@ class PreprocessWorkerThread:
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
         # conductor, so a failure here still finds no remote reader.
-        stream_signals = self._store_persisted(input.request_id, {
-            name: tensors.pop(name) for name in self._client_edges if name in tensors
-        })
+        stream_items = {name: tensors.pop(name) for name in self._client_edges if name in tensors}
+        self._charge_stream_items(input.request_id, stream_items)
+        stream_signals = self._store_persisted(input.request_id, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
 
         self.request_model_kwargs[input.request_id] = model_kwargs
@@ -782,12 +792,30 @@ class PreprocessWorkerThread:
                     )
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
+                self._charge_stream_items(request_id, items)
             if items or chunk.ends:
                 self._send_stream_input(
                     request_id, self._store_persisted(request_id, items), ended=chunk.ends,
                 )
         finally:
             unlink_files(chunk.file_paths)
+
+    def _charge_stream_items(self, request_id: str, items: NameToTensorList) -> None:
+        """Charge a call's new stream items to their streams' ``max_items``;
+        an item past it fails the call with a 400."""
+        for name, tensors in items.items():
+            limits = self._item_limits.get(name)
+            if limits is None or not tensors:
+                continue
+            carried = self._stream_items.setdefault(request_id, {})
+            size = limits.item_size
+            total = carried.get(name, 0) + (sum(size(t) for t in tensors) if size else len(tensors))
+            if total > limits.max_items:
+                raise ValueError(
+                    f"the call's {name!r} stream passed {limits.max_items} {limits.unit}, "
+                    f"this server's limit (client_streams.{name}.max_items)"
+                )
+            carried[name] = total
 
     def _client_chunk(self, chunk: ClientAppend) -> ClientChunk:
         """``chunk`` as ``process_stream_chunk`` takes it: its files loaded."""

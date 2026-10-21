@@ -34,7 +34,13 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
-from mstar.streaming.topology import CLIENT, Connection, PartitionTopology  # noqa: E402
+from mstar.streaming.topology import (  # noqa: E402
+    CLIENT,
+    ClientStreamLimits,
+    Connection,
+    PartitionTopology,
+    client_stream_limits,
+)
 from mstar.utils.ipc_format import (  # noqa: E402
     AbortRequest,
     ClientStreamInput,
@@ -573,3 +579,109 @@ def test_a_producer_partitions_end_leaves_a_colocated_consumers_stream_open():
     ))
     assert to_a.producer_done and to_a._num_items_expected == 4
     assert not to_b.producer_done
+
+
+class _Bounded(_DuplexToy):
+    """``audio_in`` with the given limits."""
+
+    def __init__(self, limits):
+        super().__init__()
+        self._limits = limits
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[Connection(
+            from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=self._limits,
+        )])
+
+
+def _consumed(c, rid, n):
+    """The consumer's step report: it has consumed ``n`` audio_in items."""
+    wg = c.node_walk_to_wg[("ear", "listen")].worker_graph_id
+    return _msg(ConductorMessageType.WORKER_GRAPHS_DONE, WorkerGraphsDone(
+        request_id=rid, worker_graph_ids=[wg], is_first_tp_rank=True,
+        partition_name="Ear", stream_tokens_consumed={"audio_in": n},
+    ))
+
+
+def test_a_call_too_far_ahead_of_its_consumer_is_refused_with_a_400(tmp_path, monkeypatch):
+    c = _conductor(tmp_path, monkeypatch, model=_Bounded(ClientStreamLimits(max_pending_items=2)))
+    _run(c, [
+        [_new_request("r")],
+        [_chunk("r", 1, 2)],          # 2 pending: at the limit
+        [_consumed(c, "r", 1)],
+        [_chunk("r", 3)],             # 2 pending again
+        [_chunk("r", 4)],             # 3: refused
+    ])
+
+    assert _stream_signals(c, "r") == [([1, 2], set()), ([3], set())]
+    drain = c.draining["r"]
+    assert drain.failure_status == 400
+    assert "client_streams.audio_in.max_pending_items" in drain.failure_error
+
+
+def test_drop_oldest_keeps_the_newest_item_waiting_for_room(tmp_path, monkeypatch):
+    """Past the limit the newest item waits in the conductor and replaces
+    any older one waiting, which is freed at once; room (a consumption
+    report) or the stream's end sends the one waiting."""
+    c = _conductor(tmp_path, monkeypatch, model=_Bounded(
+        ClientStreamLimits(max_pending_items=2, pending_overflow="drop_oldest"),
+    ))
+    _run(c, [
+        [_new_request("r")],
+        [_chunk("r", 1, 2)],          # sent: 2 pending
+        [_chunk("r", 3)],             # waits
+        [_chunk("r", 4, 5)],          # 5 waits; 3 and 4 are dropped
+        [_consumed(c, "r", 1)],       # room for one: 5 goes
+        [_chunk("r", 6)],             # waits
+        [_chunk("r", done=True)],     # the end sends it first
+    ])
+
+    assert _stream_signals(c, "r") == [([1, 2], set()), ([5], set()), ([6], set()), ([], {CLIENT})]
+    done = [b for _k, _e, b in _sends(c, "INPUT_SIGNALS") if b.request_id == "r" and b.producer_done]
+    assert [dict(b.producer_done_items) for b in done] == [{"audio_in": 4}]
+    freed = {u: n for _k, _e, b in _sends(c, "UNPERSIST_TENSORS") for u, n in b.uuid_to_ref_count.items()}
+    assert {u: freed[u] for u in (3, 4)} == {3: 0, 4: 0}       # no reader: freed now
+    assert all(freed[u] == 1 for u in (1, 2, 5, 6))
+    conn = c.requests["r"].streaming_connections[CLIENT, "Ear", "audio_in"]
+    assert conn.waiting is None and conn.token_count == 4
+
+
+def test_client_stream_limits_take_deployment_overrides():
+    topology = _Bounded(ClientStreamLimits(max_items=10)).get_partition_topology()
+
+    assert client_stream_limits(topology, None)["audio_in"].max_items == 10
+    limits = client_stream_limits(topology, {"client_streams": {"audio_in": {
+        "max_items": 6, "max_pending_items": 8, "pending_overflow": "drop_oldest",
+    }}})["audio_in"]
+    assert (limits.max_items, limits.max_pending_items, limits.pending_overflow) == (6, 8, "drop_oldest")
+
+
+@pytest.mark.parametrize("max_items", [11, None])
+def test_a_deployment_cannot_raise_or_lift_a_declared_bound(max_items):
+    """A declared bound is what the model's consumer was sized for."""
+    topology = _Bounded(ClientStreamLimits(max_items=10)).get_partition_topology()
+    with pytest.raises(ValueError, match="may lower the model's bound of 10"):
+        client_stream_limits(topology, {"client_streams": {"audio_in": {"max_items": max_items}}})
+
+
+@pytest.mark.parametrize("block, match", [
+    ({"video_in": {"max_items": 1}}, "unknown client stream"),
+    ({"audio_in": {"max_itmes": 1}}, "takes"),
+    ({"audio_in": {"max_items": 0}}, "positive integer"),
+    ({"audio_in": {"max_pending_items": True}}, "positive integer"),
+    ({"audio_in": {"pending_overflow": "block"}}, "pending_overflow"),
+    ({"audio_in": 5}, "takes"),
+])
+def test_a_bad_client_streams_block_fails_loading(block, match):
+    topology = _Bounded(ClientStreamLimits()).get_partition_topology()
+    with pytest.raises(ValueError, match=match):
+        client_stream_limits(topology, {"client_streams": block})
+
+
+def test_only_a_client_stream_takes_limits():
+    with pytest.raises(ValueError, match="not a client stream"):
+        PartitionTopology(partitions=["A", "B"], connections=[Connection(
+            from_partition="A", to_partition="B", edge_name="x",
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=ClientStreamLimits(max_items=1),
+        )])

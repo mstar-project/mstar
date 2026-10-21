@@ -250,6 +250,22 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
        depends on how fast the model consumes it.
+   * - ``client_streams``
+     - *(optional)* For a model that takes live client input: per client stream (by
+       its edge name, e.g. ``audio_in``), overrides of the limits the model declares on
+       it (``ClientStreamLimits``, see :doc:`adding_models`). ``max_items``: what the
+       stream may carry over a call's life, in the model's units (items, or the frames
+       or samples a model counts per item); a call past it ends with a 400.
+       ``max_pending_items``: how many items the model may have been sent and not yet
+       consumed at once, as the model last reported (a step late).
+       ``pending_overflow``: what an item past that does, ``refuse`` (the default: the
+       call ends with a 400) or ``drop_oldest`` (it waits in the conductor until the
+       model has room, replacing an older item waiting there, which is dropped). A
+       deployment may set a bound the model leaves open (``null`` is none) or lower one it
+       declares, which is the most the model can take, but not raise or lift it: a
+       model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
+       ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
+       ``max_call_input_mb`` these count what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``speculation_mixes_walks``

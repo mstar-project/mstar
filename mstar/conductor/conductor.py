@@ -41,7 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.streaming.topology import CLIENT
+from mstar.streaming.topology import CLIENT, ClientStreamLimits, client_stream_limits
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
@@ -344,6 +344,10 @@ class RequestData:
         ]
 
 
+class ClientInputRefusedError(ValueError):
+    """Client input past a limit of its stream: the call ends with a 400."""
+
+
 class ClientStream(NamedTuple):
     """Where a client stream's chunks go: the node that consumes the edge, a
     walk it runs in (for routing to its workers) and its partition."""
@@ -474,6 +478,12 @@ class Conductor:
         # edge name -> where its chunks go, for each stream the client feeds. After
         # get_worker_graphs: a model may shape its graphs from the deployment (bagel).
         self._client_streams = self._find_client_streams(model)
+        # the client streams that bound how far the client may run ahead of their consumer
+        self._pending_limits = {
+            name: limits
+            for name, limits in client_stream_limits(model.get_partition_topology(), self.model_config).items()
+            if limits.max_pending_items is not None
+        }
         for index, worker_graph in enumerate(worker_graphs):
             worker_graph.worker_graph_id = index
         self.worker_graphs = {
@@ -1559,7 +1569,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1579,6 +1589,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(
@@ -1715,6 +1726,8 @@ class Conductor:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
+                    if conn.waiting is not None:
+                        self._send_waiting(body.request_id, request_data, conn)
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1952,10 +1965,15 @@ class Conductor:
                     continue
                 conn = request_data.streaming_connections[CLIENT, stream.partition, name]
                 if not conn.producer_done:
+                    if conn.waiting is not None:
+                        self._send_waiting(request_id, request_data, conn, at_end=True)
                     conn.producer_done = True
                     ended.setdefault(stream.partition, []).append(name)
             for partition in sorted(ended):
                 self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
+        except ClientInputRefusedError as exc:
+            logger.info("Client input for request %s refused: %s", request_id, exc)
+            self._remove_request(request_id, request_data, failure_error=str(exc), failure_status=400)
         except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
             logger.exception("Client input for request %s failed", request_id)
             self._remove_request(request_id, request_data,
@@ -1975,7 +1993,18 @@ class Conductor:
         pstate = request_data.partition_states[stream.partition]
         if conn.producer_done or pstate.is_done:
             return  # nothing reads it any more; freed with the request
-        edge = GraphEdge(next_node=stream.node, name=name, tensor_info=list(infos), is_streaming=True)
+        limits = self._pending_limits.get(name)
+        if limits is not None:
+            infos = self._within_pending_limit(request_id, request_data, conn, limits, infos)
+        self._send_client_items(request_id, stream, conn, infos)
+
+    def _send_client_items(
+        self, request_id: str, stream: ClientStream, conn: StreamingConnectionState,
+        infos: list[TensorPointerInfo],
+    ):
+        if not infos:
+            return
+        edge = GraphEdge(next_node=stream.node, name=conn.edge_name, tensor_info=list(infos), is_streaming=True)
         sent = self._send_inputs(request_id, stream.partition, [edge], stream.graph_walk, {})
         conn.token_count += len(infos)
         # each tensor is one stream item; the producer-done signal reports them
@@ -1983,6 +2012,52 @@ class Conductor:
             n = sum(len(e.tensor_info) for e in edges)
             conn.items_sent[worker] = conn.items_sent.get(worker, 0) + n
         # After the send: the hold is released with every reader counted.
+        self._un_persist_tensors(request_id, infos)
+
+    def _within_pending_limit(
+        self, request_id: str, request_data: RequestData, conn: StreamingConnectionState,
+        limits: ClientStreamLimits, infos: list[TensorPointerInfo],
+    ) -> list[TensorPointerInfo]:
+        """Of a client chunk's items, those its consumer may be sent now: at
+        most ``max_pending_items`` sent and not consumed, by the counts the
+        consumer last reported (so a step's worth late). Past it, ``refuse``
+        ends the call; ``drop_oldest`` holds the newest item back until there
+        is room and drops what it replaces."""
+        room = max(limits.max_pending_items - (conn.token_count - conn.consumed_count), 0)
+        if limits.pending_overflow == "refuse":
+            if len(infos) > room:
+                raise ClientInputRefusedError(
+                    f"the call's {conn.edge_name!r} stream ran {limits.max_pending_items} items ahead of "
+                    f"the model, this server's limit (client_streams.{conn.edge_name}.max_pending_items)"
+                )
+            return infos
+        queued = ([conn.waiting] if conn.waiting is not None else []) + list(infos)
+        send, rest = queued[:room], queued[room:]
+        conn.waiting = rest[-1] if rest else None
+        if len(rest) > 1:
+            self._drop_client_items(request_id, request_data, rest[:-1])
+        return send
+
+    def _send_waiting(
+        self, request_id: str, request_data: RequestData, conn: StreamingConnectionState,
+        at_end: bool = False,
+    ):
+        """Send the client item held back under ``drop_oldest`` once its
+        consumer has room, or ahead of its stream's end regardless."""
+        if request_data.partition_states[conn.to_partition].is_done:
+            return  # nothing reads it any more; freed with the request
+        limits = self._pending_limits[conn.edge_name]
+        if at_end or conn.token_count - conn.consumed_count < limits.max_pending_items:
+            info, conn.waiting = conn.waiting, None
+            self._send_client_items(request_id, self._client_streams[conn.edge_name], conn, [info])
+
+    def _drop_client_items(
+        self, request_id: str, request_data: RequestData, infos: list[TensorPointerInfo],
+    ):
+        """Free client items that will never be sent: released with no reader,
+        their producer frees them at once."""
+        for info in infos:
+            request_data.persist_signal_ref_cnt.setdefault(info.uuid, 0)
         self._un_persist_tensors(request_id, infos)
 
     def _wait_for_workers_ready(self) -> None:

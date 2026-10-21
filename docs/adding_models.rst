@@ -1903,6 +1903,18 @@ streams (audio and video, say): each has its own buffer and its own end.
   consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+- A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
+  (``mstar.streaming.topology``), which the client-stream layer enforces before any of
+  the model's code runs: ``max_items``, what the stream may carry over a call's life,
+  each item counting ``item_size(item)`` (1 by default; a stream of variable-length
+  chunks counts their frames or samples, named by ``unit``); and ``max_pending_items``,
+  how many items its consumer may have been sent and not consumed, with
+  ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"drop_oldest"``
+  (the newest item waits for room and older ones waiting are dropped). A call past
+  ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
+  session cap of its own. Declare the most the consumer can take: a deployment may
+  lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
+  it.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.

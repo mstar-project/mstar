@@ -37,7 +37,12 @@ from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.base import TensorAndMetadata  # noqa: E402
 from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
-from mstar.streaming.topology import CLIENT, Connection, PartitionTopology  # noqa: E402
+from mstar.streaming.topology import (  # noqa: E402
+    CLIENT,
+    ClientStreamLimits,
+    Connection,
+    PartitionTopology,
+)
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
 # the end of every stream _ListeningModel takes
@@ -117,7 +122,7 @@ class _TensorManager:
         pass
 
 
-def _thread(model=None, is_pending=None):
+def _thread(model=None, is_pending=None, model_config=None):
     sent = []
     tm = _TensorManager()
     queues = {name: queue.Queue() for name in (
@@ -133,6 +138,7 @@ def _thread(model=None, is_pending=None):
             get_all_new_messages=lambda: [],
         ),
         tensor_manager=tm, model=model or _ListeningModel(), is_pending=is_pending,
+        model_config=model_config,
     )
     return wt, sent, tm
 
@@ -304,6 +310,78 @@ def test_queued_appends_keep_their_order_behind_the_request(tmp_path):
     chunks = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
     assert [c.signals["audio_in"][0].dims for c in chunks[:3]] == [[2], [3], [4]]
     assert chunks[3].ended == ["audio_in"]
+
+
+class _CappedModel(_ListeningModel):
+    """``audio_in`` carries at most 5 samples over a call's life."""
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       limits=ClientStreamLimits(max_items=5, item_size=lambda t: t.numel(), unit="samples")),
+        ])
+
+
+def test_a_call_past_its_streams_max_items_ends_with_a_400_naming_the_limit(tmp_path):
+    wt, sent, _tm = _thread(_CappedModel())
+    _open(wt)
+    wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 3)]}))
+    wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "b.raw", 3)]}))
+
+    error = wt.out_queue.get_nowait()
+    assert error.modality == "error" and error.metadata["status"] == 400
+    assert b"passed 5 samples" in error.data and b"client_streams.audio_in.max_items" in error.data
+    # the first append went on; the one past the limit was never sent
+    assert [b.signals["audio_in"][0].dims for b in _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)] == [[3]]
+    assert [b.request_id for b in _bodies(sent, ConductorMessageType.ABORT_REQUEST)] == ["r"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_opening_s_first_chunk_counts_against_max_items(tmp_path):
+    wt, sent, _tm = _thread(_CappedModel())
+    _open(wt, files={"audio": [_audio_file(tmp_path, "clip.raw", 4)]})
+    assert wt._stream_items["r"] == {"audio_in": 4}
+
+    wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "c.raw", 2)]}))
+
+    assert wt.out_queue.get_nowait().metadata["status"] == 400
+    wt._hard_cleanup("r")
+    assert "r" not in wt._stream_items  # dropped with the request's other state
+
+
+def test_an_opening_past_max_items_is_refused():
+    wt, sent, _tm = _thread(_CappedModel())
+    wt._process_waiting_input(PreprocessInput(
+        request_id="r", text="hi", file_paths=None, input_modalities=["text"],
+        output_modalities=["text"], model_kwargs={},
+    ))
+    assert _bodies(sent, ConductorMessageType.NEW_REQUEST)  # 0 samples: fine
+
+    class _LongOpening(_CappedModel):
+        def process_prompt(self, *a, **k):
+            return {"text_inputs": [torch.tensor([1])], "audio_in": [torch.zeros(6)]}
+
+    wt, sent, _tm = _thread(_LongOpening())
+    wt._process_waiting_input(PreprocessInput(
+        request_id="r", text="hi", file_paths=None, input_modalities=["text"],
+        output_modalities=["text"], model_kwargs={},
+    ))
+    error = wt.out_queue.get_nowait()
+    assert error.metadata["status"] == 400 and b"max_items" in error.data
+    assert _bodies(sent, ConductorMessageType.NEW_REQUEST) == []
+
+
+def test_a_deployment_lowers_a_streams_max_items(tmp_path):
+    """The serving config's ``client_streams`` block may lower the declared
+    bound; what the model counts per item stays the model's."""
+    wt, sent, _tm = _thread(_CappedModel(), model_config={"client_streams": {"audio_in": {"max_items": 2}}})
+    _open(wt)
+    wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 3)]}))
+
+    assert b"passed 2 samples" in wt.out_queue.get_nowait().data
+    with pytest.raises(ValueError, match="may lower"):
+        _thread(_CappedModel(), model_config={"client_streams": {"audio_in": {"max_items": 6}}})
 
 
 class _RecordingPreprocess:
