@@ -12,6 +12,7 @@ sys.path.insert(0, ".")
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -25,6 +26,8 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
+from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
     Path(__file__).resolve().parents[2] / "configs" / "pi05.yaml"
@@ -49,6 +52,56 @@ def _make_model() -> Pi05Model:
     model.adaln_mlp = None
     model.siglip = None
     return model
+
+
+@pytest.fixture
+def _pi05_cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize(
+    ("batched", "batch_size"), [(False, 1), (True, 1), (True, 2)],
+)
+def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+    from mstar.engine.accelerator_graph_runner import autocast_scope
+    from mstar.engine.engine import Engine
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(3, 8)
+
+        def forward(self, pixels):
+            return self.projection(pixels.mean(dim=(-1, -2))).unsqueeze(1)
+
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
+        torch.manual_seed(19)
+        submodule = Pi05ViTEncoderSubmodule(
+            Encoder(), Pi05Config(vit_image_size=4, num_cameras=2),
+        ).to("cpu").eval()
+        images = torch.linspace(-1, 1, batch_size * 96).reshape(batch_size, 2, 3, 4, 4)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=list(range(batch_size)), per_request_info={},
+        )
+        engine = Engine(graph_runtime=None, autocast_dtype=torch.bfloat16)
+
+        with autocast_scope(None, "cpu"):
+            reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
+        with autocast_scope(torch.bfloat16, "cpu"):
+            with autocast_scope(engine._autocast_dtype_for(submodule), "cpu"):
+                if batched:
+                    outputs = submodule.forward_batched("prefill", engine_inputs, images)
+                    actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
+                else:
+                    actual = submodule.forward("prefill", engine_inputs, images)["img_emb"][0].unsqueeze(0)
+
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, reference)
 
 
 # ----------------------------------------------------------------------

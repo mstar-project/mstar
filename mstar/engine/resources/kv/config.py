@@ -211,6 +211,22 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+@dataclass(frozen=True)
+class PrefixSpan:
+    """One write to a keyed stream, as the preprocess worker laid it out.
+
+    ``length`` is how many slots the write fills and ``advance`` is how far it
+    moves the position counter. ``digest`` is an item's digest, and None for
+    ids. ``end_key`` is set for an item that ends inside a page, and keys that
+    page up to the item's end.
+    """
+    length: int
+    advance: int
+    walk: str
+    digest: bytes | None = None
+    end_key: bytes | None = None
+
+
 @dataclass
 class KVReqConfig(ResourceReqConfig):
     # NOTE: this may need to be refined
@@ -234,6 +250,8 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
+    # label -> the layout its keys were chained over, one span per write
+    prefix_layout: dict[str, list[PrefixSpan]] | None = None
     prefix_cache: bool = True
 
     def apply_conductor_config(
@@ -241,6 +259,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
+        prefix_layout: dict[str, list[list]] | None=None,
         prefix_cache: bool | None=None,
         **kwargs,
     ):
@@ -250,6 +269,12 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
+        if prefix_layout is not None:
+            # sent as plain lists, which keeps the request's kwargs on the wire's plain msgpack path
+            self.prefix_layout = {
+                label: [PrefixSpan(*row) for row in rows]
+                for label, rows in prefix_layout.items()
+            }
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
 
@@ -341,6 +366,9 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # the rows the forks apply to; None is every row (a chunked prompt
+    # pre-forks on its first chunk and post-forks on its last)
+    fork_rids: frozenset | None = None
     # (request_id, label) -> the retention a committing stream declares for
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.

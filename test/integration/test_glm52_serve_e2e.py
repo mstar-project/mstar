@@ -5,7 +5,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_runner import autocast_scope
+from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
     StepContext,
     StepRunner,
@@ -293,8 +293,8 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert moe.gate.e_score_correction_bias.dtype == torch.float32
     # (16, 16) scale blocks are not the fused kernel's, so the default
     # resolves to the reference dispatch, which registers no CUDA graphs.
-    assert submodule.get_cuda_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_cuda_graph_configs(DEVICE, DTYPE) == {}
+    assert submodule.get_accelerator_graph_configs(DEVICE) == []
+    assert submodule.get_piecewise_accelerator_graph_configs(DEVICE, DTYPE) == {}
 
     # The model's declaration is what the engine builds from: naive MLA at
     # reduced dims (mla_absorb=False) -> the paged K/V cache + FlashInfer.

@@ -107,7 +107,7 @@ def test_long_context_captures_no_prefill_bucket_past_the_chunk(monkeypatch, cap
     monkeypatch.setattr(sub, "_moe_capture_blocked", lambda tp_world_size: False, raising=False)
     monkeypatch.setattr(torch._dynamo.config, "recompile_limit",
                         torch._dynamo.config.recompile_limit)
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     prefill = [n for c in configs if c.capture_graph_walk == "prefill"
                for n in c.capture_token_lengths]
     assert prefill and max(prefill) <= chunk

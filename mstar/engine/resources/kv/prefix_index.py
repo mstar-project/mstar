@@ -88,6 +88,10 @@ class PrefixIndex:
         """Every page the index is holding a reference to."""
         return list(self._by_key.values())
 
+    def num_pages(self) -> int:
+        """How many pages the index holds a reference to (``len(pages())``)."""
+        return len(self._by_key)
+
     def num_sole_owned(self) -> int:
         """Indexed pages nothing else holds: an upper bound on what ``evict`` can free."""
         return sum(

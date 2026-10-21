@@ -43,7 +43,10 @@ NDJSON stream.
      - JSON object of model-specific parameters (e.g. ``{"voice": "tara"}``).
    * - ``request_id``
      - *(uuid)*
-     - Optional client-supplied id; the server generates one when omitted.
+     - Optional client-supplied id; the server generates one when omitted. An id
+       that still has a request in flight is refused with ``409``; it is free
+       again once that request finished, failed or was aborted (a client that
+       drops a stream can resubmit its id at once).
 
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
@@ -58,7 +61,8 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+arrive. A request that fails after its stream has started ends it with one chunk of
+modality ``error`` (the HTTP status in ``metadata.status``); nothing follows it. A client that sends ``Accept: application/vnd.mstar.frames`` receives
 length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
 ``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response ``Content-Type``. ``GET /health`` returns
@@ -89,7 +93,8 @@ as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way, with the HTTP ``status`` it would have had, and no
+was accepted ends with one such reply. Both carry the HTTP ``status`` when there is one
+(``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 ``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
@@ -129,6 +134,10 @@ run anywhere:
 
    from mstar import MStarClient
    client = MStarClient("http://localhost:8000")   # optional: timeout=600.0
+
+If the server requires an API key (``--api-key`` / ``MSTAR_API_KEY``, see
+:ref:`api-key`), pass ``api_key="..."``; without one the client reads ``MSTAR_API_KEY``
+from its own environment, and sends nothing when that is unset too.
 
 The core method is ``generate``:
 
@@ -204,6 +213,9 @@ semantics. Point any OpenAI client at ``http://<host>:<port>/v1``:
    from openai import OpenAI
    client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 
+``api_key`` can be anything unless the server sets a key (:ref:`api-key`); then pass
+that key, which the client sends as ``Authorization: Bearer <key>``.
+
 Endpoints and model coverage:
 
 .. list-table::
@@ -226,7 +238,7 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``
+     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -234,7 +246,9 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance.
+       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
+       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
+       detection is null (client commits) or ``server_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -295,13 +309,55 @@ Per-model notes:
   Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
   as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
   once, each cut at the quietest moment before its boundary. Segment timestamps
-  are offset to the whole file.
+  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
+  (5 to 30) sets the window length for one request, and an upload longer than it
+  is windowed. An upload, like any audio a request attaches, is refused once it
+  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
+  worker). The decode up to that point still runs, so this bounds memory, not
+  time: refusing a 31 min file takes about as long as decoding it.
+- **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
+  its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
+  clip of up to 20 s is one request; a longer upload is cut into windows of about equal
+  length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
+  in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
+  get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
+  ``language`` is the request's ``language`` as given, or null.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
   tokens (the Qwen3-ASR SDK's streaming algorithm), so only the tail is ever revised.
   Tune ``chunk_seconds`` / ``unfixed_chunks`` / ``unfixed_tokens`` under ``session.mstar``
-  in ``transcription_session.update``.
+  in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
+  at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
+  less): commit before then, since an append past it is refused with an ``error``.
+- **Realtime turn detection** — by default the client ends each utterance with
+  ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
+  server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),
+  ``prefix_padding_ms`` (300) and ``silence_duration_ms`` (500). Silero VAD scores each
+  32 ms frame; a turn starts on a frame at or above ``threshold`` with up to
+  ``prefix_padding_ms`` of the audio before it. Silence starts on a frame below
+  ``threshold`` minus 0.15, and a frame at or above ``threshold`` cancels it; the turn
+  ends on whichever frame completes ``silence_duration_ms`` of whole frames counted from
+  that first silent frame, borderline frames included. The hysteresis is that of
+  Silero's own ``VADIterator``, but ``VADIterator`` counts from the frame after the first
+  silent one and ends only on a frame below ``threshold`` minus 0.15, so with a nonzero
+  ``silence_duration_ms`` it ends a turn one frame or more later. The server then sends
+  ``input_audio_buffer.speech_started`` (``audio_start_ms``),
+  ``input_audio_buffer.speech_stopped`` (``audio_end_ms``) and ``committed``, and the
+  transcription completes. Times are milliseconds of audio since the session started,
+  cleared audio included. A commit takes exactly the turn's audio; what follows, even
+  in the same append, goes to the next turn. A turn never passes the item cap: it is
+  committed before the frame that would pass it, and speech goes on in a new turn that
+  starts with that frame. A client ``commit`` ends an open turn; between turns it
+  drops what the VAD has not put in a turn yet. ``create_response`` and
+  ``interrupt_response`` are accepted and echoed but do nothing in a transcription
+  session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
+  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
+  ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
+  exports take other inputs, and with one of them ``server_vad`` is refused); weights are
+  never downloaded. The Dynamo bridge has no turn detection yet and
+  refuses it.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.

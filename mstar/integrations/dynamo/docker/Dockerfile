@@ -62,14 +62,25 @@ RUN uv venv --python 3.12 --seed /opt/mstar/venv \
 WORKDIR /opt/mstar/src
 COPY . .
 
+# Kokoro's English G2P loads this spaCy tagger and would otherwise download it
+# on first use, which an offline deployment cannot. Its wheel declares no
+# spaCy requirement, so the install caps spaCy at the minor it was built for.
+ARG EN_CORE_WEB_SM_VERSION=3.8.0
+
 # The torch/torchcodec pins ride along so the resolver can't upgrade them
 # (breaking the flash-attn wheel match or the torch pairing) to satisfy a
 # newer extra; the installed +cu12x/+cu13x builds already satisfy them.
 RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
+        "spacy~=${EN_CORE_WEB_SM_VERSION}" \
+        "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-${EN_CORE_WEB_SM_VERSION}/en_core_web_sm-${EN_CORE_WEB_SM_VERSION}-py3-none-any.whl" \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION} \
         torchcodec==${TORCHCODEC_VERSION}
+
+# Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
+# transformers==4.57.3 pin out of the environment (docs/installation.rst).
+RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
 
 # The venv must lead PATH: FlashInfer's JIT invokes ninja (installed in the
 # venv) via PATH lookup at request time.

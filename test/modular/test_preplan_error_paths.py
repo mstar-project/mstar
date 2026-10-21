@@ -46,7 +46,7 @@ def _fake_worker() -> Worker:
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
         set_in_flight=(
-            lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
+            lambda node_name, rids, wg_ids, value: w.despeculated.extend(rids)
         ),
         commit_speculation=(
             lambda spec_id, success, dropped, **kw: w.settled.append(
@@ -107,10 +107,11 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
 
 
 def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:
-    """Once the GPU thread has the plan future, the speculation carries no
-    future any more and the handler has nothing to drain or reset."""
+    """Once the GPU thread has the speculation (and its plan future), its rids
+    are that step's, so the handler has nothing to drain, reset or give back."""
     w = _fake_worker()
     spec = _speculation(None, "a")
+    spec.submitted = True
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [] and w.pushed_back == []
     assert w.despeculated == []  # nothing de-speculated: not this handler's batch
@@ -131,7 +132,8 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
         request_ids=("a",), release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )
-    batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=())
+    batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=(),
+                            request_walks={})
     with pytest.raises(RuntimeError, match="bad inputs"):
         Worker._execute_on_gpu_thread(w, batch, node_batch, _done_future())
     assert resets == [node_batch]
@@ -200,7 +202,7 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     cleared = []
     fake = SimpleNamespace(
         _enable_nvtx=False,
-        _submodules={"dit": SimpleNamespace(cuda_graph_runner=None)},
+        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
     fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)

@@ -684,22 +684,28 @@ class Loop(GraphSection):
         self._uncache_accumulated_outputs()
 
 
+def top_level_entities(section: GraphSection) -> dict[str, "GraphNode | Loop"]:
+    """The "outer-level" nodes and loops of a section, keyed by name: the
+    entities a registry over it counts toward completion."""
+    entities: dict[str, GraphNode | Loop] = {}
+
+    def _collect(sec: GraphSection):
+        if isinstance(sec, GraphNode) or isinstance(sec, Loop):
+            # stop here: a Loop's inner entities are owned by its own LoopStateRegistry
+            entities[sec.name] = sec
+            return
+        assert isinstance(sec, Sequential) or isinstance(sec, Parallel)
+        for s in sec.sections:
+            _collect(s)
+    _collect(section)
+    return entities
+
+
 class GraphStateRegistry(ABC):
     def __init__(
         self, graph_section: GraphSection,
     ):
-        # "Outer-level" nodes and loops
-        self.managed_entities: dict[str, GraphNode|Loop] = {}
-
-        def _set_managed_entities(section: GraphSection):
-            if isinstance(section, GraphNode) or isinstance(section, Loop):
-                # stop here — Loop's inner entities are owned by its own LoopStateRegistry
-                self.managed_entities[section.name] = section
-                return
-            assert isinstance(section, Sequential) or isinstance(section, Parallel)
-            for sec in section.sections:
-                _set_managed_entities(sec)
-        _set_managed_entities(graph_section)
+        self.managed_entities: dict[str, GraphNode|Loop] = top_level_entities(graph_section)
 
         self.is_done = False
         self._num_completed_entities = 0

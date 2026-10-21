@@ -4,6 +4,15 @@ model: "wan22"
 # conductor's config check and matches the UMT5 text length (512 tokens).
 max_seq_len: 512
 
+# The untiled VAE decode runs the shared Wan VAE decoder, compiled (1.74x faster
+# decode at 1280x704 x 121 frames on an H200). The compile is per output
+# resolution, not frame count, about 20 s on an H200, so it runs only for the
+# listed sizes (default: 1280x704); any other size decodes with stock vae.decode.
+# Uncomment to list more sizes, or to restore stock vae.decode everywhere:
+# model_kwargs:
+#   vae_decode_fast_sizes: ["1280x704", "832x480"]
+#   vae_decode_fast: false
+
 # Wan2.2-TI2V-5B single-GPU colocated: all four nodes on rank 0.
 node_groups:
   - node_names:

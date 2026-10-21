@@ -16,15 +16,21 @@
 //!   POST /v1/images/edits          (multipart)
 //!   POST /generate                 (native multipart -> NDJSON)
 //!   GET  /health
+//!   GET  /metrics                  (the API server's Prometheus text, via the bridge)
+//!
+//! With `MSTAR_API_KEY` set, every route but `/health` and `/metrics` needs
+//! `Authorization: Bearer <key>` (`auth.rs`).
 //!
 //! Two result sources, selected at startup by whether a conductor socket dir is
 //! passed: **real** (bridge to the Python conductor) or **mock** (self-contained
 //! generator that proves the HTTP/adapter/media/streaming layer standalone).
 
 mod adapters;
+mod auth;
 mod bridge;
 mod media;
 mod protocol;
+mod refusals;
 mod serving;
 mod tokenizer;
 
@@ -35,7 +41,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
+    extract::{multipart::MultipartError, rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -54,7 +60,9 @@ use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
     VideoGenerationRequest,
 };
-use serving::{collect, now, result_stream, rid, AppState, Out};
+use serving::{
+    collect, now, result_stream, rid, try_result_stream, AppState, Out, DUPLICATE_ID_GRACE,
+};
 
 #[tokio::main]
 async fn main() {
@@ -83,6 +91,9 @@ async fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(600),
     );
+    // Same variable and default as serving_images.max_images_per_request.
+    let max_images_per_request =
+        parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
         eprintln!("bridging to conductor at {dir}");
@@ -102,14 +113,17 @@ async fn main() {
         Arc::new(t)
     });
 
+    let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
         model_name: model_name.clone(),
         upload_dir,
         allow_remote,
         sample_rate,
         request_timeout,
+        max_images_per_request,
         tok,
         bridge,
+        refusals: refusals.clone(),
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration.
@@ -120,17 +134,15 @@ async fn main() {
 
     // Admission control: bound concurrent generation requests; past the cap
     // clients get an immediate 503 instead of queueing into the timeout.
-    // /health and /v1/models bypass it (a saturated server is still alive).
+    // /health, /metrics and /v1/models bypass it (a saturated server is
+    // still alive, and still scrapeable).
     let max_concurrent: usize = std::env::var("MSTAR_MAX_CONCURRENT_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
-    let body_limit_mb: usize = std::env::var("MSTAR_MAX_BODY_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
+    let body_limit_mb = body_limit_mb();
 
     let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -141,11 +153,25 @@ async fn main() {
         .route("/generate", post(generate))
         .route_layer(axum::middleware::from_fn_with_state(permits, admission));
 
+    let api_key = auth::ApiKey::from_env();
+    let key_enabled = api_key.enabled();
+
+    // The key check sits inside CORS: CORS answers browser preflights (which
+    // carry no credentials) and still stamps its headers on a 401. It is
+    // outside admission, so an unauthenticated request never takes a permit.
+    // The refusal counter sits between the two, so it sees the 401 and not
+    // the preflights.
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
+        .layer(axum::middleware::from_fn_with_state(
+            api_key,
+            auth::require_api_key,
+        ))
+        .layer(axum::middleware::from_fn_with_state(refusals, refusals::count_refusals))
         .layer(cors)
         .with_state(state);
 
@@ -154,6 +180,14 @@ async fn main() {
     let host = std::env::var("MSTAR_SERVER_HOST")
         .unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr = format!("{host}:{port}");
+    if !key_enabled {
+        eprintln!(
+            "WARNING: no API key set (--api-key or {}): any client that can reach {addr} \
+             can run requests. Set a key, or bind --host 127.0.0.1, unless a gateway in \
+             front of this server authenticates clients.",
+            auth::API_KEY_ENV
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, app)
@@ -198,14 +232,16 @@ async fn admission(
     let permit = match permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return (
+            let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": {
                     "message": "server saturated: too many concurrent requests",
                     "type": "overloaded_error"
                 }})),
             )
-                .into_response()
+                .into_response();
+            resp.extensions_mut().insert(refusals::CapRefusal);
+            return resp;
         }
     };
     // Hold the permit until the RESPONSE BODY is fully sent, not just until
@@ -242,6 +278,27 @@ fn error_type(status: u16) -> &'static str {
     }
 }
 
+/// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
+/// way (`mstar/api_server/body_limit.py`).
+fn body_limit_mb() -> usize {
+    std::env::var("MSTAR_MAX_BODY_MB")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(128)
+}
+
+/// Status and message for a failed multipart read: 413 naming the limit when
+/// the body passed `MSTAR_MAX_BODY_MB`, as the Python frontend answers, else
+/// 400 with `fallback`.
+fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        (413, format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"))
+    } else {
+        (400, fallback)
+    }
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -266,6 +323,14 @@ fn detail_error(status: u16, message: &str) -> Response {
 /// Python frontend's validation error. Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
 fn json_422(rej: JsonRejection) -> Response {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        return error(
+            413,
+            &format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"),
+            "invalid_request_error",
+        );
+    }
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({"detail": [{
@@ -320,8 +385,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
 }
 
 /// Delete a request's persisted media 60 s after translation, matching
-/// mstar's deferred upload cleanup. Only files under `upload_dir` are ours to
-/// delete — local paths passed through by reference are left alone.
+/// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     let files: Vec<PathBuf> = args
         .file_paths
@@ -348,7 +412,10 @@ fn sse_error_event(status: u16, msg: &str) -> Event {
     )
 }
 
-// ---- GET /health, /v1/models ---------------------------------------------
+// ---- GET /health, /metrics, /v1/models ------------------------------------
+
+/// How long `/health` and `/metrics` wait for the bridge loop to answer.
+const BRIDGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Deep health: liveness of the whole serving path, not just this process.
 /// With a bridge configured, a ping must round-trip to the Python backend —
@@ -356,7 +423,7 @@ fn sse_error_event(status: u16, msg: &str) -> Event {
 /// letting requests queue into the timeout. Mock mode stays shallow.
 async fn health(State(st): State<AppState>) -> Response {
     if let Some(bridge) = &st.bridge {
-        if !bridge.ping(std::time::Duration::from_secs(2)).await {
+        if !bridge.ping(BRIDGE_PROBE_TIMEOUT).await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"status": "unhealthy", "reason": "backend bridge unreachable"})),
@@ -365,6 +432,27 @@ async fn health(State(st): State<AppState>) -> Response {
         }
     }
     Json(json!({"status": "healthy"})).into_response()
+}
+
+/// Prometheus metrics: the text the API server renders from its one
+/// registry, asked over the bridge, so both frontends serve the same names.
+/// The request carries this frontend's refusal counts, which the API server
+/// exports as `mstar_http_refusals_total`.
+/// 404 when the server runs without `--enable-metrics` (and in mock mode,
+/// which has no registry), with the Python route's body; 503 when the bridge
+/// does not answer.
+async fn metrics(State(st): State<AppState>) -> Response {
+    let off = || detail_error(404, "metrics are off; start the server with --enable-metrics");
+    let Some(bridge) = &st.bridge else {
+        return off();
+    };
+    let Some(reply) = bridge.metrics(&st.refusals.snapshot(), BRIDGE_PROBE_TIMEOUT).await else {
+        return detail_error(503, "backend bridge unreachable");
+    };
+    match reply.metadata.get("content_type").and_then(Value::as_str) {
+        Some(content_type) => ([(CONTENT_TYPE, content_type.to_string())], reply.data).into_response(),
+        None => off(),
+    }
 }
 
 async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
@@ -637,7 +725,10 @@ async fn images_generations(
     // matching serving_images.create_images. Seeded requests follow the seed
     // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
     // the same request with n=1; unseeded requests draw independent seeds.
-    let n = req.n.unwrap_or(1).max(1);
+    let n = match image_count(req.n, st.max_images_per_request) {
+        Ok(n) => n,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -658,6 +749,29 @@ async fn images_generations(
         }
     }
     Json(images_response(all)).into_response()
+}
+
+/// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
+/// matching serving_images.image_count.
+/// `MSTAR_MAX_IMAGES_PER_REQUEST` as Python's `max_images_per_request` reads
+/// it: an ASCII integer, surrounding whitespace allowed, at least 1; anything
+/// else is the default 10.
+fn parse_max_images(raw: Option<&str>) -> i64 {
+    raw.map(str::trim)
+        .filter(|s| {
+            let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(10, |n| n.max(1))
+}
+
+fn image_count(n: Option<i64>, limit: i64) -> Result<i64, String> {
+    match n {
+        None => Ok(1),
+        Some(n) if (1..=limit).contains(&n) => Ok(n),
+        Some(n) => Err(format!("n must be between 1 and {limit}, got {n}")),
+    }
 }
 
 // ---- POST /v1/videos/generations (Cosmos3) -------------------------------
@@ -703,9 +817,10 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return error(
-                400, &format!("malformed multipart body: {e}"),
-                "invalid_request_error"),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return error(status, &msg, "invalid_request_error");
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         let has_file = field.file_name().is_some();
@@ -716,21 +831,31 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             image_filename = field.file_name().map(str::to_string);
             match field.bytes().await {
                 Ok(b) => image_bytes = Some(b.to_vec()),
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             }
         } else if name == "prompt" {
             prompt = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
         } else if known.contains(&name.as_str()) || has_file {
             if let Err(e) = field.bytes().await {
-                return error(400, &e.to_string(), "invalid_request_error");
+                let (status, msg) = multipart_failure(&e, e.to_string());
+                return error(status, &msg, "invalid_request_error");
             }
         } else {
             let v = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
             let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
             extra.insert(name, parsed);
@@ -874,7 +999,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return detail_error(400, &format!("malformed multipart body: {e}")),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return detail_error(status, &msg);
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "files" {
@@ -885,7 +1013,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             }
             let bytes = match field.bytes().await {
                 Ok(b) => b,
-                Err(e) => return detail_error(400, &e.to_string()),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return detail_error(status, &msg);
+                }
             };
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
@@ -914,7 +1045,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             // as an empty value.
             let val = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return detail_error(400, &format!("reading form field {name:?}: {e}")),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, format!("reading form field {name:?}: {e}"));
+                    return detail_error(status, &msg);
+                }
             };
             match name.as_str() {
                 "text" => text = Some(val),
@@ -1010,8 +1144,14 @@ async fn generate_finish(
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
+    if let Some(bridge) = &st.bridge {
+        bridge.wait_for_request_id(&request_id, DUPLICATE_ID_GRACE).await;
+    }
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
+        let base = match try_result_stream(&st, &args, &request_id, true) {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
@@ -1052,4 +1192,188 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
     .to_string();
     s.push('\n');
     s.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mstar_rust::communicator::RawZmqCommunicator;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn state(bridge: Option<Arc<Bridge>>) -> AppState {
+        AppState {
+            model_name: "m".into(),
+            upload_dir: std::env::temp_dir(),
+            allow_remote: false,
+            sample_rate: 24000,
+            request_timeout: std::time::Duration::from_secs(5),
+            max_images_per_request: 10,
+            tok: None,
+            bridge,
+            refusals: Arc::new(refusals::Refusals::default()),
+        }
+    }
+
+    /// The Python bridge loop's side of the socket: answers every `metrics`
+    /// message with `metadata`, as `RustFrontendBridge` does.
+    struct FakeBackend {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        /// Every `metrics` request it answered.
+        asked: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl FakeBackend {
+        fn start(dir: &std::path::Path, text: &'static [u8], metadata: Value) -> Self {
+            #[derive(serde::Serialize)]
+            struct Reply<'a> {
+                t: &'static str,
+                rid: &'a str,
+                sub: u64,
+                #[serde(with = "serde_bytes")]
+                data: &'a [u8],
+                metadata: &'a Value,
+            }
+            let peer = RawZmqCommunicator::bind("bridge", dir).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asking = asked.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    let Some(frame) = peer.recv_timeout(std::time::Duration::from_millis(20)) else {
+                        continue;
+                    };
+                    let msg: Value = rmp_serde::from_slice(&frame).unwrap();
+                    if msg["t"] != "metrics" {
+                        continue;
+                    }
+                    asking.lock().unwrap().push(msg.clone());
+                    let reply = Reply {
+                        t: "metrics",
+                        rid: msg["rid"].as_str().unwrap(),
+                        sub: msg["sub"].as_u64().unwrap(),
+                        data: text,
+                        metadata: &metadata,
+                    };
+                    peer.send("frontend", &rmp_serde::to_vec_named(&reply).unwrap()).unwrap();
+                }
+            });
+            Self { stop, thread: Some(thread), asked }
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn socket_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mstar-metrics-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn body(resp: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, content_type, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn metrics_serve_the_backend_s_text_with_its_content_type() {
+        let dir = socket_dir();
+        let text: &[u8] = b"# TYPE mstar_requests_total counter\nmstar_requests_total{model_name=\"m\"} 3.0\n";
+        let content_type = "text/plain; version=1.0.0; charset=utf-8";
+        let _backend = FakeBackend::start(&dir, text, json!({"content_type": content_type}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, ct, data) = body(metrics(State(state(Some(bridge)))).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct.as_deref(), Some(content_type));
+        assert_eq!(data, text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_ask_the_backend_with_this_frontend_s_refusal_counts() {
+        let dir = socket_dir();
+        let backend = FakeBackend::start(&dir, b"", json!({"content_type": "text/plain"}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+        let st = state(Some(bridge));
+        st.refusals.count("/generate", 409);
+        st.refusals.count("unmatched", 404);
+        st.refusals.count("/generate", 409);
+
+        assert_eq!(body(metrics(State(st.clone())).await).await.0, StatusCode::OK);
+        st.refusals.count("/generate", 409);
+        assert_eq!(body(metrics(State(st)).await).await.0, StatusCode::OK);
+
+        let asked: Vec<Value> = backend.asked.lock().unwrap().iter().map(|m| m["refusals"].clone()).collect();
+        assert_eq!(asked, [
+            json!({"route": ["/generate", "unmatched"], "status": [409, 404], "count": [2, 1]}),
+            json!({"route": ["/generate", "unmatched"], "status": [409, 404], "count": [3, 1]}),
+        ]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_404_when_the_backend_runs_without_them_and_in_mock_mode() {
+        let dir = socket_dir();
+        let _backend = FakeBackend::start(&dir, b"", json!({}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, _, data) = body(metrics(State(state(Some(bridge)))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&data).contains("--enable-metrics"));
+
+        let (status, _, _) = body(metrics(State(state(None))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_503_when_the_bridge_does_not_answer() {
+        let dir = socket_dir();
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, _, _) = body(metrics(State(state(Some(bridge)))).await).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn image_count_refuses_n_outside_one_to_limit() {
+        assert_eq!(image_count(None, 10), Ok(1));
+        assert_eq!(image_count(Some(1), 10), Ok(1));
+        assert_eq!(image_count(Some(10), 10), Ok(10));
+        for n in [0, -1, 11, i64::MAX] {
+            assert_eq!(
+                image_count(Some(n), 10),
+                Err(format!("n must be between 1 and 10, got {n}"))
+            );
+        }
+        assert_eq!(image_count(Some(3), 2), Err("n must be between 1 and 2, got 3".to_string()));
+    }
+
+    #[test]
+    fn max_images_parses_as_python_does() {
+        for (raw, cap) in [
+            (None, 10), (Some("2"), 2), (Some(" 2 "), 2), (Some("2\n"), 2), (Some("+3"), 3),
+            (Some("0"), 1), (Some("-1"), 1), (Some(""), 10), (Some("abc"), 10), (Some("2_0"), 10),
+            (Some("1.5"), 10), (Some("\u{ff12}"), 10),
+        ] {
+            assert_eq!(parse_max_images(raw), cap, "{raw:?}");
+        }
+    }
 }

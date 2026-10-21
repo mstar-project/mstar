@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -52,6 +52,10 @@ class LinearAttnConfig:
     # Mamba-2 only: clamp on dt after softplus, as HF's ``time_step_limit``
     # (Nemotron-H leaves it open: (0, inf)).
     time_step_limit: tuple[float, float] = (0.0, float("inf"))
+
+    # GDN only: combined walks whose steps run decode rows on the decode kernel
+    # and prompt rows on the chunked one (`GDNMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass

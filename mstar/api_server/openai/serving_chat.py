@@ -117,7 +117,13 @@ def _build_response(model_name, request_id, chunks, sample_rate, parser=None) ->
     }
 
 
-async def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False):
+def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False):
+    # Bound to the submission now: the body is iterated later, by Starlette.
+    batches = api.iter_result_chunk_batches(request_id)
+    return _stream_events(batches, model_name, request_id, sample_rate, parser, include_usage)
+
+
+async def _stream_events(batches, model_name, request_id, sample_rate, parser=None, include_usage=False):
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -144,7 +150,7 @@ async def _stream(api, model_name, request_id, sample_rate, parser=None, include
         # when its handler ran go out as one body frame (one write), which is
         # what keeps the delivery loop ahead at high token rates. A batch of
         # one is the common case when the loop keeps up.
-        async for batch in api.iter_result_chunk_batches(request_id):
+        async for batch in batches:
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":

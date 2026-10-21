@@ -1,9 +1,9 @@
-"""``resolve_dist_timeout`` / ``MSTAR_DIST_TIMEOUT_S``: the process-group timeout knob.
+"""``resolve_dist_timeout``: the process-group timeout knob.
 
 Torch's default (10 min) is shorter than a large checkpoint load at TP8, so a
-deployment opts in via ``dist_timeout_s`` in its config; the env var overrides
-it per process. Unset means ``{}`` — torch's default, untouched. Serving
-collectives go back to torch's default once warmup is done.
+deployment opts in via ``dist_timeout_s`` in its config. Unset means ``{}`` —
+torch's default, untouched. Serving collectives go back to torch's default
+once warmup is done.
 """
 
 from __future__ import annotations
@@ -20,17 +20,8 @@ from torch.distributed.constants import default_pg_timeout
 sys.path.insert(0, ".")
 
 import mstar.distributed.communication as comm_mod
-from mstar.distributed.communication import (
-    DIST_TIMEOUT_ENV,
-    CommGroup,
-    WorkerParallelGroups,
-    resolve_dist_timeout,
-)
-
-
-@pytest.fixture(autouse=True)
-def _clear_env(monkeypatch):
-    monkeypatch.delenv(DIST_TIMEOUT_ENV, raising=False)
+from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+from mstar.distributed.utils import resolve_dist_timeout
 
 
 def test_neither_set_is_torch_default():
@@ -42,38 +33,20 @@ def test_config_alone():
     assert resolve_dist_timeout(7200) == {"timeout": timedelta(seconds=7200)}
 
 
-def test_env_overrides_config(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "90")
-    assert resolve_dist_timeout(7200) == {"timeout": timedelta(seconds=90)}
-    assert resolve_dist_timeout() == {"timeout": timedelta(seconds=90)}
-
-
-def test_blank_env_falls_back_to_config(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "  ")
-    assert resolve_dist_timeout(30) == {"timeout": timedelta(seconds=30)}
-
-
 @pytest.mark.parametrize("bad", [0, -1, -0.5])
 def test_non_positive_config_raises(bad):
     with pytest.raises(ValueError, match="positive"):
         resolve_dist_timeout(bad)
 
 
-def test_non_positive_env_raises(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "0")
-    with pytest.raises(ValueError, match="positive"):
-        resolve_dist_timeout(7200)
-
-
-def test_non_numeric_env_raises(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "soon")
-    with pytest.raises(ValueError, match=DIST_TIMEOUT_ENV):
-        resolve_dist_timeout()
-
-
 def _capture_process_group_calls(monkeypatch):
-    """Stub the two collectives ``init_dist`` issues and record their kwargs."""
-    calls: dict[str, list[dict]] = {"init": [], "new_group": []}
+    """Stub the two collectives ``init_dist`` issues and record their kwargs,
+    and the rendezvous store's timeout."""
+    calls: dict[str, list] = {"init": [], "new_group": [], "store": []}
+    monkeypatch.setattr(
+        comm_mod, "rendezvous_store",
+        lambda init_method, rank, world_size, timeout: calls["store"].append(timeout),
+    )
     monkeypatch.setattr(dist, "init_process_group", lambda **kw: calls["init"].append(kw))
     monkeypatch.setattr(
         dist, "new_group", lambda **kw: calls["new_group"].append(kw) or object()
@@ -98,6 +71,7 @@ def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     groups.init_dist(device=torch.device("cpu"))
 
     expected = timedelta(seconds=3600)
+    assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
     # ``new_group`` runs once per rank tuple on every rank, members or not,
     # for the device group and its gloo twin.
@@ -108,7 +82,10 @@ def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):
     calls = _capture_process_group_calls(monkeypatch)
     _two_tp_groups().init_dist(device=torch.device("cpu"))
 
-    assert all("timeout" not in c for c in calls["init"] + calls["new_group"])
+    # the world group and its store get torch's default, which init_dist now names
+    assert calls["store"] == [default_pg_timeout]
+    assert [c["timeout"] for c in calls["init"]] == [default_pg_timeout]
+    assert all("timeout" not in c for c in calls["new_group"])
 
 
 @pytest.fixture

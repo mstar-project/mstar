@@ -24,12 +24,13 @@ import torch
 
 from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -99,23 +100,25 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+            prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
         )})
 
     def resolve(self, rid: str) -> int:
         """Both halves, in the order the engine runs them: every resource has
         to be told the length before any of them is asked to act on it."""
-        matched = self.runner.resolve_cached_prefix(rid, NODE, WALK)
-        self.runner.apply_cached_prefix(rid, NODE, WALK, None, matched)
-        return matched
+        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].prefix_layout["main"][0].length)
+        prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
+        self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+        return prefix.tokens if prefix is not None else 0
 
-    def step(self, rid: str, span: int) -> list[int]:
+    def step(self, rid: str, span: int, walk: str = WALK) -> list[int]:
         """Admit, plan, write the slots this step owns, commit."""
         step = SubmoduleStep(
             steps={KV: KVStep(), ROPE: PositionStep()},
             segments=[Segment(rid, "main", span)],
         )
         ctx = StepContext(
-            request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+            request_ids=(rid,), graph_walk=walk, slot=0, capture=False,
         )
         step.set_ctx(ctx)
         assert self.runner.admit(step).outcome.ok
@@ -268,5 +271,5 @@ def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
     declared = BagelModel.prefix_key_streams(object())
 
     assert declared == {
-        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}
+        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode", ("prefill_vit",))}
     }, "the text walk's prompt does not arrive under the name it keys"

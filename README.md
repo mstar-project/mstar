@@ -68,6 +68,7 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 
 The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
 and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`.
+Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
 
 To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
 ```bash

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 
 sys.path.insert(0, ".")
 
@@ -27,13 +28,18 @@ from mstar.engine.resources import (
     Segment,
     StepContext,
 )
+from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVLayout, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
+from mstar.platforms import current_platform
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="offload needs pinned host memory"
+)
+requires_nvidia = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="checks the CUDA copier chain"
 )
 
 PAGE_SIZE = 8
@@ -769,3 +775,124 @@ def test_pool_copies_queue_behind_the_compute_stream():
     assert waited == [compute]
     assert mgr.reload("r0") is True
     assert waited == [compute, compute]
+
+
+def _loadable(cls):
+    try:
+        return cls()
+    except (ImportError, OSError, AttributeError, RuntimeError) as e:
+        pytest.skip(f"{cls.name} unavailable: {e}")
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "copier_cls",
+    [page_copier.CudaBindingsCopier, page_copier.CudartCopier, page_copier.HipCopier,
+     page_copier.TorchCopier],
+    ids=lambda cls: cls.name,
+)
+def test_pool_copies_keep_every_layer_and_element(copier_cls):
+    """A page is one strided block per layer, so a wrong pitch or page stride
+    mixes layers or pages; distinct values in every element catch either, and
+    pages nobody named must come through untouched."""
+    mgr = _make_manager()
+    pool = mgr._cpu_pool
+    pool._copier = _loadable(copier_cls)
+    device = mgr.kv_cache.tensor
+    device.copy_(torch.randn_like(device))
+    expected = device.clone()
+    src, dst = [5, 2, 9], [3, 11, 7]
+
+    assert pool.offload_stream("r0", "main", device, src, stored_len=0, position=0)
+    pool.sync()
+    device.fill_(-99.0)
+    pool.reload_stream("r0", "main", device, dst)
+    pool.sync()
+    torch.cuda.synchronize()
+
+    for s, d in zip(src, dst, strict=True):
+        assert torch.equal(device[:, d], expected[:, s])
+    others = [p for p in range(device.shape[1]) if p not in dst]
+    assert (device[:, others] == -99.0).all()
+
+
+@requires_cuda
+def test_pool_copies_do_not_block_the_host():
+    """The copies queue behind the compute stream on the GPU; the host must
+    not wait for that stream to drain before it can go on scheduling."""
+    mgr = _make_manager()
+    pool = mgr._cpu_pool
+    assert not isinstance(pool._copier, page_copier.TorchCopier), (
+        "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"
+    )
+    device = mgr.kv_cache.tensor
+    pool.offload_stream("warm", "main", device, [1], stored_len=0, position=0)
+    pool.remove_request("warm")
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the copies
+    start = time.perf_counter()
+    pool.offload_stream("r0", "main", device, [1, 2, 3], stored_len=0, position=0)
+    pool.reload_stream("r0", "main", device, [4, 5, 6])
+    pool.sync()
+    elapsed = time.perf_counter() - start
+    torch.cuda.synchronize()
+    assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on the copies"
+
+
+@requires_cuda
+def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
+    """A full pool refuses every eviction attempt; one warning per interval,
+    counting the refusals it stood for, keeps the log readable."""
+    mgr = _make_manager(cpu_offload_pages=1)
+    pool = mgr._cpu_pool
+    device = mgr.kv_cache.tensor
+    assert pool.offload_stream("held", "main", device, [1], stored_len=0, position=0)
+    clock = [100.0]
+    monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
+
+    with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
+        for _ in range(50):
+            assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+        clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
+        assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+
+    warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
+    assert len(warnings) == 2
+    assert "0 more offloads refused" in warnings[0]
+    assert "49 more offloads refused" in warnings[1]
+
+
+@requires_cuda
+@requires_nvidia
+def test_copier_falls_through_to_the_next_that_works(monkeypatch, caplog):
+    """A binding that won't load, or loads and copies wrong, is skipped; with
+    none left the pool keeps copy_ and warns once per process, not per pool."""
+
+    class _Missing(page_copier.CudaBindingsCopier):
+        def __init__(self):
+            raise ImportError("no cuda.bindings")
+
+    class _Wrong(page_copier._Memcpy2DCopier):
+        name = "wrong"
+
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            return 0  # claims success, copies nothing
+
+    monkeypatch.setattr(page_copier, "CudaBindingsCopier", _Missing)
+    monkeypatch.setattr(page_copier, "CudartCopier", _Wrong)
+    page_copier.make_page_copier.cache_clear()
+    try:
+        with caplog.at_level("INFO", logger=page_copier.__name__):
+            pools = [_make_manager()._cpu_pool for _ in range(2)]
+        assert all(isinstance(pool._copier, page_copier.TorchCopier) for pool in pools)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("unavailable (no cuda.bindings)" in m for m in messages)
+        assert any("returned wrong data" in m for m in messages)
+        assert sum("fall back to copy_" in m for m in messages) == 1
+
+        monkeypatch.undo()
+        page_copier.make_page_copier.cache_clear()
+        assert not isinstance(page_copier.make_page_copier(), page_copier.TorchCopier)
+    finally:
+        page_copier.make_page_copier.cache_clear()

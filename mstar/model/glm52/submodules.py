@@ -12,13 +12,13 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.cuda_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -52,7 +52,7 @@ _MAIN = "main"
 _VERDICT_TIMEOUT_S = 120.0
 
 
-class _PackedPrefillConfig(PackedCudaGraphConfig):
+class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
     """Packed prefill capture without the buckets whose capture rows would pass the context
     limit: ``distribute_tokens`` gives row 0 the remainder, and such a capture fails."""
 
@@ -307,8 +307,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _compile_flags(self) -> dict[str, Any]:
         # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (escape hatch
-        # for an Inductor toolchain crash); "default" is the cuBLAS-backed
-        # mode of cuda_graph_runner.resolve_compile_mode, the fastest here.
+        # for an Inductor toolchain crash); "default" is torch.compile's own
+        # mode (cuBLAS GEMMs, no autotuning), the fastest here.
         return {
             "compile": os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             "compile_mode": "default",
@@ -342,9 +342,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self._device = super().get_device()
         return self._device
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         if self._moe_capture_blocked(tp_world_size):
             return []
         prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
@@ -371,7 +371,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
                       (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
         configs = [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 # one id in; under MTP the step verifies it and k drafts
                 single_request_inputs=ARNodeInputs(
@@ -402,7 +402,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._fit_recompile_limit(configs)
         return configs
 
-    def _fit_recompile_limit(self, configs: list[CudaGraphConfig]) -> None:
+    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
         """Raise dynamo's recompile limit to what these captures take: a decoder layer's
         frames hold an entry per captured token count and layer kind (dense, MoE, the last
         one on sampled rows), and the shapes past the limit capture uncompiled."""

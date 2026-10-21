@@ -75,7 +75,7 @@ def _init_worker(monkeypatch, runtime: PythonGraphRuntime, parallel: set[str]) -
     )
     worker_mod.Worker(
         worker_id="worker0", worker_ids=["worker0"], model=None,
-        my_worker_graphs=[SimpleNamespace(section=SimpleNamespace(get_nodes=lambda: NODES))],
+        my_worker_graphs=[SimpleNamespace(section=SimpleNamespace(get_nodes=lambda: NODES), graph_walks={WALK})],
         model_config={}, all_worker_graph_ids_to_graph_walks={},
         all_worker_graph_ids_to_nodes={}, all_worker_graph_ids_to_dyn_loops={},
         sharding_config=None, parallel_groups=groups, device=torch.device("cpu"),
@@ -84,8 +84,8 @@ def _init_worker(monkeypatch, runtime: PythonGraphRuntime, parallel: set[str]) -
 
 def test_a_transition_into_a_parallel_node_is_not_speculated(monkeypatch):
     runtime, rid = _runtime_at_prefill()
-    assert [o.node_name for o in runtime.speculate_node("prefill", WALK, rid)] == ["ar_decode"]
+    assert [o.node_name for o in runtime.speculate_node("prefill", [WALK], [rid])] == ["ar_decode"]
 
     _init_worker(monkeypatch, runtime, parallel={"ar_decode"})
 
-    assert runtime.speculate_node("prefill", WALK, rid) == []
+    assert runtime.speculate_node("prefill", [WALK], [rid]) == []

@@ -1,11 +1,11 @@
 """GLM-5.2 MTP as one captured graph per step, on one GPU: the reduced model at the real MLA
-latent dims (FlashInfer's MLA kernel), captured through the engine's ``CudaGraphRunner`` and
+latent dims (FlashInfer's MLA kernel), captured through the engine's ``AcceleratorGraphRunner`` and
 replayed the way the engine replays it, against the same model eager and plain decode."""
 import pytest
 import torch
 from test_glm52_capture_gpu import PROMPTS, _load, _Node
 
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
 pytestmark = pytest.mark.skipif(
@@ -92,7 +92,7 @@ def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eage
     """Two requests decoded as one batch, captured at bs 1/2/4 (the batch runs the bs-2
     bucket; the single prefills bs 1): captured == eager MTP == plain decode, token for token.
     With the seed oracle every step's d1 is right, so replays verify accepted rows too."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
     model, submodule = _load(tmp_path, monkeypatch, fp8=False, cfg_overrides=_mtp_cfg(0))
     plain = _Node(model, submodule, capture=False, prompts=PROMPTS)
@@ -123,7 +123,7 @@ def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eage
 def test_padded_capture_rows_leave_real_seeds_alone(tmp_path, monkeypatch, eager_capture):
     """A batch of two replayed in the bs-4 bucket: the padding rows write the sink slot, so
     the real requests' seeds and streams are the unpadded ones."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 4])
     streams = {}
     for capture in (False, True):
@@ -139,7 +139,7 @@ def test_padded_capture_rows_leave_real_seeds_alone(tmp_path, monkeypatch, eager
 def test_compiled_capture_matches_compiled_plain_decode(tmp_path, monkeypatch):
     """The serving configuration: the captured forward compiled (Inductor), MTP against plain
     decode compiled the same way."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2])
     streams = {}
     for k in (0, 3):
@@ -157,7 +157,7 @@ def test_compiled_capture_matches_compiled_plain_decode(tmp_path, monkeypatch):
 def test_captured_mtp_on_paged_dsa_matches_plain_decode(tmp_path, monkeypatch, eager_capture, k):
     """MTP over paged DSA at a small index_topk, so the prefill, every verify row and the
     seed pass select: captured MTP == eager MTP == plain paged decode, token for token."""
-    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
     # the indexer ropes its first 64 dims
     dsa = dict(dsa_long_context=True, index_topk=8, index_n_heads=16,

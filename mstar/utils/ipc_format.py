@@ -5,6 +5,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
@@ -39,6 +40,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -83,6 +85,9 @@ class InputSignals(MessageBody):
     # untyped on the wire, so an empty set a Rust sender writes came back a
     # list.
     producer_done: set[str] = field(default_factory=set)
+    # Stream edge -> items its producer sent this worker in total. The stream
+    # ends only once that many have arrived.
+    producer_done_items: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -192,6 +197,10 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # under a combined walk, request_ids[i] runs walks[walk_idx[i]]; empty
+    # means every rid runs graph_walk
+    walks: list[str] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
     # by wire request id; the followers take these before building the step
     prefix_hits: dict[str, PrefixHit] = field(default_factory=dict)
 
@@ -219,6 +228,8 @@ class ConductorMessageType(Enum):
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
+    WORKER_STATUS = "worker_status"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -229,6 +240,9 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # The client's request_id. ``request_id`` is the API server's key for this
+    # one submission, never reused; the seed still derives from the client's.
+    client_request_id: str | None = None
 
 
 @dataclass
@@ -238,12 +252,15 @@ class WorkerGraphsDone(MessageBody):
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
+    # one name per chunk this worker emitted to the client since its last report
     output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
-    output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # Stream edge -> destination worker -> items sent since the last report.
+    # Every rank reports its own.
+    stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
@@ -277,6 +294,22 @@ class FailRequests(MessageBody):
     step can fail several of them for different reasons.
     """
     errors: dict[str, str]
+
+
+@dataclass
+class WorkerStatus(MessageBody):
+    """A worker's engine metrics, sent once per status interval only while
+    metrics are on: cumulative or current values per graph node or tensor
+    edge, never per-request data."""
+    worker_id: str
+    metrics: list[MetricSnapshot]
+
+
+@dataclass
+class EnableMetrics(MessageBody):
+    """Start the workers' histograms and counters. The API server sends it to
+    the conductor after its warmup requests; the conductor forwards it to
+    every worker (``WorkerMetrics.start_counting``)."""
 
 
 @dataclass

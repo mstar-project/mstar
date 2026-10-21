@@ -184,7 +184,7 @@ print(os.environ["CI_FAKE_HOST_SYSTEM" if sys.argv[1] == "-s" else "CI_FAKE_HOST
         self.assertIn("Mac checks; full x86 CPU suite not run", help_result.stdout)
         self.assertIn("cpu-smoke", help_result.stdout)
         self.assertEqual(self.run_local("not-a-job").returncode, 2)
-        self.assertEqual(self.run_local("cpu-core").returncode, 2)
+        self.assertEqual(self.run_local("cpu-tests").returncode, 2)
         self.assertFalse(self.calls.exists())
         self.assertFalse((self.root / ".ci-results").exists())
 

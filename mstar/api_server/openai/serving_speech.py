@@ -33,7 +33,7 @@ from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import rid
+from mstar.api_server.openai._util import release_unread, rid
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
 
@@ -125,7 +125,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
                 raise _http_error(first)
         except BaseException:
             # The first piece released itself; release the ones submitted ahead.
-            _release_unread(api, pending, 1)
+            release_unread(api, pending, 1)
             raise
         return StreamingResponse(
             _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
@@ -150,7 +150,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
                 break
             pcm_parts.append(b"".join(c.data for c in results if c.modality == "audio"))
     finally:
-        _release_unread(api, pending, read)
+        release_unread(api, pending, read)
     audio_bytes, mime = media_io.pcm16_to_container(b"".join(pcm_parts), sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
 
@@ -170,12 +170,6 @@ def _http_error(chunk) -> HTTPException:
 async def _drain(iterator) -> None:
     async for _ in iterator:
         pass
-
-
-def _release_unread(api, pending: list[str], read: int) -> None:
-    """Release every submitted piece from ``pending[read]`` on (not yet fully read)."""
-    for chunk_id in pending[read:]:
-        api.release_request(chunk_id)
 
 
 async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
@@ -208,4 +202,4 @@ async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pendin
                 # the only honest signal left, so raise rather than end quietly.
                 raise _http_error(error)
     finally:
-        _release_unread(api, pending, read)
+        release_unread(api, pending, read)

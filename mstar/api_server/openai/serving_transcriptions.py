@@ -48,6 +48,7 @@ Response formats
 from __future__ import annotations
 
 import asyncio
+import codecs
 import math
 import os
 import uuid
@@ -75,13 +76,18 @@ TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 PROMPT_RESET_TEMPERATURE = 0.5
 # a seek shorter than this re-hears too much for too little, so take the window
 MIN_SEEK_SECONDS = 1.0
-# parallel mode: how far before a fixed boundary to look for the quietest cut
+# parallel mode: how far before a fixed boundary to look for the quietest cut,
+# and the frame length compared
 CUT_SEARCH_SECONDS = 2.0
+CUT_FRAME_SECONDS = 0.02
 # parallel mode: windows on the engine at once for one upload
 PARALLEL_INFLIGHT = 8
+# shortest window a request may ask for (``window_seconds``)
+MIN_WINDOW_SECONDS = 5.0
 # longest upload the route accepts, in seconds and in bytes
 MAX_DURATION_SECONDS = 30 * 60
 MAX_UPLOAD_BYTES = 512 * 2**20
+_SF_UNKNOWN_FRAMES = 2**62
 
 
 def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> str:
@@ -105,7 +111,10 @@ def audio_duration_seconds(path: str) -> float | None:
         import soundfile as sf
 
         info = sf.info(path)
-        return float(info.frames) / float(info.samplerate)
+        # libsndfile reports an unknown length (a FLAC whose header leaves the
+        # sample count out) as the largest frame count
+        if info.frames < _SF_UNKNOWN_FRAMES:
+            return float(info.frames) / float(info.samplerate)
     except Exception:  # noqa: BLE001 — try the FFmpeg decoder
         pass
     try:
@@ -145,16 +154,26 @@ class WindowPlanner:
     """Cuts an upload into windows for a model with a clip bound.
 
     ``fixed()`` cuts the whole file up front (parallel mode), moving each cut
-    to the quietest moment within :data:`CUT_SEARCH_SECONDS` before its
-    nominal boundary. ``window_at(offset)`` cuts one window from ``offset``
-    on (sequential mode, where the previous window decides where the next
-    starts). A file the model can hear whole is a single window either way
-    and is never re-encoded.
+    to the quietest frame within ``search_seconds`` before its nominal
+    boundary. ``window_at(offset)`` cuts one window from ``offset`` on
+    (sequential mode, where the previous window decides where the next
+    starts). A file of at most ``whole_seconds`` (default: the window
+    length) is a single window either way and is never re-encoded.
     """
 
-    def __init__(self, audio_path: str, max_seconds: float | None, upload_dir: Path):
+    def __init__(
+        self, audio_path: str, max_seconds: float | None, upload_dir: Path, *,
+        balanced: bool = False, search_seconds: float = CUT_SEARCH_SECONDS,
+        frame_seconds: float = CUT_FRAME_SECONDS, whole_seconds: float | None = None,
+    ):
         self.audio_path = audio_path
         self.max_seconds = max_seconds
+        self.whole_seconds = max_seconds if whole_seconds is None else whole_seconds
+        self.balanced = balanced
+        # a cut moves back at most a third of a window, so short windows a
+        # request asks for keep most of their length
+        self.search_seconds = search_seconds if max_seconds is None else min(search_seconds, max_seconds / 3)
+        self.frame_seconds = frame_seconds
         self.upload_dir = Path(upload_dir)
         self.duration = audio_duration_seconds(audio_path)
         self.files = [audio_path]
@@ -163,10 +182,30 @@ class WindowPlanner:
 
     @property
     def single(self) -> bool:
-        return self.max_seconds is None or self.duration is None or self.duration <= self.max_seconds
+        return self.max_seconds is None or self.duration is None or self.duration <= self.whole_seconds
 
     def whole(self) -> Window:
         return Window(path=self.audio_path, offset=0.0, duration=self.duration or 0.0)
+
+    def prepare(self) -> None:
+        """Decode an upload that will be windowed, so a file the decoder
+        refuses (e.g. an unsupported sample rate, or audio past
+        :data:`MAX_DURATION_SECONDS`, where the decode stops whatever the
+        header says) fails before any window runs. A file with no header
+        duration is decoded too: a refusal fails here the same way, and once
+        its length is known it is windowed when longer than the model's clip.
+        One that does not decode here (or with no audio decoder in this
+        process) is sent whole to the data worker, whose decode has the same
+        cap and reports its own errors."""
+        if not self.single:
+            self._decoded()
+        elif self.duration is None:
+            try:
+                self._decoded()
+            except media_io.AudioRefusedError:
+                raise
+            except Exception:  # noqa: BLE001 — not decodable here; the data worker reports it
+                pass
 
     def done(self, offset: float) -> bool:
         return self.single or offset >= (self.duration or 0.0) - 1e-3
@@ -175,7 +214,8 @@ class WindowPlanner:
         if self.single:
             return [self.whole()]
         pieces = media_io.split_windows(
-            self._decoded(), self.max_seconds, SAMPLE_RATE, search_seconds=CUT_SEARCH_SECONDS,
+            self._decoded(), self.max_seconds, SAMPLE_RATE,
+            search_seconds=self.search_seconds, frame_seconds=self.frame_seconds, balanced=self.balanced,
         )
         windows, offset = [], 0.0
         for piece in pieces:
@@ -188,12 +228,12 @@ class WindowPlanner:
             return self.whole()
         audio = self._decoded()
         start = int(round(offset * SAMPLE_RATE))
-        stop = min(len(audio), start + int(round(self.max_seconds * SAMPLE_RATE)))
+        stop = media_io.window_stop(start, len(audio), int(round(self.max_seconds * SAMPLE_RATE)), self.balanced)
         return self._write(audio[start:stop], offset)
 
     def _decoded(self):
         if self._audio is None:
-            self._audio = media_io.decode_audio(self.audio_path, SAMPLE_RATE)
+            self._audio = media_io.decode_audio(self.audio_path, SAMPLE_RATE, MAX_DURATION_SECONDS)
             self.duration = len(self._audio) / SAMPLE_RATE
         return self._audio
 
@@ -216,11 +256,45 @@ def plan_windows(audio_path: str, max_seconds: float | None, upload_dir: Path) -
     return WindowPlanner(audio_path, max_seconds, upload_dir).fixed()
 
 
+def planner_for(adapter, audio_path: str, upload_dir: Path, window_seconds: float | None = None) -> WindowPlanner:
+    """The adapter's window policy for one upload; ``window_seconds`` (a
+    request's override) sets the window and the longest upload heard whole."""
+    if window_seconds is None:
+        window_seconds = adapter.window_seconds or adapter.max_audio_seconds
+        whole_seconds = adapter.whole_seconds
+    else:
+        whole_seconds = window_seconds
+    return WindowPlanner(
+        audio_path, window_seconds, upload_dir,
+        balanced=adapter.balanced_windows,
+        search_seconds=CUT_SEARCH_SECONDS if adapter.window_search_seconds is None else adapter.window_search_seconds,
+        frame_seconds=CUT_FRAME_SECONDS if adapter.window_frame_seconds is None else adapter.window_frame_seconds,
+        whole_seconds=whole_seconds,
+    )
+
+
 def _long_form_mode(adapter, req) -> str:
     mode = (getattr(req, "model_extra", None) or {}).get("long_form") or adapter.long_form
     if mode not in LONG_FORM_MODES:
         raise HTTPException(status_code=400, detail=f"long_form must be one of {list(LONG_FORM_MODES)}; got {mode!r}")
     return mode
+
+
+def _window_seconds(adapter, req) -> float | None:
+    """The request's ``window_seconds`` (extra_body), checked against the
+    model's clip bound, or None when the request leaves it to the adapter."""
+    cap = adapter.max_audio_seconds
+    value = (getattr(req, "model_extra", None) or {}).get("window_seconds")
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = math.nan
+    if cap is None or not MIN_WINDOW_SECONDS <= value <= cap:
+        bound = f"between {MIN_WINDOW_SECONDS:g} and {cap:g}" if cap is not None else "unset (no clip bound)"
+        raise HTTPException(status_code=400, detail=f"window_seconds must be {bound} for this model")
+    return value
 
 
 def _window_request(req, language: str | None, carry_over: str | None, *, timestamps: bool = False):
@@ -259,6 +333,7 @@ def _attempts(req, carry_over: str | None) -> list[tuple[float, str | None]]:
 def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[str]) -> str:
     args = adapter.transcription_to_request(req, window.path)
     args.model_kwargs.pop("long_form", None)
+    args.model_kwargs.pop("window_seconds", None)
     request_id = rid("transcr")
     api.submit_request(
         text=args.text,
@@ -295,16 +370,17 @@ def _release(api, inflight: set[str]) -> None:
 
 
 def _text_of(chunks) -> str:
-    parts: list[str] = []
+    # a byte-level BPE token can end mid-character, so decode the joined bytes
+    data = bytearray()
     for c in chunks:
         if c.modality == "text":
-            parts.append(c.data.decode("utf-8", "replace"))
+            data += c.data
         elif c.modality == "error":
             raise HTTPException(
                 status_code=int((c.metadata or {}).get("status") or 500),
                 detail=c.data.decode("utf-8", "replace"),
             )
-    return "".join(parts)
+    return data.decode("utf-8", "replace")
 
 
 def _carry_over(texts: list[str]) -> str:
@@ -406,14 +482,28 @@ async def create_transcription(
         adapter.transcription_to_request(req, "")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+    window = _window_seconds(adapter, req)
     audio_path = save_upload(audio_bytes, filename, api.upload_dir)
-    planner = WindowPlanner(audio_path, adapter.max_audio_seconds, api.upload_dir)
+    planner = planner_for(adapter, audio_path, api.upload_dir, window)
     if planner.duration is not None and planner.duration > MAX_DURATION_SECONDS:
         planner.cleanup()
         raise HTTPException(
             status_code=413,
             detail=f"audio is {planner.duration:.0f} s; the limit is {MAX_DURATION_SECONDS} s",
         )
+    try:
+        planner.prepare()
+    except media_io.AudioTooLongError:
+        planner.cleanup()
+        raise HTTPException(
+            status_code=413, detail=f"audio is longer than the {MAX_DURATION_SECONDS} s limit",
+        ) from None
+    except ValueError as exc:
+        planner.cleanup()
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except BaseException:
+        planner.cleanup()
+        raise
 
     if req.stream:
         # the stream owns the files and windows from here
@@ -550,6 +640,8 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
                 raw, emitted = "", ""
+                # holds back a character split across tokens until its last byte
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
                 async for c in api.iter_result_chunks(window.request_id):
                     if c.modality == "error":
                         yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
@@ -557,7 +649,13 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                         return
                     if c.modality != "text" or not c.data:
                         continue
-                    raw += c.data.decode("utf-8", "replace")
+                    raw += decoder.decode(c.data)
+                    delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
+                    if delta:
+                        yield sse({"type": "transcript.text.delta", "delta": delta})
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    raw += tail
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
                         yield sse({"type": "transcript.text.delta", "delta": delta})

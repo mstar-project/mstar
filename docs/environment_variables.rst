@@ -58,50 +58,12 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
-   * - ``MSTAR_REQUIRE_CUDA_GRAPHS``
+   * - ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS``
      - ``0``
-     - ``1`` makes a worker fail at startup when any CUDA graph bucket
+     - ``1`` makes a worker fail at startup when any accelerator graph bucket
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
-   * - ``MSTAR_GRAPH_COMPILE_MODE``
-     - unset
-     - Overrides the ``torch.compile`` mode of every captured forward
-       (whole forwards and piecewise regions). Unset or empty, each capture
-       config's ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
-       ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
-       and skips autotuning. An unknown mode fails at import, and so
-       does one with Inductor's own CUDA graphs (``reduce-overhead``,
-       ``max-autotune``).
-   * - ``MSTAR_DIST_TIMEOUT_S``
-     - config's ``dist_timeout_s``
-     - Timeout in seconds for the NCCL world group and its parallel
-       subgroups during weight load and warmup
-       (:func:`mstar.distributed.communication.resolve_dist_timeout`); once
-       warmup is done, serving collectives go back to PyTorch's default.
-       Overrides the deployment config's ``dist_timeout_s``; with neither set,
-       PyTorch's default applies throughout. Raise it only where weight load,
-       JIT or CUDA-graph capture can exceed that default. Must be set before
-       the conductor spawns workers, which inherit it.
-   * - ``MSTAR_TP_ALLREDUCE``
-     - config's ``tp_allreduce``, else ``nccl``
-     - Backend for small TP all-reduces (``CommGroup.all_reduce``); overrides
-       the deployment config's ``tp_allreduce``.
-       ``nccl``: torch.distributed's NCCL ring/tree for every message.
-       ``symm_oneshot`` / ``symm_multimem``: contiguous CUDA messages up to
-       ``MSTAR_TP_SYMM_AR_MAX_KB`` go through torch symmetric memory —
-       one-shot reads every peer's buffer over NVLink and reduces locally;
-       multimem uses NVLS multicast (needs NVSwitch + driver support).
-       Larger messages (prefill) stay on NCCL. At batch-1 decode a TP8 step
-       issues ~160-230 all-reduces of ~10 KB, where NCCL's per-call latency
-       (~15-30 us) dominates and a one-shot kernel is ~5-10 us. Both are
-       CUDA-graph capturable. Reduction order differs from NCCL's, so bf16
-       results can differ at the last bit — measure before flipping. Falls
-       back to NCCL with a warning if symmetric memory cannot be set up.
-   * - ``MSTAR_TP_SYMM_AR_MAX_KB``
-     - ``512``
-     - Size cutoff (KiB) for the symmetric-memory all-reduce path; also the
-       size of the one persistent buffer rendezvoused per comm group.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -119,7 +81,12 @@ Communication
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
-       existing segments never move (registrations stay valid).
+       existing segments never move (registrations stay valid). A
+       segment's /dev/shm pages are committed when it is created (pinned
+       segments always were, by ``cudaHostRegister``), so the whole
+       segment counts against /dev/shm, as do spill files, which land in
+       /dev/shm by default. A segment /dev/shm cannot hold counts as arena
+       full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
      - ``32``
      - Growth cap PER ENTITY. Every entity (workers + the api-server data
@@ -172,6 +139,17 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``NCCL_SOCKET_IFNAME``
+     - ``lo``
+     - NCCL's own variable. Every worker runs on the conductor's host, so
+       the conductor sets ``lo`` for its workers and NCCL's bootstrap
+       sockets listen on loopback only. A value you set, or a set
+       ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``GLOO_SOCKET_IFNAME``
+     - ``lo``
+     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+       Same rule: the conductor sets ``lo`` for its workers unless you set
+       it, so Gloo does not listen on the address the hostname resolves to.
 
 Models
 ------
@@ -193,23 +171,36 @@ model, so they are named for it.
        images produce small bf16 drift, which at greedy ``temperature=0`` can
        flip a downstream LLM argmax. When off, ``prefill_vit`` runs one
        request at a time.
-   * - ``MSTAR_VIT_CUDA_GRAPH``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH``
      - ``0``
-     - BAGEL: CUDA-graph capture of the ViT block loop, over the node's ragged
-       attention resource (see :doc:`adding_models`). Off by default: capture
-       costs one graph per (batch size, token bucket) and the eager
-       flash-attn path is already fast. The win is removing per-layer launch
-       overhead on small images.
-   * - ``MSTAR_VIT_CG_TOKEN_BUCKETS``
+     - BAGEL: accelerator graph capture of the ViT block loop, over the node's
+       ragged attention resource (see :doc:`adding_models`). Requires the
+       deployment option ``model_kwargs.accelerator_graph`` to be true;
+       BAGEL defaults this option to true (see :doc:`models`).
+       Off by default: capture costs one graph per (batch size, token bucket)
+       and the eager flash-attn path is already fast. The win is removing
+       per-layer launch overhead on small images.
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS``
      - ``512,1024,2048,4096,4900``
      - Comma-separated token-count buckets to capture, when
-       ``MSTAR_VIT_CUDA_GRAPH=1``. A batch longer than the largest bucket runs
+       ``MSTAR_VIT_ACCELERATOR_GRAPH=1``. A batch longer than the largest bucket runs
        eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
        preprocess option emits.
-   * - ``MSTAR_VIT_CG_BATCH_SIZES``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables denoise, prefill and reasoner
+       decode capture. The deployment option
+       ``model_kwargs.accelerator_graph: false`` also disables all these
+       captures and cannot be overridden by this variable.
+   * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables only the understanding-tower
+       prefill capture. Denoise and reasoner decode captures remain eligible
+       when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -246,6 +237,16 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit on every route, as in the Rust frontend: a larger
+       body gets a 413, refused on its ``Content-Length`` or, for a chunked
+       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+       512 MiB file cap when this is lower. A body refused on its
+       ``Content-Length`` is answered before it is read, so a client that
+       writes the whole body before reading the reply can see a connection
+       reset instead of the 413; one that sends ``Expect: 100-continue``
+       gets the 413 before it sends the body.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -253,6 +254,31 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
+     - ``10``
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
+       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+       ``n`` outside ``1`` to this value is a 400 before anything is
+       submitted. The Rust frontend and the Dynamo bridge apply the same
+       variable and default.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
+       ``--api-key`` overrides it). When set, every route except
+       ``/health`` and ``/metrics`` needs ``Authorization: Bearer <key>``, WebSocket
+       handshakes included; unset or empty turns the check off. The
+       launcher passes it on to the Rust frontend only (the conductor and
+       workers do not inherit it), and
+       :class:`mstar.client.MStarClient` sends it when not given
+       ``api_key``. See :ref:`api-key`.
+   * - ``MSTAR_SILERO_VAD_PATH``
+     - unset
+     - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
+       ``server_vad`` turn detection, read by
+       ``realtime_vad.silero_weights``. Unset, the copy bundled with the
+       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       with a file whose inputs or outputs differ (the package's other
+       exports), ``server_vad`` sessions are refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------
@@ -272,6 +298,12 @@ Read by the ``mstar-server`` binary and its bridge
      - Path to the ``mstar-server`` binary. Fallback order:
        ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
        ``rust/server/target/release`` build.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - Same rule as the Python server (``rust/server/src/auth.rs``, read
+       once at startup): every route except ``/health`` and ``/metrics`` needs
+       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend; on expiry the client gets
@@ -287,7 +319,7 @@ Read by the ``mstar-server`` binary and its bridge
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
-       ``/health`` and ``/v1/models`` bypass the cap.
+       ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
@@ -321,6 +353,56 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
+
+Request media
+-------------
+
+Read by the model's media loaders in the data worker's preprocess thread,
+behind either frontend. All four are also checked once when the data worker
+starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
+value stops the server instead of failing every media request. The pixel and
+audio caps hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
+so attaching more files does not multiply them.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels a request's images may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_image_pixels`), checked from each
+       header before decoding; over it, the request gets a 400. PNG, JPEG,
+       WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
+       reads BMP and TIFF); other formats get a 400. A GIF or an animated
+       WebP is read as its first frame.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels a request's videos may decode to (see
+       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+       frames the model's loader decodes, each frame counting as at least
+       64x64; over it, the request gets a 400. At 1080p30 the default refuses
+       clips over about 17 s on Cosmos3, which decodes every frame, and over
+       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
+       frame, as Cosmos3, when the clip's header gives no frame count).
+   * - ``MSTAR_MAX_MEDIA_FILES``
+     - ``16``
+     - Images, audio clips and videos one request may attach, together (see
+       :func:`mstar.model.media_limits.max_media_files`); more get a 400
+       before any is decoded. A model can take fewer of one kind
+       (:meth:`mstar.model.base.Model.max_input_files`; Qwen3-TTS,
+       Chatterbox, Whisper and Higgs-Audio take one audio clip).
+   * - ``MSTAR_MAX_AUDIO_SECONDS``
+     - ``3600``
+     - Seconds a request's audio clips may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_audio_seconds`), checked from each
+       header before the model decodes it and again from the decoded clip (a
+       file whose header gives no length, such as a FLAC with no sample count,
+       is counted as it decodes, or from its size for a WAV with no data
+       length); over it, the request gets a 400.
 
 Worker scheduling
 -----------------
@@ -377,7 +459,16 @@ Worker scheduling
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
-       other ready work.
+       other ready work. ``0`` turns speculation off. A value that is not an
+       integer is ignored with a warning when the worker starts.
+   * - ``MSTAR_LAUNCH_WAIT_MS``
+     - ``5``
+     - Milliseconds the speculative submitter holds off the GIL waiting for
+       the GPU thread to reach the launch before it carries on. A value that
+       is not a number, is ``nan`` or ``inf``, or is past
+       ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
+       worker starts and ``5`` is used; a negative value is raised to ``0``
+       with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -404,9 +495,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's
@@ -467,14 +558,6 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
-   * - ``MSTAR_MLA_DECODE_BACKEND``
-     - ``flashinfer``
-     - Which kernel the MLA attention resource runs for plain decode plans (one causal query per
-       row): ``flashinfer`` (FlashInfer's Hopper MLA kernel) or ``flashmla`` (DeepSeek's FlashMLA,
-       where it is built for the GPU: sm90, latent 512 + rope 64). On an H100 the two cost about the
-       same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
-       FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
-       FlashInfer either way.
 
 Compilation
 -----------

@@ -6,7 +6,13 @@ from dataclasses import dataclass, field, fields
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.base import (
+    CachedPrefix,
+    CGSlotKey,
+    EngineResourceInfo,
+    PublishedInfo,
+    Resource,
+)
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
@@ -104,8 +110,6 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
-        # rid -> tokens the prefix cache matched, until `admit`
-        self._matched: dict[str, int] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -149,45 +153,33 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        self._counters[rid] = {}
+        # setdefault: a worker serving two partitions ingests the rid twice
+        self._counters.setdefault(rid, {})
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
-        self._matched.pop(rid, None)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
-        self._matched.pop(rid, None)
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
-        """Hold what the cache matched, until an admit seeds a counter with it."""
-        del node_name, graph_walk, inputs
-        if matched_len:
-            self._matched[rid] = matched_len
+        """Move the stream's counter past what the cache holds of this walk.
 
-    def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
-        """Start a matched prefix's counter past it, as a retrieved one does.
-
-        The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.
+        The counter moves here and not at admit. A walk the cache serves never
+        admits, and the walk after it can place its positions in `prepare_inputs`,
+        before its own admit, so a counter seeded at admit would put that walk on
+        top of the served ones. The position is absolute, so a repeated probe
+        moves nothing.
         """
-        del ctx
-        # taken by the step it was held for: a label the request writes later
-        # has no cached prefix of its own
-        seeds = {
-            segment.request_id: self._matched.pop(segment.request_id)
-            for segment in step.segments or ()
-            if segment.request_id in self._matched
-        }
-        for segment in step.segments or ():
-            matched = seeds.get(segment.request_id)
-            if matched is None:
-                continue
-            counters = self._counters.setdefault(segment.request_id, {})
-            if matched > counters.get(segment.label, 0):
-                counters[segment.label] = matched
-        return ADMIT_OK
+        del node_name, graph_walk, inputs
+        if prefix is None:
+            return
+        counters = self._counters.setdefault(rid, {})
+        if prefix.position > counters.get(prefix.label, 0):
+            counters[prefix.label] = prefix.position
 
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
         counters = self._counters.get(request_id)
@@ -278,7 +270,7 @@ class RopeManager(PositionManager):
 
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: the eager path hands back a "
+            "preplan requires an accelerator graph step: the eager path hands back a "
             "fresh tensor rather than writing a slot's buffer"
         )
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(

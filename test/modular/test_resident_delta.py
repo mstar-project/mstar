@@ -26,7 +26,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK
+from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
@@ -622,6 +622,9 @@ class _Leader:
 def _node_batch():
     return SimpleNamespace(
         node_name="node", graph_walk="walk", request_ids=("r0",),
+        step_context=StepContext(
+            request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
+        ),
     )
 
 
@@ -723,7 +726,6 @@ class _Rank:
 def _oom(rank, referenced_rids=frozenset()):
     batch = SimpleNamespace(
         node_name="node", graph_walk="walk",
-        node_objects={"r0": object(), "r1": object()},
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(node_name="node", failed_resource=None)
@@ -921,6 +923,7 @@ class _ForwardingLeader:
         self._pending_removes: set[int] = set()
         self._last_active: dict = {}
         self.streaming_buffers: dict = {}
+        self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[str]] = {}

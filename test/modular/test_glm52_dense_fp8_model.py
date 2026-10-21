@@ -1,6 +1,7 @@
 """GLM-5.2 ``dense_fp8`` in the model, on CPU: the flag, the module layout, TP shards along
 whole scale blocks, the load, and a reduced model whose forward is bitwise the bf16
 model's (host tensors dequantize to bf16 exactly as the loader does)."""
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -24,11 +25,13 @@ def _cpu_flashinfer() -> types.ModuleType:
     return fi
 
 
-if "flashinfer" not in sys.modules:
-    try:
-        import flashinfer  # noqa: F401
-    except ImportError:
-        sys.modules["flashinfer"] = _cpu_flashinfer()
+@pytest.fixture(autouse=True)
+def _cpu_flashinfer_without_the_real_one(monkeypatch):
+    # per test: left in sys.modules, the stand-in breaks find_spec("flashinfer")
+    # in every file collected after this one
+    if importlib.util.find_spec("flashinfer") is None:
+        monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
