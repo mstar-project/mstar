@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
@@ -936,8 +937,6 @@ _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 # Whisper's word timings follow the transcript after this marker, one
 # ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
 _WORDS_MARKER = "<|startoflm|>"
-# Qwen3-ASR writes ``language {Name}<asr_text>{text}``
-ASR_TEXT_TAG = "<asr_text>"
 
 
 # sampling knobs the engine reads as numbers; a string there fails every
