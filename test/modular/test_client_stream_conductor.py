@@ -32,7 +32,13 @@ from mstar.conductor.request_info import (  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
-from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
+from mstar.streaming.chunk_policy import (  # noqa: E402
+    FixedChunkPolicy,
+    LeftContextChunkPolicy,
+    RampChunkPolicy,
+    ScheduledLeftContextChunkPolicy,
+    SlidingWindowChunkPolicy,
+)
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
@@ -663,6 +669,40 @@ def test_a_deployment_cannot_raise_or_lift_a_declared_bound(max_items):
     topology = _Bounded(ClientStreamLimits(max_items=10)).get_partition_topology()
     with pytest.raises(ValueError, match="may lower the model's bound of 10"):
         client_stream_limits(topology, {"client_streams": {"audio_in": {"max_items": max_items}}})
+
+
+def _windowed(policy_factory):
+    return PartitionTopology(partitions=["Ear"], connections=[Connection(
+        from_partition=CLIENT, to_partition="Ear", edge_name="audio_in", chunk_policy_factory=policy_factory,
+    )])
+
+
+@pytest.mark.parametrize("policy_factory, window", [
+    (lambda: FixedChunkPolicy(chunk_size=4), 4),
+    (lambda: SlidingWindowChunkPolicy(window=28, stride=7), 28),
+    (lambda: LeftContextChunkPolicy(chunk=8, left_context=2), 8 + 2),
+    (lambda: RampChunkPolicy(first_chunk=2, chunk_size=4, growth=2.0, max_chunk=16), 16),
+    (lambda: RampChunkPolicy(first_chunk=6, chunk_size=4), 6),
+    # windows 4, 4+8, 12+16, then 25+25 once the context is full
+    (lambda: ScheduledLeftContextChunkPolicy(schedule=(4, 8, 16), chunk=25, left_context=25), 50),
+])
+def test_max_pending_items_below_a_chunk_window_fails_loading(policy_factory, window):
+    """A consumer held to fewer items than its widest chunk never forms that
+    chunk, so it never reports room: the stream would stall (a call held
+    forever under keep_newest, refused under refuse). The error names both."""
+    topology = _windowed(policy_factory)
+    fits = client_stream_limits(topology, {"client_streams": {"audio_in": {"max_pending_items": window}}})
+    assert fits["audio_in"].max_pending_items == window
+    with pytest.raises(ValueError, match=rf"'audio_in' stream's max_pending_items \({window - 1}\) is below the "
+                                         rf"{window} items"):
+        client_stream_limits(topology, {"client_streams": {"audio_in": {"max_pending_items": window - 1}}})
+
+
+def test_max_pending_items_cannot_bound_chunks_that_grow_without_a_cap():
+    topology = _windowed(lambda: RampChunkPolicy(first_chunk=2, chunk_size=4, growth=2.0))
+    assert client_stream_limits(topology, None)["audio_in"].max_pending_items is None
+    with pytest.raises(ValueError, match="grow without bound"):
+        client_stream_limits(topology, {"client_streams": {"audio_in": {"max_pending_items": 1000}}})
 
 
 @pytest.mark.parametrize("block, match", [

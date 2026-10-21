@@ -46,6 +46,15 @@ class ChunkPolicy(ABC):
         """
         ...
 
+    def max_window_size(self) -> int | None:
+        """The most items the policy ever waits for before it releases a
+        chunk, over the stream's life; None if its chunks grow without bound.
+        A bound on the items a consumer holds below this stalls the stream.
+
+        The default fits a policy whose window never changes.
+        """
+        return self.window_size()
+
     def continue_after_producer_done(self) -> bool:
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
@@ -130,6 +139,9 @@ class LeftContextChunkPolicy(ChunkPolicy):
     def window_size(self) -> int:
         if not self.first_chunk_read:
             return self._chunk
+        return self._window
+
+    def max_window_size(self) -> int:
         return self._window
 
 
@@ -220,6 +232,13 @@ class RampChunkPolicy(ChunkPolicy):
     def window_size(self) -> int:
         return self._current()
 
+    def max_window_size(self) -> int | None:
+        if self._growth == 1.0:
+            return max(self._first_chunk, self._chunk_size)
+        if self._max_chunk is None:
+            return None
+        return max(self._first_chunk, self._max_chunk)
+
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
 
@@ -276,6 +295,15 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
 
     def window_size(self) -> int:
         return self._context() + self._new_items()
+
+    def max_window_size(self) -> int:
+        # The context only grows, up to left_context, and past the schedule
+        # every chunk brings ``chunk`` new items.
+        delivered, largest = self._delivered, 0
+        for size in self._schedule[self._chunks_popped:]:
+            largest = max(largest, min(self._left_context, delivered) + size)
+            delivered += size
+        return max(largest, self._left_context + self._chunk)
 
     def next_chunk_size(self, buffer_len: int) -> int:
         # The buffer pointer sits ``context`` items before the first new item.

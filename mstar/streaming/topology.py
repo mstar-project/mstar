@@ -103,8 +103,11 @@ def client_stream_limits(
     model sized its consumer for that much (nemotron_duplex's session
     buffers and KV pools for ``max_session_s``). An unknown stream, key or
     value is an error: it would otherwise be a silently ineffective
-    setting."""
-    declared = {conn.edge_name: conn.limits or ClientStreamLimits() for conn in topology.client_connections()}
+    setting. So is a ``max_pending_items`` below what the stream's chunk
+    policy waits for: the consumer would never take a chunk, so it would
+    never make room."""
+    conns = {conn.edge_name: conn for conn in topology.client_connections()}
+    declared = {name: conn.limits or ClientStreamLimits() for name, conn in conns.items()}
     overrides = (model_config or {}).get("client_streams") or {}
     if not isinstance(overrides, Mapping):
         raise ValueError("client_streams must map client stream names to their limits")
@@ -126,7 +129,26 @@ def client_stream_limits(
                     f"client_streams.{name}.{key} may lower the model's bound of {declared_bound}, "
                     f"not raise or lift it ({bound!r})"
                 )
+        _check_pending_fits_a_chunk(name, limits[name], conns[name])
     return limits
+
+
+def _check_pending_fits_a_chunk(name: str, limits: ClientStreamLimits, conn: Connection) -> None:
+    pending = limits.max_pending_items
+    if pending is None:
+        return
+    window = conn.chunk_policy_factory().max_window_size()
+    if window is None:
+        raise ValueError(
+            f"the {name!r} stream's chunks grow without bound, so no max_pending_items ({pending}) "
+            f"fits one (client_streams.{name}.max_pending_items)"
+        )
+    if pending < window:
+        raise ValueError(
+            f"the {name!r} stream's max_pending_items ({pending}) is below the {window} items its "
+            f"chunk policy waits for before it releases a chunk, so its consumer would never take "
+            f"one (client_streams.{name}.max_pending_items)"
+        )
 
 
 def _checked_limits(name: str, limits: ClientStreamLimits) -> ClientStreamLimits:
