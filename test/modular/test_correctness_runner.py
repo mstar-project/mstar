@@ -425,6 +425,16 @@ def test_i2v_floor_takes_the_larger_move_per_video(tmp_path):
     assert Cosmos3I2V("cosmos3_nano", {}, {"ref_anchor": "fp32"}).anchor_reference_dir(ref) is None
 
 
+def test_cosmos3_droid_asks_for_the_policy_s_8_dims(tmp_path):
+    fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {})
+    sset = sets.SampleSet("droid_v1", tmp_path, {}, [sets.Item(id="ep00", prompt="p", params={"seed": 0},
+                                                              files={"exterior_image_1_left": "f.png"})])
+    (req,) = fam.requests(sset)
+    assert req.model_kwargs["raw_action_dim"] == 8
+    raw = np.arange(32 * 16, dtype=np.float32)  # the server pads to the model's action width
+    assert fam.to_array(raw).shape == (32, 8)
+
+
 def test_robotics_can_skip_episodes_without_a_task():
     items = [sets.Item(id="ep00", prompt="Put the marker in the pot"), sets.Item(id="ep05", prompt="")]
     fam = family_for_config("cosmos3_droid", "cosmos3_droid", {}, {"skip_empty_prompt": "1"})
