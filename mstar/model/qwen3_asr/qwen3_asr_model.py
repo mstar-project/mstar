@@ -51,7 +51,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
@@ -92,6 +92,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 
 class Qwen3ASRModel(Model):
     """Qwen3-ASR: AuT encoder + dense Qwen3 decoder."""
+
+    # Where process_prompt put the audio placeholders, so prefill splices the
+    # audio embeddings in by slice instead of finding them on the device.
+    INTERNAL_KWARGS = ("audio_slot", "audio_tokens")
 
     # Concurrency the default cache sizing targets: 20 minutes of audio is
     # ~16k tokens, a LibriSpeech utterance ~300, so the pool is sized for a
@@ -277,7 +281,11 @@ class Qwen3ASRModel(Model):
             ),
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
+            step_metadata={
+                "is_prefill": True,
+                "audio_slot": (model_kwargs or {}).get("audio_slot"),
+                "audio_tokens": (model_kwargs or {}).get("audio_tokens"),
+            },
         )
 
     def get_partition_forward_pass_args(
@@ -394,10 +402,13 @@ class Qwen3ASRModel(Model):
             num_audio_tokens, context=context, language=language,
             assistant_prefix=kwargs.get("assistant_prefix") or "",
         )
-        return {
-            "audio": [waveform.contiguous()],
-            "text_inputs": [torch.tensor(ids, dtype=torch.long)],
-        }
+        return ProcessPromptOutput(
+            new_input_tensors={
+                "audio": [waveform.contiguous()],
+                "text_inputs": [torch.tensor(ids, dtype=torch.long)],
+            },
+            metadata={"audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens},
+        )
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

@@ -246,18 +246,20 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
-    def splice_audio(self, input_ids: torch.Tensor, audio_embeds: torch.Tensor) -> torch.Tensor:
+    def splice_audio(
+        self, input_ids: torch.Tensor, audio_embeds: torch.Tensor, slot: int, n_slots: int,
+    ) -> torch.Tensor:
         """Prompt embeddings with the audio embeddings in place of the
-        ``<|audio_pad|>`` placeholders; the counts must agree."""
-        embeds = self.model.embed(input_ids)
-        slots = input_ids == self.config.audio_token_id
-        n_slots = int(slots.sum())
+        ``<|audio_pad|>`` run that ``process_prompt`` put at ``slot``. The
+        counts are compared on the host: finding the placeholders in
+        ``input_ids`` would wait on the device."""
         if n_slots != audio_embeds.shape[0]:
             raise ValueError(
                 f"prompt holds {n_slots} audio placeholders but the encoder produced "
                 f"{audio_embeds.shape[0]} audio tokens"
             )
-        embeds[slots] = audio_embeds.to(embeds.dtype)
+        embeds = self.model.embed(input_ids)
+        embeds[slot:slot + n_slots] = audio_embeds.to(embeds.dtype)
         return embeds
 
     def prepare_inputs(
@@ -272,10 +274,11 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         if graph_walk == DECODE_WALK:
             return ARNodeInputs(input_seq_len=1, input_ids=token_ids)
         audio_embeds = inputs["audio_embeds"][0].to(device)
+        meta = fwd_info.step_metadata
         return ARNodeInputs(
             input_seq_len=token_ids.shape[0],
             input_ids=token_ids,
-            input_embeds=self.splice_audio(token_ids, audio_embeds),
+            input_embeds=self.splice_audio(token_ids, audio_embeds, meta["audio_slot"], meta["audio_tokens"]),
         )
 
     def declare_step(
