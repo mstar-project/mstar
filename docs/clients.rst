@@ -321,7 +321,7 @@ Per-model notes:
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal
   length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
   in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
-  get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
+  get one cue per window, timed to the windows. Nothing detects the language: ``verbose_json``'s
   ``language`` is the request's ``language`` as given, or null.
 - **Canary / Canary-Qwen / Parakeet / Nemotron ASR** — no conditioning text (``prompt`` is
   dropped) and no timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /

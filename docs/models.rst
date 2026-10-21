@@ -214,7 +214,7 @@ Omnilingual ASR notes
 - The CTC head covers every language at once: ``language``, ``prompt`` and ``temperature``
   have no effect (the reference ignores a language code for CTC models too), and
   decoding is a per-frame argmax. There are no timestamps: ``srt`` / ``vtt`` get one cue
-  spanning the file and ``verbose_json`` an empty segment list. Nothing detects the
+  per window and ``verbose_json`` one segment per window, timed to the windows. Nothing detects the
   language either: ``verbose_json``'s ``language`` is the request's ``language`` as given,
   or null. ``/v1/realtime`` is not supported.
 - ``dtype`` defaults to ``bfloat16``, the reference's inference dtype; ``float32`` also
