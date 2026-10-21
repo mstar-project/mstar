@@ -434,6 +434,25 @@ def test_correctness_scores_skip_set_aside_arms(tmp_path, monkeypatch):
     assert correctness.score(run) == {"qwen3_5_4b/mstar": {"verdict": "mstar"}}
 
 
+def test_correctness_counts_near_ties_and_sums_divergences_over_modalities():
+    from types import SimpleNamespace
+
+    from benchmark.amd import correctness
+
+    checks = [SimpleNamespace(name=f"divergences vs reference that are not near ties [{m}]", value=v)
+              for m, v in (("image", 0), ("audio", 1), ("video", 0))]
+    metrics = {"vs_reference [image]": {"n": 20, "near_tie_divergences": 18}, "exact_vs_reference [image]": "2/20",
+               "vs_reference [audio]": {"n": 20, "near_tie_divergences": 8}, "exact_vs_reference [audio]": "12/20"}
+    got = correctness._key_metrics(SimpleNamespace(verdict="WARN", metrics=metrics, checks=checks))
+    assert got == {"verdict": "WARN", "exact_vs_reference": "image 2/20, audio 12/20", "near_tie_divergences": 26,
+                   "unexplained_divergences": 1}
+    assert table._correctness_text(got) == "WARN exact image 2/20, audio 12/20 1 non-tie div 26 near-tie div"
+    text = {"vs_reference": {"n": 32, "near_tie_divergences": 2}, "exact_vs_reference": "30/32"}
+    one = [SimpleNamespace(name="divergences vs reference that are not near ties", value=0)]
+    assert correctness._key_metrics(SimpleNamespace(verdict="PASS", metrics=text, checks=one)) == {
+        "verdict": "PASS", "exact_vs_reference": "30/32", "near_tie_divergences": 2, "unexplained_divergences": 0}
+
+
 def test_one_arms_scoring_error_keeps_the_others(tmp_path, monkeypatch):
     from benchmark.amd import correctness
 
