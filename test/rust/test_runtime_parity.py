@@ -176,6 +176,7 @@ def _admit(rt, rid="r1"):
         request_id=rid, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     )
 
 
@@ -296,6 +297,7 @@ def test_one_handle_per_request_across_partitions(pair):
             request_id="r", partition=p, graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
             worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+            loop_caps={},
         )
         for p in ("Thinker", "Talker", "Code2Wav")
     ]
@@ -310,6 +312,7 @@ def test_one_handle_per_request_across_partitions(pair):
         request_id="r2", partition="Thinker", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     ) == handles[0]
 
 
@@ -928,6 +931,7 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
         worker_graph_to_workers=ParallelList(
             [WG_ID, 1], [[WORKER], ["worker1", "worker2"]],
         ),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     rt.pop_rids("only", WALK, [rid])
@@ -1109,6 +1113,7 @@ def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
         request_id="r1", partition="default", graph_walk="prefill",
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     assert _run_walk(rt, book, store, rid, "prefill", 0, uuid=1) == [
         ("LLM", "prefill", [rid])
@@ -1127,6 +1132,7 @@ def _one_rid_per_walk(rt):
             request_id=f"r{walk}", partition="default", graph_walk=walk,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
         )
         for walk in ("prefill", "decode")
     ]
@@ -1205,6 +1211,7 @@ def test_a_batch_transitions_together(two_walks):
             request_id=f"r{i}", partition="default", graph_walk="prefill",
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
         )
         for i in range(3)
     ]
@@ -1291,6 +1298,7 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("image_inputs", "encoder")]))
     assert _ready(rt) == [("encoder", WALK, [rid])]
@@ -1367,6 +1375,7 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1403,6 +1412,7 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1527,6 +1537,7 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1865,6 +1876,7 @@ def _drive_tp(rt, book, store, steps=8):
         request_id="r1", partition="default", graph_walk=TP_WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER, PEER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "src")]))
 
@@ -2017,6 +2029,7 @@ def _admit_with_remote(rt, remote):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID, 1],
         worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], ["worker1"]]),
+        loop_caps={},
     )
 
 

@@ -641,6 +641,11 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # the largest max_iters of each loop name, so a cap clamped to it never cuts a longer loop of that name
+        self._loop_max_iters: dict[str, int] = {}
+        for worker_graph in self.worker_graphs.values():
+            for name, loop in worker_graph.section.get_loops().items():
+                self._loop_max_iters[name] = max(loop.max_iters, self._loop_max_iters.get(name, 0))
 
         # set each group's _tp_rank (the worker's instance rank) per worker
         self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
@@ -1107,6 +1112,11 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
+        caps = self.model.get_loop_caps(**model_kwargs)
+        # Clamp every cap to its loop's max_iters. Rust's graph runtime holds a cap
+        # as a u32, so a cap from a large max_output_tokens would fail the request
+        # there but not in Python.
+        loop_caps = {name: min(n, caps.get(name, n)) for name, n in self._loop_max_iters.items()}
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
@@ -1237,6 +1247,7 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
+                    loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,

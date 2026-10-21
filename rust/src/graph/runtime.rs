@@ -760,7 +760,7 @@ pub struct GraphRuntime {
         let Some(state) = self.state(wg, rid) else {
             return false;
         };
-        state.loop_iter(lid) + 1 < g.lp(lid).max_iters && !state.loop_finished(lid)
+        state.loop_iter(lid) + 1 < state.loop_max_iters(lid) && !state.loop_finished(lid)
     }
 
     /// One rid: ingest its chunks, check readiness, gather inputs. Returns
@@ -1607,6 +1607,9 @@ impl GraphRuntime {
     ///
     /// `worker_graph_workers` is flattened; `workers_per_worker_graph` gives
     /// each worker graph's slice, parallel to `worker_graph_ids`.
+    ///
+    /// Each loop in `loop_names` runs at most the matching `loop_caps`
+    /// iterations for this request.
     // Struct-of-arrays across the boundary, as everywhere else here: a dict
     // per worker graph would be a Python allocation per admission.
     #[allow(clippy::too_many_arguments)]
@@ -1619,6 +1622,8 @@ impl GraphRuntime {
         worker_graph_ids: Vec<u32>,
         worker_graph_workers: Vec<String>,
         workers_per_worker_graph: Vec<usize>,
+        loop_names: Vec<String>,
+        loop_caps: Vec<u32>,
     ) -> PyResult<u32> {
         let (handle, grew) = self.rids.intern(&request_id);
         if grew {
@@ -1694,8 +1699,15 @@ impl GraphRuntime {
             // In range by construction: the vectors were grown for this
             // handle above.
             if self.states[wg as usize][handle as usize].is_none() {
-                self.states[wg as usize][handle as usize] =
-                    Some(RequestState::new(self.graphs[wg as usize].clone()));
+                let g = &self.graphs[wg as usize];
+                let mut state = RequestState::new(g.clone());
+                for (name, &cap) in loop_names.iter().zip(&loop_caps) {
+                    let lid = self.interner.get(name).and_then(|s| g.loop_by_name.get(&s));
+                    if let Some(&lid) = lid {
+                        state.cap_loop(lid, cap);
+                    }
+                }
+                self.states[wg as usize][handle as usize] = Some(state);
             }
         }
 

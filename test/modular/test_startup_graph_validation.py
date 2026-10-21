@@ -285,6 +285,7 @@ class _ChunkWalkRuntime:
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
 
@@ -502,6 +503,7 @@ class _LoopWorker:
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])

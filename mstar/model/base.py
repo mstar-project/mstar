@@ -849,6 +849,15 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        """The iterations each named loop may run for this request, each at least 1.
+
+        A loop runs the smaller of its graph ``max_iters`` and its cap. A model
+        whose stop check ends a loop at a count sets the cap to that count, so the
+        loop ends on the same iteration and never speculates past it.
+        """
+        return {}
+
     def get_max_output_tokens_limit(self) -> int | None:
         """The largest ``max_output_tokens`` a request may ask for; above it the
         conductor refuses the request (a 400) rather than stopping short. None
