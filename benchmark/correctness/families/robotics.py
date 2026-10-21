@@ -1,4 +1,5 @@
-"""Robotics and video-latent models on 10 DROID episodes.
+"""Robotics and video-latent models on DROID episodes: droid_v1 (10 episodes of lerobot/droid_100), and
+droid_v2 (6 DROID 1.0.1 episodes with joint positions) for the Cosmos3 DROID policies.
 
 Only V-JEPA2 has a reference here (HF VJEPA2Model in fp32). Its embeddings are gated on how far they
 sit from fp32 compared with HF's own bf16 when that copy exists, else on cosine >= 0.999. lerobot,
@@ -135,31 +136,112 @@ class Pi05Actions(ArrayOutputFamily):
         return "lerobot PI05Policy (not installed in the ROCm env)"
 
 
-class Cosmos3DroidActions(ArrayOutputFamily):
-    """Cosmos3 DROID policies, with the request fields of examples/cosmos3_action_ws_client.py.
+DROID_VIEW_TEXT = (
+    "This video contains concatenated views from multiple camera perspectives. "
+    "The top row is from the wrist-mounted camera. The bottom row contains two horizontally "
+    "concatenated third-person perspective views of the scene from opposite sides, with the robot visible."
+)
 
-    8 action dims (7 joint positions and the gripper), as cosmos-framework's RoboLab server serves
-    the released DROID policies (action_policy_server_robolab.py, action_space joint_pos).
+
+def droid_policy_prompt(task: str, json_prompt: bool, frames: int = 33, fps: float = 15.0,
+                        hw: tuple[int, int] = (544, 736)) -> str:
+    """The prompt cosmos-framework's action transform builds for the RoboLab server: the task with the
+    concat-view, duration and resolution text (viewpoint_utils, duration_fps_text_timestamps,
+    resolution_text_info), or the same fields as a JSON caption (json_formatter) for Edge."""
+    task = task.strip()
+    if not task:
+        return ""
+    if json_prompt:
+        return json.dumps({
+            "cinematography": {"framing": DROID_VIEW_TEXT},
+            "actions": [{"time": f"0:00-0:{round(frames / fps):02d}",
+                         "description": task if task.endswith((".", "!", "?")) else task + "."}],
+            "duration": f"{int(frames / fps)}s",
+            "fps": float(fps),
+            "resolution": {"H": hw[0], "W": hw[1]},
+            "aspect_ratio": "4,3",
+        })
+    text = task + (" " if task.endswith(".") else ". ") + DROID_VIEW_TEXT
+    return (f"{text} The video is {float(int(frames / fps)):.1f} seconds long and is of {fps:.0f} FPS. "
+            f"This video is of {hw[0]}x{hw[1]} resolution.")
+
+
+class Cosmos3DroidActions(ArrayOutputFamily):
+    """Cosmos3 DROID policies, conditioned the way cosmos-framework's RoboLab server serves them
+    (action_policy_server_robolab.py): the 736x544 wrist-over-exteriors composite, the current joint
+    positions and 1 - gripper as a clean first action row (33 rows and frames, 15 fps), and the task
+    with view, duration and resolution text, a JSON caption for Edge, which also gets the cookbook's
+    guidance_interval [960, 1001]. The server drops the state row, so each output is the 32 predicted
+    rows, first 8 dims, gripper still in the model's 1 - gripper convention.
     """
 
     name = "robotics-cosmos3-droid"
+    set_name = "droid_v2"
     raw_action_dim, chunk = 8, 32
 
+    @property
+    def is_edge(self) -> bool:
+        return "edge" in self.model_key
+
+    def _state(self, sset: SampleSet, it) -> np.ndarray:
+        return np.load(sset.path(it.files["joint_states"]))[it.params["step"]]
+
     def requests(self, sset: SampleSet) -> list[Request]:
-        kw = {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": self.raw_action_dim,
-              "action_chunk_size": self.chunk, "num_frames": self.chunk + 1}
-        return [Request(it.id, text=it.prompt, files=[sset.path(it.files["exterior_image_1_left"])],
-                        input_modalities="image,text", output_modalities="action",
-                        model_kwargs={**kw, "seed": it.params["seed"]}) for it in sset.items]
+        reqs = []
+        for it in sset.items:
+            s = self._state(sset, it)
+            kw = {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": self.raw_action_dim,
+                  "action_chunk_size": self.chunk + 1, "num_frames": self.chunk + 1, "fps": 15.0,
+                  "size": "736x544", "action": [[float(v) for v in s[:7]] + [1.0 - float(s[7])]],
+                  "seed": it.params["seed"]}
+            if self.is_edge:
+                kw["guidance_interval"] = [960, 1001]
+            reqs.append(Request(it.id, text=droid_policy_prompt(it.prompt, self.is_edge),
+                                files=[sset.path(it.files["composite"])], input_modalities="image,text",
+                                output_modalities="action", model_kwargs=kw))
+        return reqs
 
     def to_array(self, raw, resp=None):
         return raw.reshape(self.chunk, -1)[:, : self.raw_action_dim]
+
+    def score(self, sset, runs, ref_dir, work, device):
+        # No reference, so these are context, not gates: how far the first predicted row is from the
+        # joints the request sent, the step-to-step change over the chunk's spread, and the mean error
+        # against the joints the robot recorded over the next 32 frames.
+        sc = super().score(sset, runs, ref_dir, work, device)
+        items = {it.id: it for it in sset.items}
+        for row in sc.rows:
+            p = runs[0] / "outputs" / f"{row['id']}.npy"
+            if not p.is_file():
+                continue
+            out, it = np.load(p).astype(np.float64), items[row["id"]]
+            k, states = it.params["step"], np.load(sset.path(it.files["joint_states"]))
+            row.update(droid_chunk_metrics(out, states, k))
+        for key in ("row1_vs_state_maxabs", "smooth_ratio", "mae_vs_recorded"):
+            vals = [r[key] for r in sc.rows if key in r]
+            if vals:
+                sc.metrics[key] = M.distribution(vals)
+        (work / "arrays.json").write_text(json.dumps(sc.rows, indent=1))
+        return sc
 
     def reference_id(self) -> str:
         return f"cosmos3-droid-{self.model_key}"
 
     def reference_description(self) -> str:
-        return "no Cosmos3 action reference in the repo, vllm-omni or SGLang Diffusion could be one"
+        return "no Cosmos3 action reference runs on ROCm (cosmos-framework's RoboLab server is CUDA-only)"
+
+
+def droid_chunk_metrics(out: np.ndarray, states: np.ndarray, k: int) -> dict:
+    """A predicted [32, 8] joint chunk (model convention) against the episode's joint states [T, 8]."""
+    joints = out[:, :7]
+    future = states[k + 1:k + 1 + len(out), :7].astype(np.float64)
+    x = out[:, :8]
+    smooth = (np.abs(np.diff(x, axis=0)).mean(0) / np.maximum(x.std(0), 1e-6)).mean()
+    m = {"row1_vs_state_maxabs": round(float(np.abs(joints[0] - states[k, :7]).max()), 4),
+         "smooth_ratio": round(float(smooth), 3)}
+    if len(future) == len(out):
+        m["mae_vs_recorded"] = round(float(np.abs(joints - future).mean()), 4)
+    return m
 
 
 def _window(arr: np.ndarray, start: int, length: int) -> list[list[float]]:
