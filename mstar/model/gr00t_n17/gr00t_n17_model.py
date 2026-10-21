@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import msgpack
 import numpy as np
 import torch
 
@@ -465,14 +466,27 @@ class Gr00tN17Model(Model):
         return [self.PREFILL_WALK, self.ACTION_GEN_WALK]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """The decoded action chunk as flat float32.
+        """The decoded action chunk as msgpack: one entry per joint group ([[D09]]).
 
         GR00T decodes **server-side**, unlike pi05, which returns its normalised
         chunk raw: the inverse needs the checkpoint's action statistics and the
-        request's own raw state, neither of which a client has ([[D06]]). The
-        groups are concatenated in the embodiment's `modality_keys` order, which
-        is the same promise pi05's flat bytes make -- the client chose the
-        embodiment tag, so the group names and widths follow from it.
+        request's own raw state, neither of which a client has ([[D06]]).
+
+        The shape is the reference's, not a wire convention of ours. NVIDIA's
+        policy returns `{joint_group: array}` cast to float32
+        (`gr00t_policy.py:425-432`, via `decode_action`, whose keys are bare --
+        the `action.` prefix is added only by its sim-compatibility wrapper). A
+        robot client written against GR00T already indexes by group name, and the
+        groups have different widths (9, 1, 7 for DROID), so flattening them
+        would make the caller rebuild the layout from the embodiment tag to learn
+        which float drives which actuator.
+
+        `msgpack` is already a core dependency. Each group carries its own dtype
+        and shape so a client reconstructs it exactly:
+        `np.frombuffer(g["data"], g["dtype"]).reshape(g["shape"])`.
+        `mstar.communication.wire` is deliberately not reused -- that is the
+        control plane's serializer, and it refuses array payloads outright
+        (`wire.py:507-511`).
 
         The two kwargs this reads are why they are in `PREPROCESS_ONLY_KWARGS`:
         stripping them from the conductor's copy leaves the data worker's
@@ -491,8 +505,16 @@ class Gr00tN17Model(Model):
         if chunk.ndim == 2:  # one request, as the engine hands it back
             chunk = chunk[None]
         groups = self.processor.unapply(tag, chunk, kwargs.get("state"))
-        decoded = np.concatenate(list(groups.values()), axis=-1)
-        return decoded.astype(np.float32).tobytes()
+        # float32 like the reference's own cast, and because float64 would double
+        # the payload for precision the decode's own floor does not support
+        return msgpack.packb({
+            name: {
+                "dtype": "float32",
+                "shape": list(value.shape),
+                "data": np.ascontiguousarray(value, dtype=np.float32).tobytes(),
+            }
+            for name, value in groups.items()
+        })
 
     # -------------------------------------------------------- forward passes
     def get_initial_forward_pass_args(
