@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import fnmatch
 import json
 import os
 import shlex
@@ -219,6 +220,7 @@ class Plan:
     measured: list[str] = field(default_factory=list)  # row/arm of every arm this invocation ran
     trees: dict = field(default_factory=dict)  # named mstar trees (--tree) for arms that serve one
     fixed_concurrency: bool = False  # --concurrency given: it wins over a row's own per-workload concurrency
+    skips: list = field(default_factory=list)  # --skip ROW/ARM[/WORKLOAD] patterns (fnmatch), e.g. from a dry run
     log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str) -> None:
@@ -373,7 +375,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 except Exception:
                     info["correctness_pass"] = {"error": traceback.format_exc()[-3000:]}
                     plan.log(f"{row.name}/{arm.name}: correctness pass failed, see arm.json")
-        workloads = row_workloads(plan, row)
+        workloads = [wl for wl in row_workloads(plan, row) if not skipped(plan, row, arm, wl)]
         kwargs_by_wl: dict = {}
         if row.family in ("image", "video"):
             from benchmark.amd import correctness
@@ -420,6 +422,16 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
     return info
 
 
+def skipped(plan: Plan, row: Row, arm: Arm, wl: tables.Workload | None = None) -> bool:
+    """Whether a --skip pattern leaves out this arm on this row: for one workload, or with wl=None for every one."""
+    for pat in getattr(plan, "skips", None) or []:
+        r, a, w = (pat.split("/") + ["*"])[:3]
+        if fnmatch.fnmatch(row.name, r) and fnmatch.fnmatch(arm.name, a) and (
+                fnmatch.fnmatch(wl.name, w) if wl is not None else w == "*"):
+            return True
+    return False
+
+
 def row_workloads(plan: Plan, row: Row) -> list[tables.Workload]:
     """The run's workloads this row takes: its family's, limited to Row.workloads when the row names some."""
     return [wl for wl in plan.workloads if wl.family == row.family and (not row.workloads or wl.name in row.workloads)]
@@ -464,7 +476,8 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
 
 def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
     """Every arm of one row, back to back on the same GPUs."""
-    arms = [a for a in catalog.arms_for(row, plan.arms) if not a.tree or a.tree in plan.trees]
+    arms = [a for a in catalog.arms_for(row, plan.arms) if (not a.tree or a.tree in plan.trees)
+            and not skipped(plan, row, a) and not all(skipped(plan, row, a, wl) for wl in row_workloads(plan, row))]
     # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
     k = index % len(arms) if arms else 0
     # Each arm gets its own port: right after a server stops, its port can sit in TIME_WAIT, and a server that
@@ -599,6 +612,8 @@ def main(argv=None) -> int:
     ap.add_argument("--correctness-src", default=None,
                     help="checkout or git ref with benchmark/correctness (default: this tree)")
     ap.add_argument("--skip-health", action="store_true", help="dry runs only")
+    ap.add_argument("--skip", action="append", default=[], metavar="ROW/ARM[/WORKLOAD]",
+                    help="leave an arm out on matching rows (and workloads), fnmatch patterns: '*/vllm-omni/video-i2v'")
     ap.add_argument("--requests", type=int, default=None,
                     help="dry runs only: every cell sends this many requests, with no warmup")
     ap.add_argument("--tree", action="append", default=[], metavar="NAME=PATH",
@@ -630,7 +645,10 @@ def main(argv=None) -> int:
                 worktree=Path(args.worktree).resolve(), port_base=args.port_base,
                 repeats=args.repeats or table.repeats, lanes=args.lanes, dry=args.dry,
                 correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
-                expect_gpus=args.expect_gpus, trees=tree_list(args.tree), fixed_concurrency=bool(args.concurrency))
+                expect_gpus=args.expect_gpus, trees=tree_list(args.tree), fixed_concurrency=bool(args.concurrency),
+                skips=list(args.skip))
+    if plan.skips:
+        plan.log(f"left out by --skip: {', '.join(plan.skips)}")
     skipped = sorted({a for a in arms if catalog.ARMS[a].tree and catalog.ARMS[a].tree not in plan.trees})
     if skipped:
         plan.log(f"no --tree for {', '.join(skipped)}; those arms are skipped")

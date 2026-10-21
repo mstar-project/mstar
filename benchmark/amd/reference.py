@@ -120,7 +120,7 @@ def diffusers_cell(config: str, worktree: Path, opts: dict, out: Path, repeats: 
     C = correctness.load(correctness_src)
     fam, _ = correctness._family(C, worktree, config, opts)
     sset = C.sets.load_set(fam.set_name, correctness.SETS_ROOT)
-    items = list(sset.items)
+    items = fam.select_items(list(sset.items))  # a pinned size renders each prompt once
     video = getattr(fam, "num_frames", None) is not None
     i2v = bool(getattr(fam, "image_to_video", False))
     pipe = fam.load_pipeline("cuda")
@@ -239,7 +239,7 @@ def run_arm(plan, row, arm, gpus: list[int], arm_dir: Path) -> dict:
         for wl in sweep.row_workloads(plan, row):
             cmd = [sys.executable, "-m", "benchmark.amd.reference", "diffusers", "--config",
                    catalog.mstar_config_name(row, "mstar"), "--worktree", str(plan.worktree),
-                   "--family-opts", json.dumps(correctness.family_opts(wl)), "--repeats", str(plan.repeats),
+                   "--family-opts", json.dumps(correctness.family_opts(wl, row)), "--repeats", str(plan.repeats),
                    "--correctness-src", str(plan.correctness_src), "--set-dir", "-"]
             out[wl.name] = _cell(plan, row, arm, wl, arm_dir, cmd, gpus)
         return out
