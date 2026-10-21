@@ -32,12 +32,7 @@ class PrefixIndex:
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
-        pages: list[int] = []
-        for key in keys:
-            page = self._by_key.get(key)
-            if page is None:
-                break
-            pages.append(page)
+        pages = self.pages_for(keys)
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
@@ -87,6 +82,16 @@ class PrefixIndex:
     def page_for(self, key: bytes) -> int | None:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
+
+    def pages_for(self, keys: Sequence[bytes]) -> list[int]:
+        """`lookup` without the stamp, for a walk that is not a hit."""
+        pages: list[int] = []
+        for key in keys:
+            page = self._by_key.get(key)
+            if page is None:
+                break
+            pages.append(page)
+        return pages
 
     def holds(self, page: int) -> bool:
         return self._key[page] is not None

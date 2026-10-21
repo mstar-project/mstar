@@ -6,9 +6,9 @@ the index first leaves the transfer with whatever is genuinely new, which for a
 second turn of the same conversation can be nothing at all.
 
 An offload meets the same sharing from the other side. A page the suspended
-request shares with the index can be evicted while it is away, so the pages it
-left are not there to take back: its host copy is the authoritative one, and
-reload allocates fresh pages and copies into them.
+request shares with the index can be evicted while it is away, so reload takes
+back what the index still holds and copies the rest from the host into fresh
+pages.
 """
 
 from __future__ import annotations

@@ -2590,60 +2590,79 @@ class KVManager(AttentionResource):
             request_id=rid,
         )
 
-    def _reload_pages_needed(self, rid: str) -> int:
-        return sum(
-            self._cpu_pool.num_pages(rid, label)
-            for label in self._cpu_pool.labels(rid)
-        )
-
     def can_reload(self, rid: str) -> bool:
         """Whether the free pages plus what the prefix index could evict cover
-        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        the pages ``rid``'s reload needs. An upper bound: ``reload`` can still refuse."""
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            evictable = 0 if self._index is None else self._index.num_sole_owned()
-            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+            needed = evictable = 0
+            if self._index is not None:
+                evictable = self._index.num_sole_owned()
+            for state in self._cpu_pool.offloaded[rid].values():
+                run = self._index.pages_for(state.keys) if self._index is not None else []
+                needed += len(state.cpu_page_indices) - len(run)
+                # the reload retains these, so it can't also evict them
+                evictable -= sum(self._arena.num_owners[page] == 1 for page in run)
+            return needed <= self._arena.num_free + evictable
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
-        False when the device can't fit them right now; nothing moves in that
-        case, so the caller can evict further and try again.
+        Keyed pages the index still holds are taken from it, and the rest come
+        from the host. False when the device can't fit them right now; nothing
+        moves in that case, so the caller can evict further and try again.
         """
         self._touch_plan_cache(rid)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
             states = dict(self._cpu_pool.offloaded[rid])
-            needed = sum(len(state.cpu_page_indices) for state in states.values())
+            # A reload is a hit, so `lookup` marks the pages recently used.
+            # They are retained before anything is evicted, so the eviction
+            # can't drop them.
+            runs = {
+                label: self._index.lookup(state.keys) if self._index is not None else []
+                for label, state in states.items()
+            }
+            for run in runs.values():
+                self._arena.retain(run)
+            needed = sum(len(state.cpu_page_indices) - len(runs[label]) for label, state in states.items())
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
                 self._index.evict(needed - self._arena.num_free)
             pages = self._arena.acquire(needed)
             if pages is None:
+                for run in runs.values():
+                    self._arena.release(run)
                 return False
             copies = PageCopies(gpu=pages, cpu=[])
             for label, state in states.items():
+                run = runs[label]
                 stream = self._ensure_label(rid, label)
                 at = len(copies.cpu)
-                stream.page_indices = pages[at:at + len(state.cpu_page_indices)]
+                stream.page_indices = run + pages[at:at + len(state.cpu_page_indices) - len(run)]
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
                 stream.protected_prefix = state.protected_prefix
-                copies.cpu.extend(state.cpu_page_indices)
+                copies.cpu.extend(state.cpu_page_indices[len(run):])
         # The streams stay marked offloaded while the copies are queued outside
         # the lock, so nothing extends or claims their pages.
         self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
-        # orders the copies before attention reads the pages
+        # Orders every later reader and writer of the pages behind the copies,
+        # so the keyed ones copied from the host can be indexed at once.
         self._cpu_pool.sync()
         with self._lock:
-            for label in states:
+            for label, state in states.items():
                 # released with the copy still queued, since the next write to a host page queues behind it
                 self._cpu_pool.arena.release(self._cpu_pool.pop(rid, label).cpu_page_indices)
                 self._streams[rid][label].offloaded = False
+                run = runs[label]
+                if len(run) < len(state.keys):
+                    copied = self._streams[rid][label].page_indices[len(run):len(state.keys)]
+                    self._index.insert_run(state.keys[len(run):], copied, run[-1] if run else None)
         return True
 
     def reclaimable(self, rid: str) -> int:

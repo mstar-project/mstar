@@ -97,9 +97,6 @@ class CPUPagePool:
     def is_offloaded(self, rid: str) -> bool:
         return bool(self.offloaded.get(rid))
 
-    def labels(self, rid: str) -> list[str]:
-        return list(self.offloaded.get(rid, {}))
-
     def retain_run(self, keys: list[bytes]) -> list[int]:
         """The host pages ``keys`` name from the root, each retained for the caller to release."""
         pages = self.index.lookup(keys)
@@ -198,10 +195,6 @@ class CPUPagePool:
         state = self.pop(rid, label)
         if state is not None:
             self.arena.release(state.cpu_page_indices)
-
-    def num_pages(self, rid: str, label: str) -> int:
-        state = self.offloaded.get(rid, {}).get(label)
-        return 0 if state is None else len(state.cpu_page_indices)
 
     def sync(self) -> None:
         """Order the current stream behind the pending copies.
