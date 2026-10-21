@@ -72,6 +72,12 @@ VISION_ENCODER, LLM, STATE_ENCODER, VL_BRIDGE, DENOISE_STEP = (
 # because `max_iters` still stops the loop. z_image and ltx2_5 both name theirs.
 DENOISE_LOOP = "denoise_loop"
 
+# Pillow's names for the formats that return the pixels they were given. WebP is
+# here because *lossless* WebP measures bit-identical to PNG through the image
+# path; Pillow reports one format for both WebP modes, so a lossy WebP gets in --
+# the one hole this list cannot close, and the reason the error says what it does.
+_LOSSLESS_IMAGE_FORMATS = frozenset({"PNG", "BMP", "TIFF", "PPM", "WEBP"})
+
 
 class Gr00tN17Model(Model):
     """`nvidia/GR00T-N1.7-3B` on M\\*."""
@@ -409,8 +415,22 @@ class Gr00tN17Model(Model):
         the same reason; this is the other half, so the refusal never fires on our
         own loader.
         """
-        from mstar.model.media_limits import read_image
+        from mstar.model.media_limits import check_image_size, read_image
 
+        # Lossless only, and refused from the header before anything is decoded.
+        # A JPEG passes every count, dtype and shape check this model makes and
+        # still moves `pixel_values` by 0.32 against a lossless 0.0019 -- 167x --
+        # so a compressed camera feed is the same silent-and-plausible failure as
+        # a reordered or double-rescaled frame: the actions look fine and the
+        # robot moves wrong. [[D10]] promises lossless; this is what keeps it.
+        fmt, _ = check_image_size(filepath)
+        if fmt not in _LOSSLESS_IMAGE_FORMATS:
+            raise ValueError(
+                f"gr00t_n17 needs lossless camera frames; got {fmt}. The pixel "
+                "path is compared against the reference bit for bit, so lossy "
+                f"compression is a silent error. Use one of "
+                f"{sorted(_LOSSLESS_IMAGE_FORMATS)}"
+            )
         # the engine's own reader, so this inherits its decode limits and its
         # RGB coercion (an RGBA or CMYK frame has no placeable channel axis)
         img = read_image(filepath, rgb=True)  # uint8 CxHxW
