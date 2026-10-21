@@ -234,3 +234,35 @@ def test_compiled_step_runs_steady_calls_compiled_after_a_warm_up_on_a_cache_cop
     assert torch.equal(cache[0], torch.full_like(x, 3))
     step(x.float(), cache)  # fp32 never warms
     assert len(compiled) == 4
+
+
+class _Platform:
+    def __init__(self, rocm: bool):
+        self._rocm = rocm
+
+    def is_rocm(self) -> bool:
+        return self._rocm
+
+
+@pytest.mark.parametrize(("rocm", "version", "expected"), [
+    (False, 91600, torch.bfloat16),
+    (False, 91500, torch.float32),
+    (False, None, torch.float32),
+    # torch reports MIOpen's version here
+    (True, 3005001, torch.bfloat16),
+    (True, 0, torch.bfloat16),
+])
+def test_decode_dtype_follows_the_conv_library(monkeypatch, rocm, version, expected) -> None:
+    monkeypatch.delenv("TEST_VAE_DECODE_FP32", raising=False)
+    monkeypatch.setattr(wan_vae, "current_platform", _Platform(rocm))
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: version)
+    assert wan_vae.decode_dtype("TEST_VAE_DECODE_FP32") is expected
+
+
+@pytest.mark.parametrize("rocm", [False, True])
+@pytest.mark.parametrize(("value", "expected"), [("1", torch.float32), ("0", torch.bfloat16), ("off", torch.bfloat16)])
+def test_decode_dtype_override_wins_on_every_platform(monkeypatch, rocm, value, expected) -> None:
+    monkeypatch.setenv("TEST_VAE_DECODE_FP32", value)
+    monkeypatch.setattr(wan_vae, "current_platform", _Platform(rocm))
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 91600)
+    assert wan_vae.decode_dtype("TEST_VAE_DECODE_FP32") is expected
