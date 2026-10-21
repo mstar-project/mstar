@@ -265,12 +265,12 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels 
 WINDOW = 70
 
 
-def _manager(window: int, per_query: bool, dtype, device, heads: int = 2, head_dim: int = 128):
+def _manager(window: int, per_query: bool, dtype, device, heads: int = 2, head_dim: int = 128, slots: int = 4):
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 
     config = BoundedKVConfig(num_layers=1, num_heads=heads, head_dim=head_dim, rows_per_request=1,
-                             max_source_len=0, retention=SinkWindow(0, window), max_slots=4, dtype=dtype,
+                             max_source_len=0, retention=SinkWindow(0, window), max_slots=slots, dtype=dtype,
                              query_window=window if per_query else None)
     return BoundedKVManager(config, torch.device(device))
 
@@ -313,6 +313,35 @@ def _stream_reference(streams, q, k, v, written, spans, window, per_query, bias)
     return out
 
 
+def _check_stream(mgr, schedule, ieee, tol):
+    """Runs ``schedule`` [(T, each row's span)] through ``mgr`` against brute force."""
+    c = mgr.config
+    h, d, window, per_query = c.num_heads, c.head_dim, c.window_capacity, c.query_window is not None
+    device, dtype = mgr.layer(0).device, mgr.layer(0).dtype
+    rows = len(schedule[0][1])
+    rids = list(range(100, 100 + rows))
+    streams = [(torch.zeros(h, 0, d, dtype=torch.float64),) * 2 for _ in rids]
+    written = [0] * rows
+    for t, spans in schedule:
+        q, k, v = (torch.randn(rows, h, t, d).to(device=device, dtype=dtype) for _ in range(3))
+        width = window + 1 if per_query else window + 2 * t - 1
+        bias = (4 * torch.randn(rows, h, t, width)).to(device=device, dtype=dtype)
+        want = _stream_reference(streams, q.double().cpu(), k.double().cpu(), v.double().cpu(),
+                                 written, spans, window, per_query, bias.double().cpu())
+        step, ctx = _step(rids, written, spans)
+        assert mgr.admit(step, ctx).ok
+        mgr.plan(step, ctx)
+        got = mgr.attend(0, q, k, v, rel_bias=bias, ieee=ieee)
+        mgr.commit(step, ctx)
+        assert torch.isfinite(got.float()).all(), (t, spans)
+        torch.testing.assert_close(got.double().cpu(), want, rtol=tol, atol=tol)
+        for b, span in enumerate(spans):
+            sk, sv = streams[b]
+            streams[b] = (torch.cat([sk, k[b, :, :span].double().cpu()], 1),
+                          torch.cat([sv, v[b, :, :span].double().cpu()], 1))
+            written[b] += span
+
+
 @pytest.mark.parametrize("per_query", [True, False])
 @pytest.mark.parametrize("device,dtype", [
     ("cpu", torch.float32),
@@ -325,33 +354,26 @@ def test_stream_matches_brute_force(device, dtype, per_query):
     masked for some queries), rows padded past their span, and rows that only
     read (span 0), at head_dim 128."""
     torch.manual_seed(0)
-    h, d, window = 2, 128, WINDOW
-    mgr = _manager(window, per_query, dtype, device, heads=h, head_dim=d)
-    rids = [11, 12, 13]
-    streams = [(torch.zeros(h, 0, d, dtype=torch.float64),) * 2 for _ in rids]
-    written = [0, 0, 0]
-    # (T, each row's span)
+    mgr = _manager(WINDOW, per_query, dtype, device, heads=2, head_dim=128)
     schedule = [(1, [1, 1, 0]), (5, [5, 2, 0]), (150, [150, 0, 150]), (3, [3, 3, 1]),
                 (1, [1, 0, 1]), (200, [200, 137, 0]), (2, [2, 2, 2])]
-    for t, spans in schedule:
-        q, k, v = (torch.randn(len(rids), h, t, d).to(device=device, dtype=dtype) for _ in range(3))
-        width = window + 1 if per_query else window + 2 * t - 1
-        bias = (4 * torch.randn(len(rids), h, t, width)).to(device=device, dtype=dtype)
-        want = _stream_reference(streams, q.double().cpu(), k.double().cpu(), v.double().cpu(),
-                                 written, spans, window, per_query, bias.double().cpu())
-        step, ctx = _step(rids, written, spans)
-        assert mgr.admit(step, ctx).ok
-        mgr.plan(step, ctx)
-        got = mgr.attend(0, q, k, v, rel_bias=bias, ieee=True)
-        mgr.commit(step, ctx)
-        assert torch.isfinite(got.float()).all(), (t, spans)
-        tol = 2e-5 if dtype == torch.float32 else 3e-2
-        torch.testing.assert_close(got.double().cpu(), want, rtol=tol, atol=tol)
-        for b, span in enumerate(spans):
-            sk, sv = streams[b]
-            streams[b] = (torch.cat([sk, k[b, :, :span].double().cpu()], 1),
-                          torch.cat([sv, v[b, :, :span].double().cpu()], 1))
-            written[b] += span
+    _check_stream(mgr, schedule, ieee=True, tol=2e-5 if dtype == torch.float32 else 3e-2)
+
+
+@CUDA
+@pytest.mark.parametrize("t", [1, 150])
+@pytest.mark.parametrize("per_query", [True, False])
+@pytest.mark.parametrize("dtype,ieee,tol", [
+    (torch.float32, True, 2e-5), (torch.float32, False, 2e-3),
+    (torch.bfloat16, True, 3e-2), (torch.bfloat16, False, 3e-2),
+])
+def test_stream_at_many_rows(dtype, ieee, tol, per_query, t):
+    """32 rows x 8 heads (enough programs for the kernel's wide query tiles) at
+    head_dim 128: every tile config a real model reaches compiles and is right."""
+    torch.manual_seed(0)
+    mgr = _manager(WINDOW, per_query, dtype, "cuda", heads=8, head_dim=128, slots=32)
+    spans = [1, 1, 0, 1] if t == 1 else [150, 0, 99, 150]
+    _check_stream(mgr, [(150, [150, 37, 0, 150] * 8), (t, spans * 8)], ieee=ieee, tol=tol)
 
 
 def test_commit_skips_read_only_segments():

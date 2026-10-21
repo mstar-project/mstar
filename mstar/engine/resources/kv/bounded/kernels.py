@@ -242,7 +242,11 @@ def bounded_attention(
     else:
         rel_bias, s_bias = q, (0, 0, 0)
     out = torch.empty(n, t, h, d, device=q.device, dtype=q.dtype)
-    block_m = 16 if n * h < 128 else 64
+    # 64-query tiles only where they pay and fit: a short step wastes them, too few
+    # programs idle SMs, and past 256 bytes per head row (fp32 at D=128) one
+    # overflows shared memory under TF32 and spills thousands of registers under
+    # IEEE (H100), where a 16-query tile fits with no spills.
+    block_m = 64 if t > 16 and n * h >= 128 and d * q.element_size() <= 256 else 16
     grid = (triton.cdiv(t, block_m), n * h)
     _bounded_attention_kernel[grid](
         q, k, v, out, cache, source, row_storage, row_slots, table, rel_bias,
