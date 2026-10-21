@@ -100,6 +100,9 @@ class VideoFamily(MathSdpaReference, Family):
     generator_device = "cpu"
     request_extra: dict = {}  # extra model_kwargs for the server only
     ref_call_kwargs: dict = {}  # extra pipeline call kwargs for the reference only
+    # False when the served request samples differently from the reference (a windowed AR walk):
+    # PSNR against it is reported for information, not judged.
+    reference_is_gate = True
 
     def model_kwargs(self, it) -> dict:
         kw = {"seed": it.params["seed"], "height": self.height, "width": self.width, "num_frames": self.num_frames,
@@ -263,15 +266,21 @@ class VideoFamily(MathSdpaReference, Family):
             basis = {("math",): "math-SDPA spread", ("anchor",): "fp32-anchor spread"}.get(
                 tuple(used), "math-SDPA and fp32-anchor spreads (per video the larger move)")
             served = statistics.median(medians) if medians else None
-            self.calibrated_verdict(sc, [min(v) for v in moves.values()], served, basis)
+            if self.reference_is_gate:
+                self.calibrated_verdict(sc, [min(v) for v in moves.values()], served, basis)
         if ref_out and SERVER_X264.get(self.model_key) is not None:
             sc.notes.append(f"The reference frames were compared after the served mp4's encode "
                             f"(libx264 {SERVER_X264[self.model_key] or 'defaults'}) and a decode.")
         if medians:
             med = statistics.median(medians)
             sc.metrics["per_video_median_frame_psnr_db"] = M.distribution(medians)
-            sc.check("median per-frame PSNR vs reference (dB)", round(med, 2),
-                     band(med, lambda v: v >= 30, lambda v: v >= 20), ">=30 PASS (repo bar), >=20 WARN (provisional)")
+            if self.reference_is_gate:
+                sc.check("median per-frame PSNR vs reference (dB)", round(med, 2),
+                         band(med, lambda v: v >= 30, lambda v: v >= 20),
+                         ">=30 PASS (repo bar), >=20 WARN (provisional)")
+            else:
+                sc.notes.append(f"Median per-frame PSNR against {self.reference_description()}: {med:.2f} dB, "
+                                "for information only.")
             mism = [r["id"] for r in sc.rows if r.get("frame_count_match") is False]
             sc.check("frame count equal to reference", n - len(mism), "PASS" if not mism else "FAIL", "all",
                      ", ".join(mism))
