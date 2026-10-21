@@ -143,10 +143,11 @@ class BoundedKVManager(Resource):
                 kv = (row_src if from_source else cache[slot, c])[:, start:start + count]
                 keys.append(kv[..., :d])
                 values.append(kv[..., d:])
-            keys, values = torch.cat([*keys, k[i]], 1), torch.cat([*values, v[i]], 1)
+            total = sum(part.shape[1] for part in keys)
+            own_len = t if window is not None or layout.span == 0 else min(layout.span, t)
+            keys, values = torch.cat([*keys, k[i][:, :own_len]], 1), torch.cat([*values, v[i][:, :own_len]], 1)
             scores = q[i] @ keys.transpose(-1, -2)
             # query i sits at total + i, key j at j
-            total = keys.shape[1] - t
             dist = (total + torch.arange(t)[:, None] - torch.arange(keys.shape[1])[None, :]).to(q.device)
             if window is None:
                 if rel_bias is not None:
