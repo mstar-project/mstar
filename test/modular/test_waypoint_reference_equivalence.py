@@ -47,6 +47,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 
 sys.path.insert(0, ".")
@@ -67,6 +68,7 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.components.layers import bf16_roundtrip
 from mstar.model.waypoint.config import waypoint_1_5_1b_720p
 from mstar.model.waypoint.weight_loader import build_waypoint_dit
+from mstar.platforms import current_platform
 
 _ROOT = Path("/mnt/storage/garv901/waypoint-1.5-1B")
 REFERENCE_SRC = Path(os.environ.get("WAYPOINT_REFERENCE_SRC", _ROOT / "world_engine"))
@@ -989,6 +991,30 @@ def test_the_port_compacts_only_slots_the_reference_never_addresses(ports, oracl
 # L4 -- batched sessions
 # ---------------------------------------------------------------------------
 
+# ROCm only: plain B=2 against B=1 on the first generated latent, as RMS of the
+# difference over RMS of the solo latent. Measured 0.005-0.009 on MI325X, the
+# same size as bf16 against an fp32 evaluation of the solo rollout (0.005-0.007).
+ROCM_BATCHED_FIRST_FRAME_RMS = 0.05
+
+
+def _rms_deviation(a: torch.Tensor, b: torch.Tensor) -> float:
+    left, right = a.float(), b.float()
+    return ((left - right).pow(2).mean().sqrt() / left.pow(2).mean().sqrt()).item()
+
+
+def _one_row_at_a_time(fn, batched_dims: int):
+    """``fn`` over each row of a batch on its own, so a batch of two gets the
+    kernels a batch of one does. Inputs with fewer than ``batched_dims`` dims
+    are not batch-first and pass through."""
+
+    def split(x, *args, **kwargs):
+        if x.dim() < batched_dims or x.size(0) == 1:
+            return fn(x, *args, **kwargs)
+        return torch.cat([fn(row, *args, **kwargs) for row in x.split(1)])
+
+    return split
+
+
 def _roll(port, rows: list[tuple[str, list[dict]]], frames: int) -> dict[str, list[torch.Tensor]]:
     """Step every row in ``rows`` together for local frames ``j = 0..frames-1``.
     ``rows`` pairs a request id with its per-frame inputs (``kind``,
@@ -1037,6 +1063,16 @@ def test_batched_generate_frame_matches_the_same_sessions_run_solo(ports, oracle
     Frame 0 on an empty ring measured 0.00 ulp deviation between B=1 and B=2 on
     both flex backends (jobs 8141/8142), so the bar here is bit-exact at every
     frame, not a tolerance.
+
+    That bar also assumes the GEMM and conv kernels round a row the same way at
+    batch 2 as at batch 1, which ROCm does not give: hipBLASLt picks other
+    kernels for the QKV and MLP output projections at M=1024, and MIOpen's
+    timed find can put the patchify on another solver at batch 2. So the B=2
+    rollout also runs with every linear and conv split per row. That arm gets
+    the solo kernels and keeps everything else batched (ring sessions, staged
+    masks, attention over the batch), and it is held bit-exact everywhere. On
+    ROCm the plain B=2 arm gets a gross-error bound on the first generated
+    frame instead; later frames compound any one-ulp change through the ring.
     """
     config = ports[True]["config"]
     port = _build_port(config, CHECKPOINT, num_sessions=2)
@@ -1067,7 +1103,19 @@ def test_batched_generate_frame_matches_the_same_sessions_run_solo(ports, oracle
     kv.reset_request("w1", free=True)
     kv.remove_request("w1")
 
-    # ---- B=2: both sessions rolled together.
+    # ---- B=2: both sessions rolled together, with the GEMM and conv rows split.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(F, "linear", _one_row_at_a_time(F.linear, 3))
+        patch.setattr(F, "conv2d", _one_row_at_a_time(F.conv2d, 4))
+        kv.ingest_request("w0")
+        kv.ingest_request("w1")
+        split = _roll(port, [("w0", w0), ("w1", w1)], 20)
+    _assert_padding_session_clean(port)
+    for rid in ("w0", "w1"):
+        kv.reset_request(rid, free=True)
+        kv.remove_request(rid)
+
+    # ---- B=2: both sessions rolled together, plain.
     kv.ingest_request("w0")
     kv.ingest_request("w1")
     batched = _roll(port, [("w0", w0), ("w1", w1)], 20)
@@ -1075,7 +1123,17 @@ def test_batched_generate_frame_matches_the_same_sessions_run_solo(ports, oracle
 
     solo = {"w0": solo_w0, "w1": solo_w1}
     for rid in ("w0", "w1"):
+        first = next((j for j in range(20) if not torch.equal(solo[rid][j], split[rid][j])), None)
+        assert first is None, (
+            f"{rid}: batching diverged from its solo run at frame {first} with the GEMM and conv rows "
+            f"split, maxabs={_deviation(solo[rid][first], split[rid][first])[0]:.4e}"
+        )
         gaps = [_deviation(solo[rid][j], batched[rid][j])[0] for j in range(20)]
         print(f"{rid}: batched vs solo maxabs over 20 frames={max(gaps):.4e}")
+        if current_platform.is_rocm():
+            rms = _rms_deviation(solo[rid][1], batched[rid][1])
+            print(f"{rid}: batched vs solo first generated frame rms={rms:.3e}")
+            assert rms < ROCM_BATCHED_FIRST_FRAME_RMS, f"{rid}: first generated frame rms={rms:.3e}"
+            continue
         first = next((j for j in range(20) if not torch.equal(solo[rid][j], batched[rid][j])), None)
         assert first is None, f"{rid}: batching diverged from its solo run at frame {first}, maxabs={gaps[first]:.4e}"
