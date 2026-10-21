@@ -995,3 +995,42 @@ def test_i2v_rows_send_their_own_first_frames(tmp_path):
                                set_dir=wan)
     assert cmd[cmd.index("--sample-set-dir") + 1] == str(wan)
     assert cmd[cmd.index("--request-type") + 1] == "image_to_video"
+
+
+def test_skip_patterns_leave_out_arms_and_workloads(monkeypatch):
+    skips = ["cosmos3_edge/vllm-omni-rc/*", "*/vllm-omni/video-i2v", "*/sglang-diffusion-compile"]
+    plan = type("P", (), {"skips": skips, "arms": list(tables.TABLES["video"].arms), "trees": {},
+                          "workloads": [tables.WORKLOADS[w] for w in tables.TABLES["video"].workloads]})()
+    edge, wan, nano = catalog.ROWS["cosmos3_edge"], catalog.ROWS["wan22"], catalog.ROWS["cosmos3_nano"]
+    rc, vo = catalog.ARMS["vllm-omni-rc"], catalog.ARMS["vllm-omni"]
+    i2v, t2v = tables.WORKLOADS["video-i2v"], tables.WORKLOADS["video-t2v"]
+    assert sweep.skipped(plan, edge, rc) and not sweep.skipped(plan, nano, rc)
+    assert sweep.skipped(plan, wan, vo, i2v) and not sweep.skipped(plan, wan, vo, t2v)
+    assert not sweep.skipped(plan, wan, vo)
+    seen = []
+    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: seen.append((row.name, arm.name)))
+    for row in (edge, nano):
+        sweep.run_row(plan, row, 0, [5], 8640)
+    assert ("cosmos3_edge", "vllm-omni-rc") not in seen and ("cosmos3_nano", "vllm-omni-rc") in seen
+    assert not any(a == "sglang-diffusion-compile" for _, a in seen)
+    assert ("cosmos3_edge", "vllm-omni") in seen  # its i2v skip doesn't touch Edge, which runs t2v only
+    plan.skips = ["*/vllm-omni/video-t2v"]
+    seen.clear()
+    sweep.run_row(plan, edge, 0, [5], 8640)
+    assert ("cosmos3_edge", "vllm-omni") not in seen  # its only workload there is skipped, so no server starts
+
+
+def test_cosmos3_t2i_row_settings():
+    from benchmark.amd import correctness
+
+    wt = Path(__file__).resolve().parents[2]
+    plan = type("P", (), {"correctness_src": wt, "worktree": wt})()
+    row, wl = catalog.ROWS["cosmos3_nano_t2i"], tables.WORKLOADS["image-gen"]
+    assert catalog.mstar_config_name(row, "mstar") == "cosmos3_nano"
+    assert correctness.family_opts(wl, row) == {"mode": "t2i", "size": "480x832"}
+    ours = correctness.media_request_kwargs(plan, row, catalog.ARMS["mstar"], wl)
+    theirs = correctness.media_request_kwargs(plan, row, catalog.ARMS["vllm-omni"], wl)
+    assert (ours["height"], ours["width"]) == (theirs["height"], theirs["width"]) == (480, 832)
+    assert ours["flow_shift"] == 1.0 and "flow_shift" not in theirs and theirs["generator_device"] == "cuda"
+    names = [a.name for a in catalog.arms_for(row, list(tables.TABLES["image"].arms))]
+    assert "vllm-omni-rc" in names and "sglang-diffusion-bcg" not in names and "ref-diffusers" in names
