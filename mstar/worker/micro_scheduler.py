@@ -278,7 +278,7 @@ class MicroScheduler:
         self.held_until: dict[int, float] = {}
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
-        self.pending_removes: set[int] = set()
+        self.pending_removes: dict[int, None] = {}
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
         # still queued. On the fail/abort path we drain these before ACKing
@@ -698,7 +698,7 @@ class MicroScheduler:
         # Do not schedule a request that was removed between scheduling
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
-        exclude = self.pending_removes | set(self.held_until) | self.failed_rids
+        exclude = self.failed_rids.union(self.pending_removes, self.held_until)
         for spec in self._ready_specs(exclude, target, exclude_target):
             if spec.node_name not in self.parallel_leader_nodes:
                 continue  # only rank 0 can initiate scheduling!
@@ -1304,7 +1304,7 @@ class MicroScheduler:
         its backlog, and graph-ready rows still on the queues. Read-only and
         graph-level (no engine readiness check, which can reload), so a held
         or not yet reloaded row counts; a failed or removed one does not."""
-        exclude = self.pending_removes | self.failed_rids
+        exclude = self.failed_rids.union(self.pending_removes)
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
