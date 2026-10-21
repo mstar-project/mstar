@@ -95,7 +95,7 @@ def _fake_model(loaded, seconds, max_input_files=None):
 
 
 def _status(wt, error):
-    wt._fail_request("r1", error, "preprocessing")
+    wt._fail_request("r1", error, "preprocessing", abort=False)
     return wt.out_queue.get_nowait().metadata["status"]
 
 

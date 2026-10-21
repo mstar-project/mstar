@@ -11,9 +11,17 @@ contrast (it does not carry history, upstream issue #105)::
     python -m benchmark.audio_watermark_check exactness --device cuda
 
 ``cost``: one ``apply_pcm16`` call per codec chunk length (1 to 25 Qwen3-TTS
-frames of 1920 samples), batch 1 and 8, streams already under way::
+frames of 1920 samples), batch 1, 8 and 32, streams already under way: the
+time until the audio is ready and until the call returns (how long it holds
+the worker loop); ``--captured`` adds the replay of the engine's captures::
 
-    python -m benchmark.audio_watermark_check cost --device cuda
+    python -m benchmark.audio_watermark_check cost --device cuda --captured
+
+``stream``: served clean WAVs marked as the codec would, all files in flight
+together with staggered starts, one call per step; ``--compare`` reports the
+int16 difference to another run, e.g. the same command on another commit::
+
+    python -m benchmark.audio_watermark_check stream --wavs off_wav --out marked --captured
 
 ``quality``: from the per-request WAVs ``benchmark.tts_speech_bench
 --save-audio-dir`` writes, one directory served with the watermark off and
@@ -43,6 +51,7 @@ MESSAGE = 0xBEEF
 FRAME = 1920  # Qwen3-TTS samples per codec frame (24 kHz)
 SCHEDULE = (1, 3, 8, 16)  # the codec's first windows, in frames
 CHUNK = 25  # frames per window after the ramp
+CAPTURE_BATCH_SIZES = (1, 2, 4, 8, 16, 32)  # the codec's
 RESAMPLED_RATES = (16000, 48000)  # copies the detector must still find the mark in
 
 
@@ -109,30 +118,127 @@ def exactness(args) -> dict:
     return report
 
 
+class _NoResources:
+    """The engine step runner a node without resources sees at capture."""
+
+    def build_accelerator_graph_buffers(self, *args, **kwargs) -> None:
+        pass
+
+    def ingest_capture_row(self, rid) -> None:
+        pass
+
+
+def captured_runners(wmk: AudioSealWatermarker, batch_sizes=CAPTURE_BATCH_SIZES) -> dict:
+    """The engine's captures of the codec's watermark lengths, as Qwen3-TTS's
+    ``get_piecewise_accelerator_graph_configs`` declares them (CUDA only)."""
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+
+    configs = wmk.piecewise_configs([f * FRAME for f in {*SCHEDULE, CHUNK}], batch_sizes)
+    pool = get_accelerator_graph_backend(wmk.device).graph_pool_handle()
+    runners = {}
+    for label, config in configs.items():
+        runner = PiecewiseAcceleratorGraphRunner(
+            label=label, config=config, resources={}, step_runner=_NoResources(), device=wmk.device,
+            autocast_dtype=None, num_slots=1, memory_pool=pool,
+        )
+        runner.warmup_and_capture()
+        runners[label] = runner
+    return runners
+
+
+def _supports_runners(wmk: AudioSealWatermarker) -> bool:
+    return hasattr(wmk, "piecewise_configs")
+
+
 def cost(args) -> dict:
+    """Per ``apply_pcm16`` call: ``ms`` until the audio is on the GPU's
+    clock (synchronized) and ``host_ms`` until the call returns, which is how
+    long it holds the worker loop. With ``--captured``, also the replay of the
+    engine's capture."""
     device = torch.device(args.device)
     sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
     wmk = AudioSealWatermarker.build(AudioWatermarkConfig(enabled=True, message=MESSAGE), device)
+    paths = {"eager": None}
+    if args.captured and device.type == "cuda" and _supports_runners(wmk):
+        paths["captured"] = captured_runners(wmk)
     rows = []
-    for batch in (1, 8):
-        for frames in (1, 3, 8, 16, 25):
-            streams = [WatermarkStream() for _ in range(batch)]
-            chunks = [(torch.randn(FRAME * frames, device=device) * 3000).to(torch.int16) for _ in range(batch)]
-            for _ in range(5):
-                wmk.apply_pcm16(chunks, streams)
-            times = []
-            for _ in range(args.iters):
-                sync()
-                t0 = time.perf_counter()
-                wmk.apply_pcm16(chunks, streams)
-                sync()
-                times.append(1000 * (time.perf_counter() - t0))
-            times.sort()
-            p50, p90 = statistics.median(times), times[int(0.9 * len(times))]
-            rows.append({"batch": batch, "frames": frames, "audio_ms": FRAME * frames / 24,
-                         "ms_p50": round(p50, 2), "ms_p90": round(p90, 2)})
-            print(json.dumps(rows[-1]), flush=True)
+    for path, runners in paths.items():
+        for batch in (1, 8, 32):
+            for frames in (1, 3, 8, 16, 25):
+                streams = [WatermarkStream() for _ in range(batch)]
+                chunks = [(torch.randn(FRAME * frames, device=device) * 3000).to(torch.int16) for _ in range(batch)]
+                kwargs = {"runners": runners} if runners else {}
+                for _ in range(5):
+                    wmk.apply_pcm16(chunks, streams, **kwargs)
+                times, host = [], []
+                for _ in range(args.iters):
+                    sync()
+                    t0 = time.perf_counter()
+                    wmk.apply_pcm16(chunks, streams, **kwargs)
+                    host.append(1000 * (time.perf_counter() - t0))
+                    sync()
+                    times.append(1000 * (time.perf_counter() - t0))
+                rows.append({"path": path, "batch": batch, "frames": frames, "audio_ms": FRAME * frames / 24,
+                             "ms_p50": round(statistics.median(times), 3),
+                             "host_ms_p50": round(statistics.median(host), 3)})
+                print(json.dumps(rows[-1]), flush=True)
     return {"device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu", "rows": rows}
+
+
+def stream(args) -> dict:
+    """Mark served clean WAVs as the codec would: every file one stream, all
+    of them in flight together (file k starting at step k % 5, so a step
+    mixes ramp, full and final chunks), one ``apply_pcm16`` call per step,
+    with ``--captured`` through the engine's captures. Writes the marked
+    WAVs to ``--out``; ``--compare DIR`` reports the int16 difference to
+    another such run (e.g. the same command on another commit)."""
+    import soundfile as sf
+
+    device = torch.device(args.device)
+    wmk = AudioSealWatermarker.build(AudioWatermarkConfig(enabled=True, message=MESSAGE), device)
+    runners = None
+    if args.captured and device.type == "cuda" and _supports_runners(wmk):
+        runners = captured_runners(wmk)
+    files = _wavs(args.wavs)
+    names = sorted(files)
+    edges = {n: _chunk_edges(len(files[n])) for n in names}
+    streams = {n: WatermarkStream() for n in names}
+    parts: dict[str, list[torch.Tensor]] = {n: [] for n in names}
+    # the codec batches at most this many rows, as serving does; a bigger call
+    # would run past every capture, eagerly
+    max_rows = max(CAPTURE_BATCH_SIZES)
+    for step in range(max(k % 5 + len(edges[n]) - 1 for k, n in enumerate(names))):
+        live = [n for k, n in enumerate(names) if 0 <= step - k % 5 < len(edges[n]) - 1]
+        for lo in range(0, len(live), max_rows):
+            rows = live[lo:lo + max_rows]
+            chunks, finals = [], []
+            for n in rows:
+                i = step - names.index(n) % 5
+                a, b = edges[n][i], edges[n][i + 1]
+                chunks.append(torch.from_numpy(files[n][a:b].copy()).to(device))
+                finals.append(i + 1 == len(edges[n]) - 1)
+            kwargs = {"runners": runners} if runners else {}
+            marked = wmk.apply_pcm16(chunks, [streams[n] for n in rows], finals, **kwargs)
+            for n, m in zip(rows, marked, strict=True):
+                parts[n].append(m.cpu())
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    marked = {}
+    for n in names:
+        marked[n] = torch.cat(parts[n]).numpy()
+        sf.write(out / f"{n}.wav", marked[n], 24000, subtype="PCM_16")
+    report = {"files": len(names), "captured": runners is not None, "out": str(out)}
+    if args.compare:
+        other = _wavs(args.compare)
+        diffs = [int(np.abs(marked[n].astype(np.int32) - other[n].astype(np.int32)).max()) for n in names]
+        report["compare"] = {
+            "dir": args.compare, "bit_identical_files": sum(d == 0 for d in diffs),
+            "max_abs_int16": max(diffs),
+            "differing_samples": int(sum((marked[n] != other[n]).sum() for n in names)),
+            "samples": int(sum(len(marked[n]) for n in names)),
+        }
+    return report
 
 
 def _chunk_edges(n: int) -> list[int]:
@@ -226,20 +332,27 @@ def quality(args) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
-    for name in ("exactness", "cost", "quality"):
+    for name in ("exactness", "cost", "quality", "stream"):
         p = sub.add_parser(name)
         p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-        p.add_argument("--out", default=None, help="also write the report as JSON")
+        p.add_argument("--out", default=None, help="also write the report as JSON (stream: the WAV directory)")
+        if name in ("cost", "stream"):
+            p.add_argument("--captured", action="store_true", help="replay the engine's captures (CUDA)")
         if name == "cost":
             p.add_argument("--iters", type=int, default=40)
+        if name == "stream":
+            p.add_argument("--wavs", required=True, help="clean WAVs (served with the watermark off)")
+            p.add_argument("--compare", default=None, help="marked WAVs of another run to compare against")
         if name == "quality":
             p.add_argument("--clean", required=True, help="WAVs served with the watermark off")
             p.add_argument("--marked", default=None, help="WAVs served with the watermark on")
             p.add_argument("--threshold", type=float, default=0.5)
     args = ap.parse_args()
-    report = {"exactness": exactness, "cost": cost, "quality": quality}[args.command](args)
+    if args.command == "stream" and not args.out:
+        ap.error("stream needs --out")
+    report = {"exactness": exactness, "cost": cost, "quality": quality, "stream": stream}[args.command](args)
     print(json.dumps(report, indent=1))
-    if args.out:
+    if args.out and args.command != "stream":
         Path(args.out).write_text(json.dumps(report, indent=1))
 
 

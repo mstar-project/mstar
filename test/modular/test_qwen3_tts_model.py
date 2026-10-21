@@ -351,7 +351,10 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     assert result.new_input_tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
     # CustomVoice default: whole text in the prefill (stream_text = 0); no
     # reference transcript or frames. Host values, for the prefill's step metadata.
-    assert result.metadata == {PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
+    assert result.metadata == {
+        PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
+        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
+    }
 
 
 def test_qwen3_tts_process_prompt_rejects_a_changed_chatml_wrapper(monkeypatch):
@@ -463,7 +466,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     )
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
-    assert Qwen3TTSModel.CODEC_STREAM_LEAD_KEY not in xvec.metadata   # no stream lead
+    assert xvec.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == 0   # no stream lead
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -1530,7 +1533,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
             stream.put(f"t{i}", frames[i])
         stream.signal_done()
         streams[rid] = stream
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule)})
+    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule, piecewise_runners={})})
     engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
     finals = 0
     with torch.no_grad():
@@ -1594,6 +1597,26 @@ def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
         assert (got.int() - expected.int()).abs().max() <= 1
     submodule.cleanup_request("a")
     assert "a" not in submodule.request_states
+
+
+def test_qwen3_tts_codec_declares_a_watermark_capture_per_schedule_length():
+    """Watermark on, the codec asks the engine to capture the generator per
+    chunk length of its schedule and batch bucket; off, nothing. Lengths that
+    are not whole 320-sample watermark frames (the tiny codec's) stay eager."""
+    from test_audio_watermark import _watermarker
+
+    # The engine looks up only this name; a misnamed override inherits the base's {}.
+    assert "get_piecewise_accelerator_graph_configs" in CodecSubmodule.__dict__
+    config = _tiny_model_config()
+    assert CodecSubmodule(_FakeCodecDecoder(4), config).get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.float32) == {}
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config, watermarker=_watermarker())
+    assert submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
+    submodule.total_upsample = 1920   # the real 12 Hz codec's samples per frame
+    configs = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32, 1)
+    frames = sorted({*config.codec.chunk_schedule, config.codec.chunk_frames})
+    assert sorted(configs) == sorted(f"watermark_{f * 1920}" for f in frames)
+    assert all(c.capture_batch_sizes == CodecSubmodule.CAPTURE_BATCH_SIZES for c in configs.values())
 
 
 def test_qwen3_tts_clone_reference_tail_is_the_first_windows_context():

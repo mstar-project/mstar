@@ -81,6 +81,7 @@ from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -143,14 +144,30 @@ def _make_graph_runtime(
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
-    """``MSTAR_TP_ASYNC_SCHED``: ``0``/empty off, ``1`` every parallel node,
-    or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
+    """``MSTAR_TP_ASYNC_SCHED``: ``0``/``false``/empty off, ``1``/``true`` every
+    parallel node, or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
     raw = raw.strip()
-    if raw in ("", "0"):
+    # a quoted yaml boolean arrives as a string; it is the switch, not a node name
+    word = raw.lower()
+    if word in ("", "0", "false", "no", "off"):
         return False, None
-    if raw == "1":
+    if word in ("1", "true", "yes", "on"):
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def _tp_async_sched_setting(
+    env: str | None, config: bool | str | list[str] | None,
+) -> tuple[bool, frozenset[str] | None]:
+    """The deployment config's ``tp_async_sched`` (true/false or a node list),
+    which a non-empty ``MSTAR_TP_ASYNC_SCHED`` overrides."""
+    if env:
+        return _parse_tp_async_sched(env)
+    if isinstance(config, (list, tuple)):
+        return _parse_tp_async_sched(",".join(config))
+    if isinstance(config, bool):
+        return config, None
+    return _parse_tp_async_sched(str(config or "0"))
 
 
 def _wait_ms(raw: str) -> float:
@@ -204,6 +221,11 @@ class PendingBatch:
     loop_name: str = None
     # The leader's broadcast seq for this batch (``ScheduleTPNode.spec_seq``).
     tp_seq: int = -1
+    # perf_counter when the main thread handed it to the GPU thread, stamped
+    # only while metrics are on and only off the speculative path: a
+    # speculated step is handed off before the step it follows finishes, so
+    # its step time starts at that finish anyway (see WorkerMetrics.step_done)
+    submitted_at: float = 0.0
 
 
 @dataclass
@@ -320,6 +342,10 @@ class Worker:
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
 
+    # Metrics are off unless __init__ gets a status interval; class-level so a
+    # worker built without __init__ reads them as off too.
+    _metrics: WorkerMetrics | None = None
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -343,7 +369,8 @@ class Worker:
         enable_nvtx: bool = False,
         enable_prof: bool = False,
         tcp_transfer_device="",
-        dist_init_method=None
+        dist_init_method=None,
+        status_interval_s: float | None = None,
     ):
         self.worker_id = worker_id
         self.device = device
@@ -519,8 +546,8 @@ class Worker:
 
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.
-        self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
-            os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
+        self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
+            os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
@@ -537,9 +564,9 @@ class Worker:
             )
         elif self.tp_async_sched and self.parallel_nodes:
             logger.warning(
-                "Worker %s: MSTAR_TP_ASYNC_SCHED=%r names none of this worker's "
+                "Worker %s: TP async scheduling names %s, none of this worker's "
                 "parallel nodes %s; running the serial protocol",
-                worker_id, os.environ.get("MSTAR_TP_ASYNC_SCHED"),
+                worker_id, sorted(self.tp_async_nodes or ()),
                 sorted(self.parallel_nodes),
             )
 
@@ -654,6 +681,22 @@ class Worker:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
+
+        if status_interval_s is not None:
+            self._metrics = self._start_metrics(status_interval_s)
+
+    def _start_metrics(self, interval_s: float) -> WorkerMetrics:
+        """Metrics on: send the conductor a WorkerStatus every ``interval_s``,
+        and from ``ENABLE_METRICS`` on record the steps of the nodes this rank
+        leads and the tensors every rank reads."""
+        return WorkerMetrics(
+            self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
+            self.engine_manager.engine, self.scheduler,
+            send=lambda status: self.communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.WORKER_STATUS, body=status,
+            )),
+            enable_transfers=self.tensor_manager.enable_transfer_metrics,
+        )
 
     @staticmethod
     def _build_innermost_loop_cache(
@@ -1038,11 +1081,11 @@ class Worker:
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
             if req_info:
-                for sbuf in req_info.stream_buffers.values():
+                for edge_name, sbuf in req_info.stream_buffers.items():
                     if sbuf.from_partition in body.producer_done:
                         # If we have multiple consumer partitions colocated, we need to signal
                         # the right one
-                        sbuf.signal_done()
+                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
@@ -1158,6 +1201,9 @@ class Worker:
                 self._register_tp_follow(message.body)
             elif message.message_type == WorkerMessageType.TP_NO_SPEC:
                 self._register_tp_nospec(message.body)
+            elif message.message_type == WorkerMessageType.ENABLE_METRICS:
+                # sent only with metrics on, so _metrics is set
+                self._metrics.start_counting()
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -2084,8 +2130,9 @@ class Worker:
         # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
         # the rid's own count is, or failed) has no step to retry: on success
         # the routing drops it too. Re-queued, it would run again with its
-        # loop-back inputs already spent.
-        prepared = set(node_batch.request_ids)
+        # loop-back inputs already spent. A row the cache served is retried,
+        # because its walk completes only on a step that runs.
+        prepared = set(node_batch.request_ids) | node_batch.cached_rids
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)
@@ -3138,7 +3185,7 @@ class Worker:
             # stopping one would finalize state the drop just removed
             for rid in failed:
                 stops.pop(rid, None)
-            if not batch_N.node_batch.request_ids:
+            if not batch_N.node_batch.request_ids and not batch_N.node_batch.cached_rids:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 return
@@ -3234,7 +3281,7 @@ class Worker:
             range_push("worker.send_outputs", synchronize=False)
 
         # The consuming pass (not the earlier ingest) reports the partition
-        # done, so it rides this pass's WGD with the final output loop index.
+        # done, so it rides the WGD that also counts this pass's last chunks.
         for rid in batch_N.node_batch.stream_partition_done_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 
@@ -4125,6 +4172,7 @@ class Worker:
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
         self.parallel_groups.barrier_all()
+        self.parallel_groups.restore_default_timeout()
 
         # Everything tracked right now — weights, capture buffers, wrapper
         # state — lives for the process, so gen2 gains nothing by walking it
@@ -4236,6 +4284,9 @@ class Worker:
         # anything. ``benchmark/worker_phases`` segments on it.
         phase_bs: list[int] = []
 
+        # None with metrics off: then nothing below records or sends anything
+        metrics = self._metrics
+
         def _phase_flush() -> None:
             if phase_period <= 0 or phase_iter[0] % phase_period != 0:
                 return
@@ -4314,6 +4365,10 @@ class Worker:
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+
+                # Reads only: whether a rank sends this changes nothing it runs.
+                if metrics is not None:
+                    metrics.maybe_report()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
@@ -4502,6 +4557,11 @@ class Worker:
                     if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
+                        if metrics is not None:
+                            metrics.step_done(
+                                pending.node_name, pending.graph_walk,
+                                pending.node_batch.inputs, pending.submitted_at,
+                            )
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -4560,6 +4620,7 @@ class Worker:
                 # iteration schedules against an admit that hasn't run.
                 node_batch.launch_started_event = threading.Event()
                 self._set_in_flight_flag(batch, True)
+                submitted_at = _time.perf_counter() if metrics is not None else 0.0
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
@@ -4573,6 +4634,7 @@ class Worker:
                     graph_walk=batch.graph_walk,
                     future=future,
                     tp_seq=fallthrough_tp_seq,
+                    submitted_at=submitted_at,
                 ))
                 # Same accounting as the speculative path above
                 if phase_period:

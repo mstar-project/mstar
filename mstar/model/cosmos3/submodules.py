@@ -2554,8 +2554,8 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
             # deployment's conditioning_resize recipe: "stretch" is the
             # diffusers VideoProcessor resize-normalize the Nano/Super
             # checkpoints were validated against (also what the action modes
-            # use for their repeated frame), "aspect_crop" the diffusers 0.40 /
-            # vLLM-Omni cover-scale + center-crop recipe of the Edge yamls.
+            # use for their repeated frame), "aspect_crop" the diffusers 0.40
+            # cover-scale + center-crop recipe of the Edge yamls.
             if is_action or self.config.conditioning_resize == "stretch":
                 frame = self._video_processor.preprocess(image[0], height=height, width=width).to(
                     device=device, dtype=torch.float32

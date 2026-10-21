@@ -87,6 +87,7 @@ MIN_WINDOW_SECONDS = 5.0
 # longest upload the route accepts, in seconds and in bytes
 MAX_DURATION_SECONDS = 30 * 60
 MAX_UPLOAD_BYTES = 512 * 2**20
+_SF_UNKNOWN_FRAMES = 2**62
 
 
 def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> str:
@@ -110,7 +111,10 @@ def audio_duration_seconds(path: str) -> float | None:
         import soundfile as sf
 
         info = sf.info(path)
-        return float(info.frames) / float(info.samplerate)
+        # libsndfile reports an unknown length (a FLAC whose header leaves the
+        # sample count out) as the largest frame count
+        if info.frames < _SF_UNKNOWN_FRAMES:
+            return float(info.frames) / float(info.samplerate)
     except Exception:  # noqa: BLE001 — try the FFmpeg decoder
         pass
     try:
@@ -185,9 +189,23 @@ class WindowPlanner:
 
     def prepare(self) -> None:
         """Decode an upload that will be windowed, so a file the decoder
-        refuses (e.g. an unsupported sample rate) fails before any window runs."""
+        refuses (e.g. an unsupported sample rate, or audio past
+        :data:`MAX_DURATION_SECONDS`, where the decode stops whatever the
+        header says) fails before any window runs. A file with no header
+        duration is decoded too: a refusal fails here the same way, and once
+        its length is known it is windowed when longer than the model's clip.
+        One that does not decode here (or with no audio decoder in this
+        process) is sent whole to the data worker, whose decode has the same
+        cap and reports its own errors."""
         if not self.single:
             self._decoded()
+        elif self.duration is None:
+            try:
+                self._decoded()
+            except media_io.AudioRefusedError:
+                raise
+            except Exception:  # noqa: BLE001 — not decodable here; the data worker reports it
+                pass
 
     def done(self, offset: float) -> bool:
         return self.single or offset >= (self.duration or 0.0) - 1e-3
@@ -215,7 +233,7 @@ class WindowPlanner:
 
     def _decoded(self):
         if self._audio is None:
-            self._audio = media_io.decode_audio(self.audio_path, SAMPLE_RATE)
+            self._audio = media_io.decode_audio(self.audio_path, SAMPLE_RATE, MAX_DURATION_SECONDS)
             self.duration = len(self._audio) / SAMPLE_RATE
         return self._audio
 
@@ -475,6 +493,11 @@ async def create_transcription(
         )
     try:
         planner.prepare()
+    except media_io.AudioTooLongError:
+        planner.cleanup()
+        raise HTTPException(
+            status_code=413, detail=f"audio is longer than the {MAX_DURATION_SECONDS} s limit",
+        ) from None
     except ValueError as exc:
         planner.cleanup()
         raise HTTPException(status_code=400, detail=str(exc)) from None

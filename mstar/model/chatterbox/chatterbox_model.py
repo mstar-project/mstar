@@ -121,7 +121,7 @@ MAX_REPETITION_PENALTY = 2.0
 MAX_CFG_WEIGHT = 1.0
 MAX_EXAGGERATION = 2.0
 # Dividing the logits by a smaller value overflows the same way: a temperature
-# under it samples greedily (vLLM's convention), a penalty under it is refused
+# under it samples greedily, a penalty under it is refused
 MIN_TEMPERATURE = 1e-5
 MIN_REPETITION_PENALTY = 1e-5
 
@@ -554,20 +554,19 @@ class ChatterboxModel(Model):
         any system library; torchcodec needs FFmpeg's shared libraries, which
         the nodes may not have, so it is only the fallback for other codecs.
         """
-        try:
-            import soundfile as sf
+        from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
 
-            data, sr = sf.read(filepath, dtype="float32", always_2d=True)
-            wav = torch.from_numpy(data).mean(dim=1)
+        try:
+            data, sr = read_soundfile_capped(filepath)
+            wav = torch.from_numpy(data)
+        except AudioRefusedError:
+            raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            from torchcodec.decoders import AudioDecoder
-
             # an undecodable upload is the client's error (400); a missing
             # decoder library above still surfaces as a server error
             try:
-                decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-                return decoder.get_all_samples().data[0].float()
+                return decode_torchcodec_capped(filepath, S3GEN_SR).float()
             except RuntimeError as decode_exc:
                 raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
         if wav.numel() == 0:

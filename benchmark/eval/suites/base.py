@@ -37,6 +37,10 @@ class Suite:
         """Suite settings that decide the numbers; recorded in the results file."""
         return {}
 
+    def default_items(self) -> list[Item] | None:
+        """Items for a run without ``--data`` (a suite that builds its own requests), else None."""
+        return None
+
     def check_items(self, items: list[Item]) -> None:
         for it in items:
             check_id(it.id)

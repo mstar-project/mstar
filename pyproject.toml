@@ -77,16 +77,24 @@ audio = [
     "soundfile",
 ]
 
+# Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
+metrics = [
+    "prometheus-client>=0.20",
+]
+
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
-# builders and the charts import the rest lazily. Install it in a separate
-# client environment if the server's should stay lean.
+# builders, compare's media inputs and PSNR checks (PyAV, Pillow) and the
+# charts import the rest lazily. Install it in a separate client environment
+# if the server's should stay lean.
 eval = [
     "aiohttp",
+    "av",
     "datasets",
     "huggingface-hub",
     "matplotlib",
+    "Pillow",
     "soundfile",
     "transformers",
 ]
@@ -96,6 +104,13 @@ eval = [
 # 0.3 may change the streaming layers mstar.model.audio_watermark drives.
 audioseal = [
     "audioseal>=0.2,<0.3",
+]
+
+# Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
+# its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+vad = [
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend
@@ -191,6 +206,15 @@ qwen3_tts = [
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
+]
+
+fish_s2_pro = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",  # reference-audio decoding for voice cloning
+    "transformers",
 ]
 
 kokoro = [
@@ -337,6 +361,8 @@ all = [
     "ruff",
     "pytest>=8.2",
     "soundfile",
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
     "av",
     "diffusers>=0.39",
     "fa3-fwd",

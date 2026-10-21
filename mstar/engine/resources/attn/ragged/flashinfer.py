@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import torch
 
 from mstar.engine.resources.attn.base import EagerSlotKey, WorkspacePool
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager, RaggedCrossAttnManager
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -227,6 +227,10 @@ class FlashInferRaggedManager(_FlashInferRaggedBase, RaggedAttnManager):
     attending within itself."""
 
     wrapper_class = RaggedPrefillWrapper
+
+    def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
+        super().plan(step, ctx)
 
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():

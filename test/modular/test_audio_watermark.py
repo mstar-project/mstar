@@ -8,6 +8,7 @@ and runs only when they are already in AudioSeal's cache.
 
 from __future__ import annotations
 
+import logging
 import sys
 from hashlib import sha1
 from types import SimpleNamespace
@@ -105,8 +106,8 @@ class _Tail(NodeSubmodule):
         if request_id == "bad":
             raise ValueError("bad request")
 
-    def batch_postprocess(self, outputs, request_infos, inputs):
-        self.calls.append((list(request_infos), list(inputs)))
+    def batch_postprocess(self, outputs, request_infos, inputs, piecewise_runners=None):
+        self.calls.append((list(request_infos), list(inputs), piecewise_runners))
         if self.fail:
             raise RuntimeError("tail failed")
 
@@ -126,16 +127,18 @@ def _batch(rids):
 
 def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
     tail = _Tail()
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail)})
+    runners = {"watermark_1920": object()}
+    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners=runners)})
     batch = _batch(["a", "bad", "c"])
     Engine._postprocess_batch(engine, batch, {"a": {}, "bad": {}, "c": {}})
-    assert tail.calls == [(["a", "c"], ["in-a", "in-c"])]
+    # the node's captured regions come along, as the forward gets them
+    assert tail.calls == [(["a", "c"], ["in-a", "in-c"], runners)]
     assert set(batch.failed_requests) == {"bad"}
 
 
 def test_batch_tail_failure_fails_its_requests_only():
     tail = _Tail(fail=True)
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail)})
+    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners={})})
     batch = _batch(["a", "bad", "c"])
     Engine._postprocess_batch(engine, batch, {})
     assert set(batch.failed_requests) == {"a", "bad", "c"}
@@ -249,14 +252,215 @@ def test_streams_batch_without_mixing():
         torch.testing.assert_close(torch.cat(out[k]), _library_offline(wmk, audio), atol=1e-5, rtol=0)
 
 
-def test_streams_leave_a_batch_with_contiguous_caches():
-    """A stream that ran in a batch can run alone next: cuDNN's LSTM (CUDA
-    only) refuses the non-contiguous hx a batch-dim slice would be."""
+def test_streams_leave_a_batch_with_one_flat_cache_row_each():
+    """A stream's state is one row of its batch's caches, so streams regroup
+    freely; the LSTM gets a contiguous ``[layers, batch, hidden]`` hx (cuDNN,
+    CUDA only, refuses a non-contiguous one)."""
     wmk = _watermarker()
     streams = [WatermarkStream() for _ in range(3)]
     wmk.apply([_speechlike(640, seed=s) for s in range(3)], streams)
     for stream in streams:
-        assert all(cache.is_contiguous() for cache in stream.caches)
+        assert stream.caches.shape == (wmk.cache_size,)
+    lstm = [cache for slot, cache in enumerate(wmk._unpack(torch.stack([s.caches for s in streams])))
+            if slot in wmk._layout.lstm_slots]
+    assert lstm and all(cache.is_contiguous() and cache.shape[1] == 3 for cache in lstm)
+    alone = wmk.apply([_speechlike(320, seed=9)], [streams[1]])[0]
+    assert alone.shape == (320,)
+
+
+def _moshi_streaming(wmk, audio, sizes):
+    """AudioSeal's own streaming layers as they would run if the state
+    reached them (the propagation bug, upstream #105, set by hand)."""
+    from audioseal.libs.moshi.modules.streaming import StreamingModule
+
+    gen = wmk.generator
+    modules = [m for m in gen.modules() if isinstance(m, StreamingModule)]
+    for module in modules:
+        module._streaming_state = module._init_streaming_state(audio.shape[0])
+        module._streaming_state.init_stream()
+    try:
+        out, start = [], 0
+        with torch.no_grad(), wmk._no_compile():
+            for size in sizes:
+                x = audio[:, start:start + size]
+                hidden = gen.encoder(x.unsqueeze(1)) + wmk._message_embedding
+                out.append(x + wmk.config.alpha * gen.decoder(hidden).squeeze(1))
+                start += size
+    finally:
+        for module in modules:
+            module._streaming_state = module._empty_state()
+    return torch.cat(out, dim=-1)
+
+
+def test_the_stream_equals_audioseals_streaming_layers_bit_for_bit():
+    """The generator run as a function of its caches does what AudioSeal's
+    streaming layers do, op for op: the same floats, not just close ones."""
+    wmk = _watermarker(message=0xBEEF)
+    audios = torch.stack([_speechlike(5760, seed=s) for s in (10, 11, 12)])
+    sizes = [640, 1920, 320, 2880]
+    streams = [WatermarkStream() for _ in range(3)]
+    pieces, start = [], 0
+    for size in sizes:
+        chunks = list(audios[:, start:start + size])
+        pieces.append(torch.stack(wmk.apply(chunks, streams)))
+        start += size
+    assert torch.equal(torch.cat(pieces, dim=-1), _moshi_streaming(wmk, audios, sizes))
+
+
+class _ReplayingRunner:
+    """``PiecewiseAcceleratorGraphRunner.run``'s contract without CUDA: the real
+    inputs go into the head of buffers padded to the capture batch (the tail
+    zeroed), the captured callable runs on the whole buffers, and the real
+    rows come back."""
+
+    def __init__(self, config, batch_sizes):
+        from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+
+        self.config, self.batch_sizes, self.calls = config, batch_sizes, []
+        self._shape, self._call = PiecewiseCaptureShape, PiecewiseCallInputs
+
+    def can_run(self, batch_size):
+        return batch_size <= max(self.batch_sizes)
+
+    def run(self, static_inputs, real_bs):
+        from mstar.engine.accelerator_graph_runner import PiecewiseOutput
+
+        bs = min(b for b in self.batch_sizes if b >= real_bs)
+        buffers = self.config.make_static_inputs(self._shape(bs=bs, seq_lens=[self.config.seq_len] * bs,
+                                                             total_tokens=self.config.seq_len * bs))
+        for name, value in static_inputs.items():
+            buffers[name][:real_bs].copy_(value)
+            buffers[name][real_bs:].zero_()
+        self.calls.append((real_bs, bs))
+        return PiecewiseOutput(self.config.capture_fn(self._call(static_inputs=buffers, engine_inputs=None)), real_bs)
+
+
+def test_replayed_pcm16_calls_equal_the_eager_ones_and_finals_pad_into_a_capture():
+    """Codec-shaped streams through ``apply_pcm16`` with the captured lengths
+    replayed (batches padded up to a capture bucket) give the eager path's
+    samples, and a short final chunk shares the call of a longer length."""
+    frame = 320 * 6
+    lengths = [frame, 3 * frame]
+    replay, eager = _watermarker(message=0xBEEF), _watermarker(message=0xBEEF)
+    configs = replay.piecewise_configs(lengths, [1, 2, 4])
+    assert sorted(configs) == [replay.capture_label(n) for n in lengths]
+    runners = {label: _ReplayingRunner(config, [1, 2, 4]) for label, config in configs.items()}
+    pcm = [(_speechlike(6 * frame, seed=s).clamp(-1, 1) * 32767).to(torch.int16) for s in (20, 21, 22)]
+    # (stream, start, end, final): streams at different points share steps; in
+    # the last, two 2-frame finals pad into the call of a 3-frame chunk
+    steps = [
+        [(0, 0, frame, False), (1, 0, frame, False), (2, 0, frame, False)],
+        [(0, frame, 4 * frame, False), (1, frame, 4 * frame, False), (2, frame, 2 * frame, False)],
+        [(0, 4 * frame, 6 * frame, True), (1, 4 * frame, 6 * frame, True), (2, 2 * frame, 5 * frame, False)],
+    ]
+    replay_streams, eager_streams = [WatermarkStream() for _ in pcm], [WatermarkStream() for _ in pcm]
+    for step in steps:
+        chunks = [pcm[k][lo:hi] for k, lo, hi, _ in step]
+        finals = [final for *_, final in step]
+        ks = [k for k, *_ in step]
+        got = replay.apply_pcm16(chunks, [replay_streams[k] for k in ks], finals, runners=runners)
+        want = eager.apply_pcm16(chunks, [eager_streams[k] for k in ks], finals)
+        for g, w in zip(got, want, strict=True):
+            assert g.dtype == torch.int16 and g.shape == w.shape
+            assert (g.int() - w.int()).abs().max() <= 1
+    one, three = (runners[replay.capture_label(n)].calls for n in lengths)
+    assert one == [(3, 4), (1, 1)] and three == [(2, 2), (3, 4)]
+    assert all(s.finished and s.caches is None for s in replay_streams[:2])
+    assert (eager_streams[2].caches - replay_streams[2].caches).abs().max() < 1e-5
+
+
+def test_calls_that_miss_the_captures_say_so_once(caplog):
+    """With captures in place, a chunk length with no capture, a batch over the
+    largest captured one and a partial frame each run eagerly and log it once."""
+    frame = 320 * 6
+    wmk = _watermarker()
+    configs = wmk.piecewise_configs([frame, 3 * frame], [1, 2])
+    runners = {label: _ReplayingRunner(config, [1, 2]) for label, config in configs.items()}
+    pcm = (_speechlike(4 * frame, seed=40).clamp(-1, 1) * 32767).to(torch.int16)
+    streams = [WatermarkStream() for _ in range(5)]
+    with caplog.at_level(logging.WARNING, logger="mstar.model.audio_watermark"):
+        for start in (0, 2 * frame):
+            wmk.apply_pcm16([pcm[start:start + 2 * frame]], streams[:1], runners=runners)
+            wmk.apply_pcm16([pcm[start:start + frame]] * 3, streams[1:4], runners=runners)
+        wmk.apply_pcm16([pcm[:frame + 100]], streams[4:], runners=runners)
+        wmk.apply_pcm16([pcm[frame + 100:2 * frame + 100]], streams[4:], runners=runners)
+    messages = [r.getMessage() for r in caplog.records if "runs eagerly" in r.getMessage()]
+    assert len(messages) == 3, messages
+    assert f"a chunk of {2 * frame} samples" in messages[0]
+    assert f"3 chunks of {frame} samples" in messages[1]
+    assert "partial frame" in messages[2]
+    assert all(not r.calls for r in runners.values())
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mstar.model.audio_watermark"):
+        wmk.apply_pcm16([pcm[:frame]], [WatermarkStream()], runners=runners)
+        _watermarker().apply_pcm16([pcm[:2 * frame]], [WatermarkStream()])
+    assert not [r for r in caplog.records if "runs eagerly" in r.getMessage()]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs CUDA")
+def test_engine_captures_replay_the_eager_watermark_bit_for_bit():
+    """The engine's piecewise runner captures ``_mark_pcm16`` per length and
+    batch bucket. At a bucket's batch size a replay gives the eager call's
+    samples and caches exactly, step after step; a batch padded up to its
+    bucket, or a final chunk padded to a captured length, convolves another
+    shape, which cuDNN may run with another TF32 algorithm: within 2 steps of
+    PCM16 on Hopper, up to 14 on an A100, so other GPUs get 1e-3 of full scale.
+    Detection is unchanged either way."""
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.platforms import current_platform
+
+    padded_bound = 2 if current_platform.has_cuda_capability(9, 0) else 33
+
+    class NoResources:
+        def build_accelerator_graph_buffers(self, *args, **kwargs):
+            pass
+
+        def ingest_capture_row(self, rid):
+            pass
+
+    frame = 320 * 6
+    wmk = AudioSealWatermarker(_random_generator().cuda(), AudioWatermarkConfig(enabled=True, message=0xBEEF),
+                               import_audioseal()[1])
+    configs = wmk.piecewise_configs([frame, 3 * frame], [1, 2, 4])
+    pool = get_accelerator_graph_backend(wmk.device).graph_pool_handle()
+    runners = {}
+    for label, config in configs.items():
+        runner = PiecewiseAcceleratorGraphRunner(
+            label=label, config=config, resources={}, step_runner=NoResources(), device=wmk.device,
+            autocast_dtype=None, num_slots=1, memory_pool=pool,
+        )
+        runner.warmup_and_capture()
+        assert runner.any_graphs and not runner.dropped_shapes
+        runners[label] = runner
+    pcm = [(_speechlike(7 * frame, seed=s).clamp(-1, 1) * 32767).to(torch.int16).cuda() for s in range(30, 34)]
+
+    def steps(streams_used, exact):
+        replayed, eager = [WatermarkStream() for _ in streams_used], [WatermarkStream() for _ in streams_used]
+        for lo, hi in [(0, frame), (frame, 4 * frame), (4 * frame, 7 * frame)]:
+            chunks = [x[lo:hi] for x in streams_used]
+            got = wmk.apply_pcm16(chunks, replayed, runners=runners)
+            want = wmk.apply_pcm16(chunks, eager)
+            for g, w in zip(got, want, strict=True):
+                assert torch.equal(g, w) if exact else (g.int() - w.int()).abs().max() <= padded_bound
+            for r, e in zip(replayed, eager, strict=True):
+                assert torch.equal(r.caches, e.caches) if exact else torch.allclose(r.caches, e.caches, atol=1e-2)
+        return replayed, eager
+
+    replayed, eager = steps(pcm, exact=True)        # 4 rows: the bs=4 capture as is
+    steps(pcm[:3], exact=False)                     # 3 rows, padded to 4
+    # two streams then finish with 2 frames, padded into the 3-frame capture
+    tail = [x[:2 * frame] for x in pcm[:2]]
+    got = wmk.apply_pcm16(tail, replayed[:2], [True, True], runners=runners)
+    want = wmk.apply_pcm16(tail, eager[:2], [True, True])
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape and (g.int() - w.int()).abs().max() <= padded_bound
+
+
+def test_capture_lengths_must_be_whole_frames():
+    wmk = _watermarker()
+    with pytest.raises(ValueError, match="whole"):
+        wmk.piecewise_configs([wmk.hop + 1], [1])
 
 
 def test_pcm16_round_trip_matches_offline_within_one_step():
@@ -278,13 +482,14 @@ def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monke
     engine turns to TF32, stay fp32."""
     wmk = _watermarker()
     seen = []
-    forward = wmk.generator.encoder.forward
+    first_conv = wmk._encoder[0].conv
+    forward = first_conv.forward
 
-    def encoder(x):
+    def conv(x):
         seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
         return forward(x)
 
-    monkeypatch.setattr(wmk.generator.encoder, "forward", encoder)
+    monkeypatch.setattr(first_conv, "forward", conv)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     wmk.apply([torch.zeros(320)], [WatermarkStream()])
@@ -434,3 +639,24 @@ def test_detector_finds_the_streamed_mark_and_its_message():
         copy = torchaudio.functional.resample(streamed, 24_000, rate)
         score, message = detector.detect(copy, rate)
         assert score > 0.9 and message == 0xBEEF, rate
+
+
+def test_stream_check_batches_at_most_the_codecs_rows(monkeypatch, tmp_path):
+    """33 streams in step: the check splits each step at the codec's 32 rows, as
+    serving does, so ``--captured`` replays every group instead of running it eagerly."""
+    import numpy as np
+
+    check = pytest.importorskip("benchmark.audio_watermark_check")
+    rows = []
+
+    class _Marker:
+        def apply_pcm16(self, chunks, streams, finals, **kwargs):
+            rows.append(len(chunks))
+            return chunks
+
+    monkeypatch.setattr(check.AudioSealWatermarker, "build", staticmethod(lambda config, device: _Marker()))
+    monkeypatch.setattr(check, "_wavs", lambda d: {f"f{i:02d}": np.zeros(240000, dtype=np.int16) for i in range(33)})
+    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(write=lambda *a, **k: None))
+    args = SimpleNamespace(device="cpu", captured=False, wavs="in", out=str(tmp_path), compare=None)
+    assert check.stream(args)["files"] == 33
+    assert max(rows) == max(check.CAPTURE_BATCH_SIZES) and 1 in rows

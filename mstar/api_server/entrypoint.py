@@ -22,7 +22,7 @@ import msgpack
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -40,6 +40,14 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
+from mstar.observability.catalog import STATUS_INTERVAL_S
+from mstar.observability.metrics import (
+    INSTALL_HINT,
+    MISSING_DEPENDENCY,
+    RefusalMiddleware,
+    ServingMetrics,
+    mark_submitted,
+)
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -90,9 +98,11 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Runs DummyConductor.run() in a spawned process."""
+    """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
+    turns on the conductor's status message (metrics on)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -144,7 +154,8 @@ def _conductor_process_target(
         enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        status_interval_s=status_interval_s,
     )
     try:
         conductor.run()
@@ -199,6 +210,15 @@ def _client_text(text: str, key: str, request_id: str | None) -> str:
     return text if request_id is None else text.replace(key, request_id)
 
 
+def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
+    """``chunks`` up to and including the first error chunk, which ends the
+    response, and whether there was one."""
+    for i, chunk in enumerate(chunks):
+        if chunk.modality == "error":
+            return chunks[:i + 1], True
+    return list(chunks), False
+
+
 def request_id_in_use(request_id: str) -> str:
     """The 409 detail for a ``request_id`` that still has a request in flight."""
     return (
@@ -215,7 +235,7 @@ class PendingRequest:
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
     chunks: list[ResultChunk] = field(default_factory=list)
-    final_outputs: dict = field(default_factory=dict)
+    output_chunk_counts: dict[str, int] = field(default_factory=dict)
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
@@ -227,6 +247,8 @@ class PendingRequest:
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
+    # Output modality -> perf_counter of its first chunk; kept only with metrics on.
+    first_chunk_times: dict[str, float] = field(default_factory=dict)
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -332,6 +354,8 @@ class APIServer:
         # (optional) appends the report to a file instead of only stdout.
         self.log_stats = log_stats
         self.log_stats_file = log_stats_file
+        # Prometheus metrics; None until enable_metrics().
+        self.metrics: ServingMetrics | None = None
 
         # Kept so the OpenAI-compatible layer can look up the per-model adapter
         # (``model_name``) and query model-level metadata such as the audio
@@ -477,6 +501,24 @@ class APIServer:
         if fatal:
             callback()
 
+    def enable_metrics(self) -> None:
+        """Count requests from now on and serve them at ``/metrics``, and
+        have the engine workers start their histograms and counters.
+
+        ``main()`` calls this after the warmup requests, so their first-shape
+        compile times stay out of the latency histograms."""
+        # The data worker reads every result, so it is the dst of the edges
+        # out of the graph; workers report the rest through the conductor.
+        transfers = (self.preprocess_worker.enable_transfer_metrics()
+                     if self.preprocess_worker is not None else None)
+        self.metrics = ServingMetrics(
+            self.model_name, in_flight=lambda: len(self.pending_requests),
+            data_worker_queue_depth=self.preprocess_worker.queue_depth,
+            local_status=(lambda: transfers.latest) if transfers is not None else None,
+        )
+        self.preprocess_worker.report_preprocess_finish()
+        self.preprocess_worker.enable_worker_metrics()
+
     # ----------------------------------------------------------
     # Submitting a request
     # ----------------------------------------------------------
@@ -543,6 +585,8 @@ class APIServer:
                 ),
                 request_id=request_id,
             )
+        if self.metrics is not None:
+            mark_submitted()
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
@@ -620,7 +664,7 @@ class APIServer:
                 req is not None
                 and not self.preprocess_worker.has_pending_tensors(rid)
                 and self.preprocess_worker.received_final_chunks(
-                    rid, req.final_outputs
+                    rid, req.output_chunk_counts
                 )
             )
             if drained or req is None:
@@ -712,6 +756,14 @@ class APIServer:
                             self.preprocess_worker.wake()
                         continue
 
+                    if message.message_type == "conductor_status":
+                        # Sent only with --enable-metrics, from before the
+                        # warmups; dropped until enable_metrics() runs.
+                        metrics = self.metrics
+                        if metrics is not None:
+                            metrics.conductor_status(message.body)
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
@@ -753,18 +805,20 @@ class APIServer:
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
-                                if not message.body.final_outputs:
+                                if not message.body.output_chunk_counts:
                                     logger.warning(
                                         "Request %s completed with no reported "
                                         "outputs; holding for late results "
                                         "until the cleanup TTL", rid,
                                     )
                                 req = self.pending_requests[rid]
-                                req.final_outputs = message.body.final_outputs
+                                req.output_chunk_counts = message.body.output_chunk_counts
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
                                     message.body.conductor_finish_time
+                                req.profile.timing.conductor_arrival_time = \
+                                    message.body.conductor_arrival_time
                                 req.profile.graph_timings = list(message.body.graph_timings.values())
                                 # Conductor-merged worker-side transfers; extend
                                 # so they combine with the data worker's own
@@ -793,7 +847,14 @@ class APIServer:
                 # Apply data-worker profiling: preprocess-finish timestamp + raw
                 # input sizes. (The data worker's own tx/rx are snapshotted
                 # directly in _prune_recently_completed once the request is done.)
+                metrics = self.metrics
                 for update in self.preprocess_worker.get_profile_updates():
+                    # A --log-stats profile begun before metrics were on has
+                    # no dequeue time.
+                    if metrics is not None and update.dequeue_time is not None:
+                        metrics.record_preprocess(update)
+                    if update.failed:
+                        continue
                     with self.request_lock:
                         req = self.pending_requests.get(update.request_id)
                         if req is not None:
@@ -824,6 +885,8 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if metrics is not None and result_chunk.modality != "error":
+                            req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
                             result_chunk.request_id = req.request_id
                         if result_chunk.modality == "error":
@@ -849,6 +912,10 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                    if metrics is not None and result_chunk.modality != "error":
+                        metrics.record_chunk(
+                            result_chunk.modality, result_chunk.data, result_chunk.metadata,
+                        )
                 if to_wake:
                     notify_many(to_wake.values())
             except Exception:
@@ -915,6 +982,12 @@ class APIServer:
     ):
         start = time.time()
         finished = False
+        # An error chunk ends the response: whatever follows it for this
+        # request (a second error, a late output) is not part of the answer.
+        # The message thread sets req.event in the same request_lock block
+        # that appends an error chunk, so a read that sees one is also done.
+        errored = False
+        timed_out = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
@@ -925,6 +998,7 @@ class APIServer:
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
+                    timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
                 # Cleared before the read: a notification that lands after
@@ -944,6 +1018,7 @@ class APIServer:
                         done = True
 
                 if new_chunks:
+                    new_chunks, errored = _until_error(new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -957,19 +1032,26 @@ class APIServer:
                     with self.request_lock:
                         req = self.pending_requests.get(key)
                         if req:
-                            remaining = req.chunks[req.consumed_chunks:]
+                            if not errored:
+                                remaining = req.chunks[req.consumed_chunks:]
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
+                        self._record_end(finished_req, "success")
                         self._finalize_profile(finished_req)
-                    tail = list(remaining)
+                    tail, tail_errored = _until_error(remaining)
+                    errored = errored or tail_errored
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
-                    # in-band as the final chunk.
-                    if finished_req is not None and finished_req.error is not None:
+                    # in-band as the final chunk, once.
+                    if (
+                        not errored
+                        and finished_req is not None
+                        and finished_req.error is not None
+                    ):
                         tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
@@ -989,7 +1071,7 @@ class APIServer:
                     pass
         finally:
             if not finished:
-                self.abort_submission(key)
+                self.abort_submission(key, outcome="timeout" if timed_out else "abort")
 
     def async_stream_results(self, request_id: str, binary: bool = False):
         """Yield the serialized body of ``/generate`` one piece at a time.
@@ -1081,7 +1163,7 @@ class APIServer:
             if done:
                 break
             if time.time() - start > self.timeout_seconds:
-                self.abort_submission(key)
+                self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
             if raw_request is not None and await raw_request.is_disconnected():
                 self.abort_submission(key)
@@ -1093,6 +1175,7 @@ class APIServer:
             self._retire(key)
         if req is None:
             return []
+        self._record_end(req, "success")
         if req.error is not None:
             raise HTTPException(
                 status_code=req.error_status, detail=req.error
@@ -1101,6 +1184,16 @@ class APIServer:
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
         return list(req.chunks)
+
+    def _record_end(self, req: PendingRequest, outcome: str) -> None:
+        """Count a request that just left ``pending_requests``. Only the
+        caller whose ``pop`` returned it calls this, so each request counts
+        once; callers must NOT hold ``request_lock``."""
+        if self.metrics is None:
+            return
+        if req.error is not None:
+            outcome = "error"
+        self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
         """Stamp the finish time, aggregate output sizes, and emit the report.
@@ -1138,9 +1231,10 @@ class APIServer:
             key = self._live.get(request_id)
         self.abort_submission(key)
 
-    def abort_submission(self, key: str | None) -> None:
+    def abort_submission(self, key: str | None, outcome: str = "abort") -> None:
         """:meth:`abort_request` for one submission, by its key
-        (:meth:`submission_key`); a newer submission under the id is untouched."""
+        (:meth:`submission_key`); a newer submission under the id is untouched.
+        ``outcome`` is what the metrics count it as (``abort`` or ``timeout``)."""
         if key is None:
             return
         with self.request_lock:
@@ -1148,9 +1242,11 @@ class APIServer:
                 key in self.pending_requests
                 or key in self.recently_completed
             )
-            self.pending_requests.pop(key, None)
+            req = self.pending_requests.pop(key, None)
             self.recently_completed.pop(key, None)
             self._retire(key)
+        if req is not None:
+            self._record_end(req, outcome)
         if not active:
             return
         logger.info("Client cancelled request %s; releasing resources", key)
@@ -1166,7 +1262,9 @@ class APIServer:
             if finished:
                 self.pending_requests.pop(key)
                 self._retire(key)
-        if not finished:
+        if finished:
+            self._record_end(req, "abort")
+        else:
             self.abort_submission(key)
 
     # ----------------------------------------------------------
@@ -1220,7 +1318,8 @@ class WarmupMedia:
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
     request in yaml form. ``files`` are the media inputs in prompt order
-    (any modality, any number), followed by ``text`` as on ``/generate``."""
+    (any modality, any number), followed by ``text`` as on ``/generate``,
+    ``repeat`` times over (a long prompt for a long-context path)."""
 
     text: str | None = None
     files: list[WarmupMedia] = field(default_factory=list)
@@ -1231,9 +1330,17 @@ class WarmupRequest:
     def from_config(cls, spec: Any) -> "WarmupRequest":
         if not isinstance(spec, dict):
             raise ValueError("not a mapping")
-        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
+        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs", "repeat"}
         if unknown:
             raise ValueError(f"unknown key(s) {sorted(unknown)}")
+        text = spec.get("text")
+        if text is not None and not isinstance(text, str):
+            raise ValueError("text must be a string")
+        repeat = spec.get("repeat", 1)
+        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+            raise ValueError(f"repeat must be a positive integer, got {repeat!r}")
+        if repeat > 1 and not text:
+            raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]
         if isinstance(out_mods, str):
             out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
@@ -1244,7 +1351,7 @@ class WarmupRequest:
         if model_kwargs is not None and not isinstance(model_kwargs, dict):
             raise ValueError("model_kwargs must be a mapping")
         return cls(
-            text=spec.get("text") or None,
+            text=(text or "") * repeat or None,
             files=[WarmupMedia.from_config(f) for f in files],
             output_modalities=list(out_mods),
             model_kwargs=model_kwargs,
@@ -1291,7 +1398,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
     for index, spec in enumerate(specs):
         try:
             request = WarmupRequest.from_config(spec)
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 — a repeat too large to build, say
             logger.warning("warmup_requests[%d] skipped: %s", index, exc)
             continue
         t0 = time.perf_counter()
@@ -1332,6 +1439,14 @@ app.add_middleware(BodyLimitMiddleware)
 # is read.
 api_key_guard = APIKeyGuard(resolve_api_key())
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
+# Outside the key check and the body limit, which refuse before routing, and
+# inside CORS, so a browser preflight is not counted. ``routes`` must list
+# every included router's routes (test_serving_metrics checks each route).
+app.add_middleware(
+    RefusalMiddleware,
+    metrics=lambda: getattr(api_server, "metrics", None),
+    routes=lambda: (*app.router.routes, *openai_router.routes),
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1404,17 +1519,21 @@ def _ws_modalities(value, key: str) -> list[str] | None:
     raise ValueError(f"{key} must be a comma-separated string or a list of strings")
 
 
+def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
+    for ps in file_paths.values():
+        for p in ps:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
     """Delete a request's uploaded files once the preprocess worker has had
     time to read them. Shared by the HTTP and WebSocket routes."""
     def _cleanup(paths: dict[str, list[str]]) -> None:
         time.sleep(delay_s)
-        for ps in paths.values():
-            for p in ps:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError:
-                    pass
+        _remove_uploads(paths)
     threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
 
 
@@ -1436,6 +1555,11 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+def _pass_turn(turn: asyncio.Future) -> None:
+    if not turn.done():
+        turn.set_result(None)
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
@@ -1452,7 +1576,8 @@ async def generate_ws(websocket: WebSocket):
     for a ``request_id`` still in flight, as on ``/generate``); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
-    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    and the ``request_id`` tells the replies apart. They are submitted in the
+    order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
     """
     if api_server is None:
@@ -1472,7 +1597,11 @@ async def generate_ws(websocket: WebSocket):
                     payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
                 await websocket.send_text(json.dumps(payload))
 
-    async def serve_one(message: dict, binary: bool) -> None:
+    async def serve_one(
+        message: dict, binary: bool, after: asyncio.Future | None, turn: asyncio.Future,
+    ) -> None:
+        """``after`` is done once the message before this one was submitted or
+        refused; ``turn`` is this message's, for the one after it."""
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
         try:
@@ -1495,6 +1624,10 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            # Messages decode side by side but are submitted in the order they
+            # were sent; a message that decodes faster waits here.
+            if after is not None:
+                await asyncio.shield(after)
             await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
@@ -1506,6 +1639,7 @@ async def generate_ws(websocket: WebSocket):
                 streaming=True,
                 request_id=request_id,
             )
+            _pass_turn(turn)
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
             failed = False
@@ -1547,7 +1681,14 @@ async def generate_ws(websocket: WebSocket):
         finally:
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
+            if not turn.done():
+                # refused: the next message still waits for the ones before this one
+                if after is None:
+                    _pass_turn(turn)
+                else:
+                    after.add_done_callback(lambda _: _pass_turn(turn))
 
+    previous_turn: asyncio.Future | None = None
     try:
         while True:
             frame = await websocket.receive()
@@ -1565,7 +1706,9 @@ async def generate_ws(websocket: WebSocket):
             if not isinstance(message, dict):
                 await send({"request_id": None, "error": "message must be an object"}, binary)
                 continue
-            task = asyncio.create_task(serve_one(message, binary))
+            turn = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(serve_one(message, binary, previous_turn, turn))
+            previous_turn = turn
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     except WebSocketDisconnect:
@@ -1632,6 +1775,9 @@ async def generate(
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
+                # a refused request is never submitted, so the deferred cleanup
+                # below never sees what it saved
+                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
@@ -1668,6 +1814,7 @@ async def generate(
         in_mods = [p.modality for p in parts]
 
     if "video_frame" in in_mods:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="'video_frame' is an output-only modality",
@@ -1676,12 +1823,14 @@ async def generate(
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
     except json.JSONDecodeError as e:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be valid JSON",
         ) from e
 
     if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be a JSON object",
@@ -1741,6 +1890,17 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus metrics, when the server runs with ``--enable-metrics``."""
+    if api_server is None or api_server.metrics is None:
+        raise HTTPException(
+            status_code=404,
+            detail="metrics are off; start the server with --enable-metrics",
+        )
+    return Response(api_server.metrics.render(), media_type=api_server.metrics.content_type)
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     if api_server is not None:
@@ -1779,8 +1939,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--api-key", type=str, default=None,
-        help=f"Require 'Authorization: Bearer <key>' on every route except /health "
-             f"(default: {API_KEY_ENV}; unset means no check). Prefer the environment "
+        help=f"Require 'Authorization: Bearer <key>' on every route except /health and "
+             f"/metrics (default: {API_KEY_ENV}; unset means no check). Prefer the environment "
              f"variable: a flag shows in the process list",
     )
     parser.add_argument("--mooncake-port", type=int, default=8080)
@@ -1829,6 +1989,10 @@ def main(argv: list[str] | None = None):
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
     parser.add_argument(
+        "--enable-metrics", action="store_true",
+        help="Serve Prometheus metrics at /metrics (needs mstar[metrics])",
+    )
+    parser.add_argument(
         "--rust-frontend", action="store_true",
         help="Serve HTTP from the Rust mstar-server binary instead of "
              "uvicorn/FastAPI; the Python process keeps preprocessing "
@@ -1840,6 +2004,8 @@ def main(argv: list[str] | None = None):
              "$PATH, then rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.enable_metrics and MISSING_DEPENDENCY is not None:
+        parser.error(INSTALL_HINT)
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
 
@@ -1902,6 +2068,8 @@ def main(argv: list[str] | None = None):
             CommProtocol(args.tensor_comm_protocol),
             args.tcp_transfer_device
         ),
+        # The API server drops these until enable_metrics(), after the warmups.
+        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
@@ -1920,6 +2088,8 @@ def main(argv: list[str] | None = None):
         if warmups:
             logger.info("Running %d warmup request(s) before binding", len(warmups))
             _run_warmup_requests(api_server, warmups)
+        if args.enable_metrics:
+            api_server.enable_metrics()
         if args.rust_frontend:
             import tempfile
 

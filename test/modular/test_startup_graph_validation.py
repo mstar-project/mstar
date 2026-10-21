@@ -605,6 +605,12 @@ def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
 
+def _fish_s2_pro(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.fish_s2_pro.config import FishS2ProConfig
+    from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel
+    return _bare(FishS2ProModel, config=FishS2ProConfig())
+
+
 def _flux2(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinConfig
     model = _constructed(name, model_kwargs)
@@ -677,6 +683,7 @@ _FACTORIES = {
     "BagelModel": _bagel,
     "ChatterboxModel": _chatterbox,
     "Cosmos3Model": _cosmos3,
+    "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,

@@ -20,12 +20,15 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT
+from test_kv_prefix_correctness import KV, NODE, PAGE_SIZE, ROOT, ROPE
 from test_kv_prefix_correctness import _Node as _TextNode
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.engine.resources import StepContext
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.position.config import PositionStep
+from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.base import PrefixStream, Span
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -106,6 +109,19 @@ class _Node(_TextNode):
         else:
             self.step(RID, length - tokens, walk)
         return tokens
+
+    def mixed_step(self, spans: dict[str, int], walks: dict[str, str]) -> None:
+        """One step of a combined walk, each row writing its span under its own walk."""
+        step = SubmoduleStep(
+            steps={KV: KVStep(), ROPE: PositionStep()},
+            segments=[Segment(rid, "main", span) for rid, span in spans.items()],
+        )
+        step.set_ctx(StepContext(
+            request_ids=tuple(spans), graph_walk="mixed", slot=0, capture=False, request_walks=walks,
+        ))
+        assert self.runner.admit(step).outcome.ok
+        self.runner.plan(step)
+        self.runner.commit(step)
 
     @property
     def stream(self):
@@ -247,4 +263,16 @@ def test_a_different_image_is_never_served_another_images_end():
 
     assert node.probe(IMAGE_WALK, 10).tokens == 0, (
         "a request was served the end of another image laid out in the same slots"
+    )
+
+
+def test_a_prompt_prefilled_beside_a_decode_is_matched_by_its_repeat():
+    prompt = list(range(500, 500 + 3 * PAGE_SIZE))
+    node = _Node(parts=[prompt])
+    node.runner.ingest_request("first", {"kv": _config([prompt])})
+
+    node.mixed_step({"first": len(prompt), "seed": 1}, {"first": TEXT_WALK, "seed": "decode"})
+
+    assert node.walk(TEXT_WALK, len(prompt)) == 2 * PAGE_SIZE, (
+        "a prompt prefilled in a step of a combined walk filed no pages, so its repeat recomputed it"
     )

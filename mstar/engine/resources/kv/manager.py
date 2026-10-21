@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -234,6 +235,9 @@ class CacheStream:
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
+    # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
+    # miss (a refused admit prepares the step again) is not counted twice
+    prefix_counted: bool = False
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -257,6 +261,13 @@ class CacheStream:
         same tokens back, so the chain that describes them has to survive it.
         """
         self.chain = None
+
+
+class KVPageCounts(NamedTuple):
+    used: int
+    total: int
+    # pages the prefix index names; some may also be in ``used`` by a request
+    cached: int
 
 
 @dataclass
@@ -491,6 +502,9 @@ class KVManager(AttentionResource):
         )
         self._prefix_root: bytes | None = None
         self._index: PrefixIndex | None = None
+        # node -> (prompt tokens looked up in the index, tokens it held), one
+        # lookup per request stream; read by the worker's metrics
+        self.prefix_tokens: dict[str, tuple[int, int]] = {}
         # label -> the walks its keys describe; a label not here is not gated
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
@@ -538,12 +552,15 @@ class KVManager(AttentionResource):
         # (rid, label) -> pages the live reservation freshly acquired, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
         # or the GPU thread holds a reservation at a time, and the unwind has to
-        # find it whichever it was.
+        # find it whichever it was. Admit, commit and unwind each touch only
+        # their own step's rows: the unbatched fallback admits every request
+        # before any runs, and a refusal unwinds the ones already admitted.
         #
         # Handle-keyed, so it MUST be purged when the handle is released: handles
         # are recycled, and a stale entry would resolve against whichever request
-        # gets that handle next. ``admit`` clears the record, but a pre-planned
-        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
+        # gets that handle next. ``admit`` clears its rows' entries, but a
+        # pre-planned step's admit returns first -- see ``remove_request`` /
+        # ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
@@ -607,6 +624,16 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def page_counts(self) -> KVPageCounts:
+        """The pool's pages right now, without the manager lock: each count is
+        read whole, though the three may straddle an allocation."""
+        total = self._arena.allocator.max_num_pages - 1  # without SINK_PAGE
+        index = self._index
+        return KVPageCounts(
+            used=total - self._arena.num_free, total=total,
+            cached=0 if index is None else index.num_pages(),
+        )
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
     ) -> CachedPrefix | None:
@@ -644,14 +671,14 @@ class KVManager(AttentionResource):
                 # Above one rank only a lease from `lease_cached_prefix` or `adopt_cached_prefix` answers.
                 # A lookup here would see this rank's commits since rank 0 sent the step.
                 return self._answer(label, chain, 0)
-        if not self._lease(rid, label, stream, chain):
+        if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
             if stream.lease is None:
                 return None
             return self._answer(label, chain, stream.lease_len)
 
-    def _lease(self, rid: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
+    def _lease(self, rid: str, node_name: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
         """Lease what the index holds of the stream's prompt, unless the stream holds a lease already.
         False if the stream was removed while its keys were hashed."""
         self._root(chain)
@@ -682,6 +709,11 @@ class KVManager(AttentionResource):
                         else:
                             matched, held = matched + cached + own, end
                     break
+                if not stream.prefix_counted:
+                    stream.prefix_counted = True
+                    # one assignment, so a reader on another thread never sees half of it
+                    queried, hit = self.prefix_tokens.get(node_name, (0, 0))
+                    self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if matched:
                     stream.lease, stream.lease_len = matched, held
             return True
@@ -720,7 +752,7 @@ class KVManager(AttentionResource):
                 or stream.converted or stream.stored_len or stream.offloaded or stream.read_pending
             ):
                 return None
-        if not self._lease(rid, label, stream, chain):
+        if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
             return stream.lease
@@ -881,10 +913,9 @@ class KVManager(AttentionResource):
             or chain is None
         ):
             return
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and (
-            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
-        ) not in walks:
+        if walks is not None and walk not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -904,7 +935,7 @@ class KVManager(AttentionResource):
             end = chain.consumed + chain.spans[chain.done].length
             # Checking every span would end the chain at the first one the cache filled rather than this walk.
             if chain.consumed < stream.stored_len and end > start and (
-                chain.spans[chain.done].walk != ctx.graph_walk
+                chain.spans[chain.done].walk != walk
             ):
                 stream.chain = None
                 return
@@ -1482,7 +1513,8 @@ class KVManager(AttentionResource):
             # stale and the clear below is right for this path.
             self.clear_preplan()
         with self._lock:
-            self._admit_reserved_pages.clear()
+            if self._admit_reserved_pages:
+                self._forget_step_reservations(ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -1557,7 +1589,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
+                if segment.span == 0 or self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1581,11 +1613,11 @@ class KVManager(AttentionResource):
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
             # this step has already been given. last, and only once every
-            # reservation above succeeded, so a refusal has nothing to unwind.
+            # reservation above succeeded, so a refusal here sets none.
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1604,18 +1636,31 @@ class KVManager(AttentionResource):
         return ADMIT_OK
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
-        """Give back the pages this admit freshly acquired. Does not touch pages
-        retained by a shared prefix or a lease converted onto the stream.
+        """Give back the pages this admit freshly acquired, and clear the
+        ``step_in_flight`` marks over the step's segments as ``commit`` does.
+        Does not touch pages retained by a shared prefix or a lease converted
+        onto the stream.
 
         ``page_indices`` maps token position to page, so the reserved pages can
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
         """
         self._touch_plan_cache()
-        del step, ctx
         with self._lock:
-            reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
-            for (rid, label), pages in reserved.items():
+            # No owner check: every rollback finishes before `commit_done` is
+            # released, and the only pre-admit (`Worker._preplan_spec`) waits on
+            # it, so no other uncommitted step can hold marks on these streams.
+            # `.get` as in `admit`: a refusal can come before a stream exists
+            for segment in step.segments:
+                stream = self._streams.get(
+                    segment.request_id, {}
+                ).get(segment.label)
+                if stream is not None:
+                    stream.step_in_flight = False
+            reserved = self._admit_reserved_pages
+            mine = [key for key in reserved if ctx.is_real_row(key[0])]
+            for rid, label in mine:
+                pages = reserved.pop((rid, label))
                 if not pages:
                     continue  # `page_indices[:-0]` would empty the whole stream
                 stream = self._streams.get(rid, {}).get(label)
@@ -1643,6 +1688,12 @@ class KVManager(AttentionResource):
         for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
             del self._admit_reserved_pages[key]
 
+    def _forget_step_reservations(self, ctx: StepContext) -> None:
+        """Drop the unwind record of this step's rows only. Caller holds the lock."""
+        reserved = self._admit_reserved_pages
+        for key in [k for k in reserved if ctx.is_real_row(k[0])]:
+            del reserved[key]
+
     def _sequence_views(
         self,
         segments: list[Segment],
@@ -1653,7 +1704,7 @@ class KVManager(AttentionResource):
         page_size = self.kv_cache.page_size
         pending_forks = pending_forks or {}
         for s in segments:
-            if ctx is not None and ctx.is_padding_row(s.request_id):
+            if ctx is not None and self._on_sink(ctx, s.request_id):
                 # A padding row reads and writes SINK_PAGE; the engine
                 # discards its output.
                 views.append(SequenceView(
@@ -2214,9 +2265,17 @@ class KVManager(AttentionResource):
         """The step's real rows its forks apply to: all of them unless it names some."""
         return [
             rid for rid in ctx.padded_request_ids
-            if not ctx.is_padding_row(rid)
+            if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _on_sink(ctx: StepContext, rid) -> bool:
+        """Whether ``rid`` runs against SINK_PAGE and holds no pages: a
+        replay's padding row, or any row of a capture. A capture's rows are the
+        padding rows its replays will run, so they run the same way, and no
+        bucket's sizing or capture depends on how many pages the pool has."""
+        return ctx.capture or ctx.is_padding_row(rid)
 
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
@@ -2266,9 +2325,10 @@ class KVManager(AttentionResource):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             # committed, so there is nothing left to unwind
-            self._admit_reserved_pages.clear()
+            if self._admit_reserved_pages:
+                self._forget_step_reservations(ctx)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing
                 stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
@@ -3216,11 +3276,23 @@ class KVManager(AttentionResource):
         )
 
     @torch.compiler.disable
+    def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
+        device tensors, for a kernel that writes the cache itself. Under a capture lease they
+        are the slot's static buffers, so a graph replays with the next step's slots."""
+        if label is None:
+            label = self._default_label
+        plan_state = self._current_plan_states[label]
+        n = plan_state.total_tokens
+        return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None = None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
-        """Write K, V into this step's planned slots.
+        """Write K, V into this step's planned slots (under MLA: the per-token
+        latent as ``k`` and ``v=None``).
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
@@ -3233,7 +3305,7 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,

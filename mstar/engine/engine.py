@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -70,6 +70,7 @@ from mstar.utils.profiler import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,13 @@ def checkpoint_identity(path: str | Path) -> bytes:
     if config.is_file():
         parts.append(config.read_bytes())
     return fingerprint(*parts)
+
+
+class PagedKVCache(NamedTuple):
+    key: str
+    # the nodes on this engine that use it
+    nodes: frozenset[str]
+    cache: "KVManager"
 
 
 @dataclass
@@ -454,6 +462,8 @@ class Engine:
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
         self._resources: dict[str, Resource] = {}
+        # resource key -> the nodes on this engine that use it
+        self._resource_nodes: dict[str, frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -543,6 +553,7 @@ class Engine:
 
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
+            self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -581,6 +592,16 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
+
+    def paged_kv_caches(self) -> list[PagedKVCache]:
+        """Every paged KV cache this engine built, with the nodes that use it."""
+        from mstar.engine.resources.kv.manager import KVManager
+
+        return [
+            PagedKVCache(key, self._resource_nodes[key], resource)
+            for key, resource in self._resources.items()
+            if isinstance(resource, KVManager)
+        ]
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -971,12 +992,11 @@ class Engine:
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                     has_loopback=loopback is not None and loopback[i],
                 )
-                if req_inputs is not None:
-                    if probe_prefix:
-                        req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
-                    if probe_prefix or mixed:
-                        # the submodule reads a mixed step's rows by their own walk
-                        req_inputs.graph_walk = row_walk
+                if req_inputs is not None and probe_prefix:
+                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                if req_inputs is not None and (probe_prefix or mixed):
+                    # the submodule reads a mixed step's rows by their own walk
+                    req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
@@ -1369,6 +1389,11 @@ class Engine:
                 ctx=ctxs[rid], nvtx=nvtx
             )
             if not admit_outcome.ok:
+                # all or nothing, as a batched step's admit is: the requests
+                # admitted ahead of this one will not run either
+                for earlier in reversed(batch.request_ids[:i]):
+                    if steps[earlier] is not None:
+                        self._runner.rollback_admit(steps[earlier])
                 return merged
 
         # Step 2: drive step, plan -> forward -> commit loop.
@@ -1699,7 +1724,8 @@ class Engine:
     def _postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
-        submodule = self._submodules[batch.node_name].submodule
+        submodule_mgmt = self._submodules[batch.node_name]
+        submodule = submodule_mgmt.submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             try:
                 submodule.postprocess(
@@ -1728,6 +1754,7 @@ class Engine:
                     outputs,
                     {rid: batch.per_request_info_wrapped[rid] for rid in rids},
                     [node_inputs for _, node_inputs in live],
+                    piecewise_runners=submodule_mgmt.piecewise_runners,
                 )
             except Exception as error:
                 logger.exception(
@@ -1754,13 +1781,15 @@ class Engine:
             if not batch.rows_only:
                 self.postprocess_batch(batch, outputs)
             else:
-                submodule = self._submodules[batch.node_name].submodule
+                submodule_mgmt = self._submodules[batch.node_name]
+                submodule = submodule_mgmt.submodule
                 if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,
+                        piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
             for rid in batch.cached_rids:
-                self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         return outputs
 
     def check_stop_for_batch(

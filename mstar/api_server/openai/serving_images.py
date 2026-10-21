@@ -87,7 +87,14 @@ async def create_image_edit(
     image_path = upload_dir / f"{uuid4().hex}{ext}"
     image_path.write_bytes(image_bytes)
 
-    args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)
+    try:
+        args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)
+    except Exception as exc:
+        image_path.unlink(missing_ok=True)
+        if isinstance(exc, NotImplementedError):
+            # a model with images but no editing: the client's error, a 400
+            raise ValueError(str(exc)) from exc
+        raise
     request_id = rid("img")
 
     api.submit_request(

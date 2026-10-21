@@ -14,7 +14,12 @@ import numpy as np
 import torch
 import yaml
 
-from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestFailed
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    ConductorStatus,
+    RequestComplete,
+    RequestFailed,
+)
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -28,8 +33,9 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.observability import catalog
+from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
@@ -150,6 +156,35 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     )
 
 
+def _run_worker(worker) -> None:
+    """``worker.run()``, then unlink the tensor files the worker still owns.
+
+    A stop (the conductor's SIGTERM, a Ctrl-C) leaves the files of requests in
+    flight waiting for a TENSOR_RECEIVED or REMOVE_REQUEST that will not come,
+    in a RAM-backed dir. Only while the conductor lives: it holds the
+    deployment's IPC lock and ports until it has joined its workers, so no
+    other deployment can be using these names yet. An orphaned worker leaves
+    them, as a new deployment on the same prefix may already reuse them.
+    """
+    try:
+        worker.run()
+    finally:
+        # A Ctrl-C reaches the conductor too, and its SIGTERM lands here within
+        # milliseconds, often already pending. Finish unlinking (it resumes
+        # where it was cut), then leave with that stop.
+        stop = None
+        while True:
+            try:
+                parent = mp.parent_process()
+                if parent is not None and parent.is_alive():
+                    worker.tensor_manager.unlink_owned_files()
+                break
+            except (KeyboardInterrupt, SystemExit) as e:
+                stop = e
+        if stop is not None:
+            raise stop
+
+
 def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
     """The device string a worker rank runs on: its own number unless the
     deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
@@ -180,15 +215,18 @@ def _worker_process_target(
     log_level: str = "INFO",
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    """Top-level target for spawned worker processes. Must be module-level for
+    picklability. ``status_interval_s`` turns on the worker's metrics."""
     # before anything in this process touches the device runtime
     apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
     # the box. Turning it into SystemExit unwinds the interpreter normally,
-    # which runs the transport's cleanup. The main process gets this for
+    # which runs the transport's cleanup (``_run_worker`` for per-tensor
+    # files, the arena's Drop for its segments). The main process gets this for
     # free from SIGINT -> KeyboardInterrupt, which is why only the workers
     # leaked.
     def _graceful_exit(_signum, _frame):
@@ -229,13 +267,14 @@ def _worker_process_target(
             device=torch.device(device),
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            status_interval_s=status_interval_s,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
-    worker.run()
+    _run_worker(worker)
 
 
 @dataclass
@@ -252,16 +291,20 @@ class RequestData:
     sharding_config: ShardingConfig | None = None
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
+    # set once request_complete goes out; after that the client must never get
+    # request_failed
+    completion_sent: bool = False
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
     partition_definitions: dict[str, PartitionDefinition] = field(default_factory=dict)
 
-    # Per-streaming-connection state (keyed by "from_partition->to_partition")
-    streaming_connections: dict[str, StreamingConnectionState] = field(default_factory=dict)
+    # Per-streaming-connection state, keyed by (from_partition, to_partition, edge_name)
+    streaming_connections: dict[tuple[str, str, str], StreamingConnectionState] = field(default_factory=dict)
 
-    # for api server recv bookeeping
-    final_outputs: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # output name -> chunks the workers emitted to the client; the API server
+    # holds the request open until it has received this many of each
+    output_chunk_counts: dict[str, int] = field(default_factory=dict)
 
     # Conductor-side profiling timestamps, in ``time.perf_counter()`` seconds.
     # Comparable with the api-server stamps because perf_counter is
@@ -269,6 +312,9 @@ class RequestData:
     # stamped.
     conductor_ingest_time: float = 0.0
     conductor_finish_time: float = 0.0
+    # when the conductor took it in (queued, or admitted on arrival); None
+    # unless metrics are on
+    conductor_arrival_time: float | None = None
     graph_timings: GraphTimings = field(default_factory=dict)
     # Tensor-transport profiling merged across workers. Keyed so repeated
     # WorkerGraphsDone updates (cumulative per worker) replace rather than
@@ -307,7 +353,31 @@ class DrainingRequest:
     failure_status: int = 500
 
 
+def _message_name(message) -> str:
+    """A message's type as a log or error text shows it: ``FAIL_REQUESTS``,
+    not ``ConductorMessageType.FAIL_REQUESTS``."""
+    message_type = getattr(message, "message_type", None)
+    if message_type is None:
+        return type(message).__name__
+    return getattr(message_type, "name", str(message_type))
+
+
+def _message_request_ids(message) -> list[str | None]:
+    """The requests a message is about: its ``request_id``, or every request a
+    FAIL_REQUESTS body names (``errors`` has no ``request_id``). ``[None]``
+    when it names none."""
+    body = getattr(message, "body", None)
+    errors = getattr(body, "errors", None)
+    if isinstance(errors, dict) and errors:
+        return list(errors)
+    return [getattr(body, "request_id", None)]
+
+
 class Conductor:
+    # Metrics are off unless __init__ gets an interval; class-level so an
+    # object built without __init__ reads them as off too.
+    _status_interval_s: float | None = None
+
     def __init__(
         self,
         model: Model,
@@ -318,7 +388,8 @@ class Conductor:
         enable_prof: bool = False,
         log_level: str = "INFO",
         tensor_comm_protocol=CommProtocol.RDMA,
-        tcp_transfer_device=""
+        tcp_transfer_device="",
+        status_interval_s: float | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
@@ -462,6 +533,21 @@ class Conductor:
         self._dist_init_port = _pick_free_tcp_port()
         self._dist_init_method = f"tcp://{hostname}:{self._dist_init_port}"
 
+        # Metrics: with an interval, the run loop sends the API server a
+        # ConductorStatus that often (see _maybe_send_status).
+        self._status_interval_s = status_interval_s
+        self._next_status = 0.0
+        # request id -> when it was queued at capacity
+        self._queued_since: dict[str, float] = {}
+        self._wg_nodes = {
+            wg_id: tuple(wg.section.get_nodes()) for wg_id, wg in self.worker_graphs.items()
+        }
+        self._components = sorted({n for nodes in self._wg_nodes.values() for n in nodes})
+        self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
+        self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        # worker id -> its latest WorkerStatus snapshots (cumulative)
+        self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
+
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
         self._launch_workers()
@@ -569,6 +655,9 @@ class Conductor:
         self.parallel_config = GlobalParallelConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
+            dist_timeout_s=self.model_config.get("dist_timeout_s"),
+            tp_allreduce=self.model_config.get("tp_allreduce"),
+            tp_allreduce_max_kb=self.model_config.get("tp_allreduce_max_kb"),
         )
 
     def _launch_workers(self):
@@ -578,6 +667,12 @@ class Conductor:
         # target runs, and it inherits os.environ.
         apply_process_env_defaults()
         keep_bootstrap_sockets_on_loopback()
+        # JIT-build the fused-MoE CUDA op once here, for a model that asks: its
+        # workers then find it cached instead of racing on the same build lock
+        if getattr(self.model, "prebuild_fused_moe", False):
+            from mstar.utils.fused_moe.align import _cuda_op_available
+
+            _cuda_op_available()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
@@ -601,7 +696,8 @@ class Conductor:
                     "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
+                    "tcp_transfer_device": self.tcp_transfer_device,
+                    "status_interval_s": self._status_interval_s,
                 },
                 daemon=False,
             )
@@ -776,7 +872,9 @@ class Conductor:
         per dest, which the consumer's fan-in path consolidates.
         """
         inputs_per_worker: dict[str, list[GraphEdge]] = defaultdict(list)
-        for edge in inputs:
+        # fanned-out edge -> (input, index) of each descriptor, for the rejoin
+        positions: dict[int, list[tuple[int, int]]] = {}
+        for e_idx, edge in enumerate(inputs):
             if not edge.tensor_info:
                 # Signal-only — broadcast to every dest worker.
                 dest_workers = sharding_config.node_to_worker.get(
@@ -786,18 +884,18 @@ class Conductor:
                     inputs_per_worker[dest_worker].append(edge.clone())
                 continue
 
-            groups: dict[tuple, list[TensorPointerInfo]] = defaultdict(list)
-            for info in edge.tensor_info:
+            groups: dict[tuple, list[int]] = defaultdict(list)
+            for i, info in enumerate(edge.tensor_info):
                 key = (
                     info.source_tp_rank,
                     info._source_node_name,
                     info._source_graph_walk,
                 )
-                groups[key].append(info)
+                groups[key].append(i)
 
-            for (src_rank, src_node, src_walk), infos in groups.items():
+            for (src_rank, src_node, src_walk), idxs in groups.items():
                 sub_edge = edge.clone()
-                sub_edge.tensor_info = infos
+                sub_edge.tensor_info = [edge.tensor_info[i] for i in idxs]
                 fanout = sharding_config.fanout_graph_edges(
                     sub_edge,
                     source_node=src_node,
@@ -806,6 +904,8 @@ class Conductor:
                     source_tp_rank=src_rank,
                 )
                 for dest_worker, sliced_edge in fanout.items():
+                    # fan-out keeps one descriptor per input descriptor, in order
+                    positions[id(sliced_edge)] = [(e_idx, i) for i in idxs]
                     inputs_per_worker[dest_worker].append(sliced_edge)
         # The split above yields one edge per (rank, node, walk), so a name
         # produced across walks arrives as several. The consumer would take the
@@ -815,6 +915,7 @@ class Conductor:
         for dest_worker, edges in inputs_per_worker.items():
             merged: list[GraphEdge] = []
             first_by_key: dict[tuple[str, str, int], GraphEdge] = {}
+            joined: dict[int, list[tuple[int, int]]] = {}
             for edge in edges:
                 if not edge.tensor_info:
                     merged.append(edge)  # signal-only, nothing to join
@@ -832,9 +933,20 @@ class Conductor:
                         f"fan-in ({first._total_fanin} vs {edge._total_fanin})"
                     )
                     first.tensor_info = first.tensor_info + edge.tensor_info
+                    joined.setdefault(id(first), list(positions[id(first)])).extend(
+                        positions[id(edge)]
+                    )
                     continue
                 first_by_key[key] = edge
                 merged.append(edge)
+            for edge in merged:
+                order = joined.get(id(edge))
+                if order is not None:
+                    edge.tensor_info = [
+                        info for _, info in sorted(
+                            zip(order, edge.tensor_info, strict=True), key=lambda p: p[0],
+                        )
+                    ]
             inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
 
@@ -925,6 +1037,8 @@ class Conductor:
                 self.max_concurrent_requests,
             )
             self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since[body.request_id] = time.perf_counter()
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
@@ -970,8 +1084,8 @@ class Conductor:
         logger.info("Rejecting request %s (%d): %s", request_id, status, error)
         self._early_reads_done.pop(request_id, None)
         self._send_remove_to_preprocess_worker(request_id)
-        self.communicator.send(
-            "api_server",
+        self._send_for_teardown(
+            request_id, "api_server",
             APIServerMessage(
                 message_type="request_failed",
                 body=RequestFailed(request_id=request_id, error_message=error, status=status),
@@ -984,6 +1098,11 @@ class Conductor:
         """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
+        # A request admitted on arrival never waited.
+        arrival_time = (
+            None if self._status_interval_s is None
+            else self._queued_since.pop(body.request_id, ingest_time)
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers()
 
         model_kwargs = body.model_kwargs or {}
@@ -1013,9 +1132,10 @@ class Conductor:
             )
 
         # Build per-connection streaming state
-        streaming_connections: dict[str, StreamingConnectionState] = {}
+        streaming_connections: dict[tuple[str, str, str], StreamingConnectionState] = {}
         for conn in topology.connections:
-            key = f"{conn.from_partition}->{conn.to_partition}"
+            # a tuple: names may hold ":" or "->" ("C:x" + "y" vs "C" + "x:y")
+            key = (conn.from_partition, conn.to_partition, conn.edge_name)
             streaming_connections[key] = StreamingConnectionState(
                 from_partition=conn.from_partition,
                 to_partition=conn.to_partition,
@@ -1041,6 +1161,7 @@ class Conductor:
             resource_configs={},
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
+            conductor_arrival_time=arrival_time,
         )
         self.requests[body.request_id] = request_data
 
@@ -1195,13 +1316,26 @@ class Conductor:
             self._finalize_draining(request_id)
 
     def _send_remove_to_preprocess_worker(self, request_id: str):
-        self.communicator.send(
-            self.PREPROCESS_WORKER,
+        self._send_for_teardown(
+            request_id, self.PREPROCESS_WORKER,
             WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id),
             ),
         )
+
+    def _send_for_teardown(self, request_id: str, entity: str, message):
+        """Send one teardown message; a send that raises is logged so it can't
+        skip the sends, drain record or free that follow it. A dead peer does
+        not raise on either transport (the send queues, then blocks at the
+        high-water mark), so this is only a backstop."""
+        try:
+            self.communicator.send(entity, message)
+        except Exception:
+            logger.exception(
+                "Could not send %s for request %s to %s",
+                _message_name(message), request_id, entity,
+            )
 
     def _finalize_draining(self, request_id: str):
         """Every reader has drained: send the hard RemoveRequest to all
@@ -1209,17 +1343,19 @@ class Conductor:
         dr = self.draining.pop(request_id, None)
         if dr is None:
             return
+        # The drain record is gone, so nothing would ever finish this teardown
+        # later: a send that raises must not skip the other sends or the free.
         for entity in dr.participants:
-            self.communicator.send(
-                entity,
+            self._send_for_teardown(
+                request_id, entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.REMOVE_REQUEST,
                     body=RemoveRequest(request_id),
                 ),
             )
         if dr.failure_error is not None:
-            self.communicator.send(
-                "api_server",
+            self._send_for_teardown(
+                request_id, "api_server",
                 APIServerMessage(
                     message_type="request_failed",
                     body=RequestFailed(
@@ -1298,7 +1434,11 @@ class Conductor:
                 )
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
-            self._remove_request(rid, request_data, failure_error=error_message)
+            try:
+                self._remove_request(rid, request_data, failure_error=error_message)
+            except Exception as exc:
+                # the other requests in the batch keep their own error
+                self._fail_after_error(rid, "failing it", exc)
 
     def _abort_request(self, request_id: str):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
@@ -1307,6 +1447,8 @@ class Conductor:
                 # Queued, never dispatched: the preprocess worker is the only
                 # holder of its (persisted) input signals, so hard-remove there.
                 self.waiting_queue.pop(i)
+                if self._status_interval_s is not None:
+                    self._queued_since.pop(request_id, None)
                 self._early_reads_done.pop(request_id, None)
                 self._send_remove_to_preprocess_worker(request_id)
                 logger.info("Aborted request %s before admission", request_id)
@@ -1343,9 +1485,14 @@ class Conductor:
         """
         workers = self._request_workers(request_data)
         participants = workers | {self.PREPROCESS_WORKER}
+        # The drain record below is what finishes this teardown (or its TTL
+        # does), so a send that raises must not skip it. The sends go first: a
+        # barrier whose READS_DONE all came early finalizes on registration,
+        # and a DRAIN_REQUEST must not reach a participant after its
+        # REMOVE_REQUEST.
         for entity in participants:
-            self.communicator.send(
-                entity,
+            self._send_for_teardown(
+                request_id, entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.DRAIN_REQUEST,
                     body=DrainRequest(request_id),
@@ -1374,15 +1521,17 @@ class Conductor:
                 message_type="request_complete",
                 body=RequestComplete(
                     request_id=request_id,
-                    final_outputs=request_data.final_outputs,
+                    output_chunk_counts=request_data.output_chunk_counts,
                     conductor_ingest_time=request_data.conductor_ingest_time,
                     conductor_finish_time=request_data.conductor_finish_time,
                     graph_timings=request_data.graph_timings,
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
+                    conductor_arrival_time=request_data.conductor_arrival_time,
                 )
             )
         )
+        request_data.completion_sent = True
 
         # Unpersist anything still held, with correct ref counts, so producers
         # reclaim it as the final reads ACK — before the hard teardown.
@@ -1434,8 +1583,21 @@ class Conductor:
             for tx in body.tx_info:
                 request_data.tx_info[(tx.source_entity, tx.edge_name)] = tx
 
+        # From every rank: a rank reports only the chunks it sent itself, and
+        # each of those reaches the API server as its own message.
+        counts = request_data.output_chunk_counts
+        for name in body.output_signal_names:
+            counts[name] = counts.get(name, 0) + 1
+
+        # Matched by edge, not by this message's partition: a worker reports
+        # what it sent on whichever completion goes out next. Every rank's
+        # items are its own, so none is skipped.
+        if body.stream_items_sent:
+            for conn in request_data.streaming_connections.values():
+                for worker_id, n in body.stream_items_sent.get(conn.edge_name, {}).items():
+                    conn.items_sent[worker_id] = conn.items_sent.get(worker_id, 0) + n
+
         pstate = request_data.partition_states.get(partition_name)
-        request_data.final_outputs.update(body.output_loop_indices)
         if pstate is None:
             logger.warning(
                 "WorkerGraphsDone for unknown partition %s (request %s)",
@@ -1472,10 +1634,6 @@ class Conductor:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
-
-            request_data.final_outputs.update(body.output_loop_indices)
-
-            pstate.curr_forward_outputs += body.output_signal_names
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1554,11 +1712,15 @@ class Conductor:
 
         if fwd_args.request_done:
             pstate.is_done = True
-            # Signal producer_done to all outgoing connections
+            # Signal producer_done to all outgoing connections, once per
+            # consumer partition however many edges lead there
+            consumers: set[str] = set()
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
-                    self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
+                    if conn.to_partition not in consumers:
+                        consumers.add(conn.to_partition)
+                        self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         elif fwd_args.inputs:
             # Partition has inputs to send — conductor-driven
             self._send_partition_inputs(request_id, partition_name, fwd_args)
@@ -1631,6 +1793,13 @@ class Conductor:
             if walks & pdef.graph_walks:
                 consumer_workers.update(worker_ids)
 
+        # The signal ends every stream from the producer, so it carries the
+        # counts of every edge between the two partitions.
+        conns = [
+            conn for conn in request_data.streaming_connections.values()
+            if conn.from_partition == producer_partition
+            and conn.to_partition == consumer_partition_name
+        ]
         for worker_id in consumer_workers:
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
@@ -1648,6 +1817,9 @@ class Conductor:
                     ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),
+                    producer_done_items={
+                        conn.edge_name: conn.items_sent.get(worker_id, 0) for conn in conns
+                    },
                 ),
             )
             self.communicator.send(worker_id, message)
@@ -1674,6 +1846,120 @@ class Conductor:
                 time.sleep(0.01)
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
+    def _route_message(
+        self, message, done_partition_forwards: list[tuple[str, str, bool]],
+    ) -> None:
+        """Apply one message from the api server or a worker. A WORKER_GRAPHS_DONE
+        that finishes a partition's pass is queued on ``done_partition_forwards``."""
+        if message.message_type == ConductorMessageType.NEW_REQUEST:
+            self._ingest_request(message.body)
+        elif message.message_type == ConductorMessageType.ABORT_REQUEST:
+            self._abort_request(message.body.request_id)
+        elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
+            self._fail_requests(message.body)
+        elif message.message_type == ConductorMessageType.READS_DONE:
+            self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.WORKER_STATUS:
+            self._worker_metrics[message.body.worker_id] = message.body.metrics
+        elif message.message_type == ConductorMessageType.ENABLE_METRICS:
+            # Every rank: each counts the tensors it reads. Sent before any
+            # message of a request the API server submits after its warmups.
+            for worker_id in self.worker_ids:
+                self.communicator.send(worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
+                ))
+        elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
+            rid = message.body.request_id
+            # Draining requests linger in self.requests (concurrency
+            # accounting) but are being torn down — ignore late dones.
+            if rid not in self.requests or rid in self.draining:
+                logger.debug(
+                    "WORKER_GRAPHS_DONE for unknown request %s (already completed?)", rid
+                )
+                return
+
+            if self.enable_nvtx:
+                range_push("conductor._process_worker_graphs_done")
+            done_parts = self._process_worker_graphs_done(message.body)
+            for pname in done_parts:
+                done_partition_forwards.append(
+                    (rid, pname, message.body.partition_done)
+                )
+            if self.enable_nvtx:
+                range_pop()
+        else:
+            raise ValueError(f"Unknown message type: {message.message_type}")
+
+    def _fail_after_error(
+        self, request_id: str | None, step: str, exc: Exception,
+    ) -> None:
+        """Fail the one request whose handling raised, through the drain barrier,
+        so its client gets the error and its concurrency slot is freed.
+
+        A request whose ``request_complete`` already went out is only torn
+        down: its client has the result."""
+        logger.exception("Conductor error %s for request %s", step, request_id)
+        request_data = self.requests.get(request_id)
+        if request_data is None or request_id in self.draining:
+            return  # unknown, never admitted, or already being torn down
+        try:
+            self._remove_request(
+                request_id, request_data,
+                failure_error=(
+                    None if request_data.completion_sent
+                    else f"Conductor error {step}: {type(exc).__name__}: {exc}"
+                ),
+            )
+        except Exception:
+            logger.exception("Could not fail request %s", request_id)
+
+    def _maybe_send_status(self) -> None:
+        """Send the API server a ConductorStatus once per status interval.
+        The gauges are sampled here rather than kept up to date per message."""
+        now = time.perf_counter()
+        if now < self._next_status:
+            return
+        self._next_status = now + self._status_interval_s
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(message_type="conductor_status", body=self._status()),
+        )
+
+    def _status(self) -> ConductorStatus:
+        running = 0
+        in_flight = dict.fromkeys(self._components, 0)
+        for request_id, request_data in self.requests.items():
+            if request_id in self.draining:
+                continue
+            running += 1
+            # wgs of this request's current passes that have not reported back
+            nodes = set()
+            for pstate in request_data.partition_states.values():
+                if pstate.is_done:
+                    continue
+                for wg_id in pstate.current_worker_graph_ids - pstate.completed_worker_graph_ids:
+                    nodes.update(self._wg_nodes[wg_id])
+            for node in nodes:
+                in_flight[node] += 1
+        states = self._requests_gauge
+        states.set(("waiting",), len(self.waiting_queue))
+        states.set(("running",), running)
+        states.set(("draining",), len(self.draining))
+        for node, count in in_flight.items():
+            self._in_flight_gauge.set((node,), count)
+        # Summed across workers: a node's replicas each report their own; for
+        # the engine families the other ranks of a lockstep instance report
+        # nothing, while every rank counts the tensor transfers it reads.
+        by_family: dict[str, list[MetricSnapshot]] = {}
+        for snapshots in self._worker_metrics.values():
+            for snap in snapshots:
+                by_family.setdefault(snap.name, []).append(snap)
+        return ConductorStatus(metrics=[
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            *(merge(family, by_family.get(name, ()))
+              for name, family in catalog.WORKER_FAMILIES.items()),
+        ])
+
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
 
@@ -1695,54 +1981,45 @@ class Conductor:
 
                 startup_backlog = self._startup_message_backlog
                 self._startup_message_backlog = []
+                # Every message, pass and completion is isolated: the batch is
+                # already off the socket, so one that raises would otherwise
+                # take the rest of it down and they would never be resent.
                 for message in startup_backlog + self.communicator.get_all_new_messages():
-                    if message.message_type == ConductorMessageType.NEW_REQUEST:
-                        self._ingest_request(message.body)
-                    elif message.message_type == ConductorMessageType.ABORT_REQUEST:
-                        self._abort_request(message.body.request_id)
-                    elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
-                        self._fail_requests(message.body)
-                    elif message.message_type == ConductorMessageType.READS_DONE:
-                        self._handle_reads_done(message.body)
-                    elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
-                        rid = message.body.request_id
-                        # Draining requests linger in self.requests (concurrency
-                        # accounting) but are being torn down — ignore late dones.
-                        if rid not in self.requests or rid in self.draining:
-                            logger.debug(
-                                "WORKER_GRAPHS_DONE for unknown request %s (already completed?)", rid
-                            )
-                            continue
-
-                        if self.enable_nvtx:
-                            range_push("conductor._process_worker_graphs_done")
-                        done_parts = self._process_worker_graphs_done(message.body)
-                        for pname in done_parts:
-                            done_partition_forwards.append(
-                                (rid, pname, message.body.partition_done)
-                            )
-                        if self.enable_nvtx:
-                            range_pop()
-                    else:
-                        raise ValueError(f"Unknown message type: {message.message_type}")
+                    try:
+                        self._route_message(message, done_partition_forwards)
+                    except Exception as exc:
+                        step = f"handling {_message_name(message)}"
+                        for request_id in _message_request_ids(message):
+                            self._fail_after_error(request_id, step, exc)
 
                 completed_requests = []
 
                 for request_id, partition_name, p_done in done_partition_forwards:
                     if request_id not in self.requests or request_id in self.draining:
                         continue  # already completed by another partition in this cycle
-                    all_done = self._process_done_forward(
-                        request_id, partition_name,
-                        partition_done_from_worker=p_done,
-                    )
+                    try:
+                        all_done = self._process_done_forward(
+                            request_id, partition_name,
+                            partition_done_from_worker=p_done,
+                        )
+                    except Exception as exc:
+                        self._fail_after_error(
+                            request_id, f"advancing partition {partition_name}", exc,
+                        )
+                        continue
                     if all_done:
                         completed_requests.append(request_id)
 
                 for request_id in dict.fromkeys(completed_requests):
                     if request_id in self.requests and request_id not in self.draining:
-                        self._process_request_done(request_id)
+                        try:
+                            self._process_request_done(request_id)
+                        except Exception as exc:
+                            self._fail_after_error(request_id, "completing it", exc)
 
                 self._sweep_expiry()
+                if self._status_interval_s is not None:
+                    self._maybe_send_status()
 
             except Exception:
                 logger.exception("Conductor error in main loop")

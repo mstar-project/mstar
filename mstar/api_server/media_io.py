@@ -341,22 +341,107 @@ def check_resample_rate(rate: int, target: int) -> None:
         raise ValueError(f"unsupported sample rate {rate} Hz; resample the audio to a standard rate")
 
 
-def decode_audio(path: str, sample_rate: int = 16000):
-    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
+# Longest request audio any decoder here produces (transcription uploads, chat
+# and /generate audio, reference clips): the transcription route's limit.
+MAX_AUDIO_SECONDS = 30 * 60
+_SOUNDFILE_BLOCK_SECONDS = 10
+# libsndfile's MP3 decoder is seamless across reads only at whole 1152-sample
+# MPEG frames; a read that splits a frame glitches the samples after it
+_SOUNDFILE_BLOCK_ALIGN = 1152
+
+
+class AudioRefusedError(ValueError):
+    """Audio a decoder opened and refuses (too long, or an unsupported rate):
+    callers re-raise it rather than fall back to another decoder."""
+
+
+class AudioTooLongError(AudioRefusedError):
+    """Audio that decodes past the limit, whatever its header declares."""
+
+    status_code = 413
+
+    def __init__(self, max_seconds: float):
+        self.max_seconds = max_seconds
+        super().__init__(f"audio is longer than the {max_seconds:g} s limit")
+
+
+def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
+    """libsndfile decode of ``path``: float32 mono at the file's own rate.
+
+    Reads in blocks and counts the frames it decodes, so a header that hides
+    or understates the length cannot make the read unbounded; past
+    ``max_seconds`` it raises :class:`AudioTooLongError`. A rate outside
+    ``1..MAX_SAMPLE_RATE`` is refused (:class:`AudioRefusedError`) before
+    any read. A container libsndfile cannot read raises soundfile's own error.
+    """
+    import soundfile as sf
+
+    with sf.SoundFile(path) as f:
+        rate = f.samplerate
+        # the frame cap scales with the rate; the range alone here, the
+        # kernel to the caller's target is checked after the decode
+        try:
+            check_resample_rate(rate, rate)
+        except ValueError as exc:
+            raise AudioRefusedError(str(exc)) from None
+        limit = int(max_seconds * rate)
+        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate // _SOUNDFILE_BLOCK_ALIGN) * _SOUNDFILE_BLOCK_ALIGN
+        parts, frames = [], 0
+        while True:
+            data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
+            if not len(data):
+                break
+            frames += len(data)
+            if frames > limit:
+                raise AudioTooLongError(max_seconds)
+            parts.append(data.mean(axis=1))
+    return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
+
+
+def decode_torchcodec_capped(path: str, sample_rate: int, max_seconds: float = MAX_AUDIO_SECONDS):
+    """FFmpeg (torchcodec) decode of ``path``: a float32 mono tensor at
+    ``sample_rate``, the same samples ``get_all_samples()`` returns.
+
+    The decode stops just past ``max_seconds`` of play time, and the audio is
+    refused with :class:`AudioTooLongError` when it plays longer or holds
+    more samples than that. The decoder resamples every frame to
+    ``sample_rate``, so what is counted is decoded output, not the rate or
+    duration the container declares.
+    """
+    return torchcodec_samples_capped(path, max_seconds, sample_rate=sample_rate, num_channels=1).data[0]
+
+
+def torchcodec_samples_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS, **decoder_args):
+    """``AudioDecoder(path, **decoder_args)``'s samples from the stream's first
+    frame, as ``get_all_samples()`` returns them, decoding just past
+    ``max_seconds`` of play time; refused with :class:`AudioTooLongError` when
+    the audio plays longer or holds more samples than that."""
+    from torchcodec.decoders import AudioDecoder
+
+    decoder = AudioDecoder(path, **decoder_args)
+    # play time counts from the stream's first timestamp, which need not be 0
+    start = max(0.0, getattr(decoder.metadata, "begin_stream_seconds_from_header", None) or 0.0)
+    samples = decoder.get_samples_played_in_range(start, start + max_seconds + 1.0)
+    rate = decoder_args.get("sample_rate") or samples.sample_rate
+    played = samples.pts_seconds - start + samples.duration_seconds
+    if played > max_seconds or samples.data.shape[-1] > max_seconds * rate:
+        raise AudioTooLongError(max_seconds)
+    return samples
+
+
+def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_AUDIO_SECONDS):
+    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
+    refused with :class:`AudioTooLongError` past ``max_seconds``.
 
     libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
     then torchcodec for the rest (m4a, webm, ...).
     """
     try:
-        import soundfile as sf
-
-        audio, sr = sf.read(path, dtype="float32", always_2d=True)
-        audio = audio.mean(axis=1)
+        audio, sr = read_soundfile_capped(path, max_seconds)
+    except AudioRefusedError:
+        raise
     except Exception:  # noqa: BLE001 — not a libsndfile container
-        from torchcodec.decoders import AudioDecoder
-
-        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
-        return frames.data[0].numpy().astype(np.float32)
+        return decode_torchcodec_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
     check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         try:
@@ -413,9 +498,80 @@ def split_windows(
     return pieces
 
 
+class StreamResampler:
+    """Resample a stream that arrives in pieces of any size (``push``), with
+    the same output however it was split. A Kaiser-windowed sinc lowpass at
+    the lower Nyquist, applied polyphase: output ``k`` is centered on input
+    time ``k * rate_in / rate_out``, so timing is kept exactly. The passband
+    is flat to 0.1 dB up to 0.9 of the lower Nyquist and 3 dB down at 0.94
+    (7.2 and 7.5 kHz at 24 to 16 kHz), close to what a 16 kHz recording
+    holds; anything above that Nyquist, which would fold back, is down 46 dB
+    or more, and 100 dB from 1.06 of it on. Each output waits for half a
+    kernel of input past its center (72 samples, 3 ms, at 24 to 16 kHz); ``flush``
+    emits the rest as if the input went on as
+    silence, ``ceil(n_in * rate_out / rate_in)`` samples in all, and starts
+    over. The kernel has ``2 * half_width * max(up, down) + 1`` taps for the
+    reduced ratio ``up/down``, so callers bound the rates."""
+
+    def __init__(self, rate_in: int, rate_out: int, half_width: int = 48, beta: float = 10.0, rolloff: float = 0.95):
+        g = math.gcd(rate_in, rate_out)
+        self.up, self.down = rate_out // g, rate_in // g
+        self.half = half_width * max(self.up, self.down)        # kernel half length, upsampled samples
+        n = np.arange(-self.half, self.half + 1)
+        cutoff = rolloff * 0.5 / max(self.up, self.down)          # cycles per upsampled sample
+        self.kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.kaiser(n.size, beta) * self.up
+        self.reset()
+
+    def reset(self) -> None:
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._base = 0      # input index of _buf[0]
+        self._n_in = 0      # input samples pushed
+        self._k_out = 0     # output samples emitted
+
+    def push(self, x: np.ndarray) -> np.ndarray:
+        self._buf = np.concatenate([self._buf, np.asarray(x, dtype=np.float64)])
+        self._n_in += int(np.size(x))
+        # output k is final once every input within half a kernel of it is in
+        return self._emit(-(-(self._n_in * self.up - self.half) // self.down))
+
+    def held(self, extra: int = 0) -> int:
+        """Output samples ``flush`` would still emit, after ``extra`` more
+        input samples."""
+        return -(-((self._n_in + extra) * self.up) // self.down) - self._k_out
+
+    def flush(self) -> np.ndarray:
+        out = self._emit(-(-(self._n_in * self.up) // self.down))
+        self.reset()
+        return out
+
+    def _emit(self, k_end: int) -> np.ndarray:
+        up, down, half = self.up, self.down, self.half
+        if k_end <= self._k_out or not self._buf.size:
+            n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
+            return np.zeros(n, dtype=np.float32)
+        span = half // up + 1
+        taps = np.arange(-span, span + 1)[None, :]
+        out = []
+        for k0 in range(self._k_out, k_end, 4096):              # bounds the gather to 4096 rows
+            t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
+            ns = t // up + taps                                  # candidate input indices
+            idx = t - ns * up + half
+            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
+            vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
+            out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
+        self._k_out = k_end
+        keep = max(self._base, -(-(k_end * down - half) // up))  # first input the next output needs
+        self._buf = self._buf[keep - self._base:]
+        self._base = keep
+        return np.concatenate(out).astype(np.float32)
+
+
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``."""
-    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
+    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
+    sample."""
+    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
+    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
     Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 

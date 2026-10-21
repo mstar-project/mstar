@@ -112,3 +112,32 @@ def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
 
     assert response.status_code == 500
     assert response.json()["detail"].startswith("downstream failure")
+
+
+class _UploadServer(_RecordingServer):
+    def __init__(self, upload_dir):
+        super().__init__()
+        self.upload_dir = upload_dir
+
+
+@pytest.mark.parametrize("files,fields,detail", [
+    ([("clip.wav", b"RIFF"), ("notes.xyz", b"?")], {}, "Cannot determine modality for file: notes.xyz"),
+    ([("clip.wav", b"RIFF")], {"input_modalities": "video_frame"}, "'video_frame' is an output-only modality"),
+    ([("clip.wav", b"RIFF")], {"model_kwargs": "{"}, "model_kwargs must be valid JSON"),
+    ([("clip.wav", b"RIFF")], {"model_kwargs": "[1]"}, "model_kwargs must be a JSON object"),
+], ids=["unknown-file", "video-frame-input", "bad-json", "not-an-object"])
+def test_a_refused_generate_leaves_no_upload_behind(monkeypatch, tmp_path, files, fields, detail):
+    """A request refused after its files are saved is never submitted, so the
+    deferred cleanup never sees them; the refusal deletes them."""
+    server = _UploadServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+
+    response = TestClient(entrypoint.app).post(
+        "/generate",
+        data={"text": "hi", **fields},
+        files=[("files", (name, data, "application/octet-stream")) for name, data in files],
+    )
+
+    assert (response.status_code, response.json()) == (400, {"detail": detail})
+    assert server.streaming is None
+    assert list(tmp_path.iterdir()) == []

@@ -89,6 +89,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_tts_base``
      - ``Qwen/Qwen3-TTS-12Hz-1.7B-Base``
      - 1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).
+   * - ``fish_s2_pro``
+     - ``fishaudio/s2-pro``
+     - Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over 10 codebooks),
+       44.1 kHz causal DAC codec, voice cloning from one reference clip, inline ``[tag]``
+       prosody control. Weights under the Fish Audio Research License (non-commercial use
+       only); check it before deploying.
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -223,7 +229,7 @@ well as a KV allocation. Set ``gdn_state.max_slots`` in
 CUDA-graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint's
-``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
@@ -239,7 +245,7 @@ code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
 Its ``output_gate_type: swish`` names the gated DeltaNet norm's activation,
 which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
-the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
@@ -320,7 +326,7 @@ Qwen3-TTS notes
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
   own (first audio one Talker step after prefill), the next windows add 3, 8
   and 16 frames, then 25 new frames behind up to 72 frames of already decoded
-  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  left context, the decoder transformer's sliding window. The
   transformer stacks 8 such layers, so a window still differs slightly from a
   whole-utterance decode once an utterance outgrows the context; 25 frames of
   context differed far more. Each window size is a CUDA-graph bucket captured
@@ -365,6 +371,12 @@ Qwen3-TTS notes
   Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
   without the package. Each request's PCM is marked chunk by chunk with its own
   streaming state, so a streamed utterance carries the same mark as a whole one.
+  At startup the engine captures the generator per chunk length of the codec
+  schedule (by default 1, 3, 8, 16 and 25 frames) and batch bucket, so marking a step's
+  chunks costs one graph replay per distinct length. The captures hold GPU memory: about
+  2.5 GiB for the default 30 graphs (5 lengths, 6 batch buckets) on an H200, 5.7 GiB with
+  25 lengths. A chunk outside them (another length, more rows than the largest bucket,
+  a partial frame) runs eagerly, and the first one of each kind is logged.
   Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
   (``--message``, the deployment's payload: without it the verdict is the
   score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
@@ -407,6 +419,32 @@ the saved WAVs with ``benchmark/tts_speech_wer.py``::
    python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
        --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
        --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+
+Fish Audio S2-Pro notes
+-----------------------
+
+- The ``fishaudio/s2-pro`` weights are under the Fish Audio Research License:
+  research and non-commercial use only. M* downloads them at runtime and does
+  not redistribute them; read the license before deploying.
+- ``pip install -e '.[fish_s2_pro]'`` then ``mstar serve fish_s2_pro --gpus 0``.
+- Requests: ``/v1/audio/speech`` with ``input``; inline ``[tag]`` prosody
+  control is part of the text. Clone a voice with ``ref_audio`` (data URL,
+  base64, or an http(s) URL when the server allows remote fetch) and its transcript in
+  ``ref_text``; with the SDK, ``client.tts(text, reference_audio="ref.wav",
+  ref_text="...")``. ``voice`` and ``speed`` are ignored.
+- Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
+  ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
+  temperature first and takes top-k and top-p over the tempered probabilities,
+  while the reference takes top-p over the untempered ones, so at the same
+  values M\* keeps a slightly different set of tokens per step. The top-p
+  boundary differs as well: M\*'s sampler (FlashInfer) keeps the token whose
+  probability carries the running total past top-p, while the reference drops
+  it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
+  4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
+- Streamed audio matches the whole-utterance decode to within one int16 step:
+  each codec window carries the decoder's whole receptive field as context, and
+  the codec runs in fp32 with TF32 off.
+
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
 
@@ -547,8 +585,9 @@ Chatterbox notes
   routine resamples on the CPU); it decodes with the package's detector like
   the package's output, from which it differs by the resampler only.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
-  the first after 15 tokens (about 0.12 s on an H100), then 50, 100 and 200
-  tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
+  the first after 35 tokens on Chatterbox (1.12 s of audio, enough to
+  cover the wait for the next chunk at 4 to 8 streams) and after 15 on
+  Multilingual and Turbo, then 50, 100 and 200 tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
   / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
   the playback time to produce a bigger one, so a stream costs three or four
   flow solves instead of one per 25 tokens. Each chunk re-runs

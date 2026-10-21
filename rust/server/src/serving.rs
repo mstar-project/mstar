@@ -20,11 +20,15 @@ use uuid::Uuid;
 
 use crate::adapters::SubmitArgs;
 use crate::bridge::{Bridge, ResultChunk, StreamItem};
+use crate::refusals::{mark_submitted, Refusals};
 use crate::tokenizer::{IncrementalDecoder, Tok};
 
 #[derive(Clone)]
 pub struct AppState {
     pub model_name: String,
+    /// The model's adapter class in Python's `ADAPTER_REGISTRY`
+    /// (`MSTAR_OPENAI_ADAPTER`, set by the launcher); empty when it has none.
+    pub python_adapter: String,
     pub upload_dir: PathBuf,
     /// Fetching arbitrary http(s) media is SSRF surface; off by default.
     pub allow_remote: bool,
@@ -44,6 +48,8 @@ pub struct AppState {
     /// Present when a conductor socket dir is given (real streaming); absent =
     /// the self-contained mock generator.
     pub bridge: Option<Arc<Bridge>>,
+    /// Requests refused before submission; sent with each `/metrics` request.
+    pub refusals: Arc<Refusals>,
 }
 
 /// One item of a request's result stream.
@@ -147,7 +153,7 @@ fn raw_result_stream(
     request_id: &str,
     streaming: bool,
 ) -> Result<OutStream, (u16, String)> {
-    Ok(match &state.bridge {
+    let stream: OutStream = match &state.bridge {
         Some(b) => {
             let (sub, rx) = b
                 .submit(args, request_id, streaming)
@@ -204,7 +210,9 @@ fn raw_result_stream(
         None => Box::pin(futures::stream::iter(
             mock_chunks(args, state.sample_rate).into_iter().map(Out::Chunk),
         )),
-    })
+    };
+    mark_submitted();
+    Ok(stream)
 }
 
 /// Gather a non-streaming request's chunks; the first error wins (mstar's

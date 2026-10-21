@@ -268,6 +268,11 @@ def _preprocess_thread(model):
     wt.request_output_state = {
         "r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1),
     }
+    # not in in_flight_requests, so a failure here sends no abort;
+    # test_output_failure_teardown.py covers the abort
+    wt.in_flight_requests = set()
+    wt._draining_rids = set()
+    wt._reads_done_sent = set()
     return wt
 
 

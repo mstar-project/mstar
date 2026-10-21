@@ -20,7 +20,12 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from mstar.api_server.media_io import check_resample_rate
+from mstar.api_server.media_io import (
+    AudioRefusedError,
+    AudioTooLongError,
+    check_resample_rate,
+    torchcodec_samples_capped,
+)
 from mstar.model.omnilingual_asr.config import MAX_AUDIO_SECONDS, MIN_AUDIO_SAMPLES, SAMPLE_RATE
 
 
@@ -31,13 +36,29 @@ def decode_file(path: str) -> tuple[torch.Tensor, int]:
     libsndfile through ``soundfile`` first; then, for a WAV file, a reader here
     that scales samples as libsndfile does, so a server without soundfile still
     decodes WAV exactly; then FFmpeg through ``torchcodec`` for the containers
-    neither reads."""
+    neither reads. The two library decoders stop just past
+    ``MAX_AUDIO_SECONDS`` and refuse a longer file with
+    :class:`~mstar.api_server.media_io.AudioTooLongError`, whatever its header
+    declares."""
     errors = []
     try:
         import soundfile as sf
 
-        audio, sr = sf.read(path, dtype="float32", always_2d=False)
+        with sf.SoundFile(path) as sound:
+            sr = sound.samplerate
+            try:
+                check_resample_rate(sr, SAMPLE_RATE)
+            except ValueError as exc:
+                raise AudioRefusedError(str(exc)) from None
+            limit = int(MAX_AUDIO_SECONDS * sr)
+            # one read, as the reference's `sf.read` does: a read split inside
+            # an MP3 frame moves the samples after it
+            audio = sound.read(limit + 1, dtype="float32", always_2d=False)
+        if len(audio) > limit:
+            raise AudioTooLongError(MAX_AUDIO_SECONDS)
         return torch.from_numpy(np.ascontiguousarray(audio)), int(sr)
+    except AudioRefusedError:
+        raise
     except Exception as exc:  # noqa: BLE001 (missing, or not a libsndfile container)
         errors.append(f"soundfile: {exc}")
     with open(path, "rb") as f:
@@ -48,12 +69,12 @@ def decode_file(path: str) -> tuple[torch.Tensor, int]:
         except ValueError as exc:
             errors.append(f"wav: {exc}")
     try:
-        from torchcodec.decoders import AudioDecoder
-
-        samples = AudioDecoder(path).get_all_samples()
+        samples = torchcodec_samples_capped(path, MAX_AUDIO_SECONDS)
         data = samples.data  # (channels, time)
         data = data[0] if data.shape[0] == 1 else data.transpose(0, 1).contiguous()
         return data.float(), int(samples.sample_rate)
+    except AudioRefusedError:
+        raise
     except Exception as exc:  # noqa: BLE001 (missing, or FFmpeg cannot read it)
         errors.append(f"torchcodec: {exc}")
     # the decoders name the file; the client only needs to know it was theirs

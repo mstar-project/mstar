@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 # Optional fused Triton MoE path. Imports succeed wherever triton is
 # installed; the alignment op JIT-builds a vendored CUDA kernel on first use
-# (or falls back to a torch impl), so no sgl-kernel/vllm dep is needed. The
+# (or falls back to a torch impl), so no extra kernel package is needed. The
 # actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe import fused_experts as _fused_experts

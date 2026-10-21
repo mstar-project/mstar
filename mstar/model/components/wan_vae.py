@@ -186,8 +186,10 @@ def compile_decode(fn, deterministic: bool = False):
     channels-first, while the upsample conv that the clone is fused into
     writes it channels-last: a Wan 2.2 (``is_residual``) decode then reads
     wrong values past the buffer's end (wrong frames, NaNs or an illegal
-    memory access). On torch 2.12.1 the decoder graph-breaks before that
-    graph forms, and the option costs nothing measurable.
+    memory access). On torch 2.12.1 the ``DecoderStep`` paths graph-break
+    before that graph forms, so the option leaves them byte-identical. The
+    stateless whole-clip decode does form it there: the option moves its
+    output by up to 2 uint8 levels, at the same speed.
 
     ``deterministic`` turns on Inductor's deterministic mode where this
     torch has it (2.9.1 does not); see ``DecoderStep``.

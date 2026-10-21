@@ -1,0 +1,37 @@
+# Fish Audio S2-Pro (fishaudio/s2-pro): dual-AR TTS with reference-audio voice cloning.
+# Weights: Fish Audio Research License, non-commercial use only.
+# The AR node holds the 4B Slow AR (paged KV) and the 4-layer Fast AR; the
+# RefEncoder DAC-encodes a voice clone's reference clip ahead of its prefill;
+# the Codec node streams 44.1 kHz audio whose chunks stitch into one decode.
+model: "fish_s2_pro"
+max_seq_len: 32768
+# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
+# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+resources:
+  slow_ar_attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names: [RefEncoder, AR]
+    ranks: [0]
+    graph_walks: [ar_prefill, ar_prefill_clone, ar_decode]
+  - node_names: [Codec]
+    ranks: [0]
+    graph_walks: [codec_chunk]
+# The first request of each kind after startup otherwise pays one-time costs:
+# the AR and codec first calls for a plain request, and on an H200 with only
+# that warmup, 3.2 s TTFA for the first greedy request and 0.25 to 0.32 s for
+# the first voice clone, against 0.11 to 0.14 s after. One short request of
+# each kind before the server binds takes them. The clone clip is a 5 s sample
+# from the Apache-2.0 Kokoro-82M repo, fetched into the HF cache on first
+# start; offline without it, that warmup is skipped with a warning.
+warmup_requests:
+  - text: Hello, this is a short warmup.
+    output_modalities: [audio]
+    model_kwargs: {max_new_tokens: 32}
+  - text: Hello, this is a short warmup.
+    output_modalities: [audio]
+    model_kwargs: {max_new_tokens: 32, do_sample: false}
+  - text: Hello, this is a short warmup.
+    files: [hf://hexgrad/Kokoro-82M/samples/af_heart_0.wav]
+    output_modalities: [audio]
+    model_kwargs: {max_new_tokens: 32}

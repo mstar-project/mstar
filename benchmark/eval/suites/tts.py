@@ -53,7 +53,7 @@ class TTSSuite(Suite):
                        help="text normalizer for WER, per item language for 'whisper' (see text_metrics)")
         g.add_argument("--judge-language", default="en", help="language for the ASR judge when items have none")
         g.add_argument("--sim-judge", default="microsoft/wavlm-base-plus-sv",
-                       help="speaker-similarity judge (used when items carry ref_audio), or 'none'")
+                       help="speaker-similarity judge (used with --clone on items with ref_audio), or 'none'")
         g.add_argument("--mos", action="store_true", help="also score UTMOS22 (torch.hub)")
         g.add_argument("--judge-device", default=None, help="device for the judges (default cuda if available)")
         g.add_argument("--stall-prebuffer-ms", type=float, default=0.0,
@@ -188,7 +188,8 @@ class TTSSuite(Suite):
                 r["hyp"], r["wer"] = hyp, counts.rate
             m["wer"] = rate
             m["wer_utt_mean"] = stats.mean(c.rate for c in per)
-        clone = [r for r in ok if by_id[r["id"]].ref_audio]
+        # Without --clone the reference clip is never sent, so there is no voice to compare.
+        clone = [r for r in ok if by_id[r["id"]].ref_audio] if a.clone else []
         if clone and a.sim_judge != "none":
             judge = judges.sim_judge(a.sim_judge, a.judge_device)
             for r in clone:

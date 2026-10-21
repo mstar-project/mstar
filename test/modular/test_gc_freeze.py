@@ -24,7 +24,7 @@ def test_freeze_after_setup_moves_the_heap():
 
 def test_a_frame_of_tokens_wakes_the_thread_once():
     facade = PreprocessWorker.__new__(PreprocessWorker)
-    facade.output_loop_idxs = {"r1": {}, "r2": {}}
+    facade.received_chunk_counts = {"r1": {}, "r2": {}}
     facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
 
     class _Q:

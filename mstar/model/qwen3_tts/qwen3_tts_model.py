@@ -649,7 +649,7 @@ class Qwen3TTSModel(Model):
         import soundfile
         import torchaudio.functional as audio_functional
 
-        from mstar.api_server.media_io import check_resample_rate
+        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
         from mstar.model.media_limits import read_sound_file, sound_file_seconds
 
         # Bound the clip before decoding it: a small compressed file can hold hours of audio.
@@ -659,12 +659,14 @@ class Qwen3TTSModel(Model):
         seconds = sound_file_seconds(info.frames, info.samplerate)
         if seconds is not None:
             self._check_reference_duration(seconds)
-            waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
+            # the header can understate the length, so the decode stops at the bound too
+            waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
+            audio = torch.from_numpy(waveform)
         else:
             # no sample count in the header (a FLAC written to a pipe): count it as it decodes
             waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
             self._check_reference_duration(len(waveform) / sample_rate)
-        audio = torch.from_numpy(waveform).mean(dim=1)
+            audio = torch.from_numpy(waveform).mean(dim=1)
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)
         return TensorAndMetadata(
@@ -792,6 +794,9 @@ class Qwen3TTSModel(Model):
 
     # model_kwargs key: reference frames leading an in-context clone's codec stream
     CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
+    INTERNAL_KWARGS = (
+        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
+    )
 
     def process_prompt(
         self,
@@ -812,9 +817,9 @@ class Qwen3TTSModel(Model):
         a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
-        request sets ``non_streaming_mode``. An in-context clone also reports,
-        as ``CODEC_STREAM_LEAD_KEY``, how many reference frames lead the codec
-        stream (context only; see ``get_initial_forward_pass_args``).
+        request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
+        how many reference frames lead the codec stream (context only, 0
+        without an in-context clone; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -862,13 +867,13 @@ class Qwen3TTSModel(Model):
             PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
             SPEAKER_ID_KEY: speaker_id,
             LANGUAGE_ID_KEY: language_id,
+            # set in every mode (0 without an in-context clone): the data worker
+            # lays this over the request's own kwargs
+            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
         }
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
-        lead = min(ref_frames, self.config.codec.left_context_frames)
-        if lead:
-            metadata[self.CODEC_STREAM_LEAD_KEY] = lead
         return ProcessPromptOutput(
             {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
         )

@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 import torch
 import torch.distributed as dist
 from torch.distributed.constants import default_pg_nccl_timeout, default_pg_timeout
+from torch.distributed.distributed_c10d import _set_pg_timeout
+
+from mstar.distributed.all_reduce import AllReduce
+from mstar.distributed.utils import resolve_dist_timeout
 
 
 def default_group_timeout(backend: str) -> timedelta:
@@ -68,6 +72,15 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
+        # NCCL until ``init_all_reduce`` sets up the deployment's backend
+        self._all_reduce = AllReduce(self.device_group)
+
+    def init_all_reduce(self, mode: str | None = None, max_kb: int | None = None) -> None:
+        """Set up the all-reduce backend the deployment config's ``tp_allreduce``
+        (``mode``) and ``tp_allreduce_max_kb`` (``max_kb``) ask for (see
+        ``AllReduce.new``). Collective across the group — every member calls
+        this from ``init_dist`` at the same point."""
+        self._all_reduce = AllReduce.new(self, mode, max_kb)
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -105,11 +118,19 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
+    def all_reduce_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Where to write the partial that the next ``all_reduce`` sums. On
+        the symmetric-memory path this is the symm buffer, so ``all_reduce``
+        skips its copy in and returns the sum in a new tensor: use its return
+        value, and all-reduce nothing else on this group in between."""
+        return self._all_reduce.buffer(shape, dtype, device)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        dist.all_reduce(input_, group=self.device_group)
-        return input_
+        return self._all_reduce.all_reduce(input_)
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
@@ -317,6 +338,14 @@ class WorkerParallelGroups:
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
+    # Process-group timeout in seconds for load and warmup, from the config's
+    # ``dist_timeout_s``. None = torch default.
+    dist_timeout_s: float | None = None
+    # Small-message all-reduce path from the deployment config's
+    # ``tp_allreduce``. None = NCCL.
+    tp_allreduce: str | None = None
+    # Largest message it takes, from ``tp_allreduce_max_kb``; None = 512.
+    tp_allreduce_max_kb: int | None = None
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -365,7 +394,9 @@ class WorkerParallelGroups:
         if device.type == "xpu":
             backend = f"cpu:gloo,xpu:{backend}"
 
-        timeout = default_group_timeout(backend)
+        timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
+        # a configured dist_timeout_s covers the rendezvous store too
+        timeout = timeout_kwargs.get("timeout", default_group_timeout(backend))
         dist.init_process_group(
             backend=backend,
             store=rendezvous_store(init_method, self.global_rank, self.num_workers, timeout),
@@ -383,7 +414,9 @@ class WorkerParallelGroups:
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
-            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), **timeout_kwargs
+            )
             if device.type == "xpu":
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
             else:
@@ -392,7 +425,7 @@ class WorkerParallelGroups:
                 # members never call for a gloo group, and blocks forever.
                 rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
                     ranks=list(rank_tuple), backend="gloo",
-                    use_local_synchronization=True,
+                    use_local_synchronization=True, **timeout_kwargs,
                 )
 
         seen: set[int] = set()
@@ -408,6 +441,10 @@ class WorkerParallelGroups:
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
             comm_group.cpu_group = rank_tuple_to_cpu_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
+            # Collective rendezvous within the group. Members visit shared
+            # groups in the same relative order: GlobalParallelConfig fills
+            # every worker's dicts in one global iteration order.
+            comm_group.init_all_reduce(self.tp_allreduce, self.tp_allreduce_max_kb)
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:
@@ -502,12 +539,28 @@ class WorkerParallelGroups:
             return
         dist.barrier()
 
+    def restore_default_timeout(self) -> None:
+        """Give every group this rank holds torch's default timeout back."""
+        # the long timeout is for load and warmup; in serving a wedged rank
+        # must abort the others, not leave them waiting for hours
+        if not self.any_parallelism or not resolve_dist_timeout(self.dist_timeout_s):
+            return
+        groups = [dist.group.WORLD]
+        for comm_group in (*self.node_to_tp_group.values(), *self.node_to_sp_group.values()):
+            groups += [comm_group.device_group, comm_group.cpu_group]
+        for pg in {id(g): g for g in groups if g is not None}.values():
+            nccl = dist.get_backend(pg) == dist.Backend.NCCL
+            _set_pg_timeout(default_pg_nccl_timeout if nccl else default_pg_timeout, pg)
+
 
 class GlobalParallelConfig:
     def __init__(
         # leaving type annotation as Any due to circular import
         self, worker_graphs: dict[str, Any],
-        worker_ids: list[str]
+        worker_ids: list[str],
+        dist_timeout_s: float | None = None,
+        tp_allreduce: str | None = None,
+        tp_allreduce_max_kb: int | None = None,
     ):
         self.num_workers = len(worker_ids)
         any_parallelism = any(
@@ -555,6 +608,9 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                dist_timeout_s=dist_timeout_s,
+                tp_allreduce=tp_allreduce,
+                tp_allreduce_max_kb=tp_allreduce_max_kb,
                 node_to_parallel_shapes=frozen_parallel_shapes,
                 node_to_instance_groups=frozen_instance_groups,
             ) for i, wid in enumerate(worker_ids)

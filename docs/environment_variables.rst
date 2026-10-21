@@ -248,12 +248,20 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - unset
      - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
        ``--api-key`` overrides it). When set, every route except
-       ``/health`` needs ``Authorization: Bearer <key>``, WebSocket
+       ``/health`` and ``/metrics`` needs ``Authorization: Bearer <key>``, WebSocket
        handshakes included; unset or empty turns the check off. The
        launcher passes it on to the Rust frontend only (the conductor and
        workers do not inherit it), and
        :class:`mstar.client.MStarClient` sends it when not given
        ``api_key``. See :ref:`api-key`.
+   * - ``MSTAR_SILERO_VAD_PATH``
+     - unset
+     - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
+       ``server_vad`` turn detection, read by
+       ``realtime_vad.silero_weights``. Unset, the copy bundled with the
+       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       with a file whose inputs or outputs differ (the package's other
+       exports), ``server_vad`` sessions are refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------
@@ -276,7 +284,7 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
-       once at startup): every route except ``/health`` needs
+       once at startup): every route except ``/health`` and ``/metrics`` needs
        ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
@@ -294,7 +302,7 @@ Read by the ``mstar-server`` binary and its bridge
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
-       ``/health`` and ``/v1/models`` bypass the cap.
+       ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
@@ -305,6 +313,13 @@ Read by the ``mstar-server`` binary and its bridge
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_OPENAI_ADAPTER``
+     - set by the launcher
+     - The class name of the model's adapter in ``ADAPTER_REGISTRY``
+       (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
+       picks the OpenAI translation ``mstar-server`` uses
+       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -390,8 +405,9 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - config's ``tp_async_sched``, else ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+       deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -402,7 +418,7 @@ Worker scheduling
        continuing request without loop-back output) are derived by each
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
-       parallel nodes only. ``0``: the serial path — leader schedules
+       parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at

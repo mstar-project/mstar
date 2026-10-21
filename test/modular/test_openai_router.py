@@ -461,11 +461,12 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
         return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
 
     frames = asyncio.run(_collect())
-    # role, abc, d, audio, e, stop, DONE
-    assert [f.count("data: ") for f in frames] == [1, 3, 1, 1, 1, 1, 1]
+    # abc (the role rides on a), d, audio, e, stop, DONE
+    assert [f.count("data: ") for f in frames] == [3, 1, 1, 1, 1, 1]
     events = [json.loads(l[6:]) for f in frames[:-1] for l in f.splitlines() if l.startswith("data: ")]
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "a"}
     assert "".join(e["choices"][0]["delta"].get("content", "") for e in events) == "abcde"
-    assert events[5]["choices"][0]["delta"]["audio"]["data"] == base64.b64encode(b"\x00\x01").decode()
+    assert events[4]["choices"][0]["delta"]["audio"]["data"] == base64.b64encode(b"\x00\x01").decode()
     assert events[-1]["choices"][0]["finish_reason"] == "stop"
     assert frames[-1] == "data: [DONE]\n\n"
 
@@ -494,7 +495,7 @@ def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
         json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
     ).text
     events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
-    assert events[1]["choices"][0]["delta"]["content"] == "Paris"
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Paris"}
     assert events[-1]["error"] == {
         "message": "Error in worker: ValueError: q implies q_len_per_req=5", "type": "server_error", "code": 500,
     }
@@ -538,11 +539,53 @@ def test_chat_stream_reports_a_timeout_in_band(client_and_stub):
     stub.next_chunks = [_Chunk("text", b"Par")]
     stub.raise_after = HTTPException(status_code=500, detail="Request timed out")
     text, events = _stream_events(client)
-    assert events[1]["choices"][0]["delta"]["content"] == "Par"
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Par"}
     assert events[-1]["error"] == {"message": "Request timed out", "type": "server_error", "code": 500}
     assert not any(e.get("choices", [{}])[0].get("finish_reason") for e in events)
     assert text.rstrip().endswith("data: [DONE]")
     assert stub.aborted == [stub.last_submit["request_id"]]
+
+
+def test_chat_stream_sends_role_with_first_token(client_and_stub):
+    """Clients time TTFT at the first chunk, so none may precede the first token."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"strea"), _Chunk("text", b"ming")]
+    _, lines = _stream_events(client)
+    assert lines[0]["choices"][0]["delta"] == {"role": "assistant", "content": "strea"}
+    assert len(lines) == 3
+
+
+def test_chat_joins_a_character_split_across_tokens(client_and_stub):
+    """Byte-level BPE models emit each token's raw bytes; "é√" arrives in 4 chunks."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b) for b in (b"\xc3", b"\xa9\xe2", b"\x88", b"\x9a!")]
+    body = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]},
+    ).json()
+    assert body["choices"][0]["message"]["content"] == "é√!"
+    _, lines = _stream_events(client)
+    assert lines[0]["choices"][0]["delta"] == {"role": "assistant", "content": "é"}
+    assert "".join(l["choices"][0]["delta"].get("content", "") for l in lines) == "é√!"
+
+
+def test_chat_stream_flushes_a_truncated_character(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"a"), _Chunk("text", b"\xe2\x88")]
+    _, lines = _stream_events(client)
+    assert lines[-1]["choices"][0] == {"index": 0, "delta": {"content": "�"}, "finish_reason": "stop"}
+
+
+def test_chat_stream_without_output_still_names_the_role(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = []
+    _, lines = _stream_events(client)
+    assert lines == [lines[0]] and lines[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert lines[0]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_unsupported_model_404(client_and_stub):
@@ -600,6 +643,22 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
         data={"prompt": "make it neon", "size": "big"},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
+def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
+    """A model with image generation but no editing refuses the edit as the
+    Rust frontend does, and the saved image goes with the refusal."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == "image editing is not supported by this model"
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
 
 
 def _refuse(**kw):
