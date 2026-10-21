@@ -432,6 +432,27 @@ def test_robotics_can_skip_episodes_without_a_task():
     assert len(family_for_config("pi05", "pi05", {}, {}).select_items(items)) == 2
 
 
+def test_vjepa2_ac_fails_a_rollout_that_repeats_a_step(tmp_path):
+    """Two instances agreeing says nothing about a response that repeats one step H times."""
+    fam = family_for_config("vjepa2_ac", "vjepa2_ac", {}, {})
+    sset = sets.SampleSet("droid_v1", tmp_path, {}, [sets.Item(id=i) for i in ("ep00", "ep01")])
+    rng = np.random.default_rng(0)
+    steps = rng.standard_normal((4, 2, 1408)).astype(np.float32)
+    outputs = {"ep00": steps, "ep01": np.repeat(steps[3:], 4, axis=0)}
+    runs = []
+    for name in ("r1", "r2"):
+        (tmp_path / name / "outputs").mkdir(parents=True)
+        for item_id, out in outputs.items():
+            np.save(tmp_path / name / "outputs" / f"{item_id}.npy", out)
+        runs.append(tmp_path / name)
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, runs, None, work, "cpu")
+    check = next(c for c in sc.checks if c.name.startswith("outputs with a rollout step"))
+    assert (check.value, check.verdict, check.detail) == (1, "FAIL", "ep01")
+    assert sc.rows[0]["step_maxabs_min"] > 0 and sc.rows[1]["step_maxabs_min"] == 0.0
+
+
 def _lossless_mp4(frames: np.ndarray, path: Path, preset: str) -> None:
     import av
 
