@@ -87,7 +87,7 @@ TABLES: dict[str, Table] = {t.name: t for t in [
     Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"), ("mstar", "mstar-base", "vllm-omni", "vllm-omni-tuned"),
           ("omni-text-speech", "omni-image-speech", "omni-audio-speech"),
           note="Qwen3-Omni, spoken answers to text, image and audio questions"),
-    Table("image", ("flux2_klein", "flux2_klein_9b", "z_image_turbo"),
+    Table("image", ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "cosmos3_nano_t2i"),
           ("mstar", "mstar-base", "vllm-omni", "vllm-omni-rc", "sglang-diffusion", "sglang-diffusion-bcg",
            "ref-diffusers"), ("image-gen",),
           note="Image generation, latency at concurrency 1 and images/s above it"),
