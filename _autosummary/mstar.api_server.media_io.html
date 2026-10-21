@@ -663,12 +663,14 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.png_to_data_url"><code class="docutils literal notranslate"><span class="pre">png_to_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.read_soundfile_capped"><code class="docutils literal notranslate"><span class="pre">read_soundfile_capped()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.remove_uploads"><code class="docutils literal notranslate"><span class="pre">remove_uploads()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resample_kernel_size"><code class="docutils literal notranslate"><span class="pre">resample_kernel_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resolve_media_ref"><code class="docutils literal notranslate"><span class="pre">resolve_media_ref()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64_audio"><code class="docutils literal notranslate"><span class="pre">save_base64_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.torchcodec_samples_capped"><code class="docutils literal notranslate"><span class="pre">torchcodec_samples_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
@@ -741,23 +743,29 @@ the base install stays slim.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.read_soundfile_capped" title="mstar.api_server.media_io.read_soundfile_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_soundfile_capped</span></code></a>(path[, max_seconds])</p></td>
 <td><p>libsndfile decode of <code class="docutils literal notranslate"><span class="pre">path</span></code>: float32 mono at the file's own rate.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resample_kernel_size" title="mstar.api_server.media_io.resample_kernel_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resample_kernel_size</span></code></a>(rate, target)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.remove_uploads" title="mstar.api_server.media_io.remove_uploads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">remove_uploads</span></code></a>(file_paths, upload_dir)</p></td>
+<td><p>Delete a request's files under <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code> now.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resample_kernel_size" title="mstar.api_server.media_io.resample_kernel_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resample_kernel_size</span></code></a>(rate, target)</p></td>
 <td><p>Floats in torchaudio's default sinc kernel resampling <code class="docutils literal notranslate"><span class="pre">rate</span></code> to <code class="docutils literal notranslate"><span class="pre">target</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
 <td><p>Resolve a media reference from a request: a data URL, or an http(s) URL when remote fetch is allowed.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
 <td><p>Persist a bare base64 blob with a known <code class="docutils literal notranslate"><span class="pre">fmt</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;wav&quot;</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64_audio" title="mstar.api_server.media_io.save_base64_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64_audio</span></code></a>(b64, upload_dir, decoder)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64_audio" title="mstar.api_server.media_io.save_base64_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64_audio</span></code></a>(b64, upload_dir, decoder)</p></td>
 <td><p>Persist bare base64 that passes <a class="reference internal" href="#mstar.api_server.media_io.check_ref_audio" title="mstar.api_server.media_io.check_ref_audio"><code class="xref py py-func docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a>; return its path, or None (leaving nothing behind) when it is not base64 or not loadable audio.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_data_url" title="mstar.api_server.media_io.save_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_data_url</span></code></a>(data_url, upload_dir)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_data_url" title="mstar.api_server.media_io.save_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_data_url</span></code></a>(data_url, upload_dir)</p></td>
 <td><p>Persist a <code class="docutils literal notranslate"><span class="pre">data:&lt;mime&gt;;base64,&lt;payload&gt;</span></code> URL.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_remote_url" title="mstar.api_server.media_io.save_remote_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_remote_url</span></code></a>(url, upload_dir[, timeout])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_remote_url" title="mstar.api_server.media_io.save_remote_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_remote_url</span></code></a>(url, upload_dir[, timeout])</p></td>
 <td><p>Download an <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> URL into <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.schedule_upload_cleanup" title="mstar.api_server.media_io.schedule_upload_cleanup"><code class="xref py py-obj docutils literal notranslate"><span class="pre">schedule_upload_cleanup</span></code></a>(file_paths, upload_dir)</p></td>
+<td><p><a class="reference internal" href="#mstar.api_server.media_io.remove_uploads" title="mstar.api_server.media_io.remove_uploads"><code class="xref py py-func docutils literal notranslate"><span class="pre">remove_uploads()</span></code></a> after <code class="xref py py-data docutils literal notranslate"><span class="pre">UPLOAD_CLEANUP_DELAY_S</span></code>, for a request that was submitted and may not have been read yet.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.split_windows" title="mstar.api_server.media_io.split_windows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_windows</span></code></a>(audio, window_seconds[, ...])</p></td>
 <td><p>Cut a waveform into consecutive windows of at most <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>; concatenating them gives the input back sample for sample.</p></td>
@@ -1148,6 +1156,25 @@ any read. A container libsndfile cannot read raises soundfile’s own error.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.remove_uploads">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">remove_uploads</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">file_paths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#remove_uploads"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.remove_uploads" title="Link to this definition">#</a></dt>
+<dd><p>Delete a request’s files under <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code> now. A path elsewhere is
+left alone: no route puts one in <code class="docutils literal notranslate"><span class="pre">file_paths</span></code> today, and a file the
+server did not save is never the request’s to delete.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>file_paths</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>upload_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.resample_kernel_size">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">resample_kernel_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rate</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">target</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#resample_kernel_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.resample_kernel_size" title="Link to this definition">#</a></dt>
 <dd><p>Floats in torchaudio’s default sinc kernel resampling <code class="docutils literal notranslate"><span class="pre">rate</span></code> to <code class="docutils literal notranslate"><span class="pre">target</span></code>.</p>
@@ -1261,6 +1288,24 @@ publicly should allowlist hosts or disable remote fetch (data-URL only).</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.schedule_upload_cleanup">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">schedule_upload_cleanup</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">file_paths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#schedule_upload_cleanup"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.schedule_upload_cleanup" title="Link to this definition">#</a></dt>
+<dd><p><a class="reference internal" href="#mstar.api_server.media_io.remove_uploads" title="mstar.api_server.media_io.remove_uploads"><code class="xref py py-func docutils literal notranslate"><span class="pre">remove_uploads()</span></code></a> after <code class="xref py py-data docutils literal notranslate"><span class="pre">UPLOAD_CLEANUP_DELAY_S</span></code>, for a
+request that was submitted and may not have been read yet.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>file_paths</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>upload_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1444,12 +1489,14 @@ sample.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.png_to_data_url"><code class="docutils literal notranslate"><span class="pre">png_to_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.read_soundfile_capped"><code class="docutils literal notranslate"><span class="pre">read_soundfile_capped()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.remove_uploads"><code class="docutils literal notranslate"><span class="pre">remove_uploads()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resample_kernel_size"><code class="docutils literal notranslate"><span class="pre">resample_kernel_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resolve_media_ref"><code class="docutils literal notranslate"><span class="pre">resolve_media_ref()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64_audio"><code class="docutils literal notranslate"><span class="pre">save_base64_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.torchcodec_samples_capped"><code class="docutils literal notranslate"><span class="pre">torchcodec_samples_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
