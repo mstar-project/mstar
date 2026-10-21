@@ -543,6 +543,31 @@ def test_video_reference_goes_through_the_served_encode(tmp_path):
     assert video.SERVER_X264["wan22"] == {}  # Wan2.2 encodes with libx264's defaults
 
 
+def test_cosmos3_nano_ar_runs_the_windowed_walk(tmp_path):
+    from benchmark.correctness.families import Cosmos3Video, Cosmos3WindowedVideo, video
+
+    cfg = yaml.safe_load((REPO / "configs/cosmos3_nano_ar.yaml").read_text())
+    sset = sets.SampleSet("video_v1", tmp_path, {}, [sets.Item(id="00", prompt="p", params={"seed": 0})])
+    ar = family_for_config("cosmos3_nano_ar", "cosmos3", cfg, {})
+    assert isinstance(ar, Cosmos3WindowedVideo) and ar.self_consistency_only
+    assert {"window_mode": "kv", "window_frames": 9}.items() <= ar.requests(sset)[0].model_kwargs.items()
+    chained = family_for_config("cosmos3_nano_ar", "cosmos3", cfg, {"window_mode": "chained"})
+    assert chained.requests(sset)[0].model_kwargs["window_mode"] == "chained"
+    plain = family_for_config("cosmos3_nano", "cosmos3", cfg, {})
+    assert type(plain) is Cosmos3Video and "window_mode" not in plain.requests(sset)[0].model_kwargs
+
+    pytest.importorskip("av")
+    rng = np.random.default_rng(1)
+    frames = rng.integers(0, 256, (5, 64, 96, 3), dtype=np.uint8)
+    other = rng.integers(0, 256, (5, 64, 96, 3), dtype=np.uint8)
+    served = video.server_mp4(other, video.SERVER_X264["cosmos3"], ar.fps)
+    sc = _video_run(tmp_path, ar, frames, {"r1": served, "r2": served})
+    names = [c.name for c in sc.checks]
+    assert "median per-frame PSNR vs reference (dB)" not in names
+    assert any(n.startswith("same-seed min frame PSNR") for n in names)
+    assert any("for information only" in n for n in sc.notes)
+
+
 def test_ltx2_5_audio_video_family(tmp_path):
     import io
     import struct
