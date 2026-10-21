@@ -1247,6 +1247,8 @@ def _video_summary(a: Analysis, rows: list[dict], kind: str, has_ref: bool, has_
                           + (f", the others at least {min(lows):.1f} dB" if lows else ""), None, "context", None))
     if kind == "av":
         _av_bars(a, rows)
+    if kind == "world":
+        _world_bars(a, rows)
     for r in sorted(rows, key=lambda r: r.get("spread_gap_db") if r.get("spread_gap_db") is not None else 0):
         why = []
         if (r.get("spread_gap_db") or 0) < -SPREAD_DB:
@@ -1272,8 +1274,24 @@ def _video_summary(a: Analysis, rows: list[dict], kind: str, has_ref: bool, has_
             why.append(f"audio onset moved {r['av_lag_shift_frames']} frames against the motion onset")
         if why:
             a.flags.append(f"{r['id']}: " + "; ".join(why))
-    a.notes.append(f"PSNR curves cap identical frames at {CAP_DB:g} dB. Reference frames go through the served mp4's "
-                   "encode (SERVER_X264) before any comparison, as in the runner.")
+    a.notes.append(f"PSNR curves cap identical frames at {CAP_DB:g} dB."
+                   + (" Reference frames go through the served mp4's encode (SERVER_X264) before any comparison, as "
+                      "in the runner." if has_ref else ""))
+
+
+def _world_bars(a: Analysis, rows: list[dict]) -> None:
+    """Rollouts have no reference: how they start from the seed image, move and drift."""
+    seed = [(r["psnr_seed_image"][0], r["psnr_seed_image"][-1]) for r in rows if r.get("psnr_seed_image")]
+    if seed:
+        a.bars.append(Bar("PSNR of the first / last frame vs the seed image, median over rollouts (dB)",
+                          f"{_fmt(_med(f for f, _ in seed))} / {_fmt(_med(x for _, x in seed))}", None, "context",
+                          None))
+    t = [r["temporal"]["r1"] for r in rows if "r1" in r.get("temporal", {})]
+    if t:
+        a.bars.append(Bar("motion (frame-to-frame mean abs diff), median per rollout", _range(
+            [x["motion_median"] for x in t]), None, "context", None))
+        a.bars.append(Bar("mean luma drift, first to last frame (levels)", _range([x["luma_drift"] for x in t]), None,
+                          "context", None))
 
 
 def _av_bars(a: Analysis, rows: list[dict]) -> None:
