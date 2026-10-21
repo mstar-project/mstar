@@ -136,15 +136,13 @@ class CommGroup:
     ) -> bool:
         """Sets up the fused kernel behind ``allreduce_add_rmsnorm`` for up to
         ``max_tokens`` rows of ``hidden`` (the platform's kernel may take fewer,
-        the rest stay unfused). Collective, so every member calls it at the
-        same point. Returns whether it's available."""
+        the rest stay unfused). Collective like ``init_all_reduce``: every
+        member calls it at the same point. Returns whether it's available."""
         if self.world_size == 1 or self._ar_fusion is not None:
             return self._ar_fusion is not None
-        from mstar.distributed.ar_fusion import create_fusion
+        from mstar.distributed.ar_fusion import ARFusion
 
-        self._ar_fusion = create_fusion(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
-        )
+        self._ar_fusion = ARFusion.new(self, hidden, dtype, max_tokens)
         return self._ar_fusion is not None
 
     def graph_capture(self):
