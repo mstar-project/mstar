@@ -43,8 +43,8 @@ def write_video(frames: np.ndarray, path: Path, fps: int) -> None:
 
 
 # x264 options of each model's served mp4 (libx264, yuv420p), by model key. Cosmos3Model.postprocess uses
-# CRF 18, preset ultrafast (COSMOS3_X264_PRESET can change it) and threads 0. Wan22Model.postprocess keeps
-# libx264's defaults, CRF 23 and preset medium.
+# CRF 18, preset ultrafast (COSMOS3_X264_PRESET can change it) and threads 0. Wan22Model.postprocess and
+# LTX2_5Model.postprocess keep libx264's defaults, CRF 23 and preset medium.
 _COSMOS3_X264 = {"crf": "18", "preset": "ultrafast", "threads": "0"}
 SERVER_X264: dict[str, dict[str, str]] = {
     "cosmos3": _COSMOS3_X264,
@@ -52,6 +52,7 @@ SERVER_X264: dict[str, dict[str, str]] = {
     "cosmos3_super": _COSMOS3_X264,
     "cosmos3_super_i2v_4step": _COSMOS3_X264,
     "wan22": {},
+    "ltx2_5": {},
 }
 
 
@@ -85,6 +86,13 @@ def server_mp4_roundtrip(frames: np.ndarray, options: dict[str, str], fps: int) 
 
     with av.open(io.BytesIO(server_mp4(frames, options, fps))) as c:
         return np.stack([f.to_ndarray(format="rgb24") for f in c.decode(c.streams.video[0])])
+
+
+def as_served(frames: np.ndarray, model_key: str, fps: float) -> np.ndarray:
+    """Reference frames as a served video carries them: through the model's mp4 encode (SERVER_X264),
+    or raw for a model with no entry there."""
+    options = SERVER_X264.get(model_key)
+    return frames if options is None else server_mp4_roundtrip(frames, options, fps)
 
 
 class VideoFamily(MathSdpaReference, Family):
@@ -188,9 +196,7 @@ class VideoFamily(MathSdpaReference, Family):
         """A reference arm's saved frames as a served video would carry them: through the model's mp4
         encode (SERVER_X264), or raw for a model with no entry there."""
         if path not in cache:
-            frames = np.load(path)
-            options = SERVER_X264.get(self.model_key)
-            cache[path] = frames if options is None else server_mp4_roundtrip(frames, options, self.fps)
+            cache[path] = as_served(np.load(path), self.model_key, self.fps)
         return cache[path]
 
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
