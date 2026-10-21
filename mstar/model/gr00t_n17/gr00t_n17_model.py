@@ -387,6 +387,25 @@ class Gr00tN17Model(Model):
             )
         return None
 
+    def warmup_preprocess(self) -> None:
+        """Pay the lazy `cv2` import before the first robot observation does.
+
+        The image transform imports cv2 inside the call (`preprocessing.py:440`)
+        because OpenCV is a `gr00t_n17` extra and not a core dependency ([[D05]]),
+        so without this the first request of a server's life pays for it. Running
+        the real resize rather than importing the module warms whatever else that
+        path touches; the frame is camera-shaped so the work is the real work, and
+        it is microseconds.
+
+        Nothing else here is lazy: `__init__` already builds the processor, which
+        is the expensive part (a tokenizer and an image processor).
+        """
+        self.processor.image(np.zeros((180, 320, 3), dtype=np.uint8))
+        # The bigger half of the first request's cost is the backbone processor's
+        # jinja template: measured 15.7 ms on first use against 0.04 ms after, and
+        # `base.py:889-895` names a tokenizer as exactly what this hook is for.
+        self.processor.warmup_chat_template()
+
     # ------------------------------------------------------------------ I/O
     def process_prompt(
         self,

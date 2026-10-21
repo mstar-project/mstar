@@ -422,6 +422,22 @@ class Gr00tN17Preprocessor:
             _compose_eef(rel, frame) for rel, frame in zip(relative, ref, strict=True)
         ])
 
+    def warmup_chat_template(self) -> None:
+        """Compile the backbone processor's jinja chat template once, up front.
+
+        `apply_chat_template` costs 15.7 ms on its first call and 0.04 ms after:
+        the template is compiled lazily and cached on the processor. A server that
+        does not do this charges its first robot observation for the compile.
+        Without a backbone processor there is no template, so there is nothing to
+        warm.
+        """
+        if self.processor is None:
+            return
+        self.processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": ""}]}],
+            tokenize=False, add_generation_prompt=False,
+        )
+
     def image(self, img: np.ndarray) -> np.ndarray:
         """One uint8 ``(H, W, 3)`` frame through the reference's eval transform:
         shortest edge to 256 (area), centre crop 95%, shortest edge to 256 again
@@ -456,7 +472,30 @@ class Gr00tN17Preprocessor:
         ``process_observation``. ``video[view]`` is uint8 ``(B, T, H, W, 3)``,
         ``language`` one instruction per item, ``state[key]`` ``(B, T, D)``."""
         tag = self._tag(embodiment_tag)
+        # The per-tag view and joint-group names are the checkpoint's, so a client
+        # cannot guess them: name the ones this embodiment wants. Without this a
+        # missing view is a bare `KeyError`, which `data_worker.py:929` answers
+        # with a **500** whose body is just the key -- the same trap the top-level
+        # guards in `gr00t_n17_model.py` were added to avoid.
+        for name, want, got in (("video", self.video_keys[tag], video),
+                                ("state", self.state_keys[tag], state)):
+            missing = [k for k in want if k not in got]
+            if missing:
+                raise ValueError(
+                    f"GR00T {tag!r} needs {name} {list(want)}; missing {missing}"
+                )
         views = [np.asarray(video[v]) for v in self.video_keys[tag]]
+        # uint8, as the reference asserts (`gr00t_policy.py:276-279`), and not for
+        # tidiness: the HF image processor rescales by 1/255 whatever it is handed,
+        # so a client that normalised its frames first gets them divided twice and
+        # the model sees a black image -- same shapes, same token count, no error,
+        # plausible-looking actions. Measured: pixel mean -0.997 against -0.164.
+        bad = [v for v, a in zip(self.video_keys[tag], views, strict=True) if a.dtype != np.uint8]
+        if bad:
+            raise ValueError(
+                f"GR00T video must be uint8 (0-255); {bad} came as "
+                f"{[views[list(self.video_keys[tag]).index(v)].dtype for v in bad]}"
+            )
         batch, steps = views[0].shape[:2]
         if len(language) != batch:
             raise ValueError(f"{len(language)} instructions for a batch of {batch}")
