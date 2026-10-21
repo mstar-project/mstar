@@ -967,6 +967,12 @@ def test_image_to_video_requests_carry_the_first_frame(tmp_path):
     asyncio.run(routes._send_request_video_job(Session(), req, "http://x", model, metrics, {}))
     parts = {f[0]["name"]: f for f in sent["data"]._fields}
     assert "input_reference" in parts and parts["input_reference"][0].get("filename") == "f.png"
+    # Text-to-video too goes as multipart/form-data: SGLang Diffusion parses anything else as JSON.
+    from benchmark.request import RequestInput, _video_job_form
+
+    form = _video_job_form(model, RequestInput(req_type=RequestType.T2V, prompt="p"), {"height": 480, "width": 832})
+    assert {f[0]["name"] for f in form._fields} >= {"model", "prompt", "size"}
+    assert form().content_type.startswith("multipart/form-data")
 
 
 def test_media_rows_workloads_and_request_settings():
