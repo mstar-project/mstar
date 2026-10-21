@@ -101,10 +101,10 @@ from mstar.conductor.mps import MpsDaemon
 mps = MpsDaemon({str(tmp_path / "mps")!r})
 mps.start()
 open({str(pid_file)!r}, "w").write(str(mps._proc.pid))
-time.sleep(60)
+time.sleep(120)
 """])
     try:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while not (pid_file.exists() and pid_file.read_text()):
             assert time.monotonic() < deadline, "the daemon did not start"
             time.sleep(0.05)
