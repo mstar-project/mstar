@@ -150,8 +150,8 @@ def test_a_real_request_padding_and_release_across_the_rotation():
 
 def test_gather_scatter_follow_the_step_addressing():
     """``gather`` / ``scatter_`` address the step's rows: a replay's padding rows
-    read and write the sink and nothing else, and a ``select`` of the step
-    addresses the same slots as the step."""
+    read and write the sink and nothing else, and a step planned over a subset
+    of the requests addresses the same slots as the full step."""
     pool = build_pool(max_slots=6)
     step = decode_step(["a", "b"])
     eager = StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False)
