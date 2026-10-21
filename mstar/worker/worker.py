@@ -879,9 +879,9 @@ class Worker:
                 ).append(body.request_id)
                 return
             if body.source == MessageSource.TP_RANK_0:
-                # One held above came from rank 0 before this one, and its step has
-                # landed too. The free list hands pages back out in the order they
-                # were freed, so they go first, as on rank 0.
+                # Removals held above came from rank 0 before this one, so the ones
+                # whose step has landed go first. The free list hands pages back out
+                # in the order they were freed.
                 self._apply_removes_whose_step_landed()
 
         # Async-scheduling deferral: if this rid is currently held by an
