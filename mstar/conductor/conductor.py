@@ -46,6 +46,7 @@ from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
+    ClientStreamConsumed,
     ClientStreamInput,
     ConductorMessageType,
     DrainRequest,
@@ -1725,9 +1726,7 @@ class Conductor:
                     if conn.from_partition == partition_name:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
-                    conn.consumed_count = max(conn.consumed_count, consumed)
-                    if conn.waiting is not None:
-                        self._send_waiting(body.request_id, request_data, conn)
+                    self._absorb_consumed(body.request_id, request_data, conn, consumed)
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1743,6 +1742,32 @@ class Conductor:
             done_partitions.append(partition_name)
 
         return done_partitions
+
+    def _absorb_consumed(
+        self, request_id: str, request_data: RequestData,
+        conn: StreamingConnectionState, consumed: int,
+    ) -> None:
+        """Take a consumer's running count of the items it has consumed; a
+        client item held for room may now go."""
+        conn.consumed_count = max(conn.consumed_count, consumed)
+        if conn.waiting is not None:
+            self._send_waiting(request_id, request_data, conn)
+
+    def _client_stream_consumed(self, body: ClientStreamConsumed) -> None:
+        """A consumer's progress through its paced client streams, reported
+        after its steps rather than when its pass ends (see
+        ``ClientStreamConsumed``)."""
+        rows = zip(body.request_ids, body.edge_names, body.consumed, strict=True)
+        for request_id, name, consumed in rows:
+            request_data = self.requests.get(request_id)
+            stream = self._client_streams.get(name)
+            if request_data is None or request_id in self.draining or stream is None:
+                continue  # a late report for a request already being torn down
+            try:
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                self._absorb_consumed(request_id, request_data, conn, consumed)
+            except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
+                self._fail_after_error(request_id, "handling CLIENT_STREAM_CONSUMED", exc)
 
     def _process_done_forward(
         self, request_id: str, partition_name: str,
@@ -2098,6 +2123,8 @@ class Conductor:
             self._handle_reads_done(message.body)
         elif message.message_type == ConductorMessageType.CLIENT_STREAM_INPUT:
             self._stream_input(message.body)
+        elif message.message_type == ConductorMessageType.CLIENT_STREAM_CONSUMED:
+            self._client_stream_consumed(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
             self._worker_metrics[message.body.worker_id] = message.body.metrics
         elif message.message_type == ConductorMessageType.ENABLE_METRICS:
