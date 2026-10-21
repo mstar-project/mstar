@@ -347,9 +347,19 @@ def _key_metrics(score) -> dict:
               "log_mel_distance_db"):
         if k in m:
             out[k] = m[k]
+    # Families that compare per input modality (Qwen3-Omni: "vs_reference [image]" and so on) report exact matches
+    # per modality, and divergences summed over them.
+    exact = {k.split("[", 1)[1].rstrip("]"): v for k, v in m.items() if k.startswith("exact_vs_reference [")}
+    if exact:
+        out["exact_vs_reference"] = ", ".join(f"{mod} {v}" for mod, v in exact.items())
+    ties = [v["near_tie_divergences"] for k, v in m.items()
+            if k.startswith("vs_reference") and isinstance(v, dict) and v.get("near_tie_divergences") is not None]
+    if ties:
+        out["near_tie_divergences"] = sum(ties)
+    div = [c.value for c in score.checks if c.name.startswith("divergences vs reference")]
+    if div:
+        out["unexplained_divergences"] = sum(div) if all(isinstance(v, (int, float)) for v in div) else div[-1]
     for c in score.checks:
-        if c.name.startswith("divergences vs reference"):
-            out["unexplained_divergences"] = c.value
         if c.name.startswith("WER - reference WER"):
             out["wer_minus_reference_pt"] = c.value
     return out
