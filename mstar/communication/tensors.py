@@ -1539,6 +1539,13 @@ class TensorCommunicationManager(ABC):
             return tensor
         return self._undo_leading_shard_dim(shard_dim, tensor)
 
+    def drop_host_copies(self) -> None:
+        """Forget the host copies stored with a step's outputs once that step's
+        sends are done. They are views of buffers the producer reuses on its
+        next step, and a tensor can be sent in a later step than the one that
+        stored it (a loop's accumulated output is sent when the loop ends)."""
+        self.tensor_store.drop_cpu_tensors()
+
     def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
         if self.tensor_store.can_gc(uuid):
