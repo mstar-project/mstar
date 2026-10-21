@@ -204,6 +204,8 @@ class WaypointModel(Model):
             # raises it via ``resources: {kv: {num_sessions: N}}`` along with
             # ``max_concurrent_requests`` (see ``validate_config_yaml``).
             num_sessions=1,
+            # the nodes run without a dtype, so the ring names its own
+            dtype=torch.bfloat16,
         )
         # Logged since nothing downstream prints this ~816 MiB/world cost.
         # Uses the DECLARED num_sessions: `apply_yaml_overrides` may still
@@ -660,14 +662,11 @@ class WaypointModel(Model):
     # ------------------------------------------------------------------
 
     def get_autocast_dtype(self):
-        """Allocate BF16 resources while every node disables autocast.
-
-        The dtype layout is settled at build time (``cast_serving_dtypes()``
-        pins fp32 islands after casting the rest to bf16); this is also the
-        ring-KV allocation dtype, and returning None would silently allocate
-        the ring in fp32.
+        """None: every node disables autocast, and the dtype layout is settled
+        at build time (``cast_serving_dtypes()`` pins fp32 islands after
+        casting the rest to bf16). The ring declares its own bf16 on its spec.
         """
-        return torch.bfloat16
+        return None
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

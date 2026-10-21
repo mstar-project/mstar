@@ -15,7 +15,7 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.base import EngineResourceInfo, Resource
 
 
 @dataclass
@@ -39,10 +39,14 @@ class RecurrentBlockConfig:
         self.shape = tuple(self.shape)
         self._unsharded_shape = self.shape
 
-    def resolved_dtype(self, kv_dtype: torch.dtype | None) -> torch.dtype:
-        """The dtype the pool stores this block in; a resource planned against
-        the pool reads it here rather than from ``dtype``."""
-        return self.dtype or kv_dtype or torch.get_default_dtype()
+    def resolved_dtype(self, info: "EngineResourceInfo", resource_key: str) -> torch.dtype:
+        """The dtype the pool stores this block in: its own, else its nodes' common one
+        (`EngineResourceInfo.resolve_dtype`). A resource planned against the pool reads
+        it here rather than from ``dtype``. A declared fp8 is kept: the linear-attention
+        kernels that take one read it as is (GDN on Blackwell), with no scales to lose."""
+        if self.dtype is not None:
+            return self.dtype
+        return info.resolve_dtype(None, resource_key)
 
     def shard(self, num_shards: int) -> None:
         from mstar.distributed.utils import divide

@@ -255,7 +255,7 @@ def test_a_block_in_the_engine_dtype_takes_each_engines_own():
     pools = [
         RecurrentStatePool.build(
             RecurrentStateSpec("state", {"node"}, config),
-            EngineResourceInfo(device=torch.device("cpu"), kv_dtype=kv_dtype),
+            EngineResourceInfo(device=torch.device("cpu"), compute_dtype=kv_dtype),
         )
         for kv_dtype in (torch.bfloat16, torch.float16)
     ]

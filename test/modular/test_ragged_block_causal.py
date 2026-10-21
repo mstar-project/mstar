@@ -197,7 +197,7 @@ def manager():
             max_segments_per_request=MAX_SEGMENTS,
         ),
     )
-    return build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    return build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
 
 
 def ctx(n, lease=None) -> StepContext:

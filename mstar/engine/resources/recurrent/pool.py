@@ -157,15 +157,16 @@ class RecurrentStatePool(Resource):
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
             device=info.device, config=config, comm_group=info.joint_comm_group,
-            name=spec.resource_key, kv_dtype=info.kv_dtype, world_size=world_size,
+            name=spec.resource_key, info=info, world_size=world_size,
         )
 
     def __init__(
         self, device: torch.device, config: RecurrentStateConfig,
         comm_group: JointGroups | None = None, name: str = "recurrent_state",
-        kv_dtype: torch.dtype | None = None, world_size: int = 1,
+        info: EngineResourceInfo | None = None, world_size: int = 1,
     ):
-        """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
+        """``info`` resolves a block's ``dtype=None`` (`RecurrentBlock.resolved_dtype`);
+        without one every block must declare its dtype."""
         if config.prefix_slots and config.disable_sink_slot:
             raise ValueError(
                 "prefix_slots needs the sink slot: a captured step's padding "
@@ -185,7 +186,7 @@ class RecurrentStatePool(Resource):
             name: torch.zeros(
                 (*((config.num_layers,) if block.per_layer else ()),
                  config.max_slots + config.prefix_slots, *block.shape),
-                dtype=block.resolved_dtype(kv_dtype),
+                dtype=block.resolved_dtype(info or EngineResourceInfo(device=device), name),
                 device=device,
             )
             for name, block in config.blocks.items()

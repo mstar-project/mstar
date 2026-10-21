@@ -283,7 +283,7 @@ def manager(**config_overrides) -> FlashInferRaggedManager:
         resource_key=ATTN, nodes={"encoder"}, config=RaggedAttentionConfig(**kwargs),
     )
     return build_resource(
-        spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE),
+        spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE),
     )
 
 
@@ -331,7 +331,7 @@ def test_shards_head_counts_at_build():
     )
     mgr = build_resource(
         spec,
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, joint_comm_group=_Group()),
+        EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE, joint_comm_group=_Group()),
     )
     assert mgr._kwargs["num_qo_heads"] == HEADS // 2
     # head_dim never shards
@@ -773,7 +773,7 @@ def cross_manager() -> FlashInferRaggedCrossManager:
         resource_key="cross", nodes={"dit"},
         config=RaggedAttentionConfig(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM),
     )
-    return build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    return build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
 
 
 def av_segments(video, text, audio):

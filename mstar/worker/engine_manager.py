@@ -329,7 +329,6 @@ class EngineManager:
             parallel_groups=parallel_groups,
             device=device,
             transfer_engine_info=transfer_engine_info,
-            kv_cache_type=autocast_dtype,
             model=model,
         )
         budgets = model_config.get("max_batch_tokens") or {}

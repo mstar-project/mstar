@@ -89,7 +89,7 @@ class _Node:
         )
         self.resources = {
             spec.resource_key: build_resource(spec, EngineResourceInfo(
-                device=DEVICE, joint_comm_group=groups, transfer_engine_info=transfer, kv_dtype=DTYPE,
+                device=DEVICE, joint_comm_group=groups, transfer_engine_info=transfer, compute_dtype=DTYPE,
                 dependencies={key: by_key[key] for key in spec.depends_on()},
             ))
             for spec in specs

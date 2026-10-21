@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+import torch
+
 from mstar.engine.resources.kv.config import KVConfig, KVLayout, PagedKVConfig
-from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -63,6 +65,8 @@ class AttentionConfig:
     # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
     # ``max_seq_len`` needs; the pool's other layers keep every token.
     layers: tuple[int, ...] | None = None
+    # dtype the kernel is planned in; None takes the KV cache's, then the nodes'
+    dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         if self.sliding_window is not None and (
@@ -101,6 +105,7 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -116,6 +121,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
@@ -206,6 +213,8 @@ class CrossAttentionConfig:
     # kernel; this picks its tensor-core or CUDA-core variant (see
     # ``AttentionConfig``)
     decode_tensor_cores: bool = True
+    # dtype the kernel is planned in; None takes the context cache's, then the nodes'
+    dtype: torch.dtype | None = None
 
 
 @dataclass
@@ -230,6 +239,7 @@ class CrossAttentionSpec(NodeResourceSpec):
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
         """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
@@ -238,6 +248,8 @@ class CrossAttentionSpec(NodeResourceSpec):
             self.config.flashinfer_backend = flashinfer_backend
         if decode_tensor_cores is not None:
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 def _yaml_bool(name: str, value) -> bool:

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -87,9 +87,8 @@ class RaggedAttentionConfig:
     compile_op: bool = False
 
     # Activation dtype of the q / k / v the node hands the kernel (and of its
-    # output). A cacheless attention doesn't need to adhere to the dtype of its
-    # KV cache, so it is free to declare a separate dtype here; when None, the
-    # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
+    # output). There is no KV cache to inherit one from; when None, the nodes'
+    # resolved dtype is used.
     dtype: torch.dtype | None = None
 
     # False keeps every head on each sequence-parallel rank (TP still shards
@@ -147,6 +146,7 @@ class _RaggedSpecBase(NodeResourceSpec):
         max_segments_per_request: int | None = None,
         max_segments_per_step: int | None = None,
         max_tokens_per_request: int | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the model's —
         an image that cannot build FA3 pins FA2 here.
@@ -172,6 +172,8 @@ class _RaggedSpecBase(NodeResourceSpec):
             self.config.max_segments_per_step = max_segments_per_step
         if max_tokens_per_request is not None:
             self.config.max_tokens_per_request = max_tokens_per_request
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 @dataclass

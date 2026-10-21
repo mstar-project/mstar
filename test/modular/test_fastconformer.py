@@ -443,7 +443,7 @@ class _Encoder:
         self.front = pool(FRONT, 1, front_state_blocks(config, hop))
         self.kv = BoundedKVManager.build(
             BoundedKVSpec(KV, {"conformer_encoder"}, encoder_kv_config(config, max_slots=8)),
-            EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+            EngineResourceInfo(device=torch.device("cpu"), compute_dtype=torch.float32),
         )
         self.resources = {CONV: self.pool, FRONT: self.front, KV: self.kv}
         self.node.bind_node_resources(self.resources)

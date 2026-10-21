@@ -746,7 +746,7 @@ class KVManager(AttentionResource):
             device=info.device,
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
-            dtype=info.kv_dtype,
+            dtype=info.resolve_dtype(spec.config.dtype, spec.resource_key),
             needs_remote_transfer=info.needs_remote_transfer,
             leads=spec.leader is None or spec.leader in info.nodes,
             nodes=info.nodes,

@@ -259,6 +259,9 @@ class VoxCPM2Model(Model):
                 head_dim=stack.head_dim,
                 num_qo_heads=stack.num_attention_heads,
                 max_seq_len=self.config.max_length,
+                # the Talker runs outside autocast, so its caches can't take its dtype; bf16
+                # is what its weights load in
+                dtype=torch.bfloat16,
             )
             # the shipped max_concurrent_requests at the full context, and the
             # sink page: 2049 pages, about 9.7 GB for both LMs

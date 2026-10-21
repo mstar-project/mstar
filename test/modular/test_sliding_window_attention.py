@@ -74,7 +74,7 @@ def build_manager(window, device="cpu", backend=AttnBackend.FLASHINFER, kv_confi
     if kv_config is None:
         resolve_spec_dependencies([kv, spec])
     return AttentionManager.build(spec, EngineResourceInfo(
-        device=torch.device(device), dependencies={"kv": kv}, kv_dtype=torch.bfloat16,
+        device=torch.device(device), dependencies={"kv": kv}, compute_dtype=torch.bfloat16,
     ))
 
 
@@ -534,7 +534,7 @@ class _Stack:
             device=torch.device("cuda"), dtype=torch.bfloat16,
         )
         info = EngineResourceInfo(
-            device=torch.device("cuda"), kv_dtype=torch.bfloat16, dependencies={"kv": specs["kv"]},
+            device=torch.device("cuda"), compute_dtype=torch.bfloat16, dependencies={"kv": specs["kv"]},
         )
         self.pool = pool
         if grouped:
@@ -546,7 +546,7 @@ class _Stack:
             # the window as a mask alone, over a pool that keeps every token
             self.attn = {
                 window: FlashInferManager(
-                    kv_cache="kv", device=info.device, dtype=info.kv_dtype, kv_config=cfg,
+                    kv_cache="kv", device=info.device, dtype=info.compute_dtype, kv_config=cfg,
                     backend=backend, splits=splits, sliding_window=window,
                 )
                 for window in pool.windows()

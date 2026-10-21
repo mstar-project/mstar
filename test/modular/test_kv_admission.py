@@ -468,7 +468,7 @@ def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
     )
     group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
     return KVManager.build(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
+        device=torch.device("cpu"), compute_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
 
 

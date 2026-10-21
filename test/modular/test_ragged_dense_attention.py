@@ -203,7 +203,7 @@ def manager(**config_overrides) -> DenseRaggedManager:
     spec = RaggedAttentionSpec(
         resource_key=ATTN, nodes={"encoder"}, config=RaggedAttentionConfig(**kwargs),
     )
-    mgr = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    mgr = build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
     assert type(mgr) is DenseRaggedManager
     return mgr
 
@@ -343,7 +343,7 @@ def cross_manager() -> DenseRaggedCrossManager:
             backend=RaggedAttnBackend.DENSE,
         ),
     )
-    mgr = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    mgr = build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
     assert type(mgr) is DenseRaggedCrossManager
     return mgr
 

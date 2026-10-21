@@ -252,7 +252,7 @@ class TestBackendSelection:
         manager = AttentionManager.build(
             spec,
             EngineResourceInfo(
-                device=device,
+                device=device, compute_dtype=torch.bfloat16,
                 dependencies={
                     "kv": KVSpec(
                         resource_key="kv", nodes={"llm"}, config=_kv_config(),
@@ -286,7 +286,7 @@ class TestBackendSelection:
         return AttentionManager.build(
             spec,
             EngineResourceInfo(
-                device=torch.device("cuda", 0),
+                device=torch.device("cuda", 0), compute_dtype=torch.bfloat16,
                 dependencies={"kv": KVSpec(resource_key="kv", nodes={"dit"}, config=PagedKVConfig(
                     num_layers=1, num_kv_heads=2, head_dim=128, max_seq_len=64, max_num_pages=MAX_PAGES,
                     page_size=PAGE_SIZE,

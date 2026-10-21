@@ -45,13 +45,7 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
         config.shard(info.head_shards)
     else:
         config.shard(joint.tp_group.world_size)
-    dtype = config.dtype if config.dtype is not None else info.kv_dtype
-    if dtype is None:
-        raise ValueError(
-            f"ragged attention {spec.resource_key!r}: no activation dtype. Set "
-            "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
-            "(the engine has no KV dtype to fall back on)."
-        )
+    dtype = info.resolve_dtype(config.dtype, spec.resource_key)
     return manager_cls(
         device=info.device, dtype=dtype, config=config, key=spec.resource_key, **kwargs,
     )
