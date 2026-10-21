@@ -76,6 +76,25 @@ _PALIGEMMA_PREFIX = "paligemma_with_expert.paligemma.model."
 _GEMMA_EXPERT_PREFIX = "paligemma_with_expert.gemma_expert.model."
 _PALIGEMMA_LM_HEAD = "paligemma_with_expert.paligemma.lm_head.weight"
 _GEMMA_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
+# Checkpoints saved from a lerobot PI05Policy (lerobot/pi05_droid) put every key
+# under "model." and also store PaliGemma's input embedding, which is tied to
+# the lm_head above.
+_POLICY_KEY_PREFIX = "model."
+_PALIGEMMA_EMBED_TOKENS = _PALIGEMMA_PREFIX + "language_model.embed_tokens.weight"
+
+
+def _strip_policy_prefix(flat: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Key a policy-saved checkpoint like lerobot/pi05_base, which has no prefix.
+
+    The embedding copy is dropped because ``_lerobot_remap`` already loads
+    ``embed_tokens`` from the lm_head, and the two are the same tensor.
+    """
+    if not flat or not all(k.startswith(_POLICY_KEY_PREFIX) for k in flat):
+        return flat
+    out = {k.removeprefix(_POLICY_KEY_PREFIX): v for k, v in flat.items()}
+    if _PALIGEMMA_LM_HEAD in out:
+        out.pop(_PALIGEMMA_EMBED_TOKENS, None)
+    return out
 
 
 class _Pi05LLMWeightContainer(nn.Module):
@@ -292,10 +311,10 @@ class Pi05Model(Model):
     def _ensure_lerobot_flat(self) -> dict[str, torch.Tensor]:
         """Lazily load ``model.safetensors`` from the lerobot snapshot.
 
-        Pi0.5 (lerobot/pi05_base) ships as a single ~14 GB safetensors
-        blob (not a sharded HF index), so we load it once into CPU memory
-        and cache it. Both ``get_submodule`` calls (vit_encoder + LLM)
-        consume the same dict.
+        lerobot's Pi0.5 checkpoints (pi05_base, pi05_droid) ship as a single
+        14-17 GB safetensors blob (not a sharded HF index), so we load it once
+        into CPU memory and cache it. Both ``get_submodule`` calls
+        (vit_encoder + LLM) consume the same dict.
         """
         if self._lerobot_flat is not None:
             return self._lerobot_flat
@@ -309,7 +328,7 @@ class Pi05Model(Model):
                 "safetensors blob in the lerobot/pi05_base snapshot."
             )
         logger.info("Loading Pi0.5 weights from %s", safetensors_path)
-        self._lerobot_flat = load_file(str(safetensors_path), device="cpu")
+        self._lerobot_flat = _strip_policy_prefix(load_file(str(safetensors_path), device="cpu"))
         return self._lerobot_flat
 
     def _lerobot_remap(self, name: str) -> str | None:
