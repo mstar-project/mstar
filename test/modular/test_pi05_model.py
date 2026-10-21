@@ -440,3 +440,36 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
+
+
+@pytest.mark.parametrize("policy_saved", [False, True])
+def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy_saved):
+    """lerobot/pi05_droid is a saved PI05Policy: every key sits under ``model.`` and
+    PaliGemma's input embedding is stored next to the lm_head it is tied to.
+    It must load the same way as lerobot/pi05_base, which has neither."""
+    from safetensors.torch import save_file
+
+    lm_head = torch.randn(8, 4)
+    base = {
+        "paligemma_with_expert.paligemma.lm_head.weight": lm_head,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 4),
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.weight": torch.randn(4),
+        "paligemma_with_expert.gemma_expert.model.norm.dense.weight": torch.randn(4),
+        "action_in_proj.weight": torch.randn(4, 2),
+        "time_mlp_in.bias": torch.randn(4),
+    }
+    saved = dict(base)
+    if policy_saved:
+        saved = {"model." + k: v for k, v in base.items()}
+        saved["model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = lm_head.clone()
+    save_file(saved, str(tmp_path / "model.safetensors"))
+
+    model = Pi05Model.__new__(Pi05Model)  # bypass __init__: no config or tokenizer download
+    model._repo_dir = tmp_path
+    model._lerobot_flat = None
+    flat = model._ensure_lerobot_flat()
+
+    assert flat.keys() == base.keys()
+    assert all(torch.equal(flat[k], v) for k, v in base.items())
+    assert model._lerobot_remap("paligemma_with_expert.paligemma.lm_head.weight") == "embed_tokens.weight"
+    assert model._lerobot_remap("time_mlp_in.bias") == "time_mlp.linear_in.bias"
