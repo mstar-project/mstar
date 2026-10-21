@@ -991,7 +991,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         A row whose walk has no loop to stop returns ``END_PARTITION`` to end
         the request's partition after this pass: a prefill whose sampled
-        token is a stop token, so the conductor never starts decode.
+        token is a stop token, so the conductor never starts decode. From a
+        row inside a running loop it does not stop the loop (the pass, and
+        so its report, ends only when the loop does); return the loop's name
+        with it.
 
         Default: no stops.
         """
@@ -1005,7 +1008,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
-        Optional. Returns rid -> loops to stop (rids with none left out), and
+        Optional. Returns rid -> what ``check_stop`` would return for it
+        (loop names, or ``END_PARTITION``; rids with nothing left out), and
         must agree with ``check_stop`` for every rid. None, or a raise, falls
         back to the per-request path. ``step_walk`` is the walk every row ran,
         or None when the step mixes walks (each row's is on its info).
