@@ -88,6 +88,8 @@ class CPUPagePool:
 
         self._refused_logged_at: float | None = None
         self._refused_unlogged = 0
+        self.dropped = 0
+        self._dropped_logged_at: float | None = None
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
@@ -160,6 +162,20 @@ class CPUPagePool:
         )
         self._refused_logged_at = now
         self._refused_unlogged = 0
+
+    def count_dropped(self, keys: list[bytes]) -> None:
+        """Count the ``keys`` the device index just dropped that have no copy on
+        the host. The total is logged at most every few seconds, as refusals are."""
+        dropped = sum(self.index.page_for(key) is None for key in keys)
+        if not dropped:
+            return
+        self.dropped += dropped
+        now = time.monotonic()
+        if self._dropped_logged_at is None or now - self._dropped_logged_at >= _EXHAUSTED_LOG_INTERVAL:
+            logger.info(
+                "CPU page pool: %d cached device pages evicted with no copy here so far", self.dropped,
+            )
+            self._dropped_logged_at = now
 
     def copy_out(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
         if not copies.gpu:

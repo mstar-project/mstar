@@ -150,6 +150,8 @@ class PrefixChain:
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
+    # pages a copy from the host brought into the index for this stream
+    from_host: int = 0
 
     @classmethod
     def seed(
@@ -699,7 +701,7 @@ class KVManager(AttentionResource):
                     if cached:
                         self._arena.retain(cached)
                         own = self._arena.acquire(1)
-                        if own is None and self._index.evict(1):
+                        if own is None and self._evict(1):
                             own = self._arena.acquire(1)
                         if own is None:
                             self._arena.release(cached)
@@ -899,6 +901,13 @@ class KVManager(AttentionResource):
         if ended is not None:
             self._cache_image_end(stream, chain, *ended)
 
+    def _evict(self, n: int) -> int:
+        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host."""
+        dropped = self._index.evict(n)
+        if self._cpu_pool is not None:
+            self._cpu_pool.count_dropped(dropped)
+        return len(dropped)
+
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
         a repeat can still reuse it instead of running the walk again."""
@@ -927,10 +936,10 @@ class KVManager(AttentionResource):
         chain.reported = True
         matched = chain.cursor
         logger.info(
-            "KV %s: %s/%s matched %d of its %d pages, whole prompt already "
-            "cached %s, replica %s",
+            "KV %s: %s/%s matched %d of its %d pages, %d from the host, whole "
+            "prompt already cached %s, replica %s",
             self.name, segment.request_id, segment.label,
-            matched, chain.keyed_pages,
+            matched, chain.keyed_pages, chain.from_host,
             bool(matched) and matched == chain.keyed_pages,
             self._replica,
         )
@@ -2765,7 +2774,7 @@ class KVManager(AttentionResource):
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
-                self._index.evict(needed - self._arena.num_free)
+                self._evict(needed - self._arena.num_free)
             pages = self._arena.acquire(needed)
             if pages is None:
                 for run in runs.values():
@@ -2816,14 +2825,17 @@ class KVManager(AttentionResource):
                 continue
             # The pages go under their parent by key, and only while that parent is indexed.
             parent = None if copy.parent is None else self._index.page_for(copy.parent)
+            linked = 0
             if copy.parent is None or parent is not None:
-                self._index.insert_run(copy.keys, copy.pages, parent)
+                linked = self._index.insert_run(copy.keys, copy.pages, parent)
             for key in copy.keys:
                 if self._arriving.get(key) is copy:
                     del self._arriving[key]
             self._cpu_pool.arena.release(copy.host_pages)
             self._arena.release(copy.pages)
             if copy.stream.host_copy is copy:
+                if copy.stream.chain is not None:
+                    copy.stream.chain.from_host += linked
                 copy.stream.host_copy = None
                 copy.stream.read_pending = copy.stream.read_future is not None
                 self._release_hold(copy.stream)
@@ -3103,24 +3115,11 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def assert_pages_conserved(self) -> None:
-        """Check the owner counts against the streams holding the pages.
-
-        Each assertion names the rule it checks. Host pages are not covered:
-        `CPUPagePool` keeps no counts.
-        """
+        """Check the owner counts against the streams holding the pages, on the
+        device and on the host. Each assertion names the rule it checks."""
         with self._lock:
             arena = self._arena
-            free = list(arena.allocator.free_pages.queue)
-            owned = [
-                page for page in range(self.config.max_num_pages)
-                if arena.num_owners[page] > 0
-            ]
-            both = sorted(set(free) & set(owned))
-            assert not both, f"pages both free and owned: {both}"
-            assert len(free) + len(owned) == self.config.max_num_pages, (
-                f"{self.config.max_num_pages} pages in the pool, but "
-                f"{len(free)} free and {len(owned)} owned"
-            )
+            owned = self._owned_pages(arena, "device")
 
             # the sink belongs to no request, so count it by hand. `frontier`
             # is the page each stream is still writing into, plus any it holds
@@ -3170,6 +3169,42 @@ class KVManager(AttentionResource):
             assert not crowded, (
                 f"pages still being written into, but not owned alone: {crowded}"
             )
+
+            if self._cpu_pool is not None:
+                self._assert_host_pages_conserved()
+
+    @staticmethod
+    def _owned_pages(arena: PageArena, pool: str) -> list[int]:
+        """The pages ``arena`` holds, checked against its free list."""
+        total = arena.allocator.max_num_pages
+        free = list(arena.allocator.free_pages.queue)
+        owned = [page for page in range(total) if arena.num_owners[page] > 0]
+        both = sorted(set(free) & set(owned))
+        assert not both, f"pages both free and owned in the {pool} pool: {both}"
+        assert len(free) + len(owned) == total, (
+            f"{total} pages in the {pool} pool, but {len(free)} free and {len(owned)} owned"
+        )
+        return owned
+
+    def _assert_host_pages_conserved(self) -> None:
+        pool = self._cpu_pool
+        host = pool.arena
+        owned = self._owned_pages(host, "host")
+        refs = Counter(pool.index.pages())
+        for streams in pool.offloaded.values():
+            for state in streams.values():
+                refs.update(state.cpu_page_indices)
+        for copy in self._host_copies:
+            refs.update(copy.host_pages)
+        counts = {page: host.num_owners[page] for page in owned}
+        assert counts == dict(refs), (
+            "host owner counts disagree with the index and requests naming the pages: "
+            + ", ".join(
+                f"page {page} owned {counts.get(page, 0)}, named {refs.get(page, 0)}"
+                for page in sorted(set(counts) | set(refs))
+                if counts.get(page, 0) != refs.get(page, 0)
+            )
+        )
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
@@ -3337,7 +3372,7 @@ class KVManager(AttentionResource):
                 if new_pages is None and self._index is not None:
                     # cached pages are the only ones that can be given back
                     # without failing a request that is already running
-                    self._index.evict(num_new_pages - self._arena.num_free)
+                    self._evict(num_new_pages - self._arena.num_free)
                     new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None:
                     pages_short = num_new_pages - self._arena.num_free

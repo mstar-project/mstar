@@ -226,7 +226,7 @@ def test_a_shared_page_can_be_evicted_while_its_request_is_away():
     assert kv._index.pages(), "nothing was indexed, so nothing is shared"
 
     assert kv.offload("a") > 0, "the request did not move to the host"
-    freed = kv._index.evict(len(shared))
+    freed = len(kv._index.evict(len(shared)))
 
     assert freed > 0, (
         "the pages the request left behind could not be given back while it "
