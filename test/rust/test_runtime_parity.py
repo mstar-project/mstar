@@ -17,6 +17,7 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RequestWalks, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -399,6 +400,27 @@ def test_prep_agrees(pair):
         streaming_edges=[], streaming_edges_per_rid=[0],
     ))
     assert capped.ready_rids == []
+
+
+def test_a_loop_a_peer_stopped_is_not_speculated(pair):
+    """A peer's stop sets the loop's finish signal and records no pending stop,
+    so the finish signal alone has to keep the loop out of speculation."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("token", "ar_decode"), _spec("kv_cache", "ar_decode")],
+    ))
+    rt.apply_peer_loop_stops(rid, "default", {"ar_loop": NestedLoopIndices(["ar_loop"], {"ar_loop": 0}, 0)})
+
+    out = rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="ar_decode", curr_node_name="ar_decode",
+        graph_walk=WALK, rids=[rid], room_for_continuing=None,
+        streaming_edges=[], streaming_edges_per_rid=[0],
+    ))
+    assert out.ready_rids == [], "the runtime would speculate an iteration of a loop a peer stopped"
 
 
 def test_cleanup_agrees(pair):
