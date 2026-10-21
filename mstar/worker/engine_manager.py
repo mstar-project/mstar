@@ -16,6 +16,7 @@ from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model
+from mstar.streaming.topology import StreamingGraphEdge
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -141,14 +142,17 @@ def _refuse_unknown_walks(model: Model) -> None:
 
 def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
     """Refuse a stream with layout walks if the cache could not serve one of its
-    walks whole: a walk where a keyed node feeds another node, or where no
-    keyed node runs.
+    walks whole: a walk where a keyed node feeds another node in the walk's
+    partition, or where no keyed node runs.
 
     A walk the cache serves whole completes with no outputs, so a node that
-    reads them would get nothing. Only a stream with layout walks is checked,
-    because a stream with one span always runs its last token.
+    reads them would get nothing. Where a keyed node streams into a partition other
+    than its own, the conductor turns the cache off for a request that runs that
+    partition (see `streamed_partitions`). Only a stream with layout walks is
+    checked, because a stream with one span always runs its last token.
     """
     graphs = model.get_graph_walk_graphs()
+    partition_of = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}
     by_key = {spec.resource_key: spec for spec in specs}
     for key, by_label in model.prefix_key_streams().items():
         for label, stream in by_label.items():
@@ -165,7 +169,11 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
                     )
                 for name in ran:
                     fed = sorted(
-                        {edge.next_node for edge in nodes[name].outputs}
+                        {
+                            edge.next_node for edge in nodes[name].outputs
+                            if not isinstance(edge, StreamingGraphEdge)
+                            or edge.target_partition == partition_of[walk]
+                        }
                         - SPECIAL_DESTINATIONS
                     )
                     if fed:
@@ -174,6 +182,26 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
                             f"{walk!r}, where {name} feeds {fed}, which would get "
                             "nothing from a walk the cache serves whole"
                         )
+
+
+def streamed_partitions(specs: list[NodeResourceSpec], model: Model) -> frozenset[str]:
+    """The partitions a keyed node streams into, counting only the walks of streams with ``layout_walks``.
+
+    A walk the cache serves, whole or in part, streams nothing for the tokens it
+    skips, so the conductor does not cache a request that runs one of these partitions.
+    """
+    graphs = model.get_graph_walk_graphs()
+    partition_of = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}
+    nodes_of = {spec.resource_key: spec.nodes for spec in specs}
+    return frozenset(
+        edge.target_partition
+        for key, by_label in model.prefix_key_streams().items()
+        for stream in by_label.values() if stream.layout_walks
+        for walk in (stream.walk, *stream.layout_walks)
+        for name, node in graphs[walk].get_nodes().items() if name in nodes_of[key]
+        for edge in node.outputs
+        if isinstance(edge, StreamingGraphEdge) and edge.target_partition != partition_of[walk]
+    )
 
 
 @dataclass

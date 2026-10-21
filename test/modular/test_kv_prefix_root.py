@@ -27,6 +27,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -429,8 +430,10 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
         if image_walk_runs_llm else node("vit", EMIT_TO_CLIENT),
     }
     stream = PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))
+    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
     return SimpleNamespace(
         prefix_key_streams=lambda: {KV: {"main": stream}}, get_graph_walk_graphs=lambda: graphs,
+        get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
     )
 

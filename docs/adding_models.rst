@@ -356,9 +356,12 @@ request's inputs on the keyed walk and cuts a prefix only from inputs that
 ``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
 there. The default ``split_inputs`` slices only the sequence, so a request whose inputs
 carry ``tensor_inputs`` is probed only when the submodule overrides it to cut those
-tensors. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
-keyed over its leading text only. A stream under a sliding window files pages only up to
-its protected prefix, which the window never releases.
+tensors. For a stream with layout walks, where a keyed node streams into a partition
+other than its own, a request that runs that partition is not cached either, since a hit
+would skip the rows the node streams for the tokens the cache holds. The keys stop at a
+prompt's first input that is not a token, so a BAGEL prompt is keyed over its leading text
+only. A stream under a sliding window files pages only up to its protected prefix, which
+the window never releases.
 
 .. _Step 2a — Declare your resources:
 
