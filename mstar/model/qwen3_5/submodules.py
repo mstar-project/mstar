@@ -636,21 +636,15 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        if request_info.graph_walk != "decode":
-            # The last prefill samples the request's first token, before
-            # decode_loop exists: a stop token there ends the request instead.
-            if not request_info.step_metadata.get("last_prefill", False):
-                return set()
-            token = outputs["new_token"][0].item()
-            ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-            if not ignore_eos and token in self.config.stop_token_ids:
-                return {END_PARTITION}
+        if "new_token" not in outputs or not self._token_is_real(request_info):
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         hit_eos = not ignore_eos and token in self.config.stop_token_ids
+        if request_info.graph_walk != "decode":
+            # the last prefill's token comes before decode_loop exists: a stop
+            # token there ends the request instead
+            return {END_PARTITION} if hit_eos else set()
         out_of_budget = (
             request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
             >= request_info.max_tokens
@@ -687,7 +681,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 # as check_stop: only the last prefill's token can end the request
                 if (
                     value in stop_ids
-                    and info.step_metadata.get("last_prefill", False)
+                    and self._token_is_real(info)
                     and not info.resource_configs[SAMPLER].ignore_eos
                 ):
                     stops[rid] = {END_PARTITION}
