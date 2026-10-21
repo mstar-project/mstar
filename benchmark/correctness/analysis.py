@@ -2,25 +2,22 @@
 
     python -m benchmark.correctness.analysis <run_dir> [--reference <ref_dir>] [--no-asr]
 
-The family comes from the run's report.json and the reference from the family, found the way the
-runner finds it, together with its sibling arms when they were built: math SDPA, fp32 anchor, a
-second seed (``<id>-seed<N>``) and a bf16 copy of an fp32 reference. Per family:
+The family comes from the run's report.json and the reference from the family, plus whichever
+sibling builds exist (math SDPA, fp32 anchor, another seed, a bf16 copy). Per family:
 
-- image: PSNR/SSIM (also at 1/8 scale), color, sharpness and seam statistics, a normalized distance
-  against the second seed, and contact sheets with a difference heatmap per item;
-- video, audio-video, world: per-frame PSNR/SSIM curves against the reference and its arms,
-  temporal statistics (motion, flicker, luma drift), color statistics, 5-frame strips, a frames
-  sheet and side-by-side mp4s; for audio-video also audio statistics, spectrograms, an AV onset
-  check and transcripts;
-- tts: audio statistics, duration and log-mel distances, F0, transcripts and WER, spectrograms;
-- actions and latents: errors against the reference and its bf16 copy, jitter, gripper events, and
-  a plot per episode.
+- image: PSNR/SSIM (also at 1/8 scale), color, sharpness and seam statistics, a normalized
+  distance against the other seed, contact sheets with a difference heatmap;
+- video, audio-video, world: per-frame PSNR/SSIM curves, motion, flicker and color statistics,
+  frame strips, a frames sheet, side-by-side mp4s; for audio-video also audio statistics,
+  spectrograms, an AV onset check and transcripts;
+- tts: audio statistics, duration and log-mel distances, F0, WER, spectrograms;
+- actions and latents: errors against the reference and its bf16 copy, jitter, gripper events,
+  plots.
 
-Everything goes to <run_dir>/analysis/ (or --out): metrics.json, items.md, analysis.md and the
-PNG/mp4 artifacts. CPU only; --device only moves Whisper. LPIPS, CLIP score and speaker similarity
-run when their package and weights are present, and analysis.md lists what was skipped and why.
-The bars in analysis.md are proposed thresholds to calibrate, not verdicts. The verdict stays the
-runner's (report.md).
+Output goes to <run_dir>/analysis/: metrics.json, items.md, a one-page analysis.md and the PNG/mp4
+artifacts. CPU only (--device moves Whisper). LPIPS, CLIP score and speaker similarity run when
+their package and weights are there, and analysis.md says when they were skipped. Its bars are
+proposed thresholds, not verdicts; the verdict stays the runner's.
 """
 
 from __future__ import annotations
@@ -52,8 +49,7 @@ SPREAD_DB = 3.0  # the runner's calibrated floor sits this far under the referen
 HEAT_VMAX = 48.0  # 8-bit levels at the darkest heatmap color
 CLIP_ID = "openai/clip-vit-large-patch14"
 # Flicker is the largest jump in the second difference of mean luma. Typical values are a fraction of a
-# level, so a ratio alone flags noise; the served jump may exceed the reference's by this factor plus
-# this many levels.
+# level, so the served jump may exceed the reference's by this factor plus this many levels.
 FLICKER_RATIO, FLICKER_LEVELS = 1.25, 1.0
 ACTION_PLOT_DIMS = 8  # DROID's 7 joints and the gripper lead every action vector
 GRIPPER_DIM = 7
