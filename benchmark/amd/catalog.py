@@ -61,6 +61,12 @@ def mstar_config_name(row: Row, arm: str) -> str:
     return row.mstar_configs.get(arm, row.name)
 
 
+def family_config_name(row: Row, arm: str) -> str:
+    """The mstar config whose correctness family scores an arm on this row: the arm's own for mstar arms, the mstar
+    arm's for every other engine."""
+    return mstar_config_name(row, arm if arm in ARMS and ARMS[arm].engine == "mstar" else "mstar")
+
+
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
     return Row(name or f"qwen3_5_{size.lower()}", "text", f"Qwen/Qwen3.5-{size}", "qwen3.5", gpus=gpus, tp=tp,
                max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4)
