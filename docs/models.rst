@@ -70,13 +70,15 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        msgpack, one entry per joint group, each with its ``dtype``, ``shape`` and
        raw ``data``. Request knobs: ``embodiment_tag`` (the checkpoint's own
        spelling, matched case-insensitively — eight are shipped, and the error
-       lists them), ``video`` as ``{camera: uint8 (1, T, H, W, 3)}``, ``state`` as
-       ``{joint_group: float32 (1, T, D)}`` — one request at a time, and the
-       camera and joint-group names are the embodiment's own — and ``walk``, which
-       selects one of the two reuse walks (``backbone`` or ``state``) instead of
-       running the full path. Video must be ``uint8``: the image processor
-       rescales by 1/255 whatever it is given, so pre-normalised frames reach the
-       model as a black image. The backbone's config **and its tokenizer and image
+       lists them), ``state`` as ``{joint_group: float32 (1, T, D)}`` with the
+       embodiment's own joint-group names, and ``walk``, which selects one of the
+       two reuse walks (``backbone`` or ``state``) instead of running the full
+       path. **Camera frames are attached as images, not passed in
+       ``model_kwargs``**: one lossless image per camera view per timestep, in
+       time-major order over the embodiment's view order — ``(t0,v0)``,
+       ``(t0,v1)``, ``(t1,v0)``, … — so a two-camera robot sends four. Lossless,
+       because the pixels are compared against the reference's bit for bit. The
+       backbone's config **and its tokenizer and image
        processor** come from the **gated** ``nvidia/Cosmos-Reason2-2B``; accept its
        terms on the Hub first. Needs the ``gr00t_n17`` extra for OpenCV, whose
        ``INTER_AREA`` resize the reference's image transform uses.

@@ -22,19 +22,22 @@ KWARGS = {
     "use_percentiles": True, "use_mean_std": False, "apply_sincos_state_encoding": False, "exclude_state": False,
     "shortest_image_edge": 256, "crop_fraction": 0.95,
     "modality_configs": {
-        "bot": {"video": {"modality_keys": ["front", "wrist"]}, "state": {"modality_keys": ["arm", "grip"]},
+        "bot": {"video": {"modality_keys": ["front", "wrist"], "delta_indices": [0, 1]},
+                "state": {"modality_keys": ["arm", "grip"]},
                 "action": {"delta_indices": [0, 1, 2], "modality_keys": ["arm", "grip"],
                            "action_configs": [
                                {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "arm"},
                                {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "grip"}]}},
-        "other": {"video": {"modality_keys": ["cam"]}, "state": {"modality_keys": ["j"]},
+        "other": {"video": {"modality_keys": ["cam"], "delta_indices": [0, 1]},
+                "state": {"modality_keys": ["j"]},
                   "action": {"delta_indices": list(range(5)), "modality_keys": ["j"],
                              "action_configs": [
                                  {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "j"}]}},
         # the SE(3) robot: three groups of three different widths with the relative
         # eef one in the *middle*, so no group's offset is its own dim and none of
         # the three offsets is 0
-        "eefbot": {"video": {"modality_keys": ["cam"]}, "state": {"modality_keys": ["grip", "pose", "joints"]},
+        "eefbot": {"video": {"modality_keys": ["cam"], "delta_indices": [0, 1]},
+                "state": {"modality_keys": ["grip", "pose", "joints"]},
                    "action": {"delta_indices": [0, 1], "modality_keys": ["grip", "pose", "joints"],
                               "action_configs": [
                                   {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": "grip"},

@@ -28,7 +28,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.gr00t_n17.components.bridge import Gr00tN17VLBridge
 from mstar.model.gr00t_n17.components.dit import ActionPositionEmbedding, DiT
 from mstar.model.gr00t_n17.components.embodiment import (
@@ -82,7 +82,7 @@ class Gr00tN17Model(Model):
     # (`data_worker.py:586`), which is where `postprocess` reads the tag back to
     # unnormalise the actions. `walk` is deliberately **not** here: the schedule
     # is chosen on the conductor side (`conductor.py:1018-1023`), after the strip.
-    PREPROCESS_ONLY_KWARGS = ("video", "state", "embodiment_tag")
+    PREPROCESS_ONLY_KWARGS = ("state", "embodiment_tag")
 
     PREFILL_WALK = "prefill"
     BACKBONE_WALK = "backbone"
@@ -387,6 +387,35 @@ class Gr00tN17Model(Model):
             )
         return None
 
+    def max_input_files(self) -> dict[str, int]:
+        """One frame per camera view per timestep, and no more ([[D10]]).
+
+        The widest embodiment in this checkpoint has 3 views and every one has 2
+        frames per view, so 6. The data worker refuses a request over this before
+        decoding any file (`data_worker.py:580`).
+        """
+        views = max(len(v) for v in self.processor.video_keys.values())
+        steps = max(self.processor.video_steps.values())
+        return {"image": views * steps}
+
+    def load_image(self, filepath: str, device: str):
+        """A camera frame as **uint8 HWC**, which is what the reference's transform
+        takes -- overriding the base, which returns float32 CHW in [0, 1].
+
+        Not a preference: the HF image processor rescales by 1/255 whatever it is
+        handed, so handing it the base's already-divided frame makes the model see
+        a black image -- measured pixel mean -0.997 against -0.164, with the same
+        shapes and no error. `preprocessing.__call__` refuses a non-uint8 frame for
+        the same reason; this is the other half, so the refusal never fires on our
+        own loader.
+        """
+        from mstar.model.media_limits import read_image
+
+        # the engine's own reader, so this inherits its decode limits and its
+        # RGB coercion (an RGBA or CMYK frame has no placeable channel axis)
+        img = read_image(filepath, rgb=True)  # uint8 CxHxW
+        return TensorAndMetadata(img.permute(1, 2, 0).contiguous().to(device))
+
     def warmup_preprocess(self) -> None:
         """Pay the lazy `cv2` import before the first robot observation does.
 
@@ -405,6 +434,38 @@ class Gr00tN17Model(Model):
         # jinja template: measured 15.7 ms on first use against 0.04 ms after, and
         # `base.py:889-895` names a tokenizer as exactly what this hook is for.
         self.processor.warmup_chat_template()
+
+    def _views_from_frames(self, tag: str, frames: list | None) -> dict[str, np.ndarray]:
+        """The request's frames, back into the reference's per-camera observation.
+
+        [[D10]]: camera frames travel the **media path**, because they are bulk
+        media -- one recorded DROID observation is 3.36 MiB against the 1 MiB cap
+        on a `model_kwargs` form field. That path keys loaded files by *modality*
+        (`data_worker.py:583`), so every frame arrives in one list and the order
+        is the only thing that says which camera it came from.
+
+        The order is the reference's own: **time-major, views in the embodiment's
+        `modality_keys` order**, which is how `preprocessing.__call__` and
+        NVIDIA's processor both build their frame list. So `(t0,v0), (t0,v1),
+        (t1,v0), (t1,v1)` for a two-camera robot.
+
+        Rebuilding the dict here rather than reshaping the processor keeps C02's
+        contract -- `video[view]` as uint8 `(B, T, H, W, 3)` -- which is the
+        reference's, and is what the parity tests are written against.
+        """
+        views, steps = self.processor.frame_layout(tag)
+        want = len(views) * steps
+        frames = frames or []
+        if len(frames) != want:
+            raise ValueError(
+                f"gr00t_n17 {tag!r} needs {want} camera frames -- {steps} per view "
+                f"for views {list(views)}, time-major -- but the request carried "
+                f"{len(frames)}"
+            )
+        stacked = np.stack([np.asarray(f.cpu()) for f in frames])  # (T*V, H, W, 3)
+        return {
+            view: stacked[j::len(views)][None] for j, view in enumerate(views)
+        }
 
     # ------------------------------------------------------------------ I/O
     def process_prompt(
@@ -433,19 +494,17 @@ class Gr00tN17Model(Model):
                 "gr00t_n17 needs an `embodiment_tag`: it selects the joint "
                 "groups, the normalisation stats and the per-robot weights"
             )
-        # `data_worker.py:688` is `400 if isinstance(exc, (ValueError, TypeError))
+        # `data_worker.py:929` is `400 if isinstance(exc, (ValueError, TypeError))
         # else 500`, so a bare KeyError here would answer a malformed request with
         # a 500 whose body is just the missing key's name.
-        for name in ("video", "state"):
-            if name not in kwargs:
-                raise ValueError(
-                    f"gr00t_n17 needs `{name}`: an observation is a language "
-                    "instruction plus the camera views and the robot's "
-                    "proprioceptive state, and all three are required"
-                )
+        if "state" not in kwargs:
+            raise ValueError(
+                "gr00t_n17 needs `state`: an observation is a language instruction "
+                "plus the camera views and the robot's proprioceptive state"
+            )
         out = self.processor(
             embodiment_tag=tag,
-            video=kwargs["video"],
+            video=self._views_from_frames(tag, (tensors or {}).get("image_inputs")),
             language=[prompt],
             state=kwargs["state"],
         )
@@ -459,7 +518,7 @@ class Gr00tN17Model(Model):
         wants GR00T's backbone features or its encoded state on their own,
         reaches a walk that is otherwise unreachable.
         """
-        return frozenset({"embodiment_tag", "video", "state", "walk"})
+        return frozenset({"embodiment_tag", "state", "walk"})
 
     def _walk_schedule(self, model_kwargs: dict | None) -> list[str]:
         """The walks this request runs, in order.
