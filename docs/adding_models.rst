@@ -780,7 +780,9 @@ methods are:
    there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
    the worker reports the partition done with that pass and the conductor ends it rather
    than start decode. Qwen3.5, Qwen3-ASR and Whisper do this for a first token that is
-   a stop token. Keep ``check_stop_batched``, if you write one, in agreement.
+   a stop token. ``END_PARTITION`` from a row inside a running loop does not stop the
+   loop, so return the loop's name with it. Keep ``check_stop_batched``, if you write
+   one, in agreement.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
