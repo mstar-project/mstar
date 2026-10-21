@@ -56,8 +56,9 @@ mstar serve
      - ZMQ IPC socket prefix; one per server, so servers on other ports do
        not share sockets.
    * - ``--upload-dir``
-     - ``/tmp/mstar_uploads_<user>/``
-     - Temp directory for uploaded media.
+     - a new ``/tmp/mstar_uploads_<user>_*/``
+     - Temp directory for uploaded media. A new one per server, logged at startup and
+       removed at exit.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.

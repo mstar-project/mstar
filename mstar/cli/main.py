@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import mstar
@@ -220,13 +221,19 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
 
 
 def _serve(args: argparse.Namespace) -> None:
+    from mstar.platforms import apply_visible_devices
+
     config = _resolve_config(args.model, args.config)
-    if args.gpus is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    apply_visible_devices(args.gpus)
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
-    upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
+    # Each server gets its own upload dir unless given, removed at exit, so
+    # one server's cleanup never takes another's uploads.
+    owned_upload_dir = None
+    upload_dir = args.upload_dir
+    if upload_dir is None:
+        upload_dir = owned_upload_dir = tempfile.mkdtemp(prefix=f"mstar_uploads_{who}_", dir="/tmp") + "/"
 
     argv = [
         "--config", config,
@@ -261,7 +268,11 @@ def _serve(args: argparse.Namespace) -> None:
 
     from mstar.api_server.entrypoint import main as serve_main
 
-    serve_main(argv)
+    try:
+        serve_main(argv)
+    finally:
+        if owned_upload_dir is not None:
+            shutil.rmtree(owned_upload_dir, ignore_errors=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -277,11 +288,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="require 'Authorization: Bearer <key>' on every route except /health "
              "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
-    serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        "--gpus", default=None,
+        help="GPUs to use, e.g. '0' or '0,1,2' (sets CUDA_VISIBLE_DEVICES, and HIP_VISIBLE_DEVICES on ROCm)",
+    )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
-    serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
-    serve.add_argument("--upload-dir", default=None, help="temp dir for uploaded media")
+    serve.add_argument(
+        "--socket-path-prefix", default=None,
+        help="ZMQ IPC socket prefix (default: /tmp/mstar_<user>_<port>/)",
+    )
+    serve.add_argument(
+        "--upload-dir", default=None,
+        help="temp dir for uploaded media (default: a new /tmp/mstar_uploads_<user>_* directory per server)",
+    )
     serve.add_argument(
         "--tensor-comm-protocol", default="SHM",
         help="tensor transfer protocol (SHM is the safe single-node default; also TCP/RDMA)",

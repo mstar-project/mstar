@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 
 
@@ -63,6 +65,18 @@ class Platform:
         """
         return {}
 
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        """Env vars that limit this process and its children to ``devices``
+        (``mstar serve --gpus``). With None, check the current env and keep it,
+        raising ValueError if it picks devices inconsistently.
+
+        Runs before the first device call, so like process_env_defaults it is
+        asked of the platform torch was built for.
+        """
+        return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
@@ -91,12 +105,38 @@ class RocmPlatform(Platform):
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
+    # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
+    ATEN_GEMM_MAX_TOKENS = 32
+
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
-        # none until one is measured to help on AMD GPUs
+        # At decode sizes inductor's autotuner can't reliably pick between its
+        # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
+        # sit above the real kernel time in a graph (6-13 us) and move up to 30%
+        # between compiles, so different compiles pick different kernels. On
+        # orpheus a bad pick cost 10% of the decode step at concurrency 4.
+        # hipBLASLt alone was the same or better at 1, 4, 16 and 64.
+        if num_tokens is not None and num_tokens <= self.ATEN_GEMM_MAX_TOKENS:
+            return {"max_autotune_gemm_backends": "ATEN"}
         return {}
 
     def process_env_defaults(self) -> dict[str, str]:
-        # none until one is measured to help on AMD GPUs
+        # nothing yet, no candidate measured a win on MI300X
+        return {}
+
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        # HIP (and torch on ROCm) prefer HIP_VISIBLE_DEVICES over
+        # CUDA_VISIBLE_DEVICES, so set both or a stale value wins.
+        if devices is not None:
+            return {"CUDA_VISIBLE_DEVICES": devices, "HIP_VISIBLE_DEVICES": devices}
+        hip = environ.get("HIP_VISIBLE_DEVICES")
+        cuda = environ.get("CUDA_VISIBLE_DEVICES")
+        if hip is not None and cuda is not None and hip != cuda:
+            raise ValueError(
+                f"HIP_VISIBLE_DEVICES={hip!r} and CUDA_VISIBLE_DEVICES={cuda!r} "
+                "disagree and HIP uses the first. Unset one or pass --gpus"
+            )
         return {}
 
 
