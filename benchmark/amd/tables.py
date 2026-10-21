@@ -57,6 +57,9 @@ WORKLOADS: dict[str, Workload] = {w.name: w for w in [
     # 5 prompts (video_v1) at the correctness family's resolution, frames, steps and guidance.
     Workload("video-t2v", "video", "text_to_video", (1, 2), "set:video_v1", min_requests=5, waves=1,
              warmup_waves_first=1, warmup_waves_next=0, primary=("clips_per_min", True)),
+    # The same prompts conditioned on video_v1's first frames (DROID episodes), for the rows that take an image.
+    Workload("video-i2v", "video", "image_to_video", (1, 2), "set:video_v1", min_requests=5, waves=1,
+             warmup_waves_first=1, warmup_waves_next=0, primary=("clips_per_min", True)),
 ]}
 
 
@@ -84,11 +87,14 @@ TABLES: dict[str, Table] = {t.name: t for t in [
     Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"), ("mstar", "mstar-base", "vllm-omni", "vllm-omni-tuned"),
           ("omni-text-speech", "omni-image-speech", "omni-audio-speech"),
           note="Qwen3-Omni, spoken answers to text, image and audio questions"),
-    Table("image", ("flux2_klein", "z_image_turbo"), ("mstar", "mstar-base", "vllm-omni", "sglang-diffusion"),
-          ("image-gen",),
+    Table("image", ("flux2_klein", "flux2_klein_9b", "z_image_turbo"),
+          ("mstar", "mstar-base", "vllm-omni", "vllm-omni-rc", "sglang-diffusion", "sglang-diffusion-bcg",
+           "ref-diffusers", "ref-xdit"), ("image-gen",),
           note="Image generation, latency at concurrency 1 and images/s above it"),
-    Table("video", ("wan22", "cosmos3_nano"), ("mstar", "mstar-base", "vllm-omni"), ("video-t2v",),
-          note="Text-to-video, time per clip at concurrency 1 and makespan at 2"),
+    Table("video", ("wan22", "cosmos3_nano", "cosmos3_edge"),
+          ("mstar", "mstar-base", "vllm-omni", "vllm-omni-rc", "sglang-diffusion", "sglang-diffusion-compile",
+           "ref-diffusers", "ref-xdit"), ("video-t2v", "video-i2v"),
+          note="Text- and image-to-video, time per clip at concurrency 1 and makespan above it"),
     Table("asr", ("whisper_large",), ("mstar", "mstar-base", "vllm-whisper", "sglang-whisper"), ("asr-libri",),
           note="Whisper large-v3 on the OpenAI transcription route"),
     # Functional runs on one dev slice: every cell type once, no timing value.
