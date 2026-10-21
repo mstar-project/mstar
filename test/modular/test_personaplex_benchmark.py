@@ -13,6 +13,7 @@ import pytest
 
 from benchmark.base import ModelType, PersonaPlex, RequestType, Status
 from benchmark.personaplex.dataset import LocalAudioDataset
+from benchmark.personaplex.serving import verify_ownership_observations
 from benchmark.request import OurSystem, aggregate_metrics
 
 
@@ -115,3 +116,16 @@ def test_failing_saved_comparison_reports_fail_and_nonzero(tmp_path):
     )
     assert result.returncode == 1
     assert json.loads(result.stdout)["status"] == "FAIL"
+
+
+def test_arena_lifecycle_cannot_pass_without_precleanup_decoder_observations():
+    with pytest.raises(AssertionError, match="Missing decoder observations"):
+        verify_ownership_observations([], completed=1)
+    rows = [
+        {"event": "after_decoder_inputs_consumed", "rid": 1, "time": 10, "tensors": []},
+        {"event": "before_hard_cleanup", "rid": 1, "time": 11, "tensors": []},
+    ]
+    verify_ownership_observations(rows, completed=1)
+    rows[0]["time"] = 12
+    with pytest.raises(AssertionError, match="followed hard cleanup"):
+        verify_ownership_observations(rows, completed=1)

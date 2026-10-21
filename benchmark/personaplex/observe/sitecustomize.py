@@ -59,23 +59,25 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     if os.environ.get("PERSONAPLEX_LIVE_BACKEND") == "rust":
         from mstar.graph.runtime.rust import RustGraphRuntime
 
-        pending_decoder = set()
+        pending_decoder_rids = set()
         rust_consumed = RustGraphRuntime.cleanup_consumed_inputs
 
         def rust_cleanup(self, node_name, rids, wg_ids):
             freed = rust_consumed(self, node_name, rids, wg_ids)
             if node_name == "MimiDecoder":
-                pending_decoder.update(freed.uuids)
+                # Arena/Rust bookkeeping may already remove UUID->rid entries.
+                # The caller immediately passes these frees to cleanup_collectable
+                # (worker.py); retain the known request IDs across that boundary.
+                pending_decoder_rids.update(rids)
             return freed
 
         RustGraphRuntime.cleanup_consumed_inputs = rust_cleanup
         original_collect = TensorCommunicationManager.cleanup_collectable
 
         def collected(self, collectable, registered):
-            relevant = pending_decoder.intersection(collectable)
-            rids = {self.tensor_store._uuid_to_rid[u] for u in relevant if u in self.tensor_store._uuid_to_rid}
             result = original_collect(self, collectable, registered)
-            pending_decoder.difference_update(relevant)
+            rids = set(pending_decoder_rids)
+            pending_decoder_rids.clear()
             for rid in rids:
                 snapshot(self, "after_decoder_inputs_consumed", rid)
             return result

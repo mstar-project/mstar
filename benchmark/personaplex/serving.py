@@ -33,6 +33,15 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def verify_ownership_observations(rows, completed):
+    decoders = [r for r in rows if r["event"] == "after_decoder_inputs_consumed"]
+    assert len(decoders) >= completed, f"Missing decoder observations: {len(decoders)} for {completed} completions"
+    assert all(not any(t["name"] == "agent_frame" for t in r["tensors"]) for r in decoders)
+    for row in decoders:
+        cleanup = [r for r in rows if r["event"] == "before_hard_cleanup" and r["rid"] == row["rid"]]
+        assert cleanup and row["time"] <= min(r["time"] for r in cleanup), "Observation followed hard cleanup"
+
+
 class Server:
     def __init__(self, settings, root, backend, observe):
         self.settings, self.root, self.backend, self.observe = settings, root, backend, observe
@@ -334,6 +343,7 @@ def main():
             run.run(smoke=args.mode != "lifecycle")
             if args.mode == "soak":
                 run.soak(1200)
+            verify_ownership_observations(run.events(), sum("samples" in row for row in run.rows))
             outcome.update(status="PASS", requests=run.rows)
     except Exception as exc:
         outcome["error"] = repr(exc)
