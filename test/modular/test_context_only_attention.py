@@ -98,6 +98,8 @@ def test_queries_attend_to_the_stored_context_only(monkeypatch):
     ("flashinfer", "FlashInferManager"), ("dense", "DenseAttentionManager"),
     ("xpu", "XPUPagedAttentionManager"), ("flex", "FlexAttentionManager"),
     ("cross", "FlashInferCrossManager"), ("ragged.flashinfer", "FlashInferRaggedManager"),
+    ("aiter", "AiterPagedAttentionManager"), ("aiter", "AiterCrossManager"),
+    ("ragged.aiter", "AiterRaggedManager"),
 ])
 def test_the_other_backends_refuse_a_context_only_step(module, manager):
     # planned without the flag, the queries would also attend to the tokens the step appends.
