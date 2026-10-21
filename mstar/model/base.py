@@ -16,6 +16,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -63,13 +64,14 @@ class PrefixStream(NamedTuple):
 
 
 class Span(NamedTuple):
-    """One write to a keyed stream. A layout lists them in the order the walks write.
+    """One write to a KV stream. A layout lists them in the order the walks write.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
     the tensor whose next entry an ids span keys, or the file of a digest span
     as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file.
+    change the tensors made from the file. A ``rows`` span writes KV made from
+    anything else, such as another node's outputs, and is never keyed.
     """
     kind: str
     walk: str
@@ -77,6 +79,20 @@ class Span(NamedTuple):
     advance: int
     source: str | tuple[str, int]
     params: tuple = ()
+
+
+class LabelLayout(NamedTuple):
+    """Everything a request writes into one paged KV label, from `process_prompt`'s ``kv_layout``.
+
+    ``spans`` are the committed writes known at intake, in walk order. Each
+    ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
+    loop. ``scratch`` is the most one non-committing step writes past the
+    committed length, and ``retention`` the policy the label's committing steps declare.
+    """
+    spans: tuple[Span, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()
+    scratch: int = 0
+    retention: RetentionPolicy | None = None
 
 
 def video_metadata_dict(metadata_obj) -> dict:

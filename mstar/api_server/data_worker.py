@@ -31,7 +31,7 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.base import LabelLayout, Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -138,6 +138,32 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
         for spec in specs
         if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
     }
+
+
+def _layout_rows(kv_layout: dict[str, dict[str, LabelLayout]]) -> dict:
+    """``kv_layout`` as plain rows, which keep the request's kwargs on the wire's plain msgpack path.
+
+    Each label becomes ``[spans, growth, scratch, retention]``, a span ``[length, advance, walk]``.
+    """
+    rows: dict[str, dict[str, list]] = {}
+    for resource_key, by_label in kv_layout.items():
+        for label, layout in by_label.items():
+            for span in layout.spans:
+                if span.kind not in ("ids", "digest", "rows"):
+                    raise ValueError(f"a span of kind {span.kind!r}")
+                if not (isinstance(span.length, int) and isinstance(span.advance, int)):
+                    raise ValueError(
+                        f"a {span.kind} span's length and advance are "
+                        f"{type(span.length).__name__} and {type(span.advance).__name__}"
+                    )
+            retention = layout.retention
+            rows.setdefault(resource_key, {})[label] = [
+                [[span.length, span.advance, span.walk] for span in layout.spans],
+                [[loop, slots] for loop, slots in layout.growth],
+                layout.scratch,
+                None if retention is None else [retention.context_budget, retention.protected_prefix],
+            ]
+    return rows
 
 
 
@@ -622,7 +648,7 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", "kv_layout", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -640,6 +666,8 @@ class PreprocessWorkerThread:
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             layouts = model_kwargs.pop("prefix_layout", {})
+            if "kv_layout" in model_kwargs:
+                model_kwargs["kv_layout"] = _layout_rows(model_kwargs["kv_layout"])
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             if model_kwargs.get("prefix_cache") is not False:

@@ -353,7 +353,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     the model's own, a default for anything it declared a stream for, and then
     each handed its own chain."""
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs, {},
+        SimpleNamespace(model=model), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
