@@ -191,24 +191,23 @@ class CommGroup:
         ``max_tokens`` rows of ``hidden`` in ``dtype`` (the platform's kernel may
         take fewer, the rest stay unfused). Returns whether it's available.
 
-        Collective: every member calls it at load, in the same order with the
-        same arguments. The lockstep nodes of an instance share its group, so
-        it uses one strategy per ``(dtype, hidden)``. A larger ``max_tokens``
-        builds another if it can and leaves the old one allocated, outside torch's
-        allocator: 512 MiB per rank in each shape measured at TP2 on H200, with
-        the MNNVL backend FlashInfer 0.7.2's "auto" chose. Other inputs take the
-        group's ``all_reduce`` and a separate norm.
+        Collective like ``init_all_reduce``: every member calls it at load, in
+        the same order with the same arguments. The lockstep nodes of an
+        instance share its group, so it uses one strategy per ``(dtype,
+        hidden)``. A larger ``max_tokens`` builds another if it can and leaves
+        the old one allocated, outside torch's allocator: 512 MiB per rank in
+        each shape measured at TP2 on H200, with the MNNVL backend FlashInfer
+        0.7.2's "auto" chose. Other inputs take the group's ``all_reduce`` and
+        a separate norm.
         """
         if self.world_size == 1:
             return False
         have = self._ar_fusion.get((dtype, hidden))
         if have is not None and have.max_tokens >= max_tokens:
             return True
-        from mstar.distributed.ar_fusion import create_fusion
+        from mstar.distributed.ar_fusion import ARFusion
 
-        fusion = create_fusion(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
-        )
+        fusion = ARFusion.new(self, hidden, dtype, max_tokens)
         if fusion is None:
             return False
         self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(fusion, max_tokens)
