@@ -369,6 +369,47 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 
+@pytest.mark.parametrize("step_walk", [DECODE_WALK, None])
+def test_engine_stop_check_takes_the_batched_path(step_walk):
+    """The engine passes ``step_walk``; a signature without it raised, and the
+    engine silently fell back to one ``check_stop`` per row."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = _llm_submodule(_tiny_config())
+
+    def per_request(*args):
+        raise AssertionError("fell back to the per-request stop check")
+
+    sub.check_stop = per_request
+    infos = {
+        rid: type("I", (), {
+            "graph_walk": DECODE_WALK, "max_tokens": 4096,
+            "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
+            "dynamic_loop_iter_counts": {"decode_loop": 0},
+        })()
+        for rid in ("end", "word")
+    }
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(
+            graph_walk=DECODE_WALK,
+            request_walks=None if step_walk else {"end": DECODE_WALK, "word": DECODE_WALK},
+        ),
+    )
+    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
+    tokens = torch.tensor([[IM_END], [1234]])
+    stops = Engine.check_stop_for_batch(
+        engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
+    )
+    assert stops == {"end": {"decode_loop"}} and not failures
+    # a step of another walk stops nothing, without reading its rows
+    assert sub.check_stop_batched(["end"], infos, HostRows(("end",), {}), step_walk=PREFILL_WALK) == {}
+
+
 # --------------------------------------------------------------------------
 # model: graph, resources, state machine
 # --------------------------------------------------------------------------

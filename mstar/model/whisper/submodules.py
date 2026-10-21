@@ -841,21 +841,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+        if step_walk is not None and step_walk != DECODE_WALK:
+            return {}  # as check_stop: only a decode row's token is checked
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
             return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        rows = host_rows.request_ids
-        if len(rows) >= len(request_ids) and all(
-            a == b for a, b in zip(request_ids, rows, strict=False)
-        ):
-            pairs = zip(request_ids, values, strict=False)
-        else:
-            row_of = {rid: i for i, rid in enumerate(rows)}
-            pairs = (
-                (rid, values[i]) for rid in request_ids
-                if (i := row_of.get(rid)) is not None and i < len(values)
-            )  # no row, no output: the per-request path skips it too
         eos = self.config.eos_token_id
         max_positions = self.config.max_target_positions
         stops: dict[str, set[str]] = {}
