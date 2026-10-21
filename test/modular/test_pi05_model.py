@@ -334,7 +334,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         input_modalities=["image", "text"],
         output_modalities=["action"],
         robot_state=state,
-    )
+    ).new_input_tensors
 
     # Result is a single text_inputs entry — no separate state_inputs.
     assert set(result.keys()) == {"text_inputs"}
@@ -357,7 +357,7 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
         prompt="hello world",
         input_modalities=["text"],
         output_modalities=["action"],
-    )
+    ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
 

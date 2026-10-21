@@ -52,7 +52,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
@@ -489,7 +489,7 @@ class Pi05Model(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
         Pi0.5's production preprocessor (lerobot's
@@ -532,7 +532,20 @@ class Pi05Model(Model):
             full_prompt = cleaned
 
         text_ids = self.tokenizer.encode_prompt(full_prompt)
-        return {"text_inputs": [text_ids]}
+        cfg = self.config
+        # The most image rows a prefill writes: a captured SigLIP step encodes all num_cameras slots.
+        images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        layout = LabelLayout(
+            spans=(
+                Span("rows", self.PREFILL_WALK, images, images, "img_emb"),
+                Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+            ),
+            scratch=cfg.action_horizon,
+        )
+        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {LLM_KV: {"main": KVLabel()}}
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
