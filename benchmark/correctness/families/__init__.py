@@ -53,6 +53,12 @@ class Wan22Video(VideoFamily):
     negative_prompt = ""
 
 
+class Wan22I2V(Wan22Video):
+    """Image-to-video on the same TI2V-5B checkpoint, conditioned on video_v1's first frames."""
+
+    image_to_video = True
+
+
 class Cosmos3Reference:
     """diffusers' Cosmos3OmniPipeline built from the checkpoint's parts, prompted like mstar.
 
@@ -263,6 +269,8 @@ def family_for_config(config_name: str, model_key: str, cfg: dict, opts: dict[st
         return {"t2i": Cosmos3T2I, "i2v": Cosmos3I2V}[opts["mode"]](model_key, cfg, opts)
     if config_name in CONFIG_FAMILIES:
         return CONFIG_FAMILIES[config_name](model_key, cfg, opts)
+    if model_key == "wan22" and opts.get("mode") == "i2v":
+        return Wan22I2V(model_key, cfg, opts)
     if opts.get("set") == "image" and issubclass(FAMILIES[model_key], TextFamily):
         hf_id = FAMILIES[model_key].hf_id
         cls = type(f"TextImage_{hf_id.rsplit('/', 1)[-1]}", (TextImageFamily,), {"hf_id": hf_id})
