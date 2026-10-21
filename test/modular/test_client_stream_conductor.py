@@ -23,15 +23,20 @@ torch = pytest.importorskip("torch")
 import mstar.communication.wire_types  # noqa: E402,F401 — registers the wire tags
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.communication import wire  # noqa: E402
+from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore  # noqa: E402
+from mstar.communication.tensors import TensorCommunicationManager  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.request_info import (  # noqa: E402
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
 )
+from mstar.distributed.base import ShardingConfig  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo  # noqa: E402
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput  # noqa: E402
+from mstar.graph.runtime.python import PythonGraphRuntime  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
-from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
+from mstar.model.base import ForwardPassArgs, Model, WorkerGraph  # noqa: E402
 from mstar.streaming.chunk_policy import (  # noqa: E402
     FixedChunkPolicy,
     LeftContextChunkPolicy,
@@ -47,8 +52,10 @@ from mstar.streaming.topology import (  # noqa: E402
     PartitionTopology,
     client_stream_limits,
 )
+from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     AbortRequest,
+    ClientStreamConsumed,
     ClientStreamInput,
     ConductorMessage,
     ConductorMessageType,
@@ -594,12 +601,10 @@ class _Bounded(_DuplexToy):
         )])
 
 
-def _consumed(c, rid, n):
-    """The consumer's step report: it has consumed ``n`` audio_in items."""
-    wg = c.node_walk_to_wg[("ear", "listen")].worker_graph_id
-    return _msg(ConductorMessageType.WORKER_GRAPHS_DONE, WorkerGraphsDone(
-        request_id=rid, worker_graph_ids=[wg], is_first_tp_rank=True,
-        partition_name="Ear", stream_tokens_consumed={"audio_in": n},
+def _consumed(rid, n):
+    """The consumer worker's report after a step: it has consumed ``n`` audio_in items."""
+    return _msg(ConductorMessageType.CLIENT_STREAM_CONSUMED, ClientStreamConsumed(
+        request_ids=[rid], edge_names=["audio_in"], consumed=[n],
     ))
 
 
@@ -608,7 +613,7 @@ def test_a_call_too_far_ahead_of_its_consumer_is_refused_with_a_400(tmp_path, mo
     _run(c, [
         [_new_request("r")],
         [_chunk("r", 1, 2)],          # 2 pending: at the limit
-        [_consumed(c, "r", 1)],
+        [_consumed("r", 1)],
         [_chunk("r", 3)],             # 2 pending again
         [_chunk("r", 4)],             # 3: refused
     ])
@@ -631,7 +636,7 @@ def test_keep_newest_sends_what_fits_and_holds_the_newest_item_for_room(tmp_path
         [_chunk("r", 1, 2)],          # sent: 2 pending
         [_chunk("r", 3)],             # waits
         [_chunk("r", 4, 5)],          # 5 waits; 3 and 4 are dropped
-        [_consumed(c, "r", 1)],       # room for one: 5 goes
+        [_consumed("r", 1)],       # room for one: 5 goes
         [_chunk("r", 6)],             # waits
         [_chunk("r", done=True)],     # the end sends it first
     ])
@@ -644,6 +649,245 @@ def test_keep_newest_sends_what_fits_and_holds_the_newest_item_for_room(tmp_path
     assert all(freed[u] == 1 for u in (1, 2, 5, 6))
     conn = c.requests["r"].streaming_connections[CLIENT, "Ear", "audio_in"]
     assert conn.waiting is None and conn.token_count == 4
+
+
+class _RuntimeTensorManager:
+    """What a graph runtime's routing calls on the tensor manager, with the
+    real refcount methods, as in ``test_stream_completion_order.py``."""
+    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
+    set_persist = TensorCommunicationManager.set_persist
+    dereference = TensorCommunicationManager.dereference
+    dereference_batch = TensorCommunicationManager.dereference_batch
+    dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
+    cleanup_collectable = TensorCommunicationManager.cleanup_collectable
+    stamps_shm_placement = False
+
+    def __init__(self, bookkeeping):
+        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
+
+    def increment_ref(self, uuid, n=1):
+        self.tensor_store.increment_ref(uuid, n=n)
+
+    def get_tensor(self, uuid):
+        return self.tensor_store.get_tensor(uuid)
+
+    def refresh_shm_placement(self, edges):
+        pass
+
+    def _cleanup_by_uuid(self, uuid, registered=None):
+        if self.tensor_store.check_uuid_presence(uuid):
+            self.tensor_store.remove_tensor(uuid)
+        elif registered is None:
+            self.tensor_store.bookkeeping.forget_tensor(uuid)
+
+
+class _LoopConsumer:
+    """The worker that consumes ``audio_in``: a real graph runtime (either one)
+    whose ``ear`` reruns inside a dynamic loop, as a node reading its client
+    stream does, so no pass finishes its worker graph; and after each pass the
+    real ``Worker._stream_and_send``, with what it reads stubbed."""
+
+    def __init__(self, kind):
+        loop = Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
+            name="ear", input_names={"state"}, outputs=[GraphEdge(name="state", next_node="ear")],
+        ))
+        common = dict(
+            my_worker_id="worker_0",
+            my_worker_graphs=[WorkerGraph(section=loop, graph_walks={"listen"}, ranks=[0], worker_graph_id=0)],
+            all_wg_ids_to_graph_walks={0: {"listen"}}, all_wg_ids_to_dyn_loops={0: {"listen_loop"}},
+            all_wg_ids_to_nodes={0: {"ear"}}, node_to_partition={"ear": "Ear"},
+            sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        )
+        if kind == "python":
+            self.book = PythonTensorBookkeeping()
+            self.rt = PythonGraphRuntime(tensor_manager=_RuntimeTensorManager(self.book), communicator=None,
+                                         **common)
+        else:
+            pytest.importorskip("mstar_rust")
+            from mstar.communication.tensor_store import RustTensorBookkeeping
+            from mstar.graph.runtime.rust import RustGraphRuntime
+
+            self.book = RustTensorBookkeeping()
+            self.rt = RustGraphRuntime(bookkeeping=self.book, **common)
+        self.rid = self.rt.add_request(
+            request_id="r", partition="Ear", graph_walk="listen", partition_worker_graph_ids=[0],
+            worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        )
+        # what each send_outputs returned: the rids it sent WORKER_GRAPHS_DONE for
+        self.graphs_done = []
+        send_outputs = self.rt.send_outputs
+
+        def recording_send_outputs(send_input):
+            done = send_outputs(send_input)
+            self.graphs_done.extend(done)
+            return done
+
+        self.rt.send_outputs = recording_send_outputs
+        self.sbuf = StreamBuffer(request_id=self.rid, edge_name="audio_in", from_partition=CLIENT,
+                                 policy=FixedChunkPolicy(chunk_size=1))
+        fwd = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
+                                     max_tokens=8, partition_name="Ear")
+        w = Worker.__new__(Worker)
+        w._graph_runtime = self.rt
+        w._phase_period = 0
+        w.enable_prof = False
+        w.communicator = _StubComm()
+        w.parallel_leader_nodes = {"ear"}
+        w._paced_streams = frozenset({"audio_in"})
+        w.tensor_manager = SimpleNamespace(dereference_batch_uniform=lambda uuids: None)
+        w.request_state = SimpleNamespace(
+            per_request_info={self.rid: SimpleNamespace(stream_buffers={"audio_in": self.sbuf})},
+            get_fwd_info=lambda rid, partition: fwd,
+            get_pending_publish_info=lambda rid, partition: {},
+            buffer_publish_info=lambda rid, partition, published: None,
+            flush_publish_info=lambda rid, partition: None,
+        )
+        self.worker = w
+        self.batch = SimpleNamespace(node_name="ear", partition="Ear",
+                                     node_batch=SimpleNamespace(resource_publish_info={}))
+        self.engine = SimpleNamespace(materialize_publish=lambda node_batch, rids: None)
+        self._uuids = iter(range(1000, 2000))
+        block = ColumnarEdgeSpecs.empty()
+        block.add(self.rid, "state", [], False, next_node="ear")
+        self.rt.ingest_inputs_batch(block)
+
+    def receive(self, *uuids):
+        """Client items the conductor forwarded, landed in the stream buffer."""
+        for uuid in uuids:
+            self.sbuf.pre_read_register(uuid)
+            self.sbuf.put(uuid, torch.zeros(1))
+
+    def step(self, take=1):
+        """One pass of ``ear`` that read ``take`` items: the messages it sent the conductor."""
+        for _ in range(take):
+            assert self.sbuf.has_chunk_ready()
+            self.sbuf.pop_chunk()
+        assert self.rt.pop_rids("ear", "listen", [self.rid], check_ready=True) is not None, "the loop stopped"
+        uuid = next(self._uuids)
+        self.book.put_tensor(uuid, _info(uuid))
+        self.book.increment_ref(uuid, 1)  # the worker's safety hold
+        out = self.rt.complete_and_route_batch(RouteInput(
+            partition="Ear", graph_walk="listen", node_name="ear", output_signals=["state"],
+            wg_ids=ParallelList([self.rid], [0]), tensors=[uuid], num_tensors=[1],
+        ))
+        sent = self.worker.communicator.sent
+        sent.clear()
+        Worker._stream_and_send(
+            self.worker, self.batch, [self.rid],
+            SimpleNamespace(flat_uuids=[uuid], flat_rids=[self.rid], signal_idxs=[0]),
+            out, ["state"], engine=self.engine,
+        )
+        return [msg for entity, msg in sent if entity == "conductor"]
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_a_consumer_reading_inside_a_loop_makes_room_as_it_reads(tmp_path, monkeypatch, kind):
+    """The loop sends no WORKER_GRAPHS_DONE until it ends, so the client's room
+    comes from the worker's report after each step: a call that sends three
+    times max_pending_items, never more than that ahead, is never refused."""
+    consumer = _LoopConsumer(kind)
+    reports = []
+    for first in (1, 3, 5):
+        consumer.receive(first, first + 1)
+        reports.append(consumer.step() + consumer.step())
+    assert consumer.graphs_done == [], "a pass finished the worker graph, so this is not the loop's case"
+    rows = [(m.body.request_ids, m.body.edge_names, m.body.consumed) for batch in reports for m in batch]
+    assert rows == [(["r"], ["audio_in"], [n]) for n in range(1, 7)]
+
+    c = _conductor(tmp_path, monkeypatch, model=_Bounded(ClientStreamLimits(max_pending_items=2)))
+    _run(c, [
+        [_new_request("r")],
+        [_chunk("r", 1, 2)], reports[0],
+        [_chunk("r", 3, 4)], reports[1],
+        [_chunk("r", 5, 6)], reports[2],
+    ])
+
+    assert "r" not in c.draining
+    assert _stream_signals(c, "r") == [([1, 2], set()), ([3, 4], set()), ([5, 6], set())]
+    assert c.requests["r"].streaming_connections[CLIENT, "Ear", "audio_in"].consumed_count == 6
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_a_consumer_that_stops_reading_still_gets_its_client_refused(tmp_path, monkeypatch, kind):
+    """Its loop keeps stepping, but a step that read nothing reports nothing,
+    so the client's room does not grow."""
+    consumer = _LoopConsumer(kind)
+    consumer.receive(1, 2)
+    read_one = consumer.step()
+    stalled = consumer.step(take=0) + consumer.step(take=0)
+    assert [m.body.consumed for m in read_one] == [[1]] and stalled == []
+
+    c = _conductor(tmp_path, monkeypatch, model=_Bounded(ClientStreamLimits(max_pending_items=2)))
+    _run(c, [
+        [_new_request("r")],
+        [_chunk("r", 1, 2)], read_one,
+        [_chunk("r", 3)],             # 2 pending again
+        stalled,
+        [_chunk("r", 4)],             # 3: refused
+    ])
+
+    assert _stream_signals(c, "r") == [([1, 2], set()), ([3], set())]
+    assert c.draining["r"].failure_status == 400
+
+
+def test_a_step_reports_only_moved_paced_counts_its_graphs_done_did_not_carry():
+    """A WORKER_GRAPHS_DONE already carries every count, an unpaced stream is
+    not the conductor's to pace, and only the lockstep leader reports."""
+    paced, other = (StreamBuffer(request_id=7, edge_name=name, from_partition=CLIENT,
+                                 policy=FixedChunkPolicy(chunk_size=1)) for name in ("audio_in", "video_in"))
+    comm = _StubComm()
+    stub = SimpleNamespace(
+        parallel_leader_nodes={"ear"}, _paced_streams=frozenset({"audio_in"}), communicator=comm,
+        _rid_str=lambda rid: "r",
+        request_state=SimpleNamespace(per_request_info={
+            7: SimpleNamespace(stream_buffers={"audio_in": paced, "video_in": other}),
+        }),
+    )
+
+    Worker._report_paced_consumption(stub, "ear", [(7, {"audio_in": 3, "video_in": 9})], [7])
+    Worker._report_paced_consumption(stub, "ear", [(7, {"audio_in": 3, "video_in": 10})], [])
+    assert comm.sent == [] and paced.consumed_reported == 3
+
+    stub.parallel_leader_nodes = set()  # a follower rank of ear's instance
+    Worker._report_paced_consumption(stub, "ear", [(7, {"audio_in": 4})], [])
+    assert comm.sent == []
+
+    stub.parallel_leader_nodes = {"ear"}
+    Worker._report_paced_consumption(stub, "ear", [(7, {"audio_in": 4, "video_in": 11})], [])
+    [(entity, msg)] = comm.sent
+    assert (entity, msg.message_type) == ("conductor", ConductorMessageType.CLIENT_STREAM_CONSUMED)
+    assert (msg.body.request_ids, msg.body.edge_names, msg.body.consumed) == (["r"], ["audio_in"], [4])
+
+
+def test_the_worker_paces_the_client_streams_it_consumes_with_a_pending_bound():
+    open_ = _Bounded(ClientStreamLimits()).get_partition_topology()
+    bounded = _Bounded(ClientStreamLimits(max_pending_items=4)).get_partition_topology()
+    override = {"client_streams": {"audio_in": {"max_pending_items": 4}}}
+
+    assert Worker._find_paced_streams(open_, open_.connections, {}) == frozenset()
+    assert Worker._find_paced_streams(bounded, bounded.connections, {}) == {"audio_in"}
+    assert Worker._find_paced_streams(open_, open_.connections, override) == {"audio_in"}
+    assert Worker._find_paced_streams(bounded, [], {}) == frozenset()  # consumed on another worker
+
+
+def test_a_consumption_report_encodes_without_pickle():
+    body = ClientStreamConsumed(request_ids=["r", "s"], edge_names=["audio_in", "audio_in"], consumed=[3, 5])
+    msg = ConductorMessage(message_type=ConductorMessageType.CLIENT_STREAM_CONSUMED, body=body)
+    assert wire._encoder(ClientStreamConsumed).__name__ == "_encode_dataclass"
+    decoded = wire.decode(wire.encode(msg)).body
+    assert (decoded.request_ids, decoded.edge_names, decoded.consumed) == (["r", "s"], ["audio_in"] * 2, [3, 5])
+
+
+def test_a_consumption_report_for_a_finished_or_unknown_request_is_ignored(tmp_path, monkeypatch):
+    c = _conductor(tmp_path, monkeypatch, model=_Bounded(ClientStreamLimits(max_pending_items=2)))
+    _run(c, [
+        [_new_request("r")],
+        [_msg(ConductorMessageType.ABORT_REQUEST, AbortRequest("r"))],
+        [_consumed("r", 1), _consumed("never-seen", 1)],
+    ])
+
+    assert c.requests["r"].streaming_connections[CLIENT, "Ear", "audio_in"].consumed_count == 0
+    assert "never-seen" not in c.requests
 
 
 def test_client_stream_limits_take_deployment_overrides():
