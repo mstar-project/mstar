@@ -292,10 +292,10 @@ class Vjepa2AcLatents(ArrayOutputFamily):
         return sc
 
     def reference_id(self) -> str:
-        return "vjepa2-ac-upstream"
+        return "vjepa2-ac-upstream-droid-transform"
 
     def reference_description(self) -> str:
-        return "upstream vjepa2 AC predictor (benchmark/vjepa2_repo_ac.py), repo not available"
+        return "upstream vjepa2 AC predictor, DROID eval transform (benchmark/vjepa2_repo_ac.py); repo not available"
 
 
 class Vjepa2Embedding(ArrayOutputFamily):
