@@ -434,6 +434,35 @@ def test_correctness_scores_skip_set_aside_arms(tmp_path, monkeypatch):
     assert correctness.score(run) == {"qwen3_5_4b/mstar": {"verdict": "mstar"}}
 
 
+def test_one_arms_scoring_error_keeps_the_others(tmp_path, monkeypatch):
+    from benchmark.amd import correctness
+
+    run = tmp_path / "run"
+    (run / "wan22").mkdir(parents=True)
+    (run / "sweep.json").write_text(json.dumps({"worktree": str(tmp_path), "correctness_src": str(tmp_path)}))
+    for arm in ("mstar", "vllm-omni"):
+        d = run / "wan22" / arm
+        (d / "cells/video-t2v/c1/a1r1").mkdir(parents=True)
+        (d / "cells/video-t2v/c1/a1r1/results.json").write_text("{}")
+        (d / "cells/video-i2v/c1/a1r1").mkdir(parents=True)
+        (d / "cells/video-i2v/c1/a1r1/results.json").write_text("{}")
+        (d / "arm.json").write_text(json.dumps({"arm": arm, "row": "wan22"}))
+
+    def fake_pass(C, tree, row, arm, cell, corr, ext, opts):
+        if arm == "vllm-omni" and cell.parent.name == "video-t2v":
+            raise FileNotFoundError("no outputs")
+        corr.mkdir(parents=True, exist_ok=True)
+        (corr / "pass.json").write_text("{}")
+
+    monkeypatch.setattr(correctness, "load", lambda src: None)
+    monkeypatch.setattr(correctness, "pass_from_cell", fake_pass)
+    monkeypatch.setattr(correctness, "score_dir", lambda C, wt, corr, device: {"verdict": "PASS"})
+    got = correctness.score(run)
+    assert got["wan22/vllm-omni"] == {"verdict": "ERROR", "error": "FileNotFoundError: no outputs"}
+    assert got["wan22/mstar"] == got["wan22/mstar/video-i2v"] == got["wan22/vllm-omni/video-i2v"] == {
+        "verdict": "PASS"}
+
+
 def test_moe_configs_reach_the_table(tmp_path):
     from benchmark.amd.launch import moe_configs_in_log
 
