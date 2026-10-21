@@ -257,7 +257,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        stream may carry over a call's life, in the model's units (items, or the frames
        or samples a model counts per item); a call past it ends with a 400.
        ``max_pending_items``: how many items the model may have been sent and not yet
-       consumed at once, as the model last reported (a step late). It counts items, not
+       consumed at once, as the model last reported (after each step that took any, so
+       a step late). It counts items, not
        the frames or samples ``max_items`` may count per item, and must be at least the
        widest chunk the stream's chunk policy waits for, or loading fails: the model
        would never take a chunk, so it would never make room.
