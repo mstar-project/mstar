@@ -920,7 +920,8 @@ def test_media_rows_workloads_and_request_settings():
 def test_first_size_requests_one_per_size(tmp_path, monkeypatch):
     calls = []
 
-    def fake_client(cmd, env, log_path):
+    def fake_client(cmd, env, log_path, timeout_s=None):
+        assert timeout_s == sweep.FIRST_SIZE_TIMEOUT_S
         sdir = Path(cmd[cmd.index("--sample-set-dir") + 1])
         item = json.loads((sdir / "manifest.json").read_text())["items"][0]
         calls.append((item["params"], json.loads(cmd[cmd.index("--request-kwargs") + 1]),
@@ -941,6 +942,93 @@ def test_first_size_requests_one_per_size(tmp_path, monkeypatch):
                                     tables.WORKLOADS["video-i2v"], 8400, tmp_path / "b", [3], None,
                                     {"height": 480, "width": 832})
     assert got == {"832x480": 1.5} and len(calls) == 1
+
+    def failing_client(cmd, env, log_path, timeout_s=None):
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        (out / "results.json").write_text(json.dumps({"per_request": [],
+                                                      "errors": [{"request_id": 0, "error": "HTTP 400: no image"}]}))
+        return 0, 0.1
+
+    monkeypatch.setattr(sweep, "run_client", failing_client)
+    got = sweep.first_size_requests(plan, catalog.ARMS["mstar"], catalog.ROWS["wan22"],
+                                    tables.WORKLOADS["video-i2v"], 8400, tmp_path / "c", [3], None,
+                                    {"height": 480, "width": 832})
+    assert got["832x480"].startswith("failed (HTTP 400: no image, see ")
+
+    def hung_client(cmd, env, log_path, timeout_s=None):
+        raise TimeoutError("still waiting")
+
+    monkeypatch.setattr(sweep, "run_client", hung_client)
+    with pytest.raises(RuntimeError, match="the first video-i2v request at 832x480 did not finish in 1800 s"):
+        sweep.first_size_requests(plan, catalog.ARMS["mstar"], catalog.ROWS["wan22"], tables.WORKLOADS["video-i2v"],
+                                  8400, tmp_path / "d", [3], None, {"height": 480, "width": 832})
+
+
+def test_run_client_kills_a_runner_past_its_timeout(tmp_path):
+    import os
+    import sys
+    import time
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        sweep.run_client([sys.executable, "-c", "import time; time.sleep(60)"], dict(os.environ),
+                         tmp_path / "log", timeout_s=0.5)
+    assert time.monotonic() - t0 < 30
+    assert sweep.run_client([sys.executable, "-c", "pass"], dict(os.environ), tmp_path / "log2", timeout_s=30)[0] == 0
+
+
+def test_a_failed_first_request_leaves_out_that_workloads_cells(tmp_path, monkeypatch):
+    from benchmark.amd import correctness
+
+    stopped, cells = [], []
+
+    class FakeLaunch:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            return {"ready_s": 1.0, "first_request_s": 1.0}
+
+        def stop(self):
+            stopped.append(1)
+            return {}
+
+    class FakeHealth:
+        monitor = None
+
+        def __init__(self, *a):
+            pass
+
+        def begin(self):
+            pass
+
+        def end(self):
+            return {}
+
+    first = {"video-t2v": {"832x480": 2.0}, "video-i2v": {"832x480": "failed (HTTP 400: no image, see x)"}}
+    monkeypatch.setattr(sweep, "Launch", FakeLaunch)
+    monkeypatch.setattr(sweep.health, "ArmHealth", FakeHealth)
+    monkeypatch.setattr(sweep.health, "smi_gpus", lambda gpus: gpus)
+    monkeypatch.setattr(correctness, "media_request_kwargs", lambda *a: {"height": 480, "width": 832})
+    monkeypatch.setattr(sweep, "first_size_requests", lambda plan, arm, row, wl, *a: first[wl.name])
+    monkeypatch.setattr(sweep, "run_cell", lambda plan, arm, row, wl, c, *a: cells.append((wl.name, c)) or {
+        "summary": {}, "spread": None, "flags": [], "errors": [], "workload": wl.name, "concurrency": c,
+        "status": "done"})
+    plan = type("P", (), {"run_dir": tmp_path, "resume": False, "measured": [], "numa": False, "log": print,
+                          "correctness": False, "worktree": tmp_path, "trees": {}, "skips": [],
+                          "fixed_concurrency": True,
+                          "workloads": [tables.WORKLOADS[w] for w in ("video-t2v", "video-i2v")]})()
+    info = sweep.run_arm(plan, catalog.ROWS["wan22"], catalog.ARMS["mstar"], [5], 8400, "")
+    assert info["status"] == "done" and {w for w, _ in cells} == {"video-t2v"} and stopped
+    assert info["error"].startswith("first request failed, its cells left out: video-i2v failed (HTTP 400")
+
+    def hung(plan, arm, row, wl, *a):
+        raise RuntimeError(f"the first {wl.name} request at 832x480 did not finish in 1800 s")
+
+    monkeypatch.setattr(sweep, "first_size_requests", hung)
+    cells.clear(), stopped.clear()
+    info = sweep.run_arm(plan, catalog.ROWS["wan22"], catalog.ARMS["mstar"], [5], 8400, "")
+    assert info["status"] == "error" and "did not finish in 1800 s" in info["error"] and not cells and stopped
 
 
 def test_diffusers_reference_runs_each_workload_with_its_family_mode(tmp_path, monkeypatch):
