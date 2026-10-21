@@ -2,6 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
+import math
 from dataclasses import dataclass, field, fields
 
 import torch
@@ -27,6 +28,22 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.platforms import current_platform
+
+
+def _cos_sin_cache_key(
+    rotary_dim: int, rope_scale: float, rope_theta: float, llama31_params: dict,
+) -> tuple:
+    """What determines a cos/sin cache's angles. Llama 3.1's blend of the scaled
+    and unscaled frequency changes nothing at ``rope_scale == 1``, so it drops
+    out there (attention layers pass default Llama 3.1 arguments)."""
+    llama31 = tuple(
+        llama31_params.get(name)
+        for name in ("low_freq_factor", "high_freq_factor", "old_context_len")
+    )
+    if None in llama31 or rope_scale == 1.0:
+        llama31 = None
+    return (rotary_dim, rope_scale, rope_theta, llama31)
 
 
 @dataclass
@@ -114,7 +131,31 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
-        # CUDA rotates from this table instead of in-kernel angles when set.
+        elif (device.type == "cuda" and current_platform.is_rocm()
+              and config.rope_table_dtype is None):
+            # The ROCm kernel reads cos/sin from an fp32 cache with every
+            # frequency rule (scale, Llama 3.1) already applied; see
+            # `position/rocm.py`. A rope_table_dtype table (below) replaces it.
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError(
+                    "RoPE on AMD GPUs needs PositionConfig.rotary_dim or the "
+                    "dependent KV cache's head_dim"
+                )
+            self._rope_cache_key = _cos_sin_cache_key(
+                rotary_dim, config.rope_scale, config.rope_theta,
+                config.llama31_params,
+            )
+            self._rope_cache = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                torch.float32,
+                llama31=self._rope_cache_key[3],
+                compute_dtype=torch.float64,
+            )
+        # CUDA and ROCm rotate from this table when set, instead of in-kernel
+        # angles or the fp32 cache.
         self._rope_table: torch.Tensor | None = None
         if config.rope_table_dtype is not None and device.type != "xpu":
             if config.llama31_params:
@@ -486,14 +527,21 @@ class RopeManager(PositionManager):
         rope_scale: float,
         rope_theta: float,
         dtype: torch.dtype,
+        llama31: tuple[float, float, float] | None = None,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        positions = (
-            torch.arange(
-                self._max_seq_len,
-                device=self._device,
-                dtype=torch.float32,
-            )
-            / rope_scale
+        """``[max_seq_len, rotary_dim]``: cos of each position's angles, then sin.
+
+        The angles follow FlashInfer's kernels: frequency ``theta ** (-2i / d)``
+        divided by ``rope_scale``, or with ``llama31 = (low_freq_factor,
+        high_freq_factor, old_context_len)`` Llama 3.1's blend of the scaled
+        and unscaled frequency. An fp32 angle is off by up to ``angle * 2**-24``
+        (2e-3 rad at position 32k); ``compute_dtype=torch.float64`` removes that.
+        """
+        positions = torch.arange(
+            self._max_seq_len,
+            device=self._device,
+            dtype=compute_dtype,
         )
         inv_freq = 1.0 / (
             rope_theta
@@ -503,11 +551,20 @@ class RopeManager(PositionManager):
                     rotary_dim,
                     2,
                     device=self._device,
-                    dtype=torch.float32,
+                    dtype=compute_dtype,
                 )
                 / rotary_dim
             )
         )
+        if llama31 is None:
+            positions = positions / rope_scale
+        else:
+            low, high, old_context_len = llama31
+            smooth = (
+                inv_freq * (old_context_len / (2 * math.pi * (high - low)))
+                - low / (high - low)
+            ).clamp(0.0, 1.0)
+            inv_freq = (1 - smooth) * inv_freq / rope_scale + smooth * inv_freq
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
 
@@ -576,6 +633,15 @@ class RopeManager(PositionManager):
                 device=q.device,
                 dtype=torch.long,
             )
+        elif self._rope_cache is not None:
+            # The cache serves the arguments it was built from. A layer that
+            # passes others (its own theta, say) gets the kernel that computes
+            # the angles from them, as NVIDIA GPUs do for every call.
+            cache_key = _cos_sin_cache_key(
+                rotary_dim or q.shape[-1], rope_scale, rope_theta, llama31_params,
+            )
+            if cache_key == self._rope_cache_key:
+                cos_sin_cache = self._rope_cache
         torch.ops.mstar.rope_apply_qk_inplace(
             q,
             k,
