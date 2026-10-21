@@ -2,7 +2,7 @@
 
 Vendored from vLLM's ``model_executor/layers/mamba/ops/causal_conv1d.py``
 (Apache-2.0), itself adapted from Tri Dao's causal-conv1d. Kept intact apart
-from the vLLM couplings: ``current_platform`` becomes a local capability check,
+from the vLLM couplings: ``current_platform`` is M*'s (``mstar.platforms``),
 ``vllm.triton_utils`` becomes triton directly, the CPU swap at the bottom is
 dropped (the GDN path is CUDA-only), and ``causal_conv1d_fn`` takes an optional
 ``seqlens_cpu``: host lengths that replace its device-to-host read, a sync that
@@ -28,6 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms import current_platform
+
 # vLLM's sentinels, kept at their upstream values: a row whose slot is
 # PAD_SLOT_ID is skipped.
 PAD_SLOT_ID = -1
@@ -36,10 +38,8 @@ NULL_BLOCK_ID = 0
 
 @functools.cache
 def _supports_pdl() -> bool:
-    """Programmatic dependent launch: Hopper and newer."""
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] >= 9
+    """Programmatic dependent launch: NVIDIA Hopper and newer."""
+    return current_platform.has_cuda_capability(9)
 
 
 

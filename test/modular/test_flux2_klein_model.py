@@ -245,7 +245,7 @@ def test_shape_key_from_step_metadata_and_capture_buckets():
         (IMAGE_EDIT_WALK, (64, 64), ((64, 64),)), (IMAGE_EDIT_WALK, (48, 64), ((48, 64),)),
     ]
     assert model.warmup_sizes() == [(1024, 1024), (768, 1024)]
-    assert _make_model(cuda_graph=False).capture_buckets() == []
+    assert _make_model(accelerator_graph=False).capture_buckets() == []
     only_small_edits = _make_model(capture_edit_sizes=[[512, 512]])
     assert [(w, s.grid, s.ref_grids) for w, s in only_small_edits.capture_buckets()] == [
         (IMAGE_GEN_WALK, (64, 64), ()), (IMAGE_EDIT_WALK, (32, 32), ((32, 32),)),

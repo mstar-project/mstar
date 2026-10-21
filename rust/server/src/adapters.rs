@@ -743,18 +743,46 @@ mod tests {
         }
     }
 
+    /// A fresh upload directory, removed on drop. Request media must be inline
+    /// (a data URL), so the server persists it here.
+    struct UploadDir(std::path::PathBuf);
+
+    impl UploadDir {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("mstar-adapters-test-{}", uuid::Uuid::new_v4())))
+        }
+    }
+
+    impl Drop for UploadDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What each persisted upload holds, in `file_paths` order.
+    fn contents(paths: &[String]) -> Vec<Vec<u8>> {
+        paths.iter().map(|p| std::fs::read(p).unwrap()).collect()
+    }
+
+    // The bytes "a" and "b", so a test can tell which image went where.
+    const IMAGE_A: &str = "data:image/png;base64,YQ==";
+    const IMAGE_B: &str = "data:image/png;base64,Yg==";
+
     #[test]
     fn an_attachment_keeps_its_place_between_text() {
+        let dir = UploadDir::new();
         let (text, file_paths, in_mods, parts) = flatten(
-            r#"[{"role":"user","content":[
-                {"type":"text","text":"A"},
-                {"type":"image_url","image_url":{"url":"/in/a.png"}},
-                {"type":"text","text":"B"}]}]"#,
-            Path::new("/unused"),
+            &format!(
+                r#"[{{"role":"user","content":[
+                {{"type":"text","text":"A"}},
+                {{"type":"image_url","image_url":{{"url":"{IMAGE_A}"}}}},
+                {{"type":"text","text":"B"}}]}}]"#
+            ),
+            &dir.0,
         )
         .unwrap();
         assert_eq!(text.as_deref(), Some("A\nB"));
-        assert_eq!(file_paths["image"], ["/in/a.png"]);
+        assert_eq!(contents(&file_paths["image"]), [b"a"]);
         assert_eq!(in_mods, ["text", "image", "text"], "the layout lost the image's place");
         assert_eq!(
             described(&parts),
@@ -769,16 +797,19 @@ mod tests {
 
     #[test]
     fn an_image_in_a_reply_lands_in_the_next_user_turn() {
+        let dir = UploadDir::new();
         let (_, file_paths, in_mods, parts) = flatten(
-            r#"[{"role":"user","content":"Draw a red cube."},
-                {"role":"assistant","content":[
-                    {"type":"text","text":"Here it is."},
-                    {"type":"image_url","image_url":{"url":"/in/a.png"}}]},
-                {"role":"user","content":"Make it blue."}]"#,
-            Path::new("/unused"),
+            &format!(
+                r#"[{{"role":"user","content":"Draw a red cube."}},
+                {{"role":"assistant","content":[
+                    {{"type":"text","text":"Here it is."}},
+                    {{"type":"image_url","image_url":{{"url":"{IMAGE_A}"}}}}]}},
+                {{"role":"user","content":"Make it blue."}}]"#
+            ),
+            &dir.0,
         )
         .unwrap();
-        assert_eq!(file_paths["image"], ["/in/a.png"]);
+        assert_eq!(contents(&file_paths["image"]), [b"a"]);
         assert_eq!(in_mods, ["text", "text", "image", "text"]);
         assert_eq!(
             described(&parts),
@@ -794,15 +825,18 @@ mod tests {
 
     #[test]
     fn two_images_are_indexed_in_order() {
+        let dir = UploadDir::new();
         let (_, file_paths, in_mods, parts) = flatten(
-            r#"[{"role":"user","content":[
-                {"type":"image_url","image_url":{"url":"/in/a.png"}},
-                {"type":"image_url","image_url":{"url":"/in/b.png"}},
-                {"type":"text","text":"Compare."}]}]"#,
-            Path::new("/unused"),
+            &format!(
+                r#"[{{"role":"user","content":[
+                {{"type":"image_url","image_url":{{"url":"{IMAGE_A}"}}}},
+                {{"type":"image_url","image_url":{{"url":"{IMAGE_B}"}}}},
+                {{"type":"text","text":"Compare."}}]}}]"#
+            ),
+            &dir.0,
         )
         .unwrap();
-        assert_eq!(file_paths["image"], ["/in/a.png", "/in/b.png"]);
+        assert_eq!(contents(&file_paths["image"]), [b"a", b"b"]);
         assert_eq!(in_mods, ["image", "image", "text"]);
         assert_eq!(
             parts.iter().map(|p| p.index).collect::<Vec<_>>(),

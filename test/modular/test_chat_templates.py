@@ -33,7 +33,7 @@ def _qwen3_omni(path, text, in_mods, parts):
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
-    model._processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+    model._processor = AutoProcessor.from_pretrained(path, trust_remote_code=False)
     model.tokenizer = model._processor.tokenizer
     [ids] = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
     rendered = model._processor.apply_chat_template(CHAT, tokenize=False, add_generation_prompt=True)

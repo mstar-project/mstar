@@ -94,5 +94,5 @@ def test_eager_prefill_is_not_held_to_the_captured_rows():
     sub.config.moe_quant_kernel = "auto"
     if sub._captured_prefill_rows() is None:
         pytest.skip("no fused KDA on this host")
-    sub._prefill_captured = False  # get_cuda_graph_configs declared none
+    sub._prefill_captured = False  # get_accelerator_graph_configs declared none
     assert sub._captured_prefill_rows() is None

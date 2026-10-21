@@ -72,15 +72,19 @@ from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
-from mstar.model.bagel.config import load_bagel_config
+from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
+    IMAGE_ADVANCE,
+    IMAGE_SENTINELS,
     CombineCFGSubmodule,
     LLMSubmodule,
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vit_patches,
+    vit_preprocess,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -262,8 +266,11 @@ class BagelModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        accelerator_graph: bool | None = None,
         **kwargs
     ):
+        if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
+            raise ValueError("accelerator_graph must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -272,6 +279,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        if accelerator_graph is not None:
+            self.config.accelerator_graph = accelerator_graph
 
         self.model_path_hf = model_path_hf
 
@@ -456,7 +465,8 @@ class BagelModel(Model):
                 connector=self.connector,
                 vit_pos_embed=self.vit_pos_embed,
                 vit_patch_size=self.config.vit_config.patch_size,
-                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
+                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side,
+                accelerator_graph=self.config.accelerator_graph,
             )
         elif node_name == "vae_encoder":
             self._init_vae_components(device, autocast_dtype=autocast_dtype)
@@ -593,7 +603,7 @@ class BagelModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
         Returns model-specific keys matching get_forward_pass_inputs:
@@ -605,10 +615,11 @@ class BagelModel(Model):
         attachments gets its own span and no seam is re-tokenized. The schedule
         builder walks the same :func:`prefill_plan`.
 
-        Bagel doesn't need the raw multimodal tensors here; images are loaded
-        as ``image_inputs`` by the data worker.
+        An understanding prompt with images, given their tensors, also returns
+        the main stream's ``prefix_layout``, so it is keyed past its images.
         """
         result: NameToTensorList = {}
+        layout = None
 
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
@@ -659,6 +670,13 @@ class BagelModel(Model):
                     spans,
                     len(segments),
                 )
+                # An edit gets no layout. Its image is resized below before the ViT
+                # sees it, and the file's digest doesn't cover that resize.
+                if is_understanding and "image" not in output_modalities and tensors is not None:
+                    layout = self._prefix_layout(
+                        parts, segments, tensors["image_inputs"],
+                        vit_preprocess(kwargs.get("image_preprocess")),
+                    )
                 if think_mode and not is_understanding:
                     # Not part of the request layout: tokenized on its own and
                     # prefilled ahead of the plan.
@@ -686,7 +704,31 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        return result
+        if layout is None:
+            return result
+        return ProcessPromptOutput(result, {"prefix_layout": {"kv": {"main": layout}}})
+
+    def _prefix_layout(
+        self, parts: list[PromptPart], segments: list[torch.Tensor],
+        images: list[torch.Tensor], image_preprocess: str,
+    ) -> list[Span]:
+        """The main stream's writes in walk order: text by its ids, an image by its file."""
+        spans = []
+        for step in prefill_plan(parts, leading_text=True):
+            if step.modality == TEXT:
+                length = segments[step.index].numel()
+                spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
+                continue
+            _, height, width = images[step.index].shape
+            patches = vit_patches(
+                height, width, image_preprocess,
+                self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side,
+            )
+            spans.append(Span(
+                "digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE,
+                ("image", step.index), (image_preprocess,),
+            ))
+        return spans
 
     @staticmethod
     def _resize_to_fit(
@@ -758,12 +800,13 @@ class BagelModel(Model):
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """The text walk's prompt is its token ids, and so is every step it takes.
 
-        The image walks write into this stream too, and an edit's picture lands
-        at the positions its keyed text would have; only the text walk is named.
-        A chat sends a reply back as its own assistant turn, so its pages match.
+        An image in an understanding prompt is keyed by its file. An edit's VAE
+        walk writes this stream too, over positions no layout describes, so it
+        is not named. A chat sends a reply back as its own assistant turn, so
+        its pages match.
         """
         return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "decode",
+            "text_inputs", "ids", "prefill_text", "decode", ("prefill_vit",),
         )}}
 
     def checkpoint_path(self) -> str:
@@ -932,6 +975,9 @@ class BagelModel(Model):
             and image_ranks.isdisjoint(llm_ranks("decode"))
         )
         return super().get_worker_graphs(config_path)
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

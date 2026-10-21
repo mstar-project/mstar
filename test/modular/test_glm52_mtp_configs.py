@@ -25,18 +25,12 @@ def _cpu_flashinfer() -> types.ModuleType:
     return fi
 
 
-try:
-    import flashinfer  # noqa: F401  (the real one stays for later test files)
-except ImportError:
-    sys.modules["flashinfer"] = _cpu_flashinfer()
-
-
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig  # noqa: E402
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
@@ -59,8 +53,8 @@ def test_mtp_decode_captures_one_graph_over_the_block(k):
     k=0, and no piecewise regions."""
     cfg = _mtp_cfg(k)
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
-    configs = sub.get_cuda_graph_configs(CPU)
-    decodes = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    configs = sub.get_accelerator_graph_configs(CPU)
+    decodes = [c for c in configs if isinstance(c, BatchedAcceleratorGraphConfig)]
     assert [c.additional_key_info for c in decodes] == [None, "sampled"]
     for decode in decodes:
         assert decode.capture_graph_walk == "decode"
@@ -69,9 +63,9 @@ def test_mtp_decode_captures_one_graph_over_the_block(k):
         assert decode.get_total_tokens(4) == [4 * (k + 1)]
         assert decode.capture_batch_sizes == Glm52LLMSubmodule.MTP_CAPTURE_BATCH_SIZES
     cfg.mtp_num_draft_tokens = 0
-    plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_cuda_graph_configs(CPU)
+    plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_accelerator_graph_configs(CPU)
     assert len(plain) == len(configs) - 1
-    assert sub.get_piecewise_cuda_graph_configs(CPU, torch.bfloat16, tp_world_size=1) == {}
+    assert sub.get_piecewise_accelerator_graph_configs(CPU, torch.bfloat16, tp_world_size=1) == {}
 
 
 def test_mtp_acceptance_log_per_position(caplog):

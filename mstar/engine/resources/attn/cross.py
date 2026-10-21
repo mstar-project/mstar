@@ -9,11 +9,13 @@ from mstar.engine.resources.attn.base import (
     EagerSlotKey,
     PlanCacheKey,
     WorkspacePool,
+    resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
     AttentionStep,
     AttnBackend,
     CrossAttentionSpec,
+    refuse_context_only,
 )
 from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 from mstar.engine.resources.base import (
@@ -48,9 +50,10 @@ class CrossAttentionManager(AttentionResource):
     def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
+        backend = resolve_attn_backend(spec.config.backend, info.device)
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
-        if spec.config.backend == AttnBackend.FLASHINFER:
+        if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
                 query_kv_cache=spec.config.query_kv_cache,
@@ -60,9 +63,7 @@ class CrossAttentionManager(AttentionResource):
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
             )
-        raise ValueError(
-            f"Unknown cross attention backend {spec.config.backend!r}"
-        )
+        raise ValueError(f"Unknown cross attention backend {backend!r}")
 
 
 class FlashInferCrossManager(CrossAttentionManager):
@@ -143,10 +144,11 @@ class FlashInferCrossManager(CrossAttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "preplan requires a captured graph step: an eager wrapper shares its "
             "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
@@ -340,7 +342,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                     ),
                     batch_size=num_rows,
                     max_total_tokens=lease.bucket.num_tokens,
-                    use_cuda_graph=True,
+                    accelerator_graph=True,
                     **self._wrapper_kv_kwargs,
                 )
             return key, wrapper

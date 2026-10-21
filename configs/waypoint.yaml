@@ -4,7 +4,7 @@ model_kwargs:
   variant: "waypoint-1.5-1b-720p"
   reference_compat: true
   compile_dit: true
-  cuda_graph: true
+  accelerator_graph: true
   # Extra (H, W) seed shapes with their own vae_encoder graph; ~15 s startup each.
   seed_capture_sizes: [[360, 640], [540, 960], [1080, 1920]]
   full_global_ring: false

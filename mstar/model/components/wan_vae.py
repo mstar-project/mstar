@@ -80,6 +80,30 @@ def to_channels_last(vae: nn.Module) -> None:
                 module.weight.data = module.weight.data.contiguous(memory_format=torch.channels_last)
 
 
+_DEFAULT_LAYOUT_CLASS = {
+    ChannelsLastCausalConv3d: WanCausalConv3d,
+    ChannelsLastConv2d: nn.Conv2d,
+    ChannelsLastUpsample: WanUpsample,
+}
+
+
+def to_default_layout(vae: nn.Module) -> None:
+    """Undo ``to_channels_last``, in place; idempotent. The weights become
+    contiguous again (the layout they load in) and the modules their diffusers
+    classes, so ``vae.decode`` is stock ``vae.decode`` bit for bit."""
+    if not is_channels_last(vae):
+        return
+    for root in (getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None)):
+        if root is None:
+            continue
+        for module in root.modules():
+            module.__class__ = _DEFAULT_LAYOUT_CLASS.get(type(module), type(module))
+            if isinstance(module, (nn.Conv3d, nn.Conv2d)):
+                # Not .contiguous(): with size-1 dims (a 1x1x1 kernel) both
+                # layouts count as contiguous and it would keep these strides.
+                module.weight.data = module.weight.data.clone(memory_format=torch.contiguous_format)
+
+
 def is_channels_last(vae: nn.Module) -> bool:
     return isinstance(getattr(vae, "post_quant_conv", None), ChannelsLastCausalConv3d)
 
@@ -147,6 +171,39 @@ def feat_cache_bytes(feat_cache: list) -> int:
     return sum(t.numel() * t.element_size() for t in feat_cache if torch.is_tensor(t))
 
 
+def _has_deterministic_mode() -> bool:
+    import torch._inductor.config as inductor_config
+
+    return hasattr(inductor_config, "deterministic")
+
+
+def compile_decode(fn, deterministic: bool = False):
+    """``torch.compile`` a Wan VAE decode callable; every compiled Wan VAE
+    decode goes through here.
+
+    Comprehensive padding is off. With it, Inductor on torch 2.13 pads the
+    strides it picks for ``up_blocks[1]``'s shortcut ``x.clone()`` as if
+    channels-first, while the upsample conv that the clone is fused into
+    writes it channels-last: a Wan 2.2 (``is_residual``) decode then reads
+    wrong values past the buffer's end (wrong frames, NaNs or an illegal
+    memory access). On torch 2.12.1 the ``DecoderStep`` paths graph-break
+    before that graph forms, so the option leaves them byte-identical. The
+    stateless whole-clip decode does form it there: the option moves its
+    output by up to 2 uint8 levels, at the same speed.
+
+    ``deterministic`` turns on Inductor's deterministic mode where this
+    torch has it (2.9.1 does not); see ``DecoderStep``.
+    """
+    import torch._inductor.config as inductor_config
+
+    options = {}
+    if hasattr(inductor_config, "comprehensive_padding"):
+        options["comprehensive_padding"] = False
+    if deterministic and _has_deterministic_mode():
+        options["deterministic"] = True
+    return torch.compile(fn, fullgraph=False, dynamic=False, options=options or None)
+
+
 def _cache_signature(feat_cache: list) -> tuple:
     return tuple(t if t is None or isinstance(t, str) else tuple(t.shape) for t in feat_cache)
 
@@ -169,17 +226,26 @@ class DecoderStep:
     a copy of the cache and discards the result before serving it. The signature is
     the input's shape and strides plus the cache's slot shapes, so the warm-up
     sees the real layout.
+
+    ``deterministic`` compiles in Inductor's deterministic mode where this
+    torch has it (2.9.1 does not): each reduction kernel's config is then
+    picked by a fixed rule. Otherwise it is benchmarked on first use with a
+    cold cache, and processes that pick differently decode the same latents
+    a few uint8 levels apart.
     """
 
-    def __init__(self, vae: nn.Module, compile: bool):
+    def __init__(self, vae: nn.Module, compile: bool, deterministic: bool = False):
         self.compiled = compile
         self._decoder = vae.decoder
-        self._fn = torch.compile(self._decoder.forward, fullgraph=False, dynamic=False) if compile else None
+        self._fn = compile_decode(self._decoder.forward, deterministic=deterministic) if compile else None
         self._warmed: set[tuple] = set()
 
     def __call__(self, x: torch.Tensor, feat_cache: list, first_chunk: bool = False) -> torch.Tensor:
         if not self.compiled or first_chunk or any(isinstance(t, str) for t in feat_cache):
             return self._decoder(x, feat_cache=feat_cache, feat_idx=[0], first_chunk=first_chunk)
+        # A slice of a clip keeps the clip's batch stride, which the compiled
+        # graph guards on: without this, every new clip length recompiles.
+        x = _compact(x)
         if x.dtype == torch.bfloat16:
             key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache))
             if key not in self._warmed:

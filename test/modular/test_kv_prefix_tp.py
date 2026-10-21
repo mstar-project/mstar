@@ -25,8 +25,14 @@ import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
 from mstar.communication.wire import decode, encode  # noqa: E402
 from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources import Resource, StepRunner  # noqa: E402
+from mstar.engine.resources.base import CachedPrefix  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
+from mstar.engine.resources.kv.config import (  # noqa: E402
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+)
 from mstar.engine.resources.kv.keys import chain  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
@@ -66,13 +72,15 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(rank: int, max_num_pages: int = 32, opt_in: bool = True) -> KVManager:
+def _manager(
+    rank: int, max_num_pages: int = 32, opt_in: bool = True, world: int = 2,
+) -> KVManager:
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE, prefix_cache_tp=opt_in,
         ),
-        name="kv", joint_comm_group=types.SimpleNamespace(rank=rank, world_size=2),
+        name="kv", joint_comm_group=types.SimpleNamespace(rank=rank, world_size=world),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
     )
     assert kv.enable_prefix_cache(ROOT) == opt_in
@@ -84,22 +92,40 @@ def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
     assert _manager(0)._index is not None
 
 
-def test_a_cap_keeps_only_whole_pages():
-    # a snapshot pool may cap at a length this cache holds only part of a page of
-    assert _manager(0).cap_cached_prefix("r", NODE, WALK, PAGE_SIZE + 3) == PAGE_SIZE
-
-
 def _tokens(n: int, seed: int) -> list[int]:
     return [(seed * 7919 + i * 31) % 1000 for i in range(n)]
 
 
 def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
-    """The keys the preprocess worker sends for ``tokens``."""
+    """The keys and layout the preprocess worker sends for ``tokens``."""
     whole = len(tokens) // PAGE_SIZE
     pages = [tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)]
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain(pages)}, prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
     ))
+
+
+def _inputs(tokens: list[int]) -> ARNodeInputs:
+    return ARNodeInputs(input_ids=torch.tensor(tokens), input_seq_len=len(tokens))
+
+
+def _decide(kv: KVManager, rid: str) -> int:
+    """Rank 0's probe as it sends the step, before the step is prepared."""
+    return kv.resolve_cached_prefix(rid, NODE, WALK, None).tokens
+
+
+def test_a_cap_keeps_only_whole_pages():
+    # a snapshot pool may cap at a length this cache holds only part of a page of
+    kv = _manager(0)
+    shared = _tokens(3 * PAGE_SIZE + 1, seed=12)
+    _ingest(kv, "a", shared)
+    _run(kv, "a", shared)
+    _ingest(kv, "b", shared[:3 * PAGE_SIZE] + _tokens(4, seed=13))
+    assert _decide(kv, "b") == 3 * PAGE_SIZE
+    capped = kv.cap_cached_prefix("b", NODE, WALK, CachedPrefix("main", PAGE_SIZE + 3, PAGE_SIZE + 3))
+    assert capped == CachedPrefix("main", PAGE_SIZE, PAGE_SIZE)
+    assert len(kv._streams["b"]["main"].lease) == 1
 
 
 def _ctx(rid: str) -> StepContext:
@@ -114,8 +140,12 @@ def _admit(kv: KVManager, rid: str, span: int) -> KVStep:
 
 
 def _run(kv: KVManager, rid: str, tokens: list[int], matched: int = 0) -> None:
-    """The rest of one prefill step past a hit: admit, plan, commit."""
-    kv.apply_cached_prefix(rid, NODE, WALK, None, matched)
+    """One prefill step as each rank prepares it past a hit: probe, apply, admit, plan,
+    commit."""
+    inputs = _inputs(tokens)
+    prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
+    assert prefix.tokens == matched
+    kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
     kv.commit(_admit(kv, rid, len(tokens) - matched), _ctx(rid))
 
 
@@ -143,7 +173,7 @@ def _rank_0_engine(kv: KVManager) -> Engine:
 def _batch(rid: str):
     return SimpleNamespace(
         node_name=NODE, graph_walk=WALK, request_ids=(rid,), step_context=_ctx(rid),
-        per_request_info_wrapped={rid: None}, cached_prefix=None,
+        per_request_info_wrapped={rid: None},
     )
 
 
@@ -157,8 +187,9 @@ class _Capping(Resource):
     def build(cls, spec, info):
         raise NotImplementedError
 
-    def cap_cached_prefix(self, rid, node_name, graph_walk, length):
-        return min(length, self._at)
+    def cap_cached_prefix(self, rid, node_name, graph_walk, prefix):
+        tokens = min(prefix.tokens, self._at)
+        return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
 
 
 def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
@@ -170,15 +201,15 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
         _run(kv, "a", shared)
         _ingest(kv, "b", prompt)
 
-    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    matched = _decide(leader, "b")
     assert matched == 5 * PAGE_SIZE
     # its own index holds the pages, but only rank 0's word counts
-    assert follower.resolve_cached_prefix("b", NODE, WALK) == 0
+    assert follower.resolve_cached_prefix("b", NODE, WALK, _inputs(prompt)).tokens == 0
     pages = leader.cached_prefix_pages("b", NODE, WALK, matched)
     assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
     # adopted once: asking again takes no second reference
     assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
-    assert follower.resolve_cached_prefix("b", NODE, WALK) == matched
+    assert follower.resolve_cached_prefix("b", NODE, WALK, _inputs(prompt)).tokens == matched
 
     for kv in ranks:
         _run(kv, "b", prompt, matched)
@@ -200,14 +231,14 @@ def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
     for kv in (leader, follower):
         _ingest(kv, "b", prompt)
 
-    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    matched = _decide(leader, "b")
     assert matched == 4 * PAGE_SIZE
     pages = leader.cached_prefix_pages("b", NODE, WALK, matched)
     # rank 0 committed "a" first; this rank has admitted it but not committed it
     assert not follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
     follower.commit(steps[follower], _ctx("a"))
     assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
-    assert follower.resolve_cached_prefix("b", NODE, WALK) == matched
+    assert follower.resolve_cached_prefix("b", NODE, WALK, _inputs(prompt)).tokens == matched
 
 
 def test_a_waiting_follower_hashes_the_prompt_once(monkeypatch):
@@ -222,7 +253,7 @@ def test_a_waiting_follower_hashes_the_prompt_once(monkeypatch):
     leader.commit(steps[leader], _ctx("a"))
     for kv in (leader, follower):
         _ingest(kv, "b", shared[:4 * PAGE_SIZE] + _tokens(9, seed=3))
-    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    matched = _decide(leader, "b")
     pages = leader.cached_prefix_pages("b", NODE, WALK, matched)
 
     hashed = []
@@ -230,7 +261,8 @@ def test_a_waiting_follower_hashes_the_prompt_once(monkeypatch):
     monkeypatch.setattr(manager_mod, "fingerprint", lambda *f: hashed.append(f) or real(*f))
     for _ in range(3):
         assert not follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
-    assert len(hashed) == 4
+    # the whole chain, as a probe roots it, on the first poll only
+    assert len(hashed) == len(follower._streams["b"]["main"].chain.keys) == 5
     follower.commit(steps[follower], _ctx("a"))
     hashed.clear()
     assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
@@ -245,7 +277,7 @@ def test_pages_that_differ_from_rank_0s_are_a_loud_error():
         _ingest(kv, "a", shared)
         _run(kv, "a", shared)
         _ingest(kv, "b", prompt)
-    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    matched = _decide(leader, "b")
     pages = [page + 1 for page in leader.cached_prefix_pages("b", NODE, WALK, matched)]
     with pytest.raises(RuntimeError, match="diverged"):
         follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
@@ -268,7 +300,7 @@ def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
         _ingest(kv, "hit", hit)
 
     z_steps = {kv: _admit(kv, "z", len(z)) for kv in ranks}
-    matched = leader.resolve_cached_prefix("hit", NODE, WALK)  # before z commits
+    matched = _decide(leader, "hit")  # before z commits
     leader.commit(z_steps[leader], _ctx("z"))
     follower.commit(z_steps[follower], _ctx("z"))  # after z commits
     pages = leader.cached_prefix_pages("hit", NODE, WALK, matched)
@@ -322,7 +354,7 @@ def test_rank_0_holds_only_the_agreed_pages_once_it_decides():
             _run(kv, rid, tokens)
             kv.remove_request(rid)
         _ingest(kv, "b", hit)
-    agreed = run.resolve_cached_prefix("b", NODE, WALK)
+    agreed = run.resolve_cached_prefix("b", NODE, WALK, None).tokens
     assert agreed == 2 * PAGE_SIZE
     pages = leader.cached_prefix_pages("b", NODE, WALK, agreed)
     assert follower.adopt_cached_prefix("b", NODE, WALK, agreed, pages)
@@ -345,7 +377,52 @@ def test_under_tp_a_stream_keys_its_prompt_only():
 def test_a_keyed_miss_answers_zero_so_another_resource_cannot_skip_it():
     kv = _manager(0)
     _ingest(kv, "a", _tokens(3 * PAGE_SIZE + 2, seed=11))
-    assert kv.resolve_cached_prefix("a", NODE, WALK) == 0
+    assert kv.resolve_cached_prefix("a", NODE, WALK, None) == CachedPrefix("main", 0, 0)
+
+
+def test_a_dropped_layout_answers_zero_so_another_resource_cannot_skip_it():
+    """A walk that disagrees with its layout ends the stream's chain; while the stream holds
+    nothing it still answers 0, or a snapshot pool's hit would skip tokens it lacks."""
+    kv = _manager(0, world=1)
+    _ingest(kv, "a", _tokens(3 * PAGE_SIZE + 2, seed=14))
+    short = _inputs(_tokens(PAGE_SIZE, seed=14))
+    assert kv.resolve_cached_prefix("a", NODE, WALK, short) == CachedPrefix("main", 0, 0)
+    assert kv._streams["a"]["main"].chain is None
+    assert kv.resolve_cached_prefix("a", NODE, WALK, short) == CachedPrefix("main", 0, 0)
+
+
+def test_a_combined_walk_decides_each_row_under_its_own_walk():
+    """Rank 0 probes only the rows whose own walk is keyed, as their prepare does."""
+    leader = _manager(0)
+    engine = _rank_0_engine(leader)
+    shared = _tokens(3 * PAGE_SIZE + 1, seed=15)
+    _ingest(leader, "a", shared)
+    _run(leader, "a", shared)
+    for rid in ("b", "c"):
+        _ingest(leader, rid, shared[:3 * PAGE_SIZE] + _tokens(2, seed=16))
+    batch = SimpleNamespace(node_name=NODE, request_ids=("b", "c"), step_context=StepContext(
+        request_ids=("b", "c"), graph_walk="mixed", slot=0, capture=False,
+        request_walks={"b": WALK, "c": "decode"},
+    ))
+    hits = engine.decide_cached_prefix(batch)
+    assert list(hits) == ["wire-b"] and hits["wire-b"].tokens == 3 * PAGE_SIZE
+    assert leader._streams["c"]["main"].lease is None
+
+
+def test_a_follower_adopts_a_combined_walks_rows_under_their_own_walks():
+    seen = []
+    engine = SimpleNamespace(
+        adopt_cached_prefix=lambda node, walk, hits, walks=None: seen.append(walks) or True)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        parallel_leader_nodes=set(),
+    )
+    sched.register_tp_follow(ScheduleTPNode(
+        NODE, "mixed", ["r1", "r2"], spec_seq=3, walks=["decode", WALK], walk_idx=[1, 0],
+        prefix_hits={"r1": PrefixHit(tokens=64, pages={"kv": [5]})},
+    ))
+    assert sched.settle_tp_follow_delta()
+    assert seen == [{"r1": WALK, "r2": "decode"}]
 
 
 def test_rank_0s_hits_cross_the_wire():
@@ -361,7 +438,7 @@ def test_rank_0s_hits_cross_the_wire():
 
 def _diverged_scheduler():
     """A follower's scheduler whose front head carries a hit this rank cannot take."""
-    def adopt(node, walk, hits):
+    def adopt(node, walk, hits, walks=None):
         raise RuntimeError("KV kv: prefix index diverged from rank 0")
 
     engine = SimpleNamespace(adopt_cached_prefix=adopt)
@@ -398,6 +475,8 @@ def test_a_follower_whose_hit_diverged_exits(monkeypatch):
     w.scheduler = _diverged_scheduler()
     w.request_state = SimpleNamespace()
     w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
+    # the speculation knobs #463 reads when the worker is built
+    w._launch_wait_s, w._max_consecutive_spec = 0.005, 1024
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=lambda: None, restore_default_timeout=lambda: None)
     w.engine_manager = SimpleNamespace(warmup_all=lambda: None)
@@ -427,10 +506,11 @@ def test_rank_0s_hit_is_plain_ints_whatever_a_resource_answers():
     engine._keyed_walks = {NODE: {WALK}}
     engine._graph_runtime = SimpleNamespace(get_rid_string=lambda rid: f"wire-{rid}")
     engine._runner = SimpleNamespace(
-        resolve_cached_prefix=lambda rid, node, walk: np.int64(2 * PAGE_SIZE),
+        resolve_cached_prefix=lambda rid, node, walk, inputs: CachedPrefix(
+            "main", np.int64(2 * PAGE_SIZE), np.int64(2 * PAGE_SIZE)),
         cached_prefix_pages=lambda rid, node, walk, n: {"kv": [torch.tensor(3), np.int64(4)]},
     )
-    batch = SimpleNamespace(node_name=NODE, graph_walk=WALK, request_ids=("a",), cached_prefix=None)
+    batch = SimpleNamespace(node_name=NODE, request_ids=("a",), step_context=_ctx("a"))
 
     body = ScheduleTPNode(NODE, WALK, ["wire-a"], prefix_hits=engine.decide_cached_prefix(batch))
     out = decode(encode(WorkerMessage(WorkerMessageType.SCHEDULE_TP, body))).body

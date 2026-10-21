@@ -22,13 +22,15 @@ sys.path.insert(0, str(REPO_ROOT))
 np = pytest.importorskip("numpy")
 pytest.importorskip("requests")
 
+from api_server_helpers import make_test_api_server  # noqa: E402
+
 from mstar.api_server import entrypoint  # noqa: E402
 from mstar.api_server.data_worker import (  # noqa: E402
     PreprocessWorkerThread,
     RequestOutputState,
     _video_frame_metadata,
 )
-from mstar.api_server.entrypoint import SUPPORTED_MODALITIES, APIServer  # noqa: E402
+from mstar.api_server.entrypoint import SUPPORTED_MODALITIES  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput, ResultTensors  # noqa: E402
 from mstar.client import MStarClient, VideoFrameChunk  # noqa: E402
 from mstar.graph.base import GraphEdge  # noqa: E402
@@ -95,7 +97,7 @@ def test_sdk_rejects_nonstreaming_raw_frames_before_http():
 
 
 def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
-    server = APIServer.__new__(APIServer)
+    server = make_test_api_server()
     assert "video_frame" in SUPPORTED_MODALITIES
 
     with pytest.raises(ValueError, match="requires streaming=True"):
@@ -113,13 +115,20 @@ def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
         )
 
 
+def _form_request(**fields):
+    async def form():
+        return fields
+
+    return SimpleNamespace(form=form)
+
+
 def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", object())
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(streaming="false"),
                 text=None,
                 files=None,
                 input_modalities=None,
@@ -140,7 +149,7 @@ def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(input_modalities="video_frame"),
                 text=None,
                 files=None,
                 input_modalities="video_frame",
@@ -383,7 +392,9 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
+    worker.timing_requested = threading.Event()
     worker._prefix_streams = {}
+    worker._live_requests = {}
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(

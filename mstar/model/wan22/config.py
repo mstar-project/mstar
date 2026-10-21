@@ -79,6 +79,45 @@ class Wan22Config:
     # "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.
     vae_decode_tiling: str = "auto"
 
+    # Compiled untiled decode through the shared Wan VAE decoder. Each output size costs a compile, so only
+    # ``vae_decode_fast_sizes`` use it; other sizes and tiled decodes run stock ``vae.decode`` / ``tiled_decode``.
+    # Compiled in Inductor's deterministic mode, so the frames do not depend on the server process, except on a
+    # torch without that mode (2.9.1).
+    vae_decode_fast: bool = True
+    # "WxH" output sizes the fast decode compiles for; None is the default size
+    # (1280x704). Requests choose their size, so an open list would let each new
+    # size cost a compile on the shared worker.
+    vae_decode_fast_sizes: tuple[str, ...] | None = None
+
+    def __post_init__(self):
+        # A yaml "false" is a truthy string, so a non-boolean is rejected here
+        # rather than read as on.
+        if not isinstance(self.vae_decode_fast, bool):
+            raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
+        self.fast_decode_sizes()
+
+    def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:
+        """``vae_decode_fast_sizes`` as (width, height) pixel pairs."""
+        sizes = self.vae_decode_fast_sizes
+        if sizes is None:
+            return frozenset({(self.default_width, self.default_height)})
+        if isinstance(sizes, str) or not isinstance(sizes, (list, tuple)):
+            raise ValueError(f"Wan2.2 vae_decode_fast_sizes must be a list of 'WxH' sizes, got {sizes!r}.")
+        align_h, align_w = self.spatial_alignment
+        parsed = set()
+        for size in sizes:
+            try:
+                width, height = (int(v) for v in str(size).lower().split("x"))
+            except ValueError:
+                raise ValueError(f"Wan2.2 vae_decode_fast_sizes entry must be 'WxH', got {size!r}.") from None
+            if width <= 0 or height <= 0 or width % align_w or height % align_h:
+                raise ValueError(
+                    f"Wan2.2 vae_decode_fast_sizes entry {size!r} must be positive multiples of "
+                    f"{align_w}x{align_h}."
+                )
+            parsed.add((width, height))
+        return frozenset(parsed)
+
     @property
     def hidden_size(self) -> int:
         """DiT hidden width (num_attention_heads * attention_head_dim)."""

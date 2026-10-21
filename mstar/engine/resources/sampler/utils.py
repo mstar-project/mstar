@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
 
@@ -980,7 +981,7 @@ def _to_tensor(
 # this narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
-def sample_cuda_graphable_gpu(
+def sample_accelerator_graphable_gpu(
     logits: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor,
@@ -1027,33 +1028,51 @@ def sample_cuda_graphable_gpu(
         output is int32; we cast to int64 so the caller can index
         ``nn.Embedding`` modules (which require int64 indices) directly.
     """
-    import flashinfer
+    if logits.device.type == "xpu":
+        with torch.xpu.device(logits.device):
+            return _sample_xpu(
+                logits, temperature, top_k, top_p,
+                rep_penalty if apply_penalty else 1.0,
+                seen_tokens if apply_penalty else None,
+                run_greedy=True,
+                top_k_zero_count=None,
+                seed=seed,
+                rand_offset=offset,
+                min_p=min_p,
+            )
+    elif logits.device.type == "cuda":
+        import flashinfer
 
-    with torch.cuda.device(logits.device):
-        probs = fused_temperature_softmax(
-            logits, temperature,
-            penalty=rep_penalty if apply_penalty else None,
-            seen_mask=seen_tokens if apply_penalty else None,
-            include_greedy=True,
+        with torch.cuda.device(logits.device):
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=rep_penalty if apply_penalty else None,
+                seen_mask=seen_tokens if apply_penalty else None,
+                include_greedy=True,
+            )
+            if min_p is not None:
+                probs = apply_min_p(probs, min_p)
+            top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+            # and offset and folds the row index into philox, so identical (probs,
+            # seed, offset) yield different tokens at different batch positions.
+            # Sampling is thus reproducible only within a fixed batch layout; under
+            # continuous batching (shifting positions) a request's stream is not.
+            # Measured in test/sampling_test/flashinfer_batch_test.py.
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, top_p, deterministic=True,
+                seed=seed, offset=offset,
+            )
+        return samples.to(torch.int64)
+    else:
+        raise ValueError(
+            f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
+            "expected 'cuda' or 'xpu'."
         )
-        if min_p is not None:
-            probs = apply_min_p(probs, min_p)
-        top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-        # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
-        # and offset and folds the row index into philox, so identical (probs,
-        # seed, offset) yield different tokens at different batch positions.
-        # Sampling is thus reproducible only within a fixed batch layout; under
-        # continuous batching (shifting positions) a request's stream is not.
-        # Measured in test/sampling_test/flashinfer_batch_test.py.
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True,
-            seed=seed, offset=offset,
-        )
-    return samples.to(torch.int64)
 
 
 @dataclass
-class CudaGraphableSampler(BaseSampler):
+class AcceleratorGraphableSampler(BaseSampler):
     temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor
     top_p_buf: torch.Tensor
@@ -1104,7 +1123,7 @@ class CudaGraphableSampler(BaseSampler):
     ):
         if self.ingraph_scatter:
             self.gather_in_graph()
-        codes = sample_cuda_graphable_gpu(
+        codes = sample_accelerator_graphable_gpu(
             logits, self.temperature_buf,
             self.top_k_buf, self.top_p_buf,
             self.seed_buf, self.offset_buf,
@@ -1113,7 +1132,7 @@ class CudaGraphableSampler(BaseSampler):
             seen_tokens=self.seen_tokens_buf,
             min_p=self.min_p_buf,
         )
-        self.offset_buf += 1
+        self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
@@ -1474,7 +1493,7 @@ class SamplerBuffers:
         good. ``cg_slots`` double-buffers the per-step tensors so the sampler can
         pre-plan.
         """
-        pinned = torch.cuda.is_available() and device.type == "cuda"
+        pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
         if ingraph_scatter:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
@@ -1810,7 +1829,7 @@ class SamplerBuffers:
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
-    def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
+    def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
         Valid regardless of when the buffers are (re)gathered into.
 
@@ -1820,7 +1839,7 @@ class SamplerBuffers:
         key = (padded_bs, cg_slot)
         sampler = self._samplers.get(key)
         if sampler is None:
-            sampler = CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+            sampler = AcceleratorGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
             self._samplers[key] = sampler
         sampler.applied_penalty_in_graph = False
         return sampler
@@ -1843,7 +1862,7 @@ class SamplerBuffers:
         # fresh pinned tensor: the host allocator holds it until the copy lands
         device = self._slot_idx_gpu.device
         return torch.tensor(
-            keep, dtype=torch.bool, pin_memory=device.type == "cuda",
+            keep, dtype=torch.bool, pin_memory=DeviceCapability.of(device).pin_memory,
         ).to(device, non_blocking=True)
 
     def scatter_offset(

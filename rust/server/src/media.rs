@@ -5,7 +5,8 @@
 //!    URLs or base64 blobs) into files under the server's `upload_dir`, so the
 //!    Python data-worker can read them by path (the same contract `/generate`
 //!    uses for multipart uploads). `http(s)` fetch is SSRF surface and is gated
-//!    off by default here (data-URL / base64 / local path only).
+//!    off by default here (data-URL / base64 only). Paths on the server are
+//!    refused.
 //!  * **Outbound** — wrap raw model audio output (16-bit PCM, no header) into a
 //!    real container (WAV by default) and encode PNG image bytes as a `data:`
 //!    URL for OpenAI chat image output.
@@ -189,10 +190,11 @@ fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), Str
     save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
 }
 
-/// Resolve a media reference (data URL, `http(s)` URL, or local path).
-/// Returns `(modality, path)`. Local paths pass through unchanged (modality
-/// from extension). `http(s)` is refused unless `allow_remote` is set — remote
-/// fetch is SSRF surface, off by default, matching mstar's `allow_remote` gate.
+/// Resolve a media reference from a request: a data URL, or an `http(s)` URL
+/// when `allow_remote` is set (remote fetch is SSRF surface, off by default).
+/// Returns `(modality, path)`. A request cannot name a file on the server, not
+/// even one under `upload_dir`: plain paths and other URL schemes are refused
+/// without accessing client-named server files.
 pub fn resolve_media_ref(
     reference: &str,
     upload_dir: &Path,
@@ -208,12 +210,7 @@ pub fn resolve_media_ref(
         }
         return save_remote_url(reference, upload_dir);
     }
-    // Treat as a local filesystem path.
-    let suffix = PathBuf::from(reference)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    Ok((modality_from_ext(&suffix).to_string(), reference.to_string()))
+    Err("server file paths are refused; send media as a data URL or a file upload".to_string())
 }
 
 // ---------------------------------------------------------------------------

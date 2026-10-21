@@ -6,25 +6,29 @@ from time import perf_counter
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
 )
 from mstar.engine.resources.sampler.utils import (
-    CudaGraphableSampler,
+    AcceleratorGraphableSampler,
     Sampler,
     SamplerBuffers,
     fused_temperature_softmax,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.device import DeviceCapability
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+
+    def can_capture(self) -> bool:
+        return DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
@@ -73,9 +77,9 @@ class SamplerResource(Resource):
         self._cg_slots = 1
 
         # This is set during plan in the cuda graph case
-        self._cg_sampler: CudaGraphableSampler | None = None
+        self._cg_sampler: AcceleratorGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
-        self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplan_cg_sampler: AcceleratorGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
         # (cg slot, padded bs) of the step planned last, for the last-token
@@ -84,8 +88,9 @@ class SamplerResource(Resource):
         # whether the last sampled token is persisted by slot at all: off until
         # a node that reads the masters registers (``enable_device_loopback_reader``)
         self._keep_last_token = False
-        # rid -> the prompt tokens a cache hit kept out of this step's inputs
-        self._cached_prefix: dict[str, torch.Tensor] = {}
+        # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
+        # position after them, so a repeated probe replaces its own entry.
+        self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
         # this step's `SamplerStep.kept_rids`, for the eager draw
         self._kept_rids: frozenset[int] | None = None
 
@@ -113,7 +118,7 @@ class SamplerResource(Resource):
             enable_min_p=spec.enable_min_p,
         )
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
     ):
         del max_seq_len
@@ -138,6 +143,10 @@ class SamplerResource(Resource):
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
+        if rid in self._sampler._sampling_config:
+            # a worker serving two partitions ingests the rid twice; adding it
+            # again would reset its seen-token mask and RNG offset mid-request
+            return
         extra_kwargs = asdict(overrides) if overrides is not None else {}
         self._sampler.add_request(request_id=rid)
         self._sampler.set_config(
@@ -179,18 +188,22 @@ class SamplerResource(Resource):
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs, matched_len: int,
+        inputs, prefix: CachedPrefix | None,
     ) -> None:
         """Keep the tokens the cache is about to skip, for `plan` to fold in.
 
         A step declares its tracked tokens from inputs the prefix has already
         been cut out of, so without these the mask would hold the prompt's tail
-        alone and the penalty would let the model repeat the rest.
+        alone and the penalty would let the model repeat the rest. A walk the
+        cache serves whole runs no plan, so its tokens are kept until the next
+        walk that does.
         """
         del node_name, graph_walk
         # a walk that prefills from embeddings has no ids to keep
-        if matched_len > 0 and inputs.input_ids is not None:
-            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
+        if prefix is not None and prefix.tokens > 0 and inputs.input_ids is not None:
+            self._cached_prefix.setdefault(rid, {})[prefix.position] = (
+                inputs.input_ids[:prefix.tokens]
+            )
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
@@ -261,6 +274,9 @@ class SamplerResource(Resource):
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
+                # a replay's padding rows are declared too, and hold no mask
+                if ctx.is_padding_row(rid):
+                    continue
                 if configs[rid].penalize_prompt:
                     self._sampler.get_token_mask(rid).add_tokens(tokens)
             # dropped as they are used: `plan` runs on every step of a resident
@@ -268,7 +284,8 @@ class SamplerResource(Resource):
             for rid in ctx.request_ids:
                 skipped = self._cached_prefix.pop(rid, None)
                 if skipped is not None and configs[rid].penalize_prompt:
-                    self._sampler.get_token_mask(rid).add_tokens(skipped)
+                    for tokens in skipped.values():
+                        self._sampler.get_token_mask(rid).add_tokens(tokens)
 
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
@@ -449,6 +466,8 @@ class SamplerResource(Resource):
                 as_tensor([c._seed for c in configs], torch.int64),
                 as_tensor(offsets, torch.int64))
 
+    # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
+    @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):

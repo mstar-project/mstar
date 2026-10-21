@@ -12,6 +12,7 @@ import json
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
     serving_chat,
     serving_images,
@@ -228,6 +229,9 @@ async def images_edits(request: Request):
         image = form.get("image")
         if image is None or not hasattr(image, "read"):
             return _error(400, "images/edits requires an 'image' file upload")
+        limit = max_body_bytes()
+        if (getattr(image, "size", None) or 0) > limit:
+            return _error(413, f"images/edits accepts files up to {limit // 2**20} MiB (MSTAR_MAX_BODY_MB)")
         image_bytes = await image.read()
         prompt = form.get("prompt") or ""
         known = {"image", "prompt", "model", "n", "size", "response_format"}

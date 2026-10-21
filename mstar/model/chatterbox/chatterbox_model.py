@@ -37,6 +37,7 @@ from typing import Any
 
 import torch
 
+from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -78,6 +79,7 @@ from mstar.model.chatterbox.loader import resolve_snapshot
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +219,7 @@ class ChatterboxModel(Model):
             if s3gen_graphs:
                 raise ValueError("s3gen_graphs and s3gen_compile are alternatives; enable one of them")
             # compile was asked for explicitly, graphs are the default: compile wins
-            logger.info("s3gen_compile requested: the S3Gen CUDA graphs are off for this deployment")
+            logger.info("s3gen_compile requested: S3Gen accelerator graphs are off for this deployment")
             self.config.s3gen_graphs = False
         if self.config.s3gen_graphs:
             if self.config.s3gen_frame_bucket <= 0:
@@ -533,6 +535,9 @@ class ChatterboxModel(Model):
     # Prompt processing (API data worker)
     # -----------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (the rate S3Gen's
         reference mel needs; the 16 kHz views are derived on the worker)."""
@@ -549,25 +554,25 @@ class ChatterboxModel(Model):
         any system library; torchcodec needs FFmpeg's shared libraries, which
         the nodes may not have, so it is only the fallback for other codecs.
         """
-        try:
-            import soundfile as sf
+        from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
 
-            data, sr = sf.read(filepath, dtype="float32", always_2d=True)
-            wav = torch.from_numpy(data).mean(dim=1)
+        try:
+            data, sr = read_soundfile_capped(filepath)
+            wav = torch.from_numpy(data)
+        except AudioRefusedError:
+            raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            from torchcodec.decoders import AudioDecoder
-
             # an undecodable upload is the client's error (400); a missing
             # decoder library above still surfaces as a server error
             try:
-                decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-                return decoder.get_all_samples().data[0].float()
+                return decode_torchcodec_capped(filepath, S3GEN_SR).float()
             except RuntimeError as decode_exc:
                 raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")
+        check_resample_rate(sr, S3GEN_SR)
         if sr != S3GEN_SR:
             wav = resample(wav, sr, S3GEN_SR)
         return wav
@@ -933,7 +938,7 @@ class ChatterboxModel(Model):
                 rows=_graph_rows(self.config.s3gen_max_batch_size), stages=self._graph_stages,
                 token_bucket=max(1, self.config.s3gen_frame_bucket // self.config.s3gen.token_mel_ratio),
             )
-            if solver is not None and torch.device(device).type == "cuda":
+            if solver is not None and DeviceCapability.of(device).graph_backend is not None:
                 self._warm_solve_graphs(s3gen, solver, builtin.prompt_feat.shape[1])
         return S3GenSubmodule(
             s3gen.eval(), self._s3_tokenizer(device), self.config,

@@ -15,9 +15,9 @@ Partitions:
     SNAC — walks: snac_chunk (streaming decode, triggered when tokens accumulate)
 
 The LLM and SNAC partitions run asynchronously. The LLM produces tokens that
-stream directly to the SNAC worker via StreamingGraphEdge. The conductor
-triggers SNAC chunks using a sliding window (28 tokens, stride 7) and extracts
-the middle region of the decoded audio for low-latency output.
+stream directly to the SNAC worker via StreamingGraphEdge, which releases
+windows of frames with left and right context (``OrpheusModelConfig.snac_*``);
+the SNAC decoder emits the audio of each window's own frames.
 """
 
 import logging
@@ -45,7 +45,6 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -73,11 +72,23 @@ class OrpheusModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        snac_chunk_schedule: list[int] | None = None,
+        snac_chunk_frames: int | None = None,
+        snac_left_context_frames: int | None = None,
+        snac_right_context_frames: int | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
-        self.config = OrpheusModelConfig()
+        snac_overrides = {
+            "snac_chunk_schedule": snac_chunk_schedule,
+            "snac_chunk_frames": snac_chunk_frames,
+            "snac_left_context_frames": snac_left_context_frames,
+            "snac_right_context_frames": snac_right_context_frames,
+        }
+        self.config = OrpheusModelConfig(
+            **{k: v for k, v in snac_overrides.items() if v is not None}
+        )
 
         tokenizer_source = _resolve_local_hf_snapshot(
             "canopylabs/orpheus-3b-0.1-pretrained",
@@ -94,6 +105,9 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {"mixed": {"prefill", "decode"}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
@@ -165,10 +179,7 @@ class OrpheusModel(Model):
                     from_partition="LLM",
                     to_partition="SNAC",
                     edge_name="new_token",
-                    chunk_policy_factory=lambda: SlidingWindowChunkPolicy(
-                        window=self.config.snac_window_tokens,
-                        stride=self.config.snac_stride_tokens,
-                    ),
+                    chunk_policy_factory=self.config.snac_chunk_policy,
                 ),
             ],
         )

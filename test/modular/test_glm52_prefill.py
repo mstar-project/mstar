@@ -7,21 +7,21 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.engine.cuda_graph_config import PackedCudaGraphConfig  # noqa: E402
+from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 
 
 def _submodule(config) -> Glm52LLMSubmodule:
-    # get_cuda_graph_configs reads only self.config
+    # get_accelerator_graph_configs reads only self.config
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     return sub
 
 
-def _prefill_config(sub) -> PackedCudaGraphConfig:
-    (packed,) = [c for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
+    (packed,) = [c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
                  if c.capture_graph_walk == "prefill"]
     return packed
 
@@ -207,7 +207,7 @@ def test_batched_prefill_buckets_get_their_own_capture():
                        prefill_batched_token_buckets=[1024, 2048],
                        prefill_capture_batch_sizes=[1, 4, 16])
     assert model.config.prefill_batched_token_buckets == [1024, 2048]
-    prefill = [c for c in _submodule(model.config).get_cuda_graph_configs(torch.device("cpu"))
+    prefill = [c for c in _submodule(model.config).get_accelerator_graph_configs(torch.device("cpu"))
                if c.capture_graph_walk == "prefill"]
     assert [(c.capture_batch_sizes, c.get_total_tokens(c.capture_batch_sizes[0]))
             for c in prefill] == [([1], [64, 128, 192]), ([4, 16], [1024, 2048])]
@@ -324,11 +324,11 @@ def test_capture_configs_raise_the_recompile_limit_to_fit(monkeypatch):
     cfg = Glm52ModelConfig(prefill_token_buckets=buckets,
                            prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
                            prefill_capture_batch_sizes=[1, 4, 16])
-    _submodule(cfg).get_cuda_graph_configs(torch.device("cpu"))
+    _submodule(cfg).get_accelerator_graph_configs(torch.device("cpu"))
     shapes = len(buckets) + 5 + 7  # + the decode batch sizes
     assert torch._dynamo.config.recompile_limit >= 3 * shapes
     monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 84)
-    _submodule(Glm52ModelConfig()).get_cuda_graph_configs(torch.device("cpu"))
+    _submodule(Glm52ModelConfig()).get_accelerator_graph_configs(torch.device("cpu"))
     assert torch._dynamo.config.recompile_limit == 84  # the default buckets fit
 
 
@@ -342,7 +342,7 @@ def test_recompile_limit_reaches_the_thread_that_runs_steps(monkeypatch):
     cfg = Glm52ModelConfig(prefill_token_buckets=list(range(64, 2049, 64)),
                            prefill_capture_batch_sizes=[1, 4, 16])
     sub = _submodule(cfg)
-    sub.get_cuda_graph_configs(torch.device("cpu"))
+    sub.get_accelerator_graph_configs(torch.device("cpu"))
     need = torch._dynamo.config.recompile_limit
     assert need > 84
 

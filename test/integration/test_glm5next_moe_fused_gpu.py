@@ -201,12 +201,12 @@ def test_get_cuda_graph_configs_nonempty_when_fused_resolved():
 
     lm.blk._use_fused = False
     assert sub._moe_capture_blocked(tp_world_size=8) is True
-    assert sub.get_cuda_graph_configs(torch.device(DEVICE), tp_world_size=8) == []
+    assert sub.get_accelerator_graph_configs(torch.device(DEVICE), tp_world_size=8) == []
 
     lm.blk._use_fused = True
     assert sub._moe_resolved_fused() is True
     assert sub._moe_capture_blocked(tp_world_size=8) is False
-    configs = sub.get_cuda_graph_configs(torch.device(DEVICE), tp_world_size=8)
+    configs = sub.get_accelerator_graph_configs(torch.device(DEVICE), tp_world_size=8)
     # Only decode is captured: KDA prefill is a host span loop.
     assert len(configs) == 1
     assert configs[0].capture_graph_walk == "decode"

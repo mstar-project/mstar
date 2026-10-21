@@ -13,6 +13,7 @@ needs a GPU.
 
 from __future__ import annotations
 
+import copy
 import sys
 
 import numpy as np
@@ -259,8 +260,7 @@ def tiny_vae_pair():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_vae_encode_normalize_decode_bit_exact(tiny_vae_pair, dtype):
-    ref, native = tiny_vae_pair
-    ref, native = ref.to(dtype), native.to(dtype)
+    ref, native = (copy.deepcopy(m).to(dtype) for m in tiny_vae_pair)
     x = torch.randn(2, 3, 32, 48, generator=torch.Generator().manual_seed(2)).to(dtype)
     with torch.no_grad():
         expected_latent = ref.encode(x).latent_dist.mode()
@@ -272,7 +272,6 @@ def test_vae_encode_normalize_decode_bit_exact(tiny_vae_pair, dtype):
         assert torch.equal((patched - mean) / std, native.normalize_latents(patched))
         assert torch.equal(patched * std + mean, native.denormalize_latents(patched))
         assert torch.equal(ref.decode(latent, return_dict=False)[0], native.decode(latent))
-    ref.to(torch.float32), native.to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +340,10 @@ def test_vae_decoder_node_stacks_per_request_latents(tiny_vae_pair):
             for row in rows
         ]
     assert batched.dtype == torch.uint8 and batched.shape == (2, 3, height, width)
+    # Unlike the port checks above, this compares two batch sizes of the same native module. CPU conv
+    # and group-norm kernels sum in a batch-size-dependent order, so fp32 activations differ by about
+    # 1e-6 and a pixel on a rounding boundary can move one uint8 level; a misplaced row moves nearly
+    # every pixel by far more.
     for i, single in enumerate(singles):
         assert single.shape == (1, 3, height, width)
-        assert torch.equal(single[0], batched[i])
+        torch.testing.assert_close(single[0].int(), batched[i].int(), atol=1, rtol=0)

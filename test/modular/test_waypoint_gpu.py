@@ -984,38 +984,38 @@ def test_block_mask_rebuild_cost_at_720p(record_property):
 
 def test_the_fp32_island_is_pinned_against_the_engine_matmul_precision():
     """``mstar/engine/__init__.py`` sets ``float32_matmul_precision``
-    process-wide, and ``NoiseConditioner`` is a deliberate fp32 island -- so
-    the setting decides what "fp32" means there. Pinned here so a change to
-    the engine default fails loudly.
-
-    It doesn't bite *today*: the model serves B == N == 1, so the island's
-    matmuls are ``[1, 512] @ [512, 8192]`` -- a GEMV, bit-identical under
-    every setting. From N >= 2 the setting reaches it, which a future batched
-    step would walk into.
+    process-wide, and ``NoiseConditioner`` is a deliberate fp32 island, so it
+    runs its GEMMs under ``fp32_matmul_highest``: its output may not move with
+    the setting at the served N == 1 or at a batched N == 8. Unpinned, the
+    N == 8 call moves at ``'high'`` even on an H200 with cuBLAS 12, and
+    cuBLAS 13 on a B200 rounds the N == 1 GEMV through TF32 too.
     """
     assert torch.get_float32_matmul_precision() == "high"
 
     config = waypoint_1_5_1b_720p()
     torch.manual_seed(0)
     island = NoiseConditioner(config.d_model).to(DEVICE, torch.float32).eval()
+    probe = torch.randn(8, 512, device=DEVICE), torch.randn(8192, 512, device=DEVICE)
     previous = torch.get_float32_matmul_precision()
     try:
-        outputs = {}
-        for served in (1, 8):
-            sigma = torch.full((1, served), 0.9, dtype=DTYPE, device=DEVICE)
-            for precision in ("highest", "high", "medium"):
-                torch.set_float32_matmul_precision(precision)
-                with torch.no_grad():
+        outputs, plain = {}, {}
+        for precision in ("highest", "high", "medium"):
+            torch.set_float32_matmul_precision(precision)
+            with torch.no_grad():
+                for served in (1, 8):
+                    sigma = torch.full((1, served), 0.9, dtype=DTYPE, device=DEVICE)
                     outputs[served, precision] = island(sigma).clone()
+                plain[precision] = torch.nn.functional.linear(*probe)
+            assert torch.get_float32_matmul_precision() == precision, "the island must restore the setting"
         torch.cuda.synchronize()
     finally:
         torch.set_float32_matmul_precision(previous)
 
-    for precision in ("high", "medium"):
-        assert torch.equal(outputs[1, "highest"], outputs[1, precision]), (
-            f"the served shape became sensitive to float32_matmul_precision={precision!r}; "
-            "the island is no longer a GEMV and the engine default now changes its numbers"
-        )
-    assert not torch.equal(outputs[8, "highest"], outputs[8, "medium"]), (
-        "precondition: float32_matmul_precision is live on this device at N >= 2"
+    assert not torch.equal(plain["highest"], plain["medium"]), (
+        "precondition: float32_matmul_precision is live on this device for an unpinned fp32 GEMM"
     )
+    for served in (1, 8):
+        for precision in ("high", "medium"):
+            assert torch.equal(outputs[served, "highest"], outputs[served, precision]), (
+                f"the island at N == {served} moved with float32_matmul_precision={precision!r}"
+            )

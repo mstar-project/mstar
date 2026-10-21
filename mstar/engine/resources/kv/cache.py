@@ -4,6 +4,8 @@ import queue
 import threading
 
 import torch
+import triton
+import triton.language as tl
 
 from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
 
@@ -53,6 +55,30 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@triton.jit
+def _kv_scatter_nhd_kernel(
+    layer_ptr, k_ptr, v_ptr, page_idx_ptr, cache_idx_ptr,
+    stride_page, stride_kv, stride_slot,
+    stride_kt, stride_kh, stride_vt, stride_vh,
+    num_pages, page_size,
+    HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    page = tl.load(page_idx_ptr + token).to(tl.int64)
+    slot = tl.load(cache_idx_ptr + token).to(tl.int64)
+    # A bad index would overwrite another page's KV. Compiled in only with TRITON_DEBUG=1.
+    tl.device_assert((page >= 0) & (page < num_pages), "KV page index out of range")
+    tl.device_assert((slot >= 0) & (slot < page_size), "KV slot index out of range")
+    offs = tl.arange(0, BLOCK)
+    mask = offs < HEADS * HEAD_DIM
+    head, dim = offs // HEAD_DIM, offs % HEAD_DIM
+    dst = layer_ptr + page * stride_page + slot * stride_slot + offs
+    k = tl.load(k_ptr + token * stride_kt + head * stride_kh + dim, mask=mask)
+    v = tl.load(v_ptr + token * stride_vt + head * stride_vh + dim, mask=mask)
+    tl.store(dst, k.to(layer_ptr.dtype.element_ty), mask=mask)
+    tl.store(dst + stride_kv, v.to(layer_ptr.dtype.element_ty), mask=mask)
+
+
 @torch.compiler.disable
 def _kv_scatter_mla_eager(
     cache: torch.Tensor, layer_idx: int,
@@ -69,6 +95,29 @@ def _kv_scatter_nhd_eager(
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
     layer = cache[layer_idx]
+    tokens, heads, head_dim = k.shape
+    if (
+        cache.is_cuda and tokens > 0
+        and k.stride(2) == 1 and v.stride(2) == 1
+        and layer.stride(3) == head_dim and layer.stride(4) == 1
+        and page_idx.is_contiguous() and cache_idx.is_contiguous()
+        # index_put rejects these; the kernel would read or write out of bounds.
+        and v.shape == k.shape and layer.shape[-2:] == (heads, head_dim)
+        and page_idx.numel() == tokens and cache_idx.numel() == tokens
+        and all(t.device == cache.device for t in (k, v, page_idx, cache_idx))
+    ):
+        block = triton.next_power_of_2(heads * head_dim)
+        # One launch for K and V instead of two index_put kernels.
+        _kv_scatter_nhd_kernel[(tokens,)](
+            layer, k, v, page_idx, cache_idx,
+            layer.stride(0), layer.stride(1), layer.stride(2),
+            k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+            layer.shape[0], layer.shape[2],
+            HEADS=heads, HEAD_DIM=head_dim, BLOCK=block,
+            # On H100, more warps only pay off past a 2048-wide block (32+ KV heads).
+            num_warps=max(4, min(16, block // 512)),
+        )
+        return
     layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
     layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
 
@@ -248,6 +297,12 @@ class KVCache:
         # The gather is materialized before the scatter, so pages may appear
         # in both src and dst.
         self.tensor[:, dst] = self.tensor[:, src]
+
+    def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
+        """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
+        # Index with slices rather than tensors. Slices need no copy from the host,
+        # so the copy doesn't wait on the stream.
+        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,

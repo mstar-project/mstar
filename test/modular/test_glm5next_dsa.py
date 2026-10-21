@@ -474,5 +474,5 @@ def test_a_non_bf16_cache_captures_nothing_in_long_mode():
     sub._moe_capture_blocked = lambda tp_world_size: False
     sub.node_resources = {ATTN: types.SimpleNamespace(uses_kernel=True),
                           KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
-    assert sub.get_cuda_graph_configs(torch.device("cuda")) == []
+    assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
     assert sub._prefill_captured is False

@@ -82,6 +82,8 @@ class Wan22Model(Model):
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
         skip_weight_loading: bool = False,
+        vae_decode_fast: bool = True,
+        vae_decode_fast_sizes: tuple[str, ...] | None = None,
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -91,7 +93,9 @@ class Wan22Model(Model):
             )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        self.config = Wan22Config(variant=variant)
+        self.config = Wan22Config(
+            variant=variant, vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+        )
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading

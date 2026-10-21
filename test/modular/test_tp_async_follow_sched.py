@@ -22,6 +22,7 @@ from mstar.graph.base import GraphNode  # noqa: E402
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
+    RequestWalks,
 )
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
@@ -100,7 +101,13 @@ class _FakeRuntime:
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
-        del graph_walk
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
+        )
+
+    def pop_walk_rids(self, node_name, rows, check_ready=False):
+        request_ids = rows.rids
         queue = self._queue
         if check_ready:
             for rid in request_ids:
@@ -172,7 +179,7 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
     assert popped is not None
-    wg, input_edges, _output_signals = popped
+    wg, input_edges = popped.wg_ids, popped.edge_specs
     assert list(wg) == ["r1", "r2"]  # wire order preserved
     assert wg == {"r1": "wg0", "r2": "wg0"}
     assert set(input_edges.rids) == {"r1", "r2"}

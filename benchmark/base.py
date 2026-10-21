@@ -303,6 +303,7 @@ class Qwen3_5_Dense(Model):
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
     def __init__(self, model_id: str | None = None):
+        super().__init__()
         if model_id is None:
             model_id = self.DEFAULT_MODEL_ID
         self.model_id = model_id
@@ -312,6 +313,12 @@ class Qwen3_5_Dense(Model):
 
     def get_supported_modalities(self):
         return {RequestType.T2T, RequestType.I2T}
+
+
+class Qwen3_8_Dense(Qwen3_5_Dense):
+    """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
+
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B"
 
 
 class Qwen3TTS1p7B(Qwen3TTS):
@@ -425,6 +432,7 @@ class ModelType(Enum):
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
     QWEN3_5 = "qwen3.5"
+    QWEN3_8 = "qwen3.8"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -453,4 +461,6 @@ class ModelType(Enum):
             return HiggsAudio(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
+        if self == ModelType.QWEN3_8:
+            return Qwen3_8_Dense(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Speculation, Worker  # noqa: E402
 
 NODE = "decoder"
@@ -31,8 +32,8 @@ def _edge(name: str) -> StreamingEdge:
 
 def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
-        scheduled_batch=SimpleNamespace(
-            node_name=NODE,
+        scheduled_batch=ScheduledBatch(
+            node_name=NODE, graph_walk="w",
             request_to_worker_graph={r: "wg" for r in rids},
         ),
         node_batch=SimpleNamespace(

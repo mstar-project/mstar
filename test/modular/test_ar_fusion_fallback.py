@@ -1,0 +1,70 @@
+"""create_workspace falls back from FlashInfer's "auto" backend to "trtllm",
+and every TP rank ends up with the same backend (or none), over a real gloo
+group with a stubbed ``flashinfer.comm``."""
+import os
+import sys
+import types
+
+import pytest
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+WORLD = 2
+
+
+class _FakeWorkspace:
+    def __init__(self, backend):
+        self.backend = backend
+        self.destroyed = False
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def _install_fake_flashinfer(fails: dict[str, set[int]], rank: int, built: list):
+    def create(*, backend, **_):
+        if rank in fails.get(backend, set()):
+            raise RuntimeError(f"{backend} unavailable on rank {rank}")
+        ws = _FakeWorkspace(backend)
+        built.append(ws)
+        return ws
+
+    comm = types.ModuleType("flashinfer.comm")
+    comm.create_allreduce_fusion_workspace = create
+    comm_backend = types.ModuleType("flashinfer.comm.comm_backend")
+    comm_backend.TorchDistBackend = lambda group: None
+    pkg = types.ModuleType("flashinfer")
+    pkg.comm = comm
+    sys.modules.update({"flashinfer": pkg, "flashinfer.comm": comm,
+                        "flashinfer.comm.comm_backend": comm_backend})
+
+
+def _worker(rank, store_path, fails, out_dir):
+    dist.init_process_group("gloo", init_method=f"file://{store_path}",
+                            rank=rank, world_size=WORLD)
+    built: list = []
+    _install_fake_flashinfer(fails, rank, built)
+    from mstar.distributed import ar_fusion
+
+    ws_id = ar_fusion.create_workspace(rank, WORLD, dist.group.WORLD, 128, 64, None)
+    chosen = None if ws_id is None else ar_fusion._WORKSPACES[ws_id].backend
+    leaked = [ws.backend for ws in built if not ws.destroyed and ws.backend != chosen]
+    with open(os.path.join(out_dir, str(rank)), "w") as f:
+        f.write(f"{chosen}|{','.join(leaked)}")
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("fails, expected", [
+    ({}, "auto"),                                   # auto works everywhere
+    ({"auto": {0, 1}}, "trtllm"),                   # multicast fails on every rank
+    ({"auto": {1}}, "trtllm"),                      # one rank fails: all must move on
+    ({"auto": {0, 1}, "trtllm": {0}}, None),        # nothing works on rank 0
+])
+def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
+    mp.spawn(_worker, args=(str(tmp_path / "store"), fails, str(tmp_path)),
+             nprocs=WORLD, join=True)
+    for rank in range(WORLD):
+        chosen, leaked = (tmp_path / str(rank)).read_text().split("|")
+        assert chosen == str(expected), f"rank {rank} chose {chosen}"
+        # a workspace built on some ranks but not all is destroyed, not kept
+        assert leaked == "", f"rank {rank} kept {leaked}"

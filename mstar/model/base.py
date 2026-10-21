@@ -25,7 +25,9 @@ from mstar.graph.base import (
     Parallel,
     Sequential,
     TensorPointerInfo,
+    top_level_entities,
 )
+from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import PromptPart
 
 DECODE = "decode"
@@ -49,13 +51,32 @@ class ProcessPromptOutput(NamedTuple):
 
 
 class PrefixStream(NamedTuple):
-    """The input tensor whose token ids key one cache stream's pages."""
+    """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
     tensor: str
     keyed_by: str
-    # the walk that writes the keyed span; a write from any other walk ends the chain
+    # the walk that writes the keyed span; a write from a walk not named here ends the chain
     walk: str
     # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None
+    # the other walks a layout may name
+    layout_walks: tuple[str, ...] = ()
+
+
+class Span(NamedTuple):
+    """One write to a keyed stream. A layout lists them in the order the walks write.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file.
+    """
+    kind: str
+    walk: str
+    length: int
+    advance: int
+    source: str | tuple[str, int]
+    params: tuple = ()
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -266,6 +287,26 @@ def _divide_into_worker_graphs(
         return loop_section_worker_graphs
 
 
+def _self_triggered(entity: GraphNode | Loop) -> bool:
+    """Whether the stream alone can re-run a top-level entity once it completes:
+    it is, or (a Loop) holds, a consumer with every input streamed. Completion
+    reseeds streaming readiness only for such nodes; a consumer with a
+    non-streamed input has to receive it again first."""
+    return any(
+        node.consumes_stream and node.input_names <= node._streaming_inputs
+        for node in entity.get_nodes().values()
+    )
+
+
+def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
+    """Whether every request runs all of these worker graphs on the same
+    workers: the conductor picks one replica per node_group, so they share a
+    node_group, or each is a single instance on the same ranks."""
+    if len({wg._group_id for wg in wgs}) == 1:
+        return True
+    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+
+
 @dataclass
 class ForwardPassArgs:
     # full_metadata is at the conductor level
@@ -293,6 +334,11 @@ class Model(ABC):
     # Retain them locally for postprocessing, but do not send the original
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
+
+    # Keys only this model's process_prompt sets (prompt layouts, stream
+    # leads) for the conductor to read back from model_kwargs. The data
+    # worker drops a client's values for them before process_prompt.
+    INTERNAL_KWARGS: tuple[str, ...] = ()
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
@@ -350,14 +396,146 @@ class Model(ABC):
         if node_groups is None:
             raise KeyError("Config must define `node_groups`.")
 
+        walk_graphs = self.get_graph_walk_graphs()
+        self._check_walk_placement(walk_graphs, node_groups, config_path)
         # TODO: merge identical worker graphs from different graph walks
-        return sum(
-            [
-                self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
-                for graph_walk, graph in self.get_graph_walk_graphs().items()
-            ],
-            start=[],
-        )
+        walk_to_wgs = {
+            graph_walk: self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
+            for graph_walk, graph in walk_graphs.items()
+        }
+        self._check_stream_driven_walks(walk_to_wgs, config_path)
+        self._check_loop_successors(walk_to_wgs, config_path)
+        return sum(walk_to_wgs.values(), start=[])
+
+    def _check_walk_placement(
+        self, walk_graphs: dict[str, GraphSection], node_groups: list[dict], config_path: str,
+    ) -> None:
+        """Reject declarations the conductor would accept and then serve wrongly:
+        a walk in no partition or in two (its worker graphs are registered on no
+        worker, or in both partitions), and a node of a walk in no node_group or
+        in two (the later group silently wins)."""
+        partitions = self.get_partitions()
+        for part in partitions:
+            unknown = sorted(part.graph_walks - walk_graphs.keys())
+            if unknown:
+                raise ValueError(
+                    f"Partition {part.name!r} lists graph walks {unknown} that "
+                    f"get_graph_walk_graphs() does not define (walks: {sorted(walk_graphs)})."
+                )
+        for walk in walk_graphs:
+            owners = [part.name for part in partitions if walk in part.graph_walks]
+            if len(owners) != 1:
+                raise ValueError(
+                    f"Graph walk {walk!r} is in {len(owners)} partitions {owners}; "
+                    "every walk must be listed in the graph_walks of exactly one "
+                    "PartitionDefinition from get_partitions()."
+                )
+
+        for i, group in enumerate(node_groups):
+            unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
+            if unknown:
+                raise ValueError(
+                    f"{config_path}: node_groups[{i}] (nodes {group['node_names']}) lists "
+                    f"graph_walks {unknown}, which this model does not define "
+                    f"(walks: {sorted(walk_graphs)})."
+                )
+        for walk, graph in walk_graphs.items():
+            for node in graph.get_nodes():
+                groups = [
+                    i for i, group in enumerate(node_groups)
+                    if node in group["node_names"]
+                    and ("graph_walks" not in group or walk in group["graph_walks"])
+                ]
+                if len(groups) != 1:
+                    where = ", ".join(f"node_groups[{i}]" for i in groups) or "no node_groups entry"
+                    raise ValueError(
+                        f"{config_path}: node {node!r} of graph walk {walk!r} is placed by "
+                        f"{where}; place it in exactly one node_groups entry for that walk "
+                        "(use graph_walks to give one node different ranks per walk)."
+                    )
+
+    def _check_stream_driven_walks(
+        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
+    ) -> None:
+        """Reject stream-driven walk shapes the runtime and conductor can't
+        account for.
+
+        A worker graph counts entity completions per pass, and a self-triggered
+        consumer (every input streamed) is re-armed for the next chunk as soon as
+        it completes, so a second top-level entity can be counted done before it
+        runs, and the pass-end reset drops input it has buffered. A consumer
+        gated on a non-streamed input waits for that input instead, which is
+        safe when it arrives once per pass (from the conductor, say).
+        Across worker graphs, self-triggered passes overlap with no pass
+        identity, and the conductor reads the final-stream flag only off the
+        report that closes a pass: the flag is per worker, so it is there only
+        if every worker graph of the walk runs on the consumer's workers. A walk
+        with no stream-consuming node is conductor driven and unaffected, and a
+        TP worker graph is one worker graph on several ranks.
+        """
+        topology = self.get_partition_topology()
+        consumer_partitions = {conn.to_partition for conn in topology.connections}
+        walk_partition = {
+            walk: part.name for part in self.get_partitions() for walk in part.graph_walks
+        }
+        for walk, wgs in walk_to_wgs.items():
+            if walk_partition[walk] not in consumer_partitions:
+                continue
+            if not any(wg.consumes_stream for wg in wgs):
+                continue
+            where = f"{config_path}: graph walk {walk!r} of consumer partition {walk_partition[walk]!r}"
+            entities = [top_level_entities(wg.section) for wg in wgs]
+            triggered = sorted(
+                name for ents in entities for name, e in ents.items() if _self_triggered(e)
+            )
+            if len(wgs) > 1 and (triggered or not _on_same_workers(wgs)):
+                raise ValueError(
+                    f"{where} consumes a stream and spans {len(wgs)} worker graphs "
+                    f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
+                    f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
+                    "is served only with every consumer gated on a non-streamed input that "
+                    "arrives once per pass and every worker graph on the same workers (one "
+                    "node_group, or one instance on the same ranks); otherwise run it as "
+                    "one worker graph, or move the work after the consumer into a "
+                    "downstream partition fed by a StreamingGraphEdge."
+                )
+            if len(wgs) == 1 and len(entities[0]) > 1 and triggered:
+                raise ValueError(
+                    f"{where} has self-triggered consumers {triggered} (every input "
+                    f"streamed) among {len(entities[0])} top-level entities {sorted(entities[0])} "
+                    "in one worker graph. Gate the consumer on a non-streamed input that "
+                    "arrives once per pass (from the conductor, say), or move the work "
+                    "after it into a downstream partition fed by a StreamingGraphEdge."
+                )
+
+    def _check_loop_successors(
+        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
+    ) -> None:
+        """Reject a Loop member with an edge to a node outside the Loop in the
+        same worker graph.
+
+        A worker graph counts top-level completions, and that successor
+        completes once per iteration, so the pass ends before the Loop and the
+        successor's later inputs are done, and the pass-end reset drops them.
+        ``Loop.accumulated_outputs`` hands the successor every iteration's
+        output once, when the Loop finishes.
+        """
+        for walk, wgs in walk_to_wgs.items():
+            for wg in wgs:
+                wg_nodes = wg.section.get_nodes()
+                for loop in wg.section.get_loops().values():
+                    members = loop.get_nodes()
+                    for name, node in members.items():
+                        for edge in node.outputs:
+                            if edge.next_node in wg_nodes and edge.next_node not in members:
+                                raise ValueError(
+                                    f"{config_path}: graph walk {walk!r}: node {name!r} of Loop "
+                                    f"{loop.name!r} sends {edge.name!r} to {edge.next_node!r}, "
+                                    "outside the Loop in the same worker graph. The worker graph "
+                                    "would report done before the Loop and its successor finish. "
+                                    "Send it through Loop.accumulated_outputs (every iteration's "
+                                    "output, once the Loop finishes) or Loop.outputs instead."
+                                )
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
@@ -451,6 +629,35 @@ class Model(ABC):
         """
         return type(self).__name__
 
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def combined_walk_of(self) -> dict[tuple[str, str], str]:
+        """``(node, real walk) -> combined walk``, validated."""
+        walks = self.get_graph_walk_graphs()
+        out: dict[tuple[str, str], str] = {}
+        for node, combined in self.get_combined_graph_walks().items():
+            for name, members in combined.items():
+                if name in walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: combined walk {name!r} of {node!r} "
+                        "reuses the name of a real walk"
+                    )
+                for walk in members:
+                    if walk not in walks or node not in walks[walk].get_nodes():
+                        raise ValueError(
+                            f"{type(self).__name__}: combined walk {name!r} names "
+                            f"{walk!r}, which is not a walk of node {node!r}"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: walk {walk!r} of {node!r} is in "
+                            f"both {out[(node, walk)]!r} and {name!r}"
+                        )
+                    out[(node, walk)] = name
+        return out
+
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.
 
@@ -458,6 +665,9 @@ class Model(ABC):
         preprocess worker keys that tensor and the KV resource matches what it
         already holds. Empty leaves the model uncached whatever the deployment
         asks for.
+
+        A stream with ``layout_walks`` takes its ``prefix_layout`` from
+        `process_prompt`'s metadata, as ``{resource: {label: [Span, ...]}}``.
         """
         return {}
 
@@ -545,26 +755,45 @@ class Model(ABC):
         """
         pass
 
-    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import torchvision
+    def max_input_files(self) -> dict[str, int]:
+        """Most files of each input modality one request may attach, e.g.
+        ``{"audio": 1}``. The data worker refuses a request over it before
+        decoding any file; a modality left out is held only to
+        ``MSTAR_MAX_MEDIA_FILES``."""
+        return {}
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float() / 255.0
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        # RGB whatever the file holds: image processors cannot place the
+        # channel axis of a 4-channel (RGBA or CMYK) image.
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
+        # FFmpeg build torchcodec happens to load (some base images ship a
+        # video-only one); torchcodec for the other containers.
+        from mstar.model.components.audio_features import load_audio_file
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
         decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        budget = VideoBudget()
+        frames = []
+        for frame in decoder:
+            budget.add(*frame.shape[-2:])
+            frames.append(frame)
+        video = torch.stack(frames)
+        del frames
+        video = video.float().div_(255.0)
         return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod

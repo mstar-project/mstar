@@ -3,12 +3,16 @@
 import functools
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import BucketKey, StepContext
+from mstar.utils.h2d import PinnedStager
 
 
 @functools.cache
@@ -25,7 +29,7 @@ def _xpu_paged_unavailable_reason() -> str | None:
     return None
 
 
-@dataclass(frozen=True)
+@dataclass
 class XPUPagedPlan:
     block_table: torch.Tensor
     cu_q: torch.Tensor
@@ -42,35 +46,99 @@ class XPUPagedAttentionManager(AttentionManager):
         self,
         kv_cache: str,
         device: torch.device,
+        kv_config: KVConfig,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
+        self._kv_config = kv_config
         self._current_plans: dict[str, XPUPagedPlan] = {}
+        self._cg_plans: dict[CGSlotKey, XPUPagedPlan] = {}
+        self._batched_buckets: set[BucketKey] = set()
+        self._preplan_states: dict[str, XPUPagedPlan] = {}
+        self._preplanned = False
+        self._plan_stagers: dict[str, PinnedStager] = {}
 
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def plan(self, step: AttentionStep, ctx: StepContext):
-        if ctx.slot_lease is not None or ctx.is_preplan:
-            raise RuntimeError(
-                "xpu_paged attention is eager-only: its plan metadata is "
-                "rebuilt for every step and does not have capture-stable addresses"
+    def build_accelerator_graph_buffers(
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+    ) -> None:
+        # Graph configs import resources, so defer this import.
+        from mstar.engine.accelerator_graph_config import (
+            AcceleratorGraphConfigType,
+            PiecewiseConfigType,
+        )
+
+        del max_bs, max_seq_len
+        self._batched_buckets.update(
+            spec.bucket for spec in slots
+            if spec.config.get_config_type() in (
+                AcceleratorGraphConfigType.BASIC_BATCHED,
+                PiecewiseConfigType.BATCHED,
             )
+        )
+
+    def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
+            "preplan requires an accelerator graph step"
+        )
+        if self._preplanned:
+            self._current_plans = self._preplan_states
+            self._preplan_states = {}
+            self._preplanned = False
+            return
+
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
             f"XPU attention expected plan result from {self._kv_cache_name}"
         )
-        self._current_plans = {
-            label: self._build_plan(kv_out, step.causal)
-            for label, kv_out in plan_outputs.items()
-        }
+        plan_states = (
+            self._preplan_states if ctx.is_preplan else self._current_plans
+        )
+        plan_states.clear()
+        for label, kv_out in plan_outputs.items():
+            # Only fixed-length batched recipes can use the dummy row's bound.
+            # Packed replays may put every query in one request.
+            max_q = (
+                lease.bucket.num_tokens
+                if lease is not None and lease.bucket not in self._batched_buckets
+                else None
+            )
+            if lease is None:
+                plan = self._build_plan(kv_out, step.causal, graph_mode=False)
+            else:
+                key = CGSlotKey(
+                    bucket=lease.bucket, slot=lease.slot, label=label
+                )
+                plan = self._build_plan(
+                    kv_out, step.causal, graph_mode=True, max_q=max_q,
+                    out=self._cg_plans.get(key),
+                )
+                self._cg_plans[key] = plan
+            plan_states[label] = plan
+        self._preplanned = ctx.is_preplan
+
+    @property
+    def supports_preplan(self):
+        return True
+
+    def clear_preplan(self):
+        self._preplanned = False
+        self._preplan_states = {}
 
     def _build_plan(
-        self, kv_out: KVPlanOutput, causal: bool,
+        self, kv_out: KVPlanOutput, causal: bool, graph_mode: bool,
+        max_q: int | None = None,
+        out: XPUPagedPlan | None = None,
     ) -> XPUPagedPlan:
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
+        if graph_mode:
+            max_blocks = self._kv_config.max_num_pages
         block_table = [
             view.page_idxs
             + [SINK_PAGE] * (max_blocks - len(view.page_idxs))
@@ -83,12 +151,41 @@ class XPUPagedAttentionManager(AttentionManager):
             cu_q.append(cu_q[-1] + view.to_compute)
             kv_lens.append(view.length)
 
+        if graph_mode:
+            metadata = {
+                "block_table": np.asarray(block_table, dtype=np.int32),
+                "cu_q": np.asarray(cu_q, dtype=np.int32),
+                "host_kv_lens": np.asarray(kv_lens, dtype=np.int32),
+            }
+            if out is None:
+                out = XPUPagedPlan(
+                    **{
+                        name: torch.empty(values.shape, dtype=torch.int32, device=self._device)
+                        for name, values in metadata.items()
+                    },
+                    max_q=max_q if max_q is not None else max((view.to_compute for view in views), default=0),
+                    max_k=self._kv_config.max_num_pages * self._kv_config.page_size,
+                    causal=causal,
+                )
+            for name, values in metadata.items():
+                dst = getattr(out, name)
+                if dst.shape != values.shape:
+                    raise ValueError(
+                        f"XPU graph {name} shape changed from "
+                        f"{tuple(dst.shape)} to {values.shape}"
+                    )
+                stager = self._plan_stagers.get(name)
+                if stager is None:
+                    stager = self._plan_stagers[name] = PinnedStager(torch.int32, numel=values.size)
+                # The stager fences its host ring before reusing a copy source.
+                stager.copy_(dst, values.reshape(-1))
+            return out
+
         return XPUPagedPlan(
             block_table=torch.tensor(
                 block_table, dtype=torch.int32, device=self._device,
             ),
             cu_q=torch.tensor(cu_q, dtype=torch.int32, device=self._device),
-            # vllm-xpu-kernels consumes KV lengths from host memory.
             host_kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
             max_q=max((view.to_compute for view in views), default=0),
             max_k=max(kv_lens, default=0),

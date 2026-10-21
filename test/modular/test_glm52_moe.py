@@ -3,10 +3,12 @@ the bf16 reference, the post-load dtype guards, the fused-allreduce path,
 and the end-to-end reduced fp8 load (whose checkpoint fabricator the
 indexer / MTP / read-plan suites reuse).
 """
+import importlib.util
 import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -25,10 +27,13 @@ def _cpu_flashinfer() -> types.ModuleType:
     return fi
 
 
-try:
-    import flashinfer  # noqa: F401  (the real one stays for later test files)
-except ImportError:
-    sys.modules["flashinfer"] = _cpu_flashinfer()
+@pytest.fixture(autouse=True)
+def _cpu_flashinfer_without_the_real_one(monkeypatch):
+    # per test: left in sys.modules, the stand-in breaks find_spec("flashinfer")
+    # in every file collected after this one
+    if importlib.util.find_spec("flashinfer") is None:
+        monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+
 
 from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
@@ -339,9 +344,9 @@ def test_cuda_graphs_return_with_fused_dispatch():
     object.__setattr__(sub, "language_model", lm)
 
     lm.blk._use_fused = False
-    assert sub.get_cuda_graph_configs(_torch.device("cpu")) == []
+    assert sub.get_accelerator_graph_configs(_torch.device("cpu")) == []
     lm.blk._use_fused = True
-    assert len(sub.get_cuda_graph_configs(_torch.device("cpu"))) == 2
+    assert len(sub.get_accelerator_graph_configs(_torch.device("cpu"))) == 2
 
 
 def test_autocast_then_restore_keeps_fp8_layout():

@@ -265,10 +265,16 @@ class ShardingConfig:
         dest_graph_walk: str | None,
         source_tp_rank: int | None = None,
     ) -> dict[str, GraphEdge]: # dest worker to graph edge
-        # canonical form: leading shard dim
-        shard_dim_sizes = [
-            info.dims[0] for info in graph_edge.tensor_info
-        ]
+        # Canonical form has the shard dim leading, so only a sharded signal is
+        # cut along dims[0]; a replicated one may be 0-dim. A missing leading
+        # dim counts as 0 rows, as in the Rust fanout.
+        if self.shard_dim.get(graph_edge.name) is None:
+            shard_dim_sizes = []
+        else:
+            shard_dim_sizes = [
+                info.dims[0] if len(info.dims) else 0
+                for info in graph_edge.tensor_info
+            ]
         fanout = self.compute_fanout(
             signal=graph_edge.name, source_graph_walk=source_graph_walk,
             source_node=source_node, dest_node=graph_edge.next_node,
@@ -315,9 +321,9 @@ class ShardingConfig:
                     # canonical form has leading shard dim
                     new_dims[0] = end_idx - start_idx
 
-                    # compute offset and new nbytes
-                    element_size = info.nbytes // math.prod(info.dims)
-                    row_nbytes = element_size * math.prod(info.dims[1:])
+                    # compute offset and new nbytes; a row can hold zero
+                    # bytes (a [4, 0] tensor), so never divide by the size
+                    row_nbytes = info.dtype.itemsize * math.prod(info.dims[1:])
                     # start_idx is a row of the LOGICAL tensor, but offset is
                     # a read into this rank's own shard (the reader does
                     # `canonical_tensor[offset // row : ...]`, and the

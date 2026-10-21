@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
+from mstar.engine.resources.base import (
+    CachedPrefix,
+    CGSlotKey,
+    CGSlotSpec,
+    EngineResourceInfo,
+    Resource,
+)
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
@@ -61,6 +68,10 @@ class RecurrentAddressing:
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # real rows, before a capture bucket's padding
+    # The same two on the host, as built: a backend that splits rows between
+    # kernels by them must not read the device copies back
+    host_slot_indices: Sequence[int] | None = None
+    host_has_state: Sequence[bool] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -106,11 +117,12 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
-        # (rid, label, slot) the live reservation freshly took, oldest first,
-        # for `rollback_admit`; see `KVManager._admit_reserved_pages`
-        self._admit_reserved: list[tuple[str, str, SlotState]] = []
+        # (rid, label) -> slot the live admit took fresh, for `rollback_admit`.
+        # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
+        # same way, so a released request's entries are purged with it.
+        self._admit_taken: dict[tuple[str, str], int] = {}
         # the part of it the pre-plan pass took: all `clear_preplan` gives back
-        self._preplan_reserved: list[tuple[str, str, SlotState]] = []
+        self._preplan_taken: set[tuple[str, str]] = set()
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -151,10 +163,8 @@ class RecurrentStatePool(Resource):
         # rid -> label -> the first of them rooted, hashed once for a TP follower's adopt polls
         self._prefix_rooted: dict[str, dict[str, list[bytes]]] = {}
         # under TP rank 0 decides each hit (`adopt_cached_prefix`)
-        self._follower = (
-            comm_group is not None and comm_group.world_size > 1
-            and getattr(comm_group, "rank", 0) != 0
-        )
+        self._tp = comm_group is not None and comm_group.world_size > 1
+        self._follower = self._tp and getattr(comm_group, "rank", 0) != 0
         # rid -> (label, snapshot slot, tokens): a hit held from the probe until admit
         self._leases: dict[str, tuple[str, int, int]] = {}
         # (rid, label) -> (snapshot slot, tokens) the request's first step copies in at plan
@@ -164,9 +174,12 @@ class RecurrentStatePool(Resource):
         # (rid, label, tokens) -> snapshot slot reserved for the forward to write
         self._snap_writes: dict[tuple[str, str, int], int] = {}
         self._snap_written: set[int] = set()
-        # what the latest admit took, for `rollback_admit` / `clear_preplan`
+        # what admits took for prefix reuse, for `rollback_admit` / `clear_preplan`: per row
+        # like `_admit_taken`, restores by (rid, label) and snapshot slots by (rid, label,
+        # tokens), and the part of it the pre-plan pass took
         self._admit_restores: list[tuple[str, str]] = []
         self._admit_snaps: list[tuple[str, str, int]] = []
+        self._preplan_prefix: set[tuple] = set()
 
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
@@ -233,6 +246,8 @@ class RecurrentStatePool(Resource):
                 snap = self._snap_writes.pop(key)
                 self._snap_written.discard(snap)
                 self._snap_free.append(snap)
+            # handle-keyed: what is left of its rollback record would name the next request
+            self._forget_prefix_admit(lambda key: key[0] == rid)
 
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
@@ -241,6 +256,7 @@ class RecurrentStatePool(Resource):
         request's state.
         """
         with self._lock:
+            self._forget_taken(lambda r: r == rid)
             labels = self._slots.get(rid)
             if not labels:
                 return
@@ -270,8 +286,16 @@ class RecurrentStatePool(Resource):
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
-            self._admit_reserved.append((rid, label, slot))
+            self._admit_taken[(rid, label)] = slot.index
             return slot
+
+    def _forget_taken(self, is_mine) -> None:
+        """Drop the rollback record of the rows ``is_mine`` accepts. Caller
+        holds the lock."""
+        taken = self._admit_taken
+        for key in [k for k in taken if is_mine(k[0])]:
+            del taken[key]
+            self._preplan_taken.discard(key)
 
     # Step lifecycle
 
@@ -284,14 +308,13 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
-        with self._lock:
-            # A pre-planned step was reserved on its pre-plan pass, and a
-            # refusal after this no-op must still find that reservation.
-            if not (self._preplanned and not ctx.is_preplan):
-                self._admit_reserved.clear()
-                self._admit_restores, self._admit_snaps = [], []
-            if ctx.is_preplan:
-                self._preplan_reserved = []
+        # A pre-planned step was reserved on its pre-plan pass, and a refusal
+        # after this no-op must still find that reservation.
+        if (self._admit_taken or self._admit_restores or self._admit_snaps) and not (
+                self._preplanned and not ctx.is_preplan):
+            with self._lock:
+                self._forget_taken(ctx.is_real_row)
+                self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                 # reads its state without extending it, or a padding row
@@ -325,33 +348,39 @@ class RecurrentStatePool(Resource):
                     return self._out_of_slots(rid, to_label)
         if ctx.is_preplan:
             with self._lock:
-                self._preplan_reserved = list(self._admit_reserved)
+                self._preplan_taken = {k for k in self._admit_taken if ctx.is_real_row(k[0])}
+                self._preplan_prefix = {
+                    k for k in (*self._admit_restores, *self._admit_snaps)
+                    if ctx.is_real_row(k[0])
+                }
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
-        """Give back the slots this admit freshly took.
-
-        Only those: a slot the request already held carries its state. Newest
-        first, so the free list is back in its old order and every rank of a
-        TP group hands out the same slots next.
-        """
-        del step, ctx
+        """Free the slots this step's admit took fresh; slots a request already
+        held stay with it. Without this, two forking requests can each keep
+        the slot the other's fork needs, and the pool has no eviction to break
+        that."""
+        del step
+        if ctx.capture or not (self._admit_taken or self._admit_restores or self._admit_snaps):
+            return
         with self._lock:
-            reserved, self._admit_reserved = self._admit_reserved, []
-            self._preplan_reserved = []
-            self._release(reserved)
-            self._undo_prefix_admit()
+            self._release([k for k in self._admit_taken if ctx.is_real_row(k[0])])
+            self._undo_prefix_admit(lambda key: ctx.is_real_row(key[0]))
 
-    def _release(self, reserved: list[tuple[str, str, SlotState]]) -> None:
-        """Free the slots of ``reserved`` still held as taken, newest first and
-        zeroed like every free slot; no forward has run on them. Caller holds the lock."""
-        for rid, label, slot in reversed(reserved):
+    def _release(self, keys: list[tuple[str, str]]) -> None:
+        """Free the slots ``keys`` took, zeroed like every free slot. Newest first, so
+        the free list is back in its old order and every rank of a TP group hands
+        out the same slots next. Caller holds the lock."""
+        for rid, label in reversed(keys):
+            index = self._admit_taken.pop((rid, label))
+            self._preplan_taken.discard((rid, label))
             labels = self._slots.get(rid)
-            if labels is None or labels.get(label) is not slot:
-                continue  # reset or removed under us; its slot went with it
+            slot = labels.get(label) if labels else None
+            if slot is None or slot.index != index:
+                continue  # reset or removed under us; the slot went with it
             del labels[label]
-            self._zero_slot(slot.index)
-            self._free.append(slot.index)
+            self._zero_slot(index)
+            self._free.append(index)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
@@ -412,7 +441,8 @@ class RecurrentStatePool(Resource):
             self._maybe_apply_forks(step, ctx)
             self._apply_restores(step)
             self._drop_stage()
-            self._preplan_reserved = []  # the live step's now: commit or roll back
+            # the live step's now: commit or roll back
+            self._preplan_taken, self._preplan_prefix = set(), set()
             return self._current
 
         # Forks run ahead of the addressing, which records `has_state`; staging
@@ -445,11 +475,9 @@ class RecurrentStatePool(Resource):
         """
         self._drop_stage()
         with self._lock:
-            staged, self._preplan_reserved = self._preplan_reserved, []
-            ids = {id(slot) for _, _, slot in staged}
-            self._admit_reserved = [r for r in self._admit_reserved if id(r[2]) not in ids]
-            self._release(staged)
-            self._undo_prefix_admit()
+            # in the order the pre-plan pass took them, so `_release` goes newest first
+            self._release([k for k in self._admit_taken if k in self._preplan_taken])
+            self._undo_prefix_admit(self._preplan_prefix.__contains__)
 
     def _drop_stage(self) -> None:
         self._preplanned = False
@@ -460,8 +488,10 @@ class RecurrentStatePool(Resource):
             return
         with self._lock:
             # committed, so there is nothing left to unwind
-            self._admit_reserved.clear()
-            self._preplan_reserved = []
+            if self._admit_taken:
+                self._forget_taken(ctx.is_real_row)
+            if self._admit_restores or self._admit_snaps:
+                self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
@@ -505,7 +535,7 @@ class RecurrentStatePool(Resource):
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         self._keyed = {
             label: frozenset(walk for walk in named if walk is not None)
@@ -564,22 +594,31 @@ class RecurrentStatePool(Resource):
         if lease is not None:
             self._unref(lease[1])
 
+    @staticmethod
+    def _held(label: str, tokens: int) -> CachedPrefix:
+        """A snapshot keys a prompt's ids, whose positions are their count."""
+        return CachedPrefix(label, tokens, tokens)
+
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """The longest prefix a snapshot holds for this request, held until admit."""
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """The longest prefix a snapshot holds for this request, held until admit.
+
+        Under TP only rank 0 looks, as it sends the step (``inputs`` None); the step's
+        prepare answers what it decided, which the other ranks adopted.
+        """
         del node_name
         with self._lock:
             label = self._keyed_label(rid, graph_walk)
             if label is None:
                 return None
             if rid in self._leases:
-                return self._leases[rid][2]
+                return self._held(label, self._leases[rid][2])
             slot = self._slots.get(rid, {}).get(label)
             if (slot is not None and slot.has_state) or (rid, label) in self._restores:
                 return None
-            if self._prefix_root is None or self._follower:
-                return 0
+            if self._prefix_root is None or (self._tp and (self._follower or inputs is not None)):
+                return self._held(label, 0)
             keys = list(self._prefix_keys[rid][label])
         rooted = self._rooted(keys)
         with self._lock:
@@ -588,36 +627,41 @@ class RecurrentStatePool(Resource):
             # one key short, as the KV cache: a fully cached prompt still runs a token
             found = self._find_snapshot(rooted, (len(rooted) - 1) * self.config.prefix_page_size)
             if found is None:
-                return 0
+                return self._held(label, 0)
             self._lease(rid, label, *found)
-            return found[1]
+            return self._held(label, found[1])
 
     def cap_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, length: int,
-    ) -> int:
-        """Snapshots sit at some page boundaries only: the longest at or under ``length``."""
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """Snapshots sit at some page boundaries only: the longest at or under the agreed
+        length. A shorter one moves the position back as far (a resource that places
+        positions has the last word; see `StepRunner.resolve_cached_prefix`)."""
         del node_name, graph_walk
+        length = prefix.tokens
         with self._lock:
             lease = self._leases.get(rid)
-            if lease is None:
-                return length
-            if lease[2] <= length:
-                return lease[2]
+            if lease is None or lease[2] == length:
+                return prefix
+            if lease[2] < length:
+                return prefix._replace(tokens=lease[2], position=prefix.position - length + lease[2])
             label = lease[0]
             keys = list(self._prefix_keys[rid][label])
         rooted = self._rooted(keys)
         with self._lock:
             self._drop_lease(rid)
             found = self._find_snapshot(rooted, length)
-            if found is None:
-                return 0
-            self._lease(rid, label, *found)
-            return found[1]
+            tokens = 0 if found is None else found[1]
+            if found is not None:
+                self._lease(rid, label, *found)
+            return prefix._replace(tokens=tokens, position=prefix.position - length + tokens)
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
         del node_name, graph_walk, inputs
+        matched_len = prefix.tokens if prefix is not None else 0
         with self._lock:
             lease = self._leases.get(rid)
             if lease is None:
@@ -750,19 +794,29 @@ class RecurrentStatePool(Resource):
                 self._snap_by_key[name] = snap
                 self._snap_meta[snap] = (name, tokens, self._snap_clock)
 
-    def _undo_prefix_admit(self) -> None:
-        """Hand back what the latest admit took: restores become leases again, and
-        reserved snapshot slots go back. Caller holds the lock."""
-        for rid, label in self._admit_restores:
+    def _undo_prefix_admit(self, is_mine) -> None:
+        """Hand back what admits took for prefix reuse, for the records ``is_mine`` accepts:
+        restores become leases again, and reserved snapshot slots go back. Caller holds
+        the lock."""
+        for rid, label in [k for k in self._admit_restores if is_mine(k)]:
             restore = self._restores.pop((rid, label), None)
             if restore is not None:
                 self._leases[rid] = (label, *restore)
-        for key in self._admit_snaps:
+        for key in [k for k in self._admit_snaps if is_mine(k)]:
             snap = self._snap_writes.pop(key, None)
             if snap is not None:
                 self._snap_written.discard(snap)
                 self._snap_free.append(snap)
-        self._admit_restores, self._admit_snaps = [], []
+        self._forget_prefix_admit(is_mine)
+
+    def _forget_prefix_admit(self, is_mine) -> None:
+        """Drop the rollback record of the restores and snapshot slots ``is_mine`` accepts
+        (a key's first item is its row), as `_forget_taken` does slots. Caller holds the lock."""
+        gone = {k for k in (*self._admit_restores, *self._admit_snaps) if is_mine(k)}
+        if gone:
+            self._admit_restores = [k for k in self._admit_restores if k not in gone]
+            self._admit_snaps = [k for k in self._admit_snaps if k not in gone]
+            self._preplan_prefix -= gone
 
     # Addressing
 
@@ -813,6 +867,10 @@ class RecurrentStatePool(Resource):
             slot_indices=target.slot_indices,
             has_state=target.has_state,
             num_rows=num_rows,
+            # the lists as built, not copies: this call made them and nothing
+            # changes them after
+            host_slot_indices=indices,
+            host_has_state=has_state,
         )
 
     def _addressing_buffers(
@@ -864,7 +922,7 @@ class RecurrentStatePool(Resource):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len

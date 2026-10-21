@@ -415,18 +415,20 @@ class ChatterboxConfig:
     max_new_tokens_limit: int | None = None
 
     # S3Gen streaming: the first waveform chunk is synthesised once
-    # ``stream_first_chunk_tokens`` speech tokens exist (about 0.23 s on an
-    # H100); later chunks start at ``stream_chunk_tokens`` and grow by
-    # ``stream_chunk_growth`` up to ``stream_max_chunk_tokens`` (15, 50, 100,
-    # 200, 200 ...): each chunk buys the playback time to produce a bigger one,
-    # so an utterance costs three or four flow solves instead of one per 25
-    # tokens (+40 % throughput at concurrency 8-32, playback still continuous
-    # at concurrency 1). ``stream_chunk_tokens = 0`` = one chunk per utterance,
-    # the reference's offline behaviour. Each chunk re-runs the flow decoder
-    # over the prompt and the recent tokens with a fixed per-request noise
-    # field and withholds the encoder's look-ahead tokens; the vocoder keeps
-    # ``stream_mel_cache_frames`` mel frames of context and crossfades the
-    # re-synthesised tail (CosyVoice 2's token2wav scheme).
+    # ``stream_first_chunk_tokens`` speech tokens exist (15 here, which the
+    # multilingual model keeps; the English model starts at 35, see
+    # ``chatterbox()``); later chunks start at ``stream_chunk_tokens`` and grow
+    # by ``stream_chunk_growth`` up to ``stream_max_chunk_tokens`` (35, 50,
+    # 100, 200, 200 ... for English): each chunk buys the playback time to
+    # produce a bigger one, so an utterance costs three or four flow solves
+    # instead of one per 25 tokens (+40 % throughput at concurrency 8-32,
+    # playback still continuous at concurrency 1). ``stream_chunk_tokens = 0``
+    # = one chunk per utterance, the reference's offline behaviour. Each chunk
+    # re-runs the flow decoder over the prompt and the recent tokens with a
+    # fixed per-request noise field and withholds the encoder's look-ahead
+    # tokens; the vocoder keeps ``stream_mel_cache_frames`` mel frames of
+    # context and crossfades the re-synthesised tail (CosyVoice 2's token2wav
+    # scheme).
     stream_first_chunk_tokens: int = 15
     stream_chunk_tokens: int = 50
     stream_chunk_growth: float = 2.0
@@ -493,7 +495,10 @@ class ChatterboxConfig:
 
     @classmethod
     def chatterbox(cls) -> "ChatterboxConfig":
-        return cls()
+        # A 15-token first chunk carries 0.32 s of audio, and at 4 to 8
+        # streams the next chunk takes longer than that to arrive, so playback
+        # stalls right after it; 35 tokens carry 1.12 s.
+        return cls(stream_first_chunk_tokens=35)
 
     @classmethod
     def multilingual(cls) -> "ChatterboxConfig":

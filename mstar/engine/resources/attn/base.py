@@ -31,6 +31,17 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
 }
 
 
+def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
+    """The concrete backend for ``backend`` on ``device``.
+
+    ``AUTO`` becomes the platform's default, FlashInfer on every platform for
+    now. A backend named in the spec or YAML is returned as is.
+    """
+    if backend is AttnBackend.AUTO:
+        return AttnBackend.FLASHINFER
+    return backend
+
+
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
 
@@ -49,7 +60,7 @@ class AttentionManager(AttentionResource):
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = spec.config.backend
+        backend = resolve_attn_backend(spec.config.backend, info.device)
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -72,10 +83,10 @@ class AttentionManager(AttentionResource):
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
             # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend rather than failing to serve. The two are
-            # drop-in for each other: the step declaration is identical
-            # (see DenseAttentionManager) and `requires_kv_write` tells the
-            # layer which one it is talking to.
+            # the paged backend AUTO picks rather than failing to serve.
+            # The two are drop-in for each other: the step declaration is
+            # identical (see DenseAttentionManager) and `requires_kv_write`
+            # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
                 _fa3_unavailable_reason,
@@ -90,8 +101,8 @@ class AttentionManager(AttentionResource):
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
                 )
-            _warn_dense_fallback(reason)
-            backend = AttnBackend.FLASHINFER
+            backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
+            _warn_dense_fallback(reason, backend)
 
         if backend == AttnBackend.FLASHINFER_MLA:
             from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
@@ -113,6 +124,8 @@ class AttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                splits=spec.config.splits,
+                max_rows_in_combined=info.max_rows_in_combined,
             )
 
         if backend == AttnBackend.FLEX:
@@ -145,6 +158,7 @@ class AttentionManager(AttentionResource):
             return XPUPagedAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown attention backend {backend!r}")
 

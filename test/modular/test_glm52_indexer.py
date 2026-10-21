@@ -21,12 +21,6 @@ def _cpu_flashinfer() -> types.ModuleType:
     return fi
 
 
-try:
-    import flashinfer  # noqa: F401  (the real one stays for later test files)
-except ImportError:
-    sys.modules["flashinfer"] = _cpu_flashinfer()
-
-
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())

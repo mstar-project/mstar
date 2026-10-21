@@ -14,7 +14,7 @@ model_kwargs:
   # graph_max_latent_area caps which resolutions are captured (latent H*W).
   # The COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars
   # override.
-  cuda_graph: true
+  accelerator_graph: true
   graph_max_latent_area: 2000
   # Video denoise steps stay eager on the dense FA3 path: capturing them
   # (gen_capture_video) forces the paged attention into the graph, which

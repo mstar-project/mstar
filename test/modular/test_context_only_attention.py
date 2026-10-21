@@ -1,7 +1,8 @@
 """``AttentionStep.context_only``: a step's queries attend to the stream's stored context only (the
 entries the same step appends are excluded), with their own query counts; and the MLA attention
 returns the natural log-sum-exp for merging with another key segment. CPU, on the torch fallback
-of the FlashInfer MLA wrapper, against a dense reference."""
+of the FlashInfer MLA wrapper, against a dense reference. The other backends refuse the flag."""
+import pytest
 import torch
 
 from mstar.engine.resources import AttentionStep, KVStep, Segment, StepContext, SubmoduleStep
@@ -91,3 +92,18 @@ def test_queries_attend_to_the_stored_context_only(monkeypatch):
     ctx3.plan_results["mla_kv"] = ctx2.plan_results["mla_kv"]
     attn.plan(s3.get("attn"), ctx3)
     assert attn._current_plan_states["main"]._fb[3] == [8, 6] and attn._current_plan_states["main"]._fb[0] == [0, 3, 6]
+
+
+@pytest.mark.parametrize("module, manager", [
+    ("flashinfer", "FlashInferManager"), ("dense", "DenseAttentionManager"),
+    ("xpu", "XPUPagedAttentionManager"), ("flex", "FlexAttentionManager"),
+    ("cross", "FlashInferCrossManager"), ("ragged.flashinfer", "FlashInferRaggedManager"),
+])
+def test_the_other_backends_refuse_a_context_only_step(module, manager):
+    # planned without the flag, the queries would also attend to the tokens the step appends.
+    # Imported here: flex compiles at import, which the macOS triton stub can't serve
+    cls = getattr(pytest.importorskip(f"mstar.engine.resources.attn.{module}"), manager)
+    attn = object.__new__(cls)  # the refusal comes before anything the plan reads
+    ctx = StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False)
+    with pytest.raises(ValueError, match="context_only"):
+        attn.plan(AttentionStep(context_only=True), ctx)

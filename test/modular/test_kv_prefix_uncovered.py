@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     KVManager,
@@ -92,6 +92,7 @@ def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT) -> None:
         ])},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR},
+        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
     ))
 
 
@@ -317,6 +318,7 @@ def _first_write(walk: str) -> KVManager:
     kv.ingest_request("r0", KVReqConfig(
         prefix_keys={"main": chain([prompt[:16], prompt[16:32], prompt[32:]])},
         prefix_tail={"main": prompt[32:]},
+        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), "prefill_text")]},
     ))
     step = KVStep(segments=(Segment("r0", "main", 50),))
     ctx = StepContext(request_ids=("r0",), graph_walk=walk, slot=0, capture=False)

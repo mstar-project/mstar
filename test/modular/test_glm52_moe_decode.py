@@ -1,6 +1,7 @@
 """GLM-5.2 small-batch MoE decode kernels (moe_decode): the config flag and block wiring on
 CPU; accuracy vs an fp32 dequantized oracle, routing and graph replay on CUDA, at one TP8
 rank's shapes (H 6144, 256 experts, top-8, 256 intermediate per rank)."""
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -17,12 +18,15 @@ def _cpu_rmsnorm(x, weight, eps=1e-6):
     return (normed * weight.float()).to(x.dtype)
 
 
-if "flashinfer" not in sys.modules:
-    try:
-        import flashinfer  # noqa: F401
-    except ImportError:
-        sys.modules["flashinfer"] = types.ModuleType("flashinfer")
-        sys.modules["flashinfer"].norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+@pytest.fixture(autouse=True)
+def _cpu_flashinfer_without_the_real_one(monkeypatch):
+    # per test: left in sys.modules, the stand-in breaks find_spec("flashinfer")
+    # in every file collected after this one
+    if importlib.util.find_spec("flashinfer") is None:
+        fi = types.ModuleType("flashinfer")
+        fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+        monkeypatch.setitem(sys.modules, "flashinfer", fi)
+
 
 from mstar.model.glm52.components import moe as moe_module  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52MoEGate, Glm52SparseMoeBlock  # noqa: E402
