@@ -189,9 +189,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
-            inputs["image_inputs"][0]
-        )})
+        # One [C, H, W] tensor per camera; every camera goes to SigLIP, in order.
+        images = inputs["image_inputs"]
+        pixels = images[0] if len(images) == 1 else torch.stack(list(images))
+        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(pixels)})
 
     def preprocess(
         self,
@@ -286,7 +287,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         ".norm.",   # final RMSNorm / adaRMS norm
     )
 
-    # For the default image size and a simple text prompt, one request is about 400 tokens
+    # For the default image size, three cameras and a simple text prompt, one request is about 910 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
@@ -309,27 +310,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self.action_out_proj = action_out_proj
         self.time_mlp = time_mlp
         self.config = config
-        # Image features and language token embeddings use DIFFERENT scaling
-        # factors in lerobot's reference, even though both end up calling it
-        # ``sqrt(hidden_size)``:
-        #
-        #   * Images: ``embed_image`` returns
-        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
-        #
-        #   * Text: lerobot's ``lang_embed_func`` does
-        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
-        #     ``embed_language_tokens`` calls HF Gemma's
-        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
-        #     multiplies the raw lookup by an internal ``embed_scale =
-        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
-        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
-        #
-        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
-        # scale), so we have to apply the full ``H`` factor manually here.
-        # Mismatching this produces a ~45x undersized text prefix and the
-        # action expert sees a wildly wrong context.
-        self._image_embed_scale = math.sqrt(config.hidden_size)
-        self._text_embed_scale = float(config.hidden_size)
+        # Prefix scaling as in openpi's and lerobot's embed_prefix: SigLIP tokens unscaled,
+        # language embeddings times sqrt(hidden_size).
+        self._text_embed_scale = math.sqrt(config.hidden_size)
 
         # Lazily allocated on first action Euler step, sized for the largest
         # captured batch. sincos_timestep_embedding fully overwrites this buffer
@@ -466,18 +449,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # been formatted as a decimal-string suffix on the language prompt
         # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
         # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
-        #
-        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
-        # (after the multi_modal_projector) and the language token embeddings
-        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
-        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
-        # to the language tokens and the action expert sees a wildly wrong
-        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
-        # lerobot integration test missed this because it bypasses
-        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
-        # output directly.)
 
-        img_emb = inputs["img_emb"][0] * self._image_embed_scale
+        img_emb = inputs["img_emb"][0]
         text_ids = inputs["text_inputs"][0]
         text_emb = self._embed_tokens_scaled(text_ids)
         prefix_emb = torch.cat([img_emb, text_emb], dim=0)

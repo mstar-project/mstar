@@ -26,7 +26,7 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
@@ -102,6 +102,29 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
 
         assert actual.dtype == torch.float32
         assert torch.equal(actual, reference)
+
+
+def test_pi05_vision_gets_every_camera():
+    """The server hands one [C, H, W] tensor per camera; all of them reach SigLIP, in order."""
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.0, 0.5, 1.0)]
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels, torch.stack(cameras) * 2 - 1)
+
+
+def test_pi05_prefix_scaling_follows_openpi():
+    """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
+    config = Pi05Config(hidden_size=16)
+    embed = torch.nn.Embedding(10, 16)
+    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
+                           torch.nn.Identity(), torch.nn.Identity(), config)
+    img = torch.randn(6, 16)
+    ids = torch.tensor([1, 4, 7])
+    with torch.no_grad():
+        prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
+        assert torch.equal(prefix[:6], img)
+        assert torch.allclose(prefix[6:], embed(ids) * 4.0)
 
 
 # ----------------------------------------------------------------------
