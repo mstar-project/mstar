@@ -386,7 +386,7 @@ class Gr00tN17Model(Model):
             return module
 
         if node_name == VISION_ENCODER:
-            return Gr00tN17VisionEncoderSubmodule(loaded(Gr00tN17VisionEncoder(config)), config)
+            return Gr00tN17VisionEncoderSubmodule(loaded(Gr00tN17VisionEncoder(config)), config.vision)
         if node_name == LLM:
             return Gr00tN17LLMSubmodule(loaded(Gr00tN17LanguageModel(config)), config)
         if node_name == STATE_ENCODER:

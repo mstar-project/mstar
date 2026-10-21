@@ -90,7 +90,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mstar.engine.resources import (
     AttentionStep,
     RaggedAttentionConfig,
@@ -1509,6 +1509,21 @@ def test_one_part_missing_from_a_fused_llm_parameter_fails_the_llm_by_name(tmp_p
     assert LLM not in model._submodules
 
 
+def test_the_served_vision_node_holds_the_vision_config_and_prepares_a_grid(tmp_path):
+    """The node reads ``config.vision`` (``spatial_merge_size``,
+    ``num_grid_per_side``). Handed the whole ``Gr00tN17Config`` it built and loaded
+    fine, and the first camera frame raised ``AttributeError`` in
+    ``prepare_inputs``: a 500 on every live request."""
+    model, _ = _served(tmp_path)
+    node = model.get_submodule(VISION_ENCODER)
+    assert node.config is model.config.vision
+
+    vision = model.config.vision
+    patch = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+    fwd = CurrentForwardPassInfo(request_id="r0", graph_walk=_PREFILL, fwd_index=0, random_seed=0, max_tokens=0)
+    grid = {"image_grid_thw": [torch.tensor([[1, 4, 6]])], "pixel_values": [torch.zeros(24, patch)]}
+    inputs = node.prepare_inputs(_PREFILL, fwd, grid)
+    assert inputs.input_seq_len == 24
 
 
 # ----------------------------------------------------------------------------
