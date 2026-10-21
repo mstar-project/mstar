@@ -1086,6 +1086,20 @@ def _media_fields(model: Model, req_input: RequestInput, additional_model_kwargs
     return fields
 
 
+def _video_job_form(model: Model, req_input: RequestInput, additional_model_kwargs: dict) -> aiohttp.FormData:
+    """The multipart body of POST /v1/videos. Multipart even without a file: SGLang Diffusion reads any other
+    content type as JSON (and a urlencoded form as an empty body), and these servers reject JSON here."""
+    form = aiohttp.FormData(default_to_multipart=True)
+    fields = {"model": model.get_hf_url(), "prompt": req_input.prompt,
+              **_media_fields(model, req_input, additional_model_kwargs)}
+    for k, v in fields.items():
+        form.add_field(k, str(v))
+    if req_input.image_path:  # image-to-video: the first frame as the multipart file both servers read
+        form.add_field("input_reference", req_input._image_bytes, filename=Path(req_input.image_path).name,
+                       content_type=_image_mime(req_input.image_path))
+    return form
+
+
 def _image_mime(path: str) -> str:
     return "image/jpeg" if str(path).lower().endswith((".jpg", ".jpeg")) else "image/png"
 
@@ -1143,14 +1157,7 @@ class MediaRoutes:
         return metrics
 
     async def _send_request_video_job(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
-        form = aiohttp.FormData()  # these servers reject a JSON body on /v1/videos
-        fields = {"model": model.get_hf_url(), "prompt": req_input.prompt,
-                  **_media_fields(model, req_input, additional_model_kwargs)}
-        for k, v in fields.items():
-            form.add_field(k, str(v))
-        if req_input.image_path:  # image-to-video: the first frame as the multipart file both servers read
-            form.add_field("input_reference", req_input._image_bytes, filename=Path(req_input.image_path).name,
-                           content_type=_image_mime(req_input.image_path))
+        form = _video_job_form(model, req_input, additional_model_kwargs)
         try:
             metrics.start_time = time.monotonic()
             async with session.post(f"{base_url}/v1/videos", data=form) as resp:
