@@ -436,7 +436,10 @@ Fish Audio S2-Pro notes
   ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
   temperature first and takes top-k and top-p over the tempered probabilities,
   while the reference takes top-p over the untempered ones, so at the same
-  values M\* keeps a slightly different set of tokens per step. ``max_new_tokens`` (default 2048, at most
+  values M\* keeps a slightly different set of tokens per step. The top-p
+  boundary differs as well: M\*'s sampler (FlashInfer) keeps the token whose
+  probability carries the running total past top-p, while the reference drops
+  it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
 - Streamed audio matches the whole-utterance decode to within one int16 step:
   each codec window carries the decoder's whole receptive field as context, and
