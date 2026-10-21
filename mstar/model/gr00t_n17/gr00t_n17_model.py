@@ -53,6 +53,7 @@ from mstar.model.gr00t_n17.submodules import (
     Gr00tN17VisionEncoderSubmodule,
     Gr00tN17VLBridgeSubmodule,
 )
+from mstar.model.gr00t_n17.weight_loader import load_gr00t_n17_weights
 from mstar.model.qwen3_5.config import VISION_ATTN
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -369,28 +370,38 @@ class Gr00tN17Model(Model):
         return submodule
 
     def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
-        """One per node. Weights are the loader's (`weight_loader.py`), which
-        maps each checkpoint prefix to exactly one of these."""
+        """One per node, with its checkpoint weights in it.
+
+        The loader (`weight_loader.py`) names each node's tensors as the
+        reference does, which is relative to the module holding them: the
+        wrapped component for the three nodes that wrap one, the submodule for
+        the two that hold their parts directly. Loading is strict, so a
+        parameter that gets no tensor raises instead of serving its random
+        init -- which still returns plausible-looking actions.
+        """
         config = self.config
+
+        def loaded(module: torch.nn.Module) -> torch.nn.Module:
+            load_gr00t_n17_weights(module, node_name, self._model_dir())
+            return module
+
         if node_name == VISION_ENCODER:
-            return Gr00tN17VisionEncoderSubmodule(
-                Gr00tN17VisionEncoder(config), config,
-            )
+            return Gr00tN17VisionEncoderSubmodule(loaded(Gr00tN17VisionEncoder(config)), config)
         if node_name == LLM:
-            return Gr00tN17LLMSubmodule(Gr00tN17LanguageModel(config), config)
+            return Gr00tN17LLMSubmodule(loaded(Gr00tN17LanguageModel(config)), config)
         if node_name == STATE_ENCODER:
-            return Gr00tN17StateEncoderSubmodule(build_state_encoder(config))
+            return loaded(Gr00tN17StateEncoderSubmodule(build_state_encoder(config)))
         if node_name == VL_BRIDGE:
-            return Gr00tN17VLBridgeSubmodule(Gr00tN17VLBridge(config), config)
+            return Gr00tN17VLBridgeSubmodule(loaded(Gr00tN17VLBridge(config)), config)
         if node_name == DENOISE_STEP:
-            return Gr00tN17DenoiseStepSubmodule(
+            return loaded(Gr00tN17DenoiseStepSubmodule(
                 config,
                 build_action_encoder(config),
                 ActionPositionEmbedding(config),
                 DiT(config),
                 build_action_decoder(config),
                 loop_name=DENOISE_LOOP,
-            )
+            ))
         return None
 
     def max_input_files(self) -> dict[str, int]:

@@ -89,14 +89,28 @@ def load_gr00t_n17_weights(
 ) -> set[str]:
     """Load one node's tensors, strictly: every parameter must get one."""
     root, _ = NODE_PREFIXES[node]
+    remap, arrived = _remapper(node), set()
+
+    def tracked(tensors):
+        for name, tensor in tensors:
+            arrived.add(remap(name))
+            yield name, tensor
+
     # the root only narrows which shards open; the remapper picks the node's keys
     loaded = load_weights_into(
         module,
-        iter_safetensors_shards(Path(path), device=device, prefix=root),
-        name_remapper=_remapper(node),
+        tracked(iter_safetensors_shards(Path(path), device=device, prefix=root)),
+        name_remapper=remap,
         stacked_params=_LLM_STACKED if node == "LLM" else None,
     )
-    missing = sorted({n for n, _ in module.named_parameters()} - loaded)
+    # A fused parameter counts as loaded once *any* of its parts lands (`loader/base.py:143`),
+    # so a checkpoint missing one of q/k/v or gate/up would serve those rows at random init.
+    missing = sorted({n for n, _ in module.named_parameters()} - loaded) + sorted(
+        name.replace(rule.target_suffix, rule.source_suffix)
+        for name, _ in module.named_parameters() if node == "LLM"
+        for rule in _LLM_STACKED
+        if rule.target_suffix in name and name.replace(rule.target_suffix, rule.source_suffix) not in arrived
+    )
     if missing:
         raise ValueError(f"{node}: {len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
     return loaded
