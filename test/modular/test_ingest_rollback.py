@@ -63,7 +63,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     w._fail_requests = failed.append
     w._process_message_list = processed.extend
     body = SimpleNamespace(
-        request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={},
+        request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
         request_info=SimpleNamespace(
             partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
         ),

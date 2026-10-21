@@ -795,6 +795,7 @@ class Worker:
             graph_walk=body.request_info.graph_walk,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+            loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
 
