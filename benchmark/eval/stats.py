@@ -58,6 +58,19 @@ def label_agreement(a: list, b: list) -> dict:
     return {"n": n, "agreement": p_o, "kappa": kappa}
 
 
+def confusion_matrix(a: list, b: list, labels: list | None = None) -> dict:
+    """Counts of each (``a`` label, ``b`` label) over the same items: one row per ``a``
+    label, one column per ``b`` label, in ``labels`` order (default: sorted union)."""
+    if len(a) != len(b):
+        raise ValueError(f"{len(a)} vs {len(b)} labels")
+    labels = list(labels) if labels is not None else sorted(set(a) | set(b))
+    index = {lab: i for i, lab in enumerate(labels)}
+    matrix = [[0] * len(labels) for _ in labels]
+    for x, y in zip(a, b, strict=True):
+        matrix[index[x]][index[y]] += 1
+    return {"labels": labels, "matrix": matrix}
+
+
 def fmt_mean_std(summary: dict | None, digits: int = 2, scale: float = 1.0) -> str:
     """``"12.30 +- 0.40"`` (or ``"12.30"`` for one repeat, ``"n/a"`` for none)."""
     if not summary or summary.get("mean") is None:

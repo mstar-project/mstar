@@ -106,18 +106,28 @@ pub struct PendingOutputs {
     pub persist: Vec<(Sym, Vec<u64>)>,
     /// partition -> signal -> count; each report carries its own partition's.
     pub new_tokens: Vec<(PartitionId, Vec<(String, i64)>)>,
-    /// Emitted signal names, in emission order.
+    /// One name per chunk emitted to the client, in emission order. The
+    /// conductor counts them to tell the API server how many chunks to wait
+    /// for.
     pub output_signals: Vec<Sym>,
-    /// signal -> the loop context it was emitted at.
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+    /// stream edge -> destination worker -> items sent, local ones included.
+    /// The conductor forwards the totals with `producer_done`, so a consumer
+    /// whose done signal overtakes the last items waits for them.
+    pub stream_items: Vec<(Sym, Vec<(Sym, i64)>)>,
 }
 
+/// What one WORKER_GRAPHS_DONE drains: persist signals, token counts,
+/// emitted signal names and stream item counts.
+pub type TakenOutputs = (
+    Vec<(Sym, Vec<u64>)>,
+    Vec<(String, i64)>,
+    Vec<Sym>,
+    Vec<(Sym, Vec<(Sym, i64)>)>,
+);
+
 impl PendingOutputs {
-    /// Everything but `output_loop_indices`, which the conductor keeps for the
-    /// life of the request -- Python re-sends it on every WGD.
-    pub fn take_for_send(
-        &mut self, partition: Option<PartitionId>,
-    ) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+    /// Everything pending, with only `partition`'s token counts.
+    pub fn take_for_send(&mut self, partition: Option<PartitionId>) -> TakenOutputs {
         let new_tokens = match self.new_tokens.iter().position(|(p, _)| Some(*p) == partition) {
             Some(i) => self.new_tokens.swap_remove(i).1,
             None => Vec::new(),
@@ -126,7 +136,23 @@ impl PendingOutputs {
             std::mem::take(&mut self.persist),
             new_tokens,
             std::mem::take(&mut self.output_signals),
+            std::mem::take(&mut self.stream_items),
         )
+    }
+
+    pub fn add_stream_items(&mut self, edge: Sym, worker: Sym, n: i64) {
+        let i = match self.stream_items.iter().position(|(e, _)| *e == edge) {
+            Some(i) => i,
+            None => {
+                self.stream_items.push((edge, Vec::new()));
+                self.stream_items.len() - 1
+            }
+        };
+        let per_worker = &mut self.stream_items[i].1;
+        match per_worker.iter_mut().find(|(w, _)| *w == worker) {
+            Some((_, v)) => *v += n,
+            None => per_worker.push((worker, n)),
+        }
     }
 
     /// Every uuid of a signal, in order and deduped, matching Python: a loop
@@ -147,8 +173,7 @@ impl PendingOutputs {
         }
     }
 
-    /// Accumulate, matching Python: a repeated signal's count adds up, and a
-    /// repeated loop index overwrites.
+    /// Accumulate, matching Python: a repeated signal's count adds up.
     pub fn add_new_tokens(&mut self, partition: PartitionId, counts: &[(String, i64)]) {
         let i = match self.new_tokens.iter().position(|(p, _)| *p == partition) {
             Some(i) => i,
@@ -163,15 +188,6 @@ impl PendingOutputs {
                 Some((_, v)) => *v += n,
                 None => pending.push((name.clone(), *n)),
             }
-        }
-    }
-
-    pub fn set_loop_indices(
-        &mut self, signal: Sym, idx: (Vec<Sym>, Vec<(Sym, u32)>, u32),
-    ) {
-        match self.output_loop_indices.iter_mut().find(|(s, _)| *s == signal) {
-            Some(slot) => slot.1 = idx,
-            None => self.output_loop_indices.push((signal, idx)),
         }
     }
 }
@@ -250,11 +266,11 @@ mod tests {
         p.add_new_tokens(1, &[("tok".to_string(), 1)]);
         p.add_new_tokens(1, &[("tok".to_string(), 2)]);
         p.add_new_tokens(2, &[("audio".to_string(), 4)]);
-        let (_, n, _) = p.take_for_send(Some(2));
+        let (_, n, _, _) = p.take_for_send(Some(2));
         assert_eq!(n, vec![("audio".to_string(), 4)]);
-        let (_, n, _) = p.take_for_send(None);
+        let (_, n, _, _) = p.take_for_send(None);
         assert!(n.is_empty());
-        let (_, n, _) = p.take_for_send(Some(1));
+        let (_, n, _, _) = p.take_for_send(Some(1));
         assert_eq!(n, vec![("tok".to_string(), 3)]);
         assert!(p.new_tokens.is_empty());
     }
@@ -324,6 +340,18 @@ mod tests {
         p.add_persist(2, vec![20]);
         p.add_persist(1, vec![11, 10]);
         assert_eq!(p.persist, vec![(1, vec![10, 11]), (2, vec![20])]);
+    }
+
+    #[test]
+    fn stream_items_add_up_per_edge_and_worker_and_drain() {
+        let mut p = PendingOutputs::default();
+        p.add_stream_items(1, 10, 2);
+        p.add_stream_items(1, 11, 1);
+        p.add_stream_items(1, 10, 3);
+        p.add_stream_items(2, 10, 1);
+        let (_, _, _, items) = p.take_for_send(None);
+        assert_eq!(items, vec![(1, vec![(10, 5), (11, 1)]), (2, vec![(10, 1)])]);
+        assert!(p.stream_items.is_empty());
     }
 
     #[test]

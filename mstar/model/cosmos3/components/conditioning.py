@@ -7,8 +7,8 @@ resolution, and both are served:
   a plain bilinear resize to ``(height, width)``, aspect ratio not preserved,
   values mapped to [-1, 1] without 8-bit rounding. What the Nano checkpoints
   were validated against.
-* ``aspect_crop`` — the diffusers 0.40 pipeline (``_preprocess_conditioning_image``)
-  and the vLLM-Omni recipe: scale so the image covers the target
+* ``aspect_crop`` — the diffusers 0.40 pipeline (``_preprocess_conditioning_image``):
+  scale so the image covers the target
   (``max(width / w, height / h)``), antialiased bilinear resize to the ceiled
   size, center crop, round to 8-bit, then ``x / 127.5 - 1``. The Edge model
   card's recipe.

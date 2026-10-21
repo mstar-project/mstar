@@ -134,3 +134,16 @@ def test_modality_from_mime():
     assert media_io.modality_from_mime("image/png") == "image"
     assert media_io.modality_from_mime("audio/wav") == "audio"
     assert media_io.modality_from_mime("text/plain") == "unknown"
+
+
+def test_remove_uploads_leaves_a_file_outside_the_upload_dir(tmp_path):
+    upload_dir, elsewhere = tmp_path / "uploads", tmp_path / "voices"
+    upload_dir.mkdir()
+    elsewhere.mkdir()
+    saved, preset = upload_dir / "clip.wav", elsewhere / "preset.wav"
+    saved.write_bytes(b"RIFF")
+    preset.write_bytes(b"RIFF")
+
+    media_io.remove_uploads({"audio": [str(saved), str(preset)]}, upload_dir)
+
+    assert not saved.exists() and preset.exists()

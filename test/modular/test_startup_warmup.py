@@ -90,6 +90,28 @@ def test_malformed_warmups_are_skipped(caplog) -> None:
     assert "model_kwargs must be a mapping" in caplog.text
 
 
+def test_repeat_sends_a_long_text(caplog) -> None:
+    fake = _FakeServer()
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        entrypoint._run_warmup_requests(fake, [
+            {"text": "ab ", "repeat": 3, "model_kwargs": {"max_output_tokens": 2}},
+            {"text": "x", "repeat": 0},
+            {"text": "x", "repeat": "3"},
+            {"text": "x", "repeat": True},
+            {"files": ["/tmp/a.jpg"], "repeat": 2},
+            {"text": 5, "repeat": 3},
+            # past what a str can hold: skipped, not a failed boot
+            {"text": "x", "repeat": 10**19},
+        ])
+    assert fake.collected == ["warmup-0"]
+    assert fake.submitted[0]["text"] == "ab ab ab "
+    assert fake.submitted[0]["prompt_parts"][0].text == "ab ab ab "
+    assert caplog.text.count("repeat must be a positive integer") == 3
+    assert "repeat needs text" in caplog.text
+    assert "text must be a string" in caplog.text
+    assert "warmup_requests[6] skipped" in caplog.text
+
+
 def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
     fake = _FakeServer(fail_on="warmup-0")
     with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):

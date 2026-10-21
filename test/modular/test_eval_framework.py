@@ -809,3 +809,28 @@ def test_speaker_similarity_is_scored_only_for_cloned_requests(tmp_path, monkeyp
     metrics = TTSSuite(args).score(items, [row], 1.0, None)
     assert (metrics.get("sim_mean") == 0.5) is clone and FakeSim.calls == int(clone)
     assert ("sim" in row) is clone
+
+
+def test_a_server_with_its_own_cwd_resolves_a_relative_python_and_its_tree_there(tmp_path, monkeypatch):
+    """The e2e compare starts each arm's server in that arm's checkout; a relative
+    ``python`` runs from there, so PATH and the recorded tree come from there too."""
+    from benchmark.eval.server import ManagedServer
+
+    arm = tmp_path / "arm"
+    (arm / "mstar").mkdir(parents=True)
+    (arm / "mstar" / "__init__.py").write_text("")
+    (arm / "pyproject.toml").write_text("[project]\nname = 'mstar-ai'\n")
+    git = ["git", "-C", str(arm), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(arm)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "arm tree"], check=True)
+    venv_bin = arm / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    srv = ManagedServer("m", python="venv/bin/python", cwd=arm, env={"PATH": "/usr/bin"})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), "/usr/bin"])
+    assert srv.info()["git"]["describe"].endswith("arm tree")

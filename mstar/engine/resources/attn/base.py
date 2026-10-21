@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.DENSE: PagedKVConfig,
     AttnBackend.FLASHINFER: PagedKVConfig,
+    AttnBackend.FLASHINFER_MLA: PagedKVConfig,
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
 }
@@ -71,6 +72,11 @@ class AttentionManager(AttentionResource):
                 f"{required.__name__}, but KV resource {spec.config.kv_cache!r} "
                 f"holds a {type(kv_config).__name__}. "
             )
+        if spec.config.sm_scale is not None and backend != AttnBackend.FLASHINFER_MLA:
+            raise ValueError(
+                f"attention backend {backend.value!r} ignores sm_scale; only "
+                f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
+            )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
@@ -98,6 +104,17 @@ class AttentionManager(AttentionResource):
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
             _warn_dense_fallback(reason, backend)
 
+        if backend == AttnBackend.FLASHINFER_MLA:
+            from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+
+            return FlashInferMLAManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
+                backend=spec.config.flashinfer_backend,
+                sm_scale=spec.config.sm_scale,
+            )
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager
 
@@ -181,6 +198,20 @@ class EagerSlotKey(NamedTuple):
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
+
+
+def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
+    """Page ids a captured wrapper's index buffer holds for a bucket of
+    ``num_rows`` rows and ``num_tokens`` tokens.
+
+    Per row, not per pool: rows that matched one cached prefix all name its
+    pages, so a step can name more page ids than the pool holds. And at least
+    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
+    whatever the pool's size."""
+    return max(
+        num_rows * kv_config.max_num_pages,
+        -(-num_tokens // kv_config.page_size) + num_rows,
+    )
 
 
 class WorkspacePool:

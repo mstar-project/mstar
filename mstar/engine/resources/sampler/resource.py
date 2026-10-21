@@ -269,6 +269,9 @@ class SamplerResource(Resource):
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
+                # a replay's padding rows are declared too, and hold no mask
+                if ctx.is_padding_row(rid):
+                    continue
                 if configs[rid].penalize_prompt:
                     self._sampler.get_token_mask(rid).add_tokens(tokens)
             # dropped as they are used: `plan` runs on every step of a resident

@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -230,6 +231,9 @@ class CacheStream:
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
+    # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
+    # miss (a refused admit prepares the step again) is not counted twice
+    prefix_counted: bool = False
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
@@ -253,6 +257,13 @@ class CacheStream:
         same tokens back, so the chain that describes them has to survive it.
         """
         self.chain = None
+
+
+class KVPageCounts(NamedTuple):
+    used: int
+    total: int
+    # pages the prefix index names; some may also be in ``used`` by a request
+    cached: int
 
 
 @dataclass
@@ -471,6 +482,9 @@ class KVManager(AttentionResource):
         )
         self._prefix_root: bytes | None = None
         self._index: PrefixIndex | None = None
+        # node -> (prompt tokens looked up in the index, tokens it held), one
+        # lookup per request stream; read by the worker's metrics
+        self.prefix_tokens: dict[str, tuple[int, int]] = {}
         # label -> the walks its keys describe; a label not here is not gated
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
@@ -584,6 +598,16 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def page_counts(self) -> KVPageCounts:
+        """The pool's pages right now, without the manager lock: each count is
+        read whole, though the three may straddle an allocation."""
+        total = self._arena.allocator.max_num_pages - 1  # without SINK_PAGE
+        index = self._index
+        return KVPageCounts(
+            used=total - self._arena.num_free, total=total,
+            cached=0 if index is None else index.num_pages(),
+        )
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
     ) -> CachedPrefix | None:
@@ -654,6 +678,11 @@ class KVManager(AttentionResource):
                         else:
                             matched, held = matched + cached + own, end
                     break
+                if not stream.prefix_counted:
+                    stream.prefix_counted = True
+                    # one assignment, so a reader on another thread never sees half of it
+                    queried, hit = self.prefix_tokens.get(node_name, (0, 0))
+                    self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if not matched:
                     return None
                 stream.lease, stream.lease_len = matched, held
@@ -772,10 +801,9 @@ class KVManager(AttentionResource):
             or chain is None
         ):
             return
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and (
-            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
-        ) not in walks:
+        if walks is not None and walk not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -795,7 +823,7 @@ class KVManager(AttentionResource):
             end = chain.consumed + chain.spans[chain.done].length
             # Checking every span would end the chain at the first one the cache filled rather than this walk.
             if chain.consumed < stream.stored_len and end > start and (
-                chain.spans[chain.done].walk != ctx.graph_walk
+                chain.spans[chain.done].walk != walk
             ):
                 stream.chain = None
                 return
@@ -1444,7 +1472,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
+                if segment.span == 0 or self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1472,7 +1500,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1559,7 +1587,7 @@ class KVManager(AttentionResource):
         page_size = self.kv_cache.page_size
         pending_forks = pending_forks or {}
         for s in segments:
-            if ctx is not None and ctx.is_padding_row(s.request_id):
+            if ctx is not None and self._on_sink(ctx, s.request_id):
                 # A padding row reads and writes SINK_PAGE; the engine
                 # discards its output.
                 views.append(SequenceView(
@@ -2120,9 +2148,17 @@ class KVManager(AttentionResource):
         """The step's real rows its forks apply to: all of them unless it names some."""
         return [
             rid for rid in ctx.padded_request_ids
-            if not ctx.is_padding_row(rid)
+            if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _on_sink(ctx: StepContext, rid) -> bool:
+        """Whether ``rid`` runs against SINK_PAGE and holds no pages: a
+        replay's padding row, or any row of a capture. A capture's rows are the
+        padding rows its replays will run, so they run the same way, and no
+        bucket's sizing or capture depends on how many pages the pool has."""
+        return ctx.capture or ctx.is_padding_row(rid)
 
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
@@ -2175,7 +2211,7 @@ class KVManager(AttentionResource):
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing
                 stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
@@ -3119,11 +3155,23 @@ class KVManager(AttentionResource):
         )
 
     @torch.compiler.disable
+    def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
+        device tensors, for a kernel that writes the cache itself. Under a capture lease they
+        are the slot's static buffers, so a graph replays with the next step's slots."""
+        if label is None:
+            label = self._default_label
+        plan_state = self._current_plan_states[label]
+        n = plan_state.total_tokens
+        return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None = None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
-        """Write K, V into this step's planned slots.
+        """Write K, V into this step's planned slots (under MLA: the per-token
+        latent as ``k`` and ``v=None``).
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
@@ -3136,7 +3184,7 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,

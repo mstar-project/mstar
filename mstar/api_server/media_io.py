@@ -23,6 +23,7 @@ import io
 import math
 import os
 import threading
+import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -313,6 +314,40 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
     raise ValueError("server file paths are refused; send media as a data URL or a file upload")
 
 
+# How long a submitted request's uploads outlive it: the data worker reads them
+# from its queue after the submission returns. The Rust frontend waits 60 s too.
+UPLOAD_CLEANUP_DELAY_S = 60.0
+
+
+def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """Delete a request's files under ``upload_dir`` now. A path elsewhere is
+    left alone: no route puts one in ``file_paths`` today, and a file the
+    server did not save is never the request's to delete."""
+    root = Path(upload_dir).resolve()
+    for paths in (file_paths or {}).values():
+        for path in paths:
+            p = Path(path)
+            if not p.resolve().is_relative_to(root):
+                continue
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """:func:`remove_uploads` after :data:`UPLOAD_CLEANUP_DELAY_S`, for a
+    request that was submitted and may not have been read yet."""
+    if not file_paths:
+        return
+
+    def _cleanup() -> None:
+        time.sleep(UPLOAD_CLEANUP_DELAY_S)
+        remove_uploads(file_paths, upload_dir)
+
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Outbound: wrap raw model output for client surfaces
 # ---------------------------------------------------------------------------
@@ -498,9 +533,80 @@ def split_windows(
     return pieces
 
 
+class StreamResampler:
+    """Resample a stream that arrives in pieces of any size (``push``), with
+    the same output however it was split. A Kaiser-windowed sinc lowpass at
+    the lower Nyquist, applied polyphase: output ``k`` is centered on input
+    time ``k * rate_in / rate_out``, so timing is kept exactly. The passband
+    is flat to 0.1 dB up to 0.9 of the lower Nyquist and 3 dB down at 0.94
+    (7.2 and 7.5 kHz at 24 to 16 kHz), close to what a 16 kHz recording
+    holds; anything above that Nyquist, which would fold back, is down 46 dB
+    or more, and 100 dB from 1.06 of it on. Each output waits for half a
+    kernel of input past its center (72 samples, 3 ms, at 24 to 16 kHz); ``flush``
+    emits the rest as if the input went on as
+    silence, ``ceil(n_in * rate_out / rate_in)`` samples in all, and starts
+    over. The kernel has ``2 * half_width * max(up, down) + 1`` taps for the
+    reduced ratio ``up/down``, so callers bound the rates."""
+
+    def __init__(self, rate_in: int, rate_out: int, half_width: int = 48, beta: float = 10.0, rolloff: float = 0.95):
+        g = math.gcd(rate_in, rate_out)
+        self.up, self.down = rate_out // g, rate_in // g
+        self.half = half_width * max(self.up, self.down)        # kernel half length, upsampled samples
+        n = np.arange(-self.half, self.half + 1)
+        cutoff = rolloff * 0.5 / max(self.up, self.down)          # cycles per upsampled sample
+        self.kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.kaiser(n.size, beta) * self.up
+        self.reset()
+
+    def reset(self) -> None:
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._base = 0      # input index of _buf[0]
+        self._n_in = 0      # input samples pushed
+        self._k_out = 0     # output samples emitted
+
+    def push(self, x: np.ndarray) -> np.ndarray:
+        self._buf = np.concatenate([self._buf, np.asarray(x, dtype=np.float64)])
+        self._n_in += int(np.size(x))
+        # output k is final once every input within half a kernel of it is in
+        return self._emit(-(-(self._n_in * self.up - self.half) // self.down))
+
+    def held(self, extra: int = 0) -> int:
+        """Output samples ``flush`` would still emit, after ``extra`` more
+        input samples."""
+        return -(-((self._n_in + extra) * self.up) // self.down) - self._k_out
+
+    def flush(self) -> np.ndarray:
+        out = self._emit(-(-(self._n_in * self.up) // self.down))
+        self.reset()
+        return out
+
+    def _emit(self, k_end: int) -> np.ndarray:
+        up, down, half = self.up, self.down, self.half
+        if k_end <= self._k_out or not self._buf.size:
+            n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
+            return np.zeros(n, dtype=np.float32)
+        span = half // up + 1
+        taps = np.arange(-span, span + 1)[None, :]
+        out = []
+        for k0 in range(self._k_out, k_end, 4096):              # bounds the gather to 4096 rows
+            t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
+            ns = t // up + taps                                  # candidate input indices
+            idx = t - ns * up + half
+            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
+            vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
+            out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
+        self._k_out = k_end
+        keep = max(self._base, -(-(k_end * down - half) // up))  # first input the next output needs
+        self._buf = self._buf[keep - self._base:]
+        self._base = keep
+        return np.concatenate(out).astype(np.float32)
+
+
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``."""
-    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
+    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
+    sample."""
+    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
+    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
     Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 

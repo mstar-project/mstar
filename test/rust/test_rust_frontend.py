@@ -10,6 +10,7 @@ import socket
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -18,9 +19,11 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
     find_server_binary,
     launch_rust_server,
+    openai_adapter_class,
 )
 
 try:
@@ -45,6 +48,8 @@ class _StubAPIServer:
     def __init__(self):
         self.submitted = []
         self.aborted = []
+        # APIServer.metrics: None until --enable-metrics turns them on.
+        self.metrics = None
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -227,6 +232,67 @@ def test_health_goes_red_when_the_bridge_dies(stack):
     assert e.value.code == 503
 
 
+def _get(port, path, headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def _without_status_age(text: bytes) -> list[bytes]:
+    return [line for line in text.splitlines()
+            if not line.startswith(b"mstar_conductor_status_age_seconds{")]
+
+
+def test_metrics_relay_the_api_server_registry_open_like_health():
+    """``/metrics`` on ``mstar-server`` is the text the API server's registry
+    renders, with its content type, and needs no key while the request
+    routes keep it."""
+    pytest.importorskip("prometheus_client")
+    from mstar.observability.metrics import ServingMetrics
+    from mstar.profile.format import RequestTiming
+
+    with _running_stack(api_key="s3cret") as (port, stub, _bridge, _proc):
+        stub.metrics = ServingMetrics(
+            "qwen3_omni", in_flight=lambda: 3, data_worker_queue_depth=lambda: 0,
+        )
+        now = time.perf_counter()
+        timing = RequestTiming(recv_time=now - 0.4, first_chunk_time=now - 0.3)
+        stub.metrics.record(types.SimpleNamespace(
+            output_modalities=["text"], profile=types.SimpleNamespace(timing=timing),
+            first_chunk_times={"text": now - 0.3},
+        ), "success")
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            status, resp_headers, body = _get(port, "/metrics", headers)
+            assert status == 200, body
+            assert resp_headers["Content-Type"] == stub.metrics.content_type
+            # The status age is computed at scrape, so it differs between renders.
+            assert _without_status_age(body) == _without_status_age(stub.metrics.render())
+        from prometheus_client.parser import text_string_to_metric_families
+
+        samples = {(s.name, tuple(sorted(s.labels.items()))): s.value
+                   for f in text_string_to_metric_families(body.decode()) for s in f.samples}
+        model = ("model_name", "qwen3_omni")
+        assert samples[("mstar_requests_in_flight", (model,))] == 3
+        assert samples[("mstar_requests_total", (model, ("outcome", "success"),
+                                                 ("output_modalities", "text")))] == 1
+        assert samples[("mstar_e2e_request_latency_seconds_count",
+                        (model, ("output_modalities", "text")))] == 1
+        assert _get(port, "/v1/models")[0] == 401
+
+
+def test_metrics_are_404_when_off_and_503_when_the_bridge_dies(stack):
+    port, _stub, bridge, _proc = stack
+    status, _, body = _get(port, "/metrics")
+    assert status == 404
+    assert "--enable-metrics" in json.loads(body)["detail"]
+    bridge.stop()
+    time.sleep(0.1)  # let the loop exit
+    assert _get(port, "/metrics")[0] == 503
+
+
 def test_sigterm_drains_and_exits(stack):
     import signal
 
@@ -266,10 +332,15 @@ def test_admission_permit_is_held_through_streaming_body():
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_adm_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_admup_")
-    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1",
+               **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
+    # What the bridge reads of APIServer.metrics.
+    stub.metrics = types.SimpleNamespace(
+        render=lambda: b"mstar_up 1\n", content_type="text/plain; version=0.0.4",
+        refusals=types.SimpleNamespace(update_rust=lambda routes, statuses, counts: None))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -290,6 +361,8 @@ def test_admission_permit_is_held_through_streaming_body():
         with pytest.raises(urllib.error.HTTPError) as e:
             _chat(port, "second", timeout=5)
         assert e.value.code == 503
+        # A saturated server is still scrapeable: /metrics bypasses the cap.
+        assert _get(port, "/metrics")[:3:2] == (200, b"mstar_up 1\n")
         # Release A; its permit frees and a subsequent request succeeds.
         gate.set()
         assert b"world" in resp_a.read()
@@ -399,6 +472,32 @@ def _generate(port, urlencoded: bool, timeout=30):
         return r.status, r.read()
 
 
+# The Python /generate's 400s (test_video_frame_protocol checks the same text there).
+_STREAMING_ONLY = ("Output modality video_frame requires streaming=true; raw frame "
+                   "chunks cannot be returned as an aggregated response.")
+_OUTPUT_ONLY = "'video_frame' is an output-only modality"
+
+
+@pytest.mark.parametrize("fields,detail", [
+    ({"output_modalities": "video_frame", "streaming": "false"}, _STREAMING_ONLY),
+    ({"input_modalities": "video_frame", "output_modalities": "text"}, _OUTPUT_ONLY),
+], ids=["output-not-streamed", "input"])
+def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields, detail):
+    """The API server's own check would raise a ValueError, which reaches
+    the client as a 500."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", **fields}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert (e.value.code, json.loads(e.value.read())) == (400, {"detail": detail})
+    assert stub.submitted == []
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the
@@ -439,8 +538,9 @@ def _model_stack(model, stub, env=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
+    env = {OPENAI_ADAPTER_ENV: openai_adapter_class(model), **(env or {})}
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **env))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -815,6 +915,105 @@ def test_a_duplicate_of_a_running_id_gets_a_409_and_the_running_one_completes(st
     assert [json.loads(line)["modality"] for line in lines if line.strip()] == ["text"] * 400
     assert stub.n == 1 and stub.refused == 0, "the duplicate reached the backend"
     assert stub.aborted == []
+
+
+class _GatedKeyedStub(_KeyedStub):
+    """``_KeyedStub`` whose streams wait for ``gate``; a prompt of ``fail``
+    gets the backend's 400 once it was submitted."""
+
+    def __init__(self, gate):
+        super().__init__(tokens=1)
+        self.gate = gate
+        self.texts = {}
+
+    def submit_request(self, *, request_id=None, text=None, **kwargs):
+        request_id = super().submit_request(request_id=request_id, text=text, **kwargs)
+        self.texts[self.live[request_id]] = text
+        return request_id
+
+    async def _stream(self, key):
+        import asyncio
+
+        if self.texts[key] == "fail":
+            self.running.discard(key)
+            yield _Chunk("error", b"bad input", {"status": 400})
+            return
+        while not self.gate.is_set():
+            await asyncio.sleep(0.01)
+        async for chunk in super()._stream(key):
+            yield chunk
+
+
+def test_refusals_reach_the_api_server_registry():
+    """Requests ``mstar-server`` refuses before submitting them (no key, body
+    over the limit, invalid JSON, a bad form, a ``request_id`` in flight,
+    the admission cap, an unknown route, a wrong method) are counted by route
+    template and status and exported by the API server's registry through
+    the bridge; a request the backend fails after submission is not."""
+    pytest.importorskip("prometheus_client")
+    import urllib.parse
+
+    from mstar.observability.metrics import ServingMetrics
+
+    key = {"Authorization": "Bearer s3cret"}
+    gate = threading.Event()
+    stub = _GatedKeyedStub(gate)
+    stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 0, data_worker_queue_depth=lambda: 0)
+    env = {"MSTAR_API_KEY": "s3cret", "MSTAR_MAX_CONCURRENT_REQUESTS": "2", "MSTAR_MAX_BODY_MB": "1"}
+    chat = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    def call(method, path, body=None, headers=key, ctype="application/json"):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=body,
+                                     headers={"Content-Type": ctype, **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def generate(request_id, text="hi", streaming="true", **fields):
+        return urllib.parse.urlencode({"text": text, "request_id": request_id,
+                                       "streaming": streaming, **fields}).encode()
+
+    def open_stream(request_id):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=generate(request_id),
+                                     headers={"Content-Type": "application/x-www-form-urlencoded", **key})
+        return urllib.request.urlopen(req, timeout=15)
+
+    form = "application/x-www-form-urlencoded"
+    with _model_stack("qwen3_omni", stub, env=env) as (port, _up):
+        assert call("POST", "/v1/chat/completions", chat, headers={}) == 401
+        assert call("GET", "/no/such/route", headers={}) == 401
+        assert call("GET", "/no/such/route") == 404
+        assert call("GET", "/generate") == 405
+        assert call("POST", "/v1/chat/completions", b"x" * 2**21) == 413
+        assert call("POST", "/v1/chat/completions", b"{not json") == 422
+        assert call("POST", "/generate", generate("B", model_kwargs="{"), ctype=form) == 400
+        assert call("POST", "/generate", generate("F", text="fail", streaming="false"), ctype=form) == 400
+        streams = [open_stream("X")]
+        try:
+            assert call("POST", "/generate", generate("X"), ctype=form) == 409
+            streams.append(open_stream("Y"))
+            assert call("POST", "/v1/chat/completions", chat) == 503
+        finally:
+            gate.set()
+            for s in streams:
+                s.read()
+                s.close()
+        status, _, body = _get(port, "/metrics")
+
+    assert status == 200, body
+    from prometheus_client.parser import text_string_to_metric_families
+
+    refusals = {(s.labels["route"], s.labels["status"]): s.value
+                for f in text_string_to_metric_families(body.decode()) for s in f.samples
+                if s.name == "mstar_http_refusals_total" and s.labels["model_name"] == "qwen3_omni"}
+    assert refusals == {
+        ("/v1/chat/completions", "401"): 1, ("unmatched", "401"): 1, ("unmatched", "404"): 1,
+        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "422"): 1,
+        ("/generate", "400"): 1, ("/generate", "409"): 1, ("/v1/chat/completions", "503"): 1,
+    }
+    assert stub.n == 3, "a refused request reached the backend"
 
 
 def _image_n_error(port, n):

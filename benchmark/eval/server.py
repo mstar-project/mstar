@@ -45,7 +45,8 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def python_tree(python: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+def python_tree(python: str, env: dict[str, str] | None = None,
+                cwd: str | Path | None = None) -> dict[str, Any]:
     """The checkout and package versions ``python`` imports M* from, without importing it.
 
     With ``--serve-python`` the server runs another venv, often another checkout, so the
@@ -54,7 +55,7 @@ def python_tree(python: str, env: dict[str, str] | None = None) -> dict[str, Any
     """
     try:
         out = subprocess.run([python, "-c", _TREE_PROBE], capture_output=True, text=True,
-                             env=env, timeout=60, check=True)
+                             env=env, cwd=cwd, timeout=60, check=True)
         probe = json.loads(out.stdout.strip().splitlines()[-1])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return {}
@@ -107,6 +108,7 @@ class ManagedServer:
         startup_timeout_s: float = 1800.0,
         command: list[str] | None = None,
         python: str | None = None,
+        cwd: str | Path | None = None,
     ):
         self.model = model
         self.python = python or sys.executable
@@ -119,6 +121,7 @@ class ManagedServer:
         self.log_path = Path(log_path) if log_path else None
         self.startup_timeout_s = startup_timeout_s
         self._command = command
+        self.cwd = cwd
         self._proc: subprocess.Popen | None = None
         self._log = None
         self._scratch: tempfile.TemporaryDirectory | None = None
@@ -148,7 +151,8 @@ class ManagedServer:
                 # Tools the server finds on PATH (FlashInfer's JIT needs ninja) come from its own
                 # venv, as when that venv is activated; the abspath keeps a venv's bin/python
                 # symlink unresolved.
-                bin_dir = os.path.dirname(os.path.abspath(python))
+                # A relative path runs from the server's cwd, as Popen resolves it there.
+                bin_dir = os.path.dirname(os.path.abspath(os.path.join(self.cwd or "", python)))
                 env["PATH"] = os.pathsep.join([bin_dir, env["PATH"]]) if env.get("PATH") else bin_dir
         return env
 
@@ -176,8 +180,14 @@ class ManagedServer:
             stdout=self._log or subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             env=self.environment(),
+            cwd=self.cwd,
             start_new_session=True,
         )
+
+    @property
+    def pid(self) -> int | None:
+        """The launched process; it leads its own session and process group (API server, conductor, workers)."""
+        return self._proc.pid if self._proc is not None else None
 
     def wait_ready(self) -> None:
         assert self._proc is not None
@@ -225,7 +235,7 @@ class ManagedServer:
 
     def info(self) -> dict[str, Any]:
         if self._tree is None:
-            self._tree = python_tree(self.python, self.environment()) if self._command is None else {}
+            self._tree = python_tree(self.python, self.environment(), self.cwd) if self._command is None else {}
         return {
             "managed": True,
             "model": self.model,

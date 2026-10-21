@@ -1,0 +1,14 @@
+# Scrapes an M* server started on the Docker host with --enable-metrics.
+# The conductor and workers report once a second, so 5 s loses nothing.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: mstar
+    metrics_path: /metrics
+    static_configs:
+      # host.docker.internal is the Docker host (docker-compose.yml maps it on
+      # Linux). Use the server's --port if it is not 8000. With Prometheus on
+      # the host network instead, use "localhost:8000" (see README.md).
+      - targets: ["host.docker.internal:8000"]

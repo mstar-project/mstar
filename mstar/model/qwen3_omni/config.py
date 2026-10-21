@@ -218,10 +218,9 @@ class TalkerConfig:
     # in HF defaults), so IDs ≥ 3072 are out-of-range and cause a
     # CUDA device-side assert when the assistant-prefix builder tries
     # to embed them.  The ACTUAL published Qwen3-Omni checkpoint uses
-    # the 2148-2157 range (matching sglang-omni's values and the
-    # model's tokenizer).  We use those as our defaults here and also
-    # load from the checkpoint's ``config.json`` via ``from_dict`` if
-    # the keys are present.
+    # the 2148-2157 range (matching the model's tokenizer).  We use
+    # those as our defaults here and also load from the checkpoint's
+    # ``config.json`` via ``from_dict`` if the keys are present.
     codec_eos_token_id: int = 2150
     codec_nothink_id: int = 2155
     codec_think_bos_id: int = 2156
@@ -297,8 +296,7 @@ class Code2WavConfig:
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
     # Streaming chunk size (in codec frames) for the Talker→Code2Wav edge.
-    # 25 frames keeps TTFT low (~1s); matches vllm-omni's
-    # ``codec_chunk_frames=25`` default. ``codec_left_context_frames`` is the
+    # 25 frames keeps TTFT low (~1s). ``codec_left_context_frames`` is the
     # number of overlap frames prepended to non-first chunks by
     # ``LeftContextChunkPolicy`` (warms up the causal ConvNet vocoder) and
     # trimmed from the emitted waveform in ``Code2WavSubmodule``.

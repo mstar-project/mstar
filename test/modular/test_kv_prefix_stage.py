@@ -333,3 +333,22 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     assert batch.inputs[0].input_seq_len == PROMPT - 96, (
         "the surviving request lost its own match"
     )
+
+
+@pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
+def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
+    engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    batch = ExecutingBatch(
+        node_name=NODE, per_request_info={RID: None, "r1": None},
+        step_context=StepContext(
+            request_ids=(RID, "r1"), graph_walk="mixed" if request_walks else WALK,
+            slot=0, capture=False, request_walks=request_walks,
+        ),
+    )
+
+    engine._prepare_inputs(batch)
+
+    assert RID in batch.cached_rids and not batch.failed_requests, (
+        "a walk the cache served whole failed its request, so it never reached its next walk"
+    )

@@ -178,8 +178,8 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
 
     def _gdn_state_dtype(self) -> torch.dtype:
-        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones),
-        as vLLM does; fp32 wherever the pool's decode kernels cannot take it.
+        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones);
+        fp32 wherever the pool's decode kernels cannot take it.
 
         ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
         halves state traffic, but only FlashInfer's fused bf16 decode kernel

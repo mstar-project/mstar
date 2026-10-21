@@ -56,13 +56,13 @@ ME = "worker_0"
 PEER = "worker_1"
 
 
-def _node(name, inputs, outs, modality=""):
+def _node(name, inputs, outs, modality="", streaming=False):
     return {
         "name": name, "async_enabled": True, "inputs": sorted(inputs),
         "streaming_inputs": [],
         "outputs": [
             {"name": sig, "dest": dest, "persist": persist,
-             "new_token": False, "streaming": False, "modality": modality}
+             "new_token": False, "streaming": streaming, "modality": modality}
             for sig, dest, persist in outs
         ],
     }
@@ -71,7 +71,7 @@ def _node(name, inputs, outs, modality=""):
 class _Mesh:
     """A runtime wired to a real transport, plus every peer's inbox."""
 
-    def __init__(self, tmp_path, outs, remote=()):
+    def __init__(self, tmp_path, outs, remote=(), streaming=False):
         self.dir = str(tmp_path)
         self.book = RustTensorBookkeeping()
         self.comm = ZmqCommunicator(ME, self.dir)
@@ -80,7 +80,8 @@ class _Mesh:
             for peer in ("conductor", "api_server", PEER)
         }
         wg = {"wg_id": WG_ID, "graph_walks": [WALK],
-              "nodes": [_node("only", ["prompt"], outs)], "loops": []}
+              "nodes": [_node("only", ["prompt"], outs, streaming=streaming)],
+              "loops": []}
         self.rt = GraphRuntime(
             worker_graphs=[wg],
             remote_worker_graphs=list(remote),
@@ -227,10 +228,9 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
             loop_indices=idx, metadata={},
         ),
     ))]
-    # The WGD reports what was emitted, and at which loop index.
+    # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
-    assert wgd.output_loop_indices == {"out": idx}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
@@ -398,6 +398,43 @@ def test_a_uuid_whose_descriptor_is_gone_is_skipped(tmp_path):
     mesh.book.put_tensor(2, info)
     got = mesh.run(rid, uuids=[1])
     assert got["conductor"][0].body.persist_signals == {"out": []}
+
+
+def _stream_mesh(tmp_path):
+    return _Mesh(
+        tmp_path, outs=[("out", "remote", False)], streaming=True,
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+
+
+def test_stream_items_sent_ride_the_worker_graphs_done(tmp_path):
+    """Per destination worker, and accumulated until a WGD drains them: the
+    conductor forwards the total with producer_done, and the consumer ends
+    the stream only once that many items have arrived."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    _put(mesh, 2)
+    got = mesh.run(rid, uuids=[1, 2])
+    assert got[PEER][0].body.inputs[0].is_streaming
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 2}}
+    _put(mesh, 3)
+    got = mesh.run(rid, uuids=[3])
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
+
+
+def test_a_stream_item_whose_descriptor_is_gone_is_not_counted(tmp_path):
+    """The count is what the consumer will register, so it follows the
+    descriptors that go out; one more would hold its stream open forever."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    _put(mesh, 2)
+    mesh.book.forget_tensor(1)
+    got = mesh.run(rid, uuids=[1, 2])
+    assert got[PEER][0].body.inputs[0].tensor_info == [_info(2)]
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
 
 
 # --- stop loops ---------------------------------------------------------------

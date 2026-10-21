@@ -33,7 +33,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.engine import Engine
-from mstar.engine.resources import BucketKey, CGSlotSpec
+from mstar.engine.resources import BucketKey, CGSlotSpec, SubmoduleStep
 
 _GIB = 2**30
 _MIB = 2**20
@@ -305,6 +305,70 @@ def test_a_sizing_step_that_fails_fails_the_boot(measured):
 
     with pytest.raises(RuntimeError, match="slot=0 eagerly to size its capture, with 51200 MiB free before it: CUDA"):
         Engine._plan_captures(engine, {"Thinker": runner}, {"Thinker": {}})
+
+
+def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
+    """Qwen3.5-0.8B with a 64-page KV pool (#728): sizing admitted each
+    capture for real pages, the 8,192-token buckets did not fit, and the boot
+    failed. A served prompt still pads into them, so each has to be sized for
+    the floor and captured. Through the real warm-up, on a real 8-page pool."""
+    from mstar.engine.accelerator_graph_config import decode_rows_then_prompt
+    from mstar.engine.resources import Segment
+    from mstar.engine.resources.kv import manager as manager_mod
+    from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
+    from mstar.engine.resources.kv.manager import KVManager
+
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=8, page_size=4),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv._cg_max_seq_len = 40
+    free = kv._arena.num_free
+    # 3 pages, and 13: more than the pool's 7
+    fits, wide = _bucket("mixed", 2, 8), _bucket("mixed", 4, 40)
+
+    def declare_step(graph_walk, request_ids, inputs, slot_lease, per_request_info):
+        spans = decode_rows_then_prompt(slot_lease.bucket.num_tokens, len(request_ids))
+        return SubmoduleStep(
+            segments=[], steps={"kv": KVStep(segments=tuple(
+                Segment(rid, "main", span) for rid, span in zip(request_ids, spans, strict=True)
+            ))},
+        )
+
+    def ensure(key, bs):
+        rids = list(range(-bs, 0))
+        for rid in rids:
+            kv.ingest_capture_row(rid)
+        return rids
+
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), {wide: _cost(100), fits: _cost(10)})
+    runner.NUM_WARMUP = 0
+    runner._warmed = partial(AcceleratorGraphRunner._warmed, runner)
+    runner._forward_for = lambda spec: lambda **kwargs: _cost(100 if spec.bucket == wide else 10)
+    runner._dummy_rows = SimpleNamespace(ensure=ensure, reset=lambda rids, free=False: None)
+    runner._dummy_engine_inputs = lambda rids, walk: SimpleNamespace(per_request_info={})
+    runner._submodule = SimpleNamespace(declare_step=declare_step, preprocess=lambda **kwargs: {})
+    runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
+    runner._step_runner = SimpleNamespace(
+        admit=lambda step: kv.admit(step.get("kv"), step.ctx),
+        plan=lambda step: kv.plan(step.get("kv"), step.ctx),
+    )
+    config = SimpleNamespace(
+        get_node_inputs=lambda bs, tokens: None, get_config_type=lambda: None,
+        input_seq_dims=None, capture_forward_method="forward", compile=False,
+    )
+    runner.prepare_for_capture = lambda: [
+        CGSlotSpec(bucket=b, slot=s, config=config) for b in (wide, fits) for s in (0, 1)
+    ]
+    engine = SimpleNamespace(_device=torch.device("cuda", 0), _submodules={"LLM": None}, _gpu_memory_fraction=None)
+
+    plan = Engine._plan_captures(engine, {"LLM": runner}, {"LLM": {}})
+
+    assert set(runner._capture_costs) == {wide, fits}, "every bucket must be sized, so the floor covers it"
+    assert plan.buckets["LLM"] == {wide, fits}, "a bucket a served step pads into must be captured"
+    assert kv._arena.num_free == free, "sizing must leave every page free"
 
 
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):

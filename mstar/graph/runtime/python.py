@@ -108,10 +108,10 @@ class GraphRuntimeRequestInfo:
     # so a persist signal cannot race the message that announces it.
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_token_counts: dict[str, dict[str, int]] = field(default_factory=dict)  # by partition
+    # one name per chunk emitted to the client; the conductor counts them
+    # stream edge -> destination worker -> items sent, local ones included
+    pending_stream_items: dict[str, dict[str, int]] = field(default_factory=dict)
     current_output_chunks: list[str] = field(default_factory=list)
-    output_loop_indices: dict[str, NestedLoopIndices] = field(
-        default_factory=dict
-    )
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -1509,7 +1509,6 @@ class PythonGraphRuntime(GraphRuntime):
                     edge.name for edge in routing.emit_to_client
                 )
                 for edge in routing.emit_to_client:
-                    info.output_loop_indices[edge.name] = nested_idxs.get(rid)
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
                         body=ResultTensors(
@@ -1526,6 +1525,16 @@ class PythonGraphRuntime(GraphRuntime):
             # local_streaming_by_signal is how the caller finds those.
             for worker_id, edges in routing.streaming_to_workers.items():
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
+
+            if info is not None:
+                for worker_id, edges in [
+                    (self._my_worker_id, routing.streaming_local),
+                    *routing.streaming_to_workers.items(),
+                ]:
+                    for edge in edges:
+                        if edge.tensor_info:
+                            sent = info.pending_stream_items.setdefault(edge.name, {})
+                            sent[worker_id] = sent.get(worker_id, 0) + len(edge.tensor_info)
 
             if routing.completed_worker_graph_ids and info is not None:
                 part = info.partition_info.get(partition)
@@ -1598,6 +1607,8 @@ class PythonGraphRuntime(GraphRuntime):
                     infos.append(i)
         info.pending_persist_signals = []
         new_token_counts = info.pending_new_token_counts.pop(partition, {})
+        stream_items_sent = info.pending_stream_items
+        info.pending_stream_items = {}
         output_signal_names = list(info.current_output_chunks)
         info.current_output_chunks.clear()
 
@@ -1618,7 +1629,7 @@ class PythonGraphRuntime(GraphRuntime):
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,
-                output_loop_indices=info.output_loop_indices,
+                stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,
                 rx_info=rx_info,
                 tx_info=tx_info,
