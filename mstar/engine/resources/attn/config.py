@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
+import torch
+
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -33,6 +35,8 @@ class AttentionConfig:
     # one-token rows on the decode wrapper and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
+    # dtype the kernel is planned in; None takes the KV cache's, then the nodes'
+    dtype: torch.dtype | None = None
 
 
 @dataclass
@@ -54,6 +58,7 @@ class AttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -65,6 +70,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 @dataclass
@@ -88,6 +95,8 @@ class CrossAttentionConfig:
     context_label: str = "context"
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # dtype the kernel is planned in; None takes the context cache's, then the nodes'
+    dtype: torch.dtype | None = None
 
 
 @dataclass
@@ -111,12 +120,15 @@ class CrossAttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
         """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 @dataclass(frozen=True)

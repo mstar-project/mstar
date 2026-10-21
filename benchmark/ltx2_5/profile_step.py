@@ -41,7 +41,7 @@ def ragged_attends(config, shape, batch, device):
                                        (RaggedCrossAttentionSpec, S.AUDIO_XATTN, audio_heads)):
         spec = spec_cls(resource_key=key, nodes={"dit"}, config=RaggedAttentionConfig(
             num_qo_heads=heads, num_kv_heads=heads, head_dim=hd, dtype=torch.bfloat16))
-        res[key] = build_resource(spec, EngineResourceInfo(device=device, kv_dtype=torch.bfloat16))
+        res[key] = build_resource(spec, EngineResourceInfo(device=device, default_dtype=torch.bfloat16))
     sub = S.LTXDenoiseSubmodule(torch.nn.Linear(1, 1), config, loop_name="x", use_ragged_attention=True)
     sub.node_resources = res
     step = sub.declare_step("g", list(range(batch)), [NodeInputs(resource_step_info=shape)] * batch)

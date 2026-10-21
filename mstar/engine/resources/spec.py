@@ -13,6 +13,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
@@ -150,3 +152,13 @@ def apply_yaml_overrides(
     for key, kwargs in overrides.items():
         by_key[key].apply_yaml_overrides(**kwargs)
     logger.info("Resource specs after YAML overrides: %s", specs)
+
+
+def parse_yaml_dtype(value: str | torch.dtype) -> torch.dtype:
+    """A YAML ``dtype:`` value, ``bfloat16`` or ``torch.bfloat16``, as a torch dtype."""
+    if isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"dtype {value!r} is not a torch dtype")
+    return dtype

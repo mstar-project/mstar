@@ -246,7 +246,7 @@ class TestBackendSelection:
         manager = AttentionManager.build(
             spec,
             EngineResourceInfo(
-                device=torch.device("cpu"),
+                device=torch.device("cpu"), default_dtype=torch.bfloat16,
                 dependencies={
                     "kv": KVSpec(
                         resource_key="kv", nodes={"llm"}, config=_kv_config(),

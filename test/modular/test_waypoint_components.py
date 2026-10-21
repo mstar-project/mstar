@@ -151,7 +151,7 @@ def ring_manager(config: WaypointConfig, *, num_sessions: int = 1) -> RingKVMana
     constructor: the spec is what picks ``RingKVManager`` over the paged one."""
     return RingKVManager.build(
         ring_kv_spec(config, num_sessions=num_sessions),
-        EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+        EngineResourceInfo(device=torch.device("cpu"), default_dtype=torch.float32),
     )
 
 
@@ -172,7 +172,7 @@ def waypoint_resources(config: WaypointConfig):
             nodes={"dit"},
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
         ),
-        EngineResourceInfo(device=cpu, kv_dtype=torch.float32, dependencies={"kv": kv_spec}),
+        EngineResourceInfo(device=cpu, default_dtype=torch.float32, dependencies={"kv": kv_spec}),
     )
     return kv, attn
 

@@ -369,7 +369,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
                 device=torch.device(device),
                 joint_comm_group=groups,
                 transfer_engine_info=transfer,
-                kv_dtype=dtype,
+                default_dtype=dtype,
                 # the attention specs name the cache they run over (engine.py
                 # resolves `depends_on` the same way)
                 dependencies={key: specs_by_key[key] for key in spec.depends_on()},

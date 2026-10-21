@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -41,6 +41,8 @@ class PositionConfig:
     rope_scale: float = 1.0
     rope_theta: float = 10000.0
     rope_dtype: torch.dtype | None = None
+    # the cos/sin cache's storage dtype when rope_dtype is unset; None takes the nodes'
+    dtype: torch.dtype | None = None
 
     low_freq_factor: float | None = None
     high_freq_factor: float | None = None
@@ -70,6 +72,11 @@ class PositionSpec(NodeResourceSpec):
         from mstar.engine.resources.position.manager import PositionManager
 
         return PositionManager
+
+    def apply_yaml_overrides(self, dtype: str | torch.dtype | None = None):
+        """The cache dtype only; rope parameters are the checkpoint's."""
+        if dtype is not None:
+            self.config.dtype = parse_yaml_dtype(dtype)
 
 
 @dataclass(frozen=True)

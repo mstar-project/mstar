@@ -103,14 +103,14 @@ def build_resources(config: WaypointConfig, dtype: torch.dtype = torch.float32):
     """
     kv_spec = ring_kv_spec(config)
     cpu = torch.device("cpu")
-    kv = RingKVManager.build(kv_spec, EngineResourceInfo(device=cpu, kv_dtype=dtype))
+    kv = RingKVManager.build(kv_spec, EngineResourceInfo(device=cpu, default_dtype=dtype))
     attn = AttentionManager.build(
         AttentionSpec(
             resource_key="attn",
             nodes={"dit"},
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
         ),
-        EngineResourceInfo(device=cpu, kv_dtype=dtype, dependencies={"kv": kv_spec}),
+        EngineResourceInfo(device=cpu, default_dtype=dtype, dependencies={"kv": kv_spec}),
     )
     return kv, attn
 

@@ -226,7 +226,7 @@ class MStarTalkerDriver:
                     device=self.device,
                     joint_comm_group=groups,
                     transfer_engine_info=transfer,
-                    kv_dtype=torch.bfloat16,
+                    default_dtype=torch.bfloat16,
                     dependencies={key: by_key[key] for key in spec.depends_on()},
                 ),
             )

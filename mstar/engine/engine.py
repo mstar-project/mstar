@@ -491,20 +491,25 @@ class Engine:
         parallel_groups: WorkerParallelGroups,
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
-        kv_cache_type=None,
         model: "Model | None" = None,
         node_dtypes: Mapping[str, torch.dtype | None] | None = None,
     ):
         """``node_dtypes`` is each node's resolved dtype, as the engine manager
-        cast it; a node missing from it resolves against the engine's dtype."""
+        cast it; a node missing from it resolves against the engine's dtype.
+        A resource's dtype is its spec's, else its local nodes' common one."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
-        if kv_cache_type is None:
-            kv_cache_type = self._autocast_dtype
 
         node_names = set(submodules.keys())
+        resolved_dtypes = {
+            name: (
+                node_dtypes[name] if node_dtypes is not None and name in node_dtypes
+                else resolve_node_dtype(submodule, self._autocast_dtype)
+            )
+            for name, submodule in submodules.items()
+        }
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
 
@@ -536,13 +541,16 @@ class Engine:
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )
+            local_dtypes = {node: resolved_dtypes[node] for node in relevant_nodes}
+            shared_dtype = set(local_dtypes.values())
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
                     device=device,
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
-                    kv_dtype=kv_cache_type,
+                    default_dtype=shared_dtype.pop() if len(shared_dtype) == 1 else None,
+                    node_dtypes=local_dtypes,
                     needs_remote_transfer=(
                         parallel_groups.resource_needs_remote_transfer(
                             spec.nodes, relevant_nodes
@@ -589,10 +597,7 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                node_dtype=(
-                    node_dtypes[node_name] if node_dtypes is not None and node_name in node_dtypes
-                    else resolve_node_dtype(submodule, self._autocast_dtype)
-                ),
+                node_dtype=resolved_dtypes[node_name],
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):

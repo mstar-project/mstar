@@ -91,7 +91,7 @@ def _manager(
     config: RingKVConfig | None = None, name: str = "kv", device: str = "cpu"
 ) -> RingKVManager:
     spec = KVSpec(resource_key=name, nodes={"dit"}, config=config or _ring_config())
-    info = EngineResourceInfo(device=torch.device(device), kv_dtype=torch.float32)
+    info = EngineResourceInfo(device=torch.device(device), default_dtype=torch.float32)
     return RingKVManager.build(spec, info)
 
 

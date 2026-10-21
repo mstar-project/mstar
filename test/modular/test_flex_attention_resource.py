@@ -117,7 +117,7 @@ def build_attention(backend: AttnBackend, kv_config) -> AttentionManager:
     )
     info = EngineResourceInfo(
         device=torch.device("cpu"),
-        kv_dtype=torch.float32,
+        default_dtype=torch.float32,
         dependencies={"kv": kv_spec},
     )
     return AttentionManager.build(attn_spec, info)

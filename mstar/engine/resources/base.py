@@ -59,7 +59,10 @@ class EngineResourceInfo:
     device: torch.device
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
-    kv_dtype: torch.dtype = torch.bfloat16
+    # the dtype the local nodes all resolved to; None if they have none or disagree
+    default_dtype: torch.dtype | None = None
+    # each local node's resolved dtype, to name them when there is no default
+    node_dtypes: "Mapping[str, torch.dtype | None]" = field(default_factory=dict)
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
     # the specs this one named in `depends_on`, by resource key
@@ -71,6 +74,25 @@ class EngineResourceInfo:
     max_rows_in_combined: "Mapping[str, int | None]" = field(
         default_factory=dict
     )
+
+    def resolve_dtype(self, declared: torch.dtype | None, resource_key: str) -> torch.dtype:
+        """A resource's storage dtype: its spec's, else its nodes' common dtype.
+
+        Never the engine-wide dtype, and never a silent fp32.
+        """
+        if declared is not None:
+            return declared
+        if self.default_dtype is not None:
+            return self.default_dtype
+        dtypes = {node: str(dtype) for node, dtype in sorted(self.node_dtypes.items())}
+        if len(set(self.node_dtypes.values())) > 1:
+            reason = f"its nodes run in different dtypes {dtypes}"
+        else:
+            reason = f"its nodes {dtypes} run without a dtype (autocast off)"
+        raise ValueError(
+            f"resource {resource_key!r} declares no dtype and {reason}; set "
+            "`dtype` on its config, or `resources.<key>.dtype` in YAML"
+        )
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)

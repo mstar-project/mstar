@@ -54,6 +54,12 @@ class AttentionManager(AttentionResource):
         # where the FA3 kernel is unusable, and the two do not agree bit for bit
         return fingerprint(type(self).__name__)
 
+    @staticmethod
+    def _planned_dtype(spec: AttentionSpec, info: EngineResourceInfo, kv_config) -> torch.dtype:
+        # planned against the pages, so the cache's dtype before the nodes'
+        declared = spec.config.dtype if spec.config.dtype is not None else kv_config.dtype
+        return info.resolve_dtype(declared, spec.resource_key)
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         # the KV resource's own config, not a copy; per-rank head counts, and
@@ -92,7 +98,7 @@ class AttentionManager(AttentionResource):
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
-                    dtype=info.kv_dtype,
+                    dtype=cls._planned_dtype(spec, info, kv_config),
                     kv_config=kv_config,
                 )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
@@ -104,7 +110,7 @@ class AttentionManager(AttentionResource):
             return FlashInferManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=cls._planned_dtype(spec, info, kv_config),
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
@@ -117,7 +123,7 @@ class AttentionManager(AttentionResource):
             return FlexAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=info.kv_dtype,
+                dtype=cls._planned_dtype(spec, info, kv_config),
                 kv_config=kv_config,
             )
 

@@ -98,7 +98,7 @@ class RingKVManager(AttentionResource):
             config=config,
             name=spec.resource_key,
             device=info.device,
-            dtype=info.kv_dtype,
+            dtype=info.resolve_dtype(config.dtype, spec.resource_key),
         )
 
     # ---- Model-facing API -------------------------------------------------

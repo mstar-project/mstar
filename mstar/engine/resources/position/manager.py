@@ -62,7 +62,7 @@ class PositionManager(Resource):
                 device=info.device,
                 max_seq_len=kv_spec.config.max_seq_len,
                 head_dim=kv_spec.config.head_dim,
-                dtype=info.kv_dtype,
+                dtype=info.resolve_dtype(spec.config.dtype, spec.resource_key),
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 

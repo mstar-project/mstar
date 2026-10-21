@@ -233,7 +233,7 @@ def _build_port(config, checkpoint: Path = CHECKPOINT, *, num_sessions: int = 1)
             ),
         ),
     )
-    info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE)
+    info = EngineResourceInfo(device=DEVICE, default_dtype=DTYPE)
     kv = RingKVManager.build(spec, info)
     attn = AttentionManager.build(
         AttentionSpec(
@@ -241,7 +241,7 @@ def _build_port(config, checkpoint: Path = CHECKPOINT, *, num_sessions: int = 1)
             nodes={"dit"},
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
         ),
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, dependencies={"kv": spec}),
+        EngineResourceInfo(device=DEVICE, default_dtype=DTYPE, dependencies={"kv": spec}),
     )
     _DitNode(dit).bind_node_resources({"kv": kv, "attn": attn})
     assert not dit._regions_compiled

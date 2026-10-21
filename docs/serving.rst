@@ -275,17 +275,24 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt
+                                # prefix_cache, prefix_cache_salt, dtype
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense)
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), dtype
      vit_attn:                  # a cacheless (ragged) attention resource
-       max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
+       max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend, dtype
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype. KV caches,
+attention, ragged attention and position resources accept it. Without it, a resource takes
+the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
+attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
+run without autocast, or in different dtypes, and that declares no dtype fails at load.
+The full resolution order is in :doc:`adding_models`.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
