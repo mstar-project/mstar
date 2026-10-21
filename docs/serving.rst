@@ -242,6 +242,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``mps``
+     - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
+       conductor starts in a private directory, so workers that share a GPU overlap their
+       kernels instead of time-slicing (the ASR ``*_split`` configs). NVIDIA only, and it
+       needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
+       shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
+       ``false``.
    * - ``pre_plan``
      - *(optional)* ``false`` plans each step's attention on the GPU thread instead of
        pre-planning the speculative batch on its own thread (default ``true``). A model

@@ -120,11 +120,21 @@ concurrent long files than the pool holds offload to the host pool and, once
 that is full too, wait on each other until they time out: serve many long files
 with a lower ``max_concurrent_requests`` or more pages.
 
-Both decode loops hand a window's tokens to the client in one message when
-the loop ends (``Loop.accumulated_outputs``) rather than one message per
-token. At concurrency 32 the per-token messages and their acknowledgements
-were a large share of the worker's host time. A streaming request therefore
-receives one delta per window, not one per token.
+Both decode loops stream their transcript token by token. A decode step
+keeps its rows' tokens on the device for the next step (the sampler's
+device loop-back), and the worker sends the batch's tokens to the client in
+one frame per step from the stop check's host copy, rather than one tensor
+message per request. A streaming request therefore receives one delta per
+token. Each chunk is one byte-level BPE token, which can end inside a UTF-8
+character; the server decodes the joined bytes.
+
+The ``*_split`` configs (``whisper_large_split.yaml``,
+``whisper_large_v3_turbo_split.yaml``, ``qwen3_asr_split.yaml``,
+``qwen3_asr_realtime_split.yaml``) put the encoder and the decoder in two
+worker processes on one GPU (``rank_devices``), so a decode step never queues
+behind an encoder batch on the same stream. They set ``mps: true``, so both
+workers run as clients of one CUDA MPS daemon and their kernels overlap rather
+than time-slice (see :doc:`serving`).
 
 Benchmarks and parity
 ---------------------
