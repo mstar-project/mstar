@@ -45,6 +45,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -856,16 +857,15 @@ class Engine:
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
-        declared = model.prefix_key_streams() if model is not None else {}
+        declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the keyed walk and the layout walks
-        # of every stream declared on a cache the node uses
+        # node -> the walks a probe may run on. Each keyed label names them in its
+        # keys, for every cache the node uses.
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    walk for stream in by_label.values()
-                    for walk in (stream.walk, *stream.layout_walks)
+                    walk for label in by_label.values() for walk in label.keys.walks
                 )
         # a cache another engine holds is taken as open when its config says so
         opened_keys = {
@@ -893,8 +893,8 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (stream.walk, stream.decode_walk, *stream.layout_walks)
-                for label, stream in declared.get(key, {}).items()
+                label: (*kv_label.keys.walks, *(walk for walk, _ in kv_label.growth if kv_label.keys.growth))
+                for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
                 continue
@@ -914,12 +914,12 @@ class Engine:
                     "prompt frees little",
                     key,
                 )
-        # the nodes of a layout walk that don't use the stream's cache, such as an image
+        # the nodes of a keyed walk that don't use the label's cache, such as an image
         # encoder. The KV computed from their output is cached under their input's digest.
         self._item_encoders: set[str] = set()
         for key in opened_keys:
-            for stream in declared[key].values():
-                for walk in stream.layout_walks:
+            for label in declared[key].values():
+                for walk in label.keys.walks:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 

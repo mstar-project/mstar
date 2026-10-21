@@ -245,8 +245,6 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
-    # label -> the layout its keys were chained over, one span per write
-    prefix_layout: dict[str, list[PrefixSpan]] | None = None
     prefix_cache: bool = True
     # label -> everything the request writes there
     kv_layout: dict[str, "StreamLayout"] | None = None
@@ -258,7 +256,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
-        prefix_layout: dict[str, list[list]] | None=None,
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
@@ -270,23 +267,22 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
-        if prefix_layout is not None:
-            # sent as plain lists, which keeps the request's kwargs on the wire's plain msgpack path
-            self.prefix_layout = {
-                label: [PrefixSpan(*row) for row in rows]
-                for label, rows in prefix_layout.items()
-            }
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
         if kv_layout is not None:
+            # a model lays out the labels a request may open on any deployment, and the
+            # request is held only to the ones it opens
+            opened = self.opened_labels()
             self.kv_layout = {
                 label: StreamLayout(
                     spans=tuple(PrefixSpan(*row) for row in spans),
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
+                    keyed_spans=keyed_spans,
                 )
-                for label, (spans, growth, scratch, retention) in kv_layout.items()
+                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                if label in opened
             }
             self.loop_caps = {
                 loop: loop_caps[loop]
@@ -301,6 +297,13 @@ class KVReqConfig(ResourceReqConfig):
         if self.needed_labels is not None:
             return self.needed_labels
         return ["main"]
+
+    def opened_labels(self) -> set[str]:
+        """Every label `get_labels` can give, on any node and walk."""
+        labels = set(self.needed_labels or ["main"])
+        for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
+            labels.update(named)
+        return labels
 
     def get_publish_labels(
         self,
@@ -382,16 +385,12 @@ class RetentionPolicy:
 
 @dataclass(frozen=True)
 class StreamLayout:
-    """Everything a request writes into one stream, known when its prompt is preprocessed.
-
-    ``spans`` are the committed writes, in walk order. Each ``(loop, slots)`` in
-    ``growth`` writes ``slots`` per iteration of ``loop``. ``scratch`` is the most one
-    non-committing step writes past the committed length.
-    """
+    """`LabelLayout` as the KV manager holds it. The stream's keys cover its first ``keyed_spans`` spans."""
     spans: tuple[PrefixSpan, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
     scratch: int = 0
     retention: RetentionPolicy | None = None
+    keyed_spans: int = 0
 
     def pages(self, caps: Mapping[str, int], page_size: int) -> int:
         """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.

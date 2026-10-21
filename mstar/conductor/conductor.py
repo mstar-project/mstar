@@ -597,16 +597,14 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
 
-        A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        A KV resource with declared labels gets a config even when the model
+        returned none, or its keys and layout would have nowhere to go.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        for key, streams in self.model.prefix_key_streams().items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
-        for key in model_kwargs.get("kv_layout") or {}:
-            configs.setdefault(key, KVReqConfig())
+        for key, labels in self.model.kv_labels().items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
 
     def _derive_worker_info(self):
@@ -1212,7 +1210,6 @@ class Conductor:
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
         kv_layout = kwargs.get("kv_layout") or {}
         for key, cfg in request_data.resource_configs.items():
@@ -1222,7 +1219,6 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
-                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,

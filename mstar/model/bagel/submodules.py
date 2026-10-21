@@ -125,6 +125,22 @@ def vit_patches(
     return (height // patch_size) * (width // patch_size)
 
 
+def vae_latents(
+    height: int, width: int, image_preprocess: str,
+    latent_downsample: int, max_latent_size: int,
+) -> int:
+    """How many latents the VAE encodes an image of this size into. Its ``prepare_inputs`` asserts the same count."""
+    if image_preprocess == "vllm":
+        # the size `vllm_vae_resize` resizes to
+        stride, max_size = latent_downsample, max_latent_size * latent_downsample
+        scale = max(min(max_size / max(width, height), 1.0), min(256, max_size) / min(width, height))
+        height = min(max(stride, round(height * scale / stride) * stride), max_size)
+        width = min(max(stride, round(width * scale / stride) * stride), max_size)
+    else:
+        height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+    return (height // latent_downsample) * (width // latent_downsample)
+
+
 class ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP2 ViT + connector + vit_pos_embed: pixel patches -> ViT features.
 
@@ -543,6 +559,10 @@ class VAEEncoderSubmodule(NodeSubmodule):
         _, img_h, img_w = image_tensor.shape
         h = (img_h // ds)
         w = (img_w // ds)
+        assert h * w == vae_latents(*img.shape[-2:], image_preprocess, ds, self.max_latent_size), (
+            f"the VAE encoded a {tuple(img.shape[-2:])} image into {h * w} latents, "
+            "not the count `vae_latents` gives a layout to size it by"
+        )
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
