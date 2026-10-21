@@ -136,10 +136,14 @@ class Pi05Actions(ArrayOutputFamily):
 
 
 class Cosmos3DroidActions(ArrayOutputFamily):
-    """Cosmos3 DROID policies, with the request fields of examples/cosmos3_action_ws_client.py."""
+    """Cosmos3 DROID policies, with the request fields of examples/cosmos3_action_ws_client.py.
+
+    8 action dims (7 joint positions and the gripper), as cosmos-framework's RoboLab server serves
+    the released DROID policies (action_policy_server_robolab.py, action_space joint_pos).
+    """
 
     name = "robotics-cosmos3-droid"
-    raw_action_dim, chunk = 10, 32
+    raw_action_dim, chunk = 8, 32
 
     def requests(self, sset: SampleSet) -> list[Request]:
         kw = {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": self.raw_action_dim,
