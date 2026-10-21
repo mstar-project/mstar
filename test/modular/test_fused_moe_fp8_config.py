@@ -290,7 +290,10 @@ def test_fused_experts_fp8_rejects_bad_scale_shapes_and_groups(fp8_fakes):
 
 def test_bf16_fused_experts_signature_unchanged():
     params = list(inspect.signature(runner.fused_experts).parameters)
+    # ``config``: a tuned launch config the MoE backend passes; None keeps get_default_config
     assert params == [
         "hidden_states", "w1", "w2", "topk_weights", "topk_ids", "activation", "reduce_results", "skip_invalid",
+        "config",
     ]
+    assert inspect.signature(runner.fused_experts).parameters["config"].default is None
     assert list(inspect.signature(get_default_config).parameters) == ["M", "E", "N", "K", "top_k"]
