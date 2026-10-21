@@ -32,8 +32,8 @@ The M* serving path is the walk graphs below: four async partitions
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws``; a
 one-shot upload is a stream of one chunk. ``get_node_resources`` declares
-the encoder's two recurrent-state pools (each call's layer state, and its audio /
-mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
+the encoder's bounded KV (each call's attention window) and two recurrent-state
+pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
 conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
 KV cache, attention and positions. Both decode steps are CUDA graphs, and so are
 the encoder's live step and the codec's steady-state decode (piecewise).
@@ -67,16 +67,22 @@ from mstar.engine.resources import (
     SamplingReqConfig,
     apply_yaml_overrides,
 )
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
-from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
+from mstar.model.nemotron_duplex.components.conformer import (
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+)
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     ENCODER_FRONT,
+    ENCODER_KV,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -410,14 +416,15 @@ class NemotronDuplexModel(Model):
     # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
     # positions; each session holds two streams (labels ``main`` / ``uncond``)
     # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. conformer_encoder: two recurrent-state pools, each
-    # call's layer state and its front end's audio / mel tails (one slot per
-    # session each). The codec declares nothing.
+    # passes at call time. conformer_encoder: a bounded KV, each call's
+    # attention window, and two recurrent-state pools, its conv tails and its
+    # front end's audio / mel tails (one slot per session each). The codec
+    # declares nothing.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front; pages in nano_kv and
-    # talker_kv). A deployment raising it raises all five (see
+    # Nemotron-H, and in encoder_state / encoder_front / encoder_kv; pages in
+    # nano_kv and talker_kv). A deployment raising it raises all six (see
     # validate_config_yaml). 32 is the most that keep up with real time on one
     # H100: a tick takes ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
     DEFAULT_SESSIONS = 32           # padding rows take no slot (#258)
@@ -471,8 +478,8 @@ class NemotronDuplexModel(Model):
         """Refuse a session cap that a per-session resource cannot hold.
 
         A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``) and its nano and talker pages from
-        its first step to its last, so a session past any of them waits on admit until
+        ``encoder_state``, ``encoder_front``), in ``encoder_kv``, and its nano and
+        talker pages from its first step to its last, so a session past any of them waits on admit until
         another ends, and its frames with it. So ``max_concurrent_requests``
         sessions must fit each; the conductor queues the rest.
         """
@@ -490,6 +497,8 @@ class NemotronDuplexModel(Model):
         for spec in specs:
             if isinstance(spec, RecurrentStateSpec):
                 held, knob = spec.config.usable_slots, "max_slots"
+            elif isinstance(spec, BoundedKVSpec):
+                held, knob = spec.config.max_slots, "max_slots"
             elif spec.resource_key in (TALKER_KV, NANO_KV):
                 kv = spec.config
                 pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
@@ -541,6 +550,11 @@ class NemotronDuplexModel(Model):
                     num_layers=1, blocks=front_state_blocks(self.config.stt),
                     max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
+            ),
+            # no sink slot: padding rows read and write nothing in it
+            BoundedKVSpec(
+                resource_key=ENCODER_KV, nodes={"conformer_encoder"},
+                config=encoder_kv_config(self.config.stt, max_slots=self.DEFAULT_SESSIONS),
             ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(

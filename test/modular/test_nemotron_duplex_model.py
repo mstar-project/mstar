@@ -23,11 +23,13 @@ from mstar.engine.resources import (
     SamplingReqConfig,
     resolve_spec_dependencies,
 )
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
 from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
     ENCODER_FRONT,
+    ENCODER_KV,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -73,25 +75,32 @@ def test_duplex_node_resources():
     planned on it (NoPE: no position resource), a recurrent pool holding the 27
     Mamba-2 layers' conv + SSM state with the Mamba-2 resource planned on it,
     and one text sampler; the talker a paged KV over its 28 layers with attention
-    and RoPE positions; the encoder two recurrent pools, each call's layer state
-    and its front end's audio / mel tails, a slot per session each. The codec
-    owns no engine resource."""
+    and RoPE positions; the encoder a bounded KV holding each call's attention
+    window, and two recurrent pools, its conv tails and its front end's audio /
+    mel tails, a slot per session each. The codec owns no engine resource."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {ENCODER_FRONT, ENCODER_STATE, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER,
-                           TALKER_KV, TALKER_ATTN, TALKER_POS}
+    assert set(by_key) == {ENCODER_FRONT, ENCODER_STATE, ENCODER_KV, NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA,
+                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
-    node = {ENCODER_STATE: {"conformer_encoder"}, ENCODER_FRONT: {"conformer_encoder"},
+    node = {**dict.fromkeys((ENCODER_STATE, ENCODER_FRONT, ENCODER_KV), {"conformer_encoder"}),
             **dict.fromkeys(nano_keys, {"nano_llm"})}
     assert all(spec.nodes == node.get(spec.resource_key, {"eartts_talker"}) for spec in specs)
 
     stt = model.config.stt
     enc = by_key[ENCODER_STATE]
     assert isinstance(enc, RecurrentStateSpec) and enc.config.num_layers == stt.num_layers
-    assert enc.config.blocks["k"].shape == (stt.num_heads, stt.att_context_size[0], stt.head_dim)
+    assert set(enc.config.blocks) == {"conv"}
     assert enc.config.blocks["conv"].shape == (stt.d_model, stt.conv_kernel_size - 1)
     assert enc.config.usable_slots == model.DEFAULT_SESSIONS
+    kv = by_key[ENCODER_KV]
+    assert isinstance(kv, BoundedKVSpec)
+    # the checkpoint's: 24 layers of 8 heads of 128, each frame over the 70 before it
+    dims = (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim, kv.config.query_window)
+    assert dims == (stt.num_layers, stt.num_heads, stt.head_dim, stt.att_context_size[0]) == (24, 8, 128, 70)
+    assert kv.config.window_capacity == 70 and kv.config.sink_capacity == 0
+    assert kv.config.max_slots == model.DEFAULT_SESSIONS and kv.config.dtype is None
 
     eartts = model.config.eartts
     tkv = by_key[TALKER_KV]
@@ -150,7 +159,7 @@ def test_duplex_shipped_configs_turn_websocket_deflate_off():
         assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
 
 
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, TALKER_KV, NANO_KV])
+@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, ENCODER_KV, TALKER_KV, NANO_KV])
 def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     """Every session holds a slot in each recurrent pool and its nano and talker
     pages from start to end; a session past any of them waits on admit until
@@ -158,7 +167,8 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     that misses one is refused at startup, naming it."""
     model = _make_model()
     resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
+                 ENCODER_FRONT: {"max_slots": 49}, ENCODER_KV: {"max_slots": 48},
+                 TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
                  NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
     model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
     del resources[key]
@@ -182,19 +192,23 @@ def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
 
 @pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16, None])
 def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dtype):
-    """The encoder stores each step's layer state for the next; in another
-    dtype than the layers compute it in, live frames drift from one-shot ones.
-    So the pool takes the dtype the engine resolved (``autocast_dtype: null``
-    computes in fp32), and no deployment dtype is refused for it."""
+    """The encoder stores each step's layer state and keys / values for the
+    next; in another dtype than the layers compute them in, live frames drift
+    from one-shot ones. So the pool and the KV take the dtype the engine
+    resolved (``autocast_dtype: null`` computes in fp32), and no deployment
+    dtype is refused for them."""
     from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
     from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
     model = _make_model()
     model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
-    (spec,) = [s for s in model.get_node_resources() if s.resource_key == ENCODER_STATE]
-    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype))
+    specs = {s.resource_key: s for s in model.get_node_resources()}
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype)
+    pool = RecurrentStatePool.build(specs[ENCODER_STATE], info)
     want = torch.float32 if autocast_dtype is None else autocast_dtype
-    assert {pool.block(name, 0).dtype for name in spec.config.blocks} == {want}
+    assert {pool.block(name, 0).dtype for name in specs[ENCODER_STATE].config.blocks} == {want}
+    assert BoundedKVManager.build(specs[ENCODER_KV], info).layer(0).dtype == want
 
 
 class _LoadReachedError(Exception):
@@ -236,6 +250,19 @@ def test_duplex_refuses_a_checkpoint_its_resources_were_not_sized_for(monkeypatc
     ckpt.stt.num_layers = 12
     _stub_checkpoint(monkeypatch, ckpt)
     with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
+        _make_model()._json_config("/nonexistent")
+
+
+def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):
+    """The encoder KV's declaration from the defaults equals the one from a
+    checkpoint of the same shape (its retention is a SinkWindow, equal by value), and
+    a checkpoint with another attention window is refused, naming it."""
+    _stub_checkpoint(monkeypatch)
+    _make_model()._json_config("/nonexistent")
+    ckpt = NemotronDuplexConfig()
+    ckpt.stt.att_context_size = (64, 0)
+    _stub_checkpoint(monkeypatch, ckpt)
+    with pytest.raises(ValueError, match=f"resources.{ENCODER_KV}"):
         _make_model()._json_config("/nonexistent")
 
 

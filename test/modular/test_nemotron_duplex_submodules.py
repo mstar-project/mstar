@@ -13,14 +13,21 @@ from torch import nn
 
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import StepContext
-from mstar.model.nemotron_duplex.components.conformer import encoder_state_blocks, front_state_blocks
+from mstar.model.nemotron_duplex.components.conformer import (
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+)
 from mstar.model.nemotron_duplex.config import (
     ENCODER_FRONT,
+    ENCODER_KV,
     ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
@@ -604,8 +611,9 @@ def _small_perception(**featurizer):
 
 
 class _Encoder:
-    """The encoder node with its state pool, driven as the engine drives an
-    eager step: declare, admit and plan the pool, preprocess, forward, commit."""
+    """The encoder node with its resources, driven as the engine drives an eager
+    step: declare, admit and plan them, preprocess, forward, commit. The bounded
+    KV runs its torch path on CPU, in fp32 (the engine's KV dtype here)."""
 
     def __init__(self, **featurizer):
         p = _small_perception(**featurizer)
@@ -617,7 +625,11 @@ class _Encoder:
 
         self.pool = pool(ENCODER_STATE, p.config.num_layers, encoder_state_blocks(p.config, torch.float32))
         self.front = pool(ENCODER_FRONT, 1, front_state_blocks(p.config))
-        self.resources = {ENCODER_STATE: self.pool, ENCODER_FRONT: self.front}
+        self.kv = BoundedKVManager.build(
+            BoundedKVSpec(ENCODER_KV, {"conformer_encoder"}, encoder_kv_config(p.config, max_slots=8)),
+            EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+        )
+        self.resources = {ENCODER_STATE: self.pool, ENCODER_FRONT: self.front, ENCODER_KV: self.kv}
         self.runner = StepRunner(self.resources)
         self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
 
@@ -648,8 +660,8 @@ class _Encoder:
 
     def _step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
-            self.pool.ingest_request(rid)
-            self.front.ingest_request(rid)
+            for resource in self.resources.values():
+                resource.ingest_request(rid)
         step = self.declare(rids, inputs)
         if step is not None:
             step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
@@ -784,11 +796,19 @@ def test_encoder_layer_region_runs_only_the_calls_with_a_frame():
 def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
     """Every read and write of a pool's state, eager or in a region, uses the
     plan the pool holds at that moment, never one held across another plan:
-    the eager path runs on this step's plan before a region plans its own. A
-    call with a chunk over a second runs in a step of its own."""
+    the eager path runs on this step's plan before a region plans its own. The
+    KV attends under a plan of exactly the rows it is given, padding included.
+    A call with a chunk over a second runs in a step of its own."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
-    for pool in enc.resources.values():
+    attend = enc.kv.attend
+
+    def attend_checked(layer_idx, q, *args, **kwargs):
+        assert len(enc.kv.current.rows) == q.shape[0], "the KV attended under a plan for other rows"
+        return attend(layer_idx, q, *args, **kwargs)
+
+    monkeypatch.setattr(enc.kv, "attend", attend_checked)
+    for pool in (enc.pool, enc.front):
         for name in ("gather", "scatter_"):
             def checked(block, rows, *args, _pool=pool, _op=getattr(pool, name), **kwargs):
                 plan = _pool.addressing("main").slot_indices
@@ -805,17 +825,26 @@ def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
+def _kv_spans(step) -> list[int]:
+    return [seg.span for seg in step.get(ENCODER_KV).segments]
+
+
 def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
     """When every call is one frame on and the whole-step region is captured
-    for the batch, the region's own step owns the pools: the node declares
+    for the batch, the region's own step owns the resources: the node declares
     nothing, so no second plan is built and thrown away. Otherwise it declares
-    every call in both pools."""
+    every call in each, and in the KV its new frames at its position, save a
+    call the region serves, which writes its frame there and here only reads."""
     enc = _Encoder()
     wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
     for at in (0, 1280):
         enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)])
     nxt = [enc.prepare(h, wavs[h][2560:3840]) for h in (1, 2)]
-    assert set(enc.declare([1, 2], nxt).keys()) == {ENCODER_FRONT, ENCODER_STATE}      # no region captured
+    step = enc.declare([1, 2], nxt)                                           # no region captured
+    assert set(step.keys()) == {ENCODER_FRONT, ENCODER_STATE, ENCODER_KV}
+    assert _kv_spans(step) == [1, 1]
+    frames = [enc.node.request_state(h).get(enc.node.STATE_KEY).frames for h in (1, 2)]
+    assert [step.get(ENCODER_KV).positions[h].written for h in (1, 2)] == frames
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION)
     assert enc.declare([1, 2], nxt) is None
     for at in range(2560, 1280 * 6, 1280):
@@ -823,7 +852,34 @@ def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
         assert all(len(out[h]["audio_frame"]) == 1 for h in (1, 2))
     assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls == 4
     mixed = [enc.prepare(1, torch.randn(640) * 0.1), enc.prepare(2, torch.randn(1280) * 0.1)]
-    assert set(enc.declare([1, 2], mixed).keys()) == {ENCODER_FRONT, ENCODER_STATE}
+    step = enc.declare([1, 2], mixed)
+    assert set(step.keys()) == {ENCODER_FRONT, ENCODER_STATE, ENCODER_KV}
+    assert _kv_spans(step) == [mixed[0].kwargs["n"], 0]
+
+
+def test_encoder_a_step_mixes_the_steady_region_with_eager_chunks_past_the_window():
+    """One step holds a call one frame on (the whole-step region), a call whose
+    chunk adds more frames than the attention window (the eager layers, a step
+    of T > 1 where each frame sees only the window before it) and a call under
+    a frame a step: each gets its offline frames."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
+    window = enc.node.perception.config.att_context_size[0]
+    wavs = {1: torch.randn(16000 * 3) * 0.1, 2: torch.randn(16000 * 3) * 0.1, 3: torch.randn(16000) * 0.1}
+    sizes = {1: 1280, 2: 16000, 3: 640}
+    assert 16000 // 1280 > window
+    widths, front = [], enc.node.streamer.front
+
+    def spy_front(*args):
+        enc_in = front(*args)
+        widths.append(0 if enc_in is None else enc_in.x.shape[1])
+        return enc_in
+
+    enc.node.streamer.front = spy_front
+    got = _stream(enc, wavs, sizes)
+    assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls > 0 and max(widths) > window
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
 @pytest.mark.parametrize("b_end_rides", [False, True])
@@ -1044,11 +1100,13 @@ def test_encoder_state_is_per_call_and_cleaned_up():
     enc.encode(1, torch.randn(4000) * 0.1)
     enc.encode(2, torch.randn(4000) * 0.1)
     assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 2
+    assert set(enc.kv._requests) == {1, 2}
     enc.node.cleanup_request(1)
-    for pool in enc.resources.values():
-        pool.remove_request(1)
+    for resource in enc.resources.values():
+        resource.remove_request(1)
     assert 1 not in enc.node.request_states and 2 in enc.node.request_states
     assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 1
+    assert set(enc.kv._requests) == {2}
 
 
 # -- no cuFFT in a captured region ---------------------------------------------
