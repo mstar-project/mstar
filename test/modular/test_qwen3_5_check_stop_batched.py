@@ -7,7 +7,7 @@ import torch
 
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 
 EOS = 7
 
@@ -55,20 +55,32 @@ def test_batched_agrees_with_per_request(shape):
     assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
 
 
-def test_only_a_decode_rows_token_can_stop():
-    """A prefill row is not in decode_loop yet, so neither stop path checks it."""
-    tokens = torch.tensor([EOS, EOS, EOS])
+@pytest.mark.parametrize("step_walk", [None, "prefill_text"])
+def test_a_last_prefill_stop_token_ends_the_request(step_walk):
+    """A prefill row is not in decode_loop yet: the last prefill's stop token
+    ends the request instead, and an earlier prefill's token is not the
+    request's. A mixed step (None) and a prefill step agree."""
+    tokens = torch.tensor([EOS, EOS, 3, EOS, EOS])
     infos = {
         "early": _info(walk="prefill_text"),                   # not the last prefill
         "last": _info(walk="prefill_text", last_prefill=True),
+        "last_word": _info(walk="prefill_text", last_prefill=True),
+        "last_ignored": _info(walk="prefill_text", last_prefill=True, ignore_eos=True),
         "dec": _info(),
     }
+    if step_walk is not None:
+        del infos["dec"]
+    rows = tuple(infos)
     got = LLMSubmodule.check_stop_batched(
-        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}),
+        _sub(), list(infos), infos, HostRows(rows, {"new_token": tokens[:len(rows)]}),
+        step_walk=step_walk,
     )
-    assert got == {"dec": {"decode_loop"}}
-    for rid, info in infos.items():
-        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+    expected = {"last": {END_PARTITION}}
+    if step_walk is None:
+        expected["dec"] = {"decode_loop"}
+    assert got == expected
+    for i, (rid, info) in enumerate(infos.items()):
+        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[i:i + 1]]})
         assert per_request == got.get(rid, set())
 
 

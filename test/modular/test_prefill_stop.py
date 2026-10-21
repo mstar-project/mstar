@@ -7,8 +7,9 @@ prefill's worker-graphs-done, and the conductor ends the partition rather
 than start the decode walk the model chose. Without that, decode ran on past
 the stop token.
 
-Covers the worker (``Worker._postprocess_batch`` with stub routing) and the
-conductor (any report of the pass carries the flag).
+Covers the worker (``Worker._postprocess_batch`` with stub routing), the
+conductor (any report of the pass carries the flag), and Whisper's and
+Qwen3-ASR's batched stop check on a prefill step, through the engine.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.model.base import ForwardPassArgs  # noqa: E402
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows  # noqa: E402
 from mstar.utils.ipc_format import WorkerGraphsDone  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
@@ -235,3 +236,62 @@ def test_a_pass_without_the_flag_starts_decode():
     assert c._process_worker_graphs_done(_report(0)) == ["default"]
     assert c._process_done_forward("r", "default") is False
     assert sent == ["decode"] and not pstate.is_done
+
+
+# --------------------------------------------------------------------------
+# engine: a prefill step's batched stop check (``step_walk`` is the prefill)
+# --------------------------------------------------------------------------
+
+
+def _engine_check(sub, infos, tokens):
+    """``Engine.check_stop_for_batch`` over a prefill step; the per-request
+    path raises, so only the batched path can answer."""
+    def _no_fallback(*a):
+        raise AssertionError("fell back to the per-request stop check")
+
+    sub.check_stop = _no_fallback
+    engine = SimpleNamespace(_submodules={NODE: SimpleNamespace(submodule=sub)})
+    rids = list(infos)
+    failures = {}
+    batch = SimpleNamespace(
+        node_name=NODE, request_ids=rids, per_request_info_wrapped=infos,
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(graph_walk=next(iter(infos.values())).graph_walk, request_walks=None),
+    )
+    per_rid = {rid: {"new_token": [tokens[i:i + 1]]} for i, rid in enumerate(rids)}
+    stops = Engine.check_stop_for_batch(
+        engine, batch, per_rid, host_rows=HostRows(tuple(rids), {"new_token": tokens}),
+    )
+    assert not failures
+    return stops
+
+
+def _info(walk, ignore_eos=False):
+    return SimpleNamespace(
+        graph_walk=walk, max_tokens=100, rid_handle=0, dynamic_loop_iter_counts={},
+        resource_configs={"sampler": SimpleNamespace(ignore_eos=ignore_eos)},
+    )
+
+
+def test_whisper_batched_stop_check_runs_and_ends_a_first_token_eos():
+    from mstar.model.whisper.config import DETECT_LANGUAGE_WALK, PREFILL_WALK
+    from mstar.model.whisper.submodules import WhisperDecoderSubmodule
+
+    sub = WhisperDecoderSubmodule.__new__(WhisperDecoderSubmodule)
+    sub.config = SimpleNamespace(eos_token_id=50257, max_target_positions=448)
+    infos = {"eos": _info(PREFILL_WALK), "word": _info(PREFILL_WALK)}
+    stops = _engine_check(sub, infos, torch.tensor([50257, 1234]))
+    assert stops == {"eos": {END_PARTITION}}
+    # a step of a walk that never stops returns before reading its rows
+    assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {}), step_walk=DETECT_LANGUAGE_WALK) == {}
+
+
+def test_qwen3_asr_batched_stop_check_runs_and_ends_a_first_token_stop():
+    from mstar.model.qwen3_asr.config import PREFILL_WALK
+    from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule
+
+    sub = Qwen3ASRLLMSubmodule.__new__(Qwen3ASRLLMSubmodule)
+    sub.config = SimpleNamespace(stop_token_ids={9, 10})
+    infos = {"stop": _info(PREFILL_WALK), "word": _info(PREFILL_WALK), "ignored": _info(PREFILL_WALK, True)}
+    stops = _engine_check(sub, infos, torch.tensor([10, 3, 9]))
+    assert stops == {"stop": {END_PARTITION}}

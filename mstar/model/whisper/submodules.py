@@ -29,6 +29,7 @@ from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -78,6 +79,8 @@ ENCODER_WALKS = (PREFILL_WALK, DETECT_LANGUAGE_WALK)
 # Walks whose sampled token is the first transcript token, subject to the
 # begin-suppression rules.
 FIRST_TOKEN_WALKS = (PREFILL_WALK, PREFILL_PROMPT_WALK)
+# Walks whose sampled token can stop the request.
+STOPPING_WALKS = (*FIRST_TOKEN_WALKS, DECODE_WALK)
 
 
 # ===================================================================
@@ -798,10 +801,15 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if not tokens or request_info.graph_walk == DETECT_LANGUAGE_WALK:
             return set()
         token = tokens[0].item()
+        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        if request_info.graph_walk in FIRST_TOKEN_WALKS:
+            # The first transcript token, before decode_loop exists: EOS here
+            # ends the request (the released checkpoints begin-suppress it).
+            stop = not ignore_eos and token == self.config.eos_token_id
+            return {END_PARTITION} if stop else set()
         if request_info.graph_walk != DECODE_WALK:
             return set()
         self._record(request_info, token)
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         # prompt + first token + decoded tokens must fit the position table
         prompt_len = self.request_state(request_info.rid_handle).get("prompt_len", 0)
@@ -833,8 +841,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            return {}  # as check_stop: only a decode row's token is checked
+        if step_walk is not None and step_walk not in STOPPING_WALKS:
+            return {}  # as check_stop: language detection and align never stop
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
@@ -844,7 +852,13 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         for rid, token in pairs:
             info = request_infos[rid]
             if info.graph_walk != DECODE_WALK:
-                continue  # prefill and language detection never stop the loop
+                # as check_stop: only a first-token EOS ends the request early
+                if (
+                    token == eos and info.graph_walk in FIRST_TOKEN_WALKS
+                    and not info.resource_configs[SAMPLER].ignore_eos
+                ):
+                    stops[rid] = {END_PARTITION}
+                continue
             self._record(info, token)
             decoded_tokens = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
             prompt_len = self.request_state(info.rid_handle).get("prompt_len", 0)

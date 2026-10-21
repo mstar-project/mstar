@@ -66,6 +66,7 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -635,8 +636,17 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        # only a decode row's stop can end decode_loop; a prefill is not in it yet
-        if request_info.graph_walk != "decode" or "new_token" not in outputs:
+        if "new_token" not in outputs:
+            return set()
+        if request_info.graph_walk != "decode":
+            # The last prefill samples the request's first token, before
+            # decode_loop exists: a stop token there ends the request instead.
+            if not request_info.step_metadata.get("last_prefill", False):
+                return set()
+            token = outputs["new_token"][0].item()
+            ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+            if not ignore_eos and token in self.config.stop_token_ids:
+                return {END_PARTITION}
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
@@ -665,18 +675,22 @@ class LLMSubmodule(ARNodeSubmodule):
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != "decode":
-            return {}  # as check_stop: only a decode row's stop ends decode_loop
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
         stop_ids = self.config.stop_token_ids
         stops: dict[str, set[str]] = {}
-        mixed = step_walk is None
         for rid, value in pairs:
             info = request_infos[rid]
-            # a mixed step reads each row's walk; a decode step need not
-            if mixed and info.graph_walk != "decode":
+            # a prefill or mixed step reads each row's walk; a decode step need not
+            if step_walk != "decode" and info.graph_walk != "decode":
+                # as check_stop: only the last prefill's token can end the request
+                if (
+                    value in stop_ids
+                    and info.step_metadata.get("last_prefill", False)
+                    and not info.resource_configs[SAMPLER].ignore_eos
+                ):
+                    stops[rid] = {END_PARTITION}
                 continue
             # the set test first: a stop id is rare, the config read behind it
             # goes through the wrapper

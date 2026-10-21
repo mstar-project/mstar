@@ -33,7 +33,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -329,7 +329,13 @@ def test_llm_check_stop():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
+    # the prefill's token is the first: a stop token ends the request before decode
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), eot) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), word) == set()
+    _Cfg.ignore_eos = True
     assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == set()
+    _Cfg.ignore_eos = False
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -346,15 +352,19 @@ def test_llm_check_stop_batched_agrees_with_per_request():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     # rows in forward order, plus a padding row a replay leaves at the end
-    tokens = torch.tensor([IM_END, 1234, EOT, IM_END, 1234, IM_END, 0])
-    row_rids = ("im_end", "word", "eot", "ignored", "budget", "prefill")
+    tokens = torch.tensor([IM_END, 1234, EOT, IM_END, 1234, IM_END, 1234, IM_END, 0])
+    row_rids = (
+        "im_end", "word", "eot", "ignored", "budget", "prefill", "prefill_word", "prefill_ignored",
+    )
     infos = {
         "im_end": info(DECODE_WALK, 0),
         "word": info(DECODE_WALK, 0),
         "eot": info(DECODE_WALK, 0),
         "ignored": info(DECODE_WALK, 0, ignore_eos=True),
         "budget": info(DECODE_WALK, 9, max_tokens=10),
-        "prefill": info(PREFILL_WALK, 0),
+        "prefill": info(PREFILL_WALK, 0),  # a first-token stop ends the request
+        "prefill_word": info(PREFILL_WALK, 0),
+        "prefill_ignored": info(PREFILL_WALK, 0, ignore_eos=True),
     }
     check = list(reversed(row_rids))  # not forward order
     batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
@@ -365,6 +375,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
             per_request[rid] = got
     assert batched == per_request == {
         "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
+        "prefill": {END_PARTITION},
     }
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
@@ -406,8 +417,6 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
         engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
     )
     assert stops == {"end": {"decode_loop"}} and not failures
-    # a step of another walk stops nothing, without reading its rows
-    assert sub.check_stop_batched(["end"], infos, HostRows(("end",), {}), step_walk=PREFILL_WALK) == {}
 
 
 # --------------------------------------------------------------------------

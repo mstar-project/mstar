@@ -48,6 +48,7 @@ from mstar.model.qwen3_asr.config import (
     Qwen3ASRModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -498,10 +499,15 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
         tokens = outputs.get("text_inputs") or outputs.get("new_token")
-        if request_info.graph_walk != DECODE_WALK or not tokens:
+        if not tokens:
             return set()
         token = tokens[0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        if request_info.graph_walk != DECODE_WALK:
+            # the prefill's token is the first: a stop token ends the request
+            # before decode_loop exists
+            stop = not ignore_eos and token in self.config.stop_token_ids
+            return {END_PARTITION} if stop else set()
         decoded = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         if (not ignore_eos and token in self.config.stop_token_ids) or decoded >= request_info.max_tokens:
             return {DECODE_LOOP}
@@ -515,8 +521,6 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            return {}  # as check_stop: only a decode row's token is checked
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
@@ -525,6 +529,8 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         for rid, token in pairs:
             info = request_infos[rid]
             if info.graph_walk != DECODE_WALK:
+                if token in stop_ids and not info.resource_configs[SAMPLER].ignore_eos:
+                    stops[rid] = {END_PARTITION}  # as check_stop
                 continue
             if (
                 token in stop_ids and not info.resource_configs[SAMPLER].ignore_eos

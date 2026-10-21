@@ -25,7 +25,13 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs  # noqa: E402
+from mstar.model.submodule_base import (  # noqa: E402
+    END_PARTITION,
+    ARNodeInputs,
+    HostRows,
+    ModelInputsFromEngine,
+    NodeInputs,
+)
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
@@ -568,7 +574,11 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
     sub.request_state(9).add("prompt_len", 4)
     eos = {"new_token": [torch.tensor([EOT])]}
     word = {"new_token": [torch.tensor([1234])]}
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
+    # the first transcript token: EOS ends the request before decode_loop exists
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_PROMPT_WALK, 0), eos) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), word) == set()
+    assert sub.check_stop("r", info(DETECT_LANGUAGE_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
@@ -588,20 +598,22 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
 
-    for handle in range(6):
+    for handle in range(8):
         sub.request_state(handle).add("prompt_len", 4)
     # rows in forward order, plus two padding rows a replay leaves at the end
-    tokens = torch.tensor([EOT, 1234, EOT, 1234, 1234, EOT, 0, 0])
-    row_rids = ("eos", "word", "ignored", "budget", "table", "prefill")
+    tokens = torch.tensor([EOT, 1234, EOT, 1234, 1234, EOT, 1234, EOT, 0, 0])
+    row_rids = ("eos", "word", "ignored", "budget", "table", "prefill", "prefill_word", "prompt")
     infos = {
         "eos": info(DECODE_WALK, 0, 0),                       # stops
         "word": info(DECODE_WALK, 0, 1),                      # keeps going
         "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
         "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
         "table": info(DECODE_WALK, 442, 4),                   # position table full
-        "prefill": info(PREFILL_WALK, 0, 5),                  # never stops the loop
+        "prefill": info(PREFILL_WALK, 0, 5),                  # first-token EOS: ends the request
+        "prefill_word": info(PREFILL_WALK, 0, 6),             # keeps going
+        "prompt": info(PREFILL_PROMPT_WALK, 0, 7),            # first-token EOS: ends the request
     }
-    check = ["prefill", "table", "budget", "ignored", "word", "eos"]  # not forward order
+    check = ["prompt", "prefill_word", "prefill", "table", "budget", "ignored", "word", "eos"]
     batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
     per_request = {}
     for i, rid in enumerate(row_rids):
@@ -610,6 +622,7 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
             per_request[rid] = got
     assert batched == per_request == {
         "eos": {"decode_loop"}, "budget": {"decode_loop"}, "table": {"decode_loop"},
+        "prefill": {END_PARTITION}, "prompt": {END_PARTITION},
     }
     # no token buffer: the engine falls back to the per-request path
     assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
