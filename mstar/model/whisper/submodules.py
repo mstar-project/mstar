@@ -804,7 +804,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if request_info.graph_walk in FIRST_TOKEN_WALKS:
             # The first transcript token, before decode_loop exists: EOS here
-            # ends the request (the released checkpoints begin-suppress it).
+            # ends the request. A guard for no-timestamp requests on a
+            # checkpoint without begin-suppression: the released checkpoints
+            # suppress EOS here, and TimestampRules forces a timestamp first
+            # whenever timestamps are on (long-form windows, segment/word).
             stop = not ignore_eos and token == self.config.eos_token_id
             return {END_PARTITION} if stop else set()
         if request_info.graph_walk != DECODE_WALK:
