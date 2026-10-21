@@ -351,10 +351,12 @@ A model that declares a stream is checked at load time. Loading fails in three c
   '<resource key>'/'<label>' on ['<walk>'], which it never runs; its walks are [...]``.
 
 Some requests stay uncached even when the model declares a stream. The engine checks each
-request's inputs on the keyed walk and cuts a prefix only from inputs that the default
-``split_inputs`` can slice. A request whose inputs carry ``tensor_inputs``, ``kwargs`` or
+request's inputs on the keyed walk and cuts a prefix only from inputs that
+``split_inputs`` can slice. A request whose inputs carry ``kwargs`` or
 ``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
-there. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
+there. The default ``split_inputs`` slices only the sequence, so a request whose inputs
+carry ``tensor_inputs`` is probed only when the submodule overrides it to cut those
+tensors. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
 keyed over its leading text only. A stream under a sliding window files pages only up to
 its protected prefix, which the window never releases.
 

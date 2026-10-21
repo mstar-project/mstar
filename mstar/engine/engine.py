@@ -48,6 +48,7 @@ from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    ARNodeSubmodule,
     BatchedModelOutput,
     HostRows,
     InputMetadata,
@@ -1106,7 +1107,9 @@ class Engine:
 
         Only the walks a keyed stream names are probed, and only when
         `split_inputs` can cut their inputs; a guided walk writes two labels
-        from one input, so it is skipped. A skipped walk is still passed to
+        from one input, so it is skipped. The base `split_inputs` cuts only the
+        sequence, so a walk carrying ``tensor_inputs`` is probed only when the
+        submodule overrides it. A skipped walk is still passed to
         `apply_cached_prefix` with no prefix, because it writes over whatever
         the resources hold for it.
         """
@@ -1117,7 +1120,10 @@ class Engine:
             f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
             "for prefix reuse, but that walk's inputs are not a sequence to cut"
         )
-        if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+        submodule = self._submodules[batch.node_name].submodule
+        if inputs.kwargs or inputs.resource_step_info or (
+            inputs.tensor_inputs and type(submodule).split_inputs is ARNodeSubmodule.split_inputs
+        ):
             self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs
         prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
@@ -1130,7 +1136,7 @@ class Engine:
         if matched >= inputs.input_seq_len:
             batch.cached_rids.add(rid)
             return None
-        return self._submodules[batch.node_name].submodule.split_inputs(
+        return submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
         )
