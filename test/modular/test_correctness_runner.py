@@ -689,6 +689,183 @@ def test_ltx2_5_scores_against_its_reference(tmp_path):
     assert "PSNR vs reference" not in by and sc.verdict == "PASS", sc.checks
 
 
+def _analysis_run(tmp_path, config: str, model: str, family: str, set_name: str, items: list, opts=None) -> Path:
+    """A run dir with report.json and config.yaml, and a toy set under tmp_path/data."""
+    root = tmp_path / "data" / "sets" / set_name
+    root.mkdir(parents=True, exist_ok=True)
+    sets._write_manifest(root, set_name, {}, items)
+    run = tmp_path / "runs" / config
+    for k in ("r1", "r2"):
+        (run / k / "outputs").mkdir(parents=True, exist_ok=True)
+    report = {"config": config, "model": model, "family": family, "run_id": "toy", "verdict": "PASS",
+              "runs": {"r1": {}, "r2": {}}, "family_opts": opts or {}}
+    (run / "report.json").write_text(json.dumps(report))
+    (run / "config.yaml").write_text(yaml.safe_dump({"model": model}))
+    return run
+
+
+def _arm(tmp_path, rid: str, set_name: str) -> Path:
+    d = tmp_path / "data" / "references" / rid / set_name
+    (d / "outputs").mkdir(parents=True)
+    (d / "meta.json").write_text("{}")
+    return d / "outputs"
+
+
+def _run_analysis(tmp_path, run: Path, *extra: str) -> dict:
+    from benchmark.correctness import analysis
+
+    assert analysis.main([str(run), "--data-root", str(tmp_path / "data"), "--no-asr", "--no-optional",
+                          "--workers", "1", *extra]) == 0
+    out = run / "analysis"
+    assert (out / "analysis.md").is_file() and (out / "items.md").is_file()
+    return json.loads((out / "metrics.json").read_text())
+
+
+def test_analysis_images(tmp_path):
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    items = [sets.Item(id=f"{i:02d}", prompt=f"prompt {i}", params={"seed": i, "height": 32, "width": 48})
+             for i in range(2)]
+    run = _analysis_run(tmp_path, "flux2_klein", "flux2_klein", "image", "image_v1", items)
+    rid = "diffusers-black-forest-labs--FLUX.2-klein-4B-s4"
+    outs = {arm: _arm(tmp_path, rid + suffix, "image_v1") for arm, suffix in
+            (("ref", ""), ("math", "-sdpa-math"), ("seed", "-seed1000"))}
+    rng = np.random.default_rng(0)
+    for it in items:
+        ref = rng.integers(0, 256, (32, 48, 3), dtype=np.uint8)
+        near = np.clip(ref.astype(int) + rng.integers(-4, 5, ref.shape), 0, 255).astype(np.uint8)
+        other = rng.integers(0, 256, ref.shape, dtype=np.uint8)
+        served = ref if it.id == "00" else np.clip(ref.astype(int) + rng.integers(-8, 9, ref.shape), 0, 255).astype(
+            np.uint8)
+        for img, path in ((ref, outs["ref"]), (near, outs["math"]), (other, outs["seed"]),
+                          (served, run / "r1" / "outputs"), (served, run / "r2" / "outputs")):
+            Image.fromarray(img).save(path / f"{it.id}.png")
+    m = _run_analysis(tmp_path, run)
+    assert m["kind"] == "image" and set(m["arms"]) == {"math", "seed"}
+    r0, r1 = m["rows"]
+    assert r0["psnr_r1_ref"] == float("inf") and r0["r1_r2_identical"] is True
+    assert r0["norm_dist_rmse"] < 0 < r1["norm_dist_rmse"] < 0.1  # as close as the math arm, far from another seed
+    bars = {b["measure"]: b for b in m["bars"]}
+    assert bars["PSNR served vs reference, median (dB)"]["ok"] is True
+    assert m["skipped"] == {"LPIPS, CLIP score": "--no-optional"}
+    assert (run / "analysis" / "sheets" / "sheet_00.png").is_file()
+
+
+def test_analysis_video_and_audio_video(tmp_path):
+    pytest.importorskip("av")
+    pytest.importorskip("PIL")
+    from benchmark.correctness.families import video
+    from benchmark.correctness.families.av import write_pcm_wav
+
+    item = sets.Item(id="00", prompt="a cat", params={"seed": 0})
+    rng = np.random.default_rng(1)
+    frames = rng.integers(0, 256, (9, 32, 48, 3), dtype=np.uint8)
+    moved = np.clip(frames.astype(int) + rng.integers(-30, 31, frames.shape), 0, 255).astype(np.uint8)
+
+    run = _analysis_run(tmp_path, "cosmos3_nano", "cosmos3", "video", "video_v1", [item])
+    rid = "diffusers-nvidia--Cosmos3-Nano-480x832x17-s35"
+    np.save(_arm(tmp_path, rid, "video_v1") / "00.npy", frames)
+    np.save(_arm(tmp_path, rid + "-sdpa-math", "video_v1") / "00.npy", moved)
+    for k in ("r1", "r2"):
+        (run / k / "outputs" / "00.mp4").write_bytes(video.server_mp4(frames, video.SERVER_X264["cosmos3"], 24))
+    m = _run_analysis(tmp_path, run)
+    row = m["rows"][0]
+    assert row["psnr_r1_ref_median"] == 99.0 and row["band_frames_below"] == 0 and row["r1_r2_identical"] is True
+    assert row["motion_ratio"] == 1.0 and row["frame_count_match"] is True
+    out = run / "analysis"
+    for name in ("strips/00.png", "curves/00.png", "curves/summary.png", "sbs/00.mp4", "sheets/frames.png"):
+        assert (out / name).is_file(), name
+
+    geo = {"height": "32", "width": "48", "num_frames": "9", "fps": "9"}
+    run = _analysis_run(tmp_path, "ltx2_5", "ltx2_5", "audio-video", "video_v1", [item], geo)
+    fam = family_for_config("ltx2_5", "ltx2_5", {}, geo)
+    sr = 8000
+    pcm = _tone_pcm(1.0, sr, 220)
+    for rid, f, audio in ((fam.reference_id(), frames, pcm), (fam.reference_id() + "-sdpa-math", moved,
+                                                                _tone_pcm(1.0, sr, 330))):
+        d = _arm(tmp_path, rid, "video_v1")
+        np.save(d / "00.npy", f)
+        write_pcm_wav(d / "00.wav", audio, sr, 2)
+    for k in ("r1", "r2"):
+        (run / k / "outputs" / "00.mp4").write_bytes(video.server_mp4(frames, video.SERVER_X264["ltx2_5"], 9))
+        write_pcm_wav(run / k / "outputs" / "00.wav", pcm, sr, 2)
+    m = _run_analysis(tmp_path, run)
+    row = m["rows"][0]
+    assert m["kind"] == "av" and row["psnr_r1_ref_median"] == 99.0
+    assert row["audio_log_mel_db"] == 0.0 < row["math_audio_log_mel_db"] and row["r1_r2_pcm_identical"] is True
+    assert row["r1_audio"]["channels"] == 2 and row["r1_audio"]["clip_frac"] == 0
+    assert m["skipped"]["transcripts"] == "--no-asr"
+    assert (run / "analysis" / "spectrograms" / "00.png").is_file()
+
+
+def test_analysis_speech(tmp_path):
+    from benchmark.correctness.families import asr_judge
+
+    items = [sets.Item(id=f"{i:03d}", prompt=f"sentence number {i}") for i in range(2)]
+    run = _analysis_run(tmp_path, "kokoro", "kokoro", "tts", "tts_seedtts_v1", items)
+    ref = _arm(tmp_path, "kokoro-pkg-0.9.4-af_heart", "tts_seedtts_v1")
+    sr = 24000
+    tone = np.concatenate([np.zeros(sr // 5), 0.3 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)]).astype(np.float32)
+    for it in items:
+        for d in (ref, run / "r1" / "outputs", run / "r2" / "outputs"):
+            M.write_wav(d / f"{it.id}.wav", tone, sr)
+    judge = {"judge": asr_judge.JUDGE_MODEL, "texts": ["sentence number 0", "a different sentence"]}
+    (run / "scoring").mkdir()
+    (run / "scoring" / "judge_r1.json").write_text(json.dumps(judge))
+    (ref.parent / f"judge_{asr_judge.JUDGE_MODEL.split('/')[-1]}.json").write_text(
+        json.dumps({**judge, "texts": ["sentence number 0", "sentence number 1"]}))
+    m = _run_analysis(tmp_path, run)
+    rows = {r["id"]: r for r in m["rows"]}
+    assert rows["000"]["wer_r1"] == 0 and rows["001"]["wer_r1"] > 0 and rows["001"]["wer_ref"] == 0
+    assert rows["000"]["dur_ratio"] == 1.0 and rows["000"]["r1_r2_identical"] is True
+    assert abs(rows["000"]["lead_s_r1"] - 0.2) < 0.03
+    assert "transcripts of r2" in m["skipped"]  # no runner transcript for r2 and --no-asr
+    assert (run / "analysis" / "spectrograms" / "000.png").is_file()
+
+
+def test_analysis_actions_and_latents(tmp_path):
+    pytest.importorskip("PIL")
+    items = [sets.Item(id=f"ep{i:02d}", prompt="pick up the block", params={"seed": i, "step": 0}) for i in range(2)]
+    run = _analysis_run(tmp_path, "pi05", "pi05", "robotics-pi05", "droid_v1", items)
+    rng = np.random.default_rng(2)
+    fp32 = _arm(tmp_path, "lerobot-pi05-base-h15-fp32", "droid_v1")
+    bf16 = _arm(tmp_path, "lerobot-pi05-base-h15-bf16", "droid_v1")
+    for it in items:
+        ref = rng.uniform(-0.5, 0.5, (15, 32)).astype(np.float32)
+        ref[:, 7] = np.where(np.arange(15) < 8, -0.5, 0.5)  # the gripper closes at step 8
+        np.save(fp32 / f"{it.id}.npy", ref)
+        np.save(bf16 / f"{it.id}.npy", ref + 0.01)
+        for k in ("r1", "r2"):
+            np.save(run / k / "outputs" / f"{it.id}.npy", ref + 0.02)
+    m = _run_analysis(tmp_path, run)
+    row = m["rows"][0]
+    assert m["kind"] == "actions" and m["arms"] == {"bf16": "lerobot-pi05-base-h15-bf16"}
+    assert abs(row["maxabs_ref"] - 0.02) < 1e-4 and abs(row["ref_spread_maxabs"] - 0.01) < 1e-4
+    assert row["gripper_r1"] == row["gripper_ref"] == [8]
+    assert {b["measure"]: b["ok"] for b in m["bars"]}["max-abs vs reference, worst episode"] is True
+    assert (run / "analysis" / "plots" / "ep00.png").is_file()
+
+    run = _analysis_run(tmp_path, "vjepa2_ac", "vjepa2_ac", "robotics-vjepa2-ac", "droid_v1", items)
+    fp32 = _arm(tmp_path, "vjepa2-ac-upstream-fp32", "droid_v1")
+    bf16 = _arm(tmp_path, "vjepa2-ac-upstream-bf16", "droid_v1")
+    for it in items:
+        ref = rng.normal(size=(4, 8, 16))
+        np.save(fp32 / f"{it.id}.npy", ref)
+        np.save(bf16 / f"{it.id}.npy", ref + rng.normal(scale=0.01, size=ref.shape))
+        out = ref + rng.normal(scale=0.01, size=ref.shape)
+        if it.id == "ep01":
+            out[2] = out[1]  # a repeated rollout step
+        for k in ("r1", "r2"):
+            np.save(run / k / "outputs" / f"{it.id}.npy", out)
+    m = _run_analysis(tmp_path, run)
+    assert m["kind"] == "latents" and m["rows"][0]["cos_ref"] > 0.99
+    bars = {b["measure"]: b for b in m["bars"]}
+    assert bars["responses with a rollout step equal to the step before"]["served"] == 1
+    assert any(f.startswith("ep01: ") for f in m["flags"])
+    assert (run / "analysis" / "plots" / "latents.png").is_file()
+
+
 def test_gpu_check_uses_hip_indices(monkeypatch, capsys):
     import subprocess
 
