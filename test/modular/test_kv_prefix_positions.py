@@ -34,6 +34,7 @@ from mstar.engine.resources.position.config import PositionSpec, PositionStep, P
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.worker.engine_manager import (
     _refuse_uncacheable_positions,
@@ -318,7 +319,8 @@ class _Walking:
         ))}}
 
     def get_graph_walk_graphs(self):
-        return {walk: None for walk in self._runs}
+        llm = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
+        return {walk: Loop(name="decode_loop", max_iters=8, outputs=[], section=llm) for walk in self._runs}
 
 
 def test_a_stream_naming_a_walk_the_model_never_runs_is_refused_at_load():
