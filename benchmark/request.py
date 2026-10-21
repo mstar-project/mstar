@@ -1096,6 +1096,8 @@ class MediaRoutes:
     benchmark/wan22/video_bench_wan22.py send them to these engines."""
 
     video_poll_s = 0.1
+    # A job that never reaches a final status fails its request instead of holding the cell (and the sweep) forever.
+    video_job_timeout_s = 3600.0
 
     async def _send_request_image(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
         body = {"model": model.get_served_model_name(), "prompt": req_input.prompt, "n": 1,
@@ -1155,6 +1157,7 @@ class MediaRoutes:
                     raise Exception(f"HTTP {resp.status}: {await resp.text()}")
                 job = await resp.json()
             vid = job.get("id") or job.get("video_id")
+            deadline = time.monotonic() + self.video_job_timeout_s
             while True:
                 async with session.get(f"{base_url}/v1/videos/{vid}") as resp:
                     info = await resp.json()
@@ -1163,6 +1166,8 @@ class MediaRoutes:
                     break
                 if status in ("failed", "error", "cancelled"):
                     raise Exception(f"job {status}: {str(info.get('error'))[:200]}")
+                if time.monotonic() > deadline:
+                    raise Exception(f"job still {status} after {self.video_job_timeout_s:.0f} s")
                 await asyncio.sleep(self.video_poll_s)
             async with session.get(f"{base_url}/v1/videos/{vid}/content",
                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=600)) as resp:
