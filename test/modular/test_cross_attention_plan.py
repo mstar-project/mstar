@@ -41,9 +41,11 @@ class _RecordingWrapper:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.plans = 0
         type(self).built.append({**kwargs, "kind": self.kind})
 
     def plan(self, **kwargs):
+        self.plans += 1
         # a real CUDA-graph wrapper raises here when the row count exceeds the
         # batch_size it was built with
         rows = kwargs["qo_indptr"].shape[0] - 1
@@ -189,3 +191,59 @@ def test_one_token_rows_plan_the_decode_kernel_and_longer_rows_the_prefill_kerne
         _manager().plan(AttentionStep(causal=False), _ctx(rids, query))
         (built,) = _RecordingWrapper.built
         assert built["kind"] == kind
+
+
+def _query(spans):
+    return {"main": _plan_output([
+        SequenceView(request_id=f"r{i}", label="main", page_idxs=[9], length=4, to_compute=n)
+        for i, n in enumerate(spans)
+    ])}
+
+
+@pytest.mark.parametrize("spans,kind", [
+    ([1, 1], "decode"),
+    # as many tokens as rows, but not one a row: the prefill kernel
+    ([2, 0], "prefill"),
+    ([3, 2], "prefill"),
+])
+def test_the_kernel_follows_every_rows_span(spans, kind):
+    for leased in (True, False):
+        _RecordingWrapper.built = []
+        ctx = _ctx(("r0", "r1"), _query(spans))
+        if not leased:
+            ctx.slot_lease = None
+        _manager().plan(AttentionStep(causal=False), ctx)
+        (built,) = _RecordingWrapper.built
+        assert built["kind"] == kind
+
+
+def test_force_prefill_takes_the_prefill_kernel():
+    ctx = _ctx(("r0", "r1"), _query([1, 1]))
+    ctx.force_prefill = True
+    _manager().plan(AttentionStep(causal=False), ctx)
+    (built,) = _RecordingWrapper.built
+    assert built["kind"] == "prefill"
+
+
+def test_an_unchanged_step_is_not_planned_again():
+    manager = _manager()
+    ctx = _ctx(("r0", "r1"), _query([1, 1]))
+    manager.plan(AttentionStep(causal=False), ctx)
+    wrapper = manager._current_plan_states["main"]
+    # the same context plan object over the same rows: nothing rebuilt
+    manager.plan(AttentionStep(causal=False), ctx)
+    # a new context plan over the same pages: FlashInfer's plan skipped
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    assert manager._current_plan_states["main"] is wrapper and wrapper.plans == 1
+    # other pages plan again
+    moved = _ctx(("r0", "r1"), _query([1, 1]))
+    moved.plan_results[CTX_KV][CONTEXT].views[1].page_idxs[0] = 7
+    manager.plan(AttentionStep(causal=False), moved)
+    assert wrapper.plans == 2
+
+
+def test_a_captured_key_keeps_its_kind():
+    manager = _manager()
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    with pytest.raises(AssertionError, match="captured as decode"):
+        manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([2, 0])))
