@@ -53,6 +53,8 @@ class Row:
     # A directory of first frames (<item id>.png) that image-to-video requests send instead of the set's own, so
     # every arm conditions on the frames the reference used.
     i2v_frames: str | None = None
+    # Options of the row's correctness family (its mode, a pinned size), which also set the requests' settings.
+    correctness_opts: dict = field(default_factory=dict)
 
 
 def mstar_config_name(row: Row, arm: str) -> str:
@@ -105,6 +107,12 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein", generator_device="cpu"),
     Row("flux2_klein_9b", "image", "black-forest-labs/FLUX.2-klein-9B", "flux2_klein_9b", generator_device="cpu"),
     Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo", generator_device="cpu"),
+    # Cosmos3-Nano's text-to-image mode, every prompt once at 480x832 (the family's pinned size); mstar serves it
+    # from its cosmos3_nano config with the family's request_extra.
+    Row("cosmos3_nano_t2i", "image", "nvidia/Cosmos3-Nano", "cosmos3_nano", generator_device="cuda",
+        mstar_configs={"mstar": "cosmos3_nano", "mstar-base": "cosmos3_nano"},
+        correctness_opts={"mode": "t2i", "size": "480x832"},
+        engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
     # mstar's wan22 takes only a frame of the request's size: i2v sends the reference's 480x832 conditioning frames.
     Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0, generator_device="cpu",
         concurrency={"video-t2v": (1, 2, 4)},

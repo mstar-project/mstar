@@ -75,9 +75,13 @@ def _family(C, worktree: Path, config_name: str, opts: dict | None = None):
     return C.families.family_for_config(config_name, cfg.get("model"), cfg, opts or {}), cfg
 
 
-def family_opts(wl) -> dict:
-    """The correctness family's options for a workload: image-to-video cells use the family's i2v mode."""
-    return {"mode": "i2v"} if wl is not None and wl.request_type == "image_to_video" else {}
+def family_opts(wl, row=None) -> dict:
+    """The correctness family's options for a row's workload: the row's own (a mode, a pinned size), and the i2v
+    mode for image-to-video cells."""
+    opts = dict(row.correctness_opts) if row is not None else {}
+    if wl is not None and wl.request_type == "image_to_video":
+        opts["mode"] = "i2v"
+    return opts
 
 
 def _write_pass(C, fam, sset, responses, out_dir: Path, header: dict, cfg: dict) -> dict:
@@ -274,10 +278,12 @@ def media_request_kwargs(plan, row, arm=None, wl=None, worktree: Path | None = N
     protocol takes it."""
     C = load(plan.correctness_src or REPO)
     config = catalog.mstar_config_name(row, arm.name) if arm is not None else row.name
-    fam, _ = _family(C, worktree or plan.worktree, config, family_opts(wl))
+    fam, _ = _family(C, worktree or plan.worktree, config, family_opts(wl, row))
     if row.family == "image":
         guidance = fam.guidance if fam.guidance is not None else (fam.ref_extra or {}).get("guidance_scale")
         kw = {"num_inference_steps": fam.steps, "guidance_scale": guidance}
+        if getattr(fam, "size", None):  # the family renders every prompt at one size
+            kw["height"], kw["width"] = fam.size
     else:
         # Where the serving recipe sets its own flow shift (Cosmos3 Edge), every engine gets that one.
         shift = (getattr(fam, "ref_scheduler_kwargs", None) or {}).get("flow_shift") or _flow_shift(row.hf_id)
@@ -402,10 +408,12 @@ def score(run_dir: Path, device: str = "cuda:0") -> dict:
         corr = arm_dir / "correctness"
         tree = _arm_tree(arm_dir, worktree)
         if not (corr / "pass.json").is_file():
+            row = catalog.ROWS.get(info["row"])
             for wl, ext in (("tts-seed", "wav"), ("asr-libri", "txt"), ("image-gen", "png"), ("video-t2v", "mp4")):
                 cell = arm_dir / "cells" / wl / "c1"
                 if (cell / "a1r1" / "results.json").is_file():
-                    pass_from_cell(C, tree, info["row"], info["arm"], cell, corr, ext)
+                    pass_from_cell(C, tree, info["row"], info["arm"], cell, corr, ext,
+                                   dict(row.correctness_opts) if row else None)
                     break
         if (corr / "pass.json").is_file():
             results[f"{info['row']}/{info['arm']}"] = score_dir(C, tree, corr, device)
