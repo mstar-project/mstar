@@ -426,6 +426,48 @@ def test_rollback_admit_frees_only_fresh_slots():
     assert mgr.admit(again, ctx).ok
 
 
+def test_attend_refuses_misuse():
+    """Arguments the kernel would read out of bounds or reinterpret are refused
+    on the host, before a launch."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVStep, StreamPosition
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+    from mstar.engine.resources.step import Segment, StepContext
+
+    h, d, t = 1, 16, 2
+    config = BoundedKVConfig(num_layers=1, num_heads=h, head_dim=d, rows_per_request=1, min_source_len=10,
+                             max_source_len=10, retention=SinkWindow(4, 8), max_slots=2)
+    mgr = BoundedKVManager(config, torch.device("cpu"))
+    # row 1 starts from a shared source, row 2 from its own row_source entry
+    step = BoundedKVStep(segments=(Segment(1, "main", t), Segment(2, "main", t)),
+                         positions={1: StreamPosition(10, 0, 0), 2: StreamPosition(10, 0, -1)})
+    ctx = StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=False)
+    assert mgr.admit(step, ctx).ok
+    mgr.plan(step, ctx)
+    q, k, v = (torch.randn(2, h, t, d) for _ in range(3))
+    source = torch.randn(1, 1, h, 10, 2 * d)
+    row_source = (torch.randn(2, 1, h, 10, 2 * d), torch.tensor([1, 0], dtype=torch.int32))
+    # 10 retained (4 sink + 6 window, all source) + 2T - 1
+    band = torch.zeros(2, h, t, 10 + 2 * t - 1)
+    mgr.attend(0, q, k, v, source, rel_bias=band, row_source=row_source)
+    for kwargs in (dict(row_source=row_source), dict(source=source),
+                   dict(source=source, row_source=row_source, rel_bias=band[..., :-1])):
+        with pytest.raises(ValueError):
+            mgr.attend(0, q, k, v, **kwargs)
+    with pytest.raises(ValueError):
+        mgr.attend(0, q.double(), k, v, source, row_source=row_source)
+
+
+def test_kernel_refuses_a_head_dim_it_cannot_tile():
+    pytest.importorskip("triton")
+    from mstar.engine.resources.kv.bounded.kernels import bounded_attention
+    from mstar.engine.resources.kv.bounded.layout import ROW_INTS
+
+    q = torch.randn(1, 1, 1, 24)
+    cache = torch.zeros(1, 1, 1, 4, 48)
+    with pytest.raises(ValueError):
+        bounded_attention(q, q, q, cache, None, torch.zeros(1, ROW_INTS, dtype=torch.int32))
+
+
 def test_per_query_window_config():
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
 
