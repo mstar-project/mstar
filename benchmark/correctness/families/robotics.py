@@ -188,6 +188,23 @@ class Vjepa2AcLatents(ArrayOutputFamily):
     def to_array(self, raw, resp=None):
         return raw.reshape(self.horizon, -1, 1408)
 
+    def score(self, sset, runs, ref_dir, work, device):
+        # Each step has its own action, state and context, so a step equal to the one before it is a step
+        # the response repeated, which agreement between two instances can't show.
+        sc = super().score(sset, runs, ref_dir, work, device)
+        repeated = []
+        for row in sc.rows:
+            p = runs[0] / "outputs" / f"{row['id']}.npy"
+            if p.is_file():
+                out = np.load(p)
+                row["step_maxabs_min"] = round(float(min(np.abs(out[k + 1] - out[k]).max()
+                                                         for k in range(len(out) - 1))), 6)
+                if row["step_maxabs_min"] == 0.0:
+                    repeated.append(row["id"])
+        sc.check("outputs with a rollout step equal to the step before", len(repeated),
+                 "PASS" if not repeated else "FAIL", "0", ", ".join(repeated))
+        return sc
+
     def reference_id(self) -> str:
         return "vjepa2-ac-upstream"
 
