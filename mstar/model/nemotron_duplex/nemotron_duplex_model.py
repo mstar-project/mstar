@@ -67,7 +67,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
@@ -742,21 +742,21 @@ class NemotronDuplexModel(Model):
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
         return out
 
-    def process_stream_chunk(
-        self, tensors: NameToTensorList, input_metadata: dict[str, list[dict]], **kwargs,
-    ) -> NameToTensorList:
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
         # Each appended file is one stream item, in order; the encoder enforces
         # the session cap as the call's audio grows. A piece of a stream can't
-        # be resampled or scaled alone without a seam at every append.
-        for key, items in tensors.items():
+        # be resampled or scaled alone without a seam at every append. The one
+        # client stream is audio_in, so a file's named stream changes nothing.
+        if chunk.text:
+            raise ValueError("this model takes audio appends only; got text")
+        for key, items in chunk.tensors.items():
             if items and key != "audio_inputs":
                 raise ValueError(f"this model takes audio appends only; got {key.removesuffix('_inputs')}")
-        for meta in input_metadata.get("audio_inputs") or []:
-            if meta.get("source_sample_rate", self.config.stt.sample_rate) != self.config.stt.sample_rate:
-                raise ValueError(
-                    f"appends must be {self.config.stt.sample_rate} Hz audio; got {meta['source_sample_rate']} Hz"
-                )
-        return {AUDIO_IN: [self._checked_audio(w).clamp(-1.0, 1.0) for w in tensors.get("audio_inputs") or []]}
+        rate = self.config.stt.sample_rate
+        for meta in chunk.input_metadata.get("audio_inputs") or []:
+            if meta.get("source_sample_rate", rate) != rate:
+                raise ValueError(f"appends must be {rate} Hz audio; got {meta['source_sample_rate']} Hz")
+        return {AUDIO_IN: [self._checked_audio(w).clamp(-1.0, 1.0) for w in chunk.tensors.get("audio_inputs") or []]}
 
     @staticmethod
     def _checked_audio(wav: torch.Tensor) -> torch.Tensor:
