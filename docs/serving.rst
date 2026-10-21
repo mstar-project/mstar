@@ -460,17 +460,28 @@ model_kwargs
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
 baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID variant fixes the action horizon:
+Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune, fixes the
+action horizon and camera count, and carries the DROID robot's normalization stats:
 
 .. code-block:: yaml
 
    model: "pi05"
    max_seq_len: 2048
    model_kwargs:
+     model_path_hf: "lerobot/pi05_droid"
      action_horizon: 15
+     num_cameras: 2
+     norm_stats:  # openpi's DROID quantiles, 8 dims each
+       state: {q01: [...], q99: [...]}
+       actions: {q01: [...], q99: [...]}
    node_groups:
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
+
+With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
+actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
+of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
+[-1, 1].
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.

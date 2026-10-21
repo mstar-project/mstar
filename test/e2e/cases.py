@@ -121,6 +121,8 @@ SQUARE_COLOR = "What color is the square? Answer with one word."
 SENTENCE = "The train leaves tomorrow morning."
 SMALL = {"height": 256, "width": 256, "seed": 7}
 ROBOT_STATE = [round(-1 + 2 * i / 31, 6) for i in range(32)]
+# pi05_droid takes the raw DROID state: 7 joint positions and the gripper, here near DROID's mean pose
+DROID_JOINT_STATE = [0.02, 0.27, -0.02, -2.03, -0.03, 2.34, 0.08, 0.4]
 ANSWER_4 = Expect("text", contains_any=("4", "four"))
 ANSWER_RED = Expect("text", contains_any=("red",))
 SPEECH = Expect("audio", min_seconds=0.5)
@@ -348,8 +350,8 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "robotics", peak_vram_gb=15.5),
     ModelSpec("pi05_droid", "configs/pi05_droid.yaml", (
         Case("image_state_to_action", "generate", generate(
-            "Pick up the red block", "action", {"robot_state": ROBOT_STATE, "seed": 7},
-            lambda: ("scene.png", scene_png())),
+            "Pick up the red block", "action", {"robot_state": DROID_JOINT_STATE, "seed": 7},
+            lambda: [("exterior.png", scene_png()), ("wrist.png", scene_png())]),
             Expect("float32", modality="action", count=15 * 32)),  # action_horizon x action_dim
     ), "robotics", peak_vram_gb=18.9),
     ModelSpec("vjepa2", "configs/vjepa2.yaml", (

@@ -623,3 +623,15 @@ def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy
     assert all(torch.equal(flat[k], v) for k, v in base.items())
     assert model._lerobot_remap("paligemma_with_expert.paligemma.lm_head.weight") == "embed_tokens.weight"
     assert model._lerobot_remap("time_mlp_in.bias") == "time_mlp.linear_in.bias"
+
+
+def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
+    import yaml
+
+    cfg = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_droid.yaml").read_text())
+    model = Pi05Model(skip_weight_loading=True, **cfg["model_kwargs"])
+    assert model.model_path_hf == "lerobot/pi05_droid"
+    assert (model.config.action_horizon, model.config.num_cameras) == (15, 2)
+    # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
+    assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
+    assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
