@@ -3,7 +3,8 @@
 Keys and values share a ``2 * head_dim`` last axis in the slot and the source:
 keys in ``[0, D)``, values in ``[D, 2D)``. Every row attends to its retained
 ranges and to this step's own tokens: unmasked, or with a per-query window
-(``SinkWindow.right``) each query to the keys at distances ``[0, window]``.
+(``BoundedKVConfig.query_window``) each query to the keys at distances
+``[0, window]``.
 Dot products use TF32 unless ``ieee``.
 """
 

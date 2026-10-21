@@ -107,7 +107,7 @@ class BoundedKVManager(Resource):
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
         ``plan`` defaults to the step's. ``rel_bias`` is a per-distance score term
         (``kernels.bounded_attention``), for relative-position attention; with a
-        per-query window (``SinkWindow.right``) it is indexed by distance,
+        per-query window (``BoundedKVConfig.query_window``) it is indexed by distance,
         ``[B * rows, H, T, window + 1]``. Rows whose
         source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
         slots [>= B])``, e.g. another resource's per-request entries."""
@@ -235,7 +235,7 @@ class BoundedKVManager(Resource):
             else:
                 pos = step.positions[seg.request_id]
                 rows.append((req.slot, row_layout(pos.source_len, pos.written, seg.span,
-                                                  c.retention(pos.source_len), c.sink_capacity,
+                                                  c.retention_for(pos.source_len), c.sink_capacity,
                                                   c.reverse_step_order), pos.source))
             values += flatten_row(*rows[-1])
         table = self._table(ctx, len(rows))
