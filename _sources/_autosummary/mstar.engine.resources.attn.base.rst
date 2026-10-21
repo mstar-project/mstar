@@ -13,6 +13,7 @@ mstar.engine.resources.attn.base
 
    .. autosummary::
    
+      captured_page_capacity
       resolve_attn_backend
    
    

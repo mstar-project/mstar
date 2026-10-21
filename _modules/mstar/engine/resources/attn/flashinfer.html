@@ -940,6 +940,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">AttentionWrapper</span><span class="p">,</span>
     <span class="n">EagerSlotKey</span><span class="p">,</span>
     <span class="n">WorkspacePool</span><span class="p">,</span>
+    <span class="n">captured_page_capacity</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">refuse_context_only</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -1031,11 +1032,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">bucket</span> <span class="o">=</span> <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span>
         <span class="n">buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
-        <span class="c1"># per row, not per pool: rows that matched one cached prefix all name</span>
-        <span class="c1"># its pages, so a step can name more page ids than the pool holds</span>
         <span class="n">kv_kwargs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
-            <span class="s2">"max_num_pages"</span><span class="p">:</span> <span class="n">num_rows</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
+            <span class="s2">"max_num_pages"</span><span class="p">:</span> <span class="n">captured_page_capacity</span><span class="p">(</span><span class="n">num_rows</span><span class="p">,</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">),</span>
         <span class="p">}</span>
         <span class="n">split</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_splits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">split</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>

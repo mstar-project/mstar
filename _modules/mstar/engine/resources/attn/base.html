@@ -1149,6 +1149,23 @@ window.runMermaid = runMermaid;</script>
 <span class="n">AttentionWrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span> <span class="o">|</span> <span class="n">FlashInferDecodeWrapper</span>
 
 
+<div class="viewcode-block" id="captured_page_capacity">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.captured_page_capacity">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">captured_page_capacity</span><span class="p">(</span><span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">kv_config</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Page ids a captured wrapper's index buffer holds for a bucket of</span>
+<span class="sd">    ``num_rows`` rows and ``num_tokens`` tokens.</span>
+
+<span class="sd">    Per row, not per pool: rows that matched one cached prefix all name its</span>
+<span class="sd">    pages, so a step can name more page ids than the pool holds. And at least</span>
+<span class="sd">    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,</span>
+<span class="sd">    whatever the pool's size."""</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span>
+        <span class="n">num_rows</span> <span class="o">*</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
+        <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="o">+</span> <span class="n">num_rows</span><span class="p">,</span>
+    <span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="WorkspacePool">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.WorkspacePool">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">WorkspacePool</span><span class="p">:</span>
