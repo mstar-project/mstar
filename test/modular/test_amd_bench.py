@@ -939,7 +939,7 @@ def test_image_to_video_requests_carry_the_first_frame(tmp_path):
 
     from benchmark.base import ModelType, RequestType
     from benchmark.dataset import SampleSetDataset
-    from benchmark.request import MediaRoutes, RequestMetrics
+    from benchmark.request import MediaRoutes, RequestInput, RequestMetrics
 
     assert RequestType.I2V.get_output_modalities() == "video_file"
     assert RequestType.I2V.get_input_modalities() == "image"
@@ -986,8 +986,17 @@ def test_image_to_video_requests_carry_the_first_frame(tmp_path):
     asyncio.run(routes._send_request_video_job(Session(), req, "http://x", model, metrics, {}))
     parts = {f[0]["name"]: f for f in sent["data"]._fields}
     assert "input_reference" in parts and parts["input_reference"][0].get("filename") == "f.png"
+    # SGLang Diffusion is asked for PNG images (its FLUX.2 default is JPEG); the other engines get no such field.
+    from benchmark.request import SGLangDiffusion
+
+    img = RequestInput(req_type=RequestType.T2I, prompt="p")
+    for cls, fmt in ((SGLangDiffusion, "png"), (MediaRoutes, None)):
+        metrics = RequestMetrics(request_id=0, type=RequestType.T2I, expected_output_modalities=["image"])
+        asyncio.run(cls._send_request_image(cls.__new__(cls), Session(), img, "http://x",
+                                            ModelType.FLUX2_KLEIN.inst(), metrics, {}))
+        assert sent["url"].endswith("/v1/images/generations") and sent["json"].get("output_format") == fmt
     # Text-to-video too goes as multipart/form-data: SGLang Diffusion parses anything else as JSON.
-    from benchmark.request import RequestInput, _video_job_form
+    from benchmark.request import _video_job_form
 
     form = _video_job_form(model, RequestInput(req_type=RequestType.T2V, prompt="p"), {"height": 480, "width": 832})
     assert {f[0]["name"] for f in form._fields} >= {"model", "prompt", "size"}
