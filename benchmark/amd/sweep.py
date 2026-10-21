@@ -520,11 +520,15 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
 def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
     """Every arm of one row, back to back on the same GPUs."""
     arms = [a for a in catalog.arms_for(row, plan.arms) if _runs(plan, row, a)]
-    # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
-    k = index % len(arms) if arms else 0
+    names = {a.name for a in arms}
+    lead = [a for a in arms if a.follows not in names]
+    # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU. An arm that follows
+    # another runs right after it.
+    k = index % len(lead) if lead else 0
+    order = [x for a in lead[k:] + lead[:k] for x in [a, *(f for f in arms if f.follows == a.name)]]
     # Each arm gets its own port: right after a server stops, its port can sit in TIME_WAIT, and a server that
     # binds without SO_REUSEADDR (sglang-omni) then refuses it.
-    for j, arm in enumerate(arms[k:] + arms[:k]):
+    for j, arm in enumerate(order):
         run_arm(plan, row, arm, gpus, port + j, "")
 
 
