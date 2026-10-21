@@ -117,6 +117,7 @@ def subprocess_case(command, output, logpath, deadline, timeout, env):
         return {"status": "NOT RUN", "reason": "Deadline reserve"}
     logpath.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
+    commit = git("rev-parse", "HEAD")
     with logpath.open("wb") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         try:
@@ -132,6 +133,7 @@ def subprocess_case(command, output, logpath, deadline, timeout, env):
             code, timed_out = process.returncode, True
     result = {
         "status": "PASS" if code == 0 else "FAIL",
+        "commit": commit,
         "command": command,
         "exit": code,
         "timeout": timed_out,
@@ -164,7 +166,11 @@ def report(root):
     players = []
     numeric_rows, benchmark_rows = [], []
     for name, row in results.items():
-        lines += [f"{name}: {row['status']}", f"  {row.get('reason', row.get('log', ''))}"]
+        lines += [
+            f"{name}: {row['status']}",
+            f"  Commit: {row.get('commit', identity['commit'])}",
+            f"  {row.get('reason', row.get('log', ''))}",
+        ]
         comparison = root / name / "comparison.json"
         if comparison.exists():
             values = json.loads(comparison.read_text())
@@ -315,7 +321,7 @@ def main():
                 "--output",
                 str(root / name),
             ]
-            scenarios.append((name, command, 1200, 180))
+            scenarios.append((name, command, 1200, 120 if smoke else 180))
     for backend in ["rust"] if smoke else ["python", "rust"]:
         name = "lifecycle-" + backend
         scenarios.append(
@@ -337,7 +343,7 @@ def main():
                     "smoke" if smoke else "lifecycle",
                 ],
                 1800,
-                360,
+                180 if smoke else 360,
             )
         )
     if not smoke:
@@ -381,7 +387,7 @@ def main():
                 *(["--smoke"] if smoke else []),
             ],
             2400,
-            300,
+            90 if smoke else 300,
         )
     )
     result_path = root / "results.json"

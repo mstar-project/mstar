@@ -33,7 +33,7 @@ def main():
         for entry in entries:
             for concurrency in [1] if args.smoke else [1, 2, 4]:
                 cell = next(c for c in cells if c["clip"] == entry["id"] and c["concurrency"] == concurrency)
-                if time.time() + 420 > float(os.environ.get("PERSONAPLEX_DEADLINE", "inf")):
+                if time.time() + (60 if args.smoke else 420) > float(os.environ.get("PERSONAPLEX_DEADLINE", "inf")):
                     cell["reason"] = "Deadline reserve; cell not launched"
                     continue
                 root = args.output / f"{entry['id']}-c{concurrency}"
@@ -122,7 +122,7 @@ def main():
                     write_json(args.output / "cells.json", cells)
                     if not compiled:
                         break
-                    if time.time() + 420 > float(os.environ.get("PERSONAPLEX_DEADLINE", "inf")):
+                    if time.time() + (60 if args.smoke else 420) > float(os.environ.get("PERSONAPLEX_DEADLINE", "inf")):
                         break
                 if cell["status"] != "PASS":
                     break  # Do not escalate concurrency after an invalid lower cell.
