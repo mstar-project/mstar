@@ -799,6 +799,28 @@ def test_analysis_video_and_audio_video(tmp_path):
     assert (run / "analysis" / "spectrograms" / "00.png").is_file()
 
 
+def test_analysis_world_rollout(tmp_path):
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    rng = np.random.default_rng(3)
+    frames = rng.integers(0, 256, (8, 32, 48, 3), dtype=np.uint8)
+    root = tmp_path / "data" / "sets" / "waypoint_v1"
+    root.mkdir(parents=True)
+    Image.fromarray(frames[0]).save(root / "seed0.png")
+    item = sets.Item(id="0", files={"seed_720p": "seed0.png"}, params={"seed": 0})
+    run = _analysis_run(tmp_path, "waypoint", "waypoint", "world-waypoint", "waypoint_v1", [item])
+    for k in ("r1", "r2"):
+        np.save(run / k / "outputs" / "0.npy", frames)
+    m = _run_analysis(tmp_path, run)
+    row = m["rows"][0]
+    assert m["kind"] == "world" and m["reference"] is None
+    assert row["psnr_seed_image"][0] == 99.0 > row["psnr_seed_image"][1]
+    assert "PSNR of the first / last frame vs the seed image, median over rollouts (dB)" in {
+        b["measure"] for b in m["bars"]}
+    assert (run / "analysis" / "strips" / "0.png").is_file() and not (run / "analysis" / "sbs").exists()
+
+
 def test_analysis_speech(tmp_path):
     from benchmark.correctness.families import asr_judge
 
