@@ -65,8 +65,29 @@ def client_for(arm: Arm, row: Row) -> str:
     return arm.client
 
 
+def workload_set_dir(row: Row, wl: tables.Workload, arm_dir: Path) -> Path | None:
+    """The sample set a row's cells send: the workload's, or for an image-to-video workload on a row with its own
+    first frames (Row.i2v_frames) a copy of its manifest that points at those frames. None for a text-file set."""
+    if not wl.prompts.startswith("set:"):
+        return None
+    src = SETS_ROOT / "sets" / wl.prompts[4:]
+    if wl.request_type != "image_to_video" or not row.i2v_frames:
+        return src
+    manifest = json.loads((src / "manifest.json").read_text())
+    for it in manifest["items"]:
+        frame = Path(row.i2v_frames) / f"{it['id']}.png"
+        if not frame.is_file():
+            raise FileNotFoundError(frame)
+        it["files"] = {**(it.get("files") or {}), "image": str(frame)}
+    out = arm_dir / f"set-{wl.name}"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    return out
+
+
 def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, out_dir: Path, warmup: int,
-                   sets_root: Path = SETS_ROOT, request_kwargs: dict | None = None) -> list[str]:
+                   sets_root: Path = SETS_ROOT, request_kwargs: dict | None = None,
+                   set_dir: Path | None = None) -> list[str]:
     cmd = [sys.executable, "-m", "benchmark.runner", "--url", f"http://127.0.0.1:{port}",
            "--model", row.runner_model, "--inference-system", client_for(arm, row),
            "--request-type", wl.request_type, "--profiling-type", "closed_loop", "--max-concurrency", str(c),
@@ -75,7 +96,7 @@ def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, o
     if row.runner_model_id:
         cmd += ["--model-id", row.hf_id]
     if wl.prompts.startswith("set:"):
-        cmd += ["--dataset", "sample_set", "--sample-set-dir", str(sets_root / "sets" / wl.prompts[4:])]
+        cmd += ["--dataset", "sample_set", "--sample-set-dir", str(set_dir or sets_root / "sets" / wl.prompts[4:])]
     else:
         cmd += ["--dataset", "text", "--request-txt-file", str(REPO / wl.prompts)]
     if wl.output_len:
@@ -262,7 +283,8 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             rdir = cell_dir / f"a{attempt}r{k}"
             rdir.mkdir(parents=True, exist_ok=True)
             warm = wl.warmup_waves_first if k == 1 else wl.warmup_waves_next
-            cmd = runner_command(arm, row, wl, c, port, rdir, warm, request_kwargs=request_kwargs)
+            cmd = runner_command(arm, row, wl, c, port, rdir, warm, request_kwargs=request_kwargs,
+                                 set_dir=workload_set_dir(row, wl, arm_dir))
             if numa is not None:
                 cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
             (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
@@ -408,7 +430,7 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
     """One untimed request per size of the workload's set, after startup and before any cell: an engine's first
     request at a new size can pay minutes of JIT, autotune and VAE builds, which would otherwise land in the first
     cell's warmup. Each is the row's first-size cost at that size (client e2e seconds, or the error)."""
-    set_dir = SETS_ROOT / "sets" / wl.prompts[4:]
+    set_dir = workload_set_dir(row, wl, arm_dir)
     manifest = json.loads((set_dir / "manifest.json").read_text())
     pinned = bool(request_kwargs and request_kwargs.get("height") and request_kwargs.get("width"))
     need = "image" if wl.request_type == "image_to_video" else None
