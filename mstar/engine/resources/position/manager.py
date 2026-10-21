@@ -131,10 +131,11 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
-        elif device.type == "cuda" and current_platform.is_rocm():
+        elif (device.type == "cuda" and current_platform.is_rocm()
+              and config.rope_table_dtype is None):
             # The ROCm kernel reads cos/sin from an fp32 cache with every
             # frequency rule (scale, Llama 3.1) already applied; see
-            # `position/rocm.py`.
+            # `position/rocm.py`. A rope_table_dtype table (below) replaces it.
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
                 raise ValueError(
@@ -153,7 +154,8 @@ class RopeManager(PositionManager):
                 llama31=self._rope_cache_key[3],
                 compute_dtype=torch.float64,
             )
-        # CUDA rotates from this table instead of in-kernel angles when set.
+        # CUDA and ROCm rotate from this table when set, instead of in-kernel
+        # angles or the fp32 cache.
         self._rope_table: torch.Tensor | None = None
         if config.rope_table_dtype is not None and device.type != "xpu":
             if config.llama31_params:
