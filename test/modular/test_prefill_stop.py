@@ -218,13 +218,13 @@ def _report(wg_id, partition_done=False):
 
 @pytest.mark.parametrize("flag_on", ["first", "last"])
 def test_a_flag_on_any_report_of_the_pass_ends_the_request(flag_on):
-    """The run loop passes the completing report's own flag; the LLM's report
-    can arrive first, and then the encoder's (flag-less) one completes the pass."""
+    """The LLM's report can arrive first, and then the encoder's (flag-less)
+    one completes the pass."""
     c, pstate, sent = _conductor()
     first, last = (_report(1, True), _report(0)) if flag_on == "first" else (_report(0), _report(1, True))
     assert c._process_worker_graphs_done(first) == []
     assert c._process_worker_graphs_done(last) == ["default"]
-    all_done = c._process_done_forward("r", "default", partition_done_from_worker=last.partition_done)
+    all_done = c._process_done_forward("r", "default")
     assert all_done is True and pstate.is_done
     assert sent == [], "the decode walk must not start"
     assert pstate.worker_reported_done is False  # per pass

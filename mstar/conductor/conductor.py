@@ -1639,10 +1639,7 @@ class Conductor:
 
         return done_partitions
 
-    def _process_done_forward(
-        self, request_id: str, partition_name: str,
-        partition_done_from_worker: bool = False,
-    ) -> bool:
+    def _process_done_forward(self, request_id: str, partition_name: str) -> bool:
         """Process a completed forward pass for a specific partition.
 
         Calls get_partition_forward_pass_args for all partitions uniformly.
@@ -1653,13 +1650,12 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
-        partition_done_from_worker = partition_done_from_worker or pstate.worker_reported_done
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
 
         # For partitions that self-trigger via StreamBuffer (have incoming
         # connections with topology), worker signals partition_done directly.
-        if incoming_connections and partition_done_from_worker:
+        if incoming_connections and pstate.worker_reported_done:
             pstate.is_done = True
 
         prev_walk =  pstate.metadata.graph_walk
@@ -1684,7 +1680,7 @@ class Conductor:
         # so a colocated consumer's report could finish this partition while its
         # last step was still running, and that step's output arrived for a
         # request already gone.
-        if partition_done_from_worker:
+        if pstate.worker_reported_done:
             fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
@@ -1840,7 +1836,7 @@ class Conductor:
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
     def _route_message(
-        self, message, done_partition_forwards: list[tuple[str, str, bool]],
+        self, message, done_partition_forwards: list[tuple[str, str]],
     ) -> None:
         """Apply one message from the api server or a worker. A WORKER_GRAPHS_DONE
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
@@ -1875,9 +1871,7 @@ class Conductor:
                 range_push("conductor._process_worker_graphs_done")
             done_parts = self._process_worker_graphs_done(message.body)
             for pname in done_parts:
-                done_partition_forwards.append(
-                    (rid, pname, message.body.partition_done)
-                )
+                done_partition_forwards.append((rid, pname))
             if self.enable_nvtx:
                 range_pop()
         else:
@@ -1970,7 +1964,7 @@ class Conductor:
                 range_push("conductor.run_loop")
 
             try:
-                done_partition_forwards: list[tuple[str, str, bool]] = []
+                done_partition_forwards: list[tuple[str, str]] = []
 
                 startup_backlog = self._startup_message_backlog
                 self._startup_message_backlog = []
@@ -1987,14 +1981,11 @@ class Conductor:
 
                 completed_requests = []
 
-                for request_id, partition_name, p_done in done_partition_forwards:
+                for request_id, partition_name in done_partition_forwards:
                     if request_id not in self.requests or request_id in self.draining:
                         continue  # already completed by another partition in this cycle
                     try:
-                        all_done = self._process_done_forward(
-                            request_id, partition_name,
-                            partition_done_from_worker=p_done,
-                        )
+                        all_done = self._process_done_forward(request_id, partition_name)
                     except Exception as exc:
                         self._fail_after_error(
                             request_id, f"advancing partition {partition_name}", exc,

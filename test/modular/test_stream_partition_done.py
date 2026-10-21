@@ -63,10 +63,16 @@ def _conductor(rid="r"):
     return c, req, rec
 
 
+def _forward(c, pname, worker_done=False):
+    """Complete a pass of ``pname``; ``worker_done`` is what a report set."""
+    c.requests["r"].partition_states[pname].worker_reported_done = worker_done
+    return c._process_done_forward("r", pname)
+
+
 def test_worker_final_chunk_signal_ends_the_partition_and_propagates_producer_done():
     c, req, rec = _conductor()
     # B consumed the final chunk of A->B: B is done, and C must learn its producer is done
-    all_done = c._process_done_forward("r", "B", partition_done_from_worker=True)
+    all_done = _forward(c, "B", worker_done=True)
     assert req.partition_states["B"].is_done is True
     assert req.streaming_connections["B->C"].producer_done is True
     assert rec.producer_done == [("r", "B", "C")]
@@ -77,7 +83,7 @@ def test_worker_final_chunk_signal_ends_the_partition_and_propagates_producer_do
 def test_counter_heuristics_are_not_needed_and_an_ordinary_pass_does_not_end_it():
     c, req, rec = _conductor()
     # B finished a pass but did not consume the final chunk: it waits for more stream data
-    all_done = c._process_done_forward("r", "B", partition_done_from_worker=False)
+    all_done = _forward(c, "B", worker_done=False)
     assert req.partition_states["B"].is_done is False
     assert req.streaming_connections["B->C"].producer_done is False
     assert rec.producer_done == [] and rec.partition_inputs == []
@@ -89,7 +95,7 @@ def test_partition_without_incoming_connections_ends_on_the_flag():
     that ended it before any loop (a prefill that sampled EOS): it ends too,
     and its consumers learn their producer is done."""
     c, req, rec = _conductor()
-    c._process_done_forward("r", "A", partition_done_from_worker=True)
+    _forward(c, "A", worker_done=True)
     assert req.partition_states["A"].is_done is True
     assert rec.producer_done == [("r", "A", "B")]
 
@@ -101,6 +107,6 @@ def test_chain_closes_partition_by_partition():
                                                    request_done=partition_name == "A")
     assert c._process_done_forward("r", "A") is False           # A ends itself (its own stream input is exhausted)
     assert req.streaming_connections["A->B"].producer_done is True
-    assert c._process_done_forward("r", "B", partition_done_from_worker=True) is False
-    assert c._process_done_forward("r", "C", partition_done_from_worker=True) is True   # every partition done
+    assert _forward(c, "B", worker_done=True) is False
+    assert _forward(c, "C", worker_done=True) is True   # every partition done
     assert rec.producer_done == [("r", "A", "B"), ("r", "B", "C")]
