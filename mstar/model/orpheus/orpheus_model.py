@@ -387,6 +387,10 @@ class OrpheusModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the decode stop check ends the loop after max_tokens iterations
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never
         come back in a prompt, so they are not keyed."""
