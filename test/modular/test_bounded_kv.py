@@ -286,11 +286,12 @@ def _step(rids, written, spans):
     return step, StepContext(request_ids=tuple(rids), graph_walk="w", slot=0, capture=False)
 
 
-def _stream_reference(streams, q, k, v, written, window, per_query, bias):
+def _stream_reference(streams, q, k, v, written, spans, window, per_query, bias):
     """float64: each row's query ``i`` (stream position ``w + i``) over its stream so
     far ``streams[b] = (keys, values) [H, w, D]`` and the step's own tokens; per
     query, the keys at distances [0, window], with the band indexed by distance;
-    per step, the last ``window`` stream keys and all of the step's own."""
+    per step, the last ``window`` stream keys and the step's first ``span`` (all T
+    for a row that writes none)."""
     n, h, t, d = q.shape
     out = torch.empty(n, t, h, d, dtype=torch.float64)
     for b in range(n):
@@ -298,12 +299,13 @@ def _stream_reference(streams, q, k, v, written, window, per_query, bias):
         keys = torch.cat([streams[b][0], k[b]], 1)
         values = torch.cat([streams[b][1], v[b]], 1)
         lo = max(0, w - window)
+        own = spans[b] or t
         for i in range(t):
             if per_query:
                 seen = torch.arange(max(0, w + i - window), w + i + 1)
                 rel = w + i - seen
             else:
-                seen = torch.arange(lo, w + t)
+                seen = torch.arange(lo, w + own)
                 rel = (w - lo) + i - (seen - lo) + t - 1
             scores = (q[b, :, i:i + 1] @ keys[:, seen].transpose(-1, -2))[:, 0] + bias[b, :, i, rel]
             att = torch.softmax(scores * d ** -0.5, dim=-1)
@@ -336,7 +338,7 @@ def test_stream_matches_brute_force(device, dtype, per_query):
         width = window + 1 if per_query else window + 2 * t - 1
         bias = (4 * torch.randn(len(rids), h, t, width)).to(device=device, dtype=dtype)
         want = _stream_reference(streams, q.double().cpu(), k.double().cpu(), v.double().cpu(),
-                                 written, window, per_query, bias.double().cpu())
+                                 written, spans, window, per_query, bias.double().cpu())
         step, ctx = _step(rids, written, spans)
         assert mgr.admit(step, ctx).ok
         mgr.plan(step, ctx)

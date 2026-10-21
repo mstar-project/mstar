@@ -2,10 +2,10 @@
 
 Keys and values share a ``2 * head_dim`` last axis in the slot and the source:
 keys in ``[0, D)``, values in ``[D, 2D)``. Every row attends to its retained
-ranges and to this step's own tokens: unmasked, or with a per-query window
-(``BoundedKVConfig.query_window``) each query to the keys at distances
-``[0, window]``.
-Dot products use TF32 unless ``ieee``.
+ranges and to this step's own tokens: unmasked (those it writes, or all T when
+it writes none), or with a per-query window (``BoundedKVConfig.query_window``)
+each query to the keys at distances ``[0, window]``. Dot products use TF32
+unless ``ieee``.
 """
 
 from __future__ import annotations
@@ -92,16 +92,18 @@ def _bounded_attention_kernel(
         own_hi = tl.minimum(m_lo + BLOCK_M, T)
         old_lo = tl.maximum(total + m_lo - window, 0)
     else:
+        own = tl.load(row + 2)
         own_lo = 0
-        own_hi = T
+        own_hi = tl.where(own > 0, tl.minimum(own, T), T)
         old_lo = 0
 
-    # this step's own tokens (separate k and v tensors, laid out like q); a pair's
-    # band entry is its query position minus its key position, plus T - 1, or
-    # with a per-query window the distance alone
+    # this step's own tokens (separate k and v tensors, laid out like q), per step
+    # the first ``span`` (``RowLayout.span``); a pair's band entry is its query
+    # position minus its key position, plus T - 1, or with a per-query window the
+    # distance alone (causality already keeps a row's real queries off its padding)
     for j0 in range(own_lo, own_hi, BLOCK_N):
         offs_n = j0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < T
+        mask_n = offs_n < own_hi
         kv_off = n * s_qn + h * s_qh + offs_n[:, None] * s_qt + offs_d[None, :]
         k = tl.load(k_ptr + kv_off, mask=mask_n[:, None], other=0.0)
         v = tl.load(v_ptr + kv_off, mask=mask_n[:, None], other=0.0)

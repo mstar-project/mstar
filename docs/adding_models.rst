@@ -697,7 +697,8 @@ computed on the host from the position the step declares, which is also what let
 different positions share a batch and a captured graph.
 
 The model calls ``attend(layer_idx, q, k, v, source, plan)``: each row attends its
-retained keys in stream order and its own, unmasked, and its writes land after. Pass
+retained keys in stream order and the step's keys it writes (all of them for a row that
+writes none), unmasked, and its writes land after. Pass
 ``source`` (``[sources, rows, H, L, 2 * head_dim]``, keys then values) when requests start
 from shared prefixes that the slots should not copy; each row reads the one its
 ``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
@@ -712,7 +713,7 @@ only makes sense for attention that ignores key order; it decides which of the o
 step's tokens leave first.
 
 By default the window is per step: every query of a step sees the same keys, the retained
-ones and all of the step's own. A streaming encoder whose frames each see a fixed left
+ones and the step's own. A streaming encoder whose frames each see a fixed left
 context (a conformer's ``att_context_size=[left, 0]``) sets
 ``BoundedKVConfig(retention=SinkWindow(0, left), query_window=left)`` instead: each query
 attends the keys at distances ``0..left`` from it, so a step of several frames is causal
