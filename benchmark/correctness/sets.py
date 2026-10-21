@@ -466,6 +466,124 @@ def build_droid_v1(root: Path, raw: Path) -> None:
                           "action trajectories (rows indexed by frame), and an 8-frame exterior clip ending there.")
 
 
+# ---------------------------------------------------------------------------
+# robotics v2: 6 DROID 1.0.1 episodes with joint positions, for the Cosmos3 DROID policies
+# ---------------------------------------------------------------------------
+
+DROID101_REPO = "cadene/droid_1.0.1"  # LeRobot v2.1: one parquet and one mp4 per camera per episode
+DROID101_REVISION = "56b622ac23335c2bb5909e1e3c72416033c65acf"
+DROID101_DIR = "cadene__droid_1.0.1"
+DROID101_CAMERAS = ("wrist_left", "exterior_1_left", "exterior_2_left")
+DROID_POLICY_HW = (540, 640)  # RoboLab server observation size
+DROID_POLICY_BUCKET_HW = (544, 736)  # the 480p bucket it is reflection-padded into
+
+
+def _droid101_fetch(raw: Path, rels: list[str]) -> Path:
+    """Download the files not yet under raw/, at the pinned revision."""
+    from huggingface_hub import hf_hub_download
+
+    root = raw / DROID101_DIR
+    for rel in rels:
+        if not (root / rel).is_file():
+            hf_hub_download(DROID101_REPO, rel, repo_type="dataset", revision=DROID101_REVISION, local_dir=root)
+    return root
+
+
+def _droid101_frame(path: Path, k: int):
+    """Frame k (RGB) of a per-episode mp4, and the episode's frame count."""
+    import av
+
+    frame, n = None, 0
+    with av.open(str(path)) as container:
+        for f in container.decode(container.streams.video[0]):
+            if n == k:
+                frame = f.to_ndarray(format="rgb24")
+            n += 1
+    return frame, n
+
+
+def droid_policy_composite(wrist, ext1, ext2):
+    """The RoboLab server's observation for the DROID policies (cosmos-framework
+    action_policy_server_robolab.py _compose_roboarena_views / _build_sample and the action transform's
+    reflection pad): wrist on top, both exteriors at half size below, bilinear to 540x640 and truncated
+    to uint8, then reflection-padded on the right and bottom to 544x736."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    def resize(img, hw):
+        t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()
+        t = F.interpolate(t, size=hw, mode="bilinear", align_corners=False)
+        return t.squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
+
+    half = (wrist.shape[0] // 2, wrist.shape[1] // 2)
+    img = np.concatenate([wrist, np.concatenate([resize(ext1, half), resize(ext2, half)], axis=1)], axis=0)
+    img = resize(img, DROID_POLICY_HW)
+    pad = ((0, DROID_POLICY_BUCKET_HW[0] - img.shape[0]), (0, DROID_POLICY_BUCKET_HW[1] - img.shape[1]), (0, 0))
+    return np.pad(img, pad, mode="reflect")
+
+
+def build_droid_v2(root: Path, raw: Path) -> None:
+    import numpy as np
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    meta = _droid101_fetch(raw, ["meta/info.json", "meta/episodes.jsonl"])
+    info = json.loads((meta / "meta/info.json").read_text())
+    fps = float(info["fps"])
+    episodes = [json.loads(line) for line in (meta / "meta/episodes.jsonl").read_text().splitlines() if line.strip()]
+    # Chunk 0, long enough for a step a third in plus a 33-frame chunk, with a task string.
+    cands = [e for e in episodes if e["episode_index"] < 1000 and 150 <= e["length"] <= 600
+             and e.get("tasks") and str(e["tasks"][0]).strip()]
+    picks = sorted(random.Random(0).sample(cands, 6), key=lambda e: e["episode_index"])
+    (root / "frames").mkdir(parents=True, exist_ok=True)
+    (root / "arrays").mkdir(parents=True, exist_ok=True)
+    items = []
+    for i, e in enumerate(picks):
+        ep, chunk = e["episode_index"], e["episode_index"] // info["chunks_size"]
+        data_rel = info["data_path"].format(episode_chunk=chunk, episode_index=ep)
+        video_rels = {cam: info["video_path"].format(episode_chunk=chunk, video_key=f"observation.images.{cam}",
+                                                     episode_index=ep) for cam in DROID101_CAMERAS}
+        _droid101_fetch(raw, [data_rel, *video_rels.values()])
+        rows = pq.read_table(meta / data_rel).to_pandas().sort_values("frame_index")
+        n = len(rows)
+        k = n // 3  # a step a third into the episode: the arm is moving
+
+        cols = {name: np.stack(rows[name].to_numpy()).astype(np.float32).reshape(n, -1) for name in (
+            "observation.state.joint_position", "observation.state.gripper_position",
+            "action.joint_position", "action.gripper_position")}
+        states = np.concatenate([cols["observation.state.joint_position"],
+                                 cols["observation.state.gripper_position"]], axis=1)
+        actions = np.concatenate([cols["action.joint_position"], cols["action.gripper_position"]], axis=1)
+        tag = f"ep{i:02d}"
+        files, views = {}, {}
+        for cam, rel in video_rels.items():
+            frame, frames = _droid101_frame(meta / rel, k)
+            if frames != n:
+                raise RuntimeError(f"episode {ep} {cam}: {frames} video frames for {n} rows")
+            views[cam] = frame
+            files[cam] = f"frames/{tag}_{cam}.png"
+            Image.fromarray(frame).save(root / files[cam])
+        files["composite"] = f"frames/{tag}_composite.png"
+        Image.fromarray(droid_policy_composite(views["wrist_left"], views["exterior_1_left"],
+                                               views["exterior_2_left"])).save(root / files["composite"])
+        np.save(root / f"arrays/{tag}_joint_states.npy", states)
+        np.save(root / f"arrays/{tag}_joint_actions.npy", actions)
+        files.update(joint_states=f"arrays/{tag}_joint_states.npy", joint_actions=f"arrays/{tag}_joint_actions.npy")
+        items.append(Item(id=tag, prompt=str(e["tasks"][0]).strip(), files=files,
+                          params={"episode": ep, "step": k, "length": n, "fps": fps, "seed": i,
+                                  "successful": bool(rows["is_episode_successful"].iloc[0])}))
+    _write_manifest(root, "droid_v2", {"hf_dataset": DROID101_REPO, "revision": DROID101_REVISION,
+                                       "license": "apache-2.0 (HF dataset tag)",
+                                       "episodes": "random.Random(0).sample of chunk-0 episodes with 150-600 "
+                                                   "frames and a task string, 6",
+                                       "step": "len(episode) // 3"}, items,
+                    notes="Per episode: the wrist and exterior frames at the step (320x180), the RoboLab policy "
+                          "composite built from them (736x544), the task string, and the joint trajectories as "
+                          "[T, 8] arrays (joint_states: observation.state.joint_position + gripper_position, "
+                          "joint_actions: action.joint_position + gripper_position), rows indexed by frame.")
+
+
 def build_waypoint_v1(root: Path, raw: Path) -> None:
     from PIL import Image
 
@@ -494,6 +612,7 @@ BUILDERS = {
     "image_v1": lambda root, raw: build_image_v1(root),
     "video_v1": build_video_v1,
     "droid_v1": build_droid_v1,
+    "droid_v2": build_droid_v2,
     "waypoint_v1": build_waypoint_v1,
 }
 
