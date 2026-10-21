@@ -1145,10 +1145,7 @@ base64, or an http(s) URL when the server allows remote fetch) and its transcrip
 <code class="docutils literal notranslate"><span class="pre">do_sample:</span> <span class="pre">false</span></code> is greedy. The order differs: M*’s sampler applies the
 temperature first and takes top-k and top-p over the tempered probabilities,
 while the reference takes top-p over the untempered ones, so at the same
-values M* keeps a slightly different set of tokens per step. The top-p
-boundary differs as well: M*’s sampler (FlashInfer) keeps the token whose
-probability carries the running total past top-p, while the reference drops
-it unless it is the most likely token. <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (default 2048, at most
+values M* keeps a slightly different set of tokens per step. <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (default 2048, at most
 4096 frames of 2048 samples at 44.1 kHz) and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code> pass through.</p></li>
 <li><p>Streamed audio matches the whole-utterance decode to within one int16 step:
 each codec window carries the decoder’s whole receptive field as context, and
