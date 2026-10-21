@@ -397,10 +397,16 @@ The spec types are:
        model needs a specific kernel. FlashInfer and dense attention require a
        ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"`` when the FlashInfer backend is selected.
+       ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
+       (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
+       kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
+       MHA and narrow GQA (few query heads per KV head). Measure before changing it:
+       Whisper and Qwen3-ASR declare ``False``.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
+       A step whose rows each query one token runs FlashInfer's decode kernel, and
+       ``decode_tensor_cores`` picks its variant as for ``AttentionConfig``.
        See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
@@ -1386,10 +1392,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
-       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
+       (``true`` / ``false``)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``)
+       (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,

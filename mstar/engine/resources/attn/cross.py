@@ -19,7 +19,6 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
-    decode_tensor_cores,
 )
 from mstar.engine.resources.base import (
     AttentionResource,
@@ -65,6 +64,7 @@ class CrossAttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
             )
         raise ValueError(f"Unknown cross attention backend {backend!r}")
 
@@ -90,9 +90,11 @@ class FlashInferCrossManager(CrossAttentionManager):
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
         backend: str = "auto",
+        decode_tensor_cores: bool = True,
     ):
         self._kv_cache_name = kv_cache
         self._query_kv_cache_name = query_kv_cache
+        self._decode_tensor_cores = decode_tensor_cores
         self._context_label = context_label
         self._device = device
         self._dtype = dtype
@@ -394,7 +396,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],
             head_dim=kv["head_dim"], page_size=kv["page_size"],
             max_num_pages=kv["max_num_pages"], device=kv["device"], backend=kv["backend"],
-            use_tensor_cores=decode_tensor_cores(kv["num_qo_heads"], kv["num_kv_heads"]),
+            use_tensor_cores=self._decode_tensor_cores,
             **kwargs,
         )
 

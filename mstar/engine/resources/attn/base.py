@@ -109,6 +109,7 @@ class AttentionManager(AttentionResource):
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
             )
 
         if backend == AttnBackend.FLEX:

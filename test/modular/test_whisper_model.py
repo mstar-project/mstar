@@ -643,6 +643,9 @@ def test_graph_walks_and_resources():
     assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
     cap = model.MAX_CONCURRENT_REQUESTS
     assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap  # padding rows of a capture hold no pages
+    # MHA: both attentions run the CUDA-core decode kernel
+    attn = [s for s in specs if hasattr(s.config, "decode_tensor_cores")]
+    assert len(attn) == 2 and not any(s.config.decode_tensor_cores for s in attn)
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32
 

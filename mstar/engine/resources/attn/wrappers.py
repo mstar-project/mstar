@@ -258,15 +258,6 @@ class FlashInferPrefillWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
-def decode_tensor_cores(num_qo_heads: int, num_kv_heads: int) -> bool:
-    """Whether a one-token-per-row decode uses FlashInfer's tensor-core kernel.
-
-    It pads each KV head's query rows to a tile, so it pays off only with
-    enough query heads per KV head; the CUDA-core decode kernel (and its
-    lighter plan) serves MHA and narrow GQA."""
-    return num_qo_heads // num_kv_heads >= 4
-
-
 class FlashInferDecodeWrapper:
     """Batched decode attention with paged KV cache.
 
@@ -444,6 +435,7 @@ class FlashInferMixedWrapper:
         max_prefill_rows: int,
         device: torch.device,
         backend: str = "auto",
+        use_tensor_cores: bool = True,
     ):
         from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -459,7 +451,8 @@ class FlashInferMixedWrapper:
         )
         self._decode = FlashInferDecodeWrapper(
             workspace_buffer=decode_workspace, batch_size=batch_size,
-            max_num_pages=max_num_pages, accelerator_graph=True, **kv,
+            max_num_pages=max_num_pages, accelerator_graph=True,
+            use_tensor_cores=use_tensor_cores, **kv,
         )
         # one row past the prompt rows takes the step's other tokens (see `plan`)
         self._prefill = FlashInferPrefillWrapper(

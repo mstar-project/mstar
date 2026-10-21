@@ -33,6 +33,11 @@ class AttentionConfig:
     # one-token rows on the decode wrapper and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
+    # FlashInfer only: run one-token decode rows on the tensor-core kernel.
+    # False picks the CUDA-core decode kernel, which can win for MHA and
+    # narrow GQA, where the tensor-core kernel pads few query heads per KV
+    # head out to a tile.
+    decode_tensor_cores: bool = True
 
 
 @dataclass
@@ -54,6 +59,7 @@ class AttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -65,6 +71,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
 
 
 @dataclass
@@ -88,6 +96,10 @@ class CrossAttentionConfig:
     context_label: str = "context"
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # FlashInfer only: a step whose rows each query one token runs the decode
+    # kernel; this picks its tensor-core or CUDA-core variant (see
+    # ``AttentionConfig``)
+    decode_tensor_cores: bool = True
 
 
 @dataclass
@@ -111,12 +123,22 @@ class CrossAttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
     ):
         """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+
+
+def _yaml_bool(name: str, value) -> bool:
+    # the string "false" would otherwise read as true
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)

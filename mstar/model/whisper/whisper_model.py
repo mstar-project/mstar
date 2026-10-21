@@ -218,9 +218,11 @@ class WhisperModel(Model):
         nodes = {DECODER_NODE}
         return [
             KVSpec(resource_key=KV_CACHE, nodes=nodes, config=kv_config),
+            # Whisper is MHA: the CUDA-core decode kernel beats the
+            # tensor-core one, which pads one query head per KV head to a tile
             AttentionSpec(
                 resource_key=ATTN, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
             ),
             KVSpec(
                 resource_key=CROSS_KV_CACHE, nodes=nodes,
@@ -232,6 +234,7 @@ class WhisperModel(Model):
                     kv_cache=CROSS_KV_CACHE,
                     query_kv_cache=KV_CACHE,
                     context_label=CONTEXT_LABEL,
+                    decode_tensor_cores=False,
                 ),
             ),
             PositionSpec(

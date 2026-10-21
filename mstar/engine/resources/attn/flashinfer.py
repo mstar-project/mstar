@@ -16,7 +16,6 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
     check_flashinfer_head_dim,
-    decode_tensor_cores,
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -35,6 +34,7 @@ class FlashInferManager(AttentionManager):
         backend: str="auto",
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
+        decode_tensor_cores: bool = True,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -64,9 +64,7 @@ class FlashInferManager(AttentionManager):
             device=device,
             backend=backend
         )
-        self._decode_tensor_cores = decode_tensor_cores(
-            kv_config.num_qo_heads, kv_config.num_kv_heads,
-        )
+        self._decode_tensor_cores = decode_tensor_cores
 
         self._workspaces = WorkspacePool(device)
 
@@ -116,6 +114,7 @@ class FlashInferManager(AttentionManager):
                 max_prefill_rows=split.max_prefill_rows(
                     self._max_rows_in_combined, num_rows,
                 ),
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
