@@ -8,10 +8,11 @@ observation is in flight while the current chunk executes.
 
     python examples/cosmos3_action_ws_client.py --host localhost --port 8000 \\
         --image path/to/observation.jpg --prompt "pick up the mug" \\
-        --domain droid_lerobot --action-dim 10 --chunk 32 --iters 20
+        --domain droid_lerobot --action-dim 8 --chunk 32 --iters 20
 
 Each reply's ``action`` payload is float32 ``[chunk, action_dim_padded]``;
-the first ``--action-dim`` columns are the embodiment's actions.
+the first ``--action-dim`` columns are the embodiment's actions (8 for the
+released DROID policies: 7 joint positions and the gripper).
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def main() -> None:
     ap.add_argument("--image", required=True, help="observation frame (jpg/png)")
     ap.add_argument("--prompt", default="pick up the object")
     ap.add_argument("--domain", default="droid_lerobot")
-    ap.add_argument("--action-dim", type=int, default=10)
+    ap.add_argument("--action-dim", type=int, default=8)
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--steps", type=int, default=None, help="denoise steps (default: the server's policy default)")
     ap.add_argument("--guidance", type=float, default=None)
