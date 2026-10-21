@@ -32,7 +32,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_droid``
      - ``nvidia/Cosmos3-Nano-Policy-DROID``
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
-       ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
+       ``droid_lerobot``, 8-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
    * - ``cosmos3_edge``
      - ``nvidia/Cosmos3-Edge``
@@ -1080,9 +1080,17 @@ The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8,
 "action_chunk_size": 32}``; the reply's ``action`` payload is float32
 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
-embodiment's actions (for the released DROID policies, 7 joint positions and the
-gripper). For a control loop use ``/generate/ws`` (one connection,
-pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
+embodiment's actions. A policy request may also send the robot's current state
+as ``action``, one row of ``raw_action_dim`` values. It is kept clean at video
+frame 0, so ``num_frames`` equals ``action_chunk_size`` (the state counts as a
+row), and the reply leaves it out. The released DROID policies were trained this
+way, and NVIDIA's RoboLab server sends ``action_chunk_size=33``, ``num_frames=33``,
+``fps=15``, the 7 joint positions plus ``1 - gripper`` as the state, the wrist frame
+above the two exterior frames reflection-padded to 736x544 (``size="736x544"``), and
+the task with view, duration and resolution text (a JSON caption for Edge, whose
+cookbook command also sets ``guidance_interval=[960, 1001]``). For a control loop
+use ``/generate/ws`` (one connection, pipelined observations):
+``examples/cosmos3_action_ws_client.py`` builds that request, runs the loop and
 reports chunks/s, actions/s and latency percentiles.
 
 Cosmos3 streaming rollout (windowed video)
