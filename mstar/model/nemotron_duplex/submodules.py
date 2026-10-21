@@ -467,13 +467,12 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     BATCHED_CHUNK_S = 1.0
 
     def __init__(self, perception: nn.Module, rnnt_decoder: nn.Module, rnnt_joint: nn.Module,
-                 config: NemotronDuplexConfig, max_session_samples: int):
+                 config: NemotronDuplexConfig):
         super().__init__()
         self.perception = perception
         self.rnnt_decoder = rnnt_decoder
         self.rnnt_joint = rnnt_joint
         self.config = config
-        self.max_session_samples = max_session_samples
         self._streamer = None
 
     def prepare_inputs(

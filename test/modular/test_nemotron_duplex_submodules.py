@@ -602,10 +602,9 @@ class _Encoder:
     """The encoder node with its state pool, driven as the engine drives an
     eager step: declare, admit and plan the pool, preprocess, forward, commit."""
 
-    def __init__(self, max_session_samples=16000 * 10, **featurizer):
+    def __init__(self, **featurizer):
         p = _small_perception(**featurizer)
-        self.node = ConformerEncoderSubmodule(p, nn.Identity(), nn.Identity(), config=NemotronDuplexConfig(),
-                                              max_session_samples=max_session_samples)
+        self.node = ConformerEncoderSubmodule(p, nn.Identity(), nn.Identity(), config=NemotronDuplexConfig())
         def pool(key, num_layers, blocks):
             spec = RecurrentStateSpec(key, {"conformer_encoder"},
                                       RecurrentStateConfig(num_layers=num_layers, blocks=blocks, max_slots=8))
@@ -822,7 +821,6 @@ def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, 
     starts = list(range(0, b_len, 1280))
     steps = len(starts) + (0 if b_end_rides else 1)
     a, b = torch.randn(a_chunk * steps) * 0.1, torch.randn(b_len) * 0.1
-    enc.node.max_session_samples = a.numel()
     got_b = []
     for k, pb in enumerate(starts):
         b_final = b_end_rides and k == len(starts) - 1
@@ -871,7 +869,7 @@ def test_encoder_and_codec_take_no_batch_wider_than_their_graphs():
 
     nodes = {
         "conformer_encoder": ConformerEncoderSubmodule(nn.Identity(), nn.Identity(), nn.Identity(),
-                                                       config=NemotronDuplexConfig(), max_session_samples=16000),
+                                                       config=NemotronDuplexConfig()),
         "audio_codec": AudioCodecDecoderSubmodule(codec=nn.Identity(), config=NemotronDuplexConfig()),
     }
     engine = Engine.__new__(Engine)

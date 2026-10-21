@@ -1286,10 +1286,7 @@ class NemotronDuplexModel(Model):
         perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
         rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
         rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
-        return ConformerEncoderSubmodule(
-            perception, rnnt_dec, rnnt_joint, config=self.config,
-            max_session_samples=self.max_session_samples,
-        )
+        return ConformerEncoderSubmodule(perception, rnnt_dec, rnnt_joint, config=self.config)
 
     def _create_talker_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
