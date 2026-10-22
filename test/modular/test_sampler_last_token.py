@@ -28,6 +28,15 @@ def test_eager_write_and_read_go_by_request():
     assert bufs.has_slot("a") and not bufs.has_slot("zz")
 
 
+def test_an_eager_write_leaves_the_master_of_a_row_outside_kept_rids():
+    bufs = _buffers()
+    for rid in ("kept", "dropped"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["kept", "dropped"], torch.tensor([1, 2]))
+    bufs.write_last_tokens(["kept", "dropped"], torch.tensor([11, 12]), kept_rids=frozenset({"kept"}))
+    assert bufs.last_tokens_for(["kept", "dropped"]).tolist() == [11, 2], "a discarded sample overwrote its row's token"
+
+
 def test_the_captured_row_scatters_to_the_slot_master_and_gathers_back():
     bufs = _buffers(max_bs=4, cg_slots=2)
     for rid in ("a", "b", "c"):
