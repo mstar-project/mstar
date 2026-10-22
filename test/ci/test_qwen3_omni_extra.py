@@ -19,7 +19,6 @@ class Qwen3OmniExtraTests(unittest.TestCase):
             self.assertIn("audioread", names, name)
 
     def test_qwen3_omni_and_all_need_the_transformers_with_vision_utils(self):
-        # the vision encoder imports transformers.vision_utils, which 5.18 has and 5.5 does not
         extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
         for name in ("qwen3_omni", "all"):
             pins = [req for req in extras[name] if req.split(">")[0].split("=")[0].strip() == "transformers"]

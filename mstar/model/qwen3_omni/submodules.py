@@ -103,8 +103,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
-    # Runs eager as a layout walk's encoder. A dynamic=True compile takes minutes on the
-    # first clip, and marking its frame dimension dynamic still recompiles for each length.
+    # A dynamic=True compile takes minutes on the first clip, and marking the frame
+    # dimension dynamic still recompiles for each length.
     eager_item_encoder = True
 
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
@@ -193,8 +193,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        """Extract pixel_values and grid_thw, and build interp_indices, interp_weights,
-        position_ids and cu_seqlens from the grid.
+        """Extract pixel_values, grid_thw, and compute cu_seqlens.
 
         ``pixel_values`` and ``image_grid_thw`` are produced by
         ``Qwen3OmniModel.process_prompt`` from the raw ``image_inputs``
@@ -217,8 +216,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)  # (1, 3)
 
-        # Built here and not in the compiled forward, whose `.tolist()` of the grid would
-        # pin the patch count and compile every image size again.
+        # Built outside the compiled forward, since these helpers call `.tolist()` on the
+        # grid, which would compile a graph for every image size.
         encoder = self.vision_encoder
         interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
             grid_thw, num_grid_per_side=encoder.num_grid_per_side, mode=encoder.interpolation_mode,
@@ -261,7 +260,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         encoder_output = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
-            # the patch count. An image is one segment this long, and no video frame's segment is longer.
+            # an image is one segment of all its patches, and no video frame's segment is longer
             max_seqlen=pixel_values.shape[0],
             **kwargs,
         )
@@ -459,8 +458,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 self._get_talker_text_mask(text_ids) # text inclusion
             ])
-            # No custom_pos_ids: the plan places a text row's positions from the counter,
-            # which a cache hit has already moved.
+            # A text row leaves its positions to the plan, which starts from the
+            # counter a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
@@ -542,7 +541,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
             if seconds_per_grid is None:
-                # from the helper the prompt's layout uses, so the cache and this walk agree on the advance
+                # Use the prompt layout's helper, so the cache and this walk move the position by the same amount.
                 end_pos_base = start_pos + image_span(grid_thw, self.config.vision.spatial_merge_size).advance - 1
             else:
                 end_pos_base = float(vision_pos_ids.max().item()) + 1
@@ -583,11 +582,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         start: int,
         end: int,
     ) -> ARNodeInputs:
-        """Also cuts the Talker masks and the deepstack rows.
-
-        A partly held image or audio clip leaves the counter at its start, so the
-        tail keeps its own positions.
-        """
         tensors = inputs.tensor_inputs
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
         cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
@@ -628,7 +622,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
             # A vision row's 3D-grid MRoPE span differs from its token count, and
             # a cut audio row moves past its whole clip, so each advances the
-            # counter by its own `mrope_pos_advance`. Other rows advance it by their span.
+            # counter by its own `mrope_pos_advance`.
             pos_advance = tuple(
                 int(inp.tensor_inputs.get("mrope_pos_advance", inp.input_seq_len))
                 for inp in inputs
@@ -708,11 +702,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        """``[3, total_tokens]`` for the step, in packed request order.
-
-        A text row takes the position resource's planned positions on all three
-        grids. Audio, vision and decode rows place their own.
-        """
         pos_ids = self.node_resources[THINKER_POS].pos_ids("main")
         parts: list[torch.Tensor] = []
         offset = 0

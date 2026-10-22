@@ -470,7 +470,6 @@ def test_a_keyed_node_that_streams_into_another_partition_loads():
         config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
     )
 
-    # the conductor turns the cache off for a request that runs the talker
     _refuse_unservable_walks([spec], model)
 
 

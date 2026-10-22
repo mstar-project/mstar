@@ -146,10 +146,8 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
     partition, or where no keyed node runs.
 
     A walk the cache serves whole completes with no outputs, so a node that
-    reads them would get nothing. Where a keyed node streams into a partition other
-    than its own, the conductor turns the cache off for a request that runs that
-    partition (see `streamed_partitions`). Only a stream with layout walks is
-    checked, because a stream with one span always runs its last token.
+    reads them would get nothing. Only a stream with layout walks is checked,
+    because a stream with one span always runs its last token.
     """
     graphs = model.get_graph_walk_graphs()
     partition_of = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}
@@ -185,10 +183,10 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
 
 
 def streamed_partitions(specs: list[NodeResourceSpec], model: Model) -> frozenset[str]:
-    """The partitions a keyed node streams into, counting only the walks of streams with ``layout_walks``.
+    """The partitions a keyed node of a stream with ``layout_walks`` streams into.
 
-    A walk the cache serves, whole or in part, streams nothing for the tokens it
-    skips, so the conductor does not cache a request that runs one of these partitions.
+    A walk the cache serves streams nothing for the tokens it skips, so the
+    conductor doesn't cache a request that runs one of these partitions.
     """
     graphs = model.get_graph_walk_graphs()
     partition_of = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}

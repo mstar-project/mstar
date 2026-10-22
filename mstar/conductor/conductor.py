@@ -588,7 +588,6 @@ class Conductor:
         return specs
 
     def _streamed_partitions(self) -> frozenset[str]:
-        """`streamed_partitions`, computed on the first ingest and kept."""
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
             streamed = streamed_partitions(list(self._resource_specs().values()), self.model)

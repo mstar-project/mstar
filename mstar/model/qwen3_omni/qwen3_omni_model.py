@@ -120,7 +120,6 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 
 
 class ImageSpan(NamedTuple):
-    """A still image's KV slots and how far it moves the MRoPE position, its two sentinels included."""
     length: int
     advance: int
 
@@ -317,7 +316,6 @@ class Qwen3OmniModel(Model):
         return self.local_dir
 
     def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
-        """The audio encoder's output length for a clip's feature frames, from the function its `forward` uses."""
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
 
         return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
@@ -1142,8 +1140,7 @@ class Qwen3OmniModel(Model):
         the Thinker's prefill walks.
 
         A prompt with images or audio and no video, given their tensors, also
-        returns the Thinker's ``prefix_layout``, so the prompt is keyed past its
-        images and audio.
+        returns the Thinker's ``prefix_layout``.
         """
         result: NameToTensorList = {}
 
@@ -1291,7 +1288,6 @@ class Qwen3OmniModel(Model):
     def _prefix_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], tensors: NameToTensorList,
     ) -> list[Span]:
-        """One span per Thinker walk, in walk order."""
         spans = []
         for step in prefill_plan(parts):
             if step.modality == TEXT:

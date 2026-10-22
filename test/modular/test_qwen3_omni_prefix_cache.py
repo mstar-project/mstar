@@ -1,10 +1,4 @@
-"""Qwen3-Omni's Thinker keys its prompt past images and audio, and a hit cuts a walk short.
-
-A cut walk has to run at the positions the cache keyed it at, after a refused
-admit too, or every later walk runs, and files its pages, at wrong positions.
-The layout ``process_prompt`` returns has to list each walk the schedule runs with
-the slots it writes, or the cache drops the layout partway through.
-"""
+"""Qwen3-Omni's Thinker keys its prompt past images and audio, and a hit cuts a walk short."""
 
 from __future__ import annotations
 
@@ -39,12 +33,7 @@ NODE = "Thinker"
 HIDDEN = 8
 
 
-# ── a cut walk's positions ──────────────────────────────────────────────
-
-
 class _StubThinker(nn.Module):
-    """The one part of the Thinker `prepare_inputs` reads: its token embeddings."""
-
     def __init__(self):
         super().__init__()
         self.model = nn.Module()
@@ -52,7 +41,6 @@ class _StubThinker(nn.Module):
 
 
 class _Holding(Resource):
-    """Answers every probe the same, as the KV cache answers from its lease."""
 
     supports_preplan = True
 
@@ -85,7 +73,6 @@ def thinker():
 
 
 def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None, rid: str = RID):
-    """`Engine._prepare_inputs` for one row: the submodule prepares, then the engine probes and cuts."""
     info = SimpleNamespace(rid_handle=rid)
     prepared = thinker.prepare_inputs(walk, info, inputs)
     if held is None:
@@ -105,7 +92,6 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
 
 
 def test_a_cut_text_walk_prepared_again_is_planned_where_the_cache_keyed_it(thinker):
-    # Earlier walks wrote 10 positions, and the cache holds 6 of this walk's 12 tokens.
     rope = thinker.node_resources[THINKER_POS]
     rope._counters[RID] = {"main": 10}
     text = {"text_inputs": [torch.arange(8, 14).repeat(2)]}
@@ -157,8 +143,8 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds_and_keep
 
 
 def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(thinker):
-    # Held: 6 of 12 text tokens, 28 of a clip's 30 slots, and 3 of an image's 8 slots, which advance
-    # the counter by 5. A partly held item leaves the counter at its start.
+    # The cache holds 6 of 12 text tokens, 28 of a clip's 30 slots, and 3 of an image's 8 slots,
+    # which advance the counter by 5. A partly held item leaves the counter at its start.
     rope = thinker.node_resources[THINKER_POS]
     rows = {
         "text": ("prefill_text", {"text_inputs": [torch.arange(8, 14).repeat(2)]}, 10, CachedPrefix("main", 6, 16)),
@@ -195,9 +181,6 @@ def test_an_images_span_is_what_its_positions_place(grid):
     )
 
 
-# ── the layout against the schedule ─────────────────────────────────────
-
-
 _SPECIALS = {
     "<|vision_start|>": 151652, "<|vision_end|>": 151653, "<|image_pad|>": 151655, "<|video_pad|>": 151656,
     "<|audio_start|>": 151669, "<|audio_end|>": 151670, "<|audio_pad|>": 151675,
@@ -210,8 +193,6 @@ _PLACEHOLDERS = {
 
 
 class _Tokenizer:
-    """Maps each placeholder to one id and each remaining character to its code point."""
-
     unk_token_id = 0
 
     def convert_tokens_to_ids(self, token):
@@ -224,8 +205,6 @@ class _Tokenizer:
 
 
 class _Processor:
-    """The checkpoint's chat template, and processors that return only the shapes the layout reads."""
-
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         turns = "".join(
             f"<|im_start|>{m['role']}\n" + (m["content"] if isinstance(m["content"], str) else "".join(
@@ -268,9 +247,9 @@ def _prompt(model, modalities: list[str], tensors: dict | None, **kwargs):
     return model.process_prompt(texts, modalities, ["text"], tensors=tensors, **kwargs)
 
 
-# a 64x96 image is a 4x6 patch grid, 2x3 after the merge: 6 slots and the two sentinels, advancing by 3 + 2
+# A 64x96 image is a 4x6 patch grid, 2x3 after the merge, so it writes 8 slots with its sentinels and advances by 5.
 _IMAGE = ("prefill_vision", 8, 5)
-# a second of audio is 100 feature frames, which the encoder turns into 13: 15 slots with the sentinels
+# A second of audio is 100 feature frames, which the encoder turns into 13, so it writes 15 slots with its sentinels.
 _AUDIO = ("prefill_audio", 15, 15)
 _PROMPTS = {
     "image then text": (["image", "text"], {"image_inputs": [torch.rand(3, 64, 96)]}, [_IMAGE]),
@@ -302,7 +281,7 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
 
 @pytest.mark.parametrize("frames", [37, 137, 1013])
 def test_an_audio_clips_length_is_what_the_encoder_returns(model, frames):
-    # a small encoder: its output length depends on the frames and the window only
+    # The output length depends only on the frames and the window, so a small encoder is enough.
     config = Qwen3OmniMoeAudioEncoderConfig(
         n_window=model.config.audio_encoder.n_window, encoder_layers=1, d_model=64, encoder_attention_heads=2,
         encoder_ffn_dim=64, output_dim=64, downsample_hidden_size=8,
@@ -331,13 +310,10 @@ def test_only_a_prompt_with_media_and_no_video_returns_a_layout(model):
     }, "the layout has no span for a video, and a text prompt is keyed whole"
 
 
-# ── the vision encoder's inputs ─────────────────────────────────────────
-
-
 @pytest.fixture
 def vision():
-    # a small encoder: the tensors `prepare_inputs` builds depend only on the grid, the merge size
-    # and `num_grid_per_side`
+    # The tensors `prepare_inputs` builds depend only on the grid, the merge size and
+    # `num_grid_per_side`, so a small encoder is enough.
     config = Qwen3OmniMoeVisionEncoderConfig(
         depth=2, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=16,
         num_position_embeddings=64, deepstack_visual_indexes=[0, 1],

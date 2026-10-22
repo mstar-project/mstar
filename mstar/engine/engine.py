@@ -614,10 +614,7 @@ class Engine:
         A node in ``_item_encoders`` is compiled with dynamic=True instead. Under
         the default it recompiles on its second input shape and the new graph
         rounds differently, so the KV cached from its earlier outputs would no
-        longer match what it computes. An item encoder whose submodule sets
-        ``eager_item_encoder`` runs eager, which keeps its outputs stable as well.
-        One whose submodule sets ``marks_dynamic_dims`` marks every dimension that
-        varies in `prepare_inputs`, so the default serves every size from one graph.
+        longer match what it computes.
         """
         if not self.device_capability.is_available:
             return
@@ -1113,9 +1110,7 @@ class Engine:
 
         Only the walks a keyed stream names are probed, and only when
         `split_inputs` can cut their inputs; a guided walk writes two labels
-        from one input, so it is skipped. The base `split_inputs` cuts only the
-        sequence, so a walk carrying ``tensor_inputs`` is probed only when the
-        submodule overrides it. A skipped walk is still passed to
+        from one input, so it is skipped. A skipped walk is still passed to
         `apply_cached_prefix` with no prefix, because it writes over whatever
         the resources hold for it.
         """
