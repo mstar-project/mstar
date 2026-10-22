@@ -331,9 +331,7 @@ is FlashInfer's one-shot kernel up to 2048 tokens when every GPU has peer
 access, and NCCL otherwise. On 4x GB200 at TP4 with ``MSTAR_TP_ASYNC_SCHED=1``
 it decodes 277 tok/s for one request and 1650 tok/s across eight, with a
 37 ms time to first token. Above ~32 concurrent requests the TP leader's CPU,
-not the GPUs, is the limit. See :doc:`environment_variables` for the
-``COMMAND_A_PLUS_*`` switches that turn the fused path, the one-shot
-all-reduce or decode graphs off.
+not the GPUs, is the limit.
 
 Against the Hugging Face reference (``benchmark/command_a_plus/validate_checkpoint.py``,
 three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output

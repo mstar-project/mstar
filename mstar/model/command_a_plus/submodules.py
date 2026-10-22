@@ -1,6 +1,5 @@
 """Packed prefill and one-token-per-request decode for Command A+."""
 
-import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -44,8 +43,6 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        if os.environ.get("COMMAND_A_PLUS_DISABLE_CUDA_GRAPH"):
-            return []
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",

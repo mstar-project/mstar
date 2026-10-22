@@ -1,7 +1,6 @@
 """Single-node text generation with pinned metadata and explicitly supplied weights."""
 
 import json
-import os
 
 import torch
 
@@ -168,7 +167,7 @@ class CommandAPlusModel(Model):
             self.local_dir, device="cpu", prefix="model.language_model.",
         ))
         language_model.eval()
-        if torch.device(device).type == "cuda" and not os.environ.get("COMMAND_A_PLUS_UNFUSED"):
+        if torch.device(device).type == "cuda":
             language_model.model.fuse_for_inference()
         return CommandAPlusLLMSubmodule(language_model, self.config).eval()
 
