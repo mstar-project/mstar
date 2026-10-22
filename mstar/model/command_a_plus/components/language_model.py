@@ -1,5 +1,3 @@
-import logging
-import os
 from collections.abc import Iterable
 
 import torch
@@ -18,8 +16,6 @@ from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.moe import ParallelSparseMoeBlock
-
-logger = logging.getLogger(__name__)
 
 
 class CommandAPlusLayerNorm(nn.Module):
@@ -304,8 +300,6 @@ class CommandAPlusLanguageModel(nn.Module):
         self.norm = CommandAPlusLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.fused = False
         self._replicated_embedding: torch.Tensor | None = None
-        self._allreduce_workspace = None
-        self._allreduce_max_tokens = 0
 
     def fuse_for_inference(self, max_allreduce_tokens: int = 2048) -> None:
         """Switch to fused kernels and concatenated GEMMs. CUDA only, after loading.
@@ -328,60 +322,12 @@ class CommandAPlusLanguageModel(nn.Module):
             torch.distributed.all_gather_into_tensor(
                 self._replicated_embedding, shard.contiguous(), group=group.device_group,
             )
-        if group.world_size > 1 and not os.environ.get("COMMAND_A_PLUS_NCCL_ALLREDUCE"):
-            self._allreduce_workspace = self._create_allreduce_workspace(max_allreduce_tokens)
-            if self._allreduce_workspace is not None:
-                self._allreduce_max_tokens = max_allreduce_tokens
-
-    def _create_allreduce_workspace(self, max_tokens: int):
-        """FlashInfer's one-shot all-reduce workspace, or None to use NCCL.
-
-        It needs direct peer access between all ranks (NVLink). Ranks agree on
-        the outcome, so if any rank fails they all fall back to NCCL.
-        """
-        group, weight = self.comm_group, self.embed_tokens.weight
-        workspace, error = None, None
-        try:
-            from flashinfer.comm import create_allreduce_fusion_workspace
-
-            workspace = create_allreduce_fusion_workspace(
-                backend="trtllm", world_size=group.world_size, rank=group.rank,
-                max_token_num=max_tokens, hidden_dim=weight.shape[1],
-                dtype=weight.dtype, group=group.device_group,
-            )
-        except Exception as exc:
-            error = exc
-        ok = torch.tensor([workspace is not None], dtype=torch.int32, device=weight.device)
-        torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN, group=group.device_group)
-        if ok.item():
-            return workspace
-        if workspace is not None:
-            workspace.destroy()
-        logger.warning(
-            "FlashInfer one-shot all-reduce unavailable (%s); Command A+ uses NCCL",
-            error if error is not None else "failed on another rank",
-        )
-        return None
+            group.init_allreduce_fusion(shard.shape[1], shard.dtype, max_allreduce_tokens)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._replicated_embedding is None:
             return self.embed_tokens(input_ids)
         return F.embedding(input_ids, self._replicated_embedding)
-
-    def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        """Small reductions (decode, short prefill) take FlashInfer's one-shot
-        NVLink all-reduce, ~4x lower latency than NCCL at decode sizes; larger
-        ones go through NCCL. Both give every rank identical sums."""
-        if self._allreduce_workspace is None or x.shape[0] > self._allreduce_max_tokens:
-            return self.comm_group.all_reduce(x)
-        from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
-
-        out = torch.empty_like(x)
-        allreduce_fusion(
-            input=x, workspace=self._allreduce_workspace, pattern=AllReduceFusionPattern.kAllReduce,
-            output=out, fp32_acc=True,
-        )
-        return out
 
     def forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
         if self.fused:
@@ -406,7 +352,7 @@ class CommandAPlusLanguageModel(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.bind_step(label)
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            delta = self._all_reduce(layer.fused_branches(normalized))
+            delta = self.comm_group.fused_all_reduce(layer.fused_branches(normalized))
             norm = norms[layer_idx + 1]
             residual, normalized = add_layernorm(residual, delta, norm.weight, norm.eps)
         return normalized
