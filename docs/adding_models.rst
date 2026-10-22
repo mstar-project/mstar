@@ -1909,6 +1909,63 @@ stream-consuming walk split over worker graphs, unless every consumer also waits
 non-streamed input and all the walk's worker graphs run on the same workers. That input
 must arrive once per pass (from the conductor, say); startup cannot check this.
 
+Streams from the client
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A model that listens while it runs (a full-duplex speech model, say) takes its live input
+as a stream the client feeds. Declare it like any other connection, with the reserved
+producer ``CLIENT``:
+
+.. code-block:: python
+
+   from mstar.streaming.topology import CLIENT, Connection
+
+   Connection(from_partition=CLIENT, to_partition="Encoder", edge_name="audio_in",
+              chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1))
+
+``CLIENT`` is not a partition: it has no walks and no worker, and it must not appear in
+``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
+``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
+chunk policy, exactly as it would a stream from another partition. Its partition
+self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+the only one, in any walk, that takes the edge; the conductor checks this at startup, and
+that the model implements ``process_stream_chunk``. A partition may take several client
+streams (audio and video, say): each has its own buffer and its own end.
+
+- ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
+  keyed by client edge name. ``chunk`` is a ``ClientChunk`` (``mstar.model.base``):
+  ``text``; ``tensors`` and ``input_metadata``, the append's files loaded as for a request
+  (``audio_inputs`` and so on); ``streams``, per ``tensors`` list the client stream each
+  file names (``None`` where the client named none, so the model decides);
+  ``model_kwargs``, the append's own; and ``request_kwargs``, the opening message's.
+  Raise ``ValueError`` for an append the model doesn't take (the client gets a 400). An
+  append of text alone that yields no item is refused rather than dropped, but the data
+  worker can't tell which items text sent with files yielded: refuse such text yourself
+  if the model takes none. Keep it stateless; the
+  consuming node keeps its own state, in its resources or ``request_state``.
+- Tensors ``process_prompt`` returns under a client edge's name are the stream's first
+  chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+- A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
+  (``mstar.streaming.topology``), which the client-stream layer enforces before any of
+  the model's code runs: ``max_items``, what the stream may carry over a call's life,
+  each item counting ``item_size(item)`` (1 by default; a stream of variable-length
+  chunks counts their frames or samples, named by ``unit``); and ``max_pending_items``,
+  how many items its consumer may have been sent and not consumed, with
+  ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"keep_newest"``
+  (what fits is sent; of the rest the newest item waits for room and the others are
+  dropped). The consumer's worker reports what it has taken after each step that took
+  any, so a consumer reading inside a loop makes room as it reads. A call past
+  ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
+  session cap of its own. Declare the most the consumer can take: a deployment may
+  lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
+  it.
+- A stream ends when the client ends it: ``end_input: true`` ends all of the call's
+  streams, a list of names only those. The consumer gets ``producer_done`` for that edge
+  and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
+  Over ``/generate/ws`` the client appends and ends input explicitly (see
+  :doc:`clients`); every other route ends the input as soon as the request is submitted.
+  ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
+
 Checklist
 ---------
 

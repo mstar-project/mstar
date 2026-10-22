@@ -32,6 +32,9 @@ def make_test_api_server(**overrides) -> APIServer:
     server.metrics = None
     server.model = None
     server.model_name = "dummy"
+    server.client_streams = frozenset()
+    server.takes_stream_input = False
+    server.max_call_input_bytes = 512 * 1024 * 1024
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None

@@ -15,6 +15,7 @@ from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput  # noqa: E402
 from mstar.communication.codec import default_codec  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
 
@@ -76,6 +77,9 @@ def test_a_queued_message_that_fails_to_send_is_dropped_not_retried():
 
 
 class _Model:
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def process_prompt(self, *args, **kwargs):
         return {"text_inputs": [torch.tensor([1, 2, 3])]}
 

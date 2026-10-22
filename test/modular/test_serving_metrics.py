@@ -38,6 +38,7 @@ from mstar.communication import wire
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
+from mstar.streaming.topology import PartitionTopology
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -706,6 +707,9 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
         def process_prompt(self, *args, **kwargs):
             return None
 
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["default"])
+
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
@@ -1007,6 +1011,9 @@ class _MediaModel:
 
     def max_input_files(self):
         return {"image": 1}
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def load_image(self, filepath, device):
         from mstar.model.base import Model

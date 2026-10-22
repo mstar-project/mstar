@@ -67,6 +67,8 @@ class StreamBuffer:
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
+    # _consumed as the conductor last heard it, for a stream it paces
+    consumed_reported: int = 0
     _chunks_popped: int = 0
     # global position just past the last item ever handed out; everything
     # before it in a later window is context, not new data

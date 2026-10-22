@@ -89,7 +89,8 @@ that cannot afford an HTTP round trip per step (robot policies, streaming world 
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
-as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
+as a msgpack binary frame (``data`` raw bytes); a field sent as ``null`` counts as
+absent. Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
@@ -123,6 +124,72 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
 ``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+
+**Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
+request's input open after the opening message, so the opening message may carry no media
+at all. An append feeds the running request more input, in order, while its output keeps
+streaming back:
+
+.. code-block:: text
+
+   {"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
+                                  "model_kwargs": {...}}}
+
+Every field of the record is optional, but an append needs text, files or ``end_input``.
+``stream`` names the client stream a file is for (the model decides when it is absent; a
+name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
+reach only the model's ``process_stream_chunk``, so they mean what that model reads from
+them, and the opening message's still hold for the request (its sampling settings, say).
+``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
+in an append is its own. An append of text alone that the model turns into no stream item
+is rejected; text sent with files reaches the model, and if it ignores the text, the text
+is dropped without an error. ``{"request_id", "end_input": true}``
+ends the input, alone or on an append (or on the opening message, for a one-shot
+request). The request then finishes as usual. A model may take several client streams
+(audio and video, say); ``end_input`` may then name the ones it ends, as a list
+(``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
+An append that names a stream already ended, as a file's ``stream`` or in
+``end_input``, is answered as late, as one after ``end_input: true`` is (below). So is
+one whose files name no stream and that the model routes to a stream already ended:
+what it carried for that stream is dropped, uncounted, and the rest goes on. The opening
+message's files may name a ``stream`` too, which is checked the same way (a name the
+model doesn't have gets a 400), but the model routes the opening's files itself.
+
+A live call needs a ``request_id``; only the socket that opened it can append to it, and
+closing the socket aborts it. A message is an append if it carries ``append`` at its top
+level, or ``end_input`` (true or a list) and no ``text`` or ``files``; the fields inside
+an append's record never open a request, and a message that opens a request under the
+call's id gets a 409 while the call goes on. An append carries its text, files and ``model_kwargs``
+inside the record: beside it they are rejected. A ``null`` field counts as absent, inside
+the record too. Input resets the request timeout. A rejected append (an unknown file type,
+say) ends the call with its error (``status`` 400), and no finish follows, since the input
+it carried is lost. So does an append the server then fails to load or process (a corrupt
+file, say), with that failure's status, as for a request's own files, and so does input
+past a limit the model or the deployment sets on a stream (how much a call may send, or
+how far it may run ahead of the model, unless the stream keeps only its newest input instead;
+``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after
+``end_input``, or after the model has ended the call, or to a request this socket has no
+live call under, gets ``{"request_id", "append": true, "error"}``: a reply to that append,
+not the end of a request, and the call goes on. A call still waiting for a slot
+(``max_concurrent_requests``) holds at most 256 messages of input meanwhile, one per append
+plus one each for the opening message's media and the end of input; the next ends the call
+with ``status`` 503. Other models ignore ``end_input``, and an append to them is rejected.
+Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
+
+.. code-block:: python
+
+   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"]}))
+   for chunk in microphone_chunks():  # e.g. 80 ms WAV files
+       ws.send(msgpack.packb({"request_id": "call",
+                              "append": [{"name": "chunk.wav", "data": chunk}]}))
+   # the record form: text, files aimed at a stream, and settings for this append,
+   # which only the model's process_stream_chunk reads
+   ws.send(msgpack.packb({"request_id": "call", "append": {
+       "text": "and now in French",
+       "files": [{"name": "chunk.wav", "data": chunk, "stream": "audio_in"}],
+       "model_kwargs": {"gain": 2.0},  # what this model's hook reads, not a sampling setting
+   }}))
+   ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
 
 Python SDK
 ----------

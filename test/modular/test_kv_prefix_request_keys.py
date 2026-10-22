@@ -28,6 +28,7 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import PrefixStream, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.streaming.topology import PartitionTopology
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -69,6 +70,9 @@ class _Model:
         self._declares = declares
         self._metadata = metadata
         self._decode_walk = decode_walk
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def prefix_key_streams(self):
         if not self._declares:

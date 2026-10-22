@@ -16,6 +16,10 @@ from mstar.graph.loop_indices import NestedLoopIndices
 
 
 class _Model:
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 

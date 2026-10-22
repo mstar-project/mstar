@@ -67,6 +67,10 @@ class _BlockingModel:
         self.release = threading.Event()
         self.entered = threading.Event()
 
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def process_prompt(self, *args, **kwargs):
         self.entered.set()
         assert self.release.wait(timeout=10)

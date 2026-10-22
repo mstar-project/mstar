@@ -56,9 +56,11 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.streaming.topology import CLIENT, client_stream_limits
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
+    ClientStreamConsumed,
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
@@ -341,6 +343,11 @@ class Worker:
     # Empty for a text model, which lets a speculation build skip its three
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
+
+    # Client streams this worker consumes whose client the conductor holds to
+    # max_pending_items. Empty for every other model, which then pays one
+    # check per step for them.
+    _paced_streams: frozenset[str] = frozenset()
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -672,6 +679,9 @@ class Worker:
         self._stream_partition: dict[str, str] = {
             conn.edge_name: conn.to_partition for conn in self._my_consumer_connections
         }
+        self._paced_streams = self._find_paced_streams(
+            self.partition_topology, self._my_consumer_connections, model_config,
+        )
 
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop in _postprocess_batch. Structural, so it is
@@ -685,6 +695,16 @@ class Worker:
 
         if status_interval_s is not None:
             self._metrics = self._start_metrics(status_interval_s)
+
+    @staticmethod
+    def _find_paced_streams(topology, consumer_connections, model_config) -> frozenset[str]:
+        """Of the streams in ``consumer_connections``, the client streams with
+        a max_pending_items bound, by the conductor's rule."""
+        mine = [conn.edge_name for conn in consumer_connections if conn.from_partition == CLIENT]
+        if not mine:
+            return frozenset()
+        limits = client_stream_limits(topology, model_config)
+        return frozenset(name for name in mine if limits[name].max_pending_items is not None)
 
     def _start_metrics(self, interval_s: float) -> WorkerMetrics:
         """Metrics on: send the conductor a WorkerStatus every ``interval_s``,
@@ -1090,19 +1110,34 @@ class Worker:
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
-        # Handle producer_done signal: mark all StreamBuffers for this request as done
-        if body.producer_done:
-            if req_info:
-                for edge_name, sbuf in req_info.stream_buffers.items():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
+        # Handle producer_done signal: end the producer's streams it counts.
+        # The conductor (its only sender) counts every edge it ends, with 0
+        # items too, so a producer partition's end names each of its edges into
+        # this consumer, and a client's names only the streams the client ended.
+        if body.producer_done and req_info:
+            counts = body.producer_done_items
+            for edge_name, sbuf in req_info.stream_buffers.items():
+                if sbuf.from_partition in body.producer_done and edge_name in counts:
+                    sbuf.signal_done(counts[edge_name])
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
-        streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
+        buffers = req_info.stream_buffers if req_info else {}
+        streaming_with_tensors = []
+        unbuffered = []
+        for edge in body.inputs:
+            if edge.is_streaming and edge.tensor_info:
+                (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
+        if unbuffered:
+            # Nothing here will consume it: ack it unread so the producer frees
+            # it. Expected when the request's ingest failed on this worker.
+            if request_id not in self.scheduler.failed_rids:
+                logger.warning(
+                    "Worker %s: no stream buffer for %s of request %s; dropping it",
+                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
+                )
+            self.tensor_manager.ack_unread_tensors(request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -1810,6 +1845,36 @@ class Worker:
                 for edge_name, sbuf in req_info.stream_buffers.items()
             }))
         return out
+
+    def _report_paced_consumption(
+        self, node_name: str, consumed: list[tuple[int, dict[str, int]]],
+        reported_rids: list[int],
+    ) -> None:
+        """Send the conductor this step's consumed counts of the paced client
+        streams (see ``ClientStreamConsumed``) that moved, except for the rids
+        whose WORKER_GRAPHS_DONE (``reported_rids``) just carried them. Only
+        the lockstep leader sends: the conductor counts only the first rank's
+        consumption, and every rank's is the same."""
+        if node_name not in self.parallel_leader_nodes:
+            return
+        infos = self.request_state.per_request_info
+        reported = set(reported_rids)
+        body = ClientStreamConsumed()
+        for rid, per_edge in consumed:
+            sbufs = infos[rid].stream_buffers
+            for name in self._paced_streams:
+                n = per_edge.get(name)
+                if n is None or n == sbufs[name].consumed_reported:
+                    continue
+                sbufs[name].consumed_reported = n
+                if rid not in reported:
+                    body.request_ids.append(self._rid_str(rid))
+                    body.edge_names.append(name)
+                    body.consumed.append(n)
+        if body.request_ids:
+            self.communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.CLIENT_STREAM_CONSUMED, body=body,
+            ))
 
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings for each rid's WORKER_GRAPHS_DONE."""
@@ -3568,6 +3633,11 @@ class Worker:
         completed_rids = self._graph_runtime.send_outputs(send_input)
         for rid in completed_rids:
             self.request_state.flush_publish_info(rid, batch_N.partition)
+        # A consumer reading its stream inside a dynamic loop sends no
+        # WORKER_GRAPHS_DONE until the loop ends, so its client's room has to
+        # come from here.
+        if self._paced_streams and consumed:
+            self._report_paced_consumption(batch_N.node_name, consumed, completed_rids)
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.send", _time.perf_counter() - _t_send,

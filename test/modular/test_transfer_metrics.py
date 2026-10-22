@@ -35,6 +35,7 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessageType,
     EnableMetrics,
@@ -360,6 +361,9 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
 class _TextModel:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

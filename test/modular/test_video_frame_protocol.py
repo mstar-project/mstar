@@ -399,6 +399,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.timing_requested = threading.Event()
     worker._prefix_streams = {}
     worker._live_requests = {}
+    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(

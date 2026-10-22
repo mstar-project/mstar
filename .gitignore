@@ -15,6 +15,8 @@ traces/
 
 # per-user env config
 .env
+# a local virtualenv, or a symlink to one (no trailing slash, so the link is ignored too)
+.venv
 
 # output filenames
 output.png

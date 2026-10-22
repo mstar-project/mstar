@@ -93,6 +93,7 @@ def _conductor(max_concurrent_requests: int | None) -> Conductor:
     c = object.__new__(Conductor)
     c.requests = {}
     c.waiting_queue = []
+    c._held_stream_inputs = {}
     c.max_concurrent_requests = max_concurrent_requests
     c._early_abort_requests = set()
     c.enable_nvtx = False

@@ -8,7 +8,9 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -39,10 +41,13 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.streaming.topology import CLIENT, ClientStreamLimits, client_stream_limits
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
+    ClientStreamConsumed,
+    ClientStreamInput,
     ConductorMessageType,
     DrainRequest,
     FailRequests,
@@ -340,6 +345,18 @@ class RequestData:
         ]
 
 
+class ClientInputRefusedError(ValueError):
+    """Client input past a limit of its stream: the call ends with a 400."""
+
+
+class ClientStream(NamedTuple):
+    """Where a client stream's chunks go: the node that consumes the edge, a
+    walk it runs in (for routing to its workers) and its partition."""
+    node: str
+    graph_walk: str
+    partition: str
+
+
 @dataclass
 class DrainingRequest:
     """Teardown barrier state: a request whose participants are draining their
@@ -429,6 +446,9 @@ class Conductor:
         self._liveness_interval_s = 0.5
         self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
+        # The client chunks of each request in waiting_queue, forwarded in
+        # order at admission.
+        self._held_stream_inputs: dict[str, list[ClientStreamInput]] = {}
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
@@ -456,6 +476,15 @@ class Conductor:
         # owns the numbering. Workers receive their graphs (and these ids) at
         # spawn, so everyone agrees without the ids having to be negotiated.
         worker_graphs = model.get_worker_graphs(model_config_file)
+        # edge name -> where its chunks go, for each stream the client feeds. After
+        # get_worker_graphs: a model may shape its graphs from the deployment (bagel).
+        self._client_streams = self._find_client_streams(model)
+        # the client streams that bound how far the client may run ahead of their consumer
+        self._pending_limits = {
+            name: limits
+            for name, limits in client_stream_limits(model.get_partition_topology(), self.model_config).items()
+            if limits.max_pending_items is not None
+        }
         for index, worker_graph in enumerate(worker_graphs):
             worker_graph.worker_graph_id = index
         self.worker_graphs = {
@@ -858,6 +887,44 @@ class Conductor:
         cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
         return cfg
 
+    @staticmethod
+    def _find_client_streams(model: Model) -> dict[str, ClientStream]:
+        """Where each client stream's chunks go, checking at startup what
+        would otherwise fail every live call."""
+        connections = model.get_partition_topology().client_connections()
+        if not connections:
+            return {}
+        if type(model).process_stream_chunk is Model.process_stream_chunk:
+            raise ValueError(
+                f"{type(model).__name__} declares client streams but does not "
+                "implement process_stream_chunk"
+            )
+        walks = model.get_graph_walk_graphs()
+        partitions = {p.name: p for p in model.get_partitions()}
+        streams: dict[str, ClientStream] = {}
+        for conn in connections:
+            name, partition = conn.edge_name, partitions.get(conn.to_partition)
+            if name in streams:
+                raise ValueError(f"client stream {name!r} is declared twice; one consumer per stream")
+            if partition is None:
+                raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
+            # Unique over every walk, as the worker resolves a streamed edge's
+            # consumer (Worker._build_consumer_node_cache), so both agree.
+            consumers = {
+                node.name for walk in walks.values() for node in walk.get_nodes().values()
+                if name in node.input_names
+            }
+            in_partition = sorted(
+                walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()
+            )
+            if len(consumers) != 1 or not in_partition:
+                raise ValueError(
+                    f"client stream {name!r} needs exactly one consuming node, in "
+                    f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
+                )
+            streams[name] = ClientStream(consumers.pop(), in_partition[-1], partition.name)
+        return streams
+
     def _split_inputs_to_workers(
         self,
         sharding_config: ShardingConfig,
@@ -1039,6 +1106,7 @@ class Conductor:
             self.waiting_queue.append(body)
             if self._status_interval_s is not None:
                 self._queued_since[body.request_id] = time.perf_counter()
+            self._held_stream_inputs[body.request_id] = []
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
@@ -1053,6 +1121,7 @@ class Conductor:
         it, and the client would wait for its timeout. A ``ValueError`` raised
         before any worker heard of the request is the client's fault: a 400.
         """
+        held = self._held_stream_inputs.pop(body.request_id, [])
         try:
             self._do_ingest_request(body)
         # Any failure must reach the client.
@@ -1074,6 +1143,9 @@ class Conductor:
                     body.request_id, request_data,
                     failure_error=f"Ingest failed: {type(exc).__name__}: {exc}",
                 )
+        else:
+            for chunk in held:
+                self._stream_input(chunk)
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -1287,6 +1359,10 @@ class Conductor:
         }
 
     PREPROCESS_WORKER = "api_server_preprocess_worker"
+    # Chunks a call still waiting for admission may send before it is turned
+    # away with a 503, so a full deployment can't hold calls' input without
+    # bound. Counted in appends, whatever their length (20 s of 80 ms ones).
+    MAX_HELD_CLIENT_CHUNKS = 256
 
     def _request_workers(self, request_data: RequestData) -> set[str]:
         return {
@@ -1314,6 +1390,16 @@ class Conductor:
         )
         if not expected_acks:
             self._finalize_draining(request_id)
+
+    def _send_drain(self, request_id: str, entities: set[str]):
+        for entity in entities:
+            self._send_for_teardown(
+                request_id, entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.DRAIN_REQUEST,
+                    body=DrainRequest(request_id),
+                ),
+            )
 
     def _send_remove_to_preprocess_worker(self, request_id: str):
         self._send_for_teardown(
@@ -1440,19 +1526,26 @@ class Conductor:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
 
-    def _abort_request(self, request_id: str):
-        """Tear down a request the client abandoned, freeing its worker GPU state."""
+    def _drop_waiting(self, request_id: str) -> bool:
+        """Take a not-yet-admitted request out of the queue, with its held chunks."""
         for i, body in enumerate(self.waiting_queue):
             if body.request_id == request_id:
-                # Queued, never dispatched: the preprocess worker is the only
-                # holder of its (persisted) input signals, so hard-remove there.
                 self.waiting_queue.pop(i)
+                self._held_stream_inputs.pop(request_id, None)
                 if self._status_interval_s is not None:
                     self._queued_since.pop(request_id, None)
-                self._early_reads_done.pop(request_id, None)
-                self._send_remove_to_preprocess_worker(request_id)
-                logger.info("Aborted request %s before admission", request_id)
-                return
+                return True
+        return False
+
+    def _abort_request(self, request_id: str):
+        """Tear down a request the client abandoned, freeing its worker GPU state."""
+        if self._drop_waiting(request_id):
+            # Queued, never dispatched: the preprocess worker is the only
+            # holder of its (persisted) input signals, so hard-remove there.
+            self._early_reads_done.pop(request_id, None)
+            self._send_remove_to_preprocess_worker(request_id)
+            logger.info("Aborted request %s before admission", request_id)
+            return
 
         request_data = self.requests.get(request_id)
         if request_data is None:
@@ -1477,7 +1570,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1490,20 +1583,14 @@ class Conductor:
         # barrier whose READS_DONE all came early finalizes on registration,
         # and a DRAIN_REQUEST must not reach a participant after its
         # REMOVE_REQUEST.
-        for entity in participants:
-            self._send_for_teardown(
-                request_id, entity,
-                WorkerMessage(
-                    message_type=WorkerMessageType.DRAIN_REQUEST,
-                    body=DrainRequest(request_id),
-                ),
-            )
+        self._send_drain(request_id, participants)
         logger.info("Draining request %s (%d participants) before teardown", request_id, len(participants))
         self._register_draining(
             request_id,
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(
@@ -1551,11 +1638,17 @@ class Conductor:
         # that emits extra/erroneous tensors could leave a worker read scheduled
         # past completion, which this path won't wait for. Gating the happy path
         # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out.
+        # robustly — TODO once the barrier has proven out. A model with a client
+        # stream already does: the client can append after the model ended the
+        # request, so a chunk can be in a worker's read at any point.
         workers = self._request_workers(request_data)
+        expected_acks = {self.PREPROCESS_WORKER}
+        if self._client_streams:
+            self._send_drain(request_id, workers)
+            expected_acks |= workers
         self._register_draining(
             request_id,
-            expected_acks={self.PREPROCESS_WORKER},
+            expected_acks=expected_acks,
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
@@ -1633,7 +1726,7 @@ class Conductor:
                     if conn.from_partition == partition_name:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
-                    conn.consumed_count = max(conn.consumed_count, consumed)
+                    self._absorb_consumed(body.request_id, request_data, conn, consumed)
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1649,6 +1742,32 @@ class Conductor:
             done_partitions.append(partition_name)
 
         return done_partitions
+
+    def _absorb_consumed(
+        self, request_id: str, request_data: RequestData,
+        conn: StreamingConnectionState, consumed: int,
+    ) -> None:
+        """Take a consumer's running count of the items it has consumed; a
+        client item held for room may now go."""
+        conn.consumed_count = max(conn.consumed_count, consumed)
+        if conn.waiting is not None:
+            self._send_waiting(request_id, request_data, conn)
+
+    def _client_stream_consumed(self, body: ClientStreamConsumed) -> None:
+        """A consumer's progress through its paced client streams, reported
+        after its steps rather than when its pass ends (see
+        ``ClientStreamConsumed``)."""
+        rows = zip(body.request_ids, body.edge_names, body.consumed, strict=True)
+        for request_id, name, consumed in rows:
+            request_data = self.requests.get(request_id)
+            stream = self._client_streams.get(name)
+            if request_data is None or request_id in self.draining or stream is None:
+                continue  # a late report for a request already being torn down
+            try:
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                self._absorb_consumed(request_id, request_data, conn, consumed)
+            except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
+                self._fail_after_error(request_id, "handling CLIENT_STREAM_CONSUMED", exc)
 
     def _process_done_forward(
         self, request_id: str, partition_name: str,
@@ -1745,26 +1864,38 @@ class Conductor:
         self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
     ):
         """Send InputSignals for a specific partition's next forward pass."""
+        self._send_inputs(
+            request_id, partition_name, fwd_args.inputs,
+            fwd_args.full_metadata.graph_walk, fwd_args.step_metadata,
+        )
+
+    def _send_inputs(
+        self, request_id: str, partition_name: str, inputs: list[GraphEdge],
+        graph_walk: str, step_metadata: dict,
+    ) -> dict[str, list[GraphEdge]]:
+        """Split ``inputs`` over the ranks that consume them, count each rank as
+        a reader of the tensors, and send each its INPUT_SIGNALS. Returns what
+        each rank was sent."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
 
         inputs_per_worker = self._split_inputs_to_workers(
             sharding_config=request_data.sharding_config,
-            inputs=fwd_args.inputs,
-            graph_walk=fwd_args.full_metadata.graph_walk,
+            inputs=inputs,
+            graph_walk=graph_walk,
         )
 
-        for worker, inputs in inputs_per_worker.items():
-            self._update_persist_ref_counts(request_id, inputs)
+        for worker, worker_inputs in inputs_per_worker.items():
+            self._update_persist_ref_counts(request_id, worker_inputs)
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    inputs=inputs,
+                    inputs=worker_inputs,
                     request_info=CurrentForwardPassInfo(
                         request_id=request_id,
-                        graph_walk=fwd_args.full_metadata.graph_walk,
-                        step_metadata=fwd_args.step_metadata,
+                        graph_walk=graph_walk,
+                        step_metadata=step_metadata,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         resource_publish_info=pstate.resource_publish_info,
@@ -1776,12 +1907,14 @@ class Conductor:
                 ),
             )
             self.communicator.send(worker, message)
+        return inputs_per_worker
 
     def _send_producer_done(
         self, request_id: str, producer_partition: str,
-        consumer_partition_name: str
+        consumer_partition_name: str, edges: Collection[str] | None = None,
     ):
-        """Send producer_done signal to the consumer partition's worker(s)."""
+        """Send producer_done signal to the consumer partition's worker(s): for
+        every stream between the two partitions, or only ``edges``."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[consumer_partition_name]
 
@@ -1793,12 +1926,13 @@ class Conductor:
             if walks & pdef.graph_walks:
                 consumer_workers.update(worker_ids)
 
-        # The signal ends every stream from the producer, so it carries the
-        # counts of every edge between the two partitions.
+        # The worker ends the streams the signal counts, so it names each edge
+        # it ends: every one between the two partitions, or ``edges``.
         conns = [
             conn for conn in request_data.streaming_connections.values()
             if conn.from_partition == producer_partition
             and conn.to_partition == consumer_partition_name
+            and (edges is None or conn.edge_name in edges)
         ]
         for worker_id in consumer_workers:
             message = WorkerMessage(
@@ -1823,6 +1957,134 @@ class Conductor:
                 ),
             )
             self.communicator.send(worker_id, message)
+
+    def _stream_input(self, body: ClientStreamInput):
+        """Forward the next chunk of a request's client streams, or end them.
+        A chunk this request can't take fails the request alone."""
+        request_id = body.request_id
+        request_data = self.requests.get(request_id)
+        if request_data is None:
+            held = self._held_stream_inputs.get(request_id)  # None unless waiting
+            if held is not None:
+                if len(held) >= self.MAX_HELD_CLIENT_CHUNKS:
+                    self._drop_waiting(request_id)
+                    self._reject_request(
+                        request_id, "server at capacity: the call waited too long for a slot", status=503,
+                    )
+                else:
+                    held.append(body)
+            # Otherwise the request ended, failed or was aborted; the preprocess
+            # worker frees the chunk with the request's other tensors.
+            return
+        if request_id in self.draining:
+            return
+        try:
+            for name, infos in body.signals.items():
+                self._forward_client_chunk(request_id, request_data, name, infos)
+            # each stream ends on its own; the call's input has ended once all have
+            ended: dict[str, list[str]] = {}
+            for name in body.ended:
+                stream = self._client_streams.get(name)
+                if stream is None:
+                    logger.warning("Request %s: %r is not a client stream; not ending it", request_id, name)
+                    continue
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                if not conn.producer_done:
+                    if conn.waiting is not None:
+                        self._send_waiting(request_id, request_data, conn, at_end=True)
+                    conn.producer_done = True
+                    ended.setdefault(stream.partition, []).append(name)
+            for partition in sorted(ended):
+                self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
+        except ClientInputRefusedError as exc:
+            logger.info("Client input for request %s refused: %s", request_id, exc)
+            self._remove_request(request_id, request_data, failure_error=str(exc), failure_status=400)
+        except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
+            logger.exception("Client input for request %s failed", request_id)
+            self._remove_request(request_id, request_data,
+                                 failure_error=f"client input failed: {type(exc).__name__}: {exc}")
+
+    def _forward_client_chunk(
+        self, request_id: str, request_data: RequestData, name: str,
+        infos: list[TensorPointerInfo],
+    ):
+        """Send one client chunk to the workers of the node that consumes it,
+        the way a partition's inputs are sent, and release its persist hold."""
+        stream = self._client_streams.get(name)
+        if stream is None:
+            logger.warning("Request %s: %r is not a client stream; dropping it", request_id, name)
+            return
+        conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+        pstate = request_data.partition_states[stream.partition]
+        if conn.producer_done or pstate.is_done:
+            return  # nothing reads it any more; freed with the request
+        limits = self._pending_limits.get(name)
+        if limits is not None:
+            infos = self._within_pending_limit(request_id, request_data, conn, limits, infos)
+        self._send_client_items(request_id, stream, conn, infos)
+
+    def _send_client_items(
+        self, request_id: str, stream: ClientStream, conn: StreamingConnectionState,
+        infos: list[TensorPointerInfo],
+    ):
+        if not infos:
+            return
+        edge = GraphEdge(next_node=stream.node, name=conn.edge_name, tensor_info=list(infos), is_streaming=True)
+        sent = self._send_inputs(request_id, stream.partition, [edge], stream.graph_walk, {})
+        conn.token_count += len(infos)
+        # each tensor is one stream item; the producer-done signal reports them
+        for worker, edges in sent.items():
+            n = sum(len(e.tensor_info) for e in edges)
+            conn.items_sent[worker] = conn.items_sent.get(worker, 0) + n
+        # After the send: the hold is released with every reader counted.
+        self._un_persist_tensors(request_id, infos)
+
+    def _within_pending_limit(
+        self, request_id: str, request_data: RequestData, conn: StreamingConnectionState,
+        limits: ClientStreamLimits, infos: list[TensorPointerInfo],
+    ) -> list[TensorPointerInfo]:
+        """Of a client chunk's items, those its consumer may be sent now: at
+        most ``max_pending_items`` sent and not consumed, by the counts the
+        consumer last reported (so a step's worth late). Past it, ``refuse``
+        ends the call; ``keep_newest`` sends what fits, holds the newest of the
+        rest back until there is room and drops the others, along with any
+        item it held before."""
+        room = max(limits.max_pending_items - (conn.token_count - conn.consumed_count), 0)
+        if limits.pending_overflow == "refuse":
+            if len(infos) > room:
+                raise ClientInputRefusedError(
+                    f"the call's {conn.edge_name!r} stream ran {limits.max_pending_items} items ahead of "
+                    f"the model, this server's limit (client_streams.{conn.edge_name}.max_pending_items)"
+                )
+            return infos
+        queued = ([conn.waiting] if conn.waiting is not None else []) + list(infos)
+        send, rest = queued[:room], queued[room:]
+        conn.waiting = rest[-1] if rest else None
+        if len(rest) > 1:
+            self._drop_client_items(request_id, request_data, rest[:-1])
+        return send
+
+    def _send_waiting(
+        self, request_id: str, request_data: RequestData, conn: StreamingConnectionState,
+        at_end: bool = False,
+    ):
+        """Send the client item held back under ``keep_newest`` once its
+        consumer has room, or ahead of its stream's end regardless."""
+        if request_data.partition_states[conn.to_partition].is_done:
+            return  # nothing reads it any more; freed with the request
+        limits = self._pending_limits[conn.edge_name]
+        if at_end or conn.token_count - conn.consumed_count < limits.max_pending_items:
+            info, conn.waiting = conn.waiting, None
+            self._send_client_items(request_id, self._client_streams[conn.edge_name], conn, [info])
+
+    def _drop_client_items(
+        self, request_id: str, request_data: RequestData, infos: list[TensorPointerInfo],
+    ):
+        """Free client items that will never be sent: released with no reader,
+        their producer frees them at once."""
+        for info in infos:
+            request_data.persist_signal_ref_cnt.setdefault(info.uuid, 0)
+        self._un_persist_tensors(request_id, infos)
 
     def _wait_for_workers_ready(self) -> None:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
@@ -1859,6 +2121,10 @@ class Conductor:
             self._fail_requests(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.CLIENT_STREAM_INPUT:
+            self._stream_input(message.body)
+        elif message.message_type == ConductorMessageType.CLIENT_STREAM_CONSUMED:
+            self._client_stream_consumed(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
             self._worker_metrics[message.body.worker_id] = message.body.metrics
         elif message.message_type == ConductorMessageType.ENABLE_METRICS:
