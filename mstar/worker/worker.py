@@ -1633,7 +1633,7 @@ class Worker:
         final_edges: dict[int, set[str]] | None = None,
         per_request_input_metadata: dict[int, InputMetadata] | None = None,
         request_walks: dict[int, str] | None = None,
-        chunk_ranges: dict[int, tuple[int, int]] | None = None,
+        chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
@@ -2430,7 +2430,7 @@ class Worker:
         spec_id: int = 0,
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
-        chunk_ranges: dict[int, tuple[int, int]] | None = None,
+        chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
         incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order) into the ``Speculation`` the main
@@ -3413,7 +3413,7 @@ class Worker:
         final chunk takes the held outputs back. False when no row is left."""
         batch, node = batch_N.batch, batch_N.node_name
         outputs = step_outputs.per_rid_outputs
-        for rid, (_, end) in batch.chunk_ranges.items():
+        for rid, (_, end, _) in batch.chunk_ranges.items():
             if rid not in batch.request_to_worker_graph:
                 continue
             self.scheduler.advance_chunk(rid, node, end)

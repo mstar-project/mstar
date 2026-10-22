@@ -308,8 +308,9 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[int] = field(default_factory=set)
 
-    # rid -> [start, end) of a chunked row's input this step
-    chunk_ranges: Mapping[int, tuple[int, int]] = field(default_factory=dict)
+    # rid -> (start, end, total): [start, end) of a chunked row's input this
+    # step, and the whole input's length as the scheduler measured it
+    chunk_ranges: Mapping[int, tuple[int, int, int]] = field(default_factory=dict)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -1134,15 +1135,19 @@ class Engine:
             return {}
         return mgmt.submodule.inline_client_signals(graph_walk)
     def _prepare_chunk(
-        self, batch: ExecutingBatch, rid: int, walk: str, chunk: tuple[int, int],
+        self, batch: ExecutingBatch, rid: int, walk: str, chunk: tuple[int, int, int],
     ) -> NodeInputs | None:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
-        (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any."""
+        (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any.
+
+        Raises when the prepared input is not the length the scheduler cut it
+        by (``get_input_sequence_len`` disagreeing with ``prepare_inputs``):
+        its chunks would miss tokens or run past the end, so the row fails."""
         submodule = self._submodules[batch.node_name].submodule
         key = (rid, batch.node_name)
         full = self._chunk_inputs.get(key)
-        start, end = chunk
+        start, end, total = chunk
         if full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
@@ -1154,6 +1159,11 @@ class Engine:
             )
             if full is None:
                 return None
+            if full.input_seq_len != total:
+                raise RuntimeError(
+                    f"{batch.node_name}/{walk}: the row was measured at {total} tokens "
+                    f"and chunked by that, but its prepared inputs hold {full.input_seq_len}"
+                )
             if walk in self._keyed_walks.get(batch.node_name, ()):
                 # a first chunk starts past what `input_sequence_len` matched;
                 # the probe answers the same again, now checked against the prepared inputs

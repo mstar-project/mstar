@@ -78,9 +78,10 @@ class ScheduledBatch:
     row_lens: dict[int, Any] = field(default_factory=dict)
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
-    # Set once scheduled: rid -> [start, end) of a chunked row's input this
-    # step, and the rows whose node needs at least one more chunk.
-    chunk_ranges: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Set once scheduled: rid -> (start, end, total), the [start, end) of a
+    # chunked row's input this step and the length the scheduler measured
+    # for it all; and the rows whose node needs at least one more chunk.
+    chunk_ranges: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     incomplete_node_rids: set[int] = field(default_factory=set)
 
     def walk_of(self, rid: int) -> str:
@@ -1150,8 +1151,8 @@ class MicroScheduler:
         self, batch: ScheduledBatch, chunk_tokens: dict[int, int],
         row_tokens: dict[int, int],
     ) -> None:
-        """Stamp the [start, end) each chunked row runs this step; a row first
-        cut here starts its progress."""
+        """Stamp the [start, end) each chunked row runs this step, with the
+        total it was measured at; a row first cut here starts its progress."""
         for rid in batch.request_to_worker_graph:
             key = (rid, batch.node_name)
             progress = self.chunk_progress.get(key)
@@ -1162,7 +1163,7 @@ class MicroScheduler:
                 progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
             start, total = progress.done, progress.total
             end = start + chunk_tokens.get(rid, total - start)
-            batch.chunk_ranges[rid] = (start, end)
+            batch.chunk_ranges[rid] = (start, end, total)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
 

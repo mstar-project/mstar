@@ -1724,14 +1724,14 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
     manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
 
     first = _next_batch(sched, manager)
-    assert first.chunk_ranges == {"p0": (0, 2)}
+    assert first.chunk_ranges == {"p0": (0, 2, 10)}
     assert first.incomplete_node_rids == {"p0"}
 
     # the chunk lands; the worker advances it and readies the node again
     sched.advance_chunk("p0", NODE, 2)
     manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
     second = _next_batch(sched, manager)
-    assert second.chunk_ranges == {"p0": (2, 4)}
+    assert second.chunk_ranges == {"p0": (2, 4, 10)}
 
     sched.advance_chunk("p0", NODE, 10)
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
@@ -1744,14 +1744,14 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
 
     first = _next_batch(sched, manager)
 
-    assert first.chunk_ranges == {"p0": (4, 6)}
+    assert first.chunk_ranges == {"p0": (4, 6, 10)}
     assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 10)
     assert not sched.cached_prefix
 
 
 @pytest.mark.parametrize("seq_lens,chunk", [
-    ([3], (0, 1)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
-    ([-1], (0, 3)),  # unknown: guessed at one token
+    ([3], (0, 1, 10)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
+    ([-1], (0, 3, 10)),  # unknown: guessed at one token
 ])
 def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8))

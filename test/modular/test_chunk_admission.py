@@ -143,7 +143,7 @@ def test_the_engine_reports_only_non_final_chunks():
     eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={})}
     batch = SimpleNamespace(
         node_name="LLM", graph_walk="prefill", per_request_info={},
-        chunk_ranges={1: (0, 4), 2: (4, 10)},
+        chunk_ranges={1: (0, 4, 10), 2: (4, 10, 10)},
     )
     inputs = [
         ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10),   # more to come
