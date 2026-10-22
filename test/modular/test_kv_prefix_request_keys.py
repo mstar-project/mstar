@@ -364,7 +364,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared, _resource_specs=dict), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)

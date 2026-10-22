@@ -469,6 +469,7 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
             prompt_parts=args.prompt_parts,
             streaming=False,
             request_id=request_id,
+            model=session.request.model,
         )
         try:
             chunks = await api.collect_results(request_id)
