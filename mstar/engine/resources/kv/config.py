@@ -218,6 +218,7 @@ class PrefixSpan:
     length: int
     advance: int
     walk: str
+    scratch: int = 0
     digest: bytes | None = None
     end_key: bytes | None = None
 
@@ -414,7 +415,11 @@ class StreamLayout:
         the budget, or at the prefix rounded up to a page if that is larger. The bound adds
         a page of overrun and the largest step past the prefix to that peak.
         """
-        pages = -(-(self.slots(caps) + self.scratch) // page_size)
+        peak, end = self.slots(caps) + self.scratch, 0
+        for span in self.spans:
+            peak = max(peak, end + span.scratch)
+            end += span.length
+        pages = -(-peak // page_size)
         if self.retention is None:
             return pages
         prefix = self.retention.protected_prefix
@@ -422,7 +427,7 @@ class StreamLayout:
         for span in self.spans:
             end += span.length
             if end > prefix:
-                step = max(step, span.length)
+                step = max(step, span.length, span.scratch)
         step = max([step, *(slots for _, slots in self.growth)])
         window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
         return min(pages, -(-(window + page_size - 1 + step) // page_size))

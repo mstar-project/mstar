@@ -432,7 +432,8 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         schedule, per_unit = state["ar_schedule"], state["ar_tokens_per_unit"]
         commits = [(plan.commit_end - plan.commit_start) * per_unit for plan in schedule.windows()]
         assert [span.length for span in laid_out.spans[1:]] == commits, f"{label}'s windows aren't the commits"
-        assert laid_out.scratch == max(plan.units for plan in schedule.windows()) * per_unit
+        assert [span.scratch for span in laid_out.spans[1:]] == [plan.units * per_unit for plan in schedule.windows()]
+        assert laid_out.scratch == 0, f"{label}'s denoise is counted on top of its last window"
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
 
 
