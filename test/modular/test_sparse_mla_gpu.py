@@ -3,7 +3,7 @@ kpe 64) and GLM-5.3's NoPE ones (kpe 0)."""
 import pytest
 import torch
 
-from mstar.engine.resources.attn import sparse_mla
+from mstar.engine.resources.dsa import sparse_mla
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

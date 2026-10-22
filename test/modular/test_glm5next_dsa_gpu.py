@@ -10,8 +10,8 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.attn import sparse_mla
-from mstar.model.glm5_next import dsa
+from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import sparse_mla
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -44,7 +44,7 @@ def _ctx(tables, row_req, positions, device, max_pools=None, graph=False):
         starts.append(len(flat))
         flat.extend(t)
     spans = None if graph else [(r, 1, q) for r, q in enumerate(row_req)]
-    return dsa.Glm5NextDsaContext(
+    return dsa.KPoolContext(
         pos=torch.tensor(positions, dtype=torch.int32, device=device),
         row_req=torch.tensor(row_req, dtype=torch.int32, device=device),
         pages=torch.tensor(flat, dtype=torch.int32, device=device),
@@ -62,7 +62,7 @@ def _write_pools(plane, tables, lens, ape, device):
     if device == "cpu":
         dsa._pool_keys_torch(view, ctx, ape, D)
     else:
-        from mstar.model.glm5_next.dsa_kernels import pool_keys
+        from mstar.engine.resources.dsa.kpool_kernels import pool_keys
 
         pool_keys(view, ctx.pages, ctx.page_start, ctx.row_req, ctx.pos, ape.to(device), D)
     return view
@@ -133,7 +133,7 @@ def _compiled(fn) -> int:
 def test_prefill_scores_compile_once_whatever_the_split():
     """The split count follows the rows and the context, so one long prompt's chunks take many
     values of it; none may compile the kernel again mid-request."""
-    from mstar.model.glm5_next.dsa_kernels import _prefill_scores_kernel, prefill_scores
+    from mstar.engine.resources.dsa.kpool_kernels import _prefill_scores_kernel, prefill_scores
 
     lens = [64000]
     plane, tables, ape = _store(lens, seed=9)
