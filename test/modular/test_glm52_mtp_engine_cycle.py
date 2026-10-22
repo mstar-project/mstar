@@ -45,13 +45,14 @@ from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 # small enough that two requests run it out mid-decode, big enough for one
 POOL_PAGES = 10
@@ -317,7 +318,8 @@ def test_mtp_eos_truncation_matches_baseline():
 @pytest.mark.parametrize("wrong_every", [None, 0], ids=["mtp", "oracle"])
 def test_kv_length_tracks_the_verified_stream(wrong_every):
     """Every step commits its whole block; the next declare takes back the rows the verdict
-    rejected, so each step starts from the prompt plus the emitted tokens but the last."""
+    rejected, from the KV length and the position alike, so each step starts from the prompt
+    plus the emitted tokens but the last."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=True)
     cfg = _cfg(k, True)
@@ -326,19 +328,25 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
         _oracle(sub, {"r0": base.tolist()}, wrong_every)
     driver = _Driver(sub, cfg, ["r0"])
     info = _fwd_info("r0", 20, True)
-    kv = driver.resources[KV_RESOURCE]
+    kv, pos = driver.resources[KV_RESOURCE], driver.resources[POS_RESOURCE]
+
+    def length():
+        n = kv._streams["r0"]["main"].stored_len
+        assert pos.position("r0", "main") == n
+        return n
+
     prompt = torch.arange(5, dtype=torch.long) + 3
     out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
     total = prompt.numel() + 1
-    assert kv.stored_len("r0") == prompt.numel()
+    assert length() == prompt.numel()
     for _ in range(4):
         inputs = [sub.prepare_inputs("decode", info, {"text_inputs": out["text_inputs"]})]
         sub.declare_step("decode", ["r0"], inputs)  # the trim; idempotent at the real declare
-        assert kv.stored_len("r0") == total - 1
+        assert length() == total - 1
         out = driver.step("decode", {"r0": (info, out["text_inputs"][0])})["r0"]
         _, _, accepted = sub._mtp_verdict["r0"]
         assert out["new_token"][0].numel() == accepted + 1
-        assert kv.stored_len("r0") == total - 1 + k + 1
+        assert length() == total - 1 + k + 1
         assert out["text_inputs"][0].numel() == 1
         total += accepted + 1
 
@@ -495,20 +503,20 @@ def test_declare_step_shapes():
     prompt = {"text_inputs": [torch.tensor([1, 2, 3])]}
     inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), prompt)]
     step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "sampler"}
+    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
     cfg.mtp_num_draft_tokens = 2
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     sub.bind_node_resources(build_cpu_resources(cfg, ["r0"])[0])
     inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), prompt)]
     step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "sampler"}
+    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
     # one id in, the block of k+1 rows planned; the verify and drafts are argmaxes
     inputs = [sub.prepare_inputs("decode", _fwd_info("r0", 8, True),
                                  {"text_inputs": [torch.tensor([4])]})]
     step = sub.declare_step("decode", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn"}
+    assert set(step.keys()) == {"kv", "attn", "pos"}
     assert step.segments[0].span == 3
 
 
@@ -548,7 +556,7 @@ def _window_stream(model, cfg, mode_k: int, prompt_len: int):
         stream = _drive(driver, prompt, _fwd_info("r0", 40, True))
         kv = driver.resources[KV_RESOURCE]
         pages = len(kv._streams["r0"]["main"].page_indices)
-        return stream, sub._token_budget["r0"], kv.stored_len("r0"), pages
+        return stream, sub.request_state("r0")["token_budget"], kv._streams["r0"]["main"].stored_len, pages
     finally:
         cfg.mtp_num_draft_tokens = k
 
@@ -579,7 +587,7 @@ def test_budget_within_the_window_is_untouched():
     driver = _Driver(sub, cfg, ["r0"])
     prompt = torch.arange(5, dtype=torch.long) + 3
     stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
-    assert sub._token_budget["r0"] == 9
+    assert sub.request_state("r0")["token_budget"] == 9
     assert stream.numel() == 9
 
 
@@ -653,12 +661,12 @@ def test_exhaustion_refuses_the_step_and_the_pool_recovers():
         # the last verdict's trim lands at declare, refused or not, and only once
         for rid in live:
             sub._apply_verdict(rid)
-        before = {rid: kv.stored_len(rid) for rid in live}
+        before = {rid: kv._streams[rid]["main"].stored_len for rid in live}
         outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)},
                            refusable=True)
         if not isinstance(outs, dict):
             assert isinstance(outs.reason, AllocationFailed), outs
-            assert {rid: kv.stored_len(rid) for rid in live} == before
+            assert {rid: kv._streams[rid]["main"].stored_len for rid in live} == before
             assert live == set(prompts)
             refused += 1
             live.discard("b")

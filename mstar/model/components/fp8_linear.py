@@ -1,4 +1,4 @@
-"""GLM-5.2 linears that keep the checkpoint's fp8 weights (``dense_fp8``).
+"""Linears that keep an fp8 block-scale checkpoint's weights (a config's ``dense_fp8``).
 
 Each holds this rank's shard of an e4m3 weight (uint8 container, like the routed experts,
 so ``module.to(bf16)`` leaves it alone) and its fp32 ``weight_scale_inv`` blocks. Column
@@ -14,15 +14,14 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
 REPLICATED, COLUMN, ROW = None, 0, 1
 
 
-def dense_fp8_block(config: Glm52ModelConfig) -> tuple[int, int] | None:
+def dense_fp8_block(config) -> tuple[int, int] | None:
     """The scale block when the non-expert linears stay fp8, else None."""
-    if not config.dense_fp8:
+    if not getattr(config, "dense_fp8", False):
         return None
     if config.quantization_config is None:
         raise ValueError(
@@ -51,7 +50,7 @@ def fp8_block_linear(x, weight, scale, block_size, glu=False):
     ``reference`` on host tensors (tests, no triton needed)."""
     if not x.is_cuda:
         return reference(x, weight, scale, block_size, glu)
-    from mstar.model.glm52 import dense_fp8
+    from mstar.utils import dense_fp8
 
     return dense_fp8.linear(x, weight, scale, block_size, glu)
 
@@ -144,7 +143,7 @@ class Fp8Linear(nn.Module):
 
     def process_weights_after_loading(self, device) -> None:
         if torch.device(device).type == "cuda":
-            from mstar.model.glm52 import dense_fp8  # registers the op before any compile
+            from mstar.utils import dense_fp8  # registers the op before any compile
 
             dense_fp8.reserve(device)
 

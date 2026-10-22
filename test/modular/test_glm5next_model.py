@@ -35,10 +35,7 @@ from mstar.model.glm5_next.components.attention import (  # noqa: E402
     Glm5NextMLAAttention,
 )
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM  # noqa: E402
-from mstar.model.glm5_next.components.moe import (  # noqa: E402
-    Glm5NextGatedMLP,
-    Glm5NextSparseMoeBlock,
-)
+from mstar.model.glm5_next.components.moe import Glm5NextGatedMLP, Glm5NextSparseMoeBlock  # noqa: E402
 from mstar.model.glm5_next.config import (  # noqa: E402
     ATTN,
     FULL_ATTENTION,
@@ -922,7 +919,7 @@ def test_fp8_checkpoint_loads_bit_identical_to_the_mmap_reader(tmp_path, monkeyp
     import mstar.model.loader.base as loader_base
     import mstar.model.loader.iterators as loader_iters
     from mstar.distributed.communication import CommGroup
-    from mstar.model.glm5_next.quantization import FP8_DTYPE
+    from mstar.utils.fp8_block import FP8_DTYPE
 
     source, cfg = _build_model(seed=25)
     torch.manual_seed(25)

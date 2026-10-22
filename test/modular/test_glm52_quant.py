@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
-from mstar.model.glm52.quantization import (  # noqa: E402
+from mstar.utils.fp8_block import (  # noqa: E402
     FP8_DTYPE,
     Fp8BlockQuantConfig,
     dequant_fp8_block_stream,

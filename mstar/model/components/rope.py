@@ -1,4 +1,5 @@
-"""Plain interleaved RoPE for GLM-5.2 MLA."""
+"""Plain interleaved (GPT-J) RoPE, computed in fp32: one cos/sin table per forward that every layer
+shares. GLM-5.x's MLA rotates its decoupled ``q_pe`` / ``k_pe`` (and its DSA indexer's first dims) this way."""
 from __future__ import annotations
 
 import torch
@@ -12,7 +13,7 @@ def rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-class Glm52RotaryEmbedding(nn.Module):
+class InterleavedRotaryEmbedding(nn.Module):
     """Unscaled interleaved rotary embedding over ``rotary_dim`` dims."""
 
     def __init__(self, rotary_dim: int, base: float) -> None:
