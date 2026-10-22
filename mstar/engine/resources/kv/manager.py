@@ -462,6 +462,7 @@ class KVManager(AttentionResource):
         device: torch.device,
         dtype=torch.bfloat16,
         needs_remote_transfer: bool = False,
+        leads: bool = True,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -526,6 +527,10 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
+        # Only a deciding pool keeps allotments and a queue. With more than one rank none decides.
+        # Rank 0 would allot at readiness, after the step goes to the other ranks and before its
+        # admit, so a grant could pass on one rank and fail on another.
+        self._decides = self._world_size == 1 and leads
         self._device = device
         self._lock = threading.RLock()
 
@@ -583,6 +588,7 @@ class KVManager(AttentionResource):
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
             needs_remote_transfer=info.needs_remote_transfer,
+            leads=spec.leader is None or spec.leader in info.nodes,
         )
 
     def build_accelerator_graph_buffers(
