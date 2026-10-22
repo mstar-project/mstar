@@ -486,3 +486,31 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
         f"seed {SEED}: pages or allotments outlived every request that held them"
     )
+
+
+def test_every_page_an_offload_frees_is_room():
+    kv = _manager(max_num_pages=9)
+    kv._cpu_pool = _StubHostPool()
+    _laid_out(kv, "r0", list(range(4 * PAGE_SIZE)))
+    assert _ready(kv, "r0")
+    _grow(kv, "r0", 2 * PAGE_SIZE)
+    room = kv._room()
+
+    assert kv.offload("r0") == 2
+
+    assert kv._room() == room + 2, "the offload gave back its victim's unused allotment, or kept the used part"
+
+
+def test_a_reload_past_the_room_is_refused_and_leaves_the_request_offloaded():
+    kv = _manager(max_num_pages=9)
+    kv._cpu_pool = _StubHostPool()
+    _laid_out(kv, "r0", list(range(4 * PAGE_SIZE)))
+    assert _ready(kv, "r0")
+    _grow(kv, "r0", 4 * PAGE_SIZE)
+    assert kv.offload("r0") == 4
+    _laid_out(kv, "r1", list(range(500, 500 + 5 * PAGE_SIZE)))
+    assert _ready(kv, "r1")
+
+    assert not kv.can_reload("r0"), "can_reload counted room an admitted prompt counts on"
+    assert kv.reload("r0") is False, "a returning request took pages an admitted prompt counts on"
+    assert kv.is_offloaded("r0")
