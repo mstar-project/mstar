@@ -15,6 +15,7 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 """
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -46,6 +47,11 @@ def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None)
             "supported size (exact: the padded dims add nothing to the scores, the padded output "
             "dims are zeros to drop) and declare that size as the KV cache's head_dim."
         )
+
+
+# Experiment switch (remove before a PR): later decode plans of a captured
+# wrapper call FlashInfer's planner directly (``_plan_direct``).
+_EXP_SLIM_FI_PLAN = os.environ.get("MSTAR_EXP_SLIM_FI_PLAN", "1") == "1"
 
 
 class FlashInferPrefillWrapper:
@@ -300,6 +306,8 @@ class FlashInferDecodeWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
+        # set by the first plan when ``_plan_direct`` may take the later ones
+        self._planner_args: list | None = None
 
         import flashinfer
 
@@ -367,6 +375,13 @@ class FlashInferDecodeWrapper:
             self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
             paged_kv_indices = self._paged_kv_indices_buf[:n]
 
+        if (
+            self._planner_args is not None and dtype is self.dtype and kv_lens is not None
+            and _EXP_SLIM_FI_PLAN
+        ):
+            self._plan_direct(paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens)
+            return
+
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push
 
@@ -390,6 +405,57 @@ class FlashInferDecodeWrapper:
 
         self._n_req = n_req
         self.dtype = dtype
+        if self.accelerator_graph and kv_lens is not None:
+            self._planner_args = self._direct_planner_args(n_req)
+
+    def _direct_planner_args(self, n_req: int) -> list | None:
+        """FlashInfer's planner arguments for this wrapper, fixed but for the
+        indptr and lengths, when its plan resolved to the one path
+        ``_plan_direct`` reproduces (fa2 tensor-core decode under a graph,
+        one query token per row, no window, no split override); else None.
+
+        Everything else FlashInfer's ``plan`` does per call (dtype and
+        backend resolution, frozen-shape checks, the module lookup) gives the
+        same answer for every step of a captured bucket."""
+        w = self.attn_wrapper
+        if not (
+            w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
+            and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
+            and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
+        ):
+            return None
+        from flashinfer.utils import _get_range_buf
+
+        return [
+            w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+            _get_range_buf(n_req + 1, "cpu"), None, None,
+            n_req, n_req, self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+            self.head_dim, self.head_dim,
+            False,  # causal
+            -1,  # window_left
+            -1,  # fixed_split_size
+            False,  # disable_split_kv
+            0,  # num_colocated_ctas
+            0,  # uniform_q_len
+        ]
+
+    def _plan_direct(self, indptr, indices, last_page_len, kv_lens) -> None:
+        """What FlashInfer's ``plan`` does per step on the path
+        ``_direct_planner_args`` checked: the three index copies into the
+        captured buffers, then its planner."""
+        w = self.attn_wrapper
+        n = indices.shape[0]
+        if n > w._paged_kv_indices_buf.shape[0]:
+            raise ValueError("more page indices than the captured buffer holds")
+        w._paged_kv_indptr_buf.copy_(indptr, non_blocking=True)
+        w._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
+        dst = w._paged_kv_indices_buf[:n]
+        if indices.data_ptr() != dst.data_ptr():
+            dst.copy_(indices, non_blocking=indices.device == dst.device)
+        args = self._planner_args
+        args[4] = indptr
+        args[5] = kv_lens
+        w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
