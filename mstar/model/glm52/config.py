@@ -14,6 +14,8 @@ POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = "sampler"
 # dsa_long_context: the DSA indexer's keys, one index_head_dim latent per token per FULL layer
 INDEX_KV_RESOURCE = "kv_index"
+# dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
+DSA_RESOURCE = "dsa"
 
 # config.json keys read by Glm52ModelConfig.from_hf_config under the same
 # name (eos_token_id becomes eos_token_ids).
@@ -78,10 +80,11 @@ class Glm52ModelConfig:
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
-    # the exact DSA computation. On (dsa_paged.py): the guard checks
-    # max_seq_len instead; FULL layers write their index keys to a KV resource
-    # and every row past index_topk attends its top index_topk latents, prefill
-    # rows included, with selection and sparse attention on device.
+    # the exact DSA computation. On: the guard checks max_seq_len instead;
+    # FULL layers write their index keys to a KV resource and the DSA resource
+    # (mstar/engine/resources/dsa) has every row past index_topk attend its top
+    # index_topk latents, prefill rows included, with selection and sparse
+    # attention on device.
     dsa_long_context: bool = False
     # a prefill step longer than this runs the trunk over row chunks of it in turn,
     # so its activations are a chunk's, whatever the prompt's length

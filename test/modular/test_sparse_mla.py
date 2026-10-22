@@ -2,7 +2,7 @@
 selection against the unsharded one."""
 import torch
 
-from mstar.engine.resources.attn import sparse_mla
+from mstar.engine.resources.dsa import sparse_mla
 
 
 def test_reference_is_masked_dense_softmax():
