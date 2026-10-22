@@ -172,6 +172,10 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
     class _Inner:
         embed_tokens = _Embed()
 
+        def embed(self, ids):
+            # the language model's embedding, with no adapter delta bound
+            return self.embed_tokens(ids)
+
         def __call__(self, embeds, label, cos_sin):
             calls["cos"] = cos_sin[0]
             return embeds
@@ -184,7 +188,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
     sampler.sample = lambda rids, logits: ("sampled", list(rids))
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
-    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
+    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h, logits=lambda h: h)
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
     def run(lease):
