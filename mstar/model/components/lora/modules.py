@@ -340,7 +340,7 @@ def _target_names(keys: list[tuple[str | None, str]], names: Mapping[str, str]) 
     out = {key: names.get(key[1], key[1].rsplit(".", 1)[-1]) for key in keys}
     for widen in (
         lambda key: key[1].replace(".", "_"),
-        lambda key: f"{key[0].replace('.', '_')}_{key[1].replace('.', '_')}",
+        lambda key: f"{(key[0] or 'root').replace('.', '_')}_{key[1].replace('.', '_')}",
     ):
         counts = Counter(out.values())
         out = {
@@ -404,18 +404,23 @@ def _check(module: LoraCapable, declared: LoraTarget, shard: LoraTarget, path: s
 
 
 def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tuple[str, ...]:
-    """Bind every module a ``module_lora_spec`` placed to its delta, for each such LoRA
-    pool among ``resources``; returns those pools' keys (empty, and nothing touched, when
-    the node serves no adapters through one).
+    """Bind every module a ``module_lora_spec`` placed to its delta, for each LoRA pool
+    among ``resources``; returns those pools' keys (empty, and nothing touched, when the
+    node serves no adapters).
 
     The node must have said how its rows meet the pool's segments (``lora_segment_rows``), since
     a step's ``LoraStep`` is what addresses each row to its adapter."""
     from mstar.engine.resources.lora.pool import LoraAdapterPool
 
     pools: list[tuple[str, LoraAdapterPool]] = [
-        (key, r) for key, r in resources.items()
-        if isinstance(r, LoraAdapterPool) and isinstance(r.spec.module_map, ModuleLoraMap)
+        (key, r) for key, r in resources.items() if isinstance(r, LoraAdapterPool)
     ]
+    for key, pool in pools:
+        if not isinstance(pool.spec.module_map, ModuleLoraMap):
+            raise ValueError(
+                f"LoRA resource {key!r} was not declared with `module_lora_spec`, so nothing "
+                "binds the node's modules to it; build the node's spec with `module_lora_spec`"
+            )
     if not pools:
         return ()
     if not getattr(submodule, "lora_segment_rows", False):

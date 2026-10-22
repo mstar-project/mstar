@@ -293,10 +293,11 @@ class LoraSpec(NodeResourceSpec):
     ``adapters`` maps the names requests ask for to safetensors paths. ``slot_wait_steps``
     bounds how long a request waits for a device slot while others keep slots busy: past
     it, requests on other adapters are held back until a slot drains (counted in the
-    pool's steps). ``module_map`` places each checkpoint module on a target
-    (``module_lora_spec`` in ``mstar.model.components.lora.modules`` builds one from the
-    model's modules and its weight loader's rules); ``convert_keys`` rewrites a
-    model-native checkpoint layout first.
+    pool's steps). ``module_map`` places each checkpoint module on a target; a node's
+    spec comes from ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
+    ``ModuleLoraMap`` is what binds the node's modules, and a pool built with any other
+    resolver is refused at bind. ``convert_keys`` rewrites a model-native checkpoint
+    layout first.
     """
 
     num_layers: int
