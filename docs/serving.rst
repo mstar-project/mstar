@@ -547,8 +547,9 @@ whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
 :doc:`adding_models`), so a deployment that never samples greedily can save their capture
 memory and time this way.
 
-``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype. Paged and ring
-KV caches, attention, cross-attention and ragged attention accept it. Without it, a resource takes
+``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype; fp8 and fp4
+are refused, since a quantized cache needs scales, not a cast. Paged and ring KV caches,
+attention, cross-attention and ragged attention accept it. Without it, a resource takes
 the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
 run without autocast, or in different dtypes, and that declares no dtype fails at load.

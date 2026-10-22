@@ -11,7 +11,7 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.resident_hooks import ResidentHooks
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, require_unscaled_dtype
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
@@ -101,10 +101,11 @@ class EngineResourceInfo:
     def resolve_dtype(self, declared: torch.dtype | None, resource_key: str) -> torch.dtype:
         """A resource's storage dtype: its spec's, else its nodes' common dtype.
 
-        Never the engine-wide dtype, and never a silent fp32.
+        Never the engine-wide dtype, never a silent fp32, and never a quantized
+        dtype: fp8 KV needs scales, so it arrives through a quant config.
         """
         if declared is not None:
-            return declared
+            return require_unscaled_dtype(declared, f"resource {resource_key!r} dtype")
         if self.compute_dtype is not None:
             return self.compute_dtype
         dtypes = {node: str(dtype) for node, dtype in sorted(self.node_dtypes.items())}
