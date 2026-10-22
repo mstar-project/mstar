@@ -91,6 +91,8 @@ def _add_report(sub) -> None:
     p.add_argument("--chart-metrics", default=None, help="comma-separated metrics for the chart")
     p.add_argument("--metrics", default=None, help="comma-separated table columns (metric names)")
     p.add_argument("--title", default=None)
+    p.add_argument("--chart-judge", default=None,
+                   help="fdb: comma-separated judges whose label shares the chart shows (default: all)")
 
 
 def _add_rescore(sub) -> None:
@@ -123,6 +125,40 @@ def _add_data(sub) -> None:
     e2e = kinds.add_parser("e2e", allow_abbrev=False, help="every input `compare` sends (speech sets and media)")
     e2e.add_argument("--archive", default=None, help="local seedtts_testset.tar (skips the download)")
     e2e.add_argument("--out", required=True)
+    fdb = kinds.add_parser("fdb-v15", allow_abbrev=False,
+                           help="Full-Duplex-Bench v1.5 pairs (CC BY-NC 4.0, non-commercial use only), downloaded "
+                                "from the official Google Drive; never vendored")
+    fdb.add_argument("--out", required=True)
+    fdb.add_argument("--per-category", default="all",
+                     help="first N pairs of each category in numeric id order, or 'all' (498 pairs)")
+    fdb.add_argument("--zips", default=None,
+                     help="directory with the four official zips; a missing one is downloaded into it")
+
+
+def _judge_args(p) -> None:
+    p.add_argument("--judge", action="append", required=True, metavar="NAME=openai|URL",
+                   help="judge to add: NAME=openai (needs OPENAI_API_KEY) or NAME=URL of a local endpoint")
+    p.add_argument("--judge-revision", action="append", default=[], metavar="NAME=REV")
+    p.add_argument("--semantic-judge", default="none", help="also regrade semantic A/F/U with this judge")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="relabel only the pairs whose label from these (unchanged) judges failed")
+    p.add_argument("--semantic-only", action="store_true",
+                   help="only regrade semantic A/F/U with --semantic-judge; keep every judge's behavior labels")
+    p.add_argument("--judge-concurrency", type=int, default=8)
+
+
+def _add_fdb_tools(sub) -> None:
+    p = sub.add_parser("rejudge", allow_abbrev=False,
+                       help="label stored fdb results with more LLM judges, from their transcripts (no GPU)")
+    p.add_argument("results", nargs="+", help="fdb results JSON files or directories")
+    _judge_args(p)
+    p.add_argument("--out", required=True, help="directory for the relabeled files")
+    p = sub.add_parser("agreement", allow_abbrev=False,
+                       help="label agreement, Cohen's kappa and confusion matrix of two judges on fdb results")
+    p.add_argument("results", nargs="+", help="fdb results JSON files or directories")
+    p.add_argument("--judges", default=None, help="A,B (default: the first two judges of the run)")
+    p.add_argument("--md", default=None, help="write the report here (default: stdout)")
+    p.add_argument("--chart", default=None, help="PNG path for the confusion matrix")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rescore(sub)
     _add_data(sub)
     e2e_compare.add_args(sub)
+    _add_fdb_tools(sub)
     return parser
 
 
@@ -211,6 +248,19 @@ def cmd_report(args) -> None:
     results = load_results(args.results)
     if not results:
         raise SystemExit("no results files")
+    if all(r.suite == "fdb" for r in results):
+        from benchmark.eval import fdb_report
+
+        table = fdb_report.render(results)
+        if args.md:
+            Path(args.md).write_text(table + "\n")
+        else:
+            print(table)
+        if args.chart:
+            judges = args.chart_judge.split(",") if args.chart_judge else None
+            fdb_report.render_chart(results, args.chart, judges, args.title)
+            print(f"wrote {args.chart}", file=sys.stderr)
+        return
     known = {c.metric: c for cols in COLUMNS.values() for c in cols}
     columns = [known.get(m, Col(m, m, digits=3)) for m in args.metrics.split(",")] if args.metrics else None
     table = render_table(results, columns)
@@ -255,6 +305,15 @@ def cmd_data(args) -> None:
         from benchmark.eval.e2e import media
 
         path = media.build(out, args.archive)
+    elif args.kind == "fdb-v15":
+        from benchmark.eval.fdb_reference import build_manifest
+
+        per = None
+        if args.per_category != "all":
+            per = int(args.per_category) if args.per_category.isdigit() else 0
+            if per <= 0:
+                raise SystemExit(f"--per-category takes a positive count or 'all', not {args.per_category!r}")
+        path = build_manifest(out, per, Path(args.zips).expanduser() if args.zips else None)
     else:
         from benchmark.eval.suites.duplex import compose_items
 
@@ -262,6 +321,53 @@ def cmd_data(args) -> None:
         path = datasets.save_manifest(compose_items(src, out / "audio", args.n or 10, args.gap_s),
                                       out / "manifest.jsonl")
     print(f"wrote {path}")
+
+
+def cmd_rejudge(args) -> None:
+    from benchmark.eval.llm_judge import parse_judges
+    from benchmark.eval.report import load_results
+    from benchmark.eval.suites.duplex_fdb import Judging, rejudge
+
+    try:
+        judges = parse_judges(args.judge, args.judge_revision)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    if args.semantic_only and args.semantic_judge in (None, "none"):
+        raise SystemExit("--semantic-only needs --semantic-judge")
+    judging = Judging(judges, args.semantic_judge, args.judge_concurrency, behavior=not args.semantic_only)
+    if not judging.available:
+        raise SystemExit("no judge is available (see the skip reasons above)")
+    out = Path(args.out)
+    for path, result in zip(_result_paths(args.results), load_results(args.results), strict=True):
+        dst = rejudge(result, judging, args.retry_failed).save(out / path.name)
+        print(f"wrote {dst}", file=sys.stderr)
+    for name, u in judging.usage().items():
+        print(f"[fdb] judge {name!r}: {u['requests']} requests ({u['retries']} transport retries), "
+              f"{u['prompt']} prompt and {u['completion']} completion tokens", file=sys.stderr)
+
+
+def cmd_agreement(args) -> None:
+    from benchmark.eval import fdb_report
+    from benchmark.eval.report import load_results
+
+    results = [r for r in load_results(args.results) if r.suite == "fdb"]
+    if not results:
+        raise SystemExit("no fdb results files")
+    a, b = None, None
+    if args.judges:
+        names = args.judges.split(",")
+        if len(names) != 2 or not all(names):
+            raise SystemExit(f"--judges takes two judge names as A,B, not {args.judges!r}")
+        a, b = names
+    ag = fdb_report.agreement(results, a, b)
+    text = fdb_report.render_agreement(ag)
+    if args.md:
+        Path(args.md).write_text(text)
+    else:
+        print(text)
+    if args.chart and ag["n"]:
+        fdb_report.render_confusion_chart(ag, args.chart)
+        print(f"wrote {args.chart}", file=sys.stderr)
 
 
 def _exit_on_signal(signum, frame) -> None:  # noqa: ARG001
@@ -299,5 +405,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(code)
     elif args.command == "calibrate":
         sys.exit(e2e_compare.cmd_calibrate(args))
+    elif args.command == "rejudge":
+        cmd_rejudge(args)
+    elif args.command == "agreement":
+        cmd_agreement(args)
     else:
         cmd_data(args)

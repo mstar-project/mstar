@@ -8,9 +8,9 @@ import sys
 import pytest
 import torch
 
+from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52 import mla_prep
 from mstar.model.glm52.components.attention import Glm52MLAAttention
-from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernels need CUDA")
@@ -59,7 +59,7 @@ def _rope_inputs(T, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = (torch.randn(T, H, NOPE + R, generator=g, device="cuda") * 2).to(torch.bfloat16)
     pos = torch.randint(0, 1 << 20, (T,), generator=g, device="cuda")
-    cos, sin = Glm52RotaryEmbedding(R, Glm52ModelConfig.rope_theta).cos_sin(pos)
+    cos, sin = InterleavedRotaryEmbedding(R, Glm52ModelConfig.rope_theta).cos_sin(pos)
     return q, cos, sin
 
 
@@ -70,7 +70,7 @@ def _slots(T, pages, seed):
 
 
 def _unfused_rope(q_pe, k_pe, cos, sin):
-    return Glm52RotaryEmbedding(R, Glm52ModelConfig.rope_theta)(None, q_pe, k_pe, cos_sin=(cos, sin))
+    return InterleavedRotaryEmbedding(R, Glm52ModelConfig.rope_theta)(None, q_pe, k_pe, cos_sin=(cos, sin))
 
 
 def test_supports_only_the_widths_whose_order_it_matches():

@@ -94,63 +94,71 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     except ValueError as exc:
         # the adapter refused the request's fields (a bad data URL, a server path)
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    request_id = rid("speech")
-    chunks = _plan_chunks(req, adapter, args.text or "")
-
-    def submit(index: int) -> str:
-        chunk_id = request_id if len(chunks) == 1 else f"{request_id}-{index}"
-        return api.submit_request(
-            text=chunks[index],
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=_chunk_kwargs(args.model_kwargs, index),
-            streaming=bool(req.stream),
-            request_id=chunk_id,
-        )
-
-    lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
-    pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
-    if req.stream:
-        raw_pcm = fmt == "pcm"
-        # Look at the first result before committing to a 200: a request the
-        # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
-        # error, not as an empty WAV.
-        first_iter = api.iter_result_chunks(pending[0])
-        try:
-            first = await anext(first_iter, None)
-            if _is_error(first):
-                # Read it to the end so the finished request isn't aborted.
-                await _drain(first_iter)
-                raise _http_error(first)
-        except BaseException:
-            # The first piece released itself; release the ones submitted ahead.
-            release_unread(api, pending, 1)
-            raise
-        return StreamingResponse(
-            _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
-                        with_wav_header=not raw_pcm),
-            media_type="audio/pcm" if raw_pcm else "audio/wav",
-            headers={"Cache-Control": "no-cache"},
-        )
-
-    pcm_parts: list[bytes] = []
-    read = 0  # pieces collect_results has released; the rest are released on early exit
+    # Every chunk reads the same reference clip, and a stream submits the later
+    # ones while it plays, so a returned stream schedules the cleanup itself.
+    stream_owns_uploads = False
     try:
-        for index in range(len(chunks)):
-            if len(pending) < len(chunks):
-                pending.append(submit(len(pending)))
+        request_id = rid("speech")
+        chunks = _plan_chunks(req, adapter, args.text or "")
+
+        def submit(index: int) -> str:
+            chunk_id = request_id if len(chunks) == 1 else f"{request_id}-{index}"
+            return api.submit_request(
+                text=chunks[index],
+                file_paths=args.file_paths,
+                input_modalities=args.input_modalities,
+                output_modalities=args.output_modalities,
+                model_kwargs=_chunk_kwargs(args.model_kwargs, index),
+                streaming=bool(req.stream),
+                request_id=chunk_id,
+            )
+
+        lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
+        pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
+        if req.stream:
+            raw_pcm = fmt == "pcm"
+            # Look at the first result before committing to a 200: a request the
+            # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
+            # error, not as an empty WAV.
+            first_iter = api.iter_result_chunks(pending[0])
             try:
-                results = await api.collect_results(pending[index], raw_request)
-            except HTTPException:
-                read = index + 1
+                first = await anext(first_iter, None)
+                if _is_error(first):
+                    # Read it to the end so the finished request isn't aborted.
+                    await _drain(first_iter)
+                    raise _http_error(first)
+            except BaseException:
+                # The first piece released itself; release the ones submitted ahead.
+                release_unread(api, pending, 1)
                 raise
-            read = index + 1
-            if not results and raw_request is not None and await raw_request.is_disconnected():
-                break
-            pcm_parts.append(b"".join(c.data for c in results if c.modality == "audio"))
+            stream_owns_uploads = True
+            return StreamingResponse(
+                _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
+                            with_wav_header=not raw_pcm, file_paths=args.file_paths),
+                media_type="audio/pcm" if raw_pcm else "audio/wav",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        pcm_parts: list[bytes] = []
+        read = 0  # pieces collect_results has released; the rest are released on early exit
+        try:
+            for index in range(len(chunks)):
+                if len(pending) < len(chunks):
+                    pending.append(submit(len(pending)))
+                try:
+                    results = await api.collect_results(pending[index], raw_request)
+                except HTTPException:
+                    read = index + 1
+                    raise
+                read = index + 1
+                if not results and raw_request is not None and await raw_request.is_disconnected():
+                    break
+                pcm_parts.append(b"".join(c.data for c in results if c.modality == "audio"))
+        finally:
+            release_unread(api, pending, read)
     finally:
-        release_unread(api, pending, read)
+        if not stream_owns_uploads:
+            media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     audio_bytes, mime = media_io.pcm16_to_container(b"".join(pcm_parts), sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
 
@@ -173,7 +181,8 @@ async def _drain(iterator) -> None:
 
 
 async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
-                      first_iter, first, sample_rate: int, with_wav_header: bool = True):
+                      first_iter, first, sample_rate: int, with_wav_header: bool = True,
+                      file_paths: dict[str, list[str]] | None = None):
     read = 0  # pieces read to the end; the rest are released if the stream stops early
     try:
         if with_wav_header:
@@ -203,3 +212,5 @@ async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pendin
                 raise _http_error(error)
     finally:
         release_unread(api, pending, read)
+        if file_paths:
+            media_io.schedule_upload_cleanup(file_paths, api.upload_dir)

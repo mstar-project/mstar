@@ -54,10 +54,10 @@ def test_config_default_buckets_unchanged():
 
 
 def _gate(hidden=256, experts=32, device="cpu"):
-    from mstar.model.glm52.components.moe import Glm52MoEGate
+    from mstar.model.components.moe import NoAuxTcRouter
 
     torch.manual_seed(3)
-    gate = Glm52MoEGate(hidden, experts, 8, routed_scaling_factor=2.5).to(device)
+    gate = NoAuxTcRouter(hidden, experts, 8, routed_scaling_factor=2.5).to(device)
     with torch.no_grad():
         gate.weight.normal_(0.0, 0.05)
         gate.e_score_correction_bias.normal_(0.0, 0.5)
@@ -80,7 +80,7 @@ def _fp32_reference(gate, x):
 
 def _check(gate, x, device):
     with torch.autocast(device, dtype=torch.bfloat16):
-        w, ids = gate(x)
+        w, ids, _ = gate(x)
     w_ref, ids_ref, gap = _fp32_reference(gate, x)
     clear = gap > 1e-5
     assert clear.float().mean() > 0.99
@@ -137,8 +137,8 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     from mstar.model.glm52._testing import build_cpu_resources
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.config import SAMPLER_RESOURCE
-    from mstar.model.glm52.quantization import process_weights_after_loading
     from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.utils import process_weights_after_loading
 
     _cpu_flashinfer(monkeypatch)
     cfg = Glm52ModelConfig.reduced()
@@ -268,8 +268,8 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     from mstar.model.glm52._testing import build_cpu_resources
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.config import SAMPLER_RESOURCE
-    from mstar.model.glm52.quantization import process_weights_after_loading
     from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.utils import process_weights_after_loading
 
     _cpu_flashinfer(monkeypatch)
     cfg = Glm52ModelConfig.reduced()
@@ -349,10 +349,10 @@ def test_recompile_limit_reaches_the_thread_that_runs_steps(monkeypatch):
     class _StopError(Exception):
         pass
 
-    def _kv(engine_inputs=None):
+    def _pos(engine_inputs=None):  # preprocess's first resource read, right after the limit
         raise _StopError
 
-    monkeypatch.setattr(sub, "_kv", _kv)
+    monkeypatch.setattr(sub, "_pos", _pos)
     seen = []
 
     def step():

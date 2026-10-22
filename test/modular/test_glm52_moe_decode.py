@@ -28,13 +28,11 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
         monkeypatch.setitem(sys.modules, "flashinfer", fi)
 
 
+from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
 from mstar.model.glm52.components import moe as moe_module  # noqa: E402
-from mstar.model.glm52.components.moe import Glm52MoEGate, Glm52SparseMoeBlock  # noqa: E402
+from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
-from mstar.model.glm52.quantization import (  # noqa: E402
-    Fp8BlockQuantConfig,
-    dequantize_fp8_block_weight,
-)
+from mstar.utils.fp8_block import Fp8BlockQuantConfig, dequantize_fp8_block_weight  # noqa: E402
 
 BLOCK = (128, 128)
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="moe_decode kernels need CUDA")
@@ -330,7 +328,7 @@ def test_router_fp32_operands_and_odd_sizes(fp32_matmul):
     from mstar.utils.fused_moe import decode as moe_decode
 
     torch.manual_seed(1)
-    gate = Glm52MoEGate(512, 7, 3, routed_scaling_factor=2.5).cuda()
+    gate = NoAuxTcRouter(512, 7, 3, routed_scaling_factor=2.5).cuda()
     with torch.no_grad():
         gate.weight.normal_(0.0, 0.05)
         gate.e_score_correction_bias.normal_(0.0, 0.5)

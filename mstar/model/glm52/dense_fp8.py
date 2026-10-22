@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from mstar.model.glm52.quantization import FP8_DTYPE
+from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
 

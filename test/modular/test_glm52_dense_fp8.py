@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.model.glm52.quantization import dequantize_fp8_block_weight  # noqa: E402
+from mstar.utils.fp8_block import dequantize_fp8_block_weight  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="dense_fp8 kernels need CUDA")
 

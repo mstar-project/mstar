@@ -187,7 +187,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
         image_preprocess = vit_preprocess(fwd_info.step_metadata.get("image_preprocess"))
         if image_preprocess == "vllm":
-            # vllm-omni parity: SiglipImageProcessor resizes to a fixed square
+            # Fixed-square option: SiglipImageProcessor resizes to a fixed square
             # (size = max_num_patch_per_side * patch_size, e.g. 70*14=980),
             # discarding aspect ratio, then [0.5]/[0.5] normalize.
             square = self.vit_max_num_patch_per_side * self.vit_patch_size
@@ -524,7 +524,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         image_preprocess = fwd_info.step_metadata.get("image_preprocess", "default")
         img = image_inputs[0].contiguous()
         if image_preprocess == "vllm":
-            # vllm-omni parity: _resize_to_stride (aspect-preserving, divisible
+            # Stride-multiple resize (aspect-preserving, divisible
             # by latent_downsample, long <= max_latent_size*latent_downsample,
             # short >= 256), then [0.5]/[0.5] normalize.
             image_tensor = vllm_vae_resize(

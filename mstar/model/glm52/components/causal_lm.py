@@ -5,13 +5,13 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52.components.decoder_layer import Glm52DecoderLayer
 from mstar.model.glm52.components.language_model import (
     build_embedding,
     build_lm_head,
     build_rmsnorm,
 )
-from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
@@ -35,7 +35,7 @@ class Glm52LanguageModel(nn.Module):
         # cos/sin for the whole forward are computed ONCE here and handed to
         # every layer (rope_cos_sin) — same dims/base as each layer's own
         # rotary, which stays the fallback for single-layer callers.
-        self.rotary = Glm52RotaryEmbedding(rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
+        self.rotary = InterleavedRotaryEmbedding(rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
 
     def forward(
         self,

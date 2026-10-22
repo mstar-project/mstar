@@ -44,6 +44,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
+    "fish_s2_pro": "fish_s2_pro.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -178,6 +179,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model == "qwen3_tts_base":
         lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
                      "ref_text=\"...\").to_wav(\"out.wav\")")
+    if model == "fish_s2_pro":
+        lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
+        lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")

@@ -15,7 +15,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
 REPLICATED, COLUMN, ROW = None, 0, 1
 

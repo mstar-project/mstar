@@ -52,7 +52,7 @@ from mstar.model.glm52.components.fp8_linear import (  # noqa: E402
     Fp8ParallelGatedMLP,
 )
 from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
 @pytest.fixture
