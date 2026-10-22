@@ -1760,7 +1760,21 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     # a merge takes only its own walk, so the continuing row is a prompt too
     merged = _next_batch(
         sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, "prefill"),
-        pre_existing_batch_size=1, pre_existing_seq_lens=seq_lens,
+        pre_existing_batch_size=1, pre_existing_seq_lens=lambda: seq_lens,
     )
 
     assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_a_merge_with_no_rows_to_size_never_estimates_its_own():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    def estimate():
+        raise AssertionError("estimated the continuing rows with nothing to size")
+
+    # a steady decode merge: nothing fresh, so the estimate is never asked for
+    assert _next_batch(
+        sched, _Manager([]), target=(NODE, "prefill"),
+        pre_existing_batch_size=1, pre_existing_seq_lens=estimate,
+    ) is None

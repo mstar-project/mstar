@@ -2698,8 +2698,8 @@ class Worker:
             target=spec_target,
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
-            # estimated from their spans in this step
-            pre_existing_seq_lens=self._continuing_seq_lens(
+            # estimated from their spans in this step, if a token budget needs them
+            pre_existing_seq_lens=lambda: self._continuing_seq_lens(
                 pending, spec_node_name, graph_walk, continuing,
                 speculating_same_node,
             ),

@@ -589,7 +589,7 @@ class MicroScheduler:
         # are being speculated to be included in the batch size cap
         pre_existing_batch_size: int=0,
         capture_group_of: int | None = None,
-        pre_existing_seq_lens: Collection[int] = (),
+        pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -608,6 +608,10 @@ class MicroScheduler:
             capture_group_of: If set, the rid whose capture group the batch
                 must share; the speculation merge passes a continuing rid.
                 Otherwise the batch's first rid sets the group.
+            pre_existing_seq_lens: The caller's rows' estimated spans, asked
+                for only when rows are merged in under a token budget:
+                estimating walks every continuing row, and a steady decode
+                merge usually brings none.
         """
         # Expire stale hold entries; done before any early returns
         now = time.monotonic()
@@ -791,7 +795,7 @@ class MicroScheduler:
         pre_existing_walk: str | None = None,
         only_walk: str | None = None,
         skip_walk: str | None = None,
-        pre_existing_seq_lens: Collection[int] = (),
+        pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder. Under a combined walk,
@@ -804,8 +808,6 @@ class MicroScheduler:
             # them and the backlog as they are for the next pass.
             return None
         max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
-        if max_tokens is not None:
-            max_tokens -= _pre_existing_tokens(pre_existing_seq_lens, pre_existing_batch_size)
         row_tokens: dict[int, int] = {}
         chunkable: set[int] = set()
         backlogged = self.backlog.pop(node_walk, None)
@@ -836,6 +838,9 @@ class MicroScheduler:
             chunkable |= chunks
         if backlogged is None and not fresh:
             return None
+        if max_tokens is not None and row_tokens:
+            seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
+            max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
