@@ -31,26 +31,9 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    if Path(repo_id).is_dir():
-        return repo_id
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        # offline with a cold cache, a gated repo, a full disk: returned as a local
-        # path, the model built without its quant config and failed later, elsewhere
-        raise RuntimeError(f"could not fetch {repo_id!r} from the Hugging Face Hub: {e}") from e
-    return str(Path(local_dir))
 
 
 class Glm52Model(Model):
@@ -124,9 +107,8 @@ class Glm52Model(Model):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            tokenizer_source = _resolve_local_hf_snapshot(
-                self.model_path_hf, cache_dir=self.cache_dir,
-            )
+            tokenizer_source = str(
+                resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
             try:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_source, cache_dir=self.cache_dir,
@@ -537,7 +519,7 @@ class Glm52Model(Model):
             return None
         if Path(path).exists():
             return str(path)
-        return _resolve_local_hf_snapshot(path, cache_dir=self.cache_dir)
+        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
         from mstar.model.glm52.quantization import Fp8BlockQuantConfig
