@@ -8,13 +8,13 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+from mstar.engine.resources.dsa import kpool
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
-from mstar.model.glm5_next import dsa
-from mstar.model.glm5_next.config import ATTN, KDA, KDA_STATE, KV_CACHE, LABEL, Glm5NextModelConfig
+from mstar.model.glm5_next.config import ATTN, DSA, KDA, KDA_STATE, KV_CACHE, LABEL, Glm5NextModelConfig
 from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
 from mstar.model.glm5_next.mla_kernels import mla_latent_norm, mla_latent_norm_available
 
@@ -133,12 +133,11 @@ class Glm5NextMLAAttention(nn.Module):
         self.kv_plane = kv_plane
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (the MTP layer selects with its own
-        # indexer too), and the forward's DSA context (shared with the submodule, which sets
-        # it per forward)
+        # indexer too), and the DSA resource whose context the submodule sets per forward
         self.index_plane = (
             config.index_plane_offset + kv_plane
             if config.dsa_long_context and kv_plane is not None else None)
-        self.dsa_state: dsa.DsaState | None = None
+        self.dsa: kpool.KPoolDSA | None = None
         self.dsa_group = comm_group if config.dsa_shard_prefill else None
 
         # The engine's MLA backend applies this scale (AttentionConfig
@@ -157,6 +156,7 @@ class Glm5NextMLAAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self.kv = resources[KV_CACHE]
         self.attn = resources[ATTN]
+        self.dsa = resources.get(DSA)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``hidden_states (T, hidden)`` flat engine layout, out the same."""
@@ -191,7 +191,7 @@ class Glm5NextMLAAttention(nn.Module):
         # planned the slots and the attention resource planned the kernel.
         self.kv.write_kv(latent, None, layer_idx=self.kv_plane, label=LABEL)
         q_pe = q.new_full((num_tokens, h, self.mla_cache_kpe), self.q_pe_value)
-        ctx = self.dsa_state.ctx if self.dsa_state is not None else None
+        ctx = self.dsa.ctx if self.dsa is not None else None
         if ctx is not None:
             return self._out(self._attend_sparse(hidden_states, q_c, q_nope, q_pe, ctx))
         attn_latent = self.attn.run(
@@ -204,34 +204,34 @@ class Glm5NextMLAAttention(nn.Module):
 
     def _attend_sparse(
         self, hidden_states: torch.Tensor, q_c: torch.Tensor, q_nope: torch.Tensor,
-        q_pe: torch.Tensor, ctx: dsa.Glm5NextDsaContext,
+        q_pe: torch.Tensor, ctx: kpool.KPoolContext,
     ) -> torch.Tensor:
         """DSA past index_topk: write the step's index keys, select each row's slots, attend
         over just those (prefill rows too: each selects over its own causal prefix)."""
         k, gate = self.indexer.keys_and_gate(hidden_states)
-        dsa.write_index(self.kv, self.index_plane, LABEL, k, gate,
+        kpool.write_index(self.kv, self.index_plane, LABEL, k, gate,
                         self.indexer.index_kpool_compress_ape, ctx)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
-        slots = dsa.select(q, w, self.kv.layer_view(self.index_plane), ctx, self.dsa_group)
-        return dsa.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
+        slots = kpool.select(q, w, self.kv.layer_view(self.index_plane), ctx, self.dsa_group)
+        return kpool.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
                                  self.softmax_scale)
 
     def _select_block_row(
         self, hidden_states: torch.Tensor, q_c: torch.Tensor, row: int,
-        index_rows: tuple[torch.Tensor, torch.Tensor], ctx: dsa.Glm5NextDsaContext,
+        index_rows: tuple[torch.Tensor, torch.Tensor], ctx: kpool.KPoolContext,
     ) -> torch.Tensor:
         """The draft row's slots under dsa_long_context: its index key joins the block's rows
         so far, then every block row selects (only ``row`` has a query; the rest go unused)."""
         keys, gates = index_rows
         n, block = keys.shape[:2]
         keys[:, row], gates[:, row] = self.indexer.keys_and_gate(hidden_states)
-        dsa.write_index(self.kv, self.index_plane, LABEL, keys.view(n * block, -1),
+        kpool.write_index(self.kv, self.index_plane, LABEL, keys.view(n * block, -1),
                         gates.view(n * block, -1), self.indexer.index_kpool_compress_ape, ctx)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
         qs = q.new_zeros(n, block, *q.shape[1:])
         ws = w.new_zeros(n, block, w.shape[-1])
         qs[:, row], ws[:, row] = q, w
-        return dsa.select(qs.view(n * block, *q.shape[1:]), ws.view(n * block, -1),
+        return kpool.select(qs.view(n * block, *q.shape[1:]), ws.view(n * block, -1),
                           self.kv.layer_view(self.index_plane), ctx, self.dsa_group)
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
@@ -261,10 +261,10 @@ class Glm5NextMLAAttention(nn.Module):
         latents[:, row] = latent
         self.kv.write_kv(latents.view(n * block, -1), None, layer_idx=self.kv_plane, label=LABEL)
         q_pe = q.new_full((n * block, h, self.mla_cache_kpe), self.q_pe_value)
-        ctx = self.dsa_state.ctx if self.dsa_state is not None else None
+        ctx = self.dsa.ctx if self.dsa is not None else None
         if ctx is not None:
             slots = self._select_block_row(hidden_states, q_c, row, index_rows, ctx)
-            attn_latent = dsa.sparse_attend(q_nope.view(n * block, h, -1), q_pe,
+            attn_latent = kpool.sparse_attend(q_nope.view(n * block, h, -1), q_pe,
                                             self.kv.layer_view(self.kv_plane), slots, ctx,
                                             self.softmax_scale)
             return self._out(attn_latent.view(n, block, h, -1)[:, row])

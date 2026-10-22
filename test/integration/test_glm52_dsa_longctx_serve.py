@@ -20,7 +20,13 @@ from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import ATTN_RESOURCE, INDEX_KV_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import (
+    ATTN_RESOURCE,
+    DSA_RESOURCE,
+    INDEX_KV_RESOURCE,
+    KV_RESOURCE,
+    Glm52ModelConfig,
+)
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -184,8 +190,8 @@ class _Serve:
     def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor,
              batched: bool = True) -> dict:
         """declare -> admit -> plan -> preprocess -> forward -> commit. The
-        plan runs BEFORE preprocess, as in the engine: the DSA preprocess
-        reads this step's page tables off the KV plan."""
+        plan runs BEFORE preprocess, as in the engine: the DSA resource stages
+        this step's rows from the KV plan."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
         step = self.submodule.declare_step(walk, [rid], inputs)
@@ -222,6 +228,7 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
     path; returns (generated tokens, stopped-via-check_stop, the tokens the
     latent cache and the index-key store hold before retirement)."""
     serve = _Serve(model, submodule)
+    dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
     generated: list[int] = []
     stopped = False
@@ -249,6 +256,7 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
                 break
         stored = tuple(serve.resources[key].stored_len(serve.rid)
                        for key in (KV_RESOURCE, INDEX_KV_RESOURCE))
+        assert dsa.ctx is None  # each forward closed the context it opened on the resource
     finally:
         serve.close()
     return generated, stopped, stored
