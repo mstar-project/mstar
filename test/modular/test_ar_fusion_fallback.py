@@ -6,6 +6,7 @@ import sys
 import types
 
 import pytest
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -68,3 +69,18 @@ def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
         assert chosen == str(expected), f"rank {rank} chose {chosen}"
         # a workspace built on some ranks but not all is destroyed, not kept
         assert leaked == "", f"rank {rank} kept {leaked}"
+
+
+def test_fused_all_reduce_uses_the_workspace_only_for_inputs_that_fit(monkeypatch):
+    from mstar.distributed import ar_fusion
+    from mstar.distributed.communication import CommGroup
+
+    group = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    monkeypatch.setattr(group, "all_reduce", lambda x: "nccl")
+    monkeypatch.setattr(ar_fusion, "allreduce_oneshot", lambda x, ws_id: "one-shot")
+    small, large = torch.zeros(4, 8), torch.zeros(16, 8)
+    assert group.fused_all_reduce(small) == "nccl"
+    group._ar_fusion_ws, group._ar_fusion_max_tokens = 0, 8
+    assert group.fused_all_reduce(small) == "one-shot"
+    assert group.fused_all_reduce(large) == "nccl"
+    assert group.fused_all_reduce(torch.zeros(8, 4).t()) == "nccl"
