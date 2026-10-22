@@ -28,6 +28,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
@@ -474,11 +475,13 @@ class MultimodalDecoderModel(Model):
         raise NotImplementedError
 
     @staticmethod
-    def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under `dtype` so no fp32 copy of the weights is
-        allocated. fp32-only parameters restore themselves in `_apply`."""
+    def _build(make, dtype: torch.dtype, device: str, precision: NodePrecision | None = None) -> torch.nn.Module:
+        """Construct under `dtype` so no fp32 copy of the weights is allocated,
+        then apply the node's policy, if given, before the weights load, so its
+        fp32 islands receive the checkpoint's values unrounded."""
         torch.set_default_dtype(dtype)
         try:
-            return make().to(device)
+            module = make().to(device)
+            return module if precision is None else apply_precision(module, precision)
         finally:
             torch.set_default_dtype(torch.float32)

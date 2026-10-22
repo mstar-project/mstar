@@ -53,6 +53,7 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -926,6 +927,20 @@ class NemotronDuplexModel(Model):
     # Submodule loading
     # -------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        if node_name == "nano_llm":
+            return NodePrecision(torch.bfloat16)
+        if node_name == "eartts_talker":
+            # bf16 without autocast; the talker's fp32 norms, pooling and MoG
+            # sampling are explicit (components/eartts_talker.py), and the codec
+            # it decodes with is bf16 with its inverse STFT in fp32
+            return NodePrecision(torch.bfloat16)
+        if node_name == "conformer_encoder":
+            # the shared FastConformer (also canary / parakeet) still takes its
+            # fp32 LayerNorms and softmax from autocast
+            return NodePrecision(torch.bfloat16, autocast=True)
+        raise ValueError(f"Unknown Nemotron duplex node {node_name!r}")
+
     def get_submodule(
         self,
         node_name: str,
@@ -1042,8 +1057,7 @@ class NemotronDuplexModel(Model):
             talker = EarTTSTalker(cfg.eartts)
             codec = AudioCodec(cfg.codec)
         talker = self._build_and_load(talker, device, autocast_dtype, local_dir)
-        # the codec decodes in the talker's step, in the engine's dtype like the
-        # talker (it turns autocast off itself)
+        # the codec decodes in the talker's step, in the talker's dtype
         codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
         from mstar.model.nemotron_duplex.components.eartts_talker import build_char_vocab, subword_to_char_ids
         tok = self._talker_tokenizer()

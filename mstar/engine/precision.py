@@ -27,22 +27,27 @@ class NodePrecision:
     # fnmatch globs on the node's module, param or buffer names; a matched
     # module stays fp32 with everything under it
     fp32_modules: tuple[str, ...] = ()
-    # wrap the forward in torch.amp.autocast(param_dtype); off, every op runs in
+    # wrap the forward in torch.amp.autocast(param_dtype), or in the dtype given
+    # (a node that keeps its build dtypes but autocasts); off, every op runs in
     # its inputs' dtypes and any fp32 the model needs is explicit
-    autocast: bool = False
+    autocast: bool | torch.dtype = False
 
     def __post_init__(self):
         if isinstance(self.fp32_modules, str):
             raise TypeError(f"fp32_modules is a tuple of globs, not the string {self.fp32_modules!r}")
         object.__setattr__(self, "fp32_modules", tuple(self.fp32_modules))
-        if self.autocast and self.param_dtype is None:
-            raise ValueError("autocast needs a param_dtype to autocast in")
+        if self.autocast is True and self.param_dtype is None:
+            raise ValueError("autocast needs a param_dtype, or a dtype of its own, to autocast in")
+        if isinstance(self.autocast, torch.dtype):
+            require_unscaled_dtype(self.autocast, "autocast")
         if self.param_dtype is not None:
             require_unscaled_dtype(self.param_dtype, "param_dtype")
 
     @property
     def autocast_dtype(self) -> torch.dtype | None:
         """What the forward's autocast scope runs in; None runs it without one."""
+        if isinstance(self.autocast, torch.dtype):
+            return self.autocast
         return self.param_dtype if self.autocast else None
 
 
@@ -150,7 +155,8 @@ def apply_yaml_precision(
                 f"node {node_name!r} runs without autocast, so nodes.{node_name}.precision "
                 "cannot turn it on"
             )
-        updates["autocast"] = bool(block["autocast"])
+        if not block["autocast"]:
+            updates["autocast"] = False
     if block.get("param_dtype") is not None:
         if precision.param_dtype is None:
             raise ValueError(

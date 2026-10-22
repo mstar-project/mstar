@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -648,21 +649,32 @@ class Pi05Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """openpi's precision (``to_bfloat16_for_selected_params``). SigLIP is
+        bf16 but for its patch and position embeddings, without autocast. The
+        two experts are bf16 under bf16 autocast, with the norms (whose
+        rounding compounds across the layers) and the time MLP stored fp32."""
+        if node_name == "vit_encoder":
+            return NodePrecision(
+                torch.bfloat16,
+                fp32_modules=("encoder.embeddings.patch_embedding", "encoder.embeddings.position_embedding"),
+                autocast=False,
+            )
+        expert = "paligemma" if node_name == "LLM" else "action_expert"
+        fp32 = (f"{expert}.layers.*.input_layernorm", f"{expert}.layers.*.post_attention_layernorm", f"{expert}.norm")
+        if node_name == "action_expert":
+            fp32 += ("time_mlp",)
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=True)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
-        # NOTE: ``autocast_dtype`` is accepted for interface parity but
-        # deliberately NOT applied at param allocation. Pi0.5's submodules
-        # (Pi05ViTEncoderSubmodule and the two experts) override ``to()`` to
-        # keep precision-sensitive params in fp32 — SigLIP's patch and
-        # position embeddings, the transformer norms and the time MLP — as
-        # openpi keeps them. Meta-casting to bf16 before
-        # ``to_empty`` would load those weights into bf16 storage and lose
-        # precision that the post-load fp32 upcast cannot recover (~0.2 abs
-        # delta on final actions). So we load in fp32 and let the submodule
-        # ``to()`` overrides do the selective down-cast. Pi0.5 (~14 GB) does
-        # not hit the load-time OOM this hint addresses.
+        # ``autocast_dtype`` (the node's param dtype) is not applied at
+        # allocation: everything loads in fp32 and the engine casts to
+        # ``get_node_precision`` after, which rounds exactly as a meta cast
+        # would and keeps the fp32 params the checkpoint's values. Pi0.5
+        # (~14 GB) does not hit the load-time peak the hint addresses.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)

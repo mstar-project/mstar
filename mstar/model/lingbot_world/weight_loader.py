@@ -26,6 +26,7 @@ def resolve_dit_dir(repo_or_dir: str, cache_dir: str | None = None) -> str:
 
 def build_lingbot_dit(
     config: LingBotWorldConfig, repo_or_dir: str, device: str = "cuda", cache_dir: str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> LingBotCausalDiT:
     from safetensors import safe_open
 
@@ -39,7 +40,7 @@ def build_lingbot_dit(
 
     with torch.device("meta"):
         dit = LingBotCausalDiT(config)
-    dit = dit.to(torch.bfloat16).to_empty(device=device).eval().requires_grad_(False)
+    dit = dit.to(dtype).to_empty(device=device).eval().requires_grad_(False)
     params = dict(dit.named_parameters())
     missing = set(params) - set(weight_map)
     unexpected = set(weight_map) - set(params)

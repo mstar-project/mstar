@@ -73,7 +73,6 @@ def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_thre
     """The ViT node opts out of the engine's autocast and runs in openpi's
     precision: bfloat16 except the patch and position embeddings."""
     from mstar.engine.accelerator_graph_runner import autocast_scope
-    from mstar.engine.node_dtype import resolve_node_dtype
 
     class Encoder(torch.nn.Module):
         def __init__(self):
@@ -102,7 +101,7 @@ def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_thre
         with autocast_scope(None, "cpu"):
             reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
         with autocast_scope(torch.bfloat16, "cpu"):
-            with autocast_scope(resolve_node_dtype(submodule, torch.bfloat16), "cpu"):
+            with autocast_scope(Pi05Model.get_node_precision(None, "vit_encoder").autocast_dtype, "cpu"):
                 if batched:
                     outputs = submodule.forward_batched("prefill", engine_inputs, images)
                     actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
@@ -777,7 +776,6 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
     """Verify that ``Pi05Model._lerobot_remap`` translates each LLM-side
     lerobot key to the matching parameter path on the LLM weight container.
     """
-    from mstar.model.pi05.pi05_model import Pi05Model
 
     model = Pi05Model.__new__(Pi05Model)  # bypass __init__ — pure-method test
     remap = model._lerobot_remap

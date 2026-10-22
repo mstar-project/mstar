@@ -96,10 +96,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     # across the DiT's own full-graph regions.
     disable_torch_compile = True
 
-    # Waypoint pins an explicit fp32 island list at build time; this flag
-    # prevents EngineManager from blanket-casting those islands to bf16.
-    disable_autocast = True
-
     def __init__(self, dit: WaypointDiT, taehv: torch.nn.Module, config: WaypointConfig):
         super().__init__()
         validate_taehv_architecture(taehv)
@@ -545,9 +541,6 @@ class WaypointVaeEncoderSubmodule(_FunctionalAeMixin, NodeSubmodule):
     """
 
     disable_torch_compile = True
-    # Dtype layout is settled at load; an engine-level cast would round it
-    # underneath the AE.
-    disable_autocast = True
 
     def __init__(self, taehv: torch.nn.Module, config: WaypointConfig):
         super().__init__()

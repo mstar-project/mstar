@@ -294,6 +294,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self._vision_bos_embed: torch.Tensor | None = None
         self._vision_eos_embed: torch.Tensor | None = None
 
+    @property
+    def _embed_dtype(self) -> torch.dtype:
+        """The dtype the layers run in (the node's param dtype). Without autocast
+        every input is put in it here: an encoder whose node runs in another
+        dtype hands its embeddings over in that one."""
+        return self.model.model.embed_tokens.weight.dtype
+
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
         """Lazy-initialize and cache inverse frequencies."""
         if self._inv_freq is None or self._inv_freq.device != device:
@@ -394,7 +401,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         if graph_walk == "prefill_vision":
             before, after = self._text_around(fwd_info, inputs)
-            vision_embeds = inputs["vision_embeds"][0].to(device)
+            vision_embeds = inputs["vision_embeds"][0].to(device, self._embed_dtype)
             vision_len = vision_embeds.shape[0]
 
             mm_mask = self._media_mask(vision_len, fwd_info)
@@ -482,7 +489,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
         cfg = self.config.thinker
         before, after = self._text_around(fwd_info, inputs)
-        audio = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
+        audio = inputs["audio_embeds"][0].to(device, self._embed_dtype)  # (audio_tokens, hidden)
         p, clip = before.shape[0], audio.shape[0] + 2
         n = p + clip + after.shape[0]
         # the start sentinel's id; past its own slot the encoder's rows overwrite it
@@ -745,7 +752,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             return out
         out["cos_3d"], out["sin_3d"] = compute_3d_cos_sin(
             self._position_ids_3d(inputs), self._get_inv_freq(self.get_device()),
-            mrope_section=self.MROPE_SECTION, target_dtype=self.model.model.embed_tokens.weight.dtype,
+            mrope_section=self.MROPE_SECTION, target_dtype=self._embed_dtype,
         )
         return out
 
@@ -957,7 +964,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     input_ids=torch.zeros((n,), dtype=torch.long, device=device),
                     input_embeds=torch.zeros(
                         (n, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16
+                        device=device, dtype=self._embed_dtype,
                     ),
                     tensor_inputs={
                         "masks_for_talker": torch.zeros(
@@ -1001,7 +1008,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             input_seq_len=n,
             input_embeds=torch.zeros(
                 (n, self.config.thinker_hidden_size),
-                device=device, dtype=torch.bfloat16,
+                device=device, dtype=self._embed_dtype,
             ),
             custom_pos_ids=torch.zeros(
                 (3, n),
@@ -1017,7 +1024,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 "deepstack": [
                     torch.zeros(
                         (n, self.config.thinker_hidden_size),
-                        dtype=torch.bfloat16, device=device,
+                        dtype=self._embed_dtype, device=device,
                     )
                     for _ in range(num_deepstack)
                 ],
@@ -1267,8 +1274,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         """
         device = next(self.model.parameters()).device
         # The Thinker embedding table may be fp32 while the Talker runs in
-        # autocast dtype; match text_projection's weight dtype before projecting.
-        proj_dtype = self.model.text_projection.linear_fc1.weight.dtype
+        # its param dtype; match text_projection's weight dtype before projecting.
+        proj_dtype = self._compute_dtype
         with torch.no_grad():
             pad_raw = thinker_embed_tokens(
                 torch.tensor([self.config.tts_pad_token_id], device=device)
@@ -1287,6 +1294,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             "TalkerSubmodule: pre-computed TTS special embeddings via "
             "Thinker embed_tokens + Talker text_projection"
         )
+
+    @property
+    def _compute_dtype(self) -> torch.dtype:
+        """The dtype the Talker runs in (the node's param dtype; an embedding
+        table's, which no quant pass touches). Without autocast its inputs are
+        put in it: the Thinker's states arrive in the Thinker node's dtype."""
+        return self.talker_code_emb.weight.dtype
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Return the bool mask of layer-0 logits to set to -inf.
@@ -1383,7 +1397,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         if graph_walk == "talker_prefill":
             # The Thinker's walk, or one chunk of it when its prefill is chunked
-            selected_hidden = inputs["thinker_states"][0].to(device)
+            selected_hidden = inputs["thinker_states"][0].to(device, self._compute_dtype)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
                 selected_hidden=selected_hidden,
@@ -1395,7 +1409,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             rid = fwd_info.rid_handle
             # Last-prefill is the assistant's first token, which is
             # text-only — Thinker postprocess pre-selected layer-0 for it.
-            last_hidden = inputs["thinker_states"][0].to(device)
+            last_hidden = inputs["thinker_states"][0].to(device, self._compute_dtype)
 
             input_embeds = self._get_last_prefill_codec_hidden(
                 fwd_info.step_metadata.get("voice", "Ethan")
@@ -1479,7 +1493,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         extra_args = {}
         if graph_walk == "talker_decode":
-            dtype = self.model.text_projection.linear_fc1.weight.dtype
+            dtype = self._compute_dtype
             input_embeds = input_embeds.to(dtype)
             extra_args["text_raw"] = torch.cat(
                 [inp.tensor_inputs["text_raw"] for inp in inputs], dim=0,
@@ -1700,18 +1714,19 @@ class TalkerSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
+        dtype = self._compute_dtype
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
                         (1, self.config.talker_hidden_size),
-                        device=device, dtype=torch.bfloat16
+                        device=device, dtype=dtype
                     ),
                     input_seq_len=1,
                     tensor_inputs={"text_raw": torch.zeros(
                         (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16,
+                        device=device, dtype=dtype,
                     )},
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
@@ -1723,7 +1738,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 make_node_input=lambda n: ARNodeInputs(
                     input_embeds=torch.zeros(
                         (n, self.config.talker_hidden_size),
-                        device=device, dtype=torch.bfloat16
+                        device=device, dtype=dtype
                     ),
                     input_seq_len=n,
                 ),
@@ -1736,7 +1751,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
                         (self.TALKER_LAST_PREFILL_TOKENS_PER_REQ, self.config.talker_hidden_size),
-                        device=device, dtype=torch.bfloat16
+                        device=device, dtype=dtype
                     ),
                     input_seq_len=self.TALKER_LAST_PREFILL_TOKENS_PER_REQ,
                 ),
@@ -1759,10 +1774,9 @@ class Code2WavSubmodule(NodeSubmodule):
     vocoder, trims overlap context, and returns the PCM audio chunk.
     """
 
-    # Runs in the checkpoint's bf16 without autocast. ``consolidate()``
-    # compiles the forward itself, so the engine must not compile it again.
+    # ``consolidate()`` compiles the forward itself, so the engine must not
+    # compile it again.
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()

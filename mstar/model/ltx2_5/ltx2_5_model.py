@@ -37,6 +37,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     NodeResourceSpec,
     RaggedAttentionConfig,
@@ -109,6 +110,17 @@ REFINE_WALKS = {
 }
 RECIPES = ("single", "two_stage")
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
+
+
+_NODE_PRECISION = {
+    # built on meta and materialized bf16 throughout
+    TEXT_ENCODER_NODE: NodePrecision(torch.bfloat16, autocast=False),
+    DIT_NODE: NodePrecision(torch.bfloat16, autocast=False),
+    # diffusers from_pretrained(torch_dtype=bfloat16): None keeps what it loads
+    VAE_DECODER_NODE: NodePrecision(None, autocast=False),
+    UPSAMPLER_NODE: NodePrecision(None, autocast=False),
+    AUDIO_DECODER_NODE: NodePrecision(None, autocast=False),
+}
 
 
 class LTX25Model(Model):
@@ -457,10 +469,10 @@ class LTX25Model(Model):
         return self.resolve_request(request_kwargs or {})["fps"]
 
     # ------------------------------------------------------------- loading
-    def get_autocast_dtype(self):
-        # None: no engine autocast or blanket cast; numerics follow the checkpoint
-        # dtypes (bf16 weights, fp32 latents and step math), as the parity tests pin.
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No node runs under autocast: numerics follow the load-time dtypes (bf16
+        weights, fp32 latents and step math), as the parity tests pin."""
+        return _NODE_PRECISION[node_name]
 
     def capture_buckets(self) -> list[tuple[str, LTXShape]]:
         if not self.accelerator_graph:
@@ -509,14 +521,18 @@ class LTX25Model(Model):
 
         snapshot = self.snapshot
         if node_name == TEXT_ENCODER_NODE:
+            dtype = _NODE_PRECISION[TEXT_ENCODER_NODE].param_dtype
             return LTXTextEncoderSubmodule(
-                weight_loader.build_text_encoder(self.config, snapshot, device),
-                weight_loader.build_connectors(self.config, snapshot, device),
+                weight_loader.build_text_encoder(self.config, snapshot, device, dtype=dtype),
+                weight_loader.build_connectors(self.config, snapshot, device, dtype=dtype),
                 self.config, max_batch_size=self.max_batch_size,
             )
         if node_name == DIT_NODE:
             return LTXDenoiseSubmodule(
-                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(
+                    self.config, snapshot, device, comm_group=tp_group, sp_group=sp_group,
+                    dtype=_NODE_PRECISION[DIT_NODE].param_dtype,
+                ),
                 self.config,
                 loop_name=DENOISE_LOOP, use_ragged_attention=self.attention_backend == "flashinfer",
                 refine_walks=frozenset(REFINE_WALKS.values()),

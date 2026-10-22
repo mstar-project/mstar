@@ -44,25 +44,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     ``(cameras_sent * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
-    disable_autocast = True
-
     def __init__(self, encoder: Pi05SiglipEncoder, config: Pi05Config):
         super().__init__()
         self.encoder = encoder
         self.config = config
-
-    # Kept in float32, as openpi keeps them (to_bfloat16_for_selected_params
-    # in models_pytorch/gemma_pytorch.py); everything else runs in bfloat16.
-    _FLOAT32_PARAM_SELECTORS = ("embeddings.patch_embedding.", "embeddings.position_embedding.")
-
-    def to(self, *args, **kwargs):
-        """Apply ``to()``, then set openpi's SigLIP precision: bfloat16 except
-        the patch and position embeddings."""
-        result = super().to(*args, **kwargs)
-        for name, param in result.named_parameters():
-            keep = any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS)
-            param.data = param.data.to(torch.float32 if keep else torch.bfloat16)
-        return result
 
     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
         """Resize one request's stack of camera images with aspect-preserving
@@ -266,27 +251,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
 
 
 class _Pi05ExpertSubmodule(ARNodeSubmodule):
-    """What the prefix and action experts share: their norms' precision."""
-
-    # Parameter name fragments whose weights stay in float32 while the rest of
-    # the node runs in bf16, as in openpi: its to_bfloat16_for_selected_params
-    # keeps the norms (whose loss compounds across the 18 layers), and its
-    # time MLP is never cast.
-    _FLOAT32_PARAM_SELECTORS = (
-        "input_layernorm",
-        "post_attention_layernorm",
-        ".norm.",   # final RMSNorm / adaRMS norm
-        "time_mlp.",  # the adaRMS condition
-    )
-
-    def to(self, *args, **kwargs):
-        """Apply standard ``to()``, then upcast the ``_FLOAT32_PARAM_SELECTORS``
-        parameters (the norms and the time MLP) back to fp32."""
-        result = super().to(*args, **kwargs)
-        for name, param in result.named_parameters():
-            if any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS):
-                param.data = param.data.to(torch.float32)
-        return result
+    """What the prefix and action experts share."""
 
     def can_batch(
         self,

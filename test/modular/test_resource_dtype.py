@@ -107,7 +107,7 @@ def test_yaml_sets_the_kv_dtype_per_resource_key():
 
 
 def test_nodes_without_a_dtype_must_declare_one():
-    with pytest.raises(ValueError, match=r"'kv' declares no dtype .* without a dtype"):
+    with pytest.raises(ValueError, match=r"'kv' declares no dtype .* keep the dtype they were built in"):
         _build(_Model(torch.bfloat16, {"opted_out"}))
     # the model-wide None is no fallback either
     with pytest.raises(ValueError, match=r"'kv' declares no dtype"):

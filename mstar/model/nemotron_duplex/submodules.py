@@ -456,19 +456,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up.
-        Computed once per speaker, under the serving autocast (bf16 on CUDA) no
-        matter who asks first: the CUDA-graph capture's first preprocess runs
-        outside the engine's autocast scope, and a warm-up computed there
-        differs in the last bits from one computed under it -- enough to move
-        a session's first frame (the talker's frame-0 decision is a knife-edge)."""
+        Computed once per speaker. The talker states its precision explicitly
+        (no autocast), so the warm-up is the same bits whoever asks first, in
+        the engine's scope or out of it (the CUDA-graph capture's first
+        preprocess) -- which matters: the talker's frame-0 decision is a
+        knife-edge that last-bit changes move."""
         if self._warmup is None:
             cfg = self.config
-            dev = self.talker.embed_code.weight.device
-            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                self._warmup = self.talker.warmup_inputs(
-                    self.SPEAKER, self._s2c, self._char_pad,
-                    text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
-                )
+            self._warmup = self.talker.warmup_inputs(
+                self.SPEAKER, self._s2c, self._char_pad,
+                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
+            )
         return self._warmup
 
     @property
@@ -684,16 +682,15 @@ def codec_step(codec: AudioCodec, pool, codes: torch.Tensor) -> CodecStreamAudio
     needs nothing else. Fixed-shape, so a graph captures it."""
     blocks = codec.config.num_blocks
     stages = len(codec.config.channels)
-    with torch.autocast(device_type=codes.device.type, enabled=False):
-        state = CodecStreamState(
-            tails=[t for i in range(stages) for t in pool.gather(f"stage{i}").unbind(1)],
-            overlap=pool.gather("overlap"),
-        )
-        audio, state = codec.decode_stream(codes, state)
-        for i in range(stages):
-            tails = torch.stack(state.tails[i * blocks:(i + 1) * blocks], dim=1)
-            pool.scatter_(f"stage{i}", tails.to(pool.block(f"stage{i}", 0).dtype))
-        pool.scatter_("overlap", state.overlap)
+    state = CodecStreamState(
+        tails=[t for i in range(stages) for t in pool.gather(f"stage{i}").unbind(1)],
+        overlap=pool.gather("overlap"),
+    )
+    audio, state = codec.decode_stream(codes, state)
+    for i in range(stages):
+        tails = torch.stack(state.tails[i * blocks:(i + 1) * blocks], dim=1)
+        pool.scatter_(f"stage{i}", tails.to(pool.block(f"stage{i}", 0).dtype))
+    pool.scatter_("overlap", state.overlap)
     return audio
 
 

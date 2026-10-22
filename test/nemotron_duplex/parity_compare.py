@@ -7,10 +7,11 @@
     # or compare a saved engine text (from a previous /generate) without a server:
     python test/nemotron_duplex/parity_compare.py --audio user.wav --engine-text engine.txt --precision fp32
 
-``--precision bf16`` runs the standalone path with bf16 weights under autocast,
-the engine's serving precision: the two must agree token for token, save the
-last frame, which the server encodes in a pass of its own when the upload's
-end of input reaches the encoder after its audio. ``fp32`` is the
+``--precision bf16`` runs the standalone path in each node's serving precision
+(``get_node_precision``: bf16, the encoder under autocast, the LLM without):
+the two must agree token for token, save the last frame, which the server
+encodes in a pass of its own when the upload's end of input reaches the
+encoder after its audio. ``fp32`` is the
 reference-verified oracle; it can legitimately differ from a bf16 run where
 the text channel's decision is a knife-edge, which the printed top-2 logit
 margins show (e.g. the agent's turn start: <s> vs <SPECIAL_12>). A mismatch
@@ -27,6 +28,7 @@ import sys
 import torch
 
 import mstar.model.nemotron_duplex.nemotron_duplex_model as duplex
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.model.registry import HF_MODELS
 
 
@@ -42,6 +44,13 @@ def load_wav_16k_mono(path: str) -> torch.Tensor:
 
         a = AF.resample(a, sr, 16000)
     return a
+
+
+def _autocast(fn, dtype: torch.dtype):
+    def run(*args, **kwargs):
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            return fn(*args, **kwargs)
+    return run
 
 
 def engine_text_from_server(url: str, audio: str) -> str:
@@ -80,15 +89,19 @@ def main():
     duplex._sample_text_token = recording_sampler
     try:
         model = duplex.NemotronDuplexModel(model_path_hf=HF_MODELS["nemotron_duplex"]["model_path_hf"])
-        dtype = torch.bfloat16 if args.precision == "bf16" else None
         for node in ("conformer_encoder", "nano_llm"):
-            model.get_submodule(node, device="cuda", autocast_dtype=dtype)
-        wav = load_wav_16k_mono(args.audio).cuda()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-            out = model.offline_inference(
-                wav.unsqueeze(0), torch.tensor([wav.shape[0]], device="cuda"),
-                device="cuda", temperature=0.0, decode_audio=False,
+            policy = model.get_node_precision(node) if args.precision == "bf16" else NodePrecision(None)
+            sub = apply_precision(
+                model.get_submodule(node, device="cuda", autocast_dtype=policy.param_dtype), policy,
             )
+            if policy.autocast:
+                # only the encoder autocasts, and encode_clip is its offline entry
+                sub.encode_clip = _autocast(sub.encode_clip, policy.param_dtype)
+        wav = load_wav_16k_mono(args.audio).cuda()
+        out = model.offline_inference(
+            wav.unsqueeze(0), torch.tensor([wav.shape[0]], device="cuda"),
+            device="cuda", temperature=0.0, decode_audio=False,
+        )
     finally:
         duplex._sample_text_token = sample
 

@@ -20,10 +20,15 @@ def _prepare_inputs(
     norm_dtype: torch.dtype | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
     """Apply the dtype contract shared by every RMSNorm kernel: ``norm_dtype``
-    if given, else ``x``'s own; never ambient autocast state."""
+    if given, else the autocast dtype of a node whose policy runs under autocast,
+    else ``x``'s own. A node with autocast off runs with it disabled, so it never
+    sees an enclosing one."""
     orig_dtype = x.dtype
+    device_type = x.device.type
     if norm_dtype is not None:
         x = x.to(norm_dtype)
+    elif torch.is_autocast_enabled(device_type):
+        x = x.to(torch.get_autocast_dtype(device_type))
     if weight.dtype != x.dtype:
         weight = weight.to(x.dtype)
     return x, weight, orig_dtype

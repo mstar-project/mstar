@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -571,14 +572,18 @@ class OmniVoiceModel(Model):
         }
         return [WalkStep(walk, step_metadata=request) for walk in walks]
 
-    def get_autocast_dtype(self):
-        """No engine autocast: the fused kernels need one dtype throughout.
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No autocast anywhere: the backbone's fused flashinfer kernels need
+        one dtype throughout (RMSNorm rejects autocast's mixed dtypes).
 
-        Returning None disables both autocast and the engine's blanket cast, so
-        numerics follow the load dtype -- the same call wan22 makes to keep its
-        numerics equal to the reference pipeline.
+        No blanket dtype: the loader casts only the backbone's llm, audio
+        embeddings and heads to ``load_dtype`` and leaves the codec (the
+        reference's ``audio_tokenizer``, shared with the two codec nodes) fp32,
+        since in float16 the DAC decoder underflows to silence.
         """
-        return None
+        if node_name not in ("backbone", "ref_encoder", "code2wav"):
+            raise ValueError(f"Unknown OmniVoice node {node_name!r}")
+        return NodePrecision(None, autocast=False)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the loop ends on the request's own num_step, and is never speculated past it;

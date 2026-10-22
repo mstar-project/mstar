@@ -198,7 +198,6 @@ class ReferenceEncoder:
 
 class SpeakerEncoderSubmodule(NodeSubmodule):
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, encoder: ReferenceEncoder, config: CosyVoice3Config):
         super().__init__()
@@ -653,7 +652,6 @@ class FlowSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, flow: nn.Module, encoder: ReferenceEncoder, config: CosyVoice3Config):
         super().__init__()
@@ -1081,7 +1079,6 @@ class HiFTSubmodule(NodeSubmodule):
     carry in the ``HIFT_STATE`` pool. Otherwise each row runs ``stream_vocode`` eagerly."""
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, hift: nn.Module, config: CosyVoice3Config):
         super().__init__()

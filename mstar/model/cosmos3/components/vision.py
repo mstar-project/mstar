@@ -49,13 +49,12 @@ def resize_position_grid(
     (2x2-merge) patch order, repeated over the frame's ``t``.
 
     Bilinear, ``align_corners=False``, antialiased — the reference's
-    ``F.interpolate`` call; fp32 on CPU because antialias has no bf16 kernel
-    there. Returns ``[total_patches, hidden]`` in pack order.
+    ``F.interpolate`` call; in fp32, as autocast runs it (and antialias has no
+    bf16 kernel on CPU), rounded back to the grid's dtype. Returns
+    ``[total_patches, hidden]`` in pack order.
     """
     source_dtype = grid_embeds.dtype
-    grid = grid_embeds.permute(2, 0, 1).unsqueeze(0)  # [1, hidden, S, S]
-    if grid.device.type == "cpu":
-        grid = grid.float()
+    grid = grid_embeds.permute(2, 0, 1).unsqueeze(0).float()  # [1, hidden, S, S]
     chunks = []
     for t, h, w in grid_thw:
         resized = F.interpolate(grid, size=(h, w), mode="bilinear", align_corners=False, antialias=True)
@@ -203,7 +202,9 @@ class Cosmos3VisionTransformer(nn.Module):
         frame_lens = [h * w for t, h, w in grid_thw for _ in range(t)]
         x = self.embeddings(pixel_values, grid_thw)
         x = self.encoder(x, frame_lens)
-        return self.post_layernorm(x)
+        # fp32 out, an island in the node's policy: the projector's norm reads
+        # it unrounded, as it did under the autocast this tower ran in
+        return self.post_layernorm(x.float())
 
 
 class Cosmos3PatchMerger(nn.Module):
@@ -227,6 +228,8 @@ class Cosmos3PatchMerger(nn.Module):
             x = self.norm(x.view(-1, self.hidden_size))
         else:
             x = self.norm(x).view(-1, self.hidden_size)
+        # the fp32 norm's output rounds once, into the bf16 projection
+        x = x.to(self.linear_fc1.weight.dtype)
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 

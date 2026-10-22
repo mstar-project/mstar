@@ -93,7 +93,6 @@ class OmniVoiceRefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, codec: nn.Module, config: OmniVoiceConfig):
         super().__init__()
@@ -152,12 +151,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     disable_torch_compile = True
     # The fused flashinfer kernels this path runs on (RMSNorm, silu_and_mul,
     # ragged attention) require every tensor in a call to share one dtype --
-    # unlike ATen, which would quietly promote. Under the engine's autocast the
-    # activations arrive at a different dtype from the weights and the fused
-    # RMSNorm rejects the call outright:
+    # unlike ATen, which would quietly promote. Under autocast the activations
+    # arrive at a different dtype from the weights and the fused RMSNorm
+    # rejects the call outright:
     #   Mismatched Tensor on argument #1 ... expected dtype=float32
-    # So numerics here are governed by the load dtype, not by the engine.
-    disable_autocast = True
+    # So the model's precision policy runs this node in the load dtype, with
+    # autocast off.
     # Packed tokens per step (both CFG documents of every request); a step
     # above the largest bucket runs eagerly. Eager steps stay launch-bound well
     # past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took
@@ -496,7 +495,6 @@ class OmniVoiceCode2WavSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, codec: nn.Module, config: OmniVoiceConfig):
         super().__init__()

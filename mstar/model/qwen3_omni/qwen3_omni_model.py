@@ -39,7 +39,11 @@ from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
+from mstar.conductor.request_info import (
+    FINAL_PREFILL,
+    PartitionDefinition,
+)
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -117,6 +121,8 @@ logger = logging.getLogger(__name__)
 
 # In a prefill schedule entry: how many of the step's text tensors lead its attachment
 TEXT_BEFORE = "text_before"
+# the vision tower's rotary frequencies, in the vision_encoder node
+VISION_ROTARY_FREQS = "vision_encoder.rotary_pos_emb.inv_freq"
 
 # Code2Wav streaming knobs a deployment YAML's ``model_kwargs`` may set; the
 # rest of the Code2Wav config comes from the checkpoint.
@@ -1317,6 +1323,19 @@ class Qwen3OmniModel(Model):
     # Model ABC: submodule loading
     # -----------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast. Code2Wav keeps the checkpoint's dtypes.
+        Routing softmax and the norms pin fp32 themselves, and the encoders'
+        LayerNorms emit bf16 where autocast emitted fp32 for the next matmul
+        to round."""
+        if node_name == "Code2Wav":
+            return NodePrecision(None, autocast=False)
+        if node_name == "vision_encoder":
+            # the rotary frequencies stay fp32, as the reference keeps them: in
+            # bf16 the far patches of a large image rotate by visibly wrong angles
+            return NodePrecision(torch.bfloat16, fp32_modules=(VISION_ROTARY_FREQS,), autocast=False)
+        return NodePrecision(torch.bfloat16, autocast=False)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -1559,8 +1578,10 @@ class Qwen3OmniModel(Model):
         # built on the device, not on meta: the rotary table is a computed buffer
         with torch.device(device):
             tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN)
-        if autocast_dtype is not None:
-            tower = tower.to(autocast_dtype)
+        # the node's policy, rooted at the tower: its fp32 rotary table survives
+        tower = apply_precision(tower, NodePrecision(
+            autocast_dtype, fp32_modules=(VISION_ROTARY_FREQS.removeprefix("vision_encoder."),),
+        ))
         prefix = "thinker.visual."
         weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
         loaded = load_hf_weights(tower, ((k.removeprefix(prefix), v) for k, v in weights))

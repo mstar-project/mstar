@@ -29,6 +29,7 @@ from dataclasses import asdict, replace
 
 import torch
 
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -236,6 +237,13 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
     # Submodules
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast. The audio tower's LayerNorms emit bf16
+        where autocast emitted fp32, which the next conv or linear rounded to
+        bf16 anyway."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def _create_submodule(
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,
