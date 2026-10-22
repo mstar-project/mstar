@@ -434,7 +434,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """Qwen3.5: text-and-image chat, text out.
+    """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
