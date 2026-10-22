@@ -32,8 +32,21 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources.lora.config import (
+    LORA_ADAPTER_KWARG,
+    LORA_RESOURCE_KEY,
+    LoraReqConfig,
+    LoraSpec,
+)
+from mstar.engine.resources.lora.serving import lora_specs, served_lora_targets
+from mstar.engine.resources.lora.store import check_adapters
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.base import (
+    ForwardPassArgs,
+    Model,
+    WorkerGraph,
+    serving_resources,
+)
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
@@ -373,6 +386,32 @@ def _message_request_ids(message) -> list[str | None]:
     return [getattr(body, "request_id", None)]
 
 
+def _apply_conductor_configs(
+    configs: dict[str, ResourceReqConfig], model_kwargs: dict | None, seed: int,
+) -> None:
+    """Hand each resource config the request's seed and its own prefix chain.
+
+    Keyed by resource, so each config is handed only its own chain. ``prefix_root``
+    names the LoRA adapter the chains were keyed under and is the same for all.
+    """
+    kwargs = model_kwargs or {}
+    prefix_keys = kwargs.get("prefix_keys") or {}
+    prefix_tail = kwargs.get("prefix_tail") or {}
+    prefix_decode = kwargs.get("prefix_decode") or {}
+    prefix_layout = kwargs.get("prefix_layout") or {}
+    for key, cfg in configs.items():
+        cfg.apply_conductor_config(
+            seed=seed,
+            resource_key=key,
+            prefix_keys=prefix_keys.get(key),
+            prefix_tail=prefix_tail.get(key),
+            prefix_decode=prefix_decode.get(key),
+            prefix_layout=prefix_layout.get(key),
+            prefix_root=kwargs.get("prefix_root"),
+            prefix_cache=kwargs.get("prefix_cache"),
+        )
+
+
 class Conductor:
     # Metrics are off unless __init__ gets an interval; class-level so an
     # object built without __init__ reads them as off too.
@@ -390,6 +429,7 @@ class Conductor:
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         status_interval_s: float | None = None,
+        lora_adapter_digests: dict[str, str] | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
@@ -450,6 +490,7 @@ class Conductor:
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
         model.validate_config_yaml(self.model_config, model_config_file)
+        self._settle_lora_adapters(lora_adapter_digests)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         # The conductor is the only process that sees every worker graph, so it
@@ -579,10 +620,13 @@ class Conductor:
         return cap
 
     def _resource_specs(self) -> dict:
-        """The model's resource specs by key, for admission-time capability checks."""
+        """The deployment's resource specs by key (YAML applied), for admission-time checks."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
+            specs = {
+                s.resource_key: s
+                for s in serving_resources(self.model, getattr(self, "model_config", None) or {})
+            }
             self._resource_specs_cache = specs
         return specs
 
@@ -597,14 +641,55 @@ class Conductor:
         is a deployment-wide property the model declares in its resource specs.
 
         A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        keys would have nowhere to go. So does a declared LoRA pool, from the
+        ``lora_adapter`` kwarg.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
         for key, streams in self.model.prefix_key_streams().items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        # the adapter config is the conductor's to fill, like the stream configs above,
+        # so a model that declares a LoRA spec needs no request code of its own; every
+        # node with a LoRA pool (an LLM, its vision encoder) runs the request's adapter
+        adapter = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
+        if LORA_RESOURCE_KEY in self._resource_specs():
+            for key, spec in self._resource_specs().items():
+                if isinstance(spec, LoraSpec):
+                    configs.setdefault(key, LoraReqConfig(adapter=adapter))
+        elif adapter is not None:
+            raise ValueError(
+                f"the request asks for LoRA adapter {adapter!r}, but this deployment "
+                "serves no LoRA adapters"
+            )
         return configs
+
+    def _settle_lora_adapters(self, digests: dict[str, str] | None) -> None:
+        """Check the serving config's LoRA adapters before any worker starts, unless the
+        API server already did (``digests``, name -> hex), so a bad adapter fails the
+        deployment at startup with every bad adapter named.
+
+        The digests go into the config the workers are spawned with
+        (``adapter_digests``), so every read a worker makes, at startup or after the
+        adapter left its host tier, serves the weights the API server keyed the prefix
+        cache under, the same on every rank. So do the targets the adapters touch, when
+        runtime updates are off (``served_lora_targets``): computed here once, every
+        process and rank builds the same specs."""
+        block = (self.model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
+        if not block.get("adapters"):
+            return
+        # every node's LoRA spec, the one keyed `lora` first: each serves the adapters
+        specs = lora_specs(self.model, self.model_config)
+        if digests is None:
+            digests = {
+                name: d.hex() for name, d in check_adapters(specs[0], others=specs[1:]).items()
+            }
+        # one block sizes every LoRA spec, so each spec's pools pin the same digests
+        block["adapter_digests"] = dict(digests)
+        targets = served_lora_targets(specs)
+        if targets is not None:
+            logger.info("LoRA: serving only the targets the adapters touch: %s", targets)
+            block["targets"] = targets
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -1194,23 +1279,7 @@ class Conductor:
         specs = self._resource_specs()
         for key, cfg in request_data.resource_configs.items():
             cfg.validate(specs.get(key))
-        # keyed by resource, so each config is handed only its own chain
-        kwargs = model_kwargs or {}
-        prefix_keys = kwargs.get("prefix_keys") or {}
-        prefix_tail = kwargs.get("prefix_tail") or {}
-        prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_layout = kwargs.get("prefix_layout") or {}
-        prefix_cache = kwargs.get("prefix_cache")
-        for key, cfg in request_data.resource_configs.items():
-            cfg.apply_conductor_config(
-                seed=seed,
-                resource_key=key,
-                prefix_keys=prefix_keys.get(key),
-                prefix_tail=prefix_tail.get(key),
-                prefix_decode=prefix_decode.get(key),
-                prefix_layout=prefix_layout.get(key),
-                prefix_cache=prefix_cache,
-            )
+        _apply_conductor_configs(request_data.resource_configs, model_kwargs, seed)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True

@@ -344,6 +344,7 @@ def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[st
         prompt_parts=args.prompt_parts,
         streaming=streaming,
         request_id=request_id,
+        model=req.model,
     )
     inflight.add(request_id)
     window.request_id = request_id

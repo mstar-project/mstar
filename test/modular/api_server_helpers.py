@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
+from mstar.api_server.served_models import ServedModels
 
 
 def make_test_api_server(**overrides) -> APIServer:
@@ -32,6 +33,9 @@ def make_test_api_server(**overrides) -> APIServer:
     server.metrics = None
     server.model = None
     server.model_name = "dummy"
+    server.served_models = ServedModels.of("dummy", None)
+    # no LoRA block: no adapters to digest, as APIServer.__init__ leaves it
+    server.lora_adapter_digests = {}
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None

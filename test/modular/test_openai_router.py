@@ -26,6 +26,8 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.served_models import ServedModels  # noqa: E402
+
 
 class _Chunk:
     def __init__(self, modality, data, metadata=None):
@@ -43,6 +45,7 @@ class _StubAPI:
     def __init__(self, model_name="bagel"):
         self.model_name = model_name
         self.model = _StubModel()
+        self.served_models = ServedModels.of(model_name, None)
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
         self._chunks: dict = {}

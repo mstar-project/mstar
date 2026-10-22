@@ -30,8 +30,10 @@ from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
-from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.lora.identity import AdapterPrefixRoots
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span, serving_resources
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -131,8 +133,7 @@ def _preprocess_loop(**kwargs):
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, model_config)
+    specs = serving_resources(model, model_config)
     return {
         spec.resource_key: spec.config.page_size
         for spec in specs
@@ -140,6 +141,23 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
+def adapter_prefix_roots(
+    model: Model | None, model_config: dict | None,
+    digests: dict[str, bytes] | None = None,
+) -> AdapterPrefixRoots | None:
+    """The roots the deployment's LoRA adapters key their prompts under.
+
+    None when the deployment keys no stream or serves no adapter. Otherwise each adapter
+    is keyed under its digest in ``digests`` (the API server's startup check) or read
+    once, here, so its digest names the weights as they were when it was registered and
+    no request pays for reading it.
+    """
+    if model is None or not model_config or not model.prefix_key_streams():
+        return None
+    if not _kv_page_sizes(model, model_config):
+        return None
+    lora = lora_specs(model, model_config)
+    return AdapterPrefixRoots.read(lora[0], digests) if lora else None
 
 
 class PreprocessWorker:
@@ -153,7 +171,10 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
+        adapter_digests: dict[str, bytes] | None = None,
     ):
+        """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
+        server's startup check read them."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -195,6 +216,9 @@ class PreprocessWorker:
             enable_prof=enable_prof,
         )
 
+        # the serving config's adapters' prefix-cache roots
+        self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
+
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -216,6 +240,7 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
+                adapter_roots=self.adapter_prefix_roots,
             )
         )
         self.thread.start()
@@ -473,7 +498,9 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
+        adapter_roots: AdapterPrefixRoots | None = None,
     ):
+        self._adapter_roots = adapter_roots
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
         declared = model.prefix_key_streams() if model is not None and model_config else {}
@@ -622,7 +649,7 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", "prefix_root", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -645,6 +672,7 @@ class PreprocessWorkerThread:
             if model_kwargs.get("prefix_cache") is not False:
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, input.file_paths, file_states,
+                    adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -727,16 +755,27 @@ class PreprocessWorkerThread:
     def _prefix_keys(
         self, tensors: dict, layouts: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
+        adapter: str | None = None,
     ) -> dict:
         """Key each page of every declared stream, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
         page, each stream's layout as ``[length, advance, walk, digest, end_key]``
         rows, and the output tensor each stream's sampled ids arrive in. The keys
-        are unrooted.
+        are not rooted in the process (the engine does that). The chains of a
+        request on a LoRA adapter hang from the adapter's root, which is also sent
+        as ``prefix_root``; a base request's hang from the empty root, as before LoRA.
         """
         if not self._prefix_streams:
             return {}
+        root = b""
+        if adapter is not None:
+            roots = self._adapter_roots
+            root = roots.root(adapter) if roots is not None else None
+            if root is None:
+                # under the empty root its pages would serve the base model; the
+                # conductor refuses an adapter it does not serve in any case
+                return {"prefix_cache": False}
         for resource_key, by_label in layouts.items():
             for label in by_label:
                 if label not in self._prefix_streams.get(resource_key, {}):
@@ -780,7 +819,7 @@ class PreprocessWorkerThread:
                 pages, items = self._page_layout(
                     stream, layout, digests, tensors, page_size,
                 )
-                page_keys = chain(pages, items)
+                page_keys = chain(pages, items, root=root)
                 keys.setdefault(resource_key, {})[label] = page_keys
                 total = sum(span.length for span in layout)
                 tails.setdefault(resource_key, {})[label] = (
@@ -791,7 +830,7 @@ class PreprocessWorkerThread:
                     at += span.length
                     page, end = divmod(at, page_size)
                     rows.append([span.length, span.advance, span.walk, digest, end_key(
-                        page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
+                        page_keys[page - 1] if page else root, pages[page], items.get(page, ()), end,
                     ) if digest is not None and end else None])
                 layout_rows.setdefault(resource_key, {})[label] = rows
                 if stream.decode_walk is not None:
@@ -803,6 +842,8 @@ class PreprocessWorkerThread:
         }
         if decode:
             kwargs["prefix_decode"] = decode
+        if root:
+            kwargs["prefix_root"] = root
         return kwargs
 
     def _page_layout(
