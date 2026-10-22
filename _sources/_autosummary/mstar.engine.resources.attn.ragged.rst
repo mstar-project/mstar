@@ -28,6 +28,7 @@ mstar.engine.resources.attn.ragged
    :recursive:
 
    base
+   block_causal
    config
    flashinfer
    wrappers

@@ -17,6 +17,7 @@ mstar.engine.resources.attn.ragged.flashinfer
 
    .. autosummary::
    
+      FlashInferRaggedBlockCausalManager
       FlashInferRaggedCrossManager
       FlashInferRaggedManager
    

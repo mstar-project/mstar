@@ -50,12 +50,12 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.engine.resources.attn.ragged.config" href="mstar.engine.resources.attn.ragged.config.html" />
+    <link rel="next" title="mstar.engine.resources.attn.ragged.block_causal" href="mstar.engine.resources.attn.ragged.block_causal.html" />
     <link rel="prev" title="mstar.engine.resources.attn.ragged" href="mstar.engine.resources.attn.ragged.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -644,6 +644,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.build"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager.prefix_skip_safe</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.build"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.prefix_skip_safe</span></code></a></li>
@@ -683,7 +688,10 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedAttnManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttnManager</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttnManager</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager</span></code></a>()</p></td>
+<td><p>Cacheless block-causal self-attention within each span; see <code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttnManager</span></code></a>()</p></td>
 <td><p>Cacheless cross-attention between two spans of each request; see <code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec</span></code>.</p></td>
 </tr>
 </tbody>
@@ -709,6 +717,32 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.RaggedAttnManager.prefix_skip_safe">
 <span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.base.</span></span><span class="sig-name descname"><span class="pre">RaggedBlockCausalAttnManager</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/base.html#RaggedBlockCausalAttnManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.AttentionResource" title="mstar.engine.resources.base.AttentionResource"><code class="xref py py-class docutils literal notranslate"><span class="pre">AttentionResource</span></code></a></p>
+<p>Cacheless block-causal self-attention within each span; see
+<code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code>.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.build">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">build</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/base.html#RaggedBlockCausalAttnManager.build"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.build" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>spec</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec"><em>RaggedBlockCausalAttentionSpec</em></a>)</p></li>
+<li><p><strong>info</strong> (<a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo" title="mstar.engine.resources.base.EngineResourceInfo"><em>EngineResourceInfo</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.prefix_skip_safe">
+<span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -779,11 +813,11 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
       </div>
     </a>
     <a class="right-next"
-       href="mstar.engine.resources.attn.ragged.config.html"
+       href="mstar.engine.resources.attn.ragged.block_causal.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.engine.resources.attn.ragged.config</p>
+        <p class="prev-next-title">mstar.engine.resources.attn.ragged.block_causal</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -808,6 +842,11 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager"><code class="docutils literal notranslate"><span class="pre">RaggedAttnManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager.build"><code class="docutils literal notranslate"><span class="pre">RaggedAttnManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedAttnManager.prefix_skip_safe</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.build"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -849,7 +888,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>

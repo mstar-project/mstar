@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../../../../../../_static/searchtools.js"></script>
@@ -1122,6 +1122,29 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">return</span> <span class="n">RaggedCrossAttnManager</span></div>
 
+
+
+<div class="viewcode-block" id="RaggedBlockCausalAttentionSpec">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedBlockCausalAttentionSpec">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedBlockCausalAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless block-causal self-attention within each declared span: a token in</span>
+<span class="sd">    block ``b`` of its span (``block_size`` tokens a block, from the span's start)</span>
+<span class="sd">    attends every key of blocks ``0..b``. Declared with ``AttentionStep(causal=False)``,</span>
+<span class="sd">    since the block structure is the whole mask.</span>
+
+<span class="sd">    Its own kind, not a flag on ``RaggedAttentionSpec``: it runs a different kernel</span>
+<span class="sd">    (paged prefill over one-token pages, see ``attn.ragged.block_causal``).</span>
+<span class="sd">    """</span>
+
+    <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedBlockCausalAttnManager</span>
+
+        <span class="k">return</span> <span class="n">RaggedBlockCausalAttnManager</span></div>
+
 </pre></div>
 
                 </article>
@@ -1169,7 +1192,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>

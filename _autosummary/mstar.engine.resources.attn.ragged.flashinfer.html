@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -639,6 +639,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.wrapper_class"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager.wrapper_class</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager.wrapper_class"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager.wrapper_class</span></code></a></li>
 </ul>
@@ -665,15 +670,56 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager" title="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager</span></code></a>(device, dtype, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager" title="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager</span></code></a>(device, ...)</p></td>
+<td><p>Block-causal self-attention: every label in the step is its own layout, each segment attending block-causally within itself.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager" title="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager</span></code></a>(device, dtype, ...)</p></td>
 <td><p>Cross-attention: each <code class="docutils literal notranslate"><span class="pre">(q_label,</span> <span class="pre">kv_label)</span></code> pair of the step is one plan, run under <code class="docutils literal notranslate"><span class="pre">cross_label(q_label,</span> <span class="pre">kv_label)</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager" title="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedManager</span></code></a>(device, dtype, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager" title="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedManager</span></code></a>(device, dtype, config)</p></td>
 <td><p>Self-attention: every label in the step is its own layout, each segment attending within itself.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.flashinfer.</span></span><span class="sig-name descname"><span class="pre">FlashInferRaggedBlockCausalManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/flashinfer.html#FlashInferRaggedBlockCausalManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_FlashInferRaggedBase</span></code>, <a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager"><code class="xref py py-class docutils literal notranslate"><span class="pre">RaggedBlockCausalAttnManager</span></code></a></p>
+<p>Block-causal self-attention: every label in the step is its own layout,
+each segment attending block-causally within itself.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a>)</p></li>
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><em>RaggedAttentionConfig</em></a>)</p></li>
+<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.plan">
+<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/flashinfer.html#FlashInferRaggedBlockCausalManager.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.plan" title="Link to this definition">#</a></dt>
+<dd><p>ret is immutable and opaque to runner; only gives to <cite>ctx.plan_results</cite></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttentionStep" title="mstar.engine.resources.attn.config.AttentionStep"><em>AttentionStep</em></a>)</p></li>
+<li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.wrapper_class">
+<span class="sig-name descname"><span class="pre">wrapper_class</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.wrapper_class" title="Link to this definition">#</a></dt>
+<dd><p>alias of <a class="reference internal" href="mstar.engine.resources.attn.ragged.block_causal.html#mstar.engine.resources.attn.ragged.block_causal.RaggedBlockCausalWrapper" title="mstar.engine.resources.attn.ragged.block_causal.RaggedBlockCausalWrapper"><code class="xref py py-class docutils literal notranslate"><span class="pre">RaggedBlockCausalWrapper</span></code></a></p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.flashinfer.</span></span><span class="sig-name descname"><span class="pre">FlashInferRaggedCrossManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/flashinfer.html#FlashInferRaggedCrossManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager" title="Link to this definition">#</a></dt>
@@ -783,6 +829,11 @@ attending within itself.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedBlockCausalManager.wrapper_class"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedBlockCausalManager.wrapper_class</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager.wrapper_class"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossManager.wrapper_class</span></code></a></li>
 </ul>
@@ -825,7 +876,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>

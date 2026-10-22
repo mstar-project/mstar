@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -967,6 +967,14 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># per step, so nodes that never ask for it pay nothing; a request that</span>
     <span class="c1"># sets ``min_p`` on a node without it is refused at ingest.</span>
     <span class="n">enable_min_p</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Capabilities for the generation-aware request knobs below; each off by</span>
+    <span class="c1"># default, leaving the node's sampler as it was.</span>
+    <span class="c1"># The longest ``repetition_window`` a request may ask for (sizes the history).</span>
+    <span class="n">max_repetition_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># The ids ``min_tokens`` bars (the model's EOS ids).</span>
+    <span class="n">min_tokens_stop_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="c1"># Allows ``top_p_first`` / ``top_p_min_keep``.</span>
+    <span class="n">enable_top_p_first</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
@@ -989,6 +997,18 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># probability is below ``min_p`` times the most likely token's, after the</span>
     <span class="c1"># penalty and temperature and before top-k/top-p. 0 disables.</span>
     <span class="n">min_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="c1"># &gt; 0: the penalty is ``repetition_penalty ** n``, n a token's count among</span>
+    <span class="c1"># the last ``repetition_window`` generated tokens; 0: presence over prompt</span>
+    <span class="c1"># and output.</span>
+    <span class="n">repetition_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># The spec's stop ids get no probability until this many tokens exist</span>
+    <span class="c1"># (applied after top-k/top-p).</span>
+    <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># HF's order, top-p then top-k, each on the full distribution (FlashInfer's</span>
+    <span class="c1"># is top-k, then top-p over the renormalised top-k).</span>
+    <span class="n">top_p_first</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Top-p keeps at least this many tokens (HF's ``min_tokens_to_keep``).</span>
+    <span class="n">top_p_min_keep</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="c1"># Whether the repetition penalty also counts the prompt's tokens (HF does).</span>
     <span class="c1"># A node whose step declares no ``prefill_tracked_tokens`` only ever has the</span>
     <span class="c1"># generated ones to count.</span>
@@ -1031,7 +1051,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># refused here, not ignored: the node's sampler has no such filter</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">enable_min_p</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"this model does not support min_p; send 0 or leave it unset"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">enable_repetion_penalty</span><span class="p">:</span>
+        <span class="c1"># a windowed penalty counts the generation history, not the seen-token mask</span>
+        <span class="n">windowed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_window</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">max_repetition_window</span> <span class="o">&gt;</span> <span class="mi">0</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">enable_repetion_penalty</span> <span class="ow">or</span> <span class="n">windowed</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">"this model does not support repetition_penalty; send 1 or leave it unset"</span>
             <span class="p">)</span></div>
@@ -1067,6 +1089,9 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">SamplerStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
     <span class="n">apply_penalty</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># False turns top-k/top-p off for this step (e.g. a TTS's first code).</span>
+    <span class="c1"># Captured graphs bake it: declare it the same way on every step of a walk.</span>
+    <span class="n">apply_filters</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># rid -&gt; prefill tokens for the repetition penalty</span>
     <span class="n">prefill_tracked_tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># Rows whose sampled token is kept; None keeps every row. A dropped row</span>
@@ -1120,7 +1145,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>

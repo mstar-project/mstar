@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../../../../../../_static/searchtools.js"></script>
@@ -943,6 +943,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">RaggedAttentionSpec</span><span class="p">,</span>
     <span class="n">RaggedAttnBackend</span><span class="p">,</span>
+    <span class="n">RaggedBlockCausalAttentionSpec</span><span class="p">,</span>
     <span class="n">RaggedCrossAttentionSpec</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionResource</span><span class="p">,</span> <span class="n">EngineResourceInfo</span>
@@ -960,7 +961,7 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">manager_cls</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">manager_cls</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
     <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
@@ -971,7 +972,7 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"RaggedAttentionConfig.dtype on a node without a KV-backed attention "</span>
             <span class="s2">"(the engine has no KV dtype to fall back on)."</span>
         <span class="p">)</span>
-    <span class="k">return</span> <span class="n">manager_cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">manager_cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="RaggedAttnManager">
@@ -1021,6 +1022,32 @@ window.runMermaid = runMermaid;</script>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown ragged cross attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="RaggedBlockCausalAttnManager">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedBlockCausalAttnManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless block-causal self-attention within each span; see</span>
+<span class="sd">    ``RaggedBlockCausalAttentionSpec``."""</span>
+
+    <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="RaggedBlockCausalAttnManager.build">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedBlockCausalAttnManager.build">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">RaggedBlockCausalAttentionSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">):</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_ragged_attn_backend</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">backend</span> <span class="ow">is</span> <span class="n">RaggedAttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.flashinfer</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+                <span class="n">FlashInferRaggedBlockCausalManager</span><span class="p">,</span>
+            <span class="p">)</span>
+
+            <span class="k">return</span> <span class="n">_build_ragged</span><span class="p">(</span>
+                <span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">,</span> <span class="n">FlashInferRaggedBlockCausalManager</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown ragged block-causal attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
+</div>
+
 </pre></div>
 
                 </article>
@@ -1068,7 +1095,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>
