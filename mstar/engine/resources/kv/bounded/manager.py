@@ -58,18 +58,19 @@ class BoundedKVManager(Resource):
     def build(cls, spec: BoundedKVSpec, info: EngineResourceInfo) -> "BoundedKVManager":
         if info.joint_comm_group is not None and info.joint_comm_group.world_size > 1:
             raise NotImplementedError("bounded KV does not shard across ranks yet")
-        if spec.config.dtype is None:
-            spec.config.dtype = info.kv_dtype if info.kv_dtype is not None else torch.get_default_dtype()
-        return cls(spec.config, info.device)
+        # resolved here, not written back: the config is the model's, shared by its specs
+        return cls(spec.config, info.device, info.kv_dtype)
 
-    def __init__(self, config: BoundedKVConfig, device: torch.device):
+    def __init__(self, config: BoundedKVConfig, device: torch.device, kv_dtype: torch.dtype | None = None):
+        """``kv_dtype`` (the engine's) stands in for ``config.dtype=None``."""
         self.config = config
         self._device = torch.device(device)
         c = config
+        dtype = c.dtype or kv_dtype or torch.get_default_dtype()
         # layer-major so one layer's slots are a contiguous [slots, rows, H, cap, 2D]
         self._cache = torch.zeros(
             c.num_layers, c.max_slots, c.rows_per_request, c.num_heads, max(c.slot_tokens, 1),
-            2 * c.head_dim, dtype=c.dtype, device=self._device,
+            2 * c.head_dim, dtype=dtype, device=self._device,
         )
         self._requests: dict[str, _Request] = {}
         self._free = list(reversed(range(c.max_slots)))

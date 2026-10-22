@@ -531,5 +531,7 @@ def test_dtype_none_is_the_engines_kv_dtype():
     spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
     mgr = BoundedKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
     assert mgr.layer(0).dtype == torch.bfloat16
+    # left as declared, so the spec still equals one built from the same config
+    assert config.dtype is None
     # the engine sizes graph tables through main's hook name
     assert BoundedKVManager.build_accelerator_graph_buffers is not Resource.build_accelerator_graph_buffers
