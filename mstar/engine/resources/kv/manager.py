@@ -439,6 +439,11 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
     ):
         self.config = cfg
+        if cfg.aux_planes and (cfg.cpu_offload_pages > 0 or needs_remote_transfer):
+            # both move the KV tensor's pages alone
+            raise ValueError(
+                f"KV {name}: aux_planes need cpu_offload_pages: 0 and no remote KV transfer"
+            )
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
@@ -3315,6 +3320,28 @@ class KVManager(AttentionResource):
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
+    def aux_view(self, name: str, layer_idx: int) -> torch.Tensor:
+        """One layer of the aux planes ``name`` (``PagedKVConfig.aux_planes``):
+        [max_num_pages, page_size, width], addressed by the same pages as ``layer_view``."""
+        return self.kv_cache.aux_view(name, layer_idx)
+
+    @torch.compiler.disable
+    def write_aux(
+        self, name: str, rows: torch.Tensor, layer_idx: int, label: str=None,
+    ) -> None:
+        """Write per-token ``rows`` ([num_tokens, width]) into the aux planes ``name`` at
+        this step's planned slots, the ones ``write_kv`` writes."""
+        if label is None:
+            label = self._default_label
+        plan_state = self._current_plan_states[label]
+        n = plan_state.total_tokens
+        self.kv_cache.write_aux(
+            name, layer_idx, rows[:n],
+            page_idx=plan_state.token_to_page[:n],
+            cache_idx=plan_state.token_to_cache[:n],
+        )
+
+    @torch.compiler.disable
     def read_kv(self, layer_idx: int=None, plan_label: str=None) -> torch.Tensor:
         """
         The slots this step's plan writes, e.g. for NHD:
@@ -3354,6 +3381,23 @@ class KVManager(AttentionResource):
             token_to_page=full.token_to_page[start:end],
             token_to_cache=full.token_to_cache[start:end],
             total_tokens=end - start,
+        )
+        try:
+            yield
+        finally:
+            self._current_plan_states[label] = full
+
+    @contextmanager
+    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
+        order), for a pass over some of a step's rows: each writes at its own slot."""
+        if label is None:
+            label = self._default_label
+        full = self._current_plan_states[label]
+        self._current_plan_states[label] = KVPlanState(
+            token_to_page=full.token_to_page[rows],
+            token_to_cache=full.token_to_cache[rows],
+            total_tokens=rows.numel(),
         )
         try:
             yield

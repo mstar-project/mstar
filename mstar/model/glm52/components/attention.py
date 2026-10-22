@@ -6,6 +6,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.dsa import paged
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm52.components.indexer import (
     Glm52Indexer,
@@ -15,7 +16,6 @@ from mstar.model.glm52.components.indexer import (
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
-    INDEX_KV_RESOURCE,
     KV_RESOURCE,
     Glm52ModelConfig,
 )
@@ -73,17 +73,15 @@ class Glm52MLAAttention(MLAAttention):
             and is_full_indexer_layer(config, layer_idx)
             else None
         )
-        # this FULL layer's layer in the index-key store
+        # this FULL layer's index plane on the MLA cache's pages
         self.index_layer_idx = (
             index_store_layer(config, layer_idx) if self.indexer is not None else None)
         # dsa_shard_prefill: TP ranks split a long prefill's selection (paged.select)
         self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
-        self._kv_index = None
         self._dsa = None
 
     def bind_resources(self, resources: dict) -> None:
         super().bind_resources(resources)
-        self._kv_index = resources.get(INDEX_KV_RESOURCE)
         self._dsa = resources.get(DSA_RESOURCE)
         if self._dsa is not None and not self.dsa_long_context:
             # built flag-off: no indexer was constructed and its weights were
@@ -127,7 +125,7 @@ class Glm52MLAAttention(MLAAttention):
         mask = dsa_selection_to_mask(dsa_selection, q.shape[0], dtype=q.dtype, device=q.device)
         return masked_reference_attention(q, k, v, mask)
 
-    def _dsa_ctx(self) -> paged.PagedContext | None:
+    def _dsa_ctx(self) -> paged.DSAContext | None:
         """The forward's DSA context, which the submodule opened on the resource."""
         return self._dsa.ctx if self._dsa is not None else None
 
@@ -151,8 +149,9 @@ class Glm52MLAAttention(MLAAttention):
         q_c: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor | None:
-        """A FULL layer writes its index keys to the store and, when a row needs it, returns
-        each row's selected latent-cache slots; a SHARED layer reuses the last FULL one's."""
+        """A FULL layer writes its index keys to its index plane and, when a row needs it,
+        returns each row's selected latent-cache slots; a SHARED layer reuses the last FULL
+        one's."""
         dsa_ctx = self._dsa_ctx()
         if dsa_ctx is None:
             return None
@@ -165,12 +164,13 @@ class Glm52MLAAttention(MLAAttention):
                     "FULL layer ran before it")
             return dsa_ctx.last_selection
         keys = self.indexer.compute_k(hidden_states, position_ids)
-        paged.write_rows(self._kv_index, self.index_layer_idx, keys, dsa_ctx)
+        paged.write_index(self._kv, self.index_layer_idx, None, keys, dsa_ctx)
         if not dsa_ctx.needs_selection:
             return None
         q, w = self.indexer.compute_query(q_c, hidden_states, position_ids)
         selection = paged.select(
-            q, w, self._kv_index.layer_view(self.index_layer_idx), dsa_ctx, self.dsa_group)
+            q, w, self._kv.aux_view(INDEX_PLANES, self.index_layer_idx), dsa_ctx,
+            self.dsa_group)
         dsa_ctx.last_selection = selection
         dsa_ctx.last_selection_layer = self.layer_idx
         return selection
@@ -189,6 +189,6 @@ class Glm52MLAAttention(MLAAttention):
         selected slots (prefill rows too: each sees its causal top-k)."""
         dsa_ctx = self._dsa_ctx()
         layer_idx = self.cache_layer_idx
-        paged.write_rows(self._kv, layer_idx, torch.cat([kv_c, k_pe], dim=-1).squeeze(1), dsa_ctx)
+        self._kv.write_kv(torch.cat([kv_c, k_pe], dim=-1).squeeze(1), None, layer_idx=layer_idx)
         return paged.sparse_attend(
             q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)

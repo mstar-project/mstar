@@ -443,7 +443,7 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
     assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
-    assert Glm52LLMSubmodule._dsa_ctx(out) is None
+    assert sub._dsa_ctx(out) is None
 
 
 def test_glm52_preprocess_positions_continue_from_the_stream_position():

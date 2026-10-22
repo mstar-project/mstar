@@ -29,7 +29,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.kpool import attn_lens_device
+from mstar.engine.resources.dsa.paged import attn_lens_device
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
@@ -164,8 +164,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # nothing writes the sink page's last row in a decode step: padding rows take
             # its first k + 1
             self._pad_slot = SINK_PAGE * size + size - 1
-            self._pad_kpe = kv.kv_cache.tensor[
-                :self.config.index_plane_offset, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
+            self._pad_kpe = kv.kv_cache.tensor[:, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
         if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
@@ -572,7 +571,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                     if split:
                         pieces = [(max(r0, start), min(r0 + n, end), req)
                                   for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
-                        self._dsa.ctx = ctx.window(start, end, pieces)
+                        self._dsa.ctx = ctx.rows(start, end)
                         scope.enter_context(kv.token_window(start, end, LABEL))
                         scope.enter_context(kda.token_window(
                             [(req, b - a) for a, b, req in pieces], LABEL))
@@ -591,7 +590,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if nxt is not None:
                 seeds = []
                 for i, r in enumerate(last):  # its MTP row again, now with the sampled token
-                    self._dsa.ctx = ctx.window(r, r + 1, [(r, r + 1, ctx.spans[i][2])])
+                    self._dsa.ctx = ctx.rows(r, r + 1)
                     with kv.token_window(r, r + 1, LABEL):
                         embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
                         seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))

@@ -1,10 +1,13 @@
 """dsa/paged.py's CUDA selection (score kernel, flashinfer top-k -> slots) against its CPU path on
-the same data, at GLM-5.2's indexer dims. Sparse MLA itself: test_sparse_mla_gpu.py."""
+the same data, at GLM-5.2's indexer dims (a key per token). Sparse MLA itself:
+test_sparse_mla_gpu.py."""
+import dataclasses
+
 import pytest
 import torch
 
 from mstar.engine.resources.dsa import paged
-from mstar.engine.resources.dsa.paged import PagedContext
+from mstar.engine.resources.dsa.paged import DSAContext
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA paths")
 
@@ -13,39 +16,36 @@ DEV = torch.device("cuda")
 
 
 def _ctx(lens, rows_per_req, gen, device):
-    """Two requests; rows are the last ``rows_per_req[i]`` positions of request i."""
+    """Two requests on shuffled pages, the index keys on the latents' pages; rows are the last
+    ``rows_per_req[i]`` positions of request i."""
     pages = [-(-n // PAGE) for n in lens]
     total = sum(pages) + 4
     perm = torch.randperm(total, generator=gen).tolist()
-    perm2 = torch.randperm(total, generator=gen).tolist()
-    width = max(pages)
-    kv, ix, row_req, row_lens, spans = [], [], [], [], []
+    starts = [sum(pages[:i]) for i in range(len(lens))]
+    row_req, positions, spans = [], [], []
     for i, (n, r) in enumerate(zip(lens, rows_per_req, strict=True)):
-        lo = sum(pages[:i])
-        kv.append(perm[lo: lo + pages[i]] + [0] * (width - pages[i]))
-        ix.append(perm2[lo: lo + pages[i]] + [0] * (width - pages[i]))
         spans.append((len(row_req), r, i))
         row_req += [i] * r
-        row_lens += list(range(n - r + 1, n + 1))
-    return total, PagedContext(
+        positions += list(range(n - r, n))
+    return total, DSAContext(
+        pos=torch.tensor(positions, dtype=torch.int32, device=device),
         row_req=torch.tensor(row_req, dtype=torch.int32, device=device),
-        lens=torch.tensor(row_lens, dtype=torch.int32, device=device), host_lens=row_lens,
-        kv_table=torch.tensor(kv, dtype=torch.int32, device=device),
-        index_table=torch.tensor(ix, dtype=torch.int32, device=device),
-        spans=spans, width=max(row_lens), page_size=PAGE, topk=TOPK, needs_selection=True)
+        pages=torch.tensor(perm[:sum(pages)], dtype=torch.int32, device=device),
+        page_start=torch.tensor(starts, dtype=torch.int32, device=device),
+        host_pos=positions, spans=spans, host_page_start=starts,
+        max_pools=max(positions) + 1, page_size=PAGE, topk=TOPK, kpool=1)
 
 
 def _to(ctx, device):
-    return PagedContext(
-        row_req=ctx.row_req.to(device), lens=ctx.lens.to(device), host_lens=ctx.host_lens,
-        kv_table=ctx.kv_table.to(device), index_table=ctx.index_table.to(device),
-        spans=ctx.spans, width=ctx.width, page_size=ctx.page_size, topk=ctx.topk,
-        needs_selection=True)
+    return dataclasses.replace(
+        ctx, pos=ctx.pos.to(device), row_req=ctx.row_req.to(device),
+        pages=ctx.pages.to(device), page_start=ctx.page_start.to(device))
 
 
 @pytest.mark.parametrize("rows_per_req", [(1, 1), (3, 5), (1, 700)])  # decode, prefill, mixed
 def test_cuda_selection_matches_the_cpu_path(rows_per_req, monkeypatch):
-    monkeypatch.setattr(paged, "PREFILL_CHUNK_ROWS", 256)  # several chunks for 700 rows
+    # several chunks for 700 rows: 256 rows of the longest request's 1500 keys' scores
+    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 1500 * 256)
     gen = torch.Generator().manual_seed(0)
     total, ctx = _ctx([700, 1500], list(rows_per_req), gen, DEV)
     index = torch.randn(total, PAGE, D, generator=gen).bfloat16()
@@ -55,9 +55,9 @@ def test_cuda_selection_matches_the_cpu_path(rows_per_req, monkeypatch):
     got = paged.select(q.to(DEV), w.to(DEV), index.to(DEV), ctx).cpu()
     ref = paged.select(q, w, index, _to(ctx, "cpu"))
     same = sum(len(set(got[r, :n].tolist()) & set(ref[r, :n].tolist()))
-               for r, n in enumerate(ctx.attn_lens))
+               for r, n in enumerate(ctx.attn_lens()))
     # fp32 summation order can swap two near-equal scores at the selection boundary
-    assert same >= 0.999 * sum(ctx.attn_lens)
+    assert same >= 0.999 * sum(ctx.attn_lens())
 
 
 def test_a_row_with_fewer_keys_than_topk_lists_them_first():
@@ -68,12 +68,11 @@ def test_a_row_with_fewer_keys_than_topk_lists_them_first():
     rows = ctx.row_req.numel()
     width = 512
     scores = torch.randn(rows, width, generator=gen)
-    scores = scores.masked_fill(torch.arange(width) >= ctx.lens.cpu()[:, None], float("-inf"))
-    got = paged.select_slots(scores.to(DEV), ctx.kv_table, ctx.row_req, ctx.lens, PAGE,
-                                 TOPK).cpu()
-    cpu = _to(ctx, "cpu")
-    ref = paged.select_slots(scores, cpu.kv_table, cpu.row_req, cpu.lens, PAGE, TOPK)
-    for r, n in enumerate(ctx.attn_lens):
+    lens = ctx.pos.cpu()[:, None] + 1
+    scores = scores.masked_fill(torch.arange(width) >= lens, float("-inf"))
+    got = paged.top_pools(scores.to(DEV), ctx).cpu()
+    ref = paged.top_pools(scores, _to(ctx, "cpu"))
+    for r, n in enumerate(ctx.attn_lens()):
         assert set(got[r, :n].tolist()) == set(ref[r, :n].tolist()), r
 
 
@@ -81,7 +80,7 @@ def test_a_row_with_fewer_keys_than_topk_lists_them_first():
 def test_sharded_selection_is_bitwise_the_unsharded_one(world, monkeypatch):
     """Ranks' blocks of a long prefill span start their score chunks at other rows than one
     rank selecting the whole span; every row's selection must still be the same."""
-    monkeypatch.setattr(paged, "PREFILL_CHUNK_ROWS", 256)
+    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 1500 * 256)
     gen = torch.Generator().manual_seed(4)
     total, ctx = _ctx([700, 1500], [1, 700], gen, DEV)  # a decode row and a sharded span
     index = torch.randn(total, PAGE, D, generator=gen).bfloat16().to(DEV)
