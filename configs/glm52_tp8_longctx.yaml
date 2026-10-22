@@ -1,7 +1,7 @@
 model: "glm52"
 # GLM-5.2 TP8 past index_topk (2048) on the DSA path, with glm52_tp8.yaml's kernels.
 # Every query row keeps its top-2048 earlier tokens by the indexer's score: the index keys
-# live in a second KV resource (kv_index), selection and sparse MLA run on device, decode and
+# live on the MLA cache's pages (aux planes), selection and sparse MLA run on device, decode and
 # short prefills are captured, and a prefill longer than prefill_chunk_tokens runs the trunk
 # over row chunks.
 #
@@ -46,9 +46,6 @@ model_kwargs:
 resources:
   kv:
     # 2304 x 128-token pages = 295k tokens/rank: one full window and change
-    max_num_pages: 2304
-    page_size: 128
-  kv_index:
     max_num_pages: 2304
     page_size: 128
 # A prompt past the captured buckets prefills eager (in row chunks past prefill_chunk_tokens), and its

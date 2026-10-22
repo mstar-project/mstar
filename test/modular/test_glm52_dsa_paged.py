@@ -1,4 +1,5 @@
-"""dsa_long_context: index keys in a KV resource, slot selection, sparse attention (CPU paths).
+"""dsa_long_context: index keys on the MLA cache's pages, slot selection, sparse attention (CPU
+paths).
 
 Decode past index_topk is held, layer by layer, to the reference indexer's selection and a
 masked dense softmax. Prefill: every row selects over its own causal prefix, so a prompt
@@ -25,15 +26,18 @@ def _cpu_flashinfer() -> types.ModuleType:
 
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.dsa import paged, sparse_mla  # noqa: E402
-from mstar.engine.resources.dsa.paged import PagedContext  # noqa: E402
-from mstar.engine.resources.dsa.topk import index_topk  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, build_random_model  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
+from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
+from mstar.model.glm52._testing import (  # noqa: E402
+    build_cpu_resources,
+    build_random_model,
+    index_topk,
+)
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.indexer import full_indexer_layers  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     DSA_RESOURCE,
-    INDEX_KV_RESOURCE,
     KV_RESOURCE,
     Glm52ModelConfig,
 )
@@ -72,7 +76,7 @@ class _Driver:
         engine_inputs = ModelInputsFromEngine(
             request_ids=[self.rid], per_request_info={}, resources=self.resources, step=step)
         packed = self.sub.preprocess(walk, engine_inputs, [ar])
-        self.last_ctx = Glm52LLMSubmodule._dsa_ctx(packed)
+        self.last_ctx = self.sub._dsa_ctx(packed)
         with torch.no_grad():
             logits = self.sub.forward(walk, engine_inputs, **packed)["logits"]
         self.runner.commit(step)
@@ -93,22 +97,22 @@ def test_paged_resources_and_step():
     model = object.__new__(Glm52Model)
     model.config = cfg
     specs = {s.resource_key: s for s in model.get_node_resources()}
-    index = specs[INDEX_KV_RESOURCE].config
+    # the index keys sit on the latent cache's pages: a row per token per FULL layer
+    index = specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES]
     assert index.num_layers == len(full_indexer_layers(cfg)) >= 1
-    assert index.latent_dim == cfg.index_head_dim
-    # the KV manager shards every KV config by the TP size; any size the attention heads take
-    index.shard(cfg.num_attention_heads)
-    assert index.num_kv_heads == 1 and index.latent_dim == cfg.index_head_dim
-    # the DSA resource selects over the index keys and attends over the latent cache
-    assert specs[DSA_RESOURCE].depends_on() == {KV_RESOURCE, INDEX_KV_RESOURCE}
+    assert index.width == cfg.index_head_dim
+    # the DSA resource selects over them and attends over the latents
+    dsa = specs[DSA_RESOURCE].config
+    assert specs[DSA_RESOURCE].depends_on() == {KV_RESOURCE}
+    assert (dsa.topk, dsa.kpool, dsa.dense_below_topk) == (cfg.index_topk, 1, True)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.zeros(3, dtype=torch.long), input_seq_len=3)
     steps = sub.declare_step("prefill", ["r0"], [ar]).steps
-    assert INDEX_KV_RESOURCE in steps and DSA_RESOURCE in steps
+    assert KV_RESOURCE in steps and DSA_RESOURCE in steps
 
 
 def _positions(slots, table, page_size):
-    """Request positions of latent-cache slots, by the request's page table."""
+    """Request positions of latent-cache slots, by the request's pages."""
     where = {int(p): j for j, p in enumerate(table.tolist())}
     return [where[int(s) // page_size] * page_size + int(s) % page_size for s in slots]
 
@@ -137,13 +141,13 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
         selection = update(self, hidden, q_c, position_ids)
         if self.indexer is not None and selection is not None:
             ctx = self._dsa.ctx  # the forward's, open on the DSA resource
-            n, page = ctx.host_lens[0], ctx.page_size
+            n, page = ctx.host_pos[0] + 1, ctx.page_size
             pos = torch.arange(n)
-            store = self._kv_index.layer_view(self.index_layer_idx)
-            keys = store[ctx.index_table[0][pos // page].long(), pos % page]
+            store = self._kv.aux_view(INDEX_PLANES, self.index_layer_idx)
+            keys = store[ctx.pages[pos // page].long(), pos % page]
             q, w = self.indexer.compute_query(q_c, hidden, position_ids)
             want = index_topk(q, w, keys, position_ids, ctx.topk)[0]
-            got = _positions(selection[0, :ctx.topk], ctx.kv_table[0], page)
+            got = _positions(selection[0, :ctx.topk], ctx.pages, page)
             assert sorted(got) == sorted(want.tolist()), (self.layer_idx, n)
             selected.append(n)
         return selection
@@ -151,12 +155,12 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     def checked_attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
         ctx = self._dsa.ctx
         out = attend(self, slots, q_nope, q_pe, kv_c, k_pe)
-        n, page = ctx.host_lens[0], ctx.page_size
-        picked = _positions(slots[0, :ctx.topk], ctx.kv_table[0], page)
+        n, page = ctx.host_pos[0] + 1, ctx.page_size
+        picked = _positions(slots[0, :ctx.topk], ctx.pages, page)
         assert len(picked) == ctx.topk < n  # a strict subset of the keys the row sees
         cache = self._kv.layer_view(self.cache_layer_idx)
         query = torch.cat([q_nope, q_pe], dim=-1)[0]
-        args = (cache, ctx.kv_table[0], page, n)
+        args = (cache, ctx.pages, page, n)
         ref = _masked_reference(*args, picked, query, self.softmax_scale, q_nope.shape[-1])
         torch.testing.assert_close(out[0].float(), ref, rtol=1e-5, atol=1e-5)
         # discrimination: attending every key the row sees must not match
@@ -170,8 +174,8 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", checked_attend)
     decode = torch.tensor([7, 1, 8, 3, 6, 4])
     _, driver = _serve(sub, cfg, torch.tensor([5, 9, 2]), decode)
-    assert isinstance(driver.last_ctx, PagedContext)
-    assert driver.resources[INDEX_KV_RESOURCE].stored_len("r0") == 3 + len(decode)
+    assert isinstance(driver.last_ctx, DSAContext)
+    assert driver.resources[KV_RESOURCE].stored_len("r0") == 3 + len(decode)
     # contexts 5..9 select: the FULL layer picks, the FULL and the SHARED layer attend
     assert selected == [5, 6, 7, 8, 9]
     assert attended == [(layer, n) for n in range(5, 10) for layer in (0, 1)]
@@ -196,51 +200,18 @@ def test_prefill_beyond_topk_selects():
     assert driver.last_ctx.needs_selection
 
 
-def test_prefill_chunks_join_at_their_boundaries(monkeypatch):
-    """Prefill rows are scored in chunks; tiny chunks give the same logits."""
+@pytest.mark.parametrize("budget_rows", [1, 3])
+def test_prefill_chunks_join_at_their_boundaries(monkeypatch, budget_rows):
+    """Prefill rows are scored in chunks under a byte budget for their fp32 scores; chunks of
+    a few rows, down to one, give the same logits."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    monkeypatch.setattr(paged, "PREFILL_CHUNK_ROWS", 3)
+    # rows of 11 keys' scores each
+    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 11 * budget_rows)
     chunked = _Driver(sub, cfg).step("prefill", tokens)
     torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
-
-
-def test_prefill_chunks_narrow_to_the_score_budget(monkeypatch):
-    """A chunk's [rows, last row's keys] fp32 scores stay under the byte budget, down to one
-    row a chunk, and the logits do not move."""
-    monkeypatch.setattr(paged, "SCORE_BUDGET_BYTES", 4 * 1000)
-    lens = list(range(1, 3001))
-    c0, chunks = 0, []
-    while c0 < len(lens):
-        c1 = paged._chunk_end(lens, c0, len(lens))
-        chunks.append((c0, c1))
-        assert (c1 - c0) * lens[c1 - 1] * 4 <= 4 * 1000 or c1 - c0 == 1
-        c0 = c1
-    assert chunks[0] == (0, 31) and chunks[-1][1] - chunks[-1][0] == 1
-
-    cfg = _cfg(topk=4)
-    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
-    tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
-    whole = _Driver(sub, cfg).step("prefill", tokens)
-    monkeypatch.setattr(paged, "SCORE_BUDGET_BYTES", 4 * 6)
-    chunked = _Driver(sub, cfg).step("prefill", tokens)
-    torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
-
-
-def test_diverged_index_store_is_refused():
-    """The latent cache and the index store match prefixes separately; if they ever disagree
-    on a request's stored tokens the step fails, instead of selecting over missing keys."""
-    cfg = _cfg(topk=4)
-    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
-    driver = _Driver(sub, cfg)
-    driver.step("prefill", torch.tensor([5, 9, 2]))
-    index = driver.resources[INDEX_KV_RESOURCE]
-    real = index.stored_len
-    index.stored_len = lambda rid, *a, **k: real(rid, *a, **k) - 1
-    with pytest.raises(RuntimeError, match="prefix caches diverged"):
-        driver.step("decode", torch.tensor([7]))
 
 
 def test_long_prefill_runs_in_row_chunks():
@@ -309,13 +280,13 @@ def test_second_prefill_step_selects_over_the_stored_keys():
     driver = _Driver(sub, cfg)
     driver.step("prefill", tokens[:6])
     second = driver.step("prefill", tokens[6:])
-    assert driver.last_ctx.host_lens == list(range(7, 12))
-    assert driver.resources[INDEX_KV_RESOURCE].stored_len("r0") == len(tokens)
+    assert driver.last_ctx.host_pos == list(range(6, 11))
+    assert driver.resources[KV_RESOURCE].stored_len("r0") == len(tokens)
     torch.testing.assert_close(second[-1], whole[-1], rtol=1e-5, atol=1e-6)
 
 
-def test_index_store_holds_the_mtp_layer():
-    """With MTP the draft layer's index keys take the store's layer after the trunk's."""
+def test_index_planes_hold_the_mtp_layer():
+    """With MTP the draft layer's index keys take the plane after the trunk's."""
     from mstar.model.glm52.components.indexer import index_store_layer
     from mstar.model.glm52.glm52_model import Glm52Model
 
@@ -325,7 +296,7 @@ def test_index_store_holds_the_mtp_layer():
     model.config = cfg
     specs = {s.resource_key: s for s in model.get_node_resources()}
     trunk = len(full_indexer_layers(cfg))
-    assert specs[INDEX_KV_RESOURCE].config.num_layers == trunk + 1
+    assert specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES].num_layers == trunk + 1
     assert index_store_layer(cfg, cfg.num_hidden_layers) == trunk
 
 
@@ -351,23 +322,20 @@ def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
     spans_n = [61, 9, 1]  # rows per request: sharded, too short to shard, decode
     ctx_lens = [61, 30, 40]  # each request's context after this step
     pages = [-(-n // page) for n in ctx_lens]
-    width = max(pages)
     index_layer = torch.randn(sum(pages), page, d)
-    table, lo = [], 0
-    for p in pages:
-        table.append(list(range(lo, lo + p)) + [0] * (width - p))
-        lo += p
-    table = torch.tensor(table, dtype=torch.int32)
-    row_req, lens, spans = [], [], []
+    starts = torch.tensor([0, *pages]).cumsum(0)[:-1].tolist()
+    row_req, positions, spans = [], [], []
     for i, (n, c) in enumerate(zip(spans_n, ctx_lens, strict=True)):
         spans.append((len(row_req), n, i))
         row_req += [i] * n
-        lens += list(range(c - n + 1, c + 1))
-    ctx = PagedContext(
-        row_req=torch.tensor(row_req, dtype=torch.int32), lens=torch.tensor(lens, dtype=torch.int32),
-        host_lens=lens, kv_table=table, index_table=table, spans=spans, width=max(lens),
-        page_size=page, topk=topk, needs_selection=True)
-    q, w = torch.randn(len(lens), nh, d), torch.randn(len(lens), nh)
+        positions += list(range(c - n, c))
+    ctx = DSAContext(
+        pos=torch.tensor(positions, dtype=torch.int32),
+        row_req=torch.tensor(row_req, dtype=torch.int32),
+        pages=torch.arange(sum(pages), dtype=torch.int32),
+        page_start=torch.tensor(starts, dtype=torch.int32), host_pos=positions, spans=spans,
+        host_page_start=starts, max_pools=max(ctx_lens), page_size=page, topk=topk, kpool=1)
+    q, w = torch.randn(len(positions), nh, d), torch.randn(len(positions), nh)
     want = paged.select(q, w, index_layer, ctx)
     group = _FakeGroup(4)
     for rank in range(4):  # the last rank's call sees every block
@@ -376,22 +344,12 @@ def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
     assert torch.equal(got, want)
 
 
-def test_a_prefill_bucket_pads_its_rows_and_scores_over_them(monkeypatch):
+def test_a_prefill_bucket_pads_its_rows_and_scores_over_them():
     """A captured prefill bucket's rows: the real ones, then padding staged as position 0 of
     the first request; every row scores on its own over the bucket's width, and a bucket no
     wider than index_topk selects nothing."""
     from mstar.engine.resources.step import BucketKey, SlotLease
 
-    planned = []
-
-    class Plan:
-        def __init__(self, rows, topk, workspace, indices):
-            self.rows = rows
-
-        def plan(self, attn_lens, *args):
-            planned.append(attn_lens)
-
-    monkeypatch.setattr(sparse_mla, "SparseGraphPlan", Plan)
     cfg = _cfg(topk=8)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=5), config=cfg)
     rids = ["a", "b"]
@@ -405,17 +363,16 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them(monkeypatch):
     assert runner.admit(step).ok
     runner.plan(step)
     engine_inputs = ModelInputsFromEngine(
-        request_ids=rids, per_request_info={}, resources=resources, step=step)
+        request_ids=rids, per_request_info={}, resources=resources, step=step, captured=True)
     for rows in (8, 16):
         ctx.slot_lease = SlotLease(slot=0, bucket=BucketKey("prefill", 2, rows))
-        dsa = Glm52LLMSubmodule._dsa_ctx(sub.preprocess("prefill", engine_inputs, ars))
+        dsa = sub._dsa_ctx(sub.preprocess("prefill", engine_inputs, ars))
         pad = rows - 7
-        assert dsa.host_lens == [1, 2, 3, 1, 2, 3, 4] + [1] * pad
-        assert dsa.lens.tolist() == dsa.host_lens
+        assert dsa.pos.tolist() == [0, 1, 2, 0, 1, 2, 3] + [0] * pad
         assert dsa.row_req.tolist() == [0, 0, 0, 1, 1, 1, 1] + [0] * pad
-        assert dsa.width == rows and dsa.decode_rows
+        assert dsa.host_pos is None and dsa.spans is None  # a replay's host values are stale
+        assert dsa.max_pools == rows and dsa.decode_rows
         assert dsa.needs_selection == (rows > cfg.index_topk)
-    assert planned == [[1, 2, 3, 1, 2, 3, 4] + [1] * 9]  # the 16-row bucket's
     # rows past a stored prefix see more keys than a bucket of their size scores: refused
     driver = _Driver(sub, cfg)
     driver.step("prefill", torch.tensor([5, 9, 2, 7, 1, 8]))
@@ -427,8 +384,9 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them(monkeypatch):
     driver.runner.plan(step)
     ctx.slot_lease = SlotLease(slot=0, bucket=BucketKey("prefill", 1, 4))
     engine_inputs = ModelInputsFromEngine(
-        request_ids=[driver.rid], per_request_info={}, resources=driver.resources, step=step)
-    with pytest.raises(RuntimeError, match="sees 9 keys, past its 4-row bucket"):
+        request_ids=[driver.rid], per_request_info={}, resources=driver.resources, step=step,
+        captured=True)
+    with pytest.raises(RuntimeError, match="sits at 8, past its 4-token bucket"):
         sub.preprocess("prefill", engine_inputs, [ar])
 
 

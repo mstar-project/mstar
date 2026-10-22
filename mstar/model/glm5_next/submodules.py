@@ -547,7 +547,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                           for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
                 ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
                 rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
-                self._dsa.ctx = ctx.window(start, end, pieces)
+                self._dsa.ctx = ctx.rows(start, end)
                 with kv.token_window(start, end, LABEL), kda.token_window(
                         [(req, b - a) for a, b, req in pieces], LABEL):
                     out = self.language_model.model(input_ids[start:end], rows=rows)

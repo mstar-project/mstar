@@ -114,7 +114,7 @@ class Glm5NextModel(Model):
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if kwargs.get("dsa_long_context", False):
-            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
             self.config.dsa_long_context = True

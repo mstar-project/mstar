@@ -3271,6 +3271,23 @@ class KVManager(AttentionResource):
         finally:
             self._current_plan_states[label] = full
 
+    @contextmanager
+    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
+        order), for a pass over some of a step's rows: each writes at its own slot."""
+        if label is None:
+            label = self._default_label
+        full = self._current_plan_states[label]
+        self._current_plan_states[label] = KVPlanState(
+            token_to_page=full.token_to_page[rows],
+            token_to_cache=full.token_to_cache[rows],
+            total_tokens=rows.numel(),
+        )
+        try:
+            yield
+        finally:
+            self._current_plan_states[label] = full
+
     @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor | None = None,

@@ -12,8 +12,6 @@ KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
 POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = "sampler"
-# dsa_long_context: the DSA indexer's keys, one index_head_dim latent per token per FULL layer
-INDEX_KV_RESOURCE = "kv_index"
 # dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
 DSA_RESOURCE = "dsa"
 
