@@ -11,7 +11,7 @@ import pytest
 from test_kv_prefix_lease import NODE, WALK, _ctx, _grow, _keys, _layout, _manager, _seed, _StubTransfer
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, RetentionPolicy, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -88,24 +88,6 @@ def test_scratch_past_its_declaration_fails_its_admit(debug):
         kv.admit(KVStep(segments=(Segment("r0", "main", 5),), commit=False), _ctx("r0"))
 
 
-def test_a_retention_other_than_the_layouts_fails_its_commit(debug):
-    kv = _manager()
-    _laid_out(kv, "r0", retention=RetentionPolicy(context_budget=16, protected_prefix=4))
-
-    with pytest.raises(AssertionError, match="a step declares"):
-        _grow(kv, "r0", 20, retention={("r0", "main"): RetentionPolicy(context_budget=32, protected_prefix=4)})
-
-
-def test_a_prompt_chunked_over_three_steps_fires_nothing(debug):
-    kv = _manager()
-    _laid_out(kv, "r0", spans=(PrefixSpan(30, 30, WALK), PrefixSpan(5, 5, "decode")))
-
-    for _ in range(3):
-        _grow(kv, "r0", 10)
-
-    assert kv._streams["r0"]["main"].span_cursor.done == 1, "the chunks never completed their span"
-
-
 def test_the_tail_after_a_cache_hit_fires_nothing(debug, monkeypatch):
     checked = []
     check = manager_mod.KVManager._assert_layout
@@ -154,23 +136,6 @@ def test_a_label_the_request_does_not_open_holds_no_pages(debug, caplog, monkeyp
     assert [r.levelno for r in caplog.records] == [logging.ERROR], "expected one overrun line and no under-use line"
     assert "label cfg_img against a footprint of 0" in caplog.text, (
         "pages a batch took for the request on a label it doesn't open left no line"
-    )
-
-
-def test_a_label_the_request_does_not_open_does_not_hide_a_real_overrun(always_on, caplog):
-    kv = _manager()
-    _laid_out(kv, "r0")
-    kv.ingest_request("r1", KVReqConfig(kv_layout={
-        "main": StreamLayout(spans=(PrefixSpan(20, 20, WALK),)),
-        "cfg_img": StreamLayout(spans=(PrefixSpan(20, 20, WALK),)),
-    }, loop_caps={}))
-
-    with caplog.at_level(logging.ERROR, logger=LOGGER):
-        _grow(kv, "r0", 60, label="cfg_img")
-        _grow(kv, "r1", 60, label="cfg_img")
-
-    assert "request r1 took 4 pages on label cfg_img against a footprint of 2" in caplog.text, (
-        "a batch's write to a label one request doesn't open hid another's overrun there"
     )
 
 

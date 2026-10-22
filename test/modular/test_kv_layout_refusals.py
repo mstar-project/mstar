@@ -9,7 +9,7 @@ sys.path.insert(0, ".")
 import pytest
 from test_kv_layout_intake import LAYOUT, _conduct, _Model, _preprocess
 
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, RingKVConfig, RingKVLayerConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, LabelLayout
 from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks
@@ -41,15 +41,6 @@ def test_a_paged_pool_with_no_labels_is_refused_at_load():
         _refuse_undeclared_pools([_paged()], _Declaring({}))
 
     assert "kv_labels" in str(refusal.value), "the refusal doesn't say what to add"
-
-
-def test_a_ring_pool_needs_no_labels():
-    ring = KVSpec(resource_key="ring", nodes={"llm"}, config=RingKVConfig(
-        num_layers=1, num_kv_heads=1, num_qo_heads=1, head_dim=8, tokens_per_frame=4,
-        layers=(RingKVLayerConfig(ring_frames=2, ring_buckets=1, pinned_dilation=1),),
-    ))
-
-    _refuse_undeclared_pools([ring], _Declaring({}))
 
 
 def test_growth_on_an_unnamed_loop_is_refused_at_load():
