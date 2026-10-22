@@ -2143,7 +2143,8 @@ class Engine:
 
         An offloaded request is brought back first; it stays not-ready until
         that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). Then each resource takes in whatever the request
+        on OOM, to evict). A dropped request stays not-ready until its
+        rebuild lands. Then each resource takes in whatever the request
         published elsewhere — a KV transfer from a prefill worker, say — and
         reports whether that has landed.
 
@@ -2151,8 +2152,8 @@ class Engine:
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id):
-            if not allow_reload:
+        if not self.is_resident(node_name, request_id):
+            if not allow_reload or not self.is_offloaded(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
@@ -2365,6 +2366,22 @@ class Engine:
             resource.is_offloaded(request_id)
             for resource in self._submodules[node_name].resources.values()
         )
+
+    def is_resident(self, node_name: str, request_id: str) -> bool:
+        return all(
+            resource.is_resident(request_id)
+            for resource in self._submodules[node_name].resources.values()
+        )
+
+    def drop_request(self, node_name: str, request_id: int) -> int:
+        """Discard the request's state on this node that can be recomputed from
+        its token ids, and return the pages freed."""
+        resources = self._submodules[node_name].resources.values()
+        # check every resource before dropping any, so a refusal changes nothing,
+        # as `reload_request` checks `can_reload`
+        for resource in resources:
+            resource.check_drop(request_id)
+        return sum(resource.drop(request_id) for resource in resources)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.

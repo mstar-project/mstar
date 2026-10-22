@@ -488,6 +488,7 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        self._dropped: set[str] = set()
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -2491,6 +2492,39 @@ class KVManager(AttentionResource):
                 stream.offloaded for stream in self._streams.get(rid, {}).values()
             )
 
+    def is_resident(self, rid: str) -> bool:
+        """False once ``rid``'s offload is claimed or its drop is applied."""
+        if rid in self._dropped:
+            return False
+        return self._cpu_pool is None or not self.is_offloaded(rid)
+
+    def check_drop(self, rid: str) -> None:
+        if self._world_size > 1:
+            raise RuntimeError(
+                f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
+                "would leave them holding different pages"
+            )
+        if self.is_offloaded(rid):
+            raise RuntimeError(f"KV {self.name}: {rid} has a host copy, which a drop would leave behind")
+        with self._lock:
+            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
+                raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
+            layouts = (self._overrides[rid].kv_layout or {}).values()
+            if any(span.kind != "ids" for layout in layouts for span in layout.spans):
+                raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
+
+    def drop(self, rid: str) -> int:
+        """Take ``rid``'s KV off the device without a host copy, and return the
+        number of pages freed. Pages the index also holds stay cached, where they
+        can be evicted, and the rest go back to the free list."""
+        with self._lock:
+            self.check_drop(rid)
+            # under the lock, so no other step allocates between the two counts
+            free = self._arena.num_free
+            self.reset_request(rid, free=True)
+            self._dropped.add(rid)
+            return self._arena.num_free - free
+
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
 
@@ -2946,6 +2980,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._dropped.discard(rid)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:

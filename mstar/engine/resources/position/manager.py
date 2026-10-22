@@ -184,6 +184,11 @@ class RopeManager(PositionManager):
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
 
+    def drop(self, rid: str) -> int:
+        # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
+        self.reset_request(rid)
+        return 0
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
