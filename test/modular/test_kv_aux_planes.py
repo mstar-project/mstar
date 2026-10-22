@@ -103,7 +103,20 @@ def test_page_copies_carry_the_aux_planes():
     assert not torch.equal(cache.tensor[:, 6, 2:], cache.tensor[:, 3, 2:])
 
 
-@pytest.mark.parametrize("kwargs", [{"cpu_offload_pages": 4}, {"needs_remote_transfer": True}])
-def test_offload_and_transfer_refuse_aux_planes(kwargs):
+def test_offload_refuses_aux_planes():
     with pytest.raises(ValueError, match="aux_planes"):
-        _manager(**kwargs)
+        _manager(cpu_offload_pages=4)
+
+
+def test_a_retrieve_refuses_aux_planes():
+    """A cache with aux planes builds as any does, but moving its pages from another instance
+    would leave the planes behind: the retrieve refuses."""
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
+
+    cache = KVCache(_config(), torch.device("cpu"), torch.float32)
+    info = TransferEngineInfo(my_entity_id="w0", my_session_id="w0",
+                              transfer_engine=LocalTransferEngine("localhost"))
+    transfer = KVTransferManager(info, cache, resource_key="kv", needs_remote_transfer=False)
+    with pytest.raises(NotImplementedError, match="aux planes"):
+        transfer.start_async_retrieve(0, 4, [1], [2], kv_transfer_info=None)

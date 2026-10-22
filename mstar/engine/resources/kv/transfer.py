@@ -720,6 +720,8 @@ class KVTransferManager:
 
         self._page_size = kv_cache.page_size
         self._num_layers = kv_cache.num_layers
+        # the engines read the KV tensor's pages alone (``PagedKVConfig.aux_planes`` stay behind)
+        self._aux_planes = sorted(kv_cache.aux)
 
         if isinstance(
             transfer_engine_info.transfer_engine, MooncakeTransferEngine
@@ -769,6 +771,10 @@ class KVTransferManager:
     ) -> Future | None:
         if start_len >= end_len:
             return
+        if self._aux_planes:
+            raise NotImplementedError(
+                f"a KV retrieve moves the KV tensor's pages alone, not their aux planes "
+                f"{self._aux_planes}")
 
         first_page = start_len // self._page_size
         last_page = (end_len - 1) // self._page_size
