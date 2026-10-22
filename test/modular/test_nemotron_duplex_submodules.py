@@ -829,7 +829,7 @@ def _kv_spans(step) -> list[int]:
     return [seg.span for seg in step.get(ENCODER_KV).segments]
 
 
-def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
+def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     """When every call is one frame on and the whole-step region is captured
     for the batch, the region's own step owns the resources: the node declares
     nothing, so no second plan is built and thrown away. Otherwise it declares
