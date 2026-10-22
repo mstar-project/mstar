@@ -26,6 +26,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import yaml
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
@@ -34,9 +35,9 @@ from test_tp_async_teardown_order import _rank, _Stop
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.wire import decode, encode
 from mstar.engine.engine import Engine
-from mstar.engine.resources import StepRunner
+from mstar.engine.resources import StepRunner, apply_yaml_overrides
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
@@ -217,6 +218,19 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
     assert _pages(leader, "b")[:5] == _pages(leader, "a")[:5], "b missed the prefix a cached"
     for kv in ranks:
         kv.assert_pages_conserved()
+
+
+def test_a_hit_for_a_request_this_rank_has_no_handle_for_doesnt_hold_settle():
+    """`pop_ready_rids` holds the step back for that request and warns. A settle that waited on the
+    request would hide the warning."""
+    engine = _engine(_manager(1))
+    engine._graph_runtime.get_rid_handle = lambda wire_rid: None
+    scheduler = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
+    )
+    scheduler.register_tp_follow(ScheduleTPNode(NODE, WALK, ["wire-b"], prefix_hits={"wire-b": {"kv": [1]}}))
+
+    assert scheduler.settle_tp_follow_delta(caught_up=True), "settle waited on a request it has no handle for"
 
 
 def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
@@ -432,6 +446,35 @@ def test_rank_0s_hits_cross_the_wire():
     assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease
 
 
+def test_rank_0s_broadcast_carries_its_hit_and_trails_to_a_follower(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(3 * PAGE_SIZE, seed=26)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        _ingest(kv, "b", shared[:2 * PAGE_SIZE] + _tokens(7, seed=27))
+    engine = _engine(leader)
+    engine._resident_delta = {}
+    group = SimpleNamespace(_workers=["rank0", "rank1"])
+    sent = []
+    worker = Worker.__new__(Worker)
+    worker.parallel_nodes = worker.parallel_leader_nodes = {NODE}
+    worker._tp_broadcast_seq = 0
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker._graph_runtime = SimpleNamespace(
+        get_rid_string=lambda rid: f"wire-{rid}",
+        get_sharding_config=lambda rid: SimpleNamespace(get_sharding_group=lambda node, walk: group),
+    )
+    worker.communicator = SimpleNamespace(send=lambda to, msg: sent.append((to, msg)))
+
+    worker.maybe_send_zmq_to_tp_followers(SimpleNamespace(**vars(_batch("b")), graph_walk=WALK))
+    [(to, message)] = sent
+    head = _wire(message.body)
+    assert to == "rank1" and head.page_trails == {"kv": leader.page_trail()}, "rank 0 sent no trail to check"
+    assert _follow(follower, head)
+    assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease, "the step carried no hit"
+
+
 # ── what the cache keys above one rank ──────────────────────────────────
 
 
@@ -468,6 +511,19 @@ def test_above_one_rank_a_repeat_with_other_text_after_the_image_takes_rank_0s_p
 def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
     assert _manager(0, opt_in=False)._index is None
     assert _manager(0)._index is not None
+
+
+def test_the_serving_config_turns_on_prefix_cache_tp():
+    spec = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2, max_num_pages=32,
+        page_size=PAGE_SIZE,
+    ))
+    apply_yaml_overrides([spec], yaml.safe_load("resources:\n  kv:\n    prefix_cache_tp: true\n"))
+    kv = KVManager(
+        cfg=spec.config, name="kv", joint_comm_group=SimpleNamespace(rank=0, world_size=2),
+        transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    )
+    assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"
 
 
 def test_host_offload_is_refused_at_load(monkeypatch):
@@ -525,6 +581,20 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
     worker._handle_main_loop_error = _caught
     with pytest.raises(TPDivergence, match="diverged"):
         worker.run()
+
+
+def test_a_follower_whose_stream_already_holds_tokens_stops_on_rank_0s_hit():
+    """b already ran here, so the pages rank 0 leased can't become its prefix."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(3 * PAGE_SIZE, seed=28)
+    prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=29)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        _ingest(kv, "b", prompt)
+    _run(follower, "b", prompt)
+
+    with pytest.raises(TPDivergence, match="already holds tokens"):
+        _follow(follower, _send(leader, "b"))
 
 
 def test_a_hit_on_a_resource_this_rank_lacks_stops_the_follower():
