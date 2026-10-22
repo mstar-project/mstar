@@ -1213,6 +1213,7 @@ class Conductor:
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
         kv_layout = kwargs.get("kv_layout") or {}
+        prompt_ids = kwargs.get("prompt_ids") or {}
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
@@ -1224,6 +1225,7 @@ class Conductor:
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
+                prompt_ids=prompt_ids.get(key),
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
