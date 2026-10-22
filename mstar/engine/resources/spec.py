@@ -154,6 +154,20 @@ def apply_yaml_overrides(
     logger.info("Resource specs after YAML overrides: %s", specs)
 
 
+def require_unscaled_dtype(dtype: torch.dtype, what: str) -> torch.dtype:
+    """Refuse a quantized storage dtype (fp8, fp4) where a plain cast is meant.
+
+    Below 16 bits a value needs a scale and a kernel that reads it; a ``.to()``
+    into such a dtype saturates or underflows silently.
+    """
+    if dtype.is_floating_point and dtype.itemsize < 2:
+        raise ValueError(
+            f"{what} is {dtype}, a quantized dtype: it needs scales and a kernel "
+            "that reads them, which a cast cannot give"
+        )
+    return dtype
+
+
 def parse_yaml_dtype(value: str | torch.dtype) -> torch.dtype:
     """A YAML ``dtype:`` value, ``bfloat16`` or ``torch.bfloat16``, as a torch dtype."""
     if isinstance(value, torch.dtype):

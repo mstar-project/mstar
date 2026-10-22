@@ -148,3 +148,11 @@ def test_shared_resource_with_mismatched_node_dtypes_errors():
 def test_yaml_dtype_must_name_a_torch_dtype():
     with pytest.raises(ValueError, match="not a torch dtype"):
         _build(_Model(torch.bfloat16, {"inherit"}), {"resources": {"kv": {"dtype": "bf16"}}})
+
+
+def test_quantized_kv_dtype_is_refused_from_spec_and_yaml():
+    # fp8 pages need scales and a kernel that reads them, not a cast
+    with pytest.raises(ValueError, match="'kv' dtype is torch.float8_e4m3fn, a quantized dtype"):
+        _build(_Model(torch.bfloat16, {"inherit"}, kv_dtype=torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="quantized dtype"):
+        _build(_Model(torch.bfloat16, {"inherit"}), {"resources": {"kv": {"dtype": "float8_e4m3fn"}}})

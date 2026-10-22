@@ -451,7 +451,9 @@ follows the ring.
 
 A resource can also store in a different dtype from the one its nodes compute in. A node
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
-attention is planned in bf16.
+attention is planned in bf16. ``dtype`` is a plain storage dtype (float32, bfloat16 or
+float16): an fp8 or fp4 cache needs scales and a kernel that reads them, so a quantized
+dtype is a load error here.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
