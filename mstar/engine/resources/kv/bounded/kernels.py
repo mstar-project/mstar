@@ -115,8 +115,10 @@ def _bounded_attention_kernel(
             rel = offs_m[:, None] - offs_n[None, :] + T - 1
         s = _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        # a query whose keys so far are all masked keeps m = -inf, and
-        # exp(-inf - -inf) is NaN: offset by 0 instead, so alpha and p are 0
+        # Defensive: a query whose keys so far are all masked keeps m = -inf, and
+        # exp(-inf - -inf) is NaN, so offset by 0 instead. No stored query gets
+        # here while BLOCK_M <= BLOCK_N: this loop runs first, and its first tile
+        # holds one of each query's keys.
         m_off = tl.where(m_new == float("-inf"), 0.0, m_new)
         alpha = tl.exp(m_i - m_off)
         p = tl.exp(s - m_off[:, None])
