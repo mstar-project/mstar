@@ -364,8 +364,7 @@ class KVStep(ResourceStep):
     # the rows the forks apply to; None is every row (a chunked prompt
     # pre-forks on its first chunk and post-forks on its last)
     fork_rids: frozenset | None = None
-    # (request_id, label) pairs that run against SINK_PAGE and hold no pages,
-    # as a padding row does. The batch runs these labels for rows that never read them.
+    # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()
     # (request_id, label) -> the retention a committing stream declares for
     # itself this step, applied at commit. It rides with the step rather than

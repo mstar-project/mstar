@@ -1468,8 +1468,6 @@ class KVManager(AttentionResource):
                             (rid, to_label), []).extend(alloc_res.new_pages)
 
             page_size = self.config.page_size
-            # each per-segment loop tests ``step.sink`` in place, since a helper
-            # call per segment slows every model's decode step
             sink = step.sink
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
@@ -1594,8 +1592,8 @@ class KVManager(AttentionResource):
         pending_forks = pending_forks or {}
         for s in segments:
             if ctx is not None and (self._on_sink(ctx, s.request_id) or (sink and (s.request_id, s.label) in sink)):
-                # A padding row or a segment in ``step.sink`` reads and writes
-                # SINK_PAGE, and its output is never used.
+                # A padding row reads and writes SINK_PAGE; the engine
+                # discards its output.
                 views.append(SequenceView(
                     request_id=s.request_id, label=s.label,
                     # a sink page per page of span, not one: fewer and its writes spill into the previous row's pages
@@ -1804,7 +1802,6 @@ class KVManager(AttentionResource):
         first hit. Any other plan leaves the cache alone; the epoch and the
         commit bookkeeping say whether it still describes the streams."""
         lease = ctx.slot_lease
-        # the plan cache gives each real row's segment its stream's pages, and a segment in ``step.sink`` holds none
         if lease is None or ctx.capture or step.pre_forks or step.post_forks or step.sink:
             return
         split = self._split_padding(step, ctx)

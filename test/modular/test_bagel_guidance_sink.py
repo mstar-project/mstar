@@ -1,7 +1,4 @@
-"""An unguided Bagel row batched with a guided one holds no guidance pages.
-The unguided row also skips the forks into ``cfg_text``, and its ``main`` and
-the guided row's labels hold their pages.
-"""
+"""An unguided Bagel row batched with a guided one holds no guidance pages."""
 
 from __future__ import annotations
 
@@ -52,7 +49,6 @@ INFO = {rid: SimpleNamespace(step_metadata={"requires_cfg": rid == "guided"}) fo
 
 
 def _step(kv: KVManager, llm: LLMSubmodule, walk: str, rows: int):
-    """Run one step of both rows on ``walk`` through Bagel's own `declare_step`."""
     inputs = [ARNodeInputs(input_seq_len=rows, resource_step_info=guided) for guided in (True, False)]
     if walk == "prefill_vit":
         for inp in inputs:
