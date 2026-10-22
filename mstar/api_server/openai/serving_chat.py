@@ -33,24 +33,26 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=bool(req.stream),
-        request_id=request_id,
-    )
-
-    if req.stream:
-        return _stream(api, model_name, request_id, sample_rate, parser, include_usage, stops)
-    if parser is not None or stops:
-        # read chunk by chunk, so a stop string ends the request as it appears
-        events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
-        return _text_response(model_name, request_id, events)
-    chunks = await api.collect_results(request_id, raw_request)
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            prompt_parts=args.prompt_parts,
+            streaming=bool(req.stream),
+            request_id=request_id,
+        )
+        if req.stream:
+            return _stream(api, model_name, request_id, sample_rate, parser, include_usage, stops)
+        if parser is not None or stops:
+            # read chunk by chunk, so a stop string ends the request as it appears
+            events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
+            return _text_response(model_name, request_id, events)
+        chunks = await api.collect_results(request_id, raw_request)
+    finally:
+        media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     return _build_response(model_name, request_id, chunks, sample_rate, parser)
 
 

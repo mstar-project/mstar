@@ -41,9 +41,9 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
+from mstar.model.components.rope import rotate_gptj  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
-from mstar.model.glm52.components.rope import rotate_gptj  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
@@ -260,7 +260,7 @@ class _Path:
         with torch.no_grad():
             out = self.attn(h, torch.arange(start, start + n))
         self.runner.commit(step)
-        assert self.resources[KV_RESOURCE].stored_len("r0") == start + n
+        assert self.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == start + n
         return out
 
 
@@ -282,6 +282,23 @@ def _build_pair(seed):
     absorbed.load_state_dict(naive.state_dict())
     absorbed.process_weights_after_loading()
     return (naive, naive_cfg), (absorbed, absorbed_cfg)
+
+
+@pytest.mark.parametrize("absorb", [False, True])
+def test_the_shared_mla_is_glm52s_dense_path(absorb):
+    """GLM-5.2's layer is the shared MLAAttention plus DSA: with DSA off, the base class on the
+    same weights and resources gives the same output, bitwise."""
+    from mstar.model.components.mla import MLAAttention
+
+    (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=11)
+    glm, cfg = (absorbed, absorbed_cfg) if absorb else (naive, naive_cfg)
+    base = MLAAttention(cfg, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE)
+    base.load_state_dict(naive.state_dict())
+    base.process_weights_after_loading()
+    torch.manual_seed(12)
+    h = torch.randn(6, cfg.hidden_size) * 0.1
+    a, b = _Path(glm, cfg, 8).step(h, 0), _Path(base, cfg, 8).step(h, 0)
+    assert torch.equal(a, b)
 
 
 def test_absorbed_resource_path_matches_naive_and_dense_reference():

@@ -123,7 +123,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     layer's attention is a dense softmax over the cache masked to them."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
-    update, attend = Glm52MLAAttention._dsa_update, Glm52MLAAttention._run_sparse
+    update, attend = Glm52MLAAttention._dsa_update, Glm52MLAAttention._attend_selected
     selected, attended = [], []
 
     def checked_update(self, ctx, hidden, q_c, position_ids):
@@ -139,8 +139,9 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
             selected.append(n)
         return selection
 
-    def checked_attend(self, ctx, slots, q_nope, q_pe, kv_c, k_pe):
-        out = attend(self, ctx, slots, q_nope, q_pe, kv_c, k_pe)
+    def checked_attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_ctx=None, dsa_selection=None):
+        ctx = dsa_ctx
+        out = attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_ctx=ctx)
         n, page = ctx.host_lens[0], ctx.page_size
         picked = _positions(slots[0, :ctx.topk], ctx.kv_table[0], page)
         assert len(picked) == ctx.topk < n  # a strict subset of the keys the row sees
@@ -157,7 +158,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
         return out
 
     monkeypatch.setattr(Glm52MLAAttention, "_dsa_update", checked_update)
-    monkeypatch.setattr(Glm52MLAAttention, "_run_sparse", checked_attend)
+    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", checked_attend)
     decode = torch.tensor([7, 1, 8, 3, 6, 4])
     _, driver = _serve(sub, cfg, torch.tensor([5, 9, 2]), decode)
     assert isinstance(driver.last_ctx, Glm52DsaPagedContext)

@@ -255,8 +255,8 @@ class TransferReadInfo:
 class AsyncMooncakeReader:
     """Background thread for non-blocking mooncake READ operations.
 
-    Follows SGLang's pattern: caller records CUDA event on default stream,
-    submits write task to thread pool. Worker thread waits on event via
+    The caller records a CUDA event on the default stream and
+    submits the write task to a thread pool. Worker thread waits on event via
     dedicated CUDA stream, then does blocking mooncake PUTs.
     The default stream is never blocked by store writes.
     """
@@ -1647,6 +1647,11 @@ class TensorCommunicationManager(ABC):
         """
         self.cleanup_request(request_id, force=True)
 
+    def unlink_owned_files(self) -> None:  # noqa: B027
+        """Unlink the shared-memory files this process wrote for its peers and
+        still owns. A no-op here: only the SHM file transport (and the arena's
+        spills) writes any."""
+
 
 # ---------------------------------------------------------------------------
 # MooncakeCommunicationManager
@@ -2171,6 +2176,20 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             except FileNotFoundError:
                 pass
         self.tensor_store.remove_tensor(uuid)
+
+    def unlink_owned_files(self) -> None:
+        """Unlink every tensor file this manager wrote that is still waiting
+        for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
+        stopping. A second call finds nothing left."""
+        files = self._shm_files
+        while files:
+            _, path = files.popitem()
+            try:
+                os.unlink(path)
+            except OSError:
+                # Already gone (FileNotFoundError) or not removable: either
+                # way, keep going so the rest are still reclaimed.
+                pass
 
 
 # ---------------------------------------------------------------------------

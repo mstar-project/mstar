@@ -9,10 +9,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.model.glm52.components.moe import (  # noqa: E402
-    _down_fp8_loader,
-    _gate_up_fp8_loader,
-)
+from mstar.model.components.moe import _down_proj_fp8_weight_loader, _gate_up_fp8_weight_loader  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.weight_loader import build_glm52_read_plan  # noqa: E402
 
@@ -104,26 +101,26 @@ def test_expert_loaders_accept_full_and_presliced():
         torch.zeros(4, 2 * shard, hidden, dtype=torch.uint8), requires_grad=False)
     full = torch.arange(full_inter * hidden, dtype=torch.uint8).view(full_inter, hidden)
 
-    _gate_up_fp8_loader(1, tp, full_inter, 1, param, full, "gate:3")
+    _gate_up_fp8_weight_loader(1, tp, full_inter, 1, param, full, "gate:3")
     from_full = param.data[3, :shard].clone()
     param.data.zero_()
-    _gate_up_fp8_loader(1, tp, full_inter, 1, param, full[shard:], "gate:3")
+    _gate_up_fp8_weight_loader(1, tp, full_inter, 1, param, full[shard:], "gate:3")
     assert torch.equal(param.data[3, :shard], from_full)
     assert torch.equal(from_full, full[shard:])
 
     with pytest.raises(ValueError):
-        _gate_up_fp8_loader(1, tp, full_inter, 1, param, full[:10], "gate:3")
+        _gate_up_fp8_weight_loader(1, tp, full_inter, 1, param, full[:10], "gate:3")
 
     dparam = torch.nn.Parameter(
         torch.zeros(4, hidden, shard, dtype=torch.uint8), requires_grad=False)
     dfull = torch.arange(hidden * full_inter, dtype=torch.uint8).view(hidden, full_inter)
-    _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull, "down:2")
+    _down_proj_fp8_weight_loader(1, tp, full_inter, 1, dparam, dfull, "down:2")
     d_from_full = dparam.data[2].clone()
     dparam.data.zero_()
-    _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull[:, shard:], "down:2")
+    _down_proj_fp8_weight_loader(1, tp, full_inter, 1, dparam, dfull[:, shard:], "down:2")
     assert torch.equal(dparam.data[2], d_from_full)
     with pytest.raises(ValueError):
-        _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull[:, :10], "down:2")
+        _down_proj_fp8_weight_loader(1, tp, full_inter, 1, dparam, dfull[:, :10], "down:2")
 
 
 def _mtp_fp8_config():

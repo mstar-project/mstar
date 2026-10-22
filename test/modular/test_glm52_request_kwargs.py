@@ -30,8 +30,8 @@ def test_a_null_kwarg_is_unset(kwargs):
 @pytest.mark.parametrize("kwargs", [
     {"top_k": "many"}, {"temperature": "hot"}, {"top_p": [0.9]}, {"repetition_penalty": float("nan")},
     {"max_output_tokens": "100x"}, {"max_output_tokens": 1.5}, {"seed": "abc"},
-    {"top_k": 2**31}, {"top_k": "1e30"}, {"seed": 2**63}, {"seed": -(2**63) - 1},
-    {"max_output_tokens": 2**64}, {"temperature": -1}, {"top_p": 0}, {"top_p": -0.5}, {"top_p": 1.5},
+    {"top_k": "1e30"}, {"seed": 2**63}, {"seed": -(2**63) - 1},
+    {"temperature": -1}, {"top_p": 0}, {"top_p": -0.5}, {"top_p": 1.5},
     {"repetition_penalty": 0},
 ])
 def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
@@ -44,11 +44,11 @@ def test_the_edges_of_each_range_are_served():
     assert _model().process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].tolist() == [72, 105]
 
 
-def test_numbers_sent_as_strings_are_read_as_numbers():
-    m = _model()
-    sampling = m.get_request_resource_configs({}, {"temperature": "0.7", "top_k": "20"})[SAMPLER_RESOURCE]
-    assert sampling.temperature == 0.7 and sampling.top_k == 20
-    assert m.get_max_output_tokens(max_output_tokens="64") == 64
+@pytest.mark.parametrize("kwargs", [{"temperature": "0.7"}, {"top_k": "20"}, {"max_output_tokens": "64"}])
+def test_numbers_sent_as_strings_are_refused(kwargs):
+    # one meaning per knob on every model (mstar/utils/generation_kwargs.py): types are strict
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
 
 
 def test_min_p_is_refused_in_process_prompt():

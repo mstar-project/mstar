@@ -331,6 +331,13 @@ Read by the ``mstar-server`` binary and its bridge
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_OPENAI_ADAPTER``
+     - set by the launcher
+     - The class name of the model's adapter in ``ADAPTER_REGISTRY``
+       (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
+       picks the OpenAI translation ``mstar-server`` uses
+       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -387,8 +394,9 @@ so attaching more files does not multiply them.
        frames the model's loader decodes, each frame counting as at least
        64x64; over it, the request gets a 400. At 1080p30 the default refuses
        clips over about 17 s on Cosmos3, which decodes every frame, and over
-       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
-       frame, as Cosmos3, when the clip's header gives no frame count).
+       about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second
+       (Qwen3-Omni decodes every frame, as Cosmos3, when the clip's header
+       gives no frame count).
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``
      - Images, audio clips and videos one request may attach, together (see

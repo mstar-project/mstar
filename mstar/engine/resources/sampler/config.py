@@ -48,11 +48,11 @@ class SamplingReqConfig(ResourceReqConfig):
     top_p: float = 1
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
-    # Min-p (HF ``MinPLogitsWarper`` / vLLM ``min_p``): drop every token whose
+    # Min-p (HF ``MinPLogitsWarper``): drop every token whose
     # probability is below ``min_p`` times the most likely token's, after the
     # penalty and temperature and before top-k/top-p. 0 disables.
     min_p: float = 0.0
-    # Whether the repetition penalty also counts the prompt's tokens (HF/vLLM do).
+    # Whether the repetition penalty also counts the prompt's tokens (HF does).
     # A node whose step declares no ``prefill_tracked_tokens`` only ever has the
     # generated ones to count.
     penalize_prompt: bool = True

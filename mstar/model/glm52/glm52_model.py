@@ -16,6 +16,8 @@ from mstar.engine.resources import (
     KVSpec,
     NodeResourceSpec,
     PagedKVConfig,
+    PositionConfig,
+    PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -29,34 +31,18 @@ from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     INDEX_KV_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import sampling_kwargs
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
 # fused_add_rmsnorm fuses all-reduces up to this size; larger ones reduce, add and norm apart
 AR_FUSION_MAX_BYTES = 1 << 20
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    if Path(repo_id).is_dir():
-        return repo_id
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        # offline with a cold cache, a gated repo, a full disk: returned as a local
-        # path, the model built without its quant config and failed later, elsewhere
-        raise RuntimeError(f"could not fetch {repo_id!r} from the Hugging Face Hub: {e}") from e
-    return str(Path(local_dir))
 
 
 class Glm52Model(Model):
@@ -178,9 +164,8 @@ class Glm52Model(Model):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            tokenizer_source = _resolve_local_hf_snapshot(
-                self.model_path_hf, cache_dir=self.cache_dir,
-            )
+            tokenizer_source = str(
+                resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
             try:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_source, cache_dir=self.cache_dir,
@@ -278,6 +263,12 @@ class Glm52Model(Model):
         return specs + [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
+            # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
+            # cos/sin table per forward that every layer and the indexer share
+            PositionSpec(
+                resource_key=POS_RESOURCE, nodes=nodes,
+                config=PositionConfig(kv_cache=KV_RESOURCE),
+            ),
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
@@ -477,7 +468,7 @@ class Glm52Model(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = sampling_kwargs(model_kwargs)
+        model_kwargs = normalize_generation_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
             k: model_kwargs.get(k, getattr(self.config, k))
@@ -515,7 +506,8 @@ class Glm52Model(Model):
         # the request's budget, held to the window: a one-token prompt emits at
         # most ``context_limit`` tokens (the last is never stored), so a larger
         # budget is unreachable and check_stop could never fire on it
-        budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
+        budget = normalize_generation_kwargs(model_kwargs).get(
+            "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else min(budget, self.context_limit())
 
     # -------------------------------------------------------------------
@@ -591,8 +583,8 @@ class Glm52Model(Model):
         self._maybe_apply_checkpoint_quant_config(source)
 
         from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
-        from mstar.model.glm52.quantization import process_weights_after_loading
         from mstar.model.glm52.submodules import Glm52LLMSubmodule
+        from mstar.model.utils import process_weights_after_loading
 
         with torch.device("meta"):
             language_model = Glm52ForCausalLM(self.config, comm_group=tp_group)
@@ -648,10 +640,10 @@ class Glm52Model(Model):
             return None
         if Path(path).exists():
             return str(path)
-        return _resolve_local_hf_snapshot(path, cache_dir=self.cache_dir)
+        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        from mstar.model.glm52.quantization import Fp8BlockQuantConfig
+        from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
         if self.config.quantization_config is not None:
             return

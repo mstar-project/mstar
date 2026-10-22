@@ -1248,7 +1248,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _get_last_prefill_talker_hidden(
         self, thinker_hidden: torch.Tensor
     ):
-        # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
+        # Build assistant prefix (matching the HF pattern):
         # Text hidden: [pad*4, bos, proj[3]] (9 tokens)
         # (note that the assistant prefix was handled in the previous prefill stage)
 
@@ -1267,7 +1267,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _get_last_prefill_codec_hidden(
         self, speaker: str
     ):
-        # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
+        # Build assistant prefix (matching the HF pattern):
         # Codec hidden: [codec_embed(nothink, think_bos, think_eos,
         #                speaker, pad, bos)] (9 tokens)
         tc = self.config.talker

@@ -8,7 +8,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.glm52.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
+from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import Glm52ModelConfig
 

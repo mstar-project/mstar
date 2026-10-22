@@ -174,8 +174,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
-          # prometheus-client: the frontend's /metrics test renders a real registry
-          pip install pytest pyzmq msgpack numpy pyyaml prometheus-client
+          # prometheus-client: the frontend's /metrics test renders a real registry;
+          # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
+          # parity cases run the Python app through fastapi's TestClient
+          pip install pytest pyzmq msgpack numpy pyyaml prometheus-client \
+            fastapi uvicorn python-multipart httpx
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

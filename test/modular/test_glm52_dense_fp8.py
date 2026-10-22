@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.model.glm52.quantization import dequantize_fp8_block_weight  # noqa: E402
+from mstar.utils.fp8_block import dequantize_fp8_block_weight  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="dense_fp8 kernels need CUDA")
 
@@ -85,7 +85,7 @@ def _worst(got, ref, bound):
 
 @pytest.fixture(scope="module")
 def dense_fp8():
-    from mstar.model.glm52 import dense_fp8
+    from mstar.utils import dense_fp8
 
     dense_fp8.reserve("cuda")
     return dense_fp8
@@ -191,7 +191,7 @@ def test_op_compiles_whole(dense_fp8, rank_weights):
 def test_an_unusable_cublas_block_gemm_falls_back(monkeypatch):
     """torch 2.10-2.12 have the API, but blockwise scaled_mm raises off SM90 or on a
     cuBLASLt before 12.9 (the cu128 builds): every prefill step past 512 tokens failed."""
-    from mstar.model.glm52 import dense_fp8
+    from mstar.utils import dense_fp8
 
     def raises(*args, **kwargs):
         raise NotImplementedError("blockwise scaling needs cuBLASLt >= 12.9")

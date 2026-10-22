@@ -46,7 +46,8 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import sampling_kwargs
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -68,24 +69,6 @@ def _check_all_loaded(module: torch.nn.Module, loaded: set[str], source: str) ->
             f"{len(missing)} parameters got no tensor from {source} (e.g. "
             f"{sorted(missing)[:3]}); the snapshot is partial or a key was renamed"
         )
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    if Path(repo_id).is_dir():
-        return repo_id
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        # offline with a cold cache, a gated repo, a full disk: returned as a local
-        # path, the model built without its quant config and failed later, elsewhere
-        raise RuntimeError(f"could not fetch {repo_id!r} from the Hugging Face Hub: {e}") from e
-    return str(Path(local_dir))
 
 
 class Glm5NextModel(Model):
@@ -161,9 +144,7 @@ class Glm5NextModel(Model):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            tokenizer_source = _resolve_local_hf_snapshot(
-                self.model_path_hf, cache_dir=self.cache_dir,
-            )
+            tokenizer_source = str(resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
             try:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_source, cache_dir=self.cache_dir,
@@ -277,7 +258,7 @@ class Glm5NextModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = sampling_kwargs(model_kwargs)
+        model_kwargs = normalize_generation_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
             k: model_kwargs.get(k, getattr(self.config, k))
@@ -427,7 +408,7 @@ class Glm5NextModel(Model):
             return {}
         # the conductor reads these kwargs; read here first, a bad one is the
         # client's 400 before the request reaches any rank
-        kwargs = sampling_kwargs(kwargs)
+        kwargs = normalize_generation_kwargs(kwargs)
         self.get_request_resource_configs({}, kwargs)
         self.get_max_output_tokens(**kwargs)
         if kwargs.get("min_p", 0) > 0:
@@ -503,7 +484,7 @@ class Glm5NextModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs):
         # held to the window: a one-token prompt emits at most context_limit tokens
-        budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
+        budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         return self.config.context_limit if budget is None else min(budget, self.config.context_limit)
 
     # -------------------------------------------------------------------
@@ -640,7 +621,7 @@ class Glm5NextModel(Model):
         """Adopt the checkpoint's fp8-block quant config from its config.json."""
         import json
 
-        from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
+        from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
         if self.config.quantization_config is not None:
             return
@@ -670,4 +651,4 @@ class Glm5NextModel(Model):
             return None
         if Path(path).exists():
             return str(path)
-        return _resolve_local_hf_snapshot(path, cache_dir=self.cache_dir)
+        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
