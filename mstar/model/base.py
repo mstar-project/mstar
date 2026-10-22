@@ -82,11 +82,10 @@ class LabelLayout(NamedTuple):
     growth: tuple[tuple[str, int], ...] = ()
     scratch: int = 0
     retention: RetentionPolicy | None = None
-    # the label's keys cover its first `keyed_spans` spans; None covers every span before the first rows span
+    # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
 
     def keyed_count(self) -> int:
-        """How many leading spans the label's keys cover."""
         if self.keyed_spans is not None:
             return self.keyed_spans
         return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
@@ -152,7 +151,6 @@ class KVLabel(NamedTuple):
 
 
 def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
-    """The labels of ``model``'s `kv_labels` that have keys, by resource, leaving out a resource with none."""
     keyed = {}
     for key, labels in model.kv_labels().items():
         marked = {label: kv_label for label, kv_label in labels.items() if kv_label.keys is not None}

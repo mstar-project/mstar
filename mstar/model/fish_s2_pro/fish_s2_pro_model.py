@@ -382,7 +382,7 @@ class FishS2ProModel(Model):
         metadata: dict[str, Any] = {PROMPT_LAYOUT_KEY: [prefix_len, ref_frames]}
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
-        # a clone prefills on its own walk, which splices the reference frames into the prompt's rows
+        # a clone's walk splices the reference frames into the prompt's rows
         clone = "audio" in input_modalities
         rows = len(ids) + ref_frames
         walk = "ar_prefill_clone" if clone else "ar_prefill"

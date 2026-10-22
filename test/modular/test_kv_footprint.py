@@ -1,12 +1,4 @@
-"""A stream's footprint is never below the pages the manager gives it.
-
-The footprint is computed from the layout alone, before the request runs, so
-the arithmetic copies the manager's: per-label rounding in `_alloc`, pages a
-non-committing step leaves behind, and the page-floored release under a
-retention policy. Each test runs the real manager and compares what the stream
-held with what the layout predicted. A footprint below that would let a pool
-promise room it doesn't have.
-"""
+"""A stream's footprint is never below the pages the manager gives it."""
 
 from __future__ import annotations
 
@@ -43,7 +35,6 @@ def _grow(
     kv: KVManager, rid: str, span: int, label: str = "main", commit: bool = True,
     retention: RetentionPolicy | None = None,
 ) -> int:
-    """Run one step and return the pages ``label`` holds at its peak, right after admit."""
     step = KVStep(
         segments=(Segment(rid, label, span),), commit=commit,
         retention={} if retention is None else {(rid, label): retention},
@@ -81,7 +72,6 @@ def test_growth_is_its_cap_times_its_slots():
 
 
 def test_scratch_counts_once_however_often_it_runs():
-    """A non-committing step writes past the committed length and leaves its pages with the stream."""
     kv = _manager()
     kv.ingest_request("r")
     held = _grow(kv, "r", 6)
@@ -93,11 +83,6 @@ def test_scratch_counts_once_however_often_it_runs():
 
 
 def test_a_window_holds_its_peak_not_its_sum():
-    """Window commits under a retention policy, each denoised first by a step that commits nothing.
-
-    The footprint must cover every admit. Once the window fills before the largest
-    step runs, the footprint may exceed the peak by one page at most.
-    """
     for prefix, budget, window in [(13, 24, 9), (16, 16, 16), (5, 40, 7), (0, 3, 12)]:
         kv = _manager()
         kv.ingest_request("r")

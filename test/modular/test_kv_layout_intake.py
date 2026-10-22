@@ -1,12 +1,4 @@
-"""A request's KV layout travels from `process_prompt` to the stream that holds its pages.
-
-`process_prompt` is where every length a request writes is known: it tokenizes
-and runs the media processors. Its layout crosses the preprocess worker and the
-conductor as plain rows, the conductor resolves each growth loop's iterations,
-and the manager turns each label's layout into a page footprint when the stream
-opens. Keys are optional on that path, so a request with the prefix cache off
-still arrives with its footprint. A client can't send a layout of its own.
-"""
+"""A request's KV layout travels from `process_prompt` to the stream that holds its pages."""
 
 from __future__ import annotations
 
@@ -51,7 +43,6 @@ LAYOUT = {"kv": {
 
 
 class _Comm:
-    """Records sends, and replays one batch of inbound messages per call."""
 
     def __init__(self):
         self.sent = []
@@ -69,7 +60,6 @@ class _ScriptDoneError(Exception):
 
 
 class _Model(Model):
-    """Lays out two labels of one pool, and caps ``decode_loop`` at the request's ``max_output_tokens``."""
 
     def __init__(self, layout=LAYOUT):
         self._layout = layout
@@ -129,7 +119,6 @@ class _Model(Model):
 
 
 def _preprocess(model: _Model, model_kwargs: dict) -> dict:
-    """The kwargs the preprocess worker sends the conductor."""
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
@@ -143,8 +132,6 @@ def _preprocess(model: _Model, model_kwargs: dict) -> dict:
 
 
 def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch) -> _Comm:
-    """Run the real `Conductor.run` to ingest the request. Return the communicator, which holds the
-    conductor and every message the conductor sent."""
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}],
@@ -172,7 +159,6 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch) -> _Comm:
 
 
 def _ingest(model: _Model, model_kwargs: dict, tmp_path, monkeypatch):
-    """The NewRequest the conductor sent its worker."""
     sent = _conduct(model, model_kwargs, tmp_path, monkeypatch).sent
     return next(msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST")
 
@@ -207,7 +193,6 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
 
 
 def test_the_new_request_crosses_the_wire_unchanged(tmp_path, monkeypatch):
-    """The worker sizes its pages from the frame the conductor encodes, retention included."""
     uncond = LAYOUT["kv"]["uncond"]._replace(retention=RetentionPolicy(context_budget=64, protected_prefix=10))
     model = _Model({"kv": {**LAYOUT["kv"], "uncond": uncond}})
     new_request = _ingest(model, _preprocess(model, {"max_output_tokens": 30}), tmp_path, monkeypatch)
@@ -222,8 +207,6 @@ def test_the_new_request_crosses_the_wire_unchanged(tmp_path, monkeypatch):
 
 
 def test_a_cap_past_its_loop_reaches_the_workers_as_its_max_iters(tmp_path, monkeypatch):
-    """Rust's graph runtime holds a cap as a u32, so a cap from a large ``max_output_tokens`` would fail
-    the request there but not in Python."""
     model = _Model()
 
     new_request = _ingest(model, _preprocess(model, {"max_output_tokens": 2**40}), tmp_path, monkeypatch)
@@ -232,8 +215,6 @@ def test_a_cap_past_its_loop_reaches_the_workers_as_its_max_iters(tmp_path, monk
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
-    """Each worker's KV manager ingests the layout from its NewRequest. The conductor's later messages
-    carry the request's configs to the workers again, so its own copy drops the layout and caps."""
     model = _Model()
 
     comm = _conduct(model, _preprocess(model, {"max_output_tokens": 30}), tmp_path, monkeypatch)
@@ -245,8 +226,6 @@ def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
 
 
 def test_a_worker_keeps_the_layout_out_of_the_frames_it_sends():
-    """The KV manager keeps the config it ingests. The request's info the worker stores rides every
-    frame it sends, so that copy drops the layout and caps."""
     from test_rid_handles import _worker
 
     from mstar.worker.worker import Worker

@@ -130,7 +130,8 @@ def vae_latents(
     height: int, width: int, image_preprocess: str,
     latent_downsample: int, max_latent_size: int,
 ) -> int:
-    """How many latents the VAE encodes an image of this size into. Its ``prepare_inputs`` asserts the same count."""
+    """How many latents the VAE encodes an image of this size into. The VAE's
+    ``prepare_inputs`` asserts the same count."""
     if image_preprocess == "vllm":
         height, width = vllm_vae_size(height, width, latent_downsample, max_latent_size * latent_downsample)
     else:

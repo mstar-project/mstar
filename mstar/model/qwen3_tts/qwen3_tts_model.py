@@ -876,7 +876,7 @@ class Qwen3TTSModel(Model):
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
         from mstar.model.qwen3_tts.submodules import prefill_rows
 
-        # a clone prefills on its own walk, and its x-vector takes the speaker slot
+        # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
         rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
         metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(

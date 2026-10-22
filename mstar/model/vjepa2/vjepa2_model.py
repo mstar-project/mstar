@@ -795,15 +795,13 @@ class VJepa2Model(Model):
 
         kv_layout = {}
         if self.config.predictor_kind == "ac":
-            # only a rollout runs the AC predictor, one frame per iteration: its
-            # action, state (and extrinsics) tokens, then its spatial tokens
+            # a rollout frame is its action and state tokens, an extrinsics token if used, then its spatial tokens
             frame = (3 if self.config.ac_predictor.use_extrinsics else 2) + self.config.grid_size ** 2
             rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
             kv_layout[KV_CACHE] = {"main": LabelLayout(growth=((self.ROLLOUT_LOOP_NAME, frame),) if rollout else ())}
         return ProcessPromptOutput(out, {"kv_layout": kv_layout})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the rollout's stop check ends it at its horizon
         return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

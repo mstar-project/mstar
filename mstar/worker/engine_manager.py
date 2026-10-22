@@ -125,9 +125,7 @@ def _refuse_unknown_walks(model: Model) -> None:
     growth loop its walk doesn't run.
 
     Only the named walks may file pages or be probed, so a name that matches
-    nothing leaves that cache empty for good, and nothing says why. A loop takes
-    its cap by name, and a loop built without a name gets a different one in every
-    process, so no declaration can refer to it.
+    nothing leaves that cache empty for good, and nothing says why.
     """
     graphs = model.get_graph_walk_graphs()
     walks = set(graphs)
@@ -153,10 +151,7 @@ def _refuse_unknown_walks(model: Model) -> None:
 
 
 def _refuse_undeclared_pools(specs: list[NodeResourceSpec], model: Model) -> None:
-    """Refuse a paged pool the model declares no labels for, since no request
-    could lay out its pages there. A ring pool needs none: its size is fixed
-    per request.
-    """
+    """A ring pool needs no labels, since its size is fixed per request."""
     declared = model.kv_labels()
     for spec in specs:
         if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and not declared.get(spec.resource_key):

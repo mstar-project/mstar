@@ -246,9 +246,7 @@ class KVReqConfig(ResourceReqConfig):
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
     prefix_cache: bool = True
-    # label -> everything the request writes there
     kv_layout: dict[str, "StreamLayout"] | None = None
-    # loop -> the most iterations it runs, for each loop a layout grows on
     loop_caps: dict[str, int] | None = None
 
     def apply_conductor_config(
@@ -270,8 +268,7 @@ class KVReqConfig(ResourceReqConfig):
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
         if kv_layout is not None:
-            # a model lays out the labels a request may open on any deployment, and the
-            # request is held only to the ones it opens
+            # a model lays out every label the request could open on any deployment, so keep only the ones it opens
             opened = self.opened_labels()
             self.kv_layout = {
                 label: StreamLayout(
@@ -299,7 +296,6 @@ class KVReqConfig(ResourceReqConfig):
         return ["main"]
 
     def opened_labels(self) -> set[str]:
-        """Every label `get_labels` can give, on any node and walk."""
         labels = set(self.needed_labels or ["main"])
         for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
             labels.update(named)
@@ -333,9 +329,7 @@ def refuse_undeclared_labels(
     model: str, declared: Mapping[str, tuple[str, ...]], kv_layout: Mapping[str, Mapping],
     configs: Mapping[str, ResourceReqConfig],
 ) -> None:
-    """Refuse a request whose layout leaves out a label the request opens, or lays
-    out one ``model`` doesn't declare. The model is at fault and not the client, so
-    this raises RuntimeError, which fails the request with a 500."""
+    """The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500."""
     for key in declared.keys() | kv_layout.keys():
         laid_out = set(kv_layout.get(key, ()))
         if extra := sorted(laid_out - set(declared.get(key, ()))):
@@ -344,8 +338,8 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """``configs`` with each KV config's layouts and caps left out. Only the KV manager's ingest
-    reads them, and the request's info that carries the configs rides every frame between workers."""
+    """Only the KV manager's ingest reads the layouts and caps, so they are dropped
+    before the configs go out with every frame between workers."""
     return {
         key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
         for key, config in configs.items()
@@ -400,7 +394,7 @@ class RetentionPolicy:
 
 @dataclass(frozen=True)
 class StreamLayout:
-    """`LabelLayout` as the KV manager holds it. The stream's keys cover its first ``keyed_spans`` spans."""
+    """`LabelLayout` as the KV manager holds it."""
     spans: tuple[PrefixSpan, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
     scratch: int = 0
@@ -408,7 +402,6 @@ class StreamLayout:
     keyed_spans: int = 0
 
     def slots(self, caps: Mapping[str, int]) -> int:
-        """Every slot the stream commits, its spans then its growth."""
         return sum(span.length for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
         )

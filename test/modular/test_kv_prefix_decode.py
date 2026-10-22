@@ -85,7 +85,6 @@ def _pages(tokens: list[int]) -> list[list[int]]:
 
 
 def _layout(prompt: list[int]) -> StreamLayout:
-    """The prompt, then a slot per decode step."""
     return StreamLayout(
         spans=(PrefixSpan(len(prompt), len(prompt), WALK),), growth=(("decode_loop", 1),), keyed_spans=1,
     )

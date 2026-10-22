@@ -709,7 +709,6 @@ class BagelModel(Model):
         if tensors is None:
             return result
         if prompt is None:
-            # the walks then prefill the attachments alone (see `_build_prefill_schedule`)
             parts, segments = parts_from_modalities(input_modalities), []
         images = result.get("image_inputs") or tensors.get("image_inputs", [])
         params = self._request_params(input_modalities, output_modalities, kwargs)
@@ -762,7 +761,6 @@ class BagelModel(Model):
                 keyed_spans=None if "image" not in output_modalities else keyed,
             )
             return {"main": main}
-        # an edit generates at its input's size (see `get_initial_forward_pass_args`)
         height, width = images[0].shape[-2:] if images else (params["height"], params["width"])
         scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
         growth = (("decode_loop", 1),) if think_mode else ()
@@ -850,16 +848,15 @@ class BagelModel(Model):
         """The text walk's prompt is its token ids, and so is every step it takes.
 
         An image in an understanding prompt is keyed by its file. An edit's VAE
-        walk writes ``main`` too, but the keys of ``main`` leave that walk out (see
-        `_kv_layout`). A chat sends a reply back as
-        its own assistant turn, so its pages match.
+        walk writes ``main`` too, but the keys of ``main`` leave that walk out. A
+        chat sends a reply back as its own assistant turn, so its pages match.
         """
         decode = ((DECODE, "decode_loop"),)
         return {"kv": {
             "main": KVLabel(
                 growth=decode, keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vit"), growth=True),
             ),
-            # written by forks from main
+            # forks from main fill cfg_text, so it declares no growth
             "cfg_text": KVLabel(),
             "cfg_img": KVLabel(growth=decode),
         }}
@@ -934,7 +931,7 @@ class BagelModel(Model):
         model_kwargs = model_kwargs or {}
         request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
         cfg = request["requires_cfg"]
-        # the CFG nodes run only a generation's image_gen_cfg, so other requests open none of their labels
+        # only a generation's image_gen_cfg runs the CFG nodes
         nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
@@ -1283,8 +1280,6 @@ class BagelModel(Model):
     def _request_params(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
     ) -> dict:
-        """The request's generation settings: its own where it set them, else the defaults for its input
-        and output modalities."""
         overridable_keys = [
             "cfg_text_scale", "cfg_img_scale", "cfg_interval",
             "cfg_renorm_type", "cfg_renorm_min", "think_mode",

@@ -533,7 +533,7 @@ class Pi05Model(Model):
 
         text_ids = self.tokenizer.encode_prompt(full_prompt)
         cfg = self.config
-        # The most image rows a prefill writes: a captured SigLIP step encodes all num_cameras slots.
+        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
         images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
