@@ -560,10 +560,9 @@ class Conductor:
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
-        """The request's output cap: an int >= 1 within the model's published
-        limit, else ``ValueError`` (a 400). Checked here because the cap is
-        compared inside the run loop, where a non-int would raise and the
-        request would hang."""
+        """The request's output cap: an int >= 1, else ``ValueError`` (a 400).
+        Checked here because the cap is compared inside the run loop, where a
+        non-int would raise and the request would hang."""
         requested = model_kwargs.get("max_output_tokens")
         if requested is not None and (
             isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
@@ -572,12 +571,19 @@ class Conductor:
         cap = self.model.get_max_output_tokens(**model_kwargs)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
-        limit = self.model.get_max_output_tokens_limit()
-        if limit is not None and cap > limit:
-            raise ValueError(
-                f"max_output_tokens is {cap}; this model produces at most {limit}"
-            )
         return cap
+
+    def _loop_caps(self, model_kwargs: dict) -> dict[str, int]:
+        """Each named loop's cap for the request. A cap past its loop's ``max_iters``
+        would end the request short of what it asked for, so it is a ``ValueError`` (a 400)."""
+        caps = self.model.get_loop_caps(**model_kwargs)
+        for name, cap in caps.items():
+            max_iters = self._loop_max_iters.get(name)
+            if max_iters is not None and cap > max_iters:
+                raise ValueError(
+                    f"this request needs {cap} iterations of {name!r}, and this model runs at most {max_iters}"
+                )
+        return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
 
     def _resource_specs(self) -> dict:
         """The model's resource specs by key, for admission-time capability checks."""
@@ -1115,10 +1121,7 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
-        caps = self.model.get_loop_caps(**model_kwargs)
-        # Rust's graph runtime holds a cap as a u32, so an unclamped cap from a large
-        # max_output_tokens would fail the request there but not in Python.
-        loop_caps = {name: min(n, caps.get(name, n)) for name, n in self._loop_max_iters.items()}
+        loop_caps = self._loop_caps(model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.

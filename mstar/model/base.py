@@ -939,18 +939,6 @@ class Model(ABC):
         """
         return {}
 
-    def get_max_output_tokens_limit(self) -> int | None:
-        """The largest ``max_output_tokens`` a request may ask for; above it the
-        conductor refuses the request (a 400) rather than stopping short. None
-        is no published limit.
-
-        A model whose decode Loop is built with ``max_iters`` from the
-        kwarg-less ``get_max_output_tokens()`` must return the most tokens a
-        request can get: ``max_iters``, plus one if a prefill samples the first
-        token.
-        """
-        return None
-
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,

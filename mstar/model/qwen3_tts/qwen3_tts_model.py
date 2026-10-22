@@ -1088,9 +1088,6 @@ class Qwen3TTSModel(Model):
             model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
         )
 
-    def get_max_output_tokens_limit(self) -> int:
-        return self.get_max_output_tokens() + 1
-
     def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
         # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
         return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}

@@ -827,9 +827,6 @@ class Cosmos3Model(Model):
             self.REASONER_DECODE_WALK: decode,
         }
 
-    def get_max_output_tokens_limit(self) -> int:
-        return self.get_max_output_tokens() + 1
-
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------

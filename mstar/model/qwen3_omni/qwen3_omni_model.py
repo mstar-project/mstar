@@ -293,17 +293,8 @@ class Qwen3OmniModel(Model):
             )
         }
 
-    def get_max_output_tokens_limit(self) -> int:
-        return self.get_max_output_tokens() + 1
-
     def _get_max_talker_output_tokens(self, **model_kwargs):
-        # Both decode loops share max_iters and both prefills sample the first token,
-        # so the Talker's cap has the same limit.
-        requested = model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
-        limit = self.get_max_output_tokens_limit()
-        if requested > limit:
-            raise ValueError(f"talker_max_output_tokens is {requested}; this model produces at most {limit}")
-        return requested
+        return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -----------------------------------------------------------------------
     # Model ABC: graph walk definitions

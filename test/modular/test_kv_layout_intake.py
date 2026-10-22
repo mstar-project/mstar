@@ -186,12 +186,14 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
     assert kv._ensure_label("r", "uncond").footprint == -(-(10 + 2 * 40 + 7) // PS)
 
 
-def test_a_cap_past_its_loop_reaches_the_workers_as_its_max_iters(tmp_path, monkeypatch):
+def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
     model = _Model()
 
-    new_request = _ingest(model, _preprocess(model, {"max_output_tokens": 2**40}), tmp_path, monkeypatch)
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 51}), tmp_path, monkeypatch).sent
 
-    assert new_request.loop_caps == {"decode_loop": 50, "talk_loop": 40}, "a cap went out past its loop's max_iters"
+    failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [body.status for body in failed] == [400], "a request the loop would end short was served"
+    assert not any(getattr(msg.message_type, "name", "") == "NEW_REQUEST" for msg in sent)
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):

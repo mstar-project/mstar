@@ -1038,9 +1038,6 @@ class BagelModel(Model):
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
-    def get_max_output_tokens_limit(self) -> int:
-        return self.get_max_output_tokens() + 1
-
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
         # No output needed — conductor is notified when the worker graph completes.

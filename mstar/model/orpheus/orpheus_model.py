@@ -109,9 +109,6 @@ class OrpheusModel(Model):
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {"mixed": {"prefill", "decode"}}}
 
-    def get_max_output_tokens_limit(self) -> int:
-        return self.get_max_output_tokens() + 1
-
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
             name="LLM",
