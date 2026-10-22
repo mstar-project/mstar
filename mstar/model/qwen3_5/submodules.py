@@ -380,17 +380,20 @@ class LLMSubmodule(ARNodeSubmodule):
         return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
     @staticmethod
-    def _pack_mixed_ids(
-        ids: torch.Tensor, inputs: list[ARNodeInputs],
+    def _splice_row_ids(
+        ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool,
     ) -> torch.Tensor:
-        """A mixed step's input ids: each row's own ids, or its loop-back
-        token (``ids[i]``), in row order. Consecutive loop-back rows go in as
-        one slice, so a step of mostly decode rows concatenates a few pieces
-        rather than one per row."""
+        """``ids`` (one loop-back token per row) with each row that brought
+        its own ids taking them instead, in row order: a mixed step's prompt
+        rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+        rows go in as one slice each, and the splice is device ops only: an
+        index built from a host list would be a synchronous copy behind the
+        step in flight. A decode step keeps the slot's padding rows past
+        ``inputs``, so its length stays the captured one."""
         pieces: list[torch.Tensor] = []
         run = None
         for i, inp in enumerate(inputs):
-            if inp.input_ids is None:
+            if inp.input_ids is None or (decode and not inp.input_seq_len):
                 if run is None:
                     run = i
                 continue
@@ -400,6 +403,8 @@ class LLMSubmodule(ARNodeSubmodule):
             pieces.append(inp.input_ids.to(ids.dtype))
         if run is not None:
             pieces.append(ids[run:len(inputs)])
+        if decode and ids.shape[0] > len(inputs):
+            pieces.append(ids[len(inputs):])
         return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
 
     def preprocess(
@@ -418,17 +423,16 @@ class LLMSubmodule(ARNodeSubmodule):
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
+            laps = PhaseLaps("engine.preprocess.loopback.")
             ids = sampler.loopback_tokens(engine_inputs.request_ids)
-            if graph_walk != "decode":
-                ids = self._pack_mixed_ids(ids, inputs)
-            else:
-                # rows whose last step ran elsewhere brought their token
-                routed = [
-                    i for i, inp in enumerate(inputs)
-                    if inp.input_ids is not None and inp.input_seq_len
-                ]
-                if routed:
-                    sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
+            laps.lap("tokens")
+            decode = graph_walk == "decode"
+            # rows whose last step ran elsewhere brought their token
+            if not decode or any(
+                inp.input_ids is not None and inp.input_seq_len for inp in inputs
+            ):
+                ids = self._splice_row_ids(ids, inputs, decode)
+            laps.lap("splice")
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
