@@ -92,7 +92,7 @@ class SlidingWindowTests(unittest.TestCase):
                         manager.plan(AttentionStep(), ctx)
                         wrapper = manager._current_plan_states["main"]
                         self.assertEqual(wrapper.attn_wrapper.plan.call_args.kwargs["window_left"], expected)
-                        self.assertEqual(wrapper.use_cuda_graph, captured)
+                        self.assertEqual(wrapper.accelerator_graph, captured)
                         manager.plan(AttentionStep(), ctx)
                         self.assertIs(manager._current_plan_states["main"], wrapper)
                         self.assertEqual(wrapper.attn_wrapper.plan.call_count, 2)

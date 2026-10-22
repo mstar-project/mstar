@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.utils.fused_moe import MoeAlignment
+
 
 @triton.jit
 def _add_layernorm_kernel(
@@ -156,10 +158,10 @@ ROUTE_ALIGN_MAX_SLOTS = 128
 
 def route_align(
     logits: torch.Tensor, k: int, block_m: int, dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, MoeAlignment]:
     """``sigmoid_topk`` plus ``moe_align_block_size`` in one single-program kernel.
 
-    Returns ``(weights, ids, (sorted_token_ids, expert_ids, num_tokens_post_padded))``.
+    Returns ``(weights, ids, alignment)``.
     The alignment buffers are sized for at most ``min(E, slots)`` active
     experts, the bound ``invoke_fused_moe_kernel`` sizes its grid with.
     Meant for decode-sized batches (``tokens * k <= ROUTE_ALIGN_MAX_SLOTS``).
@@ -180,7 +182,7 @@ def route_align(
         BLOCK_T=triton.next_power_of_2(tokens), PAD_LEN=pad_len,
         BLOCK_PAD=triton.next_power_of_2(pad_len), num_warps=4,
     )
-    return weights, ids, (sorted_ids, expert_ids, post_pad)
+    return weights, ids, MoeAlignment(sorted_ids, expert_ids, post_pad, block_m)
 
 
 @triton.jit
