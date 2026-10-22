@@ -32,9 +32,11 @@ The M* serving path is the walk graphs below: four async partitions
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws``; a
 one-shot upload is a stream of one chunk. ``get_node_resources`` declares
-the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
-slots), the Mamba-2 resource and the sampler, and the talker's paged KV cache,
-attention and positions. Both decode steps are CUDA graphs.
+the encoder's bounded KV (each call's attention window) and two recurrent-state
+pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
+conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
+KV cache, attention and positions. Both decode steps are CUDA graphs, and so are
+the encoder's live step and the codec's steady-state decode (piecewise).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -42,6 +44,7 @@ multi-KV, aux sampling, async partitions).
 """
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 
@@ -62,15 +65,25 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    apply_yaml_overrides,
 )
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
+from mstar.model.nemotron_duplex.components.conformer import (
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+)
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    ENCODER_FRONT,
+    ENCODER_KV,
+    ENCODER_STATE,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -403,16 +416,20 @@ class NemotronDuplexModel(Model):
     # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
     # positions; each session holds two streams (labels ``main`` / ``uncond``)
     # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. The encoder and the codec declare nothing.
+    # passes at call time. conformer_encoder: a bounded KV, each call's
+    # attention window, and two recurrent-state pools, its conv tails and its
+    # front end's audio / mel tails (one slot per session each). The codec
+    # declares nothing.
     # -------------------------------------------------------------------
 
-    # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
-    # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
-    # 32 is the most that keep up with real time on one H100: a tick takes
-    # ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
-    DEFAULT_MAMBA_SLOTS = 32          # sessions; the runner's padding rows take no slot (#258)
+    # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
+    # Nemotron-H, and in encoder_state / encoder_front / encoder_kv; pages in
+    # nano_kv and talker_kv). A deployment raising it raises all six (see
+    # validate_config_yaml). 32 is the most that keep up with real time on one
+    # H100: a tick takes ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
+    DEFAULT_SESSIONS = 32           # padding rows take no slot (#258)
     # Longest session served (``model_kwargs: {max_session_s: ...}``). The
-    # talker KV pool is sized so DEFAULT_MAMBA_SLOTS sessions this long fit at
+    # talker KV pool is sized so DEFAULT_SESSIONS sessions this long fit at
     # once: a full pool stalls every session, not just the one that outgrew it.
     # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
     # head dim) x K,V x bf16 = 28 MiB. 160 s = 2001 frames, so 37 warm-up + 2001
@@ -443,11 +460,58 @@ class NemotronDuplexModel(Model):
     def max_session_frames(self) -> int:
         return self.config.stt.num_frames(self.max_session_samples)
 
-    def talker_kv_pages(self, page_size: int) -> int:
-        """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
-        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
+    def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
+        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of max_session_frames, both CFG streams."""
+        return self._session_kv_pages(self.TALKER_WARMUP_POSITIONS, 2, page_size, sessions)
+
+    def nano_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
+        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of the longest prompt and max_session_frames."""
+        return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
+
+    def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
+        sessions = self.DEFAULT_SESSIONS if sessions is None else sessions
+        positions = prefix + self.max_session_frames + 1
         # + 1 for the pool's sink page
-        return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
+        return sessions * streams * -(-positions // page_size) + 1
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a session cap that a per-session resource cannot hold.
+
+        A session holds a slot in each recurrent pool (``mamba_state``,
+        ``encoder_state``, ``encoder_front``), in ``encoder_kv``, and its nano and
+        talker pages from its first step to its last, so a session past any of them waits on admit until
+        another ends, and its frames with it. So ``max_concurrent_requests``
+        sessions must fit each; the conductor queues the rest.
+        """
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: a session past the per-session "
+                "resources waits on admit until another ends", config_path,
+            )
+            return
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
+        specs = self.get_node_resources()
+        apply_yaml_overrides(specs, config)
+        for spec in specs:
+            if isinstance(spec, RecurrentStateSpec):
+                held, knob = spec.config.usable_slots, "max_slots"
+            elif isinstance(spec, BoundedKVSpec):
+                held, knob = spec.config.max_slots, "max_slots"
+            elif spec.resource_key in (TALKER_KV, NANO_KV):
+                kv = spec.config
+                pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
+                per_session = pages(kv.page_size, sessions=1) - 1
+                held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
+            else:
+                continue
+            if held < cap:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "
+                    f"many in resources.{spec.resource_key}, which holds {held}; raise its {knob} "
+                    "or lower max_concurrent_requests"
+                )
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within
@@ -468,8 +532,30 @@ class NemotronDuplexModel(Model):
             head_dim=nano.head_dim,
             max_seq_len=nano.max_position_embeddings,
             num_qo_heads=nano.num_attention_heads,
+            # a session holds its prompt and every frame for life (no eviction)
+            max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
         )
         return [
+            RecurrentStateSpec(
+                resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
+                config=RecurrentStateConfig(
+                    num_layers=self.config.stt.num_layers,
+                    blocks=encoder_state_blocks(self.config.stt),       # in the engine's compute dtype
+                    max_slots=self.DEFAULT_SESSIONS + 1,
+                ),
+            ),
+            RecurrentStateSpec(
+                resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
+                config=RecurrentStateConfig(
+                    num_layers=1, blocks=front_state_blocks(self.config.stt),
+                    max_slots=self.DEFAULT_SESSIONS + 1,
+                ),
+            ),
+            # no sink slot: padding rows read and write nothing in it
+            BoundedKVSpec(
+                resource_key=ENCODER_KV, nodes={"conformer_encoder"},
+                config=encoder_kv_config(self.config.stt, max_slots=self.DEFAULT_SESSIONS),
+            ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(
                 resource_key=NANO_ATTN, nodes={"nano_llm"},
@@ -486,8 +572,8 @@ class NemotronDuplexModel(Model):
                         n_groups=nano.n_groups,
                         conv_kernel_size=nano.conv_kernel,
                     ).to_blocks(),
-                    # + 1 for the pool's sink slot, so DEFAULT_MAMBA_SLOTS sessions fit
-                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                    # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
+                    max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
             ),
             LinearAttnSpec(
@@ -1151,11 +1237,26 @@ class NemotronDuplexModel(Model):
         """
         if getattr(self, "_json_config_cache", None) is None:
             try:
-                self._json_config_cache = NemotronDuplexConfig.from_pretrained(local_dir)
+                cfg = NemotronDuplexConfig.from_pretrained(local_dir)
             except (FileNotFoundError, KeyError) as e:
                 logger.warning("Could not read config.json (%s); using config defaults.", e)
-                self._json_config_cache = self.config
+                cfg = self.config
+            self._refuse_resources_sized_otherwise(cfg)
+            self._json_config_cache = cfg
         return self._json_config_cache
+
+    def _refuse_resources_sized_otherwise(self, cfg: NemotronDuplexConfig) -> None:
+        """The resources are declared from the dataclass defaults, before the
+        checkpoint is read: refuse a config.json that sizes one otherwise,
+        rather than run its modules against pools of another shape."""
+        loaded = copy.copy(self)
+        loaded.config = cfg
+        for declared, needed in zip(self.get_node_resources(), loaded.get_node_resources(), strict=True):
+            if declared != needed:
+                raise ValueError(
+                    f"the checkpoint's config.json sizes resources.{declared.resource_key} as {needed}, "
+                    f"not as declared ({declared})"
+                )
 
     def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):
         """meta-build -> cast -> materialize -> load the module's checkpoint subtree.
@@ -1199,10 +1300,7 @@ class NemotronDuplexModel(Model):
         perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
         rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
         rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
-        return ConformerEncoderSubmodule(
-            perception, rnnt_dec, rnnt_joint, config=self.config,
-            max_session_samples=self.max_session_samples,
-        )
+        return ConformerEncoderSubmodule(perception, rnnt_dec, rnnt_joint, config=self.config)
 
     def _create_talker_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
@@ -1235,4 +1333,5 @@ class NemotronDuplexModel(Model):
         with torch.device("meta"):
             codec = AudioCodec(cfg.codec)
         codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
-        return AudioCodecDecoderSubmodule(codec=codec, config=self.config)
+        # the checkpoint's config, as the talker's: the codec decodes the codes it emits
+        return AudioCodecDecoderSubmodule(codec=codec, config=cfg)

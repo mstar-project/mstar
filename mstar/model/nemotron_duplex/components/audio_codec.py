@@ -29,6 +29,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
+from mstar.model.nemotron_duplex.components.dft import irfft_dim1
 from mstar.model.nemotron_duplex.config import CodecConfig
 
 # The encoder/decoder layer specs — (kind, weight_shape, stride, transpose) for
@@ -155,14 +156,19 @@ def _spectrogram(wav: torch.Tensor, n_fft: int, hop_length: int, win_length: int
 
 def _spec_to_wav(
     spec: torch.Tensor, n_fft: int, hop_length: int, win_length: int, constrain_value_range: bool = True,
+    by_matmul: bool = False,
 ) -> torch.Tensor:
-    """Inverse STFT via windowed overlap-add (ports NeMo ``spec_to_wav``)."""
+    """Inverse STFT via windowed overlap-add (ports NeMo ``spec_to_wav``).
+    ``by_matmul`` takes the inverse DFT as a matmul, for a captured graph (see ``dft``)."""
     with torch.autocast(device_type=spec.device.type, enabled=False):
         pad = (win_length - hop_length) // 2
         T = spec.size(-1)
         window = torch.hann_window(win_length, device=spec.device)
 
-        ifft = torch.fft.irfft(spec, n=n_fft, dim=-2, norm="backward")
+        if by_matmul:
+            ifft = irfft_dim1(spec, n_fft)
+        else:
+            ifft = torch.fft.irfft(spec, n=n_fft, dim=-2, norm="backward")
         window_unsqz = window.unsqueeze(-1)
 
         if constrain_value_range:
@@ -179,14 +185,38 @@ def _spec_to_wav(
             ifft, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
         )[..., 0, 0, pad:-pad]
 
-        window_sq = window.square().expand(T, -1).transpose(0, 1)
-        window_envelope = F.fold(
-            window_sq, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
-        ).squeeze()[pad:-pad]
+        # The envelope is ~0 only where the window and hop leave a gap, which
+        # check_window_envelope refuses when the codec is built; a device-side
+        # guard keeps the decode free of host syncs, for CUDA-graph capture.
+        env = _window_envelope(window, T, hop_length, win_length)
+        return torch.where(env > _ENVELOPE_FLOOR, wav / env, torch.zeros_like(wav))
 
-        assert (window_envelope > 1e-11).all(), "Window envelope has zero values, cannot normalize."
-        wav = wav / window_envelope
-        return wav
+
+_ENVELOPE_FLOOR = 1e-11
+
+
+def _window_envelope(window: torch.Tensor, T: int, hop_length: int, win_length: int) -> torch.Tensor:
+    """The overlap-added squared window of ``T`` frames, trimmed as ``_spec_to_wav``
+    trims the signal."""
+    pad = (win_length - hop_length) // 2
+    output_size = (T - 1) * hop_length + win_length
+    return F.fold(
+        window.square().expand(T, -1).transpose(0, 1), output_size=(1, output_size),
+        kernel_size=(1, win_length), stride=(1, hop_length),
+    ).squeeze()[pad:-pad]
+
+
+def check_window_envelope(window: torch.Tensor, hop_length: int) -> None:
+    """Refuse a window and hop whose overlap-add has a gap at any frame count.
+    A sample within one window of either end sees the same frames for every
+    count of at least ``ceil(win / hop)``, and an interior one the full periodic
+    overlap, so the counts up to twice that and one more cover them all."""
+    win_length = window.numel()
+    k = -(-win_length // hop_length)
+    for T in range(1, 2 * k + 2):
+        if not (_window_envelope(window, T, hop_length, win_length) > _ENVELOPE_FLOOR).all():
+            raise ValueError(f"the codec's window overlap-adds to ~0 at hop {hop_length} ({T} frames): "
+                             "its inverse STFT cannot normalize")
 
 
 class AudioCodec(nn.Module):
@@ -201,6 +231,8 @@ class AudioCodec(nn.Module):
         self.hop_length = cfg.hop_length
         self.wav_to_token_ratio = cfg.wav_to_token_ratio
         self.max_magnitude = cfg.max_magnitude
+        # on the host: the model builds the codec under torch.device("meta")
+        check_window_envelope(torch.hann_window(cfg.n_fft, device="cpu"), cfg.hop_length)
 
     # ---- autoencoder halves -------------------------------------------------
     def ae_encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -212,8 +244,9 @@ class AudioCodec(nn.Module):
         x = self.encoder.run(x)
         return x.transpose(-1, -2)
 
-    def ae_decode(self, x: torch.Tensor, constrain_value_range: bool = True) -> torch.Tensor:
-        """Continuous latents ``[B, T', latent]`` -> waveform ``[B, 1, T]``."""
+    def ae_decode(self, x: torch.Tensor, constrain_value_range: bool = True, by_matmul: bool = False) -> torch.Tensor:
+        """Continuous latents ``[B, T', latent]`` -> waveform ``[B, 1, T]``; ``by_matmul``
+        as ``_spec_to_wav`` takes it."""
         x = x.transpose(-1, -2)
         x = self.decoder.run(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -230,6 +263,7 @@ class AudioCodec(nn.Module):
 
             x = _spec_to_wav(
                 spec, self.n_fft, self.hop_length, self.n_fft, constrain_value_range=constrain_value_range,
+                by_matmul=by_matmul,
             ).unsqueeze(1)
         return x
 
@@ -248,10 +282,12 @@ class AudioCodec(nn.Module):
         code_len = x_len // self.wav_to_token_ratio if x_len is not None else None
         return code, code_len
 
-    def decode(self, code: torch.Tensor, code_len: torch.Tensor | None = None, constrain_value_range: bool = True):
-        """Codes ``[B, T', num_quantizers]`` -> (waveform ``[B, 1, T]``, wav_len)."""
+    def decode(self, code: torch.Tensor, code_len: torch.Tensor | None = None, constrain_value_range: bool = True,
+               by_matmul: bool = False):
+        """Codes ``[B, T', num_quantizers]`` -> (waveform ``[B, 1, T]``, wav_len); ``by_matmul``
+        as ``_spec_to_wav`` takes it."""
         z_q = self.dequantize(code)
-        x_hat = self.ae_decode(z_q, constrain_value_range=constrain_value_range)
+        x_hat = self.ae_decode(z_q, constrain_value_range=constrain_value_range, by_matmul=by_matmul)
         wav_len = code_len * self.wav_to_token_ratio if code_len is not None else None
         return x_hat, wav_len
 

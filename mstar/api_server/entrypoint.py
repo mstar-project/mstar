@@ -2324,6 +2324,16 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
+    # Per-message deflate is negotiated server-wide, for every WebSocket route,
+    # so it is the deployment's to turn off (see ws_per_message_deflate in
+    # docs/serving.rst); on by default, as uvicorn's.
+    return uvicorn.Config(
+        app, host=host, port=port, access_log=False,
+        ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
+    )
+
+
 def _set_preprocess_threads(model, config: dict) -> None:
     """Size torch's intra-op pool for this process's media preprocessing.
 
@@ -2530,9 +2540,7 @@ def main(argv: list[str] | None = None):
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
             # uvicorn.run() inlined so the server object is reachable. The
             # message thread stops it when the conductor dies.
-            server = uvicorn.Server(
-                uvicorn.Config(app, host=args.host, port=args.port, access_log=False)
-            )
+            server = uvicorn.Server(_uvicorn_config(app, args.host, args.port, config))
 
             def _stop_server():
                 server.should_exit = True

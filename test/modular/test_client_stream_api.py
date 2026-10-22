@@ -1624,3 +1624,13 @@ def test_max_call_input_mb_reads_in_mib():
     server.max_call_input_bytes = entrypoint._call_input_limit({"max_call_input_mb": 0.5})
     with pytest.raises(ValueError, match=r"passed 0\.5 MiB"):
         server._check_call_input(1 << 20)
+
+
+def test_websocket_deflate_is_a_serving_setting():
+    """Per-message deflate on the WebSocket routes is the deployment's choice:
+    on unless the serving config turns it off (as the duplex configs do, where
+    compressing live audio cost the event loop more than it saved)."""
+    app = object()
+    assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {}).ws_per_message_deflate is True
+    off = entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {"ws_per_message_deflate": False})
+    assert off.ws_per_message_deflate is False

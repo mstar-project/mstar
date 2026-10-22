@@ -9,9 +9,17 @@
 model: "nemotron_duplex"
 max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 
-# One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
-# on admit and wedges every session. Keep the two equal; the overflow queues.
+# Sessions at once; the overflow queues. Each session holds a slot in
+# resources mamba_state, encoder_state, encoder_front and encoder_kv and its
+# pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to raise
+# the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
+# sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
+# The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
+
+# No per-message deflate on the WebSocket routes: compressing 32 live calls'
+# 80 ms appends cost the event loop ~8% on /generate/ws (H100, 2026-10-17).
+ws_per_message_deflate: false
 
 # A live call's input files over its whole life; past it the call ends with a
 # 400. 160 s of 16 kHz audio is about 10 MB as float32 WAV: 32 leaves room for

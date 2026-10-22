@@ -404,6 +404,16 @@ The spec types are:
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
        Ring storage is currently paired with FlexAttention.
+   * - ``BoundedKVSpec(config=BoundedKVConfig(...))``
+     - Fixed-size per-request KV with sink + window retention, and its attention. A
+       request's stream is an optional read-only source (e.g. a voice prompt's keys,
+       shared by the requests that use it) followed by what it writes; ``retention`` maps
+       the source length to the ``SinkWindow`` kept (the first ``sink`` entries and the
+       last ``window``). Each step declares its rows' ``StreamPosition`` and writes
+       (``BoundedKVStep``), so rows at different positions batch, and nothing is
+       reserved or released per step. ``attend`` takes an optional per-distance score
+       term (``rel_bias``) for relative-position attention. Float32 by default (Triton
+       kernels). See `Bounded (sink + window) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -449,6 +459,17 @@ The spec types are:
        ``high_freq_factor`` and ``old_context_len``. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
+     - A pool of fixed-size per-request state slots (a Mamba or gated-DeltaNet
+       layer's conv window and SSM state, a streaming encoder's caches), one slot per
+       request and label, held until the request ends. ``blocks`` names each tensor of
+       a slot and its shape and dtype (None: the engine's compute dtype, what its KV
+       caches store); ``max_slots`` (one more than the requests, for
+       the sink that padding rows address) is deployment-tunable. A recurrent kernel
+       reads the step's ``addressing``; plain torch reads and writes a block through
+       ``gather`` / ``scatter_`` with that addressing, so eager and captured forwards
+       address the same slots. Those two need the sink: a pool built with
+       ``disable_sink_slot`` refuses them for a padded step.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
@@ -696,6 +717,46 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Bounded (sink + window) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
+prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder's chunk
+caches do) declares a ``BoundedKVSpec``. A request takes a slot when it first runs and
+keeps it; the window is a ring overwritten in place, so a step reserves and releases
+nothing. A step's layout is at most five key ranges and three write ranges per row,
+computed on the host from the position the step declares, which is also what lets rows at
+different positions share a batch and a captured graph.
+
+The model calls ``attend(layer_idx, q, k, v, source, plan)``: each row attends its
+retained keys in stream order and the step's keys it writes (all of them for a row that
+writes none), unmasked, and its writes land after. Pass
+``source`` (``[sources, rows, H, L, 2 * head_dim]``, keys then values) when requests start
+from shared prefixes that the slots should not copy; each row reads the one its
+``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
+the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
+like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's.
+
+Two flags cover retention rules that are not quite a token FIFO.
+``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.
+``BoundedKVConfig(reverse_step_order=True)`` appends each step's tokens last-first, which
+only makes sense for attention that ignores key order; it decides which of the oldest
+step's tokens leave first.
+
+By default the window is per step: every query of a step sees the same keys, the retained
+ones and the step's own. A streaming encoder whose frames each see a fixed left
+context (a conformer's ``att_context_size=[left, 0]``) sets
+``BoundedKVConfig(retention=SinkWindow(0, left), query_window=left)`` instead: each query
+attends the keys at distances ``0..left`` from it, so a step of several frames is causal
+within itself and matches the offline mask. ``rel_bias`` is then indexed by that distance,
+``[rows, H, T, left + 1]``, and passed unscaled (the kernel scales the sum by
+``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
+``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
+``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
+compute in it. Nemotron VoiceChat's streaming encoder (``ENCODER_KV``,
+``encoder_kv_config`` in ``mstar/model/nemotron_duplex/components/conformer.py``) is the
+per-query example.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -1445,6 +1506,8 @@ that a misspelled setting is never silently ignored:
        ``prefix_cache``, ``prefix_cache_salt``
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
+   * - ``BoundedKVSpec``
+     - ``max_slots``
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)

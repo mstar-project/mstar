@@ -59,7 +59,7 @@ class RecurrentAddressing:
 
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
-    num_rows: int               # real rows, before a capture bucket's padding
+    num_rows: int               # the rows the step declared, a replay's padding rows included
     # The same two on the host, as built: a backend that splits rows between
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
@@ -74,6 +74,9 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
+        for block in config.blocks.values():
+            if block.dtype is None:
+                block.dtype = info.kv_dtype if info.kv_dtype is not None else torch.get_default_dtype()
         return cls(device=info.device, config=config)
 
     def __init__(self, device: torch.device, config: RecurrentStateConfig):
@@ -137,6 +140,34 @@ class RecurrentStatePool(Resource):
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
+
+    def gather(self, name: str, rows: RecurrentAddressing, layer_idx: int = 0) -> torch.Tensor:
+        """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
+
+        ``rows`` is the step's addressing (``addressing``), so a captured and an
+        eager forward address their slots the same way; padding rows read the
+        sink."""
+        self._check_addressable(rows)
+        # index_select takes the int32 indices as they are; index_copy_ needs int64
+        return self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows])
+
+    def scatter_(
+        self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,
+    ) -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of these rows' slots."""
+        self._check_addressable(rows)
+        index = rows.slot_indices[: rows.num_rows].long()
+        self._blocks[name][layer_idx].index_copy_(0, index, value)
+
+    def _check_addressable(self, rows: RecurrentAddressing) -> None:
+        # Without a sink, padding rows carry the sentinel, which only kernels
+        # that skip rows honour; indexing with it fails on the device. Checked
+        # on the host plan, and only for pools without a sink.
+        if self.config.disable_sink_slot and NO_SLOT in (rows.host_slot_indices or ()):
+            raise ValueError(
+                "gather / scatter_ address padding rows at the sink, and this pool "
+                "has none (disable_sink_slot)"
+            )
 
     @property
     def num_free_slots(self) -> int:

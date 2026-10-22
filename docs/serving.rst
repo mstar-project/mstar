@@ -275,6 +275,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``max_call_input_mb`` these count what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``ws_per_message_deflate``
+     - *(optional, default true)* Whether the server offers per-message deflate on its
+       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
+       55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
+       costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
+       ``/generate/ws``, whose configs turn it off. Turn it off where the server's
+       event loop, not the network, is the bottleneck.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation

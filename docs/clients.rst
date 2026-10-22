@@ -86,6 +86,9 @@ WebSocket ``/generate/ws``
 
 ``/generate/ws`` is the same request over one persistent WebSocket, for control loops
 that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+The server negotiates per-message deflate on its WebSocket routes unless the deployment
+turns it off (``ws_per_message_deflate`` in :doc:`serving`, as the Nemotron VoiceChat
+configs do).
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
@@ -178,6 +181,12 @@ not the end of a request, and the call goes on. A call still waiting for a slot
 plus one each for the opening message's media and the end of input; the next ends the call
 with ``status`` 503. Other models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
+The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
+CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
+audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
+multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
+the call off the graph for the rest of its life. Other sizes are served the same, more
+slowly (see :doc:`models`).
 
 .. code-block:: python
 

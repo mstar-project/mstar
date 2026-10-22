@@ -30,6 +30,13 @@ TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
 TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
 TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
 AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
+ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder conv tails
+ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
+ENCODER_KV = "encoder_kv"           # bounded KV: each call's streaming-encoder attention window, per layer
+
+# Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
+# a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).
+SESSION_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
 
 def session_too_long(max_session_s: float) -> ValueError:
