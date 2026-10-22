@@ -8,6 +8,7 @@ Nothing passes the head, or a stream of short requests would starve a long one.
 
 from __future__ import annotations
 
+import random
 import sys
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_admit_rollback import _HostPoolStub
 from test_kv_prefix_layout_lease import ASK, IMAGE, OTHER_ASK, RID, TEXT, _config, _walks
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _grow, _keys, _layout, _manager, _seed, _StubTransfer
@@ -28,11 +30,15 @@ from mstar.engine.resources.kv.config import (
     KVStep,
     PagedKVConfig,
     PrefixSpan,
+    RetentionPolicy,
     StreamLayout,
 )
+from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
-from mstar.engine.resources.step import AdmitRuntimeError, Segment
+from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
+
+SEED = 20261022
 
 
 @pytest.fixture(autouse=True)
@@ -356,3 +362,128 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     ))
 
     assert _ready(kv, "a") and kv._allotments["a"].pages == 3, "the leader counted a label only another worker opens"
+
+
+class _StubHostPool(_HostPoolStub):
+    """`_HostPoolStub` that keeps each offloaded stream, so `reload` can bring it back."""
+
+    def offload_stream(self, rid, label, gpu_kv_cache, gpu_page_indices, **state):
+        self.offloaded.setdefault(rid, {})[label] = OffloadedStream(list(gpu_page_indices), **state)
+        return True
+
+    def reload_stream(self, rid, label, **kwargs):
+        streams = self.offloaded[rid]
+        return streams.pop(label) if len(streams) > 1 else self.offloaded.pop(rid)[label]
+
+    def labels(self, rid):
+        return list(self.offloaded.get(rid, ()))
+
+    def num_pages(self, rid, label):
+        return len(self.offloaded[rid][label].cpu_page_indices)
+
+
+def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None, preplan: bool = False) -> str:
+    """Admit one step of ``rid``, then commit the step, roll it back as a later resource's refusal
+    would, or drop the step if it was staged ahead."""
+    step = KVStep(
+        segments=(Segment(rid, "main", span),),
+        post_forks=(("main", "fork"),) if rng.random() < 0.2 else (),
+        retention={(rid, "main"): policy} if policy else {},
+    )
+    ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False, is_preplan=preplan)
+    if not kv.admit(step, ctx).ok:
+        kv.rollback_admit(step, ctx)
+        return "refused"
+    if preplan:
+        kv.clear_preplan()
+        return "dropped"
+    if rng.random() < 0.15:
+        kv.rollback_admit(step, ctx)
+        return "rolled back"
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+    return "committed"
+
+
+# each call, the states of the requests it applies to, and how often it is drawn
+_CALLS = {
+    "ingest": ((), 1), "ready": (("waiting",), 2), "prefill": (("ready",), 2), "decode": (("running",), 12),
+    "preplan": (("running",), 1), "reset": (("ready", "running"), 1), "offload": (("running",), 1),
+    "reload": (("offloaded",), 1), "remove": (("waiting", "ready", "running", "offloaded"), 1),
+}
+
+
+def _drive(kv, rng: random.Random, ops: int) -> list[str]:
+    """Drive requests that share two prompts, keyed or not and some windowed, through every call
+    that moves their pages, and run the pool's debug checks after each."""
+    prompts = [list(range(base, base + 90)) for base in (0, 1000)]
+    live: dict[str, list] = {}  # rid -> [state, prompt length, policy, decoded]
+    log: list[str] = []
+    for i in range(ops):
+        op = rng.choices(list(_CALLS), weights=[w for _, w in _CALLS.values()])[0]
+        rids = [rid for rid, entry in live.items() if entry[0] in _CALLS[op][0]]
+        rid = rng.choice(rids) if rids else f"r{i}"
+        state, n, policy, decoded = live.get(rid, (None, 0, None, 0))
+        if op == "ingest" and len(live) < 5:
+            tokens = rng.choice(prompts)[:rng.randrange(20, 90)] + [i] * rng.randrange(0, 20)
+            # a window that keeps one page releases prompt pages too, past what the request was allotted
+            policy = RetentionPolicy(1, PAGE_SIZE) if rng.random() < 0.3 else None
+            n = len(tokens)
+            kv.ingest_request(rid, KVReqConfig(
+                prefix_keys={"main": _keys(tokens)} if rng.random() < 0.7 else None, loop_caps={"decode_loop": 40},
+                kv_layout={"main": StreamLayout((PrefixSpan(n, n, WALK),), (("decode_loop", 1),), 0, policy, 1)},
+            ))
+            live[rid] = ["waiting", n, policy, 0]
+        elif state is None:
+            continue
+        elif op == "ready" and _ready(kv, rid):
+            live[rid][0] = "ready"
+        elif op == "prefill":
+            inputs = ARNodeInputs(input_seq_len=n)
+            prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
+            # a lease the probe took can be cut, but not one a refused admit converted
+            if prefix and prefix.tokens >= PAGE_SIZE and not kv._streams[rid]["main"].stored_len and rng.random() < 0.3:
+                prefix = CachedPrefix("main", PAGE_SIZE, PAGE_SIZE)
+            kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+            op = _run(kv, rng, rid, n - (0 if prefix is None else prefix.tokens), WALK, policy)
+            live[rid][0] = "running" if op == "committed" else state
+        elif op in ("decode", "preplan") and decoded < 40:
+            op = _run(kv, rng, rid, 1, "decode", policy, preplan=op == "preplan")
+            live[rid][3] += op == "committed"
+        elif op == "reset":
+            kv.reset_request(rid, free=rng.random() < 0.5)
+            live[rid][0], live[rid][3] = "ready", 0
+        elif op in ("offload", "reload"):
+            allotment = kv._allotments.get(rid)
+            left = None if allotment is None else allotment.remaining
+            if not (kv.offload(rid) if op == "offload" else kv.reload(rid)):
+                continue
+            assert op == "offload" or left is None or allotment.remaining == left, (
+                f"{op} {rid}: the reload took the pages it brought back out of what the request had left"
+            )
+            live[rid][0] = "offloaded" if op == "offload" else "running"
+        elif op == "remove":
+            kv.remove_request(rid)
+            del live[rid]
+        else:
+            continue
+        log.append(f"{op} {rid}")
+        kv.assert_pages_conserved()
+        assert kv._index.evictable() == _walk(kv), f"after {log[-1]}: the evictable set is not what a walk finds"
+    return log
+
+
+def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager(max_num_pages=20)
+    kv._cpu_pool = _StubHostPool()
+
+    log = _drive(kv, random.Random(SEED), ops=10_000)
+
+    for op in ("committed", "rolled back", "dropped", "refused", "reset", "offload", "reload", "remove"):
+        assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
+    for rid in list(kv._streams):
+        kv.remove_request(rid)
+    assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
+        f"seed {SEED}: pages or allotments outlived every request that held them"
+    )
