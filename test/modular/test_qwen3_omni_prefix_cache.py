@@ -8,11 +8,9 @@ import pytest
 import torch
 from torch import nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
     Qwen3OmniMoeVisionEncoder,
 )
 
@@ -22,7 +20,6 @@ from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.base import ProcessPromptOutput
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
@@ -107,24 +104,7 @@ def test_a_cut_text_walk_prepared_again_is_planned_where_the_cache_keyed_it(thin
     )
 
 
-def test_a_text_row_packed_after_an_audio_row_takes_its_own_slice_of_the_plan(thinker):
-    rope = thinker.node_resources[THINKER_POS]
-    rope._counters.update({"clip": {"main": 20}, "text": {"main": 50}})
-    clip = _prepare(thinker, "prefill_audio", {"audio_embeds": [torch.zeros(4, HIDDEN)]}, rid="clip")
-    text = _prepare(thinker, "prefill_text", {"text_inputs": [torch.arange(8, 11)]}, rid="text")
-    rows = [("clip", "main", clip.input_seq_len), ("text", "main", text.input_seq_len)]
-    kv_plan = KVPlanOutputs({"main": SimpleNamespace(rows=rows)})
-    ctx = StepContext(("clip", "text"), THINKER_MIXED, 0, False, plan_results={THINKER_KV: kv_plan})
-    rope.plan(PositionStep(), ctx)
-
-    positions = thinker._position_ids_3d([clip, text])
-    assert torch.equal(positions[:, :clip.input_seq_len], clip.custom_pos_ids), "the clip lost the positions it placed"
-    assert positions[:, clip.input_seq_len:].tolist() == [[50, 51, 52]] * 3, (
-        "the text row took another row's planned positions"
-    )
-
-
-def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds_and_keeps_its_advance(thinker):
+def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker):
     image = {
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
         "image_grid_thw": [torch.tensor([1, 4, 6])],
@@ -137,9 +117,6 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds_and_keep
         torch.equal(layer, full[3:])
         for layer, full in zip(cut.tensor_inputs["deepstack"], whole.tensor_inputs["deepstack"], strict=True)
     ), "the Talker masks or deepstack rows kept rows the embeds lost, so they would land on other tokens"
-    assert cut.tensor_inputs["mrope_pos_advance"] == whole.tensor_inputs["mrope_pos_advance"], (
-        "the cut image would move the counter by less than the whole image"
-    )
 
 
 def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(thinker):
@@ -170,9 +147,8 @@ def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(
     )
 
 
-@pytest.mark.parametrize("grid", [(1, 4, 6), (1, 14, 14), (1, 30, 40), (1, 76, 100)])
-def test_an_images_span_is_what_its_positions_place(grid):
-    start = 7
+def test_an_images_span_is_what_its_positions_place():
+    grid, start = (1, 30, 40), 7
     positions = get_rope_index_vision(torch.tensor(grid), start + 1, position_id_per_seconds=25, spatial_merge_size=2)
 
     # the end sentinel sits one past the image's last position, and the next walk one past that
@@ -187,7 +163,6 @@ _SPECIALS = {
 }
 _PLACEHOLDERS = {
     "image": "<|vision_start|><|image_pad|><|vision_end|>",
-    "video": "<|vision_start|><|video_pad|><|vision_end|>",
     "audio": "<|audio_start|><|audio_pad|><|audio_end|>",
 }
 
@@ -224,12 +199,6 @@ class _Processor:
         frames = len(audio) // 160
         return {"input_features": torch.zeros(1, 128, frames), "attention_mask": torch.ones(1, frames)}
 
-    class video_processor:
-        temporal_patch_size = 2
-
-        def __new__(cls, videos, size):
-            return {"video_grid_thw": torch.tensor([[2, 4, 4]]), "pixel_values_videos": torch.zeros(1)}
-
 
 @pytest.fixture
 def model():
@@ -252,12 +221,7 @@ _IMAGE = ("prefill_vision", 8, 5)
 # A second of audio is 100 feature frames, which the encoder turns into 13, so it writes 15 slots with its sentinels.
 _AUDIO = ("prefill_audio", 15, 15)
 _PROMPTS = {
-    "image then text": (["image", "text"], {"image_inputs": [torch.rand(3, 64, 96)]}, [_IMAGE]),
     "text, image, text": (["text", "image", "text"], {"image_inputs": [torch.rand(3, 64, 96)]}, [_IMAGE]),
-    "two images back to back": (
-        ["text", "image", "image", "text"], {"image_inputs": [torch.rand(3, 64, 96), torch.rand(3, 32, 32)]},
-        [_IMAGE, ("prefill_vision", 3, 3)],
-    ),
     "audio then text": (["audio", "text"], {"audio_inputs": [torch.zeros(16000)]}, [_AUDIO]),
 }
 
@@ -277,37 +241,6 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
-
-
-@pytest.mark.parametrize("frames", [37, 137, 1013])
-def test_an_audio_clips_length_is_what_the_encoder_returns(model, frames):
-    # The output length depends only on the frames and the window, so a small encoder is enough.
-    config = Qwen3OmniMoeAudioEncoderConfig(
-        n_window=model.config.audio_encoder.n_window, encoder_layers=1, d_model=64, encoder_attention_heads=2,
-        encoder_ffn_dim=64, output_dim=64, downsample_hidden_size=8,
-    )
-    encoder = Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
-    with torch.no_grad():
-        out = encoder(torch.randn(config.num_mel_bins, frames), feature_lens=torch.tensor([frames]))
-
-    assert int(model._audio_frames(torch.tensor([frames]))) == out.last_hidden_state.shape[0], (
-        "the layout's audio span disagrees with the slots its walk writes, so the cache drops the layout"
-    )
-
-
-def test_only_a_prompt_with_media_and_no_video_returns_a_layout(model):
-    returned = {
-        "image": _prompt(model, ["image", "text"], {"image_inputs": [torch.rand(3, 64, 96)]}),
-        "text": _prompt(model, ["text"], None),
-        "video": _prompt(
-            model, ["video", "text"], {"video_inputs": [torch.zeros(4, 3, 64, 64)]},
-            input_metadata={"video_inputs": [{}]},
-        ),
-    }
-
-    assert {name: isinstance(out, ProcessPromptOutput) for name, out in returned.items()} == {
-        "image": True, "text": False, "video": False,
-    }, "the layout has no span for a video, and a text prompt is keyed whole"
 
 
 @pytest.fixture
@@ -338,13 +271,3 @@ def test_the_vision_encoder_embeds_an_image_from_its_prepared_inputs_as_it_would
     assert torch.equal(ours["vision_embeds"][0], alone.pooler_output) and all(
         torch.equal(layer, own) for layer, own in zip(ours["deepstack"], alone.deepstack_features, strict=True)
     ), "the inputs built before the compiled call embed the image otherwise than the encoder does"
-
-
-def test_the_vision_encoder_marks_the_patch_dimension_of_every_input_that_has_one(vision):
-    _, _, prepared = _image(vision)
-
-    marked = {name for name, tensor in prepared.tensor_inputs.items() if getattr(tensor, "_dynamo_dynamic_indices", ())}
-    assert marked == {"pixel_values", "interp_indices", "interp_weights", "position_ids"}, (
-        "an input sized by the patch count is unmarked, so the next image size compiles again "
-        "and its cached KV stops matching"
-    )

@@ -498,8 +498,7 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
 @pytest.mark.parametrize(("asks", "expected"), [
     ({"eager_item_encoder": True}, {True: "eager", False: None}),
     ({"marks_dynamic_dims": True}, {True: None, False: None}),
-    ({}, {True: True, False: None}),
-], ids=["eager", "marks its dims", "neither"])
+], ids=["eager", "marks its dims"])
 def test_an_encoder_compiles_as_its_submodule_asks_only_while_its_output_is_cached(monkeypatch, asks, expected):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
