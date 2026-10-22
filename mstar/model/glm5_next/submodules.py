@@ -54,7 +54,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.pinned_staging import to_device_async
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
+        # the step's small host indices, one pinned H2D each
+        self._long_stager = PinnedStager(torch.long)
+        self._int_stager = PinnedStager(torch.int32)
+        self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
         # dsa_long_context: the forward's DSA context, which the MLA layers read, and under
@@ -458,7 +462,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             parts.append(torch.zeros(pad, dtype=torch.int32))
         device = self.lm_head.weight.device
         n_pos, n_req = len(pos), indptr.numel() - 1
-        staged = to_device_async(torch.cat(parts), torch.int32, device)
+        staged = self._int_stager.to_device(torch.cat(parts), device)
         lens = attn_lens(pos, cfg.index_topk, cfg.index_kpool)  # a padding row's is 1
         # score width: the serving window's pools for a decode graph; a captured prefill holds
         # whole prompts no longer than its bucket
@@ -528,7 +532,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
-        return to_device_async(keep, self.lm_head.weight.dtype, self.lm_head.weight.device)
+        # staged in fp32 (no bf16 host view), cast on the device
+        return self._keep_stager.to_device(keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
 
     def _mailbox_key(self, engine_inputs: ModelInputsFromEngine) -> int | None:
         """A captured step's capture slot, None eager: each has its own mailbox, which a
@@ -557,7 +562,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
                     self.request_state(rid).add("mtp_pending", (seq, key, row))
-        return to_device_async([seq], torch.long, self.lm_head.weight.device)
+        return self._long_stager.to_device([seq], self.lm_head.weight.device)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -566,7 +571,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         for inp in inputs:
             end += inp.input_seq_len
             last.append(max(end - 1, 0))  # a padding row repeats the one before
-        return to_device_async(last, torch.int32, self.lm_head.weight.device)
+        return self._int_stager.to_device(last, self.lm_head.weight.device)
 
     def _forward(
         self,
@@ -628,7 +633,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
         # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
         if total <= size or len(ctx.spans) == total:
-            rows = to_device_async(last, torch.long, input_ids.device)
+            rows = self._long_stager.to_device(last, input_ids.device)
             hidden = self.language_model.model(input_ids, rows=rows)
             return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
         hidden: list[torch.Tensor | None] = [None] * len(last)
@@ -638,8 +643,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 pieces = [(max(r0, start), min(r0 + n, end), req)
                           for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
                 ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
-                rows = to_device_async([r for _, r in ends] or [end - start - 1], torch.long,
-                                       input_ids.device)
+                rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
                 self._dsa.ctx = ctx.window(start, end, pieces)
                 with kv.token_window(start, end, LABEL), kda.token_window(
                         [(req, b - a) for a, b, req in pieces], LABEL):
