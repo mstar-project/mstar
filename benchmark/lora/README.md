@@ -196,7 +196,59 @@ The CPU tests behind it are in `test/modular/test_lora_prefix_keys.py` (a real
 the Orpheus test above. The prefix cache is off under tensor
 parallelism (`KVManager.enable_prefix_cache`), so there is no TP version of this phase.
 
-## 6. Against vLLM and SGLang: per-request multi-LoRA serving (about 3.5 hours, GPU 0 only)
+## 6. Loading and unloading adapters at runtime, under base traffic (about 15 minutes)
+
+Needs the `reference` phase of section 2 in the same `--out` (same `--max-tokens`).
+
+```
+python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity
+```
+
+One server whose `resources: lora:` block names no adapter (with `runtime_updates: true`), with 32 closed-loop
+base-model requests (`--base-concurrency`) running from start to end. While they run:
+
+* **load**: `proofreader` and `router` loaded with `POST /v1/load_lora_adapter` (their
+  PEFT directories); both 200, both listed by `/v1/models` with `parent`, a second load
+  of one a 400, and a request on one before its load a 400.
+* **parity**: every parity prompt on each adapter against the HF + PEFT reference by
+  vLLM's greedy rule, and the control that each adapter changes some output against the
+  base model.
+* **unload**: 8 requests of 4096 tokens (`ignore_eos`) on `proofreader`, then its unload
+  while they run: 200; a new request on it 400; every held request runs to its length
+  (`finish_reason` length, its text re-tokenized to at least 90% of 4096: the
+  non-streaming `usage` is not filled in); a second unload 404; `/v1/models` no longer lists it.
+* **reload**: `proofreader` loaded again from the same directory (retried for up to a
+  minute while the workers still hold it for the requests that just ended), then the
+  parity prompts again, which must equal the first load's outputs exactly.
+
+Pass: exit 0, which includes `failed == 0` for the base traffic. Results:
+`runtime_load.json` (every check, the outputs, the held requests, the base traffic's
+latency overall and while each load or unload was in flight) and
+`server_runtime_load.log`. Copy both off the box when it finishes.
+
+Worth reading even on a pass: `base_traffic.during_load_*`. A worker reads the adapter
+on its main loop as the load arrives, so a large adapter could stall that worker's steps
+for the read's duration; for these rank-16 0.8B adapters it should be small. A bump
+there is the number that would justify moving the read off the main loop.
+
+Qwen3.5 keys no prefix-cache stream, so no adapter has a prefix-cache root in this run.
+That a reload of the same weights keeps its root, and of other weights does not, is the
+CPU test `test_a_runtime_load_and_unload_end_to_end` in `test/modular/test_lora_api.py`.
+
+Under TP (two GPUs; after section 4 passes), once per `MSTAR_TP_ASYNC_SCHED` setting:
+
+```
+python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 0
+python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 1
+```
+
+Loads and unloads reach each rank of the instance on its own, at whatever step it is on;
+the pool is built so that this cannot change a slot decision (`LoraAdapterPool`'s
+docstring). A hang (requests time out at 300 s and count as failed), a failed base
+request or a parity failure here is the sign it can. Results are suffixed
+`_tp2_async<0|1>`.
+
+## 7. Against vLLM and SGLang: per-request multi-LoRA serving (about 3.5 hours, GPU 0 only)
 
 Each engine in its own venv; record nothing by hand, the script writes every version to
 `versions.json`:
