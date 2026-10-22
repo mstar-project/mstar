@@ -35,6 +35,7 @@ def _force_cpu_flashinfer(monkeypatch):
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
@@ -603,6 +604,13 @@ def test_stop_counts_what_the_checked_steps_delivered():
         assert delivered == budget, (budget, delivered)
 
 
+def _stored_index_rows(kv, rid: str) -> torch.Tensor:
+    """The first index plane's rows at the request's stored tokens."""
+    pos = torch.arange(kv.stored_len(rid))
+    pages = torch.tensor(kv._streams[rid]["main"].page_indices)[pos // kv.config.page_size]
+    return kv.aux_view(INDEX_PLANES, 0)[pages, pos % kv.config.page_size]
+
+
 @pytest.mark.parametrize("wrong_every", [None, 0, 3], ids=["mtp", "oracle", "oracle_partial"])
 @pytest.mark.parametrize("chunk", [8192, 3], ids=["one-pass", "row-chunks"])
 def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
@@ -623,8 +631,10 @@ def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
             _oracle(sub, {"r0": streams[0].tolist()}, wrong_every)
         driver = _Driver(sub, cfg, ["r0"])
         streams.append(_drive(driver, prompt, _fwd_info("r0", 18, True)))
-        index = driver.resources["kv_index"]
-        assert index.stored_len("r0") == driver.resources[KV_RESOURCE].stored_len("r0")
+        # the index keys sit at their tokens' latent slots, one length for both: every token
+        # the cache still holds after the trims has its keys
+        rows = _stored_index_rows(driver.resources[KV_RESOURCE], "r0")
+        assert rows.shape[0] > prompt.shape[0] and (rows != 0).any(-1).all()
     cfg.mtp_num_draft_tokens = 2
     assert torch.equal(streams[0], streams[1]), f"{streams[0].tolist()} vs {streams[1].tolist()}"
     assert len(set(streams[0].tolist())) > 3

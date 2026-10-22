@@ -53,7 +53,8 @@ def test_shipped_config_prefill_steps_fit_the_largest_bucket(name):
 
 @pytest.mark.parametrize("name", ["glm52_tp8_longctx.yaml", "glm52_tp8_longctx_mtp.yaml"])
 def test_longctx_config_window_fits_its_pages(name):
-    """The long-context yamls build the DSA path, and both caches hold a full window."""
+    """The long-context yamls build the DSA path, and their cache (the latents and, on the same
+    pages, the index keys) holds a full window."""
     import yaml
 
     path = Path(__file__).resolve().parents[2] / "configs" / name
@@ -65,10 +66,10 @@ def test_longctx_config_window_fits_its_pages(name):
     # every step of the captured prefill buckets runs in one pass, never in row chunks
     assert _submodule(model.config).max_step_tokens("prefill") <= model.config.prefill_chunk_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
-    for key in ("kv", "kv_index"):
-        res = cfg["resources"][key]
-        # the manager holds one page back as its sink
-        assert (res["max_num_pages"] - 1) * res["page_size"] >= model.config.max_seq_len
+    assert set(cfg["resources"]) == {"kv"}
+    res = cfg["resources"]["kv"]
+    # the manager holds one page back as its sink
+    assert (res["max_num_pages"] - 1) * res["page_size"] >= model.config.max_seq_len
 
 
 def _kv(pages, page_size, eviction=False):
@@ -81,7 +82,7 @@ def _kv(pages, page_size, eviction=False):
 
 @pytest.mark.parametrize("change, resources, match", [
     ({"prefill_chunk_tokens": 0}, {}, "must be >= 1"),
-    ({}, {"kv_index": _kv(4096, 96)}, "power of two"),
+    ({}, {"kv": _kv(4096, 96)}, "kv page_size=96 must be a power of two"),
     ({"dsa_shard_prefill": True}, {"kv": _kv(4096, 128, eviction=True)}, "cpu_offload_pages"),
 ])
 def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match):

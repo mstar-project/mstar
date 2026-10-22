@@ -12,6 +12,7 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    AuxPlanes,
     DSAConfig,
     DSASpec,
     KVLayout,
@@ -24,6 +25,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -32,7 +34,6 @@ from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
-    INDEX_KV_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -213,9 +214,8 @@ class Glm52Model(Model):
         # the layer-78 draft module keeps its KV in one extra layer plane at
         # index num_hidden_layers, on the trunk's page table (draft-tail rows
         # are overwritten as the verified stream advances into them).
-        num_kv_layers = self.config.num_hidden_layers + (
-            1 if self.config.mtp_num_draft_tokens > 0 else 0
-        )
+        mtp_planes = 1 if self.config.mtp_num_draft_tokens > 0 else 0
+        num_kv_layers = self.config.num_hidden_layers + mtp_planes
         nodes = {"LLM"}
         if self.config.mla_absorb:
             kv = PagedKVConfig(
@@ -227,6 +227,12 @@ class Glm52Model(Model):
                 layout=KVLayout.MLA,
                 kv_lora_rank=self.config.kv_lora_rank,
                 qk_rope_head_dim=self.config.qk_rope_head_dim,
+                # dsa_long_context: the indexer's keys on the latents' pages, an index_head_dim
+                # row per token for each FULL layer (and the MTP layer)
+                aux_planes={INDEX_PLANES: AuxPlanes(
+                    num_layers=len(full_indexer_layers(self.config)) + mtp_planes,
+                    width=self.config.index_head_dim,
+                )} if self.config.dsa_long_context else {},
             )
             attn = AttentionSpec(
                 resource_key=ATTN_RESOURCE, nodes=nodes,
@@ -250,20 +256,7 @@ class Glm52Model(Model):
                 resource_key=ATTN_RESOURCE, nodes=nodes,
                 config=AttentionConfig(kv_cache=KV_RESOURCE),
             )
-        specs = []
-        if self.config.dsa_long_context:
-            # the indexer's keys as a one-latent MLA cache, one layer per FULL layer
-            d = self.config.index_head_dim
-            specs.append(KVSpec(resource_key=INDEX_KV_RESOURCE, nodes=nodes, config=PagedKVConfig(
-                num_layers=len(full_indexer_layers(self.config)) + (
-                    1 if self.config.mtp_num_draft_tokens > 0 else 0),
-                num_kv_heads=1, head_dim=d,
-                max_seq_len=self.config.max_seq_len, layout=KVLayout.MLA, kv_lora_rank=d,
-                qk_rope_head_dim=0,
-                # replicated like the latent; its qo count only has to shard evenly under TP,
-                # as the attention heads do
-                num_qo_heads=self.config.num_attention_heads)))
-        specs += [
+        specs = [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
             # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
@@ -283,7 +276,7 @@ class Glm52Model(Model):
                 resource_key=DSA_RESOURCE, nodes=nodes,
                 config=DSAConfig(
                     kv_cache=KV_RESOURCE, topk=self.config.index_topk,
-                    sm_scale=self.config.qk_head_dim ** -0.5, index_cache=INDEX_KV_RESOURCE),
+                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True),
             ))
         return specs
 

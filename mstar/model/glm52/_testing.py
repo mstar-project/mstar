@@ -33,6 +33,53 @@ def fake_quantize_fp8_block(
     return w_fp8, scale_inv, dequant
 
 
+# -- DSA's selection in torch: the references the paged path and its kernels are held to ------
+
+def select_topk_causal(
+    scores: torch.Tensor, positions: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Per-row top-``topk`` key positions of causally masked ``scores``.
+
+    ``scores`` is ``(T, num_keys)`` with every key past a row's position
+    already ``-inf``; the result is ``(T, topk)`` int32, -1 padded where a
+    row sees fewer than ``topk`` keys. One stable sort for the whole batch:
+    no per-token topk launch, no host sync. Ties break toward the earlier
+    key position, so a row's selection does not depend on how the batch
+    is packed or on which device ran it (torch.topk's tie order is neither).
+    """
+    num_tokens, num_keys = scores.shape
+    k_eff = min(topk, num_keys)
+    order = scores.sort(dim=1, descending=True, stable=True).indices[:, :k_eff]
+    # the -inf tail sorts last (stable: by ascending index), so rank >= p_t+1
+    # is exactly the invisible remainder
+    rank = torch.arange(k_eff, device=scores.device)
+    invisible = rank.unsqueeze(0) >= positions.unsqueeze(1) + 1
+    selection = torch.full(
+        (num_tokens, topk), -1, dtype=torch.int32, device=scores.device)
+    selection[:, :k_eff] = order.to(torch.int32).masked_fill(invisible, -1)
+    return selection
+
+
+def index_topk(
+    q: torch.Tensor, weights: torch.Tensor, keys: torch.Tensor,
+    positions: torch.Tensor, topk: int,
+) -> torch.Tensor:
+    """Top-``topk`` key positions per query row, ``(T, topk)`` int32, -1 padded.
+
+    ``q`` ``(T, H, D)`` and ``weights`` ``(T, H)`` are the indexer's queries and head weights
+    (any scales folded in), ``keys`` ``(S, D)`` a request's keys by position and ``positions``
+    ``(T,)`` the rows' own: a row sees keys ``0 .. position``, itself included."""
+    # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]), in fp32: per-head ReLU BEFORE the
+    # weighted sum; the raw weights get no softmax/sigmoid. The engine's bf16 autocast would run
+    # both einsums in bf16.
+    with torch.autocast(q.device.type, enabled=False):
+        dots = torch.einsum("thd,sd->ths", q.float(), keys.float()).relu()
+        scores = torch.einsum("th,ths->ts", weights.float(), dots)
+    key_pos = torch.arange(keys.shape[0], device=scores.device)
+    scores = scores.masked_fill(key_pos.unsqueeze(0) > positions.unsqueeze(1), float("-inf"))
+    return select_topk_causal(scores, positions, topk)
+
+
 class ReferenceAttentionResource(AttentionResource):
     """CPU stand-in for the naive-path attention resource (the FlashInfer K/V backend):
     dense causal attention over the rows a real NHD ``KVManager`` holds, planned from
@@ -126,17 +173,16 @@ def build_cpu_resources(
     them. Requests in ``request_ids`` are ingested.
     """
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
-    from mstar.engine.resources.dsa.config import DSAConfig
+    from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig
     from mstar.engine.resources.dsa.manager import DSAManager
     from mstar.engine.resources.kv import manager as manager_mod
-    from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+    from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.position.config import PositionConfig
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.model.glm52.config import (
         ATTN_RESOURCE,
         DSA_RESOURCE,
-        INDEX_KV_RESOURCE,
         KV_RESOURCE,
         POS_RESOURCE,
         SAMPLER_RESOURCE,
@@ -148,12 +194,21 @@ def build_cpu_resources(
     manager_mod.KVTransferManager = _StubTransferManager
     try:
         if config.mla_absorb:
+            aux = {}
+            if config.dsa_long_context:
+                from mstar.model.glm52.components.indexer import full_indexer_layers
+
+                # an index plane per FULL layer, and the MTP layer's
+                aux[INDEX_PLANES] = AuxPlanes(
+                    num_layers=len(full_indexer_layers(config)) + num_layers
+                    - config.num_hidden_layers,
+                    width=config.index_head_dim)
             kv_cfg = PagedKVConfig(
                 num_layers=num_layers, num_kv_heads=1, head_dim=config.cache_latent_dim,
                 max_seq_len=config.max_seq_len, max_num_pages=max_num_pages,
                 page_size=page_size, num_qo_heads=config.num_attention_heads,
                 layout=KVLayout.MLA, kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim, aux_planes=aux,
             )
             kv = KVManager(
                 cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
@@ -182,22 +237,6 @@ def build_cpu_resources(
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
             attn = ReferenceAttentionResource(KV_RESOURCE)
-        index = None
-        if config.dsa_long_context:
-            from mstar.model.glm52.components.indexer import full_indexer_layers
-
-            d = config.index_head_dim
-            index = KVManager(
-                cfg=PagedKVConfig(
-                    num_layers=len(full_indexer_layers(config)) + (
-                        1 if config.mtp_num_draft_tokens > 0 else 0),
-                    num_kv_heads=1, head_dim=d,
-                    max_seq_len=config.max_seq_len, max_num_pages=max_num_pages,
-                    page_size=page_size, layout=KVLayout.MLA, kv_lora_rank=d,
-                    qk_rope_head_dim=0),
-                name=INDEX_KV_RESOURCE, joint_comm_group=None, transfer_engine_info=None,
-                device=device, dtype=torch.float32,
-            )
     finally:
         manager_mod.KVTransferManager = stub
     pos = RopeManager(
@@ -205,12 +244,11 @@ def build_cpu_resources(
     resources = {
         KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos, SAMPLER_RESOURCE: GreedySampler(),
     }
-    if index is not None:
-        resources[INDEX_KV_RESOURCE] = index
+    if config.dsa_long_context:
         resources[DSA_RESOURCE] = DSAManager(
             DSAConfig(kv_cache=KV_RESOURCE, topk=config.index_topk,
-                      sm_scale=config.qk_head_dim ** -0.5, index_cache=INDEX_KV_RESOURCE),
-            kv_cfg, index.config, device,
+                      sm_scale=config.qk_head_dim ** -0.5, dense_below_topk=True),
+            kv_cfg, device,
         )
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:

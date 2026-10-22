@@ -22,6 +22,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnConfig,
@@ -116,7 +117,7 @@ class Glm5NextModel(Model):
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if kwargs.get("dsa_long_context", False):
-            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
             self.config.dsa_long_context = True
@@ -218,6 +219,10 @@ class Glm5NextModel(Model):
                     layout=KVLayout.MLA,
                     kv_lora_rank=self.config.kv_lora_rank,
                     qk_rope_head_dim=self.config.mla_cache_kpe,
+                    aux_planes=(
+                        {INDEX_PLANES: self.config.index_planes}
+                        if self.config.dsa_long_context else {}
+                    ),
                 ),
             ),
             AttentionSpec(
