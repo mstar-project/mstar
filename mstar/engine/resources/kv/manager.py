@@ -2568,6 +2568,9 @@ class KVManager(AttentionResource):
                 stream.chain.extend([ids[-1]], self.config.page_size)
             return walk
 
+    def land_rebuild(self, rid: str) -> None:
+        self._dropped.discard(rid)
+
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
 
