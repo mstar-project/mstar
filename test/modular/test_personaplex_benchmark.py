@@ -129,3 +129,48 @@ def test_arena_lifecycle_cannot_pass_without_precleanup_decoder_observations():
     rows[0]["time"] = 12
     with pytest.raises(AssertionError, match="followed hard cleanup"):
         verify_ownership_observations(rows, completed=1)
+
+
+def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monkeypatch):
+    import runpy
+    import types
+    from pathlib import Path
+
+    from mstar.communication.arena import ArenaShmCommunicationManager
+    from mstar.communication.tensors import TensorCommunicationManager
+    from mstar.graph.runtime.python import PythonGraphRuntime
+
+    class StubRustRuntime:
+        def cleanup_consumed_inputs(self, node_name, rids, wg_ids):
+            return [], []
+
+    rust = types.ModuleType("mstar.graph.runtime.rust")
+    rust.RustGraphRuntime = StubRustRuntime
+    monkeypatch.setitem(sys.modules, "mstar.graph.runtime.rust", rust)
+    # The observer rebinds these class attributes; monkeypatch restores them.
+    for cls, name in (
+        (TensorCommunicationManager, "cleanup_collectable"),
+        (TensorCommunicationManager, "force_cleanup_request"),
+        (PythonGraphRuntime, "cleanup_consumed_inputs"),
+    ):
+        monkeypatch.setattr(cls, name, cls.__dict__[name])
+    arena_calls = []
+    monkeypatch.setattr(ArenaShmCommunicationManager, "cleanup_collectable",
+                        lambda self, collectable, registered: arena_calls.append(collectable))
+    monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_OBSERVE", "1")
+    monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_ROOT", str(tmp_path))
+    monkeypatch.setenv("PERSONAPLEX_LIVE_BACKEND", "rust")
+    runpy.run_path(str(Path("benchmark/personaplex/observe/sitecustomize.py")))
+
+    store = types.SimpleNamespace(
+        get_all_uuids=lambda rid: [5], get_info=lambda uuid: None,
+        bookkeeping=types.SimpleNamespace(_ref_info={}), _uuid_to_rid={5: 7},
+    )
+    manager = types.SimpleNamespace(tensor_store=store, uuid_to_edge_name={}, my_entity_id="worker_0")
+    StubRustRuntime().cleanup_consumed_inputs("MimiDecoder", [7], [0])
+    ArenaShmCommunicationManager.cleanup_collectable(manager, [5], [True])
+
+    assert arena_calls == [[5]]
+    rows = [json.loads(line) for path in tmp_path.glob("ownership-events-*.jsonl")
+            for line in path.read_text().splitlines()]
+    assert [(row["event"], row["rid"]) for row in rows] == [("after_decoder_inputs_consumed", 7)]

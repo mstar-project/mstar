@@ -72,17 +72,26 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
             return freed
 
         RustGraphRuntime.cleanup_consumed_inputs = rust_cleanup
-        original_collect = TensorCommunicationManager.cleanup_collectable
 
-        def collected(self, collectable, registered):
-            result = original_collect(self, collectable, registered)
-            rids = set(pending_decoder_rids)
-            pending_decoder_rids.clear()
-            for rid in rids:
-                snapshot(self, "after_decoder_inputs_consumed", rid)
-            return result
+        def observe_collectable(cls):
+            original_collect = cls.__dict__["cleanup_collectable"]
 
-        TensorCommunicationManager.cleanup_collectable = collected
+            def collected(self, collectable, registered):
+                result = original_collect(self, collectable, registered)
+                rids = set(pending_decoder_rids)
+                pending_decoder_rids.clear()
+                for rid in rids:
+                    snapshot(self, "after_decoder_inputs_consumed", rid)
+                return result
+
+            cls.cleanup_collectable = collected
+
+        # The SHM arena manager overrides cleanup_collectable without calling
+        # super(), so wrapping only the base class never fires under the arena.
+        from mstar.communication.arena import ArenaShmCommunicationManager
+
+        for cls in (TensorCommunicationManager, ArenaShmCommunicationManager):
+            observe_collectable(cls)
 
     original_force = TensorCommunicationManager.force_cleanup_request
 
