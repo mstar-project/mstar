@@ -1,8 +1,8 @@
 model: "glm52"
 # glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module. A verify
-# step takes its rejected rows back from both KV resources (latents and index keys) before
-# the next step plans, and every verify row and the draft module's own indexer select their
-# top-2048 tokens like the trunk's. MTP's prefill over DSA runs eager.
+# step takes its rejected rows back from the KV cache (the latents and, on the same pages, the
+# index keys) before the next step plans, and every verify row and the draft module's own
+# indexer select their top-2048 tokens like the trunk's. MTP's prefill over DSA runs eager.
 #
 # KV per token per rank: 79 MLA layers x (512 + 64) x 2 B + 22 index layers x 128 x 2 B
 # ~= 96 KB, so the pools below hold about one full window, as glm52_tp8_longctx.yaml's.
@@ -37,10 +37,6 @@ resources:
     max_num_pages: 2304
     page_size: 128
     # the prefix cache at TP > 1: rank 0 decides each hit and the other ranks adopt it
-    prefix_cache_tp: true
-  kv_index:
-    max_num_pages: 2304
-    page_size: 128
     prefix_cache_tp: true
 # MTP's prefill over DSA runs eager, a short prompt's too (the buckets above only size
 # prefill_max_step_tokens), in row chunks past prefill_chunk_tokens, and its kernels compile on

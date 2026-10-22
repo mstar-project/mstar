@@ -18,6 +18,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
@@ -635,14 +636,14 @@ def test_long_context_mtp_layer_selects_with_its_own_indexer():
     context, not over its last index_topk tokens."""
     engine, sub, cfg = _build_engine(2, long_context=True)
     attn = sub.language_model.mtp.transformer_layer.self_attn
-    assert attn.index_plane == cfg.index_plane_offset + attn.kv_plane
-    assert cfg.num_kv_planes == 2 * cfg.index_plane_offset
+    assert attn.index_plane == attn.kv_plane
+    assert cfg.index_planes.num_layers == cfg.num_kv_planes
     prompt = {"a": LONG_PROMPTS["a"]}
     engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
     _step(engine, "prefill", prompt, LONG_MAX_TOKENS)
     kv = engine._resources[KV_CACHE]
     pages, size = kv._streams["a"]["main"].page_indices, kv.kv_cache.page_size
-    plane, d = kv.layer_view(attn.index_plane), cfg.index_head_dim
+    plane, d = kv.aux_view(INDEX_PLANES, attn.index_plane), cfg.index_head_dim
     keys = torch.stack([plane[pages[p // size], p % size, :d] for p in range(len(prompt["a"]))])
     assert bool(keys.abs().sum(-1).gt(0).all())
     engine.remove_request("a")
