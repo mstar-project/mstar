@@ -12,6 +12,8 @@ KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
 POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = "sampler"
+# dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
+DSA_RESOURCE = "dsa"
 
 # config.json keys read by Glm52ModelConfig.from_hf_config under the same
 # name (eos_token_id becomes eos_token_ids).
@@ -77,12 +79,11 @@ class Glm52ModelConfig:
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
     # the exact DSA computation. On: the guard checks max_seq_len instead,
-    # FULL layers maintain a per-request indexer k-store + compute selection,
-    # and decode beyond index_topk runs sparse absorbed attention over the
-    # selected latents (dsa.py / components/attention.py). v1 is decode-only
+    # FULL layers hand their index keys and queries to the DSA resource
+    # (mstar/engine/resources/dsa), which picks each query's top index_topk,
+    # and decode beyond index_topk attends just those latents. Decode-only
     # beyond topk (prefill prompts must still fit index_topk) and eager-only
-    # (selection is host-side per-request work a captured graph would not
-    # replay).
+    # (the resource selects per request on the host).
     dsa_long_context: bool = False
 
     # --- MoE ---
