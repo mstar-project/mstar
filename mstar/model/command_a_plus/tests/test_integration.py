@@ -28,9 +28,9 @@ from mstar.model.command_a_plus.config import (
     CommandAPlusConfig,
 )
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
+from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.submodule_base import ModelInputsFromEngine
-from test.command_a_plus.test_backbone import bind_test_resources
-from test.command_a_plus.test_weight_loading import checkpoint
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 

@@ -16,9 +16,9 @@ from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
 from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER, CommandAPlusConfig
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
+from mstar.model.command_a_plus.tests.test_integration import FIXTURE, info
 from mstar.model.submodule_base import ModelInputsFromEngine
-from test.command_a_plus.test_backbone import bind_test_resources
-from test.command_a_plus.test_integration import FIXTURE, info
 
 
 def reference_weights(reference):

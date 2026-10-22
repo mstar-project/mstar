@@ -10,8 +10,8 @@ import yaml
 from mstar.cli.main import _resolve_config
 from mstar.model.command_a_plus.assets import CHECKPOINT_REVISION, METADATA_FILES, MODEL_ID, resolve_metadata
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+from mstar.model.command_a_plus.tests.test_integration import FIXTURE
 from mstar.model.registry import HF_MODELS, get_model_class
-from test.command_a_plus.test_integration import FIXTURE
 
 
 class RegistrationTests(unittest.TestCase):

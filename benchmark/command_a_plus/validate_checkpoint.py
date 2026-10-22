@@ -69,7 +69,7 @@ def reference(args):
     print(f"HF loaded in {load_seconds:.1f}s", flush=True)
     trace = None
     if args.trace:
-        from test.command_a_plus.activation_trace import ActivationTrace
+        from benchmark.command_a_plus.activation_trace import ActivationTrace
 
         trace = ActivationTrace(model.model.language_model, reference=True)
     tensors, cases = {}, []
@@ -213,7 +213,7 @@ def mstar(args):
         runtime = Runtime(args, group)
         trace = None
         if args.trace and rank == 0:
-            from test.command_a_plus.activation_trace import ActivationTrace
+            from benchmark.command_a_plus.activation_trace import ActivationTrace
 
             trace = ActivationTrace(runtime.node.language_model.model, reference=False)
         reference_info = json.loads((args.output / "hf_reference.json").read_text())
@@ -260,7 +260,7 @@ def mstar(args):
             save_file(tensors, args.output / "mstar_logits.safetensors")
             write_json(args.output / "mstar_parity.json", results)
         if args.trace:
-            from test.command_a_plus.activation_trace import compare_reference_routing
+            from benchmark.command_a_plus.activation_trace import compare_reference_routing
 
             compare_reference_routing(runtime, args, rank)
         # Stop before benchmarks if the same-prefix logits do not match. Keep

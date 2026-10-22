@@ -3,8 +3,8 @@
 Run once against an eager server and once against a CUDA-graph server, then
 compare the two JSON files with ``--compare``.
 
-    python -m test.command_a_plus.parity_http --url http://127.0.0.1:8000 --output eager.json
-    python -m test.command_a_plus.parity_http --url http://127.0.0.1:8000 --output graphs.json \
+    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output eager.json
+    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output graphs.json \
       --compare eager.json
 """
 
