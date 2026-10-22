@@ -60,7 +60,8 @@ from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_ca
 logger = logging.getLogger(__name__)
 
 # Off by default: `assert_pages_conserved` walks every stream of every live
-# request after each admit, commit, reset and remove.
+# request after each admit, commit, reset and remove, and after each change to
+# an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 _WAIT = AdmitOutcome(ok=True, ready=False, held_back=True)
@@ -3101,6 +3102,25 @@ class KVManager(AttentionResource):
                 f"pages still being written into, but not owned alone: {crowded}"
             )
 
+            unused = 0
+            for rid, allotment in self._allotments.items():
+                held = 0
+                for label, stream in self._streams[rid].items():
+                    stale = stream.lent - set(stream.page_indices) - set(stream.lease or ())
+                    assert not stale, f"{rid}/{label} counts pages it no longer holds as lent: {sorted(stale)}"
+                    held += len(stream.page_indices) + len(stream.lease or ()) - len(stream.lent)
+                unused += max(0, allotment.pages - held)
+            assert unused == self._unused, (
+                f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
+            )
+            evictable = 0 if self._index is None else len(self._index.evictable())
+            assert self._unused <= len(free) + evictable, (
+                f"admitted requests were allotted {self._unused} pages they haven't used, "
+                f"but only {len(free)} are free and {evictable} evictable"
+            )
+            if self._index is not None:
+                self._index.assert_evictable()
+
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
 
@@ -3304,6 +3324,8 @@ class KVManager(AttentionResource):
         remaining = max(0, allotment.pages - held)
         self._unused += remaining - allotment.remaining
         allotment.remaining = remaining
+        if _DEBUG_ASSERTS:
+            self.assert_pages_conserved()
 
     def _check_ready(
         self, rid: str, label: str
@@ -3454,6 +3476,7 @@ class KVManager(AttentionResource):
                     self._report_overrun(request_id, label, stream)
                 if _DEBUG_ASSERTS:
                     stream.peak = max(stream.peak, len(stream.page_indices))
+                    self.assert_pages_conserved()
         return AllocResult(new_pages=new_pages)
 
     def _grant(self, rid: str, label: str, n: int, past: int) -> list[int] | None:
