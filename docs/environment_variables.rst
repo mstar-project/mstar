@@ -376,8 +376,9 @@ so attaching more files does not multiply them.
        frames the model's loader decodes, each frame counting as at least
        64x64; over it, the request gets a 400. At 1080p30 the default refuses
        clips over about 17 s on Cosmos3, which decodes every frame, and over
-       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
-       frame, as Cosmos3, when the clip's header gives no frame count).
+       about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second
+       (Qwen3-Omni decodes every frame, as Cosmos3, when the clip's header
+       gives no frame count).
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``
      - Images, audio clips and videos one request may attach, together (see
@@ -545,9 +546,9 @@ Worker scheduling
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       ``remove_request``, check the KV page bookkeeping against the streams
+       holding the pages, and each commit against its request's layout. Logs a
+       label left under its footprint at removal. Tests and debugging only.
 
 Compilation
 -----------

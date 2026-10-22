@@ -582,8 +582,8 @@ class CodecSubmodule(ARNodeSubmodule):
 class RefEncoderSubmodule(NodeSubmodule):
     """DAC-encode one 44.1 kHz reference clip into ``[frames, 10]`` codes.
 
-    Runs on the GPU in full fp32 (SGLang-Omni measured 1.9 s per clip on the
-    CPU and 0.06 s on the GPU, with identical codes once TF32 is off). Codes
+    Runs on the GPU under ``full_fp32``: TF32 convolutions would flip some
+    of the codes. Codes
     are memoised by clip content: a voice is reused across requests and
     across the sentence chunks of one long request.
     """

@@ -23,6 +23,7 @@ import io
 import math
 import os
 import threading
+import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -311,6 +312,40 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
             raise ValueError("Remote media fetch is disabled on this server")
         return save_remote_url(ref, upload_dir)
     raise ValueError("server file paths are refused; send media as a data URL or a file upload")
+
+
+# How long a submitted request's uploads outlive it: the data worker reads them
+# from its queue after the submission returns. The Rust frontend waits 60 s too.
+UPLOAD_CLEANUP_DELAY_S = 60.0
+
+
+def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """Delete a request's files under ``upload_dir`` now. A path elsewhere is
+    left alone: no route puts one in ``file_paths`` today, and a file the
+    server did not save is never the request's to delete."""
+    root = Path(upload_dir).resolve()
+    for paths in (file_paths or {}).values():
+        for path in paths:
+            p = Path(path)
+            if not p.resolve().is_relative_to(root):
+                continue
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """:func:`remove_uploads` after :data:`UPLOAD_CLEANUP_DELAY_S`, for a
+    request that was submitted and may not have been read yet."""
+    if not file_paths:
+        return
+
+    def _cleanup() -> None:
+        time.sleep(UPLOAD_CLEANUP_DELAY_S)
+        remove_uploads(file_paths, upload_dir)
+
+    threading.Thread(target=_cleanup, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------

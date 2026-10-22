@@ -375,8 +375,11 @@ def test_codec_state_loads_completely_and_rejects_gaps(config, decoder):
     with pytest.raises(RuntimeError, match="no place"):
         load_codec_state(FishDACDecoder(config.codec), {**state, "decoder.extra.weight": torch.zeros(1)}, prefixes)
     bad_rope = dict(state, **{"quantizer.post_module.freqs_cis": torch.zeros(256, 8, 2, dtype=torch.bfloat16)})
-    with pytest.raises(RuntimeError, match="RoPE table"):
+    with pytest.raises(RuntimeError, match=r"by up to 1; the tolerance is 0\.015625$"):
         load_codec_state(FishDACDecoder(config.codec), bad_rope, prefixes)
+    short_rope = dict(state, **{"quantizer.post_module.freqs_cis": precompute_freqs_cis(128, 16, 10000.0)})
+    with pytest.raises(RuntimeError, match=r"freqs_cis: checkpoint \(128, 8, 2\) vs \(256, 8, 2\)"):
+        load_codec_state(FishDACDecoder(config.codec), short_rope, prefixes)
 
 
 def test_codec_runs_the_checkpoints_rope_table_even_one_bf16_step_off(config, decoder):
@@ -393,8 +396,11 @@ def test_codec_runs_the_checkpoints_rope_table_even_one_bf16_step_off(config, de
     assert torch.equal(fresh.quantizer.post_module.freqs_cis, stored)
 
     other_base = precompute_freqs_cis(256, 16, 5000.0)
-    with pytest.raises(RuntimeError, match="RoPE table"):
-        load_codec_state(FishDACDecoder(config.codec), {**state, key: other_base}, ("quantizer.", "decoder."))
+    target = FishDACDecoder(config.codec)
+    gap = (other_base.float() - target.quantizer.post_module.freqs_cis.float()).abs().max().item()
+    assert gap > 2.0**-6
+    with pytest.raises(RuntimeError, match=rf"RoPE table {key} .* by up to {gap:.3g}; the tolerance is 0\.015625"):
+        load_codec_state(target, {**state, key: other_base}, ("quantizer.", "decoder."))
 
 
 def test_ref_encoder_emits_frames_and_memoises_by_clip(config):

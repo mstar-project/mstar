@@ -95,6 +95,13 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
+            # XPU always rotates from this cache, so it already rounds the
+            # table to cache_dtype; another rope_table_dtype has no kernel here.
+            if config.rope_table_dtype not in (None, cache_dtype):
+                raise NotImplementedError(
+                    f"rope_table_dtype={config.rope_table_dtype} is not implemented for XPU, "
+                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the KV dtype)"
+                )
             self._rope_cache_key = (
                 rotary_dim,
                 config.rope_scale,

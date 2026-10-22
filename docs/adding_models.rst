@@ -241,6 +241,17 @@ There are two ``ResourceReqConfig`` subclasses:
   per-request seed. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
+  Further knobs, each needing a ``SamplerSpec`` capability (CUDA only):
+
+  - ``repetition_window`` (``max_repetition_window``): the penalty counts a token's
+    occurrences in the last N generated tokens, ``repetition_penalty ** n``.
+  - ``min_tokens`` (``min_tokens_stop_ids``): those ids are barred until
+    ``min_tokens`` tokens exist; applied after top-k/top-p.
+  - ``top_p_first``, ``top_p_min_keep`` (``enable_top_p_first``): HF's order (top-p,
+    then top-k) instead of FlashInfer's, and HF's ``min_tokens_to_keep``.
+
+  ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
+  TTS's first code); declare it the same way on every step of a walk.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -276,45 +287,131 @@ sampling parameters. The engine no longer reads it directly. Pass its result int
    through ``SamplingReqConfig`` are stored in buffers whose addresses do not change
    across replays, so they stay per-request and remain safe under CUDA graphs.
 
+Paged KV layouts
+~~~~~~~~~~~~~~~~
+
+A model with a paged KV pool states, for every request, what its walks write into each
+label of the pool. The KV manager turns that layout into the request's footprint, the most
+pages each label can hold, before the request runs. A model declares its labels once and
+returns each request's layout from ``process_prompt``.
+
+``kv_labels(self) -> dict[str, dict[str, KVLabel]]``
+   Return ``{resource_key: {label: KVLabel}}`` for every label of every paged pool. A
+   :class:`mstar.model.base.KVLabel` has two fields:
+
+   - ``growth``: ``(walk, loop)`` pairs, each a walk that keeps writing after admission,
+     bounded by the named loop. Only a named loop can bound growth, since an unnamed one
+     is renamed in every process.
+   - ``keys``: a :class:`mstar.model.base.PrefixKeys`, or ``None``. See **Cross-request
+     prefix reuse** below.
+
+   A label written only by spans and scratch, such as a guidance branch, is ``KVLabel()``.
+
+``process_prompt`` returns, under ``kv_layout`` in its metadata, a
+:class:`mstar.model.base.LabelLayout` for every label the request opens: the labels its
+``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
+empty where an opened label is never written. It may also name labels the request opens
+only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
+A layout has five fields:
+
+- ``spans``: the committed writes known at intake, in walk order. A
+  :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
+  ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
+  ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
+  node's outputs. ``length`` is the slots the write fills, ``advance`` how far it moves
+  the position counter. A span's ``scratch`` is the most one non-committing step writes
+  before the span commits into those slots, as a window's denoise steps do.
+- ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
+- ``scratch``: the most KV slots one non-committing step writes past the committed length.
+- ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
+- ``keyed_spans``: how many leading spans the label's keys cover, by default every span
+  before the first ``rows`` span.
+
+The footprint adds the spans, the growth at each loop's iterations and the scratch, and
+rounds up to whole pages per label. A span's own scratch counts only with the spans before
+it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
+takes the window's peak instead.
+
+``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
+text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
+
+.. code-block:: python
+
+   layout = LabelLayout(
+       spans=tuple(prompt_spans(prefill_plan(parts), segments, walk, image)),
+       growth=(("decode_loop", 1),),
+   )
+   return ProcessPromptOutput(result, {"kv_layout": {KV_CACHE: {"main": layout}}})
+
+``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
+   The iterations each named loop may run for this request. A loop runs the smaller of its
+   graph ``max_iters`` and its cap, and speculation never runs past it. A model whose stop
+   check ends a loop at a count returns that count, so the cap and the stop check end the
+   loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
+   every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+
+Where ``process_prompt`` computes a length that a walk computes another way, such as a
+media item's rows, the walk asserts the two agree: BAGEL's ViT walk against
+``vit_patches``, Qwen3-Omni's vision encoder against the processor's grid.
+
+Loading fails in three cases, and a request fails in two:
+
+- A paged pool has no labels. The message is ``<Model> declares no labels for its paged
+  pool '<key>'; add them to `kv_labels`, and return each request's layout for them from
+  `process_prompt```. A ring pool needs none.
+- A label's growth or keys name a walk the model never runs. The message is ``<Model>
+  declares '<key>'/'<label>' over ['<walk>'], which it never runs; its walks are [...]``.
+- A label grows on a loop its walk doesn't run. The message is ``<Model> declares
+  '<key>'/'<label>' growing on '<loop>', which '<walk>' doesn't run; its loops are [...]``.
+- A request's layout leaves out a label the request opens, or lays out one the model
+  doesn't declare. The request fails with a 500, ``<Model> returned no kv_layout for
+  '<key>'/'<label>', which the request opens``, or ``<Model> returned a kv_layout for
+  '<key>'/'<label>', which it does not declare``.
+
+A request that takes a page past its footprint logs once per label, with the layout that
+under-counted. A request is held only to the labels it opens, and to no pages on a label
+it doesn't open. A page there logs the same line, reported apart from a real overrun on
+that label so neither hides the other. Under ``MSTAR_KV_DEBUG_ASSERTS=1`` each commit is also
+checked against the layout: the walk that wrote each span, growth past its bound, scratch
+past its declaration and the retention a step declares. At removal, a label left a page
+or more under its footprint logs the most pages it held.
+
 Cross-request prefix reuse
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Two requests that begin with the same tokens fill the same KV pages, and the second can
-attend the pages the first filled instead of recomputing them. A model opts in with two
-methods. Both have defaults, and a model that overrides neither is never cached. The
-deployment switch and the per-request opt-out are described under **Resource overrides**
-in :doc:`serving`.
+attend the pages the first filled instead of recomputing them. A model opts a label in by
+giving it ``keys``, and names its checkpoint. A model with no keyed label is never cached.
+The deployment switch and the per-request opt-out are described under **Resource
+overrides** in :doc:`serving`.
 
-``prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]``
-   Return ``{resource_key: {label: PrefixStream}}``, one entry for each KV cache stream
-   whose pages are keyed. A :class:`mstar.model.base.PrefixStream` has four fields:
+``PrefixKeys(tensor, walks, growth=False)``
+   - ``tensor`` names the request tensor whose entries the layout's ids spans are keyed
+     by, as ``process_prompt`` returns it.
+   - ``walks``: only a write from one of these walks keeps the keys going. A write from
+     another walk ends them, and the rest of the label is computed, never served.
+   - ``growth``: the ids the label's growth walk samples extend the keys, so a later
+     request that re-sends the reply matches it too.
 
-   - ``tensor`` names the request tensor that holds the stream's token ids, as
-     ``process_prompt`` returns it.
-   - ``keyed_by`` is ``"ids"``: each page is keyed by its token ids, chained from the key
-     of the page before it.
-   - ``walk`` names the graph walk that writes the keyed span. Only this walk is probed
-     for a match. If any walk other than ``walk`` and ``decode_walk`` writes into the
-     stream, the stream stops being keyed.
-   - ``decode_walk`` names the walk whose input is the token just sampled, so that the
-     generated tokens are chained onto the prompt's keys and a later request that
-     re-sends the reply matches it too. ``None`` keys the prompt only.
+   The keys cover the label's first ``keyed_spans`` spans. An ids span is keyed by its
+   token ids, a digest span by its file.
 
-   BAGEL keys the text walk of its LLM and the decode that follows it:
+   BAGEL keys its text and ViT walks and the decode that follows them:
 
    .. code-block:: python
 
-      return {"kv": {"main": PrefixStream(
-          "text_inputs", "ids", "prefill_text", "decode",
+      return {"kv": {"main": KVLabel(
+          growth=((DECODE, "decode_loop"),),
+          keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vit"), growth=True),
+      ), ...}}
+
+   Orpheus keys its prompt walk:
+
+   .. code-block:: python
+
+      return {KV_CACHE: {"main": KVLabel(
+          growth=(("decode", "decode_loop"),), keys=PrefixKeys("text_inputs", ("prefill",)),
       )}}
-
-   Orpheus keys its prompt walk and its decode walk:
-
-   .. code-block:: python
-
-      return {
-          KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
-      }
 
 ``checkpoint_path(self) -> str | None``
    Return the local directory that holds the weights and ``config.json``. The cache
@@ -324,7 +421,7 @@ in :doc:`serving`.
    checkpoint therefore needs ``prefix_cache_salt`` set to use the cache at all. Without
    one, the engine keeps the cache shut and logs why.
 
-A model that declares a stream is checked at load time. Loading fails in three cases:
+A model with a keyed label is checked at load time. Loading fails in two more cases:
 
 - A position resource over a keyed cache uses a scheme other than sequential. A page is
   reusable only where its tokens land at the positions they were written at. The message
@@ -336,16 +433,15 @@ A model that declares a stream is checked at load time. Loading fails in three c
   those tokens. The message is ``resource '<key>' cannot serve a request whose prefix
   came from the cache, but it sits on ['<node>'], which the model keyed for prefix
   reuse; either drop the stream or give the resource the prefix hooks``.
-- A stream names a walk that the model does not run. The message is ``<Model> keys
-  '<resource key>'/'<label>' on ['<walk>'], which it never runs; its walks are [...]``.
 
-Some requests stay uncached even when the model declares a stream. The engine checks each
+Some requests stay uncached even when the model keys a label. The engine checks each
 request's inputs on the keyed walk and cuts a prefix only from inputs that the default
 ``split_inputs`` can slice. A request whose inputs carry ``tensor_inputs``, ``kwargs`` or
 ``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
-there. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
-keyed over its leading text only. A stream under a sliding window files pages only up to
-its protected prefix, which the window never releases.
+there. BAGEL keys an understanding prompt's text and images, and a generation's first
+span when it is text: an edit's images are resized before their walks see them, and a
+file's digest doesn't cover the resize. A label under a sliding window files pages only
+up to its protected prefix, which the window never releases.
 
 .. _Step 2a — Declare your resources:
 
@@ -427,6 +523,10 @@ The spec types are:
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
        between spans`_.
+   * - ``RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...), block_size=...)``
+     - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
+       between ``block_size``-token blocks, bidirectional within one. Same config. See
+       `Block-causal attention within spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -440,6 +540,9 @@ The spec types are:
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
+       ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
+       ``enable_top_p_first`` are capabilities of the same kind. See
+       ``SamplingReqConfig`` above.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -656,6 +759,21 @@ request's ``kv_label`` span; cross-attention is never causal. A layer attends th
 span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
+
+Block-causal attention within spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A Whisper-style encoder trained for streaming masks attention by chunk: a frame in chunk
+``b`` sees every frame of chunks ``0..b`` and nothing later. Declare it as a
+``RaggedBlockCausalAttentionSpec`` with the chunk length as ``block_size``, and step it like
+any ragged self-attention, one segment per independently attending span, with
+``AttentionStep(causal=False)``. Blocks are counted from each span's start, so a span need
+not be a multiple of ``block_size``.
+
+The prefixes overlap, which a ragged layout cannot express, so this kind runs FlashInfer's
+paged prefill over the packed keys viewed as one-token pages, each query block listing its
+prefix; nothing is copied. Under a captured graph the block count and page list are sized
+for the worst layout the bucket's token count allows.
 
 .. note::
 
@@ -1217,6 +1335,13 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   argument. The region still declares, plans and commits its own work. The lease only
   tells the outer declaration which resources are already taken, so that it can exclude
   them.
+- ``can_lease`` has signature ``(inputs: list[NodeInputs]) -> bool``. It applies only with
+  ``lease_before_step``, and lets the region refuse a batch for a limit that the
+  capture bucket key doesn't express, such as Qwen3.5's per-request segment count. The
+  engine then gives the region no lease for that step. Your forward must replay only
+  when the region was leased, for example when the outer step is ``None``, and not
+  whenever ``runner.can_run`` is true: a refused batch can still fit a bucket, and
+  replaying it would declare the region's resources twice.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
@@ -1890,7 +2015,8 @@ Checklist
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
-         [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
+         [ ] kv_labels, kv_layout from process_prompt (+ get_loop_caps) — with a paged KV pool
+         [ ] (optional) keys on a KVLabel + checkpoint_path — cross-request prefix reuse
    [ ] mstar/model/registry.py                    — (module_path, class_name) in MODEL_REGISTRY
          [ ] HF_MODELS too, if weights come from Hugging Face
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)

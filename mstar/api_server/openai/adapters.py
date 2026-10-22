@@ -141,7 +141,7 @@ def flatten_messages(
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
                     add_file(mod or "video", path)
-            elif ptype == "audio_url":  # data:/http audio input (vllm-omni content style)
+            elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
                 url = (part.get("audio_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
@@ -434,7 +434,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """Qwen3.5: text-and-image chat, text out.
+    """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
@@ -565,7 +565,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
-        # the server allows it) or bare base64 (vLLM-Omni's field). It becomes the
+        # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
         # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
         # voices come with the shared voice registry (engine/voice-registry).
@@ -808,8 +808,9 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
-        # ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;
-        # accept it alongside a flat ``enable_thinking``.
+        # Clients written for the Edge model's serving recipe toggle thinking
+        # through ``chat_template_kwargs``; accept it alongside a flat
+        # ``enable_thinking``.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
             mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))

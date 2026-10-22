@@ -68,7 +68,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -874,6 +874,15 @@ class Qwen3TTSModel(Model):
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+        from mstar.model.qwen3_tts.submodules import prefill_rows
+
+        # a clone's x-vector takes the speaker row
+        clone = "audio" in input_modalities
+        rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
+        metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(
+            spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
+            growth=(("talker_decode_loop", 1),),
+        )}}
         return ProcessPromptOutput(
             {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
         )
@@ -1081,6 +1090,13 @@ class Qwen3TTSModel(Model):
 
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens() + 1
+
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {TALKER_KV: {"main": KVLabel(growth=(("talker_decode", "talker_decode_loop"),))}}
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.output_sample_rate

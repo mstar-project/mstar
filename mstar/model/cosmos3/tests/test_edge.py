@@ -595,7 +595,7 @@ def test_edge_reasoner_video_prompt() -> None:
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0, "num_frames": 30}]},
         enable_thinking=False,
-    )
+    ).new_input_tensors
     ids = out["text_inputs"][0]
     grid = out["vision_grid_thw"][0]
     assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
@@ -616,7 +616,7 @@ def test_edge_reasoner_video_prompt() -> None:
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
-    )
+    ).new_input_tensors
     assert int(out2["vision_grid_thw"][0][0, 0]) == 4
 
 

@@ -326,7 +326,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.enable_nvtx = False
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched = False
+    w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
@@ -404,9 +404,9 @@ def test_prefix_lookups_count_each_request_once_through_the_engines_probe():
     m = _metrics(eng)
     prompt = list(range(100))
     keys = _seed(kv, prompt)
-    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     other = _keys(list(range(1000, 1100)))
-    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, prefix_layout=_layout(100)))
+    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, kv_layout=_layout(100)))
     assert _prefix(m) == ({}, {})
 
     batch = _prepare(eng, PREFILL, hit=100, miss=100)
@@ -467,15 +467,15 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
     eng = _engine([kv], keyed=True)
     m = _metrics(eng, counting=False)
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("warmup-0", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("warmup-0", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     _prepare(eng, PREFILL, **{"warmup-0": 100})
     assert _prefix(m) == ({}, {})
 
     m.start_counting()
     assert _prefix(m) == ({(NODE,): 0}, {(NODE,): 0})
     other = _keys(list(range(1000, 1100)))
-    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, prefix_layout=_layout(100)))
-    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, kv_layout=_layout(100)))
+    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     _prepare(eng, PREFILL, miss=100, hit=100)
     assert _prefix(m) == ({(NODE,): 200}, {(NODE,): 96})
 
@@ -592,7 +592,7 @@ def test_pending_rows_are_the_backlog_and_the_ready_rows_not_in_a_step():
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 4
 
     sched.fail_rids({"r2"})
-    sched.pending_removes.add("r5")
+    sched.pending_removes["r5"] = None
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 2
 
 

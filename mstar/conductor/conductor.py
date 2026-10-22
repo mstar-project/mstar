@@ -32,6 +32,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -596,14 +597,14 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
 
-        A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        A KV resource with declared labels gets a config even when the model
+        returned none, or its keys and layout would have nowhere to go.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        for key, streams in self.model.prefix_key_streams().items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        for key, labels in self._kv_labels.items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
 
     def _derive_worker_info(self):
@@ -640,6 +641,13 @@ class Conductor:
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
+        self._loop_max_iters: dict[str, int] = {}
+        for worker_graph in self.worker_graphs.values():
+            for name, loop in worker_graph.section.get_loops().items():
+                self._loop_max_iters[name] = max(loop.max_iters, self._loop_max_iters.get(name, 0))
+        self._kv_labels: dict[str, tuple[str, ...]] = {
+            key: tuple(labels) for key, labels in self.model.kv_labels().items()
         }
 
         # set each group's _tp_rank (the worker's instance rank) per worker
@@ -1107,6 +1115,10 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
+        caps = self.model.get_loop_caps(**model_kwargs)
+        # Rust's graph runtime holds a cap as a u32, so an unclamped cap from a large
+        # max_output_tokens would fail the request there but not in Python.
+        loop_caps = {name: min(n, caps.get(name, n)) for name, n in self._loop_max_iters.items()}
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
@@ -1199,8 +1211,9 @@ class Conductor:
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        kv_layout = kwargs.get("kv_layout") or {}
+        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
@@ -1208,8 +1221,9 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
-                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
+                kv_layout=kv_layout.get(key),
+                loop_caps=loop_caps,
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
@@ -1237,6 +1251,7 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
+                    loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
@@ -1255,6 +1270,8 @@ class Conductor:
                         body=message,
                     ),
                 )
+
+        request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.

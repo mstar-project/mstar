@@ -95,7 +95,7 @@ def _worker():
     w._pending_drains = set()
     w._reads_done_sent = set()
     w._in_flight_rids = set()
-    w._pending_removes = set()
+    w._pending_removes = {}
     w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
@@ -113,6 +113,7 @@ def _new_request(request_id="r1"):
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers={WG_ID: [WORKER]},
         initial_inputs=[],
+        loop_caps={},
     )
 
 

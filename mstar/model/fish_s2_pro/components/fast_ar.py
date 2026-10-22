@@ -3,8 +3,8 @@
 After the Slow AR samples a frame's semantic code, this 4-layer decoder runs
 along the codebook axis of that frame: position 0 is the Slow AR's final
 hidden state, position ``i`` the embedding of codebook ``i - 1``'s code, and
-the head at positions 1..9 picks codebooks 1..9 by argmax, as SGLang-Omni's
-S2-Pro path does. Its KV cache is frame-local scratch, overwritten every
+the head at positions 1..9 picks codebooks 1..9 by argmax, as the S2-Pro
+serving recipe does (see ``FishGenerationConfig``). Its KV cache is frame-local scratch, overwritten every
 frame, so the whole loop is fixed-shape tensor code that a decode CUDA graph
 captures as is (the Qwen3-TTS CodePredictor pattern).
 

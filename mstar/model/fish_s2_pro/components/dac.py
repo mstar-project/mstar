@@ -541,7 +541,9 @@ def _fold_weight_norm(state: dict[str, torch.Tensor]) -> Iterator[tuple[str, tor
             yield name, tensor
 
 
-# Two bf16 steps at |x| near 1; a wrong rope base or length is off by far more.
+# An absolute bound: four bf16 steps for |x| in [0.5, 1), and more steps for
+# smaller values (the bf16 step halves with each halving of |x|). A 1% change
+# of the rope base already moves some entries by more than 1.
 _ROPE_TABLE_ATOL = 2.0**-6
 
 
@@ -563,12 +565,18 @@ def load_codec_state(module: nn.Module, state: dict[str, torch.Tensor], prefixes
             continue
         if name.endswith(".freqs_cis"):
             own = buffers.get(name)
-            if (
-                own is None
-                or own.shape != tensor.shape
-                or (own.detach().cpu().float() - tensor.float()).abs().max() > _ROPE_TABLE_ATOL
-            ):
-                raise RuntimeError(f"Fish codec RoPE table {name} differs from the reference table")
+            if own is None:
+                raise RuntimeError(f"Fish codec RoPE table {name} has no place in this port")
+            if own.shape != tensor.shape:
+                raise RuntimeError(
+                    f"Fish codec RoPE table {name}: checkpoint {tuple(tensor.shape)} vs {tuple(own.shape)}"
+                )
+            gap = (own.detach().cpu().float() - tensor.float()).abs().max().item()
+            if gap > _ROPE_TABLE_ATOL:
+                raise RuntimeError(
+                    f"Fish codec RoPE table {name} differs from the checkpoint's by up to {gap:.3g}; "
+                    f"the tolerance is {_ROPE_TABLE_ATOL:g}"
+                )
             with torch.no_grad():
                 own.copy_(tensor.to(dtype=own.dtype))
             continue

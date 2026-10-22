@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -85,7 +85,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
             tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
         ])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 
 

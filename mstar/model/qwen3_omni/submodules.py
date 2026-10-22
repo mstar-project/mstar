@@ -81,6 +81,27 @@ def _accepts_kwarg(fn: Any, name: str) -> bool:
     )
 
 
+def talker_text_mask(input_ids: torch.Tensor, config: Qwen3OmniModelConfig) -> torch.Tensor:
+    """
+    Cut system prompt and previous assistant parts out of the talker input
+    """
+    im_start_indexes = (
+        input_ids == config.im_start_token_id
+    ).nonzero(as_tuple=True)[0]
+    mask = torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+
+    for i in range(len(im_start_indexes) - 1):
+        im_start_index = im_start_indexes[i]
+        segment_end_index = im_start_indexes[i + 1]
+        role_token = input_ids[im_start_index + 1]
+        # Talker should ignore thinker system prompt
+        if role_token == config.system_token_id:
+            mask[im_start_index:segment_end_index] = 0
+        elif role_token == config.assistant_token_id:
+            mask[im_start_index:segment_end_index] = 0
+    return mask
+
+
 # ===================================================================
 # 1. AudioEncoderSubmodule (enc_dec engine)
 # ===================================================================
@@ -321,26 +342,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
         return self._decode_thinker_mask
 
-    def _get_talker_text_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Cut system prompt and previous assistant parts out of the talker input
-        """
-        im_start_indexes = (
-            input_ids == self.config.im_start_token_id
-        ).nonzero(as_tuple=True)[0]
-        mask = torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
-
-        for i in range(len(im_start_indexes) - 1):
-            im_start_index = im_start_indexes[i]
-            segment_end_index = im_start_indexes[i + 1]
-            role_token = input_ids[im_start_index + 1]
-            # Talker should ignore thinker system prompt
-            if role_token == self.config.system_token_id:
-                mask[im_start_index:segment_end_index] = 0
-            elif role_token == self.config.assistant_token_id:
-                mask[im_start_index:segment_end_index] = 0
-        return mask
-
     def _wrap_audio_input(self, audio_embeds: torch.Tensor):
         # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
         # sentinel token embeddings so the Thinker sees the same
@@ -437,7 +438,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
-                self._get_talker_text_mask(text_ids) # text inclusion
+                talker_text_mask(text_ids, self.config) # text inclusion
             ])
             return ARNodeInputs(
                 input_seq_len=seq_len,
@@ -507,6 +508,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # ``image_grid_thw`` is available, use ``get_rope_index_vision``;
             # otherwise fall back to a 1-D sequence (test path)
             grid_thw = inputs.get("image_grid_thw", [None])[0]
+            assert vision_len == int(grid_thw.prod()) // self.config.vision.spatial_merge_size ** 2, (
+                f"the vision encoder gave {vision_len} rows, where the layout counts the grid's merged patches"
+            )
             seconds_per_grid = inputs.get("video_second_per_grid", [])
             seconds_per_grid = seconds_per_grid[0].item() if seconds_per_grid else None
             vision_pos_ids = get_rope_index_vision(
@@ -1248,7 +1252,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _get_last_prefill_talker_hidden(
         self, thinker_hidden: torch.Tensor
     ):
-        # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
+        # Build assistant prefix (matching the HF pattern):
         # Text hidden: [pad*4, bos, proj[3]] (9 tokens)
         # (note that the assistant prefix was handled in the previous prefill stage)
 
@@ -1267,7 +1271,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _get_last_prefill_codec_hidden(
         self, speaker: str
     ):
-        # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
+        # Build assistant prefix (matching the HF pattern):
         # Codec hidden: [codec_embed(nothink, think_bos, think_eos,
         #                speaker, pad, bos)] (9 tokens)
         tc = self.config.talker
