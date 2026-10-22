@@ -13,7 +13,6 @@ from mstar.model.glm52.components.language_model import (
     build_rmsnorm,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
 
 class Glm52LanguageModel(nn.Module):
@@ -38,18 +37,15 @@ class Glm52LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
-        """``dsa_ctx`` (engine DSA threading, None when dsa_long_context is
-        off): layer order IS the IndexShare order — each FULL layer
-        overwrites ``dsa_ctx.last_selection`` and the SHARED layers between
-        it and the next FULL layer consume that value.
-        """
+        """Layer order IS the IndexShare order under dsa_long_context: each FULL
+        layer's pick is the one the SHARED layers after it reuse, until the next
+        FULL layer (the DSA resource keeps it for the forward)."""
         hidden_states = self.embed_tokens(input_ids)
         rope_cos_sin = self.rotary.cos_sin(position_ids)
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
-                hidden_states, position_ids, dsa_ctx=dsa_ctx, rope_cos_sin=rope_cos_sin,
+                hidden_states, position_ids, rope_cos_sin=rope_cos_sin,
             )
         return self.norm(hidden_states)
 
