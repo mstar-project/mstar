@@ -6,7 +6,9 @@ Requirements
 
 - **Python 3.12+**.
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families. A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
+  families, or **Intel GPUs with XPU PyTorch** for BAGEL
+  (see `Using Docker image on Intel GPU`_).
+  A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
   (submodules return ``None``) for development and the modular tests, but not real model
   inference.
 - Enough GPU memory for the model you intend to serve — several families (e.g.
@@ -55,8 +57,9 @@ console scripts, ``mstar`` and ``mstar-serve``.
 
 .. important::
 
-   **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.9
-   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``). The flag tells 
+   **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
+   PyTorch at 2.9 (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``).
+   The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
    compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
@@ -64,6 +67,38 @@ console scripts, ``mstar`` and ``mstar-serve``.
    Without the flag ``uv`` installs PyPI's default (cu128) build. You can set it once
    with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
    CUDA toolkit`_ for details and the manual fallback.
+
+Using Docker image on Intel GPU
+-------------------------------
+
+Build the image using ``docker/Dockerfile.xpu``:
+
+.. code-block:: bash
+
+   git clone https://github.com/mstar-project/mstar.git
+   cd mstar
+   docker build -t mstar:xpu - < docker/Dockerfile.xpu
+
+
+The host must have a working Intel GPU driver and expose ``/dev/dri``. Run an
+interactive shell and check GPU access:
+
+.. code-block:: bash
+
+   docker run --rm -it --device=/dev/dri --ipc=host \
+     -v /dev/dri/by-path:/dev/dri/by-path:ro \
+     -p 8000:8000 \
+     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     mstar:xpu
+   python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
+one for the encoders and decoder, and two for the LLM.
+
+.. code-block:: bash
+
+   cd /mstar-workspace/mstar
+   mstar serve bagel --config configs/bagel_xpu_tp2.yaml
 
 Optional dependencies
 ---------------------
@@ -92,6 +127,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[fish_s2_pro]``
+     - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
    * - ``.[omnivoice]``
      - OmniVoice TTS. The extra is empty on purpose: the runtime is the
        ``omnivoice`` package, installed separately from git —
@@ -488,6 +526,15 @@ keeping preprocessing and the conductor protocol. Build and opt in:
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 ``$PATH`` / the in-repo build. Its knobs are listed in
 :doc:`environment_variables`.
+
+The OpenAI routes take the model's adapter from the same registry as the Python
+frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
+``mstar-server`` ports adapter classes, not model names, so every model of a
+ported class is served. Chat is served for every model the Python frontend serves
+it for. Some speech, image and video adapters, and the transcription and realtime
+routes, are not ported yet (``NOT_PORTED`` in
+``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
+logs a warning at startup, and ``/generate`` still works.
 
 Troubleshooting
 ---------------

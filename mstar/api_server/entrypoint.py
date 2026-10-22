@@ -1715,18 +1715,16 @@ def _ws_modalities(value, key: str) -> list[str] | None:
     raise ValueError(f"{key} must be a comma-separated string or a list of strings")
 
 
-def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
+def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
+    if file_paths:
+        media_io.remove_uploads(file_paths, api_server.upload_dir)
+
+
+def _schedule_upload_cleanup(file_paths: dict[str, list[str]]) -> None:
     """Delete a request's uploaded files once the preprocess worker has had
     time to read them. Shared by the HTTP and WebSocket routes."""
-    def _cleanup(paths: dict[str, list[str]]) -> None:
-        time.sleep(delay_s)
-        for ps in paths.values():
-            for p in ps:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError:
-                    pass
-    threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
+    if file_paths:
+        media_io.schedule_upload_cleanup(file_paths, api_server.upload_dir)
 
 
 def _ws_input_layout(
@@ -1815,6 +1813,11 @@ def _ws_file_streams(
     return streams
 
 
+def _pass_turn(turn: asyncio.Future) -> None:
+    if not turn.done():
+        turn.set_result(None)
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
@@ -1831,7 +1834,8 @@ async def generate_ws(websocket: WebSocket):
     for a ``request_id`` still in flight, as on ``/generate``); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
-    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    and the ``request_id`` tells the replies apart. They are submitted in the
+    order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
 
     A request to a model with client streams keeps its input open until the
@@ -1857,6 +1861,8 @@ async def generate_ws(websocket: WebSocket):
     # submission key once it is submitted, None if it never was. The task
     # serving a call is handed its entry and removes it when the call ends.
     live: dict[str, asyncio.Future] = {}
+    # each live call's latest append task; the next one waits for it
+    appends: dict[str, asyncio.Task] = {}
     # keys of requests this socket submitted that haven't finished: aborted if
     # it closes
     submitted: set[str] = set()
@@ -1885,7 +1891,13 @@ async def generate_ws(websocket: WebSocket):
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def serve_one(message: dict, binary: bool, call: asyncio.Future | None) -> None:
+    async def serve_one(
+        message: dict, binary: bool, call: asyncio.Future | None,
+        after: asyncio.Future | None, turn: asyncio.Future,
+    ) -> None:
+        """``call`` is the message's entry in ``live`` when it opens a live
+        call. ``after`` is done once the message before this one was submitted
+        or refused; ``turn`` is this message's, for the one after it."""
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
         key: str | None = None
@@ -1905,6 +1917,10 @@ async def generate_ws(websocket: WebSocket):
                 text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
             )
             model_kwargs = _ws_model_kwargs(message.get("model_kwargs"))
+            # Messages decode side by side but are submitted in the order they
+            # were sent; a message that decodes faster waits here.
+            if after is not None:
+                await asyncio.shield(after)
             await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
@@ -1922,6 +1938,7 @@ async def generate_ws(websocket: WebSocket):
             submitted.add(key)
             if call is not None:
                 call.set_result(key)
+            _pass_turn(turn)
             # Closing the socket cancels this task; the receive loop's
             # ``finally`` then aborts what the socket submitted.
             failed = False
@@ -1948,7 +1965,7 @@ async def generate_ws(websocket: WebSocket):
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
             if call is not None and not call.done():
                 # before the send, which can wait on the socket: the call's
-                # appends wait on this in the receive loop
+                # appends wait on this
                 call.set_result(None)
             payload = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
@@ -1970,16 +1987,26 @@ async def generate_ws(websocket: WebSocket):
                 if not call.done():
                     call.set_result(None)
                 del live[request_id]
+                appends.pop(request_id, None)
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
+            if not turn.done():
+                # refused: the next message still waits for the ones before this one
+                if after is None:
+                    _pass_turn(turn)
+                else:
+                    after.add_done_callback(lambda _: _pass_turn(turn))
 
-    async def append_one(message: dict, binary: bool) -> None:
-        """Feed an append to a call's client streams, in arrival order. A bad
-        append ends the call: the audio it carried is lost to it."""
+    async def append_one(message: dict, binary: bool, before: asyncio.Task | None) -> None:
+        """Feed an append to a call's client streams, after ``before``, the
+        call's previous append. A bad append ends the call: the audio it
+        carried is lost to it."""
         request_id = message["request_id"]
         file_paths: dict[str, list[str]] | None = None
         late = {"request_id": request_id, "append": True,
                 "error": f"request {request_id!r} is not taking input"}
+        if before is not None:
+            await asyncio.wait([before])
         # in order behind the call's own submission, which may still be running
         key = await live[request_id]
         # checked before decoding, so a bad append to a call that has ended is
@@ -2028,6 +2055,7 @@ async def generate_ws(websocket: WebSocket):
         finally:
             unlink_files(file_paths)
 
+    previous_turn: asyncio.Future | None = None
     try:
         while True:
             frame = await websocket.receive()
@@ -2056,7 +2084,13 @@ async def generate_ws(websocket: WebSocket):
                     reply({"request_id": request_id, "append": True,
                            "error": f"request {request_id!r} is not taking input on this socket"}, binary)
                     continue
-                await append_one(message, binary)
+                # A task per append, chained per call: awaited here, an append
+                # whose call waits its turn to submit would hold up reading
+                # every other call's.
+                task = asyncio.create_task(append_one(message, binary, appends.get(request_id)))
+                appends[request_id] = task
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
                 continue
             if request_id in live:
                 # refused as any id in flight is, and the call goes on
@@ -2070,7 +2104,9 @@ async def generate_ws(websocket: WebSocket):
                     reply({"request_id": None, "error": "a live call needs a request_id"}, binary)
                     continue
                 call = live[request_id] = asyncio.get_running_loop().create_future()
-            task = asyncio.create_task(serve_one(message, binary, call))
+            turn = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(serve_one(message, binary, call, previous_turn, turn))
+            previous_turn = turn
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     except WebSocketDisconnect:
@@ -2142,6 +2178,9 @@ async def generate(
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
+                # a refused request is never submitted, so the deferred cleanup
+                # below never sees what it saved
+                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
@@ -2178,6 +2217,7 @@ async def generate(
         in_mods = [p.modality for p in parts]
 
     if "video_frame" in in_mods:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="'video_frame' is an output-only modality",
@@ -2186,12 +2226,14 @@ async def generate(
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
     except json.JSONDecodeError as e:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be valid JSON",
         ) from e
 
     if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be a JSON object",

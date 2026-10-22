@@ -98,8 +98,9 @@ was accepted ends with one such reply. Both carry the HTTP ``status`` when there
 (``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
-``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
-flight.
+``request_id`` tells the replies apart. Pipelined messages are submitted in the order
+they were sent, so of two under one ``request_id`` it is the later one that gets the
+``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
 
 .. code-block:: python
 

@@ -2,7 +2,8 @@
 """Label PRs by the areas they touch (area/*, model/*) and their size (size/*).
 
 Run by .github/workflows/pr-labels.yml with the default branch checked out;
-reads only the PR's file list through the API, never its code. Locally:
+reads only the PR's file list through the API (for a stacked PR, its diff
+against the PR it is stacked on), never its code. Locally:
 
     python3 .github/labels/label_prs.py --repo mstar-project/mstar --all --dry-run
 
@@ -32,6 +33,7 @@ AREAS = [
     ("mstar/cli/", "area/api"),
     ("mstar/conductor/", "area/conductor"),
     ("mstar/graph/", "area/graph"),
+    ("mstar/worker/worker_metrics.py", ("area/observability", "area/worker")),
     ("mstar/worker/", "area/worker"),
     ("mstar/streaming/", "area/worker"),
     ("mstar/communication/", "area/transport"),
@@ -41,18 +43,29 @@ AREAS = [
     ("mstar/distributed/", "area/distributed"),
     ("mstar/observability/", "area/observability"),
     ("mstar/profile/", "area/observability"),
-    # GPU kernels models build on; the rest of utils/ is engine plumbing.
+    ("mstar/validation/", "area/conductor"),
+    # GPU kernels models build on.
     ("mstar/utils/adarms_norm.py", "area/model-shared"),
     ("mstar/utils/attention.py", "area/model-shared"),
     ("mstar/utils/causal_conv1d/", "area/model-shared"),
     ("mstar/utils/fused_moe/", "area/model-shared"),
-    ("mstar/utils/", "area/engine"),
+    # The messages to and from workers.
+    ("mstar/utils/ipc_format.py", "area/worker"),
+    # Helpers for the API server and the Rust frontend.
+    ("mstar/utils/client_errors.py", "area/api"),
+    ("mstar/utils/runtime_dir.py", "area/api"),
+    ("mstar/utils/socket_prefix.py", "area/api"),
+    ("mstar/utils/utf8_stream.py", "area/api"),
+    ("mstar/utils/profiler.py", "area/observability"),
+    # The rest are shared by several layers, so they name none of them.
+    ("mstar/utils/", "area/utils"),
     # The model API (base.py, registry.py, ...) and components/ and loader/.
     ("mstar/model/", "area/model-shared"),
     ("mstar/integrations/", "area/integrations"),
     ("mstar/default_configs/", "area/infra"),
     # The Rust frontend, graph runtime and transport mirror their Python
     # counterparts and change with them (AGENTS.md invariant 5).
+    ("rust/server/Cargo.lock", "area/infra"),
     ("rust/server/", ("area/rust", "area/api")),
     ("rust/src/graph/", ("area/rust", "area/graph")),
     ("rust/src/communicator.rs", ("area/rust", "area/transport")),
@@ -83,7 +96,7 @@ AREAS = [
     ("test/", "area/tests"),
 ]
 # Lockfiles say nothing about review effort, so they don't count toward size.
-NOT_SIZED = ("uv.lock", "rust/Cargo.lock")
+NOT_SIZED = ("uv.lock", "rust/Cargo.lock", "rust/server/Cargo.lock")
 
 # A layer (area/*) needs this many changed lines, so a one-line touch doesn't
 # label a PR with every layer it brushed against. Any change to a model's code
@@ -112,6 +125,13 @@ COLORS = {"area/": "1d76db", "model/": "5319e7", "size/": "c5def5"}
 # `MODEL_REGISTRY["<key>"] = ("mstar.model.<folder>...`, so a config named after
 # a registry key (qwen3_8_27b_tp4.yaml) finds its model folder.
 REGISTRY_ENTRY = re.compile(r'"([\w.-]+)"\]?\s*[:=]\s*\(\s*"mstar\.model\.(\w+)\.')
+
+# A stacked PR from a fork targets main, since it can't target its parent's
+# branch, and says "Stacked on #N" before its body's first heading or toggle.
+STACKED_ON = re.compile(r"\bstacked on #(\d+)", re.IGNORECASE)
+BODY_SECTION = re.compile(r"^\s*(?:#{1,6}\s|<details)", re.MULTILINE)
+# The compare API lists at most this many files.
+COMPARE_MAX_FILES = 300
 
 
 def gh(*args, data=None):
@@ -145,6 +165,9 @@ def model_of_config(path, aliases):
 
 
 def areas_of(path, aliases):
+    # Tests kept next to the code they test (mstar/model/<name>/tests/) are tests.
+    if "/tests/" in path:
+        return ("area/tests",)
     if path.startswith("mstar/model/"):
         parts = path.split("/")
         if len(parts) > 3 and parts[2] not in ("components", "loader"):
@@ -219,6 +242,52 @@ def model_aliases(repo_root, files):
     return aliases
 
 
+def stacked_on(body, number):
+    """The PR named by "Stacked on #N" in the body's opening lines, or None."""
+    lead = BODY_SECTION.split(body or "", maxsplit=1)[0]
+    m = STACKED_ON.search(lead)
+    return int(m.group(1)) if m and int(m.group(1)) != number else None
+
+
+def stacked_files(repo, pr, files, open_prs):
+    """The files a stacked PR's own commits change, or None to use its file list.
+
+    Its file list against main carries its parent's changes too; its head
+    against the parent's head leaves only its own. None when the PR isn't
+    stacked, the parent is closed or merged, the compare fails or may be cut
+    off, or the compare lists a file the PR doesn't change, as it does when the
+    head isn't built on the parent's history (a wrong number, or a child
+    rebased onto a newer main than its parent). A push to the parent doesn't
+    relabel the child; the child's next push or a manual run does.
+
+    open_prs maps number to PR for every open PR (--all), or is None to look
+    the parent up.
+    """
+    parent = stacked_on(pr["body"], pr["number"])
+    if parent is None:
+        return None
+    try:
+        if open_prs is None:
+            parent_pr = json.loads(gh("api", f"repos/{repo}/pulls/{parent}"))
+        else:
+            parent_pr = open_prs.get(parent)
+        if not parent_pr or parent_pr["state"] != "open":
+            return None
+        # Only the first page of a compare lists the files; per_page only
+        # pages the commits.
+        cmp = json.loads(gh("api", f"repos/{repo}/compare/{parent_pr['head']['sha']}"
+                                   f"...{pr['head']['sha']}?per_page=1"))
+    except RuntimeError as e:
+        print(f"#{pr['number']}: sized against main, not #{parent}: {e}", file=sys.stderr)
+        return None
+    own = cmp.get("files") or []
+    if not own or len(own) >= COMPARE_MAX_FILES:
+        return None
+    if not {f["filename"] for f in own} <= {f["filename"] for f in files}:
+        return None
+    return own
+
+
 def sync(repo, number, wanted, current, existing, dry_run):
     managed = {lb for lb in current if lb.startswith(MANAGED)}
     add, remove = sorted(wanted - managed), sorted(managed - wanted)
@@ -249,17 +318,19 @@ def main():
 
     if a.all:
         pulls = gh_pages(f"repos/{a.repo}/pulls?state=open&per_page=100")
-        targets = [(p["number"], [lb["name"] for lb in p["labels"]]) for p in pulls]
+        open_prs = {p["number"]: p for p in pulls}
     else:
-        targets = [(n, [lb["name"] for lb in json.loads(gh("api", f"repos/{a.repo}/issues/{n}"))["labels"]])
-                   for n in a.prs]
+        pulls = [json.loads(gh("api", f"repos/{a.repo}/pulls/{n}")) for n in a.prs]
+        open_prs = None
     existing = set() if a.dry_run else {lb["name"] for lb in gh_pages(f"repos/{a.repo}/labels?per_page=100")}
     failed = 0
-    for number, current in targets:
+    for pr in pulls:
+        number = pr["number"]
         try:
             files = gh_pages(f"repos/{a.repo}/pulls/{number}/files?per_page=100")
-            sync(a.repo, number, labels_for(files, model_aliases(a.root, files)),
-                 set(current), existing, a.dry_run)
+            own = stacked_files(a.repo, pr, files, open_prs) or files
+            sync(a.repo, number, labels_for(own, model_aliases(a.root, files)),
+                 {lb["name"] for lb in pr["labels"]}, existing, a.dry_run)
         except RuntimeError as e:
             print(f"#{number}: {e}", file=sys.stderr)
             failed += 1
