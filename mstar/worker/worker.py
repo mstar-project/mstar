@@ -599,9 +599,10 @@ class Worker:
         # from _process_messages on any iter — reads/writes them.
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
         #   speculation; REMOVE_REQUEST for these is deferred.
-        # _pending_removes: deferred REMOVE_REQUESTs.
+        # _pending_removes: deferred REMOVE_REQUESTs, in the order they were
+        #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
-        self._pending_removes: set[int] = set()
+        self._pending_removes: dict[int, None] = {}
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
@@ -877,6 +878,11 @@ class Worker:
                     body.after_tp_seq, []
                 ).append(body.request_id)
                 return
+            if body.source == MessageSource.TP_RANK_0:
+                # Removals held above came from rank 0 before this one, so the ones
+                # whose step has landed go first. The free list hands pages back out
+                # in the order they were freed.
+                self._apply_removes_whose_step_landed()
 
         # Async-scheduling deferral: if this rid is currently held by an
         # in-flight GPU step (or its speculation), tearing down engine /
@@ -892,8 +898,14 @@ class Worker:
             # later message would ever pop it.
             self.scheduler.clear_wire_rid(body.request_id)
             return
-        if request_id in self._in_flight_rids:
-            self._pending_removes.add(request_id)
+        # A follower tears down in rank 0's order, so never ahead of one it deferred
+        # earlier.
+        behind = (
+            self.is_tp_follower
+            and next(iter(self._pending_removes), request_id) != request_id
+        )
+        if request_id in self._in_flight_rids or behind:
+            self._pending_removes.setdefault(request_id)
             return
 
         # If we are the TP leader for this request, signal the followers to
@@ -939,7 +951,7 @@ class Worker:
         self.profile_info.pop_request(request_id)
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
-        self._pending_removes.discard(request_id)
+        self._pending_removes.pop(request_id, None)
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
@@ -2125,8 +2137,9 @@ class Worker:
         # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
         # the rid's own count is, or failed) has no step to retry: on success
         # the routing drops it too. Re-queued, it would run again with its
-        # loop-back inputs already spent.
-        prepared = set(node_batch.request_ids)
+        # loop-back inputs already spent. A row the cache served is retried,
+        # because its walk completes only on a step that runs.
+        prepared = set(node_batch.request_ids) | node_batch.cached_rids
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)
@@ -2212,10 +2225,11 @@ class Worker:
         # rid torn down here cannot be pushed onto queues that have just been dismantled.
         self._apply_removes_whose_step_landed()
 
-        # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
-        # so no forward ran and its own pages are fair game. Empty in practice —
+        # ``referenced_rids``: what a speculation still touches. Empty in practice —
         # nothing is speculated on a refusal — so it only guards a future caller
-        # that broadcasts something here.
+        # that broadcasts something here. This step's own rids stay in
+        # ``_in_flight_rids`` until the loop clears the pending step, and their
+        # removals wait for that.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
         if self._is_tp_follower_node(batch.node_name):
@@ -3203,7 +3217,7 @@ class Worker:
             # stopping one would finalize state the drop just removed
             for rid in failed:
                 stops.pop(rid, None)
-            if not batch_N.node_batch.request_ids:
+            if not batch_N.node_batch.request_ids and not batch_N.node_batch.cached_rids:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 return
@@ -3890,14 +3904,19 @@ class Worker:
         self, in_flight_rids: set[int]
     ) -> None:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
-        an in-flight GPU step. Removes for in-flight rids stay deferred and
-        are reattempted next iter."""
-        to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
-        for rid in to_apply:
-            self._pending_removes.discard(rid)
+        an in-flight GPU step, in the order they were deferred. Removes for
+        in-flight rids stay deferred and are reattempted next iter; on a
+        follower, so do the ones after them, which rank 0 tore down later."""
+        for rid in list(self._pending_removes):
+            if rid in in_flight_rids or rid in self._in_flight_rids:
+                if self.is_tp_follower:
+                    break
+                continue
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
             ))
+            # torn down above, unless its handle was already gone
+            self._pending_removes.pop(rid, None)
 
     def _drop_failed_rids(
         self, pending: PendingBatch,
@@ -4587,6 +4606,13 @@ class Worker:
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     _set_pending(None)
+                    if spec_pending is None and self.is_tp_follower:
+                        # N is done and nothing runs. Rank 0 tore down what N held
+                        # here, and what it stamped with a step this rank dropped,
+                        # before it sent the next step, so this rank does too, before
+                        # it takes that step.
+                        self._apply_removes_whose_step_landed()
+                        self._apply_pending_removes_safe_to_drop(set())
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:

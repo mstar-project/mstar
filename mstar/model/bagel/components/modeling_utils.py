@@ -305,10 +305,10 @@ class ImageTransform:
 
 
 def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
-    """vllm-omni's SigLIP ViT preprocessing: resize to a fixed ``size``x``size``
-    square, discarding aspect ratio. Mirrors HF ``SiglipImageProcessor`` with
-    ``size={"height": size, "width": size}`` (BICUBIC, antialias), which is what
-    vllm-omni feeds BAGEL for image understanding. ``image`` is a CHW float
+    """Fixed-square SigLIP ViT preprocessing: resize to a fixed
+    ``size``x``size`` square, discarding aspect ratio. Mirrors HF
+    ``SiglipImageProcessor`` with ``size={"height": size, "width": size}``
+    (BICUBIC, antialias). ``image`` is a CHW float
     tensor in [0, 1]; normalization is applied separately by the caller.
     """
     return F.resize(image, (size, size), InterpolationMode.BICUBIC, antialias=True)
@@ -320,8 +320,7 @@ def vllm_vae_resize(
     max_img_size: int,
     min_img_size: int = 256,
 ) -> torch.Tensor:
-    """vllm-omni's img2img VAE input resize (``_resize_to_stride`` in
-    vllm_omni/diffusion/models/bagel/pipeline_bagel.py): aspect-preserving,
+    """Stride-multiple img2img VAE input resize: aspect-preserving,
     longest edge <= ``max_img_size``, shortest edge >= ``min_img_size``, both
     rounded to a multiple of ``stride`` and clamped to ``max_img_size``
     (BICUBIC, antialias). ``image`` is a CHW float tensor in [0, 1];

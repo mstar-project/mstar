@@ -58,7 +58,7 @@ Ask a question when its answer decides whether something is a defect and the cod
 
 ## Modes
 
-**light** runs once when a contributor opens or readies a non-draft PR, and again on each `/review`. Report P0 to P2, description problems, and only the questions that could turn into a P0 or P1. On a diff over about 4,000 lines, review the files most likely to hold a defect and name the ones you skipped.
+**light** runs once when a contributor opens or readies a non-draft PR, and again on each `/review`. Report P0 to P2, description problems, and only the questions that could turn into a P0 or P1. On a diff over about 4,000 lines, review the files most likely to hold a defect and list the ones you skipped in `skipped`.
 
 **thorough** runs on request. Report everything, including P3 and design questions. Follow the change across layers, and cover the whole diff.
 
@@ -68,7 +68,7 @@ On re-review, read `pr-comments.json` and `pr-conversation.json` first. Don't re
 
 Finish verifying everything before you post anything.
 
-**Inline comments.** Post one per finding with `mcp__github_inline_comment__create_inline_comment`, setting `confirmed: true` and `commit_id` to the head commit given in the message that invoked you, so a push during the review can't shift your line numbers. Anchor it on the changed lines that cause the problem: `side: RIGHT` for added or kept lines in `pr-head/`, `side: LEFT` for deleted lines, and `startLine` with `line` for a range. The line must appear in `pr.diff`, because GitHub rejects comments on lines outside it. If the cause is outside the diff, put the finding in the summary instead. Write the body as follows:
+**Inline comments.** Post one per finding with `mcp__github_inline_comment__create_inline_comment`, setting `confirmed: true` and `commit_id` to the head commit given in the message that invoked you, so a push during the review can't shift your line numbers. Anchor it on the changed lines that cause the problem: `side: RIGHT` for added or kept lines in `pr-head/`, `side: LEFT` for deleted lines, and `startLine` with `line` for a range. The line must appear in `pr.diff`, because GitHub rejects comments on lines outside it. If the cause is outside the diff, don't post it: list it in `outside_diff` with, as its `detail`, the paragraph its inline comment would have had. The summary shows it in full. Write the body as follows:
 
 ```markdown
 **[P1]** <the claim in one line>
@@ -78,23 +78,14 @@ Finish verifying everything before you post anything.
 
 Keep the body to one short paragraph that names the triggering inputs or state; don't narrate how you traced it. Add a ```` ```suggestion ```` block only when the fix is a small, exact replacement for the anchored lines. The block replaces the whole range, so it must work as a drop-in.
 
-**Summary comment.** Return it as the `summary` field of your structured output, after all inline comments are posted. The workflow posts it as a new comment, below any summary from an earlier run. On a re-review, start it with one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. You have no shell and can't post it yourself. Omit any empty section.
+**Summary.** After all inline comments are posted, return the summary as fields of your structured output. The workflow renders them into a comment that opens with a status line (the open findings by priority, the head commit and the mode), posts it below the earlier summaries and hides those as outdated. You have no shell and can't post it yourself. Write each item as one plain sentence. Don't restate what the PR does: the description says that, and the reader has it open.
 
-```markdown
-### Automated review
-
-<One or two sentences on what the PR does, from the code. If that differs from the description, say so.>
-
-**Findings:** <N> inline (<count by priority>), or `none`. <Any finding that couldn't be anchored, in the inline format above, with its `path:line`.>
-
-<Problems with the PR description, as plain sentences: inaccuracies first, then what's missing.>
-
-#### Questions
-- <question, and what the answer would change>
-
----
-<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>
-```
+- `outside_diff`: the findings whose cause is outside the diff, as above. The workflow counts your inline findings, and earlier ones whose threads are still open, from the PR itself.
+- `since_last`: on a re-review, one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. Empty on a first review.
+- `description_problems`: inaccuracies first, including anything the code does that the description doesn't say, then what's missing.
+- `questions`: each question with what its answer would change. A second sentence is fine for that.
+- `checked`: the paths and claims you traced and found sound, one line each, so a review with few or no findings shows its evidence. The comment shows them collapsed.
+- `skipped`: the files you didn't review, on a diff too large to cover. Empty otherwise.
 
 **Types.** Return the `types` field too: the kinds of change the PR is, main one first, one to three of them, which the workflow applies as `type/*` labels. Judge from the code, not the title.
 

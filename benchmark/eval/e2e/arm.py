@@ -327,6 +327,9 @@ def build_rust_server(arm: dict) -> str | None:
 
 
 RDMA_SYSFS = Path("/sys/class/infiniband")
+#: Starts the requirement check's one result line. An import can print to stdout too, before or after it
+#: (qwen_tts prints transformers' docstring warnings), so only this line is read.
+REQUIRES_RESULT = "mstar-e2e-requires: "
 
 
 def requirements_problem(arm: dict) -> str:
@@ -340,10 +343,15 @@ def requirements_problem(arm: dict) -> str:
         return nic
     code = ("import importlib, sys\nbad = []\nfor m in sys.argv[1:]:\n    mod, _, fn = m.partition(':')\n"
             "    try:\n        x = importlib.import_module(mod)\n        if fn:\n            getattr(x, fn)()\n"
-            "    except Exception as e:\n        bad.append(f'{m}: {type(e).__name__}')\nprint('; '.join(bad))")
+            "    except Exception as e:\n        bad.append(f'{m}: {type(e).__name__}')\n"
+            f"print({REQUIRES_RESULT!r} + '; '.join(bad), flush=True)")
     r = subprocess.run([job["python"], "-c", code, *mods], env={**os.environ, **server_env(arm)}, cwd=arm["src"],
                        capture_output=True, text=True, timeout=600, check=False)
-    bad = r.stdout.strip() or (r.stderr.strip()[-300:] if r.returncode else "")
+    results = [line for line in r.stdout.splitlines() if line.startswith(REQUIRES_RESULT)]
+    if results:
+        bad = results[-1].removeprefix(REQUIRES_RESULT).strip()
+    else:   # the check died before its result line, e.g. an import that crashed the interpreter
+        bad = (r.stderr.strip() or r.stdout.strip())[-300:] or f"requirement check exited {r.returncode}"
     return "; ".join(x for x in (bad, nic) if x)
 
 

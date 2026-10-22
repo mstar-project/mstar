@@ -11,6 +11,7 @@ import torch
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
     RaggedAttnBackend,
+    RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
@@ -25,7 +26,7 @@ def resolve_ragged_attn_backend(
     return backend
 
 
-def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
+def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
     if info.joint_comm_group is not None:
         config.shard(info.joint_comm_group.world_size)
@@ -36,7 +37,7 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
-    return manager_cls(device=info.device, dtype=dtype, config=config)
+    return manager_cls(device=info.device, dtype=dtype, config=config, **kwargs)
 
 
 class RaggedAttnManager(AttentionResource):
@@ -74,3 +75,23 @@ class RaggedCrossAttnManager(AttentionResource):
 
             return _build_ragged(spec, info, FlashInferRaggedCrossManager)
         raise ValueError(f"Unknown ragged cross attention backend {backend!r}")
+
+
+class RaggedBlockCausalAttnManager(AttentionResource):
+    """Cacheless block-causal self-attention within each span; see
+    ``RaggedBlockCausalAttentionSpec``."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
+        backend = resolve_ragged_attn_backend(spec.config.backend, info.device)
+        if backend is RaggedAttnBackend.FLASHINFER:
+            from mstar.engine.resources.attn.ragged.flashinfer import (
+                FlashInferRaggedBlockCausalManager,
+            )
+
+            return _build_ragged(
+                spec, info, FlashInferRaggedBlockCausalManager, block_size=spec.block_size,
+            )
+        raise ValueError(f"Unknown ragged block-causal attention backend {backend!r}")
