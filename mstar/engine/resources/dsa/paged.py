@@ -85,14 +85,18 @@ class DSAContext:
     def row_meta(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per row, int32, what the top-k takes: the pools it sees, its request's first entry
         in ``pages``, and its row of the one-row page table (0). Every layer of a forward
-        selects with the same rows, so they are built once (each launch is a few us)."""
-        if self._row_meta is None or self._row_meta[0] is not self.pos \
-                or self._row_meta[1] is not self.row_req:
-            self._row_meta = (
-                self.pos, self.row_req, ((self.pos + 1) // self.kpool).to(torch.int32),
+        selects with the same rows, so they are built once (each launch is a few us), and
+        again for new rows or a capture: a graph must hold the ops that build them."""
+        capturing = self.pos.is_cuda and torch.cuda.is_current_stream_capturing()
+        meta = self._row_meta
+        if (meta is None or meta[0] is not self.pos or meta[1] is not self.row_req
+                or meta[2] != capturing):
+            meta = self._row_meta = (
+                self.pos, self.row_req, capturing,
+                ((self.pos + 1) // self.kpool).to(torch.int32),
                 self.page_start[self.row_req.long()].to(torch.int32),
                 torch.zeros_like(self.row_req))
-        return self._row_meta[2:]
+        return meta[3:]
 
     def rows(self, c0: int, c1: int) -> DSAContext:
         """This eager step's rows ``[c0, c1)`` alone, for a pass over them after the rows
