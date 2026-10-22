@@ -1,4 +1,4 @@
-"""Tuned-config lookup, grid bound and precomputed alignment for the fused MoE."""
+"""Tuned-config lookup and precomputed alignment for the fused MoE."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def test_get_config_uses_nearest_batch_and_down_overrides(tuned_table):
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64])
 def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
     from mstar.model.components.moe import dispatch_experts_fused
-    from mstar.utils.fused_moe import fused_experts, moe_block_m
+    from mstar.utils.fused_moe import MoeAlignment, fused_experts, moe_block_m
     from mstar.utils.fused_moe.align import moe_align_block_size
 
     # The Command A+ expert shape, which has a tuned table on GB200.
@@ -63,8 +63,10 @@ def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
     naive = dispatch_experts_fused(x, w1, w2, experts, ids, weights)
     torch.testing.assert_close(out, naive, atol=2e-2, rtol=2e-2)
 
-    alignment = moe_align_block_size(
-        ids.to(torch.int32), moe_block_m(num_tokens, w1, top_k), experts,
-    )
+    block_m = moe_block_m(num_tokens, w1, top_k)
+    alignment = MoeAlignment(*moe_align_block_size(ids.to(torch.int32), block_m, experts), block_m)
     precomputed = fused_experts(x, w1, w2, weights, ids, alignment=alignment)
     torch.testing.assert_close(precomputed, out, atol=0, rtol=0)
+
+    with pytest.raises(AssertionError, match="BLOCK_SIZE_M"):
+        fused_experts(x, w1, w2, weights, ids, alignment=alignment._replace(block_m=block_m * 2))

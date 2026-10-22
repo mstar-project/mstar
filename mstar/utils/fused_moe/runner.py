@@ -9,6 +9,8 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton.language as tl
 
@@ -22,6 +24,15 @@ from mstar.utils.fused_moe.kernels import (
     moe_sum_reduce_triton,
 )
 from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
+
+
+class MoeAlignment(NamedTuple):
+    """``moe_align_block_size``'s output and the ``BLOCK_SIZE_M`` it aligned to."""
+
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    block_m: int
 
 
 def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
@@ -47,7 +58,7 @@ def fused_experts(
     activation: str = "silu",
     reduce_results: bool = True,
     skip_invalid: bool = False,
-    alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    alignment: MoeAlignment | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -80,9 +91,8 @@ def fused_experts(
         Set when ``topk_ids`` may hold ids ``>= num_experts`` (the EP
         sentinel for experts another rank owns). Those slots skip both GEMMs
         and contribute zeros, at the cost of one memset of the output cache.
-    alignment : tuple of torch.Tensor, optional
-        Precomputed ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``
-        for ``topk_ids`` in the ``moe_align_block_size`` layout, aligned to
+    alignment : MoeAlignment, optional
+        Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
 
     Returns
@@ -114,9 +124,11 @@ def fused_experts(
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
+    block_m = config["BLOCK_SIZE_M"]
     if alignment is None:
-        alignment = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = alignment
+        alignment = MoeAlignment(*moe_align_block_size(topk_ids, block_m, E), block_m)
+    assert alignment.block_m == block_m, f"alignment uses BLOCK_SIZE_M={alignment.block_m}, config {block_m}"
+    sorted_token_ids, expert_ids, num_tokens_post_padded, _ = alignment
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k
