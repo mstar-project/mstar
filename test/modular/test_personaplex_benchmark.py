@@ -174,3 +174,15 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
     rows = [json.loads(line) for path in tmp_path.glob("ownership-events-*.jsonl")
             for line in path.read_text().splitlines()]
     assert [(row["event"], row["rid"]) for row in rows] == [("after_decoder_inputs_consumed", 7)]
+
+
+def test_timing_summary_measures_frames_against_the_80ms_budget():
+    from benchmark.personaplex.timing import median_runs, summarize
+
+    out = summarize([70.0, 90.0, 80.0, 100.0, 60.0], audio_seconds=0.4, total_seconds=0.6)
+    assert out["frames"] == 5 and out["frame_ms_p50"] == 80.0 and out["frame_ms_max"] == 100.0
+    assert out["frames_within_80ms"] == 0.6 and out["rtf"] == pytest.approx(1.5)
+    with pytest.raises(ValueError):
+        summarize([], audio_seconds=1.0, total_seconds=1.0)
+    merged = median_runs([{"rtf": 1.0, "note": "a"}, {"rtf": 3.0, "note": "b"}, {"rtf": 2.0, "note": "c"}])
+    assert merged["rtf"] == 2.0 and merged["repeats"] == 3 and "note" not in merged
