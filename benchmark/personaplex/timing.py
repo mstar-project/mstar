@@ -133,12 +133,21 @@ def main():
         sub = LMSubmodule(native)
         sub.bind_node_resources(resources.resources)
 
+        # One generator per variant, reused across warmup and repeats, so CUDA graph
+        # capture happens in the excluded warmup, not inside a timed run.
+        generators = {}
+
         def nvidia(audio, static, meta, graphs: bool):
             context = contextlib.nullcontext() if graphs else no_cuda_graph()
             with context:
-                gen = LMGen(ref, audio_silence_frame_cnt=cfg.SILENCE_FRAMES, sample_rate=cfg.SAMPLE_RATE,
-                            device="cuda", frame_rate=cfg.FRAME_RATE, use_sampling=False)
-                for m in (ref_mimi, ref_other, gen):
+                if graphs not in generators:
+                    generators[graphs] = LMGen(
+                        ref, audio_silence_frame_cnt=cfg.SILENCE_FRAMES, sample_rate=cfg.SAMPLE_RATE,
+                        device="cuda", frame_rate=cfg.FRAME_RATE, use_sampling=False,
+                    )
+                    generators[graphs].streaming_forever(1)
+                gen = generators[graphs]
+                for m in (ref_mimi, ref_other):
                     m.streaming_forever(1)
                 gen.load_voice_prompt_embeddings(str(a.voices / "NATF2.pt"))
                 gen.text_prompt_tokens = static["persona_tokens"][0].tolist()
