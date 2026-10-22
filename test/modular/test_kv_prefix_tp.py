@@ -28,6 +28,7 @@ import torch
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
+from test_tp_async_teardown_order import _rank, _Stop
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.wire import decode, encode
@@ -39,7 +40,7 @@ from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, Publish
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
 from mstar.utils.ipc_format import ScheduleTPNode, WorkerMessage, WorkerMessageType
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, TPDivergence
 
 WALKS = {"main": (WALK, "decode", IMAGE_WALK)}
 
@@ -398,3 +399,99 @@ def test_a_pool_on_more_than_one_tp_group_is_refused_at_load():
     assert _manager(0, shared=True, world_size=1)._index is not None, (
         "one rank has nobody to agree with, so sharing the pool is its own business"
     )
+
+
+# ── a follower that diverged from rank 0 ────────────────────────────────
+
+
+def _diverged() -> tuple[KVManager, KVManager]:
+    """Two ranks whose indexes hold x's prefix on different pages, since the follower ran y
+    first. Both have ingested b, which shares x's prefix."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
+    for kv, order in ((leader, (("x", x), ("y", y))), (follower, (("y", y), ("x", x)))):
+        for rid, tokens in order:
+            _ingest(kv, rid, tokens)
+            _run(kv, rid, tokens)
+    for kv in ranks:
+        _ingest(kv, "b", x[:2 * PAGE_SIZE] + _tokens(5, seed=5))
+    return ranks
+
+
+def test_pages_that_differ_from_rank_0s_are_a_loud_error():
+    leader, follower = _diverged()
+    pages = _send(leader, "b").prefix_hits["wire-b"]["kv"]
+    with pytest.raises(RuntimeError, match="diverged"):
+        follower.adopt_cached_prefix("b", NODE, WALK, pages)
+
+
+def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
+    """Failing the step's requests would leave the other ranks waiting in the step's collective for good."""
+    leader, follower = _diverged()
+    worker, _ = _rank(monkeypatch, tp_rank=1, inbox=[])
+    worker.scheduler.get_next_batch = lambda request_state, **kwargs: _follow(follower, _send(leader, "b"))
+
+    def _caught(error, *args):
+        # the real handler logs the error and runs the next pass
+        raise _Stop
+
+    worker._handle_main_loop_error = _caught
+    with pytest.raises(TPDivergence, match="diverged"):
+        worker.run()
+
+
+def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monkeypatch):
+    """Both ranks have allocated the same number of times, but on different pages, and nothing
+    fails until a sharded prefill gathers the wrong slots. So the follower checks before each
+    step, and before adopting the step's hit, since a rank out of step may wait on that hit for
+    good."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    ranks = leader, follower = _manager(0), _manager(1)
+    x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
+    for kv in ranks:
+        _ingest(kv, "x", x)
+        _ingest(kv, "y", y)
+        _ingest(kv, "b", x[:2 * PAGE_SIZE] + _tokens(5, seed=5))
+    _run(leader, "x", x)
+    _run(leader, "y", y)
+    _run(follower, "y", y)
+    # admitted and not committed, so this rank's index doesn't hold x yet
+    _step(follower, "x", len(x))
+    assert leader.page_trail()[0] == follower.page_trail()[0]
+
+    in_step = ScheduleTPNode(NODE, WALK, ["wire-b"], page_trails={"kv": follower.page_trail()})
+    assert _follow(follower, in_step), "a follower in step with rank 0 was held back"
+    head = _send(leader, "b")
+    with pytest.raises(TPDivergence, match=rf"KV kv: .*{NODE}/{WALK}, tp seq {head.spec_seq}"):
+        _follow(follower, head)
+
+
+def test_with_the_debug_flag_off_no_trail_is_kept_or_sent(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    leader = _manager(0)
+    tokens = _tokens(3 * PAGE_SIZE, seed=18)
+    _ingest(leader, "a", tokens)
+    _run(leader, "a", tokens)
+
+    assert leader._arena.trail is None
+    assert _send(leader, "a").page_trails == {}
+
+
+def test_a_pool_without_the_tp_cache_keeps_no_trail(monkeypatch):
+    """A pool without the TP cache may offload to the host. A reload allocates when rank 0 checks
+    readiness and when a follower replays the move, so the two trails would not match."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    assert _manager(0)._arena.trail is not None
+    assert _manager(0, opt_in=False)._arena.trail is None
+
+
+def test_rank_0s_trails_cross_the_wire(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    ranks = leader, follower = _manager(0), _manager(1)
+    _cache(ranks, "a", _tokens(3 * PAGE_SIZE, seed=14))
+    for kv in ranks:
+        _ingest(kv, "b", _tokens(2 * PAGE_SIZE, seed=15))
+
+    head = _wire(_send(leader, "b"))
+    assert head.page_trails, "rank 0 sent no trail to compare"
+    assert _follow(follower, head), "a trail that came back a list would never compare equal"
