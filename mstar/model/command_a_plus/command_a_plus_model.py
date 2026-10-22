@@ -210,8 +210,8 @@ class CommandAPlusModel(Model):
             ), dtype=torch.long)
         if ids.ndim != 1 or ids.numel() == 0 or ids.numel() > self.max_seq_len:
             raise ValueError("Prompt must contain 1..max_seq_len token IDs")
-        max_output_tokens = kwargs.get("max_output_tokens")
-        if max_output_tokens is not None and ids.numel() + max_output_tokens > self.max_seq_len:
+        max_output_tokens = self.get_max_output_tokens(**kwargs)
+        if ids.numel() + max_output_tokens > self.max_seq_len:
             raise ValueError(
                 f"prompt ({ids.numel()} tokens) + max_output_tokens ({max_output_tokens}) "
                 f"exceeds max_seq_len ({self.max_seq_len})"

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from safetensors.torch import save_file
@@ -18,6 +18,7 @@ from mstar.engine.resources import AttentionStep, SamplingReqConfig
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
@@ -256,6 +257,8 @@ class ModelIntegrationTests(unittest.TestCase):
             )),
         )
         self.model._tokenizer = tokenizer
+        # Room for the default output cap, which counts toward max_seq_len.
+        self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
         result = self.model.process_prompt("hello", ["text"], ["text"])
         self.assertEqual(result["text_inputs"][0].tolist(), [2, 10, 11])
         tokenizer.apply_chat_template.assert_called_once_with(
@@ -274,6 +277,10 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model.process_prompt("hi", ["text"], ["text"], max_output_tokens=self.model.max_seq_len - 3)
         with self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
             self.model.process_prompt("hi", ["text"], ["text"], max_output_tokens=self.model.max_seq_len - 2)
+        # Without max_output_tokens the default cap still counts.
+        with patch.object(self.model, "max_seq_len", MAX_OUTPUT_TOKENS + 2), \
+                self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
+            self.model.process_prompt("hi", ["text"], ["text"])
         for bad in ([], [{"role": "tool", "content": "x"}], [{"role": "user"}], "hi"):
             with self.assertRaisesRegex(ValueError, "messages"):
                 self.model.process_prompt("hi", ["text"], ["text"], messages=bad)
