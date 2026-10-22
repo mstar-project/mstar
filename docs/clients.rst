@@ -318,7 +318,8 @@ Endpoints and model coverage:
      - Notes
    * - ``GET /v1/models``
      - all
-     - Lists the served model.
+     - Lists the served model, and any LoRA adapters it serves (each with ``parent``
+       naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
      - ``bagel``, ``qwen3_omni``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
