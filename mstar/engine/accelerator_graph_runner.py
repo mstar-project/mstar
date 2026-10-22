@@ -1492,12 +1492,16 @@ class AcceleratorGraphRunner:
         earlier hands the main thread a GIL the GPU thread still needs. Only
         `graph.replay()` below drops it in C++.
         """
+        laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
-        return self._replay(lease)
+        laps.lap("stage")
+        out = self._replay(lease)
+        laps.lap("replay")
+        return out
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
