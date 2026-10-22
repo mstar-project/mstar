@@ -13,7 +13,7 @@ Drives the real code from a RESULT_TOKENS frame to the SSE text a
   sse      the event loop running every handler's ``_stream_events`` until
            each has yielded this step's token (no HTTP write; see ``--http``)
   relay    instead of ``sse`` with ``--frontend rust``: the Rust-frontend
-           bridge's ``_relay`` per chunk (msgpack + a real Rust ZMQ send)
+           bridge relaying the chunks (msgpack + a real Rust ZMQ send)
 
 ``stages`` runs them one after another on one thread and times each. ``threaded``
 runs the real threads (message thread, data worker thread, event loop) over a
@@ -249,6 +249,8 @@ class Consumers:
             else:
                 key = server.submission_key(rid)
                 bridge._keys[id(rid)] = key
+                bridge.loop = asyncio.get_running_loop()
+                server.relay_chunks_to(key, bridge, id(rid))
                 chunks = server.iter_result_chunks(rid)
                 self.tasks.append(asyncio.ensure_future(
                     bridge._relay(rid, id(rid), chunks)))
@@ -274,10 +276,12 @@ class _CountingSend:
     def __call__(self, msg):
         self.comm.send("frontend", msg)
         c = self.ref[0]
-        if c is not None and msg.get("t") == "chunk":
-            c.events += 1
+        t = msg.get("t")
+        n = 1 if t == "chunk" else len(msg["subs"]) if t == "chunks" else 0
+        if c is not None and n:
+            c.events += n
             if c.track:
-                c.first_seen.append(time.perf_counter())
+                c.first_seen.extend([time.perf_counter()] * n)
 
 
 def make_bridge(server, sock_dir: str, consumers_ref):
