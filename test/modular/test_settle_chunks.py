@@ -9,6 +9,7 @@ row the prefix cache served whole still has to be routed (#768).
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.worker.chunk_outputs import ChunkOutputAccumulator
@@ -55,7 +56,7 @@ def _worker():
     return w
 
 
-def _pending(ranges: dict, incomplete: set, ran: list[int], cached=()):
+def _pending(ranges: dict, incomplete: set, ran: list[int], cached=(), event=None):
     batch = ScheduledBatch(
         node_name=NODE, graph_walk=WALK,
         request_to_worker_graph={rid: 7 for rid in ran},
@@ -63,7 +64,7 @@ def _pending(ranges: dict, incomplete: set, ran: list[int], cached=()):
     )
     node_batch = SimpleNamespace(
         request_ids=list(ran), per_request_info={rid: object() for rid in ran},
-        cached_rids=set(cached),
+        cached_rids=set(cached), completion_event=event,
     )
     return SimpleNamespace(batch=batch, node_name=NODE, node_batch=node_batch)
 
@@ -122,3 +123,40 @@ def test_a_row_dropped_from_the_step_is_left_alone():
     w._settle_chunks(pending, _outputs(r1=[1.0]))
 
     assert w.scheduler.advanced == [(1, NODE, 4)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="stream ordering needs a device")
+def test_a_joined_output_is_ready_when_the_steps_event_says_so():
+    """The gpu thread has launched N+1 by the time N's chunks are joined; the
+    join must not queue behind it, or the copies that wait on N's event read
+    the joined tensor before it is written (Qwen3-Omni's Talker got broken
+    audio over SHM, PR #365 review)."""
+    device = torch.device("cuda:0")
+    w = _worker()
+    w.device = device
+    w.device_capability = SimpleNamespace(is_accelerator=True)
+    # warm the side stream's allocator pool and the cat kernel: a first
+    # cudaMalloc, or a lazily loaded kernel module, syncs the whole device
+    w._d2h_stream = torch.Stream(device=device)
+    with w._d2h_stream:
+        torch.cat([torch.empty(4096, device=device)] * 2)
+    copier = torch.cuda.Stream(device)  # as the store's copy stream does
+    host = torch.empty(8192, pin_memory=True)
+    first = torch.full((4096,), 1.0, device=device)
+    w.scheduler.chunk_outputs.hold(1, NODE, {"hidden": [first]})
+    last = torch.full((4096,), 2.0, device=device)
+    torch.cuda.synchronize(device)
+    step_n = torch.cuda.current_stream(device).record_event()
+    torch.cuda._sleep(2_000_000_000)  # step N+1, still running on the current stream
+    pending = _pending({1: (4, 10, 10)}, set(), [1], event=step_n)
+    outputs = SimpleNamespace(per_rid_outputs={1: {"hidden": [last]}})
+
+    w._settle_chunks(pending, outputs)
+
+    copier.wait_event(pending.node_batch.completion_event)
+    with torch.cuda.stream(copier):
+        host.copy_(outputs.per_rid_outputs[1]["hidden"][0], non_blocking=True)
+    copier.synchronize()
+    assert not torch.cuda.current_stream(device).query(), "N+1 should still be running"
+    assert host[:4096].eq(1.0).all() and host[4096:].eq(2.0).all()
+    torch.cuda.synchronize(device)

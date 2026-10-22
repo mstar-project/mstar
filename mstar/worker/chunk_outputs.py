@@ -30,6 +30,10 @@ class ChunkOutputAccumulator:
             if policies.get(name, _DEFAULT).mode is not ChunkedPrefillOutputMode.FINAL:
                 held.setdefault(name, []).append(list(tensors))
 
+    def holds(self, rid: int, node_name: str) -> bool:
+        """Whether earlier chunks of ``rid`` on ``node_name`` wait to be joined."""
+        return (rid, node_name) in self._held
+
     def release(
         self, rid: int, node_name: str, outputs: NameToTensorList,
         policies: Mapping[str, ChunkedPrefillOutputPolicy] = {},

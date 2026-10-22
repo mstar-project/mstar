@@ -9,7 +9,7 @@ import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property, partial
@@ -3414,6 +3414,8 @@ class Worker:
         route: no row that ran, and no row the prefix cache served whole."""
         batch, node = batch_N.batch, batch_N.node_name
         outputs = step_outputs.per_rid_outputs
+        join_stream = None
+        joined: list[torch.Tensor] = []
         for rid, (_, end, _) in batch.chunk_ranges.items():
             if rid not in batch.request_to_worker_graph:
                 continue
@@ -3429,12 +3431,20 @@ class Worker:
             else:
                 engine = self.engine_manager.get_engine(node)
                 engine.release_chunk_inputs(rid, node)
-                merged = self.scheduler.chunk_outputs.release(
-                    rid, node, outputs.get(rid, {}),
-                    engine.chunked_prefill_output_policies(node, batch.walk_of(rid)),
-                )
+                joins = self.scheduler.chunk_outputs.holds(rid, node)
+                if joins and join_stream is None:
+                    join_stream = self._chunk_join_stream(batch_N)
+                with join_stream if joins and join_stream is not None else nullcontext():
+                    merged = self.scheduler.chunk_outputs.release(
+                        rid, node, outputs.get(rid, {}),
+                        engine.chunked_prefill_output_policies(node, batch.walk_of(rid)),
+                    )
+                if joins and join_stream is not None:
+                    joined += [t for ts in merged.values() for t in ts if torch.is_tensor(t)]
                 if merged or rid in outputs:
                     outputs[rid] = merged
+        if joined:
+            self._publish_joined_chunks(batch_N, join_stream, joined)
         held = batch.incomplete_node_rids
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid not in held
@@ -3443,6 +3453,34 @@ class Worker:
             batch_N.node_batch.per_request_info.pop(rid, None)
         # a served row's walk completes only when it is routed (#768)
         return bool(batch_N.node_batch.request_ids or batch_N.node_batch.cached_rids)
+
+    def _chunk_join_stream(self, batch_N: PendingBatch) -> torch.Stream | None:
+        """The side stream a final chunk's outputs are joined on, ordered after
+        step N alone; None off a device. Joined on the current stream instead,
+        they would queue behind N+1, which the gpu thread has already
+        launched, while every copy of them (``_prematerialize_for_check_stop``,
+        the store's) waits only on N's completion event and reads them first."""
+        event = batch_N.node_batch.completion_event
+        if event is None or not self.device_capability.is_accelerator:
+            return None
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.Stream(device=self.device)
+        self._d2h_stream.wait_event(event)
+        return self._d2h_stream
+
+    def _publish_joined_chunks(
+        self, batch_N: PendingBatch, side: torch.Stream, joined: list[torch.Tensor],
+    ) -> None:
+        """Make the tensors joined on ``side`` safe to read everywhere: later
+        steps on the current stream wait for them, the allocator keeps them
+        until those steps are done, and the step's completion event moves past
+        the join, so the copies postprocess makes next read the joined data."""
+        current = torch.accelerator.current_stream(self.device)
+        current.wait_stream(side)
+        for t in joined:
+            if t.device.type == self.device.type:
+                t.record_stream(current)
+        batch_N.node_batch.completion_event = side.record_event()
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
