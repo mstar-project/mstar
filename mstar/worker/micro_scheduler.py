@@ -169,7 +169,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(taken)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(taken),
-            row_lens={rid: self.row_lens[rid] for rid in taken if rid in self.row_lens},
+            row_lens=self._row_lens_for(taken),
             # shared, not trimmed to the walks each half keeps: an extra entry
             # costs nothing, since outputs are only looked up for walks present
             walk_output_signals=self.walk_output_signals,
@@ -182,7 +182,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(left)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(left),
-            row_lens={rid: self.row_lens[rid] for rid in left if rid in self.row_lens},
+            row_lens=self._row_lens_for(left),
             walk_output_signals=self.walk_output_signals,
         )
 
@@ -190,6 +190,11 @@ class ScheduledBatch:
         if not self.request_walks:
             return {}
         return {rid: self.request_walks[rid] for rid in rids}
+
+    def _row_lens_for(self, rids: list[int]) -> dict[int, Any]:
+        if not self.row_lens:
+            return {}
+        return {rid: self.row_lens[rid] for rid in rids if rid in self.row_lens}
 
     def __len__(self):
         return len(self.request_to_worker_graph)

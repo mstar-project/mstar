@@ -164,7 +164,6 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
-        backlogged = set() if request.backlog is None else set(request.backlog.request_to_worker_graph)
         walk = _single_walk(batch, request)
         if walk is None:
             max_bs, left_out = _compose_walks(batch, exclude, request)
@@ -204,8 +203,9 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         if dropped:
             # a fresh row that missed the budget goes back to its queue; a backlogged one stays parked
             scheduled, out = scheduled.split_off_first(None, exclude_rids=dropped)
+            backlogged = () if request.backlog is None else request.backlog.request_to_worker_graph
             back, fresh_out = out.split_off_first(
-                None, exclude_rids=set(out.request_to_worker_graph) - backlogged,
+                None, exclude_rids=set(out.request_to_worker_graph).difference(backlogged),
             )
             if back is not None:
                 remainder = back if remainder is None else _merged(remainder, back)

@@ -2451,8 +2451,8 @@ class Worker:
             graph_walk=label,
             request_to_worker_graph=request_to_worker_graph,
             request_walks=request_walks,
-            chunk_ranges=dict(chunk_ranges or {}),
-            incomplete_node_rids=set(incomplete_node_rids or ()),
+            chunk_ranges=dict(chunk_ranges) if chunk_ranges else {},
+            incomplete_node_rids=set(incomplete_node_rids) if incomplete_node_rids else set(),
             # Reported by whichever step chose the target -- speculate_node on
             # the leader, get_spec_target on a follower -- so the hot path does
             # not cross back into the runtime once per forward pass.
@@ -2633,10 +2633,10 @@ class Worker:
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
         # a row mid-prefill takes its next chunk after this one lands, never speculatively
-        candidates = [
-            r for r in walk_rids
-            if not self._is_tearing_down(r) and r not in batch_N.incomplete_node_rids
-        ]
+        held = batch_N.incomplete_node_rids
+        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        if held:
+            candidates = [r for r in candidates if r not in held]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
@@ -3149,10 +3149,10 @@ class Worker:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
         # a row mid-prefill keeps its inputs: its next chunk reads them again
+        held = batch_N.batch.incomplete_node_rids
         rids = [
-            r for r in batch_N.batch.request_to_worker_graph
-            if r not in batch_N.batch.incomplete_node_rids
-        ]
+            r for r in batch_N.batch.request_to_worker_graph if r not in held
+        ] if held else list(batch_N.batch.request_to_worker_graph)
         # What the runtime dereferenced to zero and cannot reclaim itself: a
         # runtime behind the contract has the bookkeeper, not the shm files or
         # the registered memory.
