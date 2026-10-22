@@ -163,9 +163,15 @@ class PersonaPlexModel(Model):
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode at 24 kHz and keep channel 0, not a downmix ([PP] models/lm.py:121-129; offline.py:259)."""
+        # Outside the try: a missing FFmpeg runtime fails here and is a server fault (500).
         from torchcodec.decoders import AudioDecoder
 
-        samples = AudioDecoder(filepath, sample_rate=cfg.SAMPLE_RATE).get_all_samples().data
+        try:
+            samples = AudioDecoder(filepath, sample_rate=cfg.SAMPLE_RATE).get_all_samples().data
+        except RuntimeError as exc:
+            # torchcodec reports undecodable bytes as RuntimeError; the data worker maps
+            # ValueError to a 400. The message omits the server-side upload path.
+            raise ValueError("PersonaPlex cannot decode the uploaded audio") from exc
         if samples.dim() != 2 or samples.shape[0] < 1:
             raise ValueError(f"cannot decode audio from {filepath!r}")
         audio = samples[0].to(torch.float32)

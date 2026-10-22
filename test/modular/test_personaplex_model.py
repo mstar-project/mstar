@@ -537,6 +537,25 @@ def test_t10_load_audio_keeps_channel_zero_at_24khz(monkeypatch):
     assert loaded.metadata == {"sample_rate": 24000, "num_channels": 1, "source_channels": 2, "num_samples": 5000}
 
 
+def test_load_audio_reports_undecodable_upload_as_client_error(monkeypatch):
+    _fake_torchcodec(monkeypatch, torch.zeros(1, 10))
+
+    def undecodable(self):
+        raise RuntimeError("Could not open input file: /tmp/mstar_uploads/x.wav Invalid data found")
+
+    monkeypatch.setattr(sys.modules["torchcodec.decoders"].AudioDecoder, "get_all_samples", undecodable)
+    with pytest.raises(ValueError, match="cannot decode the uploaded audio") as info:
+        _model().load_audio("/tmp/mstar_uploads/x.wav", "cpu")
+    assert "/tmp/mstar_uploads" not in str(info.value)
+
+
+def test_load_audio_missing_decoder_runtime_stays_a_server_error(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", types.ModuleType("torchcodec.decoders"))
+    with pytest.raises(ImportError):
+        _model().load_audio("in.wav", "cpu")
+
+
 def _request(model, *, samples=1920 * 3, prompt=None, outputs=("audio", "text"), **kwargs):
     kwargs.setdefault("voice", "NATF2")
     return model.process_prompt(prompt, ["audio"], list(outputs), {"audio_inputs": [torch.zeros(samples)]},
