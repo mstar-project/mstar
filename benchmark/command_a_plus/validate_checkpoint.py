@@ -208,6 +208,7 @@ def mstar(args):
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     group = CommGroup(dist.get_rank(), dist.get_rank(), list(range(dist.get_world_size())))
     group.device_group = dist.group.WORLD
+    group.cpu_group = dist.new_group(backend="gloo")
     runtime = None
     try:
         runtime = Runtime(args, group)

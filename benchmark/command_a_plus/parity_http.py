@@ -1,11 +1,11 @@
 """Record greedy outputs and decode speed from a running Command A+ server.
 
-Run once against an eager server and once against a CUDA-graph server, then
-compare the two JSON files with ``--compare``.
+Run once before a change and once after it, then compare the two JSON files
+with ``--compare``.
 
-    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output eager.json
-    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output graphs.json \
-      --compare eager.json
+    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output before.json
+    python -m benchmark.command_a_plus.parity_http --url http://127.0.0.1:8000 --output after.json \
+      --compare before.json
 """
 
 import argparse
