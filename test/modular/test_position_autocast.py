@@ -4,9 +4,9 @@ from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
 
 
-def test_apply_qk_runs_in_the_input_dtype_whatever_the_ambient_autocast(monkeypatch):
-    """RoPE reads no ambient autocast state: fp32 q/k run in fp32 (the kernel's
-    portable path) inside or outside an autocast scope; rope_dtype overrides."""
+def test_apply_qk_follows_the_node_autocast_else_the_input_dtype(monkeypatch):
+    """Under a node whose policy autocasts, RoPE runs in its dtype; with autocast
+    off, fp32 q/k stay fp32 (the kernel's portable path); rope_dtype overrides."""
     from mstar.engine.accelerator_graph_runner import autocast_scope
 
     kernel_dtypes = []
@@ -25,5 +25,5 @@ def test_apply_qk_runs_in_the_input_dtype_whatever_the_ambient_autocast(monkeypa
 
     manager.apply_qk(q, q.clone(), "main", rope_dtype=torch.float16)
 
-    assert kernel_dtypes == [torch.float32, torch.float32, torch.float16]
+    assert kernel_dtypes == [torch.bfloat16, torch.float32, torch.float16]
     assert result_q.dtype == torch.float32

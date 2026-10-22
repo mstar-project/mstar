@@ -19,6 +19,7 @@ from test_send_registration_failure import _decode_step, _postprocess_worker
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import accelerator_graph_runner as runner_module
 from mstar.engine.engine import Engine
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -656,8 +657,8 @@ def test_what_the_lane_cannot_serve_is_refused_naming_the_field(kwargs, reason):
 def test_a_cpu_build_that_asks_for_the_lane_fails_at_startup():
     """Through the real ``EngineManager.build``."""
     class Model(_Model):
-        def get_autocast_dtype(self):
-            return None
+        def get_node_precision(self, node_name):
+            return NodePrecision(None)
 
         def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
             return _Submodule() if node_name == "Codec" else _Node()

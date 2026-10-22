@@ -27,6 +27,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
@@ -236,6 +237,14 @@ class ParakeetModel(Model):
     # submodules
     # -------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """The FastConformer encoder: bf16 params under bf16 autocast, which it
+        leaves its precision to. The transducer keeps the fp32 it is built in and
+        runs without autocast: its argmax decides every token."""
+        if node_name == "transducer":
+            return NodePrecision(None)
+        return NodePrecision(torch.bfloat16, autocast=True)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -263,7 +272,7 @@ class ParakeetModel(Model):
             from mstar.model.components.transducer import TransducerHead
             from mstar.model.parakeet.submodules import TransducerSubmodule
 
-            # fp32: the submodule opts out of the engine's cast
+            # fp32, kept as built (``get_node_precision``)
             head = TransducerHead(self.config.transducer).to(device)
             state = {
                 k: v for prefix in ("encoder_projector.", "decoder.", "joint.", "prompt_projector.")
@@ -273,6 +282,9 @@ class ParakeetModel(Model):
             if missing or unexpected:
                 raise KeyError(f"transducer weights: missing {missing[:4]}, unexpected {unexpected[:4]}")
             return TransducerSubmodule(
-                head.eval(), compile_step=self.compile_step, encoder_dtype=autocast_dtype or torch.float32,
+                head.eval(), compile_step=self.compile_step,
+                # the encoder node's output dtype; a YAML override of its
+                # param dtype is not visible here
+                encoder_dtype=self.get_node_precision("audio_encoder").param_dtype,
             )
         return None

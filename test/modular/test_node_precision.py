@@ -283,3 +283,16 @@ def test_a_quantized_param_dtype_is_refused_and_quantized_tensors_survive_the_ca
     assert node.blocks[0].proj.weight.dtype is torch.float8_e4m3fn
     assert node.blocks[1].proj.weight.dtype is torch.bfloat16
     assert precision_mismatches(node, NodePrecision(torch.bfloat16)) == []
+
+
+def test_autocast_may_name_its_own_dtype_for_a_node_that_keeps_its_build_dtypes():
+    precision = NodePrecision(None, autocast=torch.bfloat16)
+    assert precision.autocast_dtype is torch.bfloat16
+    node = torch.nn.Linear(2, 2)
+    apply_precision(node, precision)
+    assert node.weight.dtype is torch.float32
+    with pytest.raises(ValueError, match="quantized dtype"):
+        NodePrecision(None, autocast=torch.float8_e4m3fn)
+    # YAML may turn it off, and asking for it again keeps the model's dtype
+    assert apply_yaml_precision(precision, "n", {"autocast": False}).autocast_dtype is None
+    assert apply_yaml_precision(precision, "n", {"autocast": True}).autocast_dtype is torch.bfloat16

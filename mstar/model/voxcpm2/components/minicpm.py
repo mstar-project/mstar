@@ -105,8 +105,8 @@ class RopeTable(nn.Module):
         self.sin = sin.to(self.sin.dtype).to(device=self.sin.device, dtype=torch.float32)
 
     def _apply(self, fn, recurse=True):
-        # The worker casts each submodule to the autocast dtype; once
-        # materialized, the tables follow device moves but stay fp32.
+        # Once materialized, the tables follow device moves but stay fp32
+        # through any dtype cast (the node's policy itself casts nothing).
         before = dict(self._buffers)
         super()._apply(fn, recurse)
         for name, old in before.items():

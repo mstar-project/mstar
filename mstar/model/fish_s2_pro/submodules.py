@@ -378,7 +378,6 @@ class CodecSubmodule(ARNodeSubmodule):
     # the decode is a compile region (``compile_regions``); the capture's
     # gather and scatter stay outside it
     disable_torch_compile = True
-    disable_autocast = True
     # cuDNN's heuristic conv picks are slower than the ones it times per captured shape
     capture_cudnn_benchmark = True
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -605,7 +604,6 @@ class RefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     float32_matmul_precision = "highest"
     cudnn_allow_tf32 = False
     CACHE_SIZE = 64

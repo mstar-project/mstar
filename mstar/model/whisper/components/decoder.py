@@ -192,8 +192,9 @@ class WhisperDecoderModel(nn.Module):
             k, v = cross.compute_kv(encoder_states)  # (enc_len, heads, head_dim)
             k = k.transpose(0, 1)
             v = v.transpose(0, 1)
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * head_dim ** -0.5
-            probs = scores.softmax(dim=-1)  # (heads, tokens, enc_len)
+            # scores in the params' dtype, softmax in fp32, as openai-whisper
+            scores = torch.matmul(q, k.transpose(-1, -2)) * head_dim ** -0.5
+            probs = scores.float().softmax(dim=-1)  # (heads, tokens, enc_len)
             for head_idx in wanted.get(layer_idx, []):
                 out.append(probs[head_idx])
             a = torch.matmul(probs.to(v.dtype), v).transpose(0, 1).reshape(num_tokens, heads_n * head_dim)

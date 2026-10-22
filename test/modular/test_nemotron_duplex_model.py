@@ -200,29 +200,50 @@ def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
                                    "c.yaml")
 
 
-@pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16, None])
-def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dtype):
+def test_duplex_node_precisions():
+    """Every node in bf16; only the encoder, the shared FastConformer, still
+    takes its fp32 norms and softmax from autocast."""
+    from mstar.engine.precision import NodePrecision
+
+    model = _make_model()
+    assert {node: model.get_node_precision(node) for node in NODES} == {
+        "nano_llm": NodePrecision(torch.bfloat16),
+        "eartts_talker": NodePrecision(torch.bfloat16),
+        "conformer_encoder": NodePrecision(torch.bfloat16, autocast=True),
+    }
+
+
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "float16", "float32", None])
+def test_duplex_encoder_state_is_stored_in_the_encoders_dtype(param_dtype):
     """The encoder stores each step's layer state and keys / values for the
     next; in another dtype than the layers compute them in, live frames drift
-    from one-shot ones. So the pool and the KV take the dtype the engine
-    resolved, and no deployment dtype is refused for them. With
-    ``autocast_dtype: null`` the nodes have no dtype to give, so the deployment
-    declares one."""
+    from one-shot ones. So the pool and the KV take the encoder node's param
+    dtype, whatever ``nodes.conformer_encoder.precision`` sets it to. A node
+    that keeps the dtype it was built in has no dtype to give, so the
+    deployment declares one."""
+    from mstar.engine.precision import NodePrecision, deployment_precisions
     from mstar.engine.resources.base import EngineResourceInfo
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
     from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
     model = _make_model()
-    model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
     specs = {s.resource_key: s for s in model.get_node_resources()}
-    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=autocast_dtype)
-    if autocast_dtype is None:
+    assert specs[ENCODER_STATE].nodes == specs[ENCODER_KV].nodes == {"conformer_encoder"}
+    if param_dtype is None:
+        dtype = NodePrecision(None).param_dtype
+    else:
+        config = {"nodes": {"conformer_encoder": {"precision": {"param_dtype": param_dtype}}}}
+        dtype = deployment_precisions(model, config, NODES)["conformer_encoder"].param_dtype
+        assert dtype == getattr(torch, param_dtype)
+    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=dtype,
+                              node_dtypes={"conformer_encoder": dtype})
+    if dtype is None:
         with pytest.raises(ValueError, match="declares no dtype"):
             RecurrentStatePool.build(specs[ENCODER_STATE], info)
         return
     pool = RecurrentStatePool.build(specs[ENCODER_STATE], info)
-    assert {pool.block(name, 0).dtype for name in specs[ENCODER_STATE].config.blocks} == {autocast_dtype}
-    assert BoundedKVManager.build(specs[ENCODER_KV], info).layer(0).dtype == autocast_dtype
+    assert {pool.block(name, 0).dtype for name in specs[ENCODER_STATE].config.blocks} == {dtype}
+    assert BoundedKVManager.build(specs[ENCODER_KV], info).layer(0).dtype == dtype
 
 
 class _LoadReachedError(Exception):

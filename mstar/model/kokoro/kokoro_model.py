@@ -28,6 +28,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -242,8 +243,11 @@ class KokoroModel(Model):
     def get_default_voice(self) -> str:
         return self.config.default_voice
 
-    def get_autocast_dtype(self):
-        return torch.float32
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        # fp32 end to end, as the reference: the phase-sensitive vocoder does
+        # not tolerate reduced precision (the decoder's own autocast is a config)
+        del node_name
+        return NodePrecision(torch.float32, autocast=False)
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """Emitted PCM16 tensor -> little-endian bytes."""

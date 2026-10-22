@@ -153,14 +153,15 @@ def test_pruned_combine_matches_the_old_combine(renorm, rmin, request_kind, dtyp
     for k in STEPS:
         old = _old_combine(k, v_main, v_text, v_img, *args)
         new = _pruned_combine(k, v_main, v_text, v_img, *args)
-        assert new.dtype == old.dtype
         if _branches(k, *args[:3]) > 1:
             # in the interval: the same ops on the same branches
+            assert new.dtype == old.dtype
             assert torch.equal(new, old), (k, renorm)
         else:
-            # outside: the old combine was v_main up to rounding
+            # outside: the old combine was v_main up to rounding, in fp32 where
+            # a per-channel renorm (fp32) scaled it
             tol = 1e-6 if dtype == torch.float32 else 1e-2
-            torch.testing.assert_close(new, old, rtol=tol, atol=tol)
+            torch.testing.assert_close(new.float(), old.float(), rtol=tol, atol=tol)
 
 
 # --- the declaration and the forward's inputs -----------------------------

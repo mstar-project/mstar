@@ -306,9 +306,10 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="prefill_audio",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
+                    # the dtype `prepare_inputs` embeds in, the node's param dtype
                     input_embeds=torch.zeros(
                         (n, self.config.hidden_size),
-                        device=device, dtype=torch.bfloat16,
+                        device=device, dtype=self.model.embed_tokens.weight.dtype,
                     ),
                 ),
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -338,7 +339,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 if inputs.get(name) else None
                 for name in ("text_pre", "text_post")
             )
-            dtype = (pre if pre is not None else audio).dtype
+            # the LLM's dtype: the encoder node's policy may differ
+            dtype = self.model.embed_tokens.weight.dtype
             embeds = torch.cat([t.to(dtype) for t in (pre, audio, post) if t is not None], dim=0)
             return ARNodeInputs(
                 input_seq_len=embeds.shape[0],

@@ -4,8 +4,9 @@ diffusers 0.41's Cosmos3OmniPipeline keeps the denoise state of every band in
 fp32 (the noise, the latents between steps, the guidance combine and the
 scheduler step) and casts to bf16 only for the transformer input. The served
 loop does the same for image, video, sound and action requests (windowed
-rollouts keep bf16), and the DiT's forwards run with the engine's CUDA autocast
-off so the fp32 step is not cast back down. The stand-in returns fixed bf16
+rollouts keep bf16), and the DiT's forwards run with CUDA autocast off (the
+node's policy, and the forwards' own guard against an ambient autocast) so the
+fp32 step is not cast back down. The stand-in returns fixed bf16
 velocities per guidance branch, so a guidance combine or a scheduler step run
 in bf16 shows in the result.
 """
@@ -313,9 +314,8 @@ def _record_autocast(seen):
 
 @pytest.mark.parametrize("walk", [C.PREFILL_WALK, C.IMAGE_GEN_WALK, C.VIDEO_SOUND_GEN_WALK, C.ACTION_GEN_WALK])
 def test_forwards_run_with_the_engine_autocast_off(walk, monkeypatch) -> None:
-    """The engine runs a node's forward under its bf16 autocast; the DiT's eager
-    and batched forwards turn it off for everything they call (on a CPU host
-    the flag is set by hand, which is what the engine's scope does on a GPU)."""
+    """Under an ambient bf16 autocast, the DiT's eager and batched forwards turn
+    it off for everything they call (on a CPU host the flag is set by hand)."""
     sub = _dit()
     seen: list[bool] = []
     for name in (

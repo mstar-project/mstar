@@ -55,16 +55,6 @@ class Qwen3OmniVisionTower(nn.Module):
             OmniPatchMerger(config, postshuffle=True) for _ in config.deepstack_visual_indexes
         )
 
-    def _apply(self, fn, recurse=True):
-        """Keep the rotary frequencies fp32 through a dtype cast (the worker
-        casts every submodule to its node's dtype), as the reference does: in
-        bf16 the far patches of a large image rotate by visibly wrong angles."""
-        out = super()._apply(fn, recurse)
-        rotary = self.rotary_pos_emb
-        if rotary.inv_freq.dtype != torch.float32 and rotary.inv_freq.device.type != "meta":
-            rotary.inv_freq = VisionRotaryEmbedding(self.config).inv_freq.to(rotary.inv_freq.device)
-        return out
-
     def embed(
         self,
         pixel_values: torch.Tensor,

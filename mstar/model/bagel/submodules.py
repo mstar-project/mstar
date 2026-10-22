@@ -318,8 +318,8 @@ def combine_cfg_velocity(
     if renorm_type == "text_channel":
         # text_channel: renorm AFTER text CFG, THEN apply image CFG
         v_text_guided = v_cfg_text + text_scale * (v_main - v_cfg_text)
-        norm_v = torch.norm(v_main, dim=-1, keepdim=True)
-        norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
+        norm_v = torch.norm(v_main.float(), dim=-1, keepdim=True)
+        norm_v_text = torch.norm(v_text_guided.float(), dim=-1, keepdim=True)
         scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=renorm_min, max=1.0)
         v_text_renormed = v_text_guided * scale
         if apply_img:
@@ -335,12 +335,12 @@ def combine_cfg_velocity(
 
     if renorm_type == "channel":
         renorm_scale = (
-            v_main.norm(dim=-1, keepdim=True) /
-            (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
+            v_main.float().norm(dim=-1, keepdim=True) /
+            (v_combined.float().norm(dim=-1, keepdim=True) + 1e-8)
         ).clamp(min=renorm_min, max=1.0)
     else:
         renorm_scale = (
-            v_main.norm() / (v_combined.norm() + 1e-8)
+            v_main.float().norm() / (v_combined.float().norm() + 1e-8)
         ).clamp(min=renorm_min, max=1.0)
     return v_combined * renorm_scale
 
@@ -568,9 +568,9 @@ class ViTEncoderSubmodule(NodeSubmodule):
         stay traceable, which is worth ~7% on this tower.
         """
         vision_model = self.vit_model.vision_model
-        hidden_states, rope_inputs = vision_model.embed(
-            packed_pixel_values, packed_position_ids
-        )
+        # fp32 pixels, in the patch embedding's dtype
+        pixels = packed_pixel_values.to(vision_model.embeddings.patch_embedding.weight.dtype)
+        hidden_states, rope_inputs = vision_model.embed(pixels, packed_position_ids)
         captured = self._replay_block_loop(
             engine_inputs, hidden_states, rope_inputs, cu_seqlens, seq_lens,
         )
@@ -822,7 +822,8 @@ class VAEEncoderSubmodule(NodeSubmodule):
             packed_timesteps.shape, h, w
         )
 
-        latent = self.vae_model.encode(padded_images, noise=vae_noise)
+        vae_dtype = next(self.vae_model.parameters()).dtype
+        latent = self.vae_model.encode(padded_images.to(vae_dtype), noise=vae_noise)
 
         p = self.latent_patch_size
         # h, w are already ints from preprocess (CUDA graph compatible)
@@ -840,7 +841,10 @@ class VAEEncoderSubmodule(NodeSubmodule):
         # Project to hidden dim with timestep and position embeddings
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
+        packed_latent = (
+            self.vae2llm(packed_latent.to(self.vae2llm.weight.dtype))
+            + packed_timestep_embeds + packed_pos_embed
+        )
         return {"img_emb": [packed_latent]}
 
 def _init_latents_and_time_index(
@@ -863,8 +867,6 @@ def _init_latents_and_time_index(
         generator=g,
         device=device,
     )
-    if torch.is_autocast_enabled(latents.device.type):
-        latents = latents.to(torch.get_autocast_dtype(latents.device.type))
     time_idx = torch.zeros(latents.shape[0], device=device)
     return latents, time_idx
 
@@ -1135,9 +1137,10 @@ class LLMSubmodule(ARNodeSubmodule):
             shape_inputs = self._image_gen_shape_inputs(H, W, device)
             tensor_inputs = {"vae_position_ids": shape_inputs["vae_position_ids"]}
             if first_iter:
-                node_inputs.input_embeds, tensor_inputs["time_index"] = _init_latents_and_time_index(
+                latents, tensor_inputs["time_index"] = _init_latents_and_time_index(
                     self.config, device, seed=fwd_info.random_seed, H=H, W=W
                 )
+                node_inputs.input_embeds = latents.to(self.llm2vae.weight.dtype)
             else:
                node_inputs.input_embeds = inputs["latents"][0]
                tensor_inputs["time_index"] = inputs["time_index"][0]
@@ -1660,9 +1663,7 @@ class LLMSubmodule(ARNodeSubmodule):
             v_final = self.llm2vae(hidden)[1:-1]
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
-        latents = latents - v_final * dt
-        if torch.is_autocast_enabled(latents.device.type):
-            latents = latents.to(torch.get_autocast_dtype(latents.device.type))
+        latents = (latents - v_final * dt).to(self.llm2vae.weight.dtype)
         return {
             "latents": [latents],
             "time_index": [time_index + 1]
@@ -2111,9 +2112,8 @@ class CombineCFGSubmodule(NodeSubmodule):
         )
 
         # Euler step
-        new_latents = latents - v_final * dt
-        if torch.is_autocast_enabled(new_latents.device.type):
-            new_latents = new_latents.to(torch.get_autocast_dtype(new_latents.device.type))
+        # the velocities come in the LLM nodes' param dtype
+        new_latents = (latents - v_final * dt).to(v_main.dtype)
 
         new_time_index = time_index + 1
         return {

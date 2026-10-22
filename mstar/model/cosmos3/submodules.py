@@ -478,17 +478,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             time.perf_counter() - t0, width, height, frames,
         )
 
-    def to(self, *args, **kwargs):
-        # The engine casts this submodule to bf16; the timestep embedder must stay
-        # fp32 (diffusers keeps it in _keep_in_fp32_modules, and the multi-step
-        # video denoise scrambles when it runs in bf16), so re-assert fp32 after
-        # any cast — paired with the autocast-disabled forward below.
-        super().to(*args, **kwargs)
-        te = getattr(self.transformer, "time_embedder", None)
-        if te is not None:
-            te.float()
-        return self
-
     def cg_key_info(
         self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None, **kwargs,
     ) -> object | None:
@@ -2091,8 +2080,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         output comes at the end of its loop."""
         return StepOrder.TURNS if graph_walk == VIDEO_GEN_AR_WALK else StepOrder.ARRIVAL
 
-    # Native bf16, not the engine autocast — see the note on forward(). The
-    # cross-request batched denoise must match the per-request path exactly.
+    # Native bf16, not autocast: autocast keeps norms in fp32, perturbing the
+    # velocity ~1 ULP/step, amplified geometrically over the multi-step video
+    # denoise. The node's policy runs it without autocast; this also covers a
+    # direct call. The cross-request batched denoise must match the per-request
+    # path exactly.
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
@@ -2720,9 +2712,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
     ):
         vae = self.vae
         # In the VAE's own dtype, like the reference pipeline's encode and latent
-        # normalization: bf16 as built and as the engine casts this node. An
-        # fp32 encode moves the anchor latent enough to move the whole i2v
-        # trajectory.
+        # normalization: bf16 as built and as the node's precision policy keeps
+        # it. An fp32 encode moves the anchor latent enough to move the whole
+        # i2v trajectory.
         dtype = next(vae.parameters()).dtype
         device = vision.device
         mean, inv_std = _latent_affine(vae, dtype, device)
@@ -2860,9 +2852,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode
         # through the shared Wan VAE decoder, always channels-last.
         fast = vae is not None and fast
-        if fast:
+        if vae is not None:
             # Cast before the layout switch and the compile trace, so both see
-            # the weights the decode runs with.
+            # the weights the decode runs with; the node's precision policy
+            # keeps this dtype (an instance shared with another decoder takes
+            # the same one).
             self.vae = vae = vae.to(self._decode_dtype())
         # Channels-last weights and activations (cuDNN's native conv3d layout),
         # converted in place before any compile traces the decode; only the
@@ -2914,10 +2908,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
         mean, inv_std = _latent_affine(vae, vae_dtype, latents.device)
-        # Force z to the VAE dtype: the engine's outer autocast promotes the
-        # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
-        # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
-        # on the fp32-decode path.
+        # z in the VAE dtype: the latents arrive fp32, and a fp32 z into a bf16
+        # conv3d fails ("Input type (float) and bias type (BFloat16)").
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         if self._channels_last:
             # Also the layout the compiled decode's warm-up traces with.

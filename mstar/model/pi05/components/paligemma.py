@@ -20,6 +20,22 @@ from mstar.model.components.distributed import ParallelAttention, ParallelGatedM
 from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 
 
+class _ProjectionInputNorm(RMSNorm):
+    """Gemma RMSNorm (fp32 math, fp32 weight) whose output is rounded to the
+    dtype of the projections it feeds.
+
+    The prefix residual stream is fp32 (the image features are), so the norm
+    returns fp32; ``compute_dtype`` is the one rounding before the bf16 q/k/v
+    and gate/up projections, where autocast used to put it.
+    """
+
+    compute_dtype: torch.dtype | None = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        out = super().forward(hidden_states)
+        return out if self.compute_dtype is None else out.to(self.compute_dtype)
+
+
 def _build_paligemma_layer(
     config: Pi05Config,
     input_hidden_size: int | None = None,
@@ -50,8 +66,8 @@ def _build_paligemma_layer(
             intermediate_size=inter,
             activation="gelu_tanh",
         ),
-        input_layernorm=RMSNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
-        post_attention_layernorm=RMSNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
+        input_layernorm=_ProjectionInputNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
+        post_attention_layernorm=_ProjectionInputNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
     )
 
 
@@ -71,6 +87,13 @@ class Pi05PaliGemmaExpert(nn.Module):
             [_build_paligemma_layer(config) for _ in range(config.num_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma_mode=True)
+
+    def set_compute_dtype(self, dtype: torch.dtype | None) -> None:
+        """The dtype the layers' projections run in (the node's param dtype);
+        None leaves the norm outputs in the residual stream's dtype."""
+        for layer in self.layers:
+            layer.input_layernorm.compute_dtype = dtype
+            layer.post_attention_layernorm.compute_dtype = dtype
 
     def forward(
         self,

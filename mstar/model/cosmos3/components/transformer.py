@@ -180,14 +180,6 @@ class TimestepEmbedder(nn.Module):
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=True)
 
-    def _apply(self, fn, recurse=True):
-        # ``Module.to``/``.bfloat16()`` on any ancestor lands here; keep the
-        # device move, undo the dtype change.
-        super()._apply(fn, recurse)
-        if any(t.is_floating_point() and t.dtype != torch.float32 for t in self.parameters()):
-            super()._apply(lambda t: t.float() if t.is_floating_point() else t, recurse)
-        return self
-
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
         return self.linear_2(self.act(self.linear_1(sample.float())))
 

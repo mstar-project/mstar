@@ -133,9 +133,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         ).to(device=encoder.conv1.weight.device, dtype=torch.float32)  # float32 even under a bf16 default dtype
 
     def _mel(self, audio: torch.Tensor) -> torch.Tensor:
-        """The spectrogram in float32 whatever dtype the engine cast this
-        module to (it casts submodules to the compute dtype after they are
-        built; a bf16 STFT would not match the reference features)."""
+        """The spectrogram in float32 (a bf16 STFT would not match the
+        reference features). The node's precision policy keeps ``log_mel``
+        fp32; this covers a caller that cast the whole module."""
         if self.log_mel.window.dtype != torch.float32:
             self.log_mel.float()
         return self.log_mel(audio)

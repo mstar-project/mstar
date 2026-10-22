@@ -24,6 +24,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -315,6 +316,12 @@ class CanaryModel(Model):
     # -------------------------------------------------------------------
     # submodules
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params under bf16 autocast for every node: the shared
+        FastConformer encoder leaves its precision to autocast."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=True)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

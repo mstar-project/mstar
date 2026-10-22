@@ -26,6 +26,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (  # noqa
     Qwen3OmniMoeVisionEncoder,
 )
 
+from mstar.engine.precision import apply_precision  # noqa: E402
 from mstar.engine.resources import RaggedAttentionSpec  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
@@ -221,10 +222,12 @@ def test_vision_capture_refuses_more_frames_than_a_replay_plans(vision_pair):
     assert not sub._fits_capture(rows[1:])
 
 
-def test_rotary_table_stays_fp32_through_a_cast():
-    tower = Qwen3OmniVisionTower(VisionEncoderConfig.from_dict(VISION), attn_key=VISION_ATTN)
+def test_rotary_table_stays_fp32_under_the_node_precision():
+    config = VisionEncoderConfig.from_dict(VISION)
+    tower = Qwen3OmniVisionTower(config, attn_key=VISION_ATTN)
     want = tower.rotary_pos_emb.inv_freq.clone()
-    tower = tower.to(torch.bfloat16)
+    sub = VisionEncoderSubmodule(tower, Qwen3OmniModelConfig(vision=config))
+    apply_precision(sub, object.__new__(Qwen3OmniModel).get_node_precision("vision_encoder"))
     assert tower.patch_embed.proj.weight.dtype == torch.bfloat16
     assert tower.rotary_pos_emb.inv_freq.dtype == torch.float32
     assert torch.equal(tower.rotary_pos_emb.inv_freq, want)

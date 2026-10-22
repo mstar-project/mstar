@@ -14,8 +14,8 @@ from torch import nn
 
 from mstar.model.waypoint.config import WaypointConfig
 
-# Submodule paths, relative to the WaypointDiT root, whose parameters must be
-# restored to fp32 after a global .to(torch.bfloat16). The reference's
+# Submodule paths, relative to the WaypointDiT root, that stay fp32 while the
+# rest serves in bf16 (the dit's precision policy). The reference's
 # NoCastModule set has three members; the other two (OrthoRoPEAngles, OrthoRoPE)
 # carry no parameters or buffers for a cast to corrupt.
 FP32_MODULE_PATHS: tuple[str, ...] = ("denoise_step_emb",)
@@ -146,7 +146,7 @@ class MLP(nn.Module):
 class NoiseConditioner(nn.Module):
     """sigma -> Fourier features -> MLP, the DiT's only noise-level input.
 
-    fp32 island: ``FP32_MODULE_PATHS`` pins ``self.mlp`` back to fp32 after the
+    fp32 island: ``FP32_MODULE_PATHS`` keeps ``self.mlp`` fp32 under the
     serving bf16 cast, and the body runs under ``autocast(enabled=False)`` on a
     ``.float()`` sigma and, eagerly, under ``fp32_matmul_highest`` (a batched
     call rounds through TF32 at ``'high'``, and cuBLAS 13 on a B200 rounds

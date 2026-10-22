@@ -204,7 +204,10 @@ You must implement these abstract methods:
      inputs' dtypes, so where the model needs fp32 (a softmax, a norm, a timestep
      embedding) it says so in ``fp32_modules`` or with an explicit ``.float()``. Keep
      ``autocast=True`` only for a node whose reference numerics depend on autocast's
-     implicit fp32 ops and that has not been checked without them.
+     implicit fp32 ops and that has not been checked without them. ``autocast`` may also
+     name a dtype, for a node that keeps the dtypes it builds itself in
+     (``param_dtype=None``) but runs under autocast. Under autocast, ``rms_norm`` and
+     RoPE take the autocast dtype, as other ops do.
 
    The policy is known before the submodule exists, so ``get_submodule`` can build in
    it. The default is ``NodePrecision(torch.bfloat16)``. Nodes that share a module must

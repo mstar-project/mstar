@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.model.vjepa2.components.layers import VJEPA2Layer
+from mstar.model.vjepa2.components.layers import CastLinear, FP32LayerNorm, VJEPA2Layer
 from mstar.model.vjepa2.components.vit_encoder import apply_masks
 from mstar.model.vjepa2.config import VJepa2Config
 
@@ -33,7 +33,7 @@ class VJEPA2PredictorEmbeddings(nn.Module):
     def __init__(self, config: VJepa2Config):
         super().__init__()
         self.config = config
-        self.predictor_embeddings = nn.Linear(config.hidden_size, config.pred_hidden_size)
+        self.predictor_embeddings = CastLinear(config.hidden_size, config.pred_hidden_size)
         self.num_mask_tokens = config.pred_num_mask_tokens
         self.zero_init_mask_tokens = config.pred_zero_init_mask_tokens
         self.mask_tokens = nn.Parameter(torch.zeros(self.num_mask_tokens, 1, 1, config.pred_hidden_size))
@@ -85,8 +85,8 @@ class VJEPA2Predictor(nn.Module):
                 for _ in range(config.pred_num_hidden_layers)
             ]
         )
-        self.layernorm = nn.LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
-        self.proj = nn.Linear(config.pred_hidden_size, config.hidden_size, bias=True)
+        self.layernorm = FP32LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
+        self.proj = CastLinear(config.pred_hidden_size, config.hidden_size, bias=True)
 
     @staticmethod
     def _sort_tokens(

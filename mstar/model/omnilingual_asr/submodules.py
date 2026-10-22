@@ -50,9 +50,6 @@ class OmniASRCTCSubmodule(NodeSubmodule):
     # forward would recompile per shape; the encoder runs eagerly. The conv
     # feature extractor alone is compiled (``compile_regions``).
     disable_torch_compile = True
-    # The model runs in its own dtype end to end, as the reference does (only
-    # the conv stack's LayerNorms upcast to fp32), not under autocast.
-    disable_autocast = True
 
     # Frames of one packed encoder replay (50 a second); a step past the top
     # bucket runs the encoder eagerly. 16384 frames is 320 s, the default

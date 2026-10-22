@@ -44,6 +44,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -149,6 +150,8 @@ class CosyVoice3Model(Model):
 
     INTERNAL_KWARGS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY, PROMPT_MODE)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
+    # the LM's dtype; ``lm_dtype`` overrides it per instance
+    _lm_dtype: torch.dtype = torch.bfloat16
 
     def __init__(
         self,
@@ -692,8 +695,16 @@ class CosyVoice3Model(Model):
     # Output
     # -----------------------------------------------------------------------
 
-    def get_autocast_dtype(self):
-        return self._lm_dtype
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """The LM runs in ``lm_dtype`` under autocast. The cast covers its
+        ``llm_decoder`` too, so the head's weight is rounded to ``lm_dtype``
+        although the logits matmul runs in fp32. The other nodes keep the
+        dtypes they are built in (fp32; the flow estimator in
+        ``flow_estimator_dtype``, the HiFT f0 predictor in fp64) and run
+        without autocast."""
+        if node_name == LM_NODE:
+            return NodePrecision(self._lm_dtype, autocast=True)
+        return NodePrecision(None)
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return SAMPLE_RATE

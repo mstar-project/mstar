@@ -58,7 +58,6 @@ class TransducerSubmodule(NodeSubmodule):
     """
 
     MAX_BATCH_SIZE = max(CAPTURE_BATCH_SIZES)
-    disable_autocast = True
     # only the greedy step is compiled (``__init__``)
     disable_torch_compile = True
     # TF32 flips argmax near-ties

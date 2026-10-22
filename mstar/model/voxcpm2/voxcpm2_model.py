@@ -41,6 +41,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -646,6 +647,13 @@ class VoxCPM2Model(Model):
 
         self.local_dir = snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
         return self.local_dir
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """Every node keeps the dtype it is built in and runs without autocast,
+        as the reference does: the Talker in the checkpoint's bf16 with fp32
+        LongRoPE tables, the AudioVAE in fp32."""
+        del node_name
+        return NodePrecision(None)
 
     def get_submodule(
         self,
