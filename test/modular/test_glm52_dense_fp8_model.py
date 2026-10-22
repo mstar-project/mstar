@@ -42,15 +42,10 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.model.components.distributed import ColumnParallelLinear  # noqa: E402
+from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, Fp8ParallelGatedMLP  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
-from mstar.model.glm52.components.fp8_linear import (  # noqa: E402
-    COLUMN,
-    ROW,
-    Fp8Linear,
-    Fp8ParallelGatedMLP,
-)
 from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 

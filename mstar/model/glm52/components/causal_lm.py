@@ -120,7 +120,7 @@ class Glm52ForCausalLM(nn.Module):
             load_mtp=self.mtp is not None,
         )
         if self.config.dense_fp8:
-            from mstar.model.glm52.components.fp8_linear import Fp8Linear
+            from mstar.model.components.fp8_linear import Fp8Linear
 
             missing = {
                 f"{name}.{p}" for name, m in self.named_modules() if isinstance(m, Fp8Linear)

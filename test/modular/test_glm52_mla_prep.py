@@ -9,9 +9,9 @@ import pytest
 import torch
 
 from mstar.model.components.rope import InterleavedRotaryEmbedding
-from mstar.model.glm52 import mla_prep
 from mstar.model.glm52.components.attention import Glm52MLAAttention
 from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.utils import mla_prep
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernels need CUDA")
 

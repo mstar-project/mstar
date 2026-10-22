@@ -237,9 +237,9 @@ def test_router_kernel_matches_the_torch_top_k(tokens):
     gate = _gate(hidden=6144, experts=256, device="cuda")
     x = torch.randn(tokens, 6144, dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():  # as the engine runs it
-        w_ref, ids_ref = gate(x)
+        w_ref, ids_ref, _ = gate(x)
         gate._topk_op = moe_decode.router_topk
-        w, ids = torch.compile(gate, fullgraph=True)(x)  # an opaque op: no graph break
+        w, ids, _ = torch.compile(gate, fullgraph=True)(x)  # an opaque op: no graph break
     _, _, gap = _fp32_reference(gate, x)
     clear = gap > 1e-5
     ids, order = ids.sort(dim=-1)

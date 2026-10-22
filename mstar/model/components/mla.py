@@ -24,16 +24,10 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
+from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, dense_fp8_block, fp8_block_linear
 from mstar.model.components.norm import RMSNorm
 from mstar.model.components.rope import InterleavedRotaryEmbedding
-from mstar.model.glm52 import mla_prep
-from mstar.model.glm52.components.fp8_linear import (
-    COLUMN,
-    ROW,
-    Fp8Linear,
-    dense_fp8_block,
-    fp8_block_linear,
-)
+from mstar.utils import mla_prep
 
 
 class MLAAttention(nn.Module):

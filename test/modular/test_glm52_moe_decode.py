@@ -229,7 +229,7 @@ def test_decode_matches_oracle_at_rank_shapes(rank_block, tokens, fp32_matmul):
     torch.manual_seed(tokens)
     x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
-        topk_w, topk_ids = block.gate(x)
+        topk_w, topk_ids, _ = block.gate(x)
         got = block._dispatch_decode(x, topk_w, topk_ids)
         oracle = _oracle(block, x, topk_w, topk_ids)
         old = _current(block, x)
@@ -279,7 +279,7 @@ def test_grouped_x_row_scales(rank_block, tokens, fp32_matmul):
     x[2, 7] = 3.0e4
     x = x.to(torch.bfloat16)
     with torch.no_grad():
-        topk_w, topk_ids = block.gate(x)
+        topk_w, topk_ids, _ = block.gate(x)
         got = block._dispatch_decode(x, topk_w, topk_ids).float()
         ref, mag = _oracle(block, x, topk_w, topk_ids)
     assert torch.equal(got[1], torch.zeros_like(got[1]))
@@ -313,7 +313,7 @@ def test_router_matches_the_fp32_gate(rank_block, tokens, fp32_matmul):
             w, ids = moe_decode.route(
                 x, gate.weight, gate.e_score_correction_bias, top_k=gate.top_k,
                 scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob)
-            w_r, ids_r = gate(x)
+            w_r, ids_r, _ = gate(x)
         assert w.dtype == torch.float32 and ids.dtype == torch.int64
         # same experts per token (the reference's topk order is unspecified)
         ids, order = ids.sort(dim=-1)
@@ -335,7 +335,7 @@ def test_router_fp32_operands_and_odd_sizes(fp32_matmul):
     x = torch.randn(5, 512, device="cuda")
     w, ids = moe_decode.route(x, gate.weight, gate.e_score_correction_bias, top_k=3,
                               scale=2.5, normalize=True)
-    w_r, ids_r = gate(x)
+    w_r, ids_r, _ = gate(x)
     ids, order = ids.sort(dim=-1)
     ids_r, order_r = ids_r.sort(dim=-1)
     torch.testing.assert_close(ids, ids_r, rtol=0, atol=0)
@@ -378,7 +378,7 @@ def test_large_batch_and_flag_off_take_the_current_path(rank_block):
                 got = block(x)
             else:
                 got = _current(block, x)
-            topk_w, topk_ids = block.gate(x)
+            topk_w, topk_ids, _ = block.gate(x)
             exp = block.experts
             old = fused_experts_fp8(
                 x, exp.gate_up_proj_fp8, exp.down_proj_fp8, exp.gate_up_proj_scale_inv,

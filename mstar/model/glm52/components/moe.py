@@ -11,6 +11,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.components.moe import (
     NoAuxTcRouter,
     _dispatch,
@@ -20,7 +21,6 @@ from mstar.model.components.moe import (
     _gate_up_weight_loader,
     dispatch_experts_fused,
 )
-from mstar.model.glm52.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.utils.fp8_block import dequantize_fp8_block_weight
 
