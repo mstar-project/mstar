@@ -20,6 +20,7 @@ ATTN = "attn"              # the absorbed-MLA attention backend over KV_CACHE
 SAMPLER = "sampler"
 KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of the 34 KDA layers
 KDA = "kda"                # the KDA linear attention run against KDA_STATE
+DSA = "dsa"                # dsa_long_context: the k-pool DSA over KV_CACHE's index planes
 # KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
 # step's first token, and that draft
 MTP_HIDDEN = "mtp_hidden"
@@ -153,7 +154,7 @@ class Glm5NextModelConfig:
     # where dense MLA computes exactly what DSA would (selecting
     # <= topk/kpool pools out of <= topk/kpool is the identity, tail
     # included). On: contexts up to max_seq_len, every MLA layer through
-    # the k-pool indexer and sparse MLA (dsa.py).
+    # the k-pool indexer and sparse MLA (mstar/engine/resources/dsa/kpool.py).
     dsa_long_context: bool = False
     # dsa_long_context: a prefill step runs its tokens through the model in windows of
     # this many, so activations stay bounded however long the prompt.
@@ -394,7 +395,7 @@ class Glm5NextModelConfig:
             # masked one a sparse plan's spare entries attend
             raise ValueError(f"page_size={page_size} must exceed an MTP block of "
                              f"{self.mtp_num_draft_tokens + 1} rows")
-        from mstar.engine.resources.attn.sparse_mla import check_flashinfer
+        from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 
         check_flashinfer()
 
