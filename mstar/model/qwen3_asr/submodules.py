@@ -24,6 +24,10 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
@@ -46,14 +50,19 @@ from mstar.model.qwen3_asr.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    device_loopback_enabled,
 )
 
 logger = logging.getLogger(__name__)
 
 WINDOW_LABEL = "main"
+# The AuT encoder's transformer stack and projector, as a piecewise capture region
+AUT_ENCODE = "aut_encode"
 
 
 # ===================================================================
@@ -129,7 +138,10 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
-    ) -> SubmoduleStep:
+    ) -> SubmoduleStep | None:
+        # leased, the captured stack plans its own attention per replay
+        if (piecewise_leases or {}).get(AUT_ENCODE):
+            return None
         # one segment per attention window, in the packed order the forward
         # lays the requests out in
         segments = [
@@ -153,8 +165,81 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         ])
         return {"audio_features": padded, "feature_lens": lens}
 
-    def _encode(self, audio_features: torch.Tensor, feature_lens: list[int]) -> list[torch.Tensor]:
-        embeds, layout = self.encoder(audio_features, feature_lens)
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype,
+        tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """The encoder's 24-layer stack and projector, by batch size and packed
+        token count. At ASR clip lengths (13 tokens a second) its GEMMs are a
+        few dozen rows, so eager it is launch-bound: a 7 s clip's stack is
+        ~6.3 ms eager and ~1.9 ms replayed. The conv frontend before it runs
+        eagerly. Batches past the largest bucket run eagerly too."""
+        d_model = self.encoder.config.d_model
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            return {"hidden": torch.zeros(shape.total_tokens, d_model, dtype=autocast_dtype, device=device)}
+
+        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            # Every window of every request is a segment; the kernel needs
+            # only the boundaries, so they all name the first row's id.
+            # Zero-length rows pad the batch to the bucket.
+            return SubmoduleStep(
+                segments=[Segment(request_id=request_ids[0], label=WINDOW_LABEL, span=n) for n in seq_lens],
+                steps={AUT_ATTN: AttentionStep(causal=False)},
+            )
+
+        return {
+            AUT_ENCODE: PiecewisePackedConfig(
+                capture_fn=self._capture_encode,
+                make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
+                lease_before_step=True,
+                total_tokens=self.ENCODE_TOKEN_BUCKETS,
+                capture_batch_sizes=self.ENCODE_CAPTURE_BATCH_SIZES,
+            )
+        }
+
+    # Packed token counts the stack is captured at, and batch sizes (up to
+    # MAX_BATCH_SIZE). 4096 tokens is 8 requests of ~39 s.
+    ENCODE_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+    ENCODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+
+    def _capture_encode(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        """The captured region: reads the runner's buffer, never rebinds."""
+        return {"embeds": self.encoder.encode(inp.static_inputs["hidden"], None)}
+
+    @torch.compiler.disable
+    def _replay_encode(
+        self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, windows: list[int],
+    ) -> torch.Tensor | None:
+        """The stack replayed for the whole packed batch, or None if not leased
+        (decided as the engine leased, on batch size and total tokens)."""
+        runner = engine_inputs.piecewise_runners.get(AUT_ENCODE)
+        bs = len(engine_inputs.request_ids)
+        if runner is None or not runner.can_run(bs, int(hidden.shape[0])):
+            return None
+        # an owned copy: the encoder states leave this worker after the step,
+        # and the buffer is the next replay's
+        return runner.run(
+            static_inputs={"hidden": hidden},
+            request_ids=list(engine_inputs.request_ids),
+            seq_lens=windows,
+            real_bs=bs,
+        ).get("embeds")
+
+    def _encode(
+        self, audio_features: torch.Tensor, feature_lens: list[int],
+        engine_inputs: ModelInputsFromEngine | None = None,
+    ) -> list[torch.Tensor]:
+        enc = self.encoder
+        layout = enc.layout(feature_lens)
+        hidden = enc.frontend(audio_features, feature_lens)
+        embeds = None
+        if engine_inputs is not None:
+            embeds = self._replay_encode(engine_inputs, hidden, layout.window_lengths)
+        if embeds is None:
+            cu = torch.tensor(layout.cu_seqlens, dtype=torch.int32, device=hidden.device)
+            embeds = enc.encode(hidden, cu)
         return list(embeds.split(layout.tokens_per_request, dim=0))
 
     def forward(
@@ -167,7 +252,7 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         if audio_features.dim() == 2:
             audio_features = audio_features.unsqueeze(0)
-        return {"audio_embeds": [self._encode(audio_features, feature_lens)[0]]}
+        return {"audio_embeds": [self._encode(audio_features, feature_lens, engine_inputs)[0]]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -184,7 +269,7 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         feature_lens: list[int],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        per_request = self._encode(audio_features, feature_lens)
+        per_request = self._encode(audio_features, feature_lens, engine_inputs)
         return {
             rid: {"audio_embeds": [emb]}
             for rid, emb in zip(engine_inputs.request_ids, per_request, strict=True)
@@ -215,6 +300,9 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     # Prefill and decode are graph replays. The compiled path only served the
     # uncaptured shapes and recompiled per request id (see the encoder).
     disable_torch_compile = True
+    # The decode walk reads its last token off the sampler's slot masters and
+    # its client token rides inline (see ``device_loopback_signals``).
+    reads_device_loopback = True
 
     def __init__(self, llm: Qwen3DenseLM, config: Qwen3ASRModelConfig):
         super().__init__()
@@ -269,6 +357,10 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
+        if graph_walk == DECODE_WALK and kwargs.get("has_loopback") and self._device_loopback():
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty here
+            return ARNodeInputs(input_seq_len=1)
         device = self.get_device()
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
         if graph_walk == DECODE_WALK:
@@ -303,6 +395,25 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    def uniform_row_inputs(self, graph_walk: str, has_loopback: bool = False) -> ARNodeInputs | None:
+        # the loop-back decode row above, built once for the step's rows
+        if graph_walk == DECODE_WALK and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def _device_loopback(self) -> bool:
+        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == DECODE_WALK and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the decode loop's client edge carries the token the stop check
+        # already has on the host; prefill's new_token edge is persisted
+        return {"text_inputs": "new_token"} if graph_walk == DECODE_WALK else {}
+
     def preprocess(
         self,
         graph_walk: str,
@@ -310,6 +421,16 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         if graph_walk == DECODE_WALK:
+            if any(inp.input_ids is None for inp in inputs):
+                # device loop-back: every row is its request's last sampled
+                # token, read by slot (padding rows read slot 0)
+                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+                ids = sampler.loopback_tokens(engine_inputs.request_ids)
+                # rows whose last step ran elsewhere brought their token
+                routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
+                if routed:
+                    sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
+                return {"input_ids": ids}
             return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
 
@@ -349,12 +470,16 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
-        return {
-            rid: {"new_token": [new_tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # Row i is request i: one clone and one D2H copy per step instead of
+        # one per request. A decode step's token is its loop's one signal
+        # (`text_inputs`); prefill's is the persisted first token.
+        signal = "text_inputs" if graph_walk == DECODE_WALK else "new_token"
+        return BatchedModelOutput(
+            row_outputs={signal: new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self,
@@ -372,11 +497,37 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if request_info.graph_walk != DECODE_WALK or "new_token" not in outputs:
+        tokens = outputs.get("text_inputs") or outputs.get("new_token")
+        if request_info.graph_walk != DECODE_WALK or not tokens:
             return set()
-        token = outputs["new_token"][0].item()
+        token = tokens[0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         if (not ignore_eos and token in self.config.stop_token_ids) or decoded >= request_info.max_tokens:
             return {DECODE_LOOP}
         return set()
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist``."""
+        if step_walk is not None and step_walk != DECODE_WALK:
+            return {}  # as check_stop: only a decode row's token is checked
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
+            return None
+        stop_ids = self.config.stop_token_ids
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            info = request_infos[rid]
+            if info.graph_walk != DECODE_WALK:
+                continue
+            if (
+                token in stop_ids and not info.resource_configs[SAMPLER].ignore_eos
+            ) or info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1 >= info.max_tokens:
+                stops[rid] = {DECODE_LOOP}
+        return stops

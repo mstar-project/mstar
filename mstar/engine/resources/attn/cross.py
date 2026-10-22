@@ -16,7 +16,10 @@ from mstar.engine.resources.attn.config import (
     AttnBackend,
     CrossAttentionSpec,
 )
-from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
+from mstar.engine.resources.attn.wrappers import (
+    FlashInferDecodeWrapper,
+    FlashInferPrefillWrapper,
+)
 from mstar.engine.resources.base import (
     AttentionResource,
     CGSlotKey,
@@ -30,6 +33,17 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+
+
+class _LastPlan(NamedTuple):
+    """What a wrapper was last planned with. The context's KV manager hands
+    back the same plan object while the context streams are untouched, so the
+    same object over the same query rows skips building the arrays; a new
+    object over the same pages still skips FlashInfer's plan."""
+    context: Any  # the context label's KVPlanOutput
+    request_ids: tuple
+    qo_indptr: tuple
+    plan_key: PlanCacheKey
 
 
 class QueryPacking(NamedTuple):
@@ -61,6 +75,7 @@ class CrossAttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
             )
         raise ValueError(f"Unknown cross attention backend {backend!r}")
 
@@ -86,9 +101,11 @@ class FlashInferCrossManager(CrossAttentionManager):
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
         backend: str = "auto",
+        decode_tensor_cores: bool = True,
     ):
         self._kv_cache_name = kv_cache
         self._query_kv_cache_name = query_kv_cache
+        self._decode_tensor_cores = decode_tensor_cores
         self._context_label = context_label
         self._device = device
         self._dtype = dtype
@@ -101,11 +118,8 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
-        # wrapper key (plan label, or CGSlotKey under capture) -> fingerprint
-        # of the last plan call made on that wrapper
-        # NOTE: a little bit (very) sketchy should be refined; goal is to avoid
-        # redundant plan comp. how to do the mapping to track is another issue
-        self._plan_keys: dict[Any, PlanCacheKey] = {}
+        # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
+        self._last_plans: dict[Any, _LastPlan] = {}
 
         self._kv_config = kv_config
         self._wrapper_kv_kwargs = dict(
@@ -159,38 +173,48 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._preplanned = False
             return
 
-        context_views = self._context_views(ctx)
+        context_out = self._context_output(ctx)
+        context_views = None
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
         for plan_label, packing in self._query_packings(step, ctx).items():
-            indptrs = self._build_indptrs(packing, context_views, plan_label)
+            qo_indptr = tuple(packing.qo_indptr.tolist())
+            num_rows = len(qo_indptr) - 1
+            # every row queries one token (a span-0 row does not)
+            decode = not ctx.force_prefill and qo_indptr == tuple(range(num_rows + 1))
             state_key, wrapper = self._wrapper_for(
-                plan_label, lease, num_rows=indptrs.qo_indptr.shape[0] - 1,
-                slot=ctx.slot,
+                plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
+            request_ids = tuple(packing.request_ids)
+            last = self._last_plans.get(state_key)
+            if (
+                last is not None and last.context is context_out
+                and last.request_ids == request_ids and last.qo_indptr == qo_indptr
+            ):
+                plan_states[plan_label] = wrapper
+                continue
+            if context_views is None:
+                context_views = {view.request_id: view for view in context_out.views}
+            indptrs = self._build_indptrs(packing, context_views, plan_label)
 
-            # The context pages are immutable once written, so between steps
-            # only the query side moves; when neither moved the whole plan is
-            # skippable. Every tensor here is on CPU, so `.tolist()` costs no
-            # sync.
-
-            # context is immutable; between step only q will change; when nothing
-            # changes we can skip plan (use old)
+            # The context pages are immutable once written, so only the query
+            # side moves between steps; when neither moved, FlashInfer's plan
+            # is skippable. Every tensor here is on CPU: `.tolist()` costs no sync.
             plan_key = PlanCacheKey(
-                q_seq_lens=tuple(indptrs.qo_indptr.tolist()),
+                q_seq_lens=qo_indptr,
                 page_indices=tuple(indptrs.paged_kv_indices.tolist()),
                 last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
             )
-            if self._plan_keys.get(state_key) != plan_key:
+            if last is None or last.plan_key != plan_key:
                 wrapper.plan(
                     causal=False,
                     dtype=self._dtype,
                     **indptrs.to_kwargs_dict()
                 )
-                self._plan_keys[state_key] = plan_key
+            self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
             plan_states[plan_label] = wrapper
 
         self._preplanned = ctx.is_preplan
@@ -200,11 +224,10 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._preplanned = False
         self._preplan_states = {}
 
-    def _context_views(self, ctx: StepContext) -> dict[str, SequenceView]:
-        """context stream of each request in batch by request id
-
-        key by request rather than zip with query view because not
-        necessarily same length"""
+    def _context_output(self, ctx: StepContext):
+        """The context label's KV plan output (its views are each request's
+        context stream; key by request rather than zip with the query rows,
+        which need not line up)."""
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._kv_cache_name
         )
@@ -218,7 +241,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             "that attends the context must declare a zero-span segment on "
             f"that label. planned: {sorted(plan_outputs)}"
         )
-        return {view.request_id: view for view in kv_out.views}
+        return kv_out
 
     def _query_packings(
         self, step: AttentionStep, ctx: StepContext
@@ -323,40 +346,66 @@ class FlashInferCrossManager(CrossAttentionManager):
 
     def _wrapper_for(
         self, plan_label: str, lease: SlotLease | None, num_rows: int, slot: int,
+        decode: bool = False,
     ) -> tuple[Any, AttentionWrapper]:
         """``num_rows`` is this label's qo_indptr row count — bucket.bs for an
         ordinary label, more when the query plan combines labels. See
-        ``FlashInferManager._cg_wrapper``."""
+        ``FlashInferManager._cg_wrapper``.
+
+        ``decode``: every row queries one token, as a decoder's cross
+        attention does each step against the whole encoder context, which the
+        decode kernel serves."""
         if lease is not None:
             key = CGSlotKey(
                 bucket=lease.bucket, slot=lease.slot, label=plan_label
             )
             wrapper = self._cg_plan_states.get(key)
-            if wrapper is None:
-                # built on first plan for the key; see FlashInferManager._cg_wrapper
-                wrapper = self._cg_plan_states[key] = FlashInferPrefillWrapper(
-                    workspace_buffer=self._workspaces.get(
-                        plan_label, lease.slot
-                    ),
-                    batch_size=num_rows,
-                    max_total_tokens=lease.bucket.num_tokens,
-                    accelerator_graph=True,
-                    **self._wrapper_kv_kwargs,
+            if wrapper is not None:
+                # a captured graph replays the kernel it was recorded with
+                assert isinstance(wrapper, FlashInferDecodeWrapper) == decode, (
+                    f"cross attention {plan_label!r} in {lease.bucket} was captured as "
+                    f"{'decode' if not decode else 'prefill'} but this step plans "
+                    f"{'decode' if decode else 'prefill'} rows"
                 )
+            else:
+                # built on first plan for the key; see FlashInferManager._cg_wrapper
+                workspace = self._workspaces.get(plan_label, lease.slot)
+                if decode:
+                    wrapper = self._decode_wrapper(workspace, batch_size=num_rows, accelerator_graph=True)
+                else:
+                    wrapper = FlashInferPrefillWrapper(
+                        workspace_buffer=workspace,
+                        batch_size=num_rows,
+                        max_total_tokens=lease.bucket.num_tokens,
+                        accelerator_graph=True,
+                        **self._wrapper_kv_kwargs,
+                    )
+                self._cg_plan_states[key] = wrapper
             return key, wrapper
 
         # slotted like the captured one, and on the same workspace; see
         # `FlashInferManager._eager_wrapper`
-        key = EagerSlotKey(label=plan_label, slot=slot)
+        key = EagerSlotKey(label=plan_label, slot=slot, is_decode=decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self._workspaces.get(plan_label, slot),
-                **self._wrapper_kv_kwargs,
-            )
+            workspace = self._workspaces.get(plan_label, slot)
+            if decode:
+                wrapper = self._decode_wrapper(workspace)
+            else:
+                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
+    def _decode_wrapper(self, workspace: torch.Tensor, **kwargs) -> FlashInferDecodeWrapper:
+        kv = self._wrapper_kv_kwargs
+        return FlashInferDecodeWrapper(
+            workspace_buffer=workspace,
+            num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],
+            head_dim=kv["head_dim"], page_size=kv["page_size"],
+            max_num_pages=kv["max_num_pages"], device=kv["device"], backend=kv["backend"],
+            use_tensor_cores=self._decode_tensor_cores,
+            **kwargs,
+        )
 
     def run(
         self, q: torch.Tensor, label: str | None = None,

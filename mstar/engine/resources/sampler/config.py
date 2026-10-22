@@ -19,6 +19,23 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+@dataclass(frozen=True)
+class LoopbackState:
+    """Per-request state a decode loop carries from step to step on the
+    device, beside its last sampled token: one row of ``width`` values per
+    request, kept by sampler slot. A row starts (and restarts, when its slot
+    is reused) at ``default``."""
+    width: int
+    dtype: torch.dtype
+    default: tuple[int | float, ...]
+
+    def __post_init__(self):
+        if len(self.default) != self.width:
+            raise ValueError(
+                f"LoopbackState default has {len(self.default)} values for width {self.width}"
+            )
+
+
 @dataclass
 class SamplerSpec(NodeResourceSpec):
     vocab_size: int | None # must be set for enabled_repetion_penalty
@@ -33,6 +50,10 @@ class SamplerSpec(NodeResourceSpec):
     # per step, so nodes that never ask for it pay nothing; a request that
     # sets ``min_p`` on a node without it is refused at ingest.
     enable_min_p: bool = False
+    # name -> extra loop-back state the node keeps by slot beside the last
+    # token (``SamplerResource.loopback_state`` / ``store_loopback_state``);
+    # only used on the device loop-back path
+    loopback_state: dict[str, LoopbackState] = field(default_factory=dict)
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -123,3 +144,6 @@ class SamplerStep(ResourceStep):
     # Rows whose sampled token is kept; None keeps every row. A dropped row
     # still draws, but its RNG offset and seen-token mask are not committed.
     kept_rids: frozenset[int] | None = None
+    # The spec's loop-back states this step's forward stores
+    # (``store_loopback_state``); commit persists them by slot.
+    loopback_writes: frozenset[str] = frozenset()

@@ -18,6 +18,8 @@ from pathlib import Path
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = "sampler"
+# The sampler's loop-back state holding each request's timestamp rule state
+TS_RULES = "ts_rules"
 # Positions: Whisper has no RoPE. The resource is declared for its
 # per-(request, label) position counter, which drives the learned absolute
 # ``embed_positions`` lookup; the attention layers never call it.

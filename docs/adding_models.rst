@@ -397,10 +397,16 @@ The spec types are:
        model needs a specific kernel. FlashInfer and dense attention require a
        ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"`` when the FlashInfer backend is selected.
+       ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
+       (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
+       kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
+       MHA and narrow GQA (few query heads per KV head). Measure before changing it:
+       Whisper and Qwen3-ASR declare ``False``.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
+       A step whose rows each query one token runs FlashInfer's decode kernel, and
+       ``decode_tensor_cores`` picks its variant as for ``AttentionConfig``.
        See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
@@ -427,7 +433,9 @@ The spec types are:
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
-       ``repetition_penalty`` values of the resident requests.
+       ``repetition_penalty`` values of the resident requests. ``loopback_state``
+       declares per-request state a decode loop keeps on the device beside its last
+       sampled token. See `Device loop-back`_.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -819,16 +827,19 @@ resource key:
   nothing. A request contributes one segment per label that is active for it.
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
   that does not set its own ``segments`` uses this list.
-- ``KVStep(commit=, combined_labels=, pre_forks=, post_forks=)``. See below.
+- ``KVStep(commit=, eager_write=, combined_labels=, pre_forks=, post_forks=)``. See
+  below.
 - ``AttentionStep(causal=)`` describes the attention plan. A ``RaggedAttentionSpec``
   steps through this same type. There, the segments are the whole layout rather than an
   extension of a cache. See `Cacheless attention (encoder towers)`_.
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
   the stream counters. Pass explicit ids, keyed by plan label, when the model computes
   positions itself.
-- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=)``. ``prefill_tracked_tokens``
-  initializes the repetition-penalty mask with the prompt tokens. Only the prefill step
-  passes them, because the sampler tracks every token it samples afterwards.
+- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=, loopback_writes=)``.
+  ``prefill_tracked_tokens`` initializes the repetition-penalty mask with the prompt
+  tokens. Only the prefill step passes them, because the sampler tracks every token it
+  samples afterwards. ``loopback_writes`` names the declared loop-back states this step's
+  forward stores (see `Device loop-back`_).
 
 The Orpheus declaration is the simplest form. It uses one label, computes spans directly
 from the prepared inputs, and steps all four resources together:
@@ -888,6 +899,18 @@ handled as special cases. BAGEL uses all of them, in
   branch that must keep the context from before this step. ``post_forks`` forks at commit
   time, for a branch that must include this step's
   writes.
+- ``eager_write=True``: the step's tokens for this cache are written outside any captured
+  graph, for example in ``preprocess`` before the replay. Their addressing stays an
+  ordinary plan rather than the slot's static buffers, which are sized for the bucket's
+  in-graph tokens. Whisper's prefill uses it to write its 1500-token encoder context
+  while replaying a graph sized by its few prompt tokens.
+
+**Writing K/V yourself.** A layer that writes its K/V inside a fused kernel of its own,
+rather than through ``write_kv``, asks the KV resource where the step's tokens go:
+``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
+page of each token, number of tokens to write)`` for the current plan (NHD layout only).
+Tokens past that number are the plan's padding and must not be written. Qwen3-ASR's
+fused q/k norm, RoPE and KV-write kernel (``Qwen3Attention``) is the example.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/vjepa2/fake_resources.py`` shows how to stub
@@ -950,6 +973,38 @@ drives the layer stack binds the label once, then advances the index for each la
 
 Cursors are used instead of arguments because passing the layer index as an argument makes
 inductor specialize on that integer. The frame is then retraced once per layer.
+
+.. _Device loop-back:
+
+**Device loop-back.** A decode loop normally routes its sampled token back to itself as a
+tensor per request. A node that sets ``reads_device_loopback = True`` can instead read
+each row's last sampled token off the sampler on the device. It names those signals in
+``device_loopback_signals(graph_walk)``, so the worker routes them without a tensor, and
+reads them in ``preprocess`` with ``sampler.loopback_tokens(request_ids)``. A row whose
+last step did not keep its value on the device (its first decode step, after the prefill)
+still brings it routed; put it over the one read from the device with
+``sampler.overwrite_rows(rows, (ids, routed_ids))``.
+
+State that a decode loop carries from step to step beside the token, such as Whisper's
+timestamp rule state, is declared on the sampler, not kept in the model:
+
+.. code-block:: python
+
+   SamplerSpec(
+       resource_key=SAMPLER, nodes={"decoder"}, vocab_size=vocab,
+       loopback_state={"ts_rules": LoopbackState(
+           width=4, dtype=torch.long, default=tuple(inactive_state()),
+       )},
+   )
+
+The sampler keeps one row per request by slot, grows it with its other per-request
+buffers, and resets a row to ``default`` when its slot is given to a new request. A step
+reads the rows with ``sampler.loopback_state(name, request_ids)`` in ``preprocess`` and
+stores the next ones from the forward with ``sampler.store_loopback_state(name,
+request_ids, values)``. Under a CUDA-graph slot the store is captured into a per-step
+buffer and commit persists it, so the step must list the name in
+``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
+address rows the same way, and the model never sees a slot index.
 
 .. warning::
 
@@ -1386,10 +1441,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
-       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
+       (``true`` / ``false``)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``)
+       (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,

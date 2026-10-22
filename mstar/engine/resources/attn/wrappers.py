@@ -289,6 +289,7 @@ class FlashInferDecodeWrapper:
         accelerator_graph: bool = False,
         enable_nvtx: bool = False,
         backend: str = "auto",
+        use_tensor_cores: bool = True,
     ):
         check_flashinfer_head_dim(head_dim, device)
         self.device = device
@@ -323,7 +324,7 @@ class FlashInferDecodeWrapper:
                 workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
@@ -332,7 +333,7 @@ class FlashInferDecodeWrapper:
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 backend=backend,
             )
 
@@ -434,6 +435,7 @@ class FlashInferMixedWrapper:
         max_prefill_rows: int,
         device: torch.device,
         backend: str = "auto",
+        use_tensor_cores: bool = True,
     ):
         from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -449,7 +451,8 @@ class FlashInferMixedWrapper:
         )
         self._decode = FlashInferDecodeWrapper(
             workspace_buffer=decode_workspace, batch_size=batch_size,
-            max_num_pages=max_num_pages, accelerator_graph=True, **kv,
+            max_num_pages=max_num_pages, accelerator_graph=True,
+            use_tensor_cores=use_tensor_cores, **kv,
         )
         # one row past the prompt rows takes the step's other tokens (see `plan`)
         self._prefill = FlashInferPrefillWrapper(

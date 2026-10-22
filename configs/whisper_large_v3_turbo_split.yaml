@@ -1,0 +1,19 @@
+# Whisper turbo with the encoder and the decoder in separate worker processes on one GPU, so a decode
+# step never queues behind an encoder batch on the same stream. `mps: true` runs both as clients of
+# one MPS daemon so their kernels overlap rather than time-slice.
+model: "whisper_large_v3_turbo"
+max_seq_len: 448
+max_concurrent_requests: 64
+pre_plan: false
+rank_devices: {0: 0, 1: 0}
+mps: true
+resources:
+  kv_cache:
+    cpu_offload_pages: 128
+  cross_kv_cache:
+    cpu_offload_pages: 128
+node_groups:
+  - node_names: [audio_encoder]
+    ranks: [0]
+  - node_names: [decoder]
+    ranks: [1]

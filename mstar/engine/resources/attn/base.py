@@ -109,6 +109,7 @@ class AttentionManager(AttentionResource):
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
             )
 
         if backend == AttnBackend.FLEX:
@@ -175,8 +176,7 @@ class EagerSlotKey(NamedTuple):
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int
-    # decode and prefill take different wrapper classes; cross-attention plans
-    # one wrapper per label either way and leaves this False
+    # decode and prefill take different wrapper classes
     is_decode: bool = False
 
 

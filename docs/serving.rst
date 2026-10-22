@@ -242,6 +242,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``mps``
+     - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
+       conductor starts in a private directory, so workers that share a GPU overlap their
+       kernels instead of time-slicing (the ASR ``*_split`` configs). NVIDIA only, and it
+       needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
+       shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
+       ``false``.
    * - ``pre_plan``
      - *(optional)* ``false`` plans each step's attention on the GPU thread instead of
        pre-planning the speculative batch on its own thread (default ``true``). A model
@@ -282,7 +289,7 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense)
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
 
@@ -336,6 +343,13 @@ still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU se
 other's memory only as used, so the first to capture can take the other's room. Set
 ``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
+
+Workers that share a GPU time-slice it by default: one process's kernels wait for the
+other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
+before it spawns the workers, run every worker as its client so their kernels overlap,
+and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
+processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
+driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:

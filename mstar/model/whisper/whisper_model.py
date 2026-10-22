@@ -27,10 +27,9 @@ Request state machine:
     language given:  prefill -> decode -> done
     language absent: detect_language -> prefill_prompt -> decode -> done
 
-The client gets each window's transcript in one message when its decode loop
-ends, as Whisper's own token stream rendered to text: spoken words as bytes,
-plus the language token (``<|en|>``) and, when
-timestamps were requested, the ``<|s.ss|>`` markers. The OpenAI layer's
+The transcript is streamed token by token as Whisper's own token stream
+rendered to text: spoken words as bytes, plus the language token (``<|en|>``)
+and, when timestamps were requested, the ``<|s.ss|>`` markers. The OpenAI layer's
 adapter lifts those into ``language`` / ``segments``.
 """
 
@@ -50,6 +49,7 @@ from mstar.engine.resources import (
     CrossAttentionConfig,
     CrossAttentionSpec,
     KVSpec,
+    LoopbackState,
     NodeResourceSpec,
     PagedKVConfig,
     PositionConfig,
@@ -65,6 +65,7 @@ from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer
+from mstar.model.whisper.components.timestamps import inactive_state
 from mstar.model.whisper.config import (
     ALIGN_WALK,
     ATTN,
@@ -81,6 +82,7 @@ from mstar.model.whisper.config import (
     PREFILL_PROMPT_WALK,
     PREFILL_WALK,
     SAMPLER,
+    TS_RULES,
     WhisperModelConfig,
 )
 
@@ -219,9 +221,11 @@ class WhisperModel(Model):
         nodes = {DECODER_NODE}
         return [
             KVSpec(resource_key=KV_CACHE, nodes=nodes, config=kv_config),
+            # Whisper is MHA: the CUDA-core decode kernel beats the
+            # tensor-core one, which pads one query head per KV head to a tile
             AttentionSpec(
                 resource_key=ATTN, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
             ),
             KVSpec(
                 resource_key=CROSS_KV_CACHE, nodes=nodes,
@@ -233,6 +237,7 @@ class WhisperModel(Model):
                     kv_cache=CROSS_KV_CACHE,
                     query_kv_cache=KV_CACHE,
                     context_label=CONTEXT_LABEL,
+                    decode_tensor_cores=False,
                 ),
             ),
             PositionSpec(
@@ -246,6 +251,10 @@ class WhisperModel(Model):
                 vocab_size=self.config.vocab_size,
                 # ASR transcription decodes greedily; no seen-token buffers.
                 enable_repetion_penalty=False,
+                # the decode loop's timestamp rule state, kept by slot
+                loopback_state={TS_RULES: LoopbackState(
+                    width=len(inactive_state()), dtype=torch.long, default=tuple(inactive_state()),
+                )},
             ),
         ]
 
@@ -274,11 +283,26 @@ class WhisperModel(Model):
         ``max_concurrent_requests`` requests at full length must fit in each
         cache next to its sink page; the conductor queues the rest.
         """
-        self._decoder_tp_size = max(
-            (int(group.get("tp_size", 1)) for group in config.get("node_groups") or []
-             if DECODER_NODE in (group.get("node_names") or [])),
-            default=1,
-        )
+        decoder_groups = [
+            group for group in config.get("node_groups") or []
+            if DECODER_NODE in (group.get("node_names") or [])
+        ]
+        self._decoder_tp_size = max((int(group.get("tp_size", 1)) for group in decoder_groups), default=1)
+
+        def serving(walk: str) -> list:
+            return sorted(
+                tuple(group.get("ranks") or ()) for group in decoder_groups
+                if group.get("graph_walks") is None or walk in group["graph_walks"]
+            )
+
+        # the align walk reads the tokens the decode walk recorded in the
+        # decoder's worker-local request state
+        if serving(DECODE_WALK) != serving(ALIGN_WALK):
+            raise ValueError(
+                f"{config_path}: the {DECODER_NODE} node's {DECODE_WALK!r} and {ALIGN_WALK!r} "
+                f"walks must run on the same ranks (word timestamps align the tokens the decode "
+                f"walk kept on its worker); got {serving(DECODE_WALK)} and {serving(ALIGN_WALK)}"
+            )
         cap = config.get("max_concurrent_requests")
         if cap is None:
             logger.warning(
@@ -361,28 +385,20 @@ class WhisperModel(Model):
                 name=DECODER_NODE,
                 input_names=["text_inputs", "ts_rules"],
                 outputs=[
-                    # The token loops back to the node, which does not list it
-                    # as an input, so it only lands in the loop's accumulated
-                    # cache. The client gets the transcript in one message when
-                    # the loop ends instead of one message per token.
-                    GraphEdge(next_node=DECODER_NODE, name="new_token"),
-                    GraphEdge(
-                        next_node=DECODER_NODE,
-                        name="text_inputs",
-                    ),
-                    # the rule state advanced by this step's token
-                    GraphEdge(
-                        next_node=DECODER_NODE,
-                        name="ts_rules",
-                    ),
+                    # The sampled token loops back as the next input and goes to
+                    # the client; the rule state it advanced loops back too. The
+                    # node keeps both on the device by sampler slot and the
+                    # worker sends the batch's tokens inline, one frame a step,
+                    # so a decode step stores no tensor per request (the client
+                    # joins the text chunks; the align walk reads the tokens the
+                    # decoder recorded, see `check_stop_batched`).
+                    GraphEdge(next_node=DECODER_NODE, name="text_inputs"),
+                    GraphEdge(next_node=DECODER_NODE, name="ts_rules"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
-            # persisted as well, the align walk needs the whole transcript
-            accumulated_outputs=[
-                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True),
-            ],
         )
 
         align = GraphNode(
@@ -514,8 +530,9 @@ class WhisperModel(Model):
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
         elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done. Align the transcript (every generated token
-            # is still persisted) against the persisted encoder output.
+            # The loop is done. Align the transcript (the persisted first token
+            # here, the rest recorded on the decoder) against the persisted
+            # encoder output.
             metadata.graph_walk = ALIGN_WALK
             inputs = [
                 self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),

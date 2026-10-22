@@ -164,9 +164,10 @@ class Qwen3ASRModel(Model):
                 ),
             ),
             KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
+            # two query heads per KV head: the CUDA-core decode kernel wins
             AttentionSpec(
                 resource_key=ATTN, nodes={LLM_NODE},
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
             ),
             PositionSpec(
                 resource_key=ROPE, nodes={LLM_NODE},
@@ -241,18 +242,17 @@ class Qwen3ASRModel(Model):
                 name=LLM_NODE,
                 input_names=["text_inputs"],
                 outputs=[
-                    # Loops back to a node that does not take it as an input,
-                    # so the token only lands in the accumulated cache and the
-                    # client gets the whole answer in one message at the end.
-                    GraphEdge(next_node=LLM_NODE, name="new_token"),
+                    # One signal: the sampled token loops back as the next
+                    # input and goes to the client. The node keeps the loop-back
+                    # on the device and the worker sends the batch's tokens
+                    # inline, one frame a step, so a decode step stores no
+                    # tensor per request (the client joins the text chunks).
                     GraphEdge(next_node=LLM_NODE, name="text_inputs"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
-            accumulated_outputs=[
-                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
-            ],
         )
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
 

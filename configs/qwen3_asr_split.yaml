@@ -1,0 +1,20 @@
+# The encoder and the decoder in separate worker processes on one GPU, so a decode step never queues
+# behind an encoder batch on the same stream. `mps: true` runs both as clients of one MPS daemon so
+# their kernels overlap rather than time-slice.
+model: "qwen3_asr"
+max_seq_len: 65536
+# Requests past the cap queue in the conductor instead of fighting for pages.
+# A 20 min file takes about 122 pages of 128 tokens, so 2048 pages let 16 of
+# them decode at once and short utterances are never the limit.
+max_concurrent_requests: 64
+resources:
+  kv_cache:
+    max_num_pages: 2048
+    cpu_offload_pages: 256
+rank_devices: {0: 0, 1: 0}
+mps: true
+node_groups:
+  - node_names: [audio_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [1]
