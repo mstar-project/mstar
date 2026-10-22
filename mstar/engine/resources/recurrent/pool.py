@@ -161,6 +161,11 @@ class RecurrentStatePool(Resource):
         with self._lock:
             self._slots.pop(rid, None)
 
+    def drop(self, rid: str) -> int:
+        # zeroed in place, so recomputing the state never waits for a free slot
+        self.reset_request(rid)
+        return 0
+
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
 

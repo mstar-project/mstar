@@ -292,6 +292,13 @@ class SamplerResource(Resource):
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
+    def check_drop(self, rid: str) -> None:
+        if self._cg_buffers is not None and self._cg_buffers.ingraph_scatter:
+            raise RuntimeError(
+                f"Sampler: dropping {rid} under MSTAR_SAMPLER_INGRAPH_SCATTER=1, whose captured sample "
+                "writes a rebuild row's discarded token and RNG offset"
+            )
+
     def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
         """Settle this step's two penalty flags (and whether it filters).
         """

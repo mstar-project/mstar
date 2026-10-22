@@ -211,14 +211,15 @@ class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
 
     ``length`` is how many slots the write fills and ``advance`` is how far it
-    moves the position counter. ``digest`` is an item's digest, and None for
-    ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end.
+    moves the position counter. ``kind`` is the span's `Span.kind`. ``digest`` is
+    an item's digest, and None for ids. ``end_key`` is set for an item that ends
+    inside a page, and keys that page up to the item's end.
     """
     length: int
     advance: int
     walk: str
     scratch: int = 0
+    kind: str = "ids"
     digest: bytes | None = None
     end_key: bytes | None = None
 
