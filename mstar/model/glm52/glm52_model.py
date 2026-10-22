@@ -16,6 +16,8 @@ from mstar.engine.resources import (
     KVSpec,
     NodeResourceSpec,
     PagedKVConfig,
+    PositionConfig,
+    PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -26,6 +28,7 @@ from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -188,6 +191,12 @@ class Glm52Model(Model):
         return [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
+            # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
+            # cos/sin table per forward that every layer and the indexer share
+            PositionSpec(
+                resource_key=POS_RESOURCE, nodes=nodes,
+                config=PositionConfig(kv_cache=KV_RESOURCE),
+            ),
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,

@@ -20,6 +20,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
+    PositionStep,
     SamplerStep,
     Segment,
     SlotLease,
@@ -28,6 +29,7 @@ from mstar.engine.resources import (
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -93,6 +95,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         res = engine_inputs.resources if engine_inputs is not None else self.node_resources
         return res[KV_RESOURCE]
 
+    def _pos(self, engine_inputs: ModelInputsFromEngine):
+        return engine_inputs.resources[POS_RESOURCE]
+
     def _attn(self, engine_inputs: ModelInputsFromEngine | None = None):
         res = engine_inputs.resources if engine_inputs is not None else self.node_resources
         return res[ATTN_RESOURCE]
@@ -121,6 +126,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_RESOURCE: KVStep(),
                 ATTN_RESOURCE: AttentionStep(causal=True),
+                POS_RESOURCE: PositionStep(),
                 SAMPLER_RESOURCE: sampler,
             },
         )
@@ -285,7 +291,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        kv = self._kv(engine_inputs)
+        pos = self._pos(engine_inputs)
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]
 
@@ -302,7 +308,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         q_start = 0
         page_tables = self._page_tables(engine_inputs) if long_context else None
         for i, (rid, sl) in enumerate(zip(request_ids, seq_lens, strict=True)):
-            start = kv.stored_len(rid)
+            start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
                 raise RuntimeError(
                     f"request {rid}: context {start + sl} exceeds {limit}, "

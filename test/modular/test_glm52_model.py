@@ -47,6 +47,7 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E40
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -89,10 +90,12 @@ def test_glm52_graph_walks_are_one_node():
 
 
 def _specs(config):
-    kv, attn, sampler = _make_model(config).get_node_resources()
+    kv, attn, pos, sampler = _make_model(config).get_node_resources()
     assert isinstance(kv, KVSpec) and kv.resource_key == KV_RESOURCE
     assert isinstance(sampler, SamplerSpec) and sampler.resource_key == SAMPLER_RESOURCE
     assert attn.resource_key == ATTN_RESOURCE
+    # positions over the latent cache; the layers rotate themselves
+    assert pos.resource_key == POS_RESOURCE and pos.config.kv_cache == KV_RESOURCE
     return kv, attn, sampler
 
 
@@ -356,13 +359,14 @@ def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
 # ── submodule: preprocess ──
 
 
-class _FakeKV:
-    """Only what preprocess reads off the KV resource: the stored length."""
+class _FakePositions:
+    """Only what preprocess reads off the position resource: each stream's next position."""
 
     def __init__(self, starts):
         self._starts = starts
 
-    def stored_len(self, rid, label="main"):
+    def position(self, rid, label):
+        assert label == "main"
         return self._starts[rid]
 
 
@@ -378,7 +382,7 @@ def _preprocess(sub, starts, seq_len):
         for _ in starts
     ]
     engine_inputs = SimpleNamespace(
-        request_ids=list(starts), resources={KV_RESOURCE: _FakeKV(starts)},
+        request_ids=list(starts), resources={POS_RESOURCE: _FakePositions(starts)},
     )
     return sub.preprocess("prefill", engine_inputs, inputs)
 
@@ -390,7 +394,7 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     assert out["dsa_ctx"] is None
 
 
-def test_glm52_preprocess_positions_continue_from_the_stored_length():
+def test_glm52_preprocess_positions_continue_from_the_stream_position():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 5, "r1": 0}, seq_len=3)
     assert out["position_ids"].tolist() == [5, 6, 7, 0, 1, 2]

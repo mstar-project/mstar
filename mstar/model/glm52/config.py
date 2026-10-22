@@ -5,11 +5,12 @@ from dataclasses import dataclass, field
 from mstar.model.glm52.quantization import Fp8BlockQuantConfig
 
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
-# the attention resource planned over it, the sampler. Layers bind the first
-# two by these names (``bind_resources``); the model declares all three in
-# ``get_node_resources``.
+# the attention resource planned over it, the token positions over it, the
+# sampler. Layers bind the first two by these names (``bind_resources``); the
+# model declares all four in ``get_node_resources``.
 KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
+POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = "sampler"
 
 # config.json keys read by Glm52ModelConfig.from_hf_config under the same

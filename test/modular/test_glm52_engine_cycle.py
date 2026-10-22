@@ -39,6 +39,7 @@ from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -133,22 +134,23 @@ def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
     return model.eval()
 
 
-def test_kv_length_tracks_the_stream():
+def test_kv_length_and_position_track_the_stream():
     cfg = _cfg(True)
     model = _model(cfg)
     prompt = torch.arange(5, dtype=torch.long) + 3
     sub = Glm52LLMSubmodule(model, cfg)
     driver = _Driver(sub, cfg, ["r0"])
     info = _fwd_info("r0", 20, True)
-    kv = driver.resources[KV_RESOURCE]
+    kv, pos = driver.resources[KV_RESOURCE], driver.resources[POS_RESOURCE]
     out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
     total = prompt.numel()
-    assert kv.stored_len("r0") == total
+    assert kv._streams["r0"]["main"].stored_len == pos.position("r0", "main") == total
     text = out["text_inputs"][0]
     for _ in range(4):
         out = driver.step("decode", {"r0": (info, text)})["r0"]
         total += 1
-        assert kv.stored_len("r0") == total
+        # preprocess placed this step's token at the position the resource held
+        assert kv._streams["r0"]["main"].stored_len == pos.position("r0", "main") == total
         assert out["text_inputs"][0].numel() == 1
         text = out["text_inputs"][0]
 
@@ -199,7 +201,7 @@ def test_declare_step_shapes():
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), {"text_inputs": [torch.tensor([1, 2, 3])]})]
     step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "sampler"}
+    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
 
 
@@ -246,7 +248,7 @@ def test_stream_stops_cleanly_at_the_context_limit():
     expect_tokens = limit - prompt_len
     assert sub.request_state("r0")["token_budget"] == expect_tokens
     assert stream.numel() == expect_tokens
-    assert kv.stored_len("r0") == limit - 1
+    assert kv._streams["r0"]["main"].stored_len == limit - 1
     assert len(kv._streams["r0"]["main"].page_indices) == limit // 8
 
 
@@ -264,7 +266,7 @@ def test_the_step_after_the_context_stop_still_fits():
         info.dynamic_loop_iter_counts["decode_loop"] = step
         step += 1
     driver.step("decode", {"r0": (info, out["text_inputs"][0])})
-    assert driver.resources[KV_RESOURCE].stored_len("r0") == limit
+    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == limit
 
 
 def test_a_prompt_without_room_fails_alone():

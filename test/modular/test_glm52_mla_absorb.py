@@ -260,7 +260,7 @@ class _Path:
         with torch.no_grad():
             out = self.attn(h, torch.arange(start, start + n))
         self.runner.commit(step)
-        assert self.resources[KV_RESOURCE].stored_len("r0") == start + n
+        assert self.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == start + n
         return out
 
 

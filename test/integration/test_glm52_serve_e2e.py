@@ -303,7 +303,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     # The model's declaration is what the engine builds from: naive MLA at
     # reduced dims (mla_absorb=False) -> the paged K/V cache + FlashInfer.
     specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == ["kv", "attn", "sampler"]
+    assert [spec.resource_key for spec in specs] == ["kv", "attn", "pos", "sampler"]
 
     logits = _prefill_logits(model, submodule, prompt_ids)
     assert logits.shape == (1, cfg.vocab_size)
