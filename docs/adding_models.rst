@@ -366,10 +366,10 @@ three common fields:
   branch nodes share one KV pool. A node that no spec names receives no resources. Such a
   node was called "stateless" in earlier versions.
 - ``depends_on()`` returns the keys of other specs that this spec is built against.
-  ``AttentionSpec`` and ``PositionSpec`` depend on the ``kv_cache`` key they name. If a
-  spec names a dependency that the model does not declare, loading fails immediately,
-  rather than during a forward pass. ``RaggedAttentionSpec`` is the one attention spec
-  that depends on nothing: it names no cache, because it has none.
+  ``AttentionSpec``, ``PositionSpec`` and ``DSASpec`` depend on the ``kv_cache`` key they
+  name. If a spec names a dependency that the model does not declare, loading fails
+  immediately, rather than during a forward pass. ``RaggedAttentionSpec`` is the one
+  attention spec that depends on nothing: it names no cache, because it has none.
 
 The spec types are:
 
@@ -410,6 +410,16 @@ The spec types are:
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph.
+   * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
+       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
+       The model's indexer layers store their index keys (``store_keys``) and pick each
+       query's top ``topk`` positions by the indexer's score (``select``); a layer that
+       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
+       absorbed MLA over just the picked latents. The keys sit in per-request buffers
+       outside the paged pool and the selection runs per request on the host, so the
+       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
+       decodes one row per step. GLM-5.2 declares it under ``dsa_long_context``.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -496,6 +506,9 @@ appears in no spec, so it receives no resources:
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
+   * - An LLM with DeepSeek sparse attention (GLM-5.2)
+     - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
+       plus a ``DSASpec`` over the same cache.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
