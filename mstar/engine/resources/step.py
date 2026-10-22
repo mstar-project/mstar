@@ -197,10 +197,16 @@ class AdmitOutcome(NamedTuple):
     ok: bool
     ready: bool = True
     reason: AdmitFailedReason | None = None
+    # Set by a resource with admission control, such as a KV pool that decides admission.
+    # ``held_back``: not ready, because the resource keeps the request in its queue.
+    # ``admitted``: the resource admitted the request in this call.
+    held_back: bool = False
+    admitted: bool = False
 
 
 # Every resource's admit returns this on the common path, several times a
-# step; nothing reads identity, so hand back one instance rather than build it.
+# step, so hand back one instance rather than build it. The readiness sweep
+# recognizes this instance by identity and skips its fields.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
 
 

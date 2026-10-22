@@ -15,6 +15,7 @@ from typing import Any
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
+    ADMIT_OK,
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
     FullAdmitOutcome,
@@ -317,7 +318,7 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
-        ready = True
+        ready, held_back, admitted = True, False, ()
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
         ):
@@ -331,7 +332,15 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 return FullAdmitOutcome(outcome, key)
-            ready = ready and outcome.ready
+            if outcome is not ADMIT_OK:
+                ready = ready and outcome.ready
+                held_back = held_back or outcome.held_back
+                if outcome.admitted:
+                    admitted += (key,)
+        if held_back:
+            # otherwise room reserved for a request that is still waiting is kept from the requests already running
+            for key in admitted:
+                self._resources[key].requeue(rid)
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
 
