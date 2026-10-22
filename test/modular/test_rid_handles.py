@@ -164,7 +164,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows = {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows = {"n": ["kv"]}, {"n": {a: None, b: None}}, {a: None}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -177,6 +177,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert b in w.request_state.per_request_info
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
+    assert w._kept_ids == {"n": {b: None}} and not w._rebuild_rows, "the next request would rebuild from these ids"
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a
