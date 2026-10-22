@@ -1,4 +1,4 @@
-"""fp8 block-scale linears for GLM-5.2's non-expert weights: ``x @ (w * s).T``.
+"""fp8 block-scale linears for a checkpoint's non-expert weights: ``x @ (w * s).T``.
 
 The checkpoint stores the attention projections, the shared expert and the dense-layer MLPs
 as e4m3 with one fp32 scale per 128 x 128 block. Kept that way, a decode step reads half the
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from mstar.model.glm52.quantization import FP8_DTYPE
+from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@
 
 One M* deployment (conductor + GPU workers + its own control mesh and
 tensor transport) presents to Dynamo as a single worker instance with one
-endpoint, the way a TP=N vLLM worker does. Dynamo's frontend parses and
+endpoint, the way one TP=N engine worker does. Dynamo's frontend parses and
 validates OpenAI requests and forwards the raw body to Text-input
 backends; the per-model OpenAI adapters translate them onto the same
 submission path the native surfaces use. Replication for throughput means

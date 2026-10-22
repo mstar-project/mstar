@@ -243,6 +243,10 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
         submodule.postprocess(serve.rid, info, out)  # rebinds text_inputs
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
+        # as the runtime: the prefill walk's stop check (it ends no loop, but marks a stop
+        # token for the first decode step), then the decode walk's
+        submodule.check_stop(serve.rid, info, out)
+        info.graph_walk = "decode"
 
         for step in range(max_tokens + 4):  # +slack; check_stop must break first
             out = serve.step("decode", info, next_token)
@@ -299,7 +303,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     # The model's declaration is what the engine builds from: naive MLA at
     # reduced dims (mla_absorb=False) -> the paged K/V cache + FlashInfer.
     specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == ["kv", "attn", "sampler"]
+    assert [spec.resource_key for spec in specs] == ["kv", "attn", "pos", "sampler"]
 
     logits = _prefill_logits(model, submodule, prompt_ids)
     assert logits.shape == (1, cfg.vocab_size)

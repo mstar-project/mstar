@@ -35,19 +35,17 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
         monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
+from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
 from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.components.indexer import is_full_indexer_layer  # noqa: E402
-from mstar.model.glm52.components.moe import (  # noqa: E402
-    Glm52MoEGate,
-    Glm52SparseMoeBlock,
-)
+from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
-from mstar.model.glm52.quantization import dequantize_fp8_block_weight  # noqa: E402
 from mstar.model.glm52.weight_loader import (  # noqa: E402
     load_glm52_hf_weights,
     restore_fp32_params,
 )
+from mstar.utils.fp8_block import dequantize_fp8_block_weight  # noqa: E402
 
 BLOCK = (16, 16)
 
@@ -69,7 +67,7 @@ def test_gate_is_noaux_tc_groupless():
     """GLM's router is the DeepSeek-V3 noaux_tc sigmoid gate with n_group=1 —
     pin it bitwise against an independent transcription of the rule."""
     torch.manual_seed(0)
-    glm = Glm52MoEGate(
+    glm = NoAuxTcRouter(
         hidden_size=64, n_routed_experts=8, num_experts_per_tok=3,
         routed_scaling_factor=2.5, norm_topk_prob=True,
     )
@@ -79,20 +77,21 @@ def test_gate_is_noaux_tc_groupless():
     h = torch.randn(17, 64)
     w_ref, ids_ref = _noaux_tc_reference(
         h, glm.weight, glm.e_score_correction_bias, top_k=3, scale=2.5)
-    w_glm, ids_glm = glm(h)
+    w_glm, ids_glm, state = glm(h)
+    assert state is None  # stateless, per the router contract
     assert torch.equal(ids_ref, ids_glm)
     assert torch.equal(w_ref, w_glm)
     # the bias steers selection only: a huge bias on one expert makes it a
     # pick for every token while the combine weights stay raw affinities
     glm.e_score_correction_bias.data[5] = 100.0
-    w_glm, ids_glm = glm(h)
+    w_glm, ids_glm, _ = glm(h)
     assert (ids_glm == 5).any(dim=-1).all()
     assert (w_glm <= 2.5).all()
     # the fp32 router cache (finalize_weights) is the same values, bitwise
     glm.e_score_correction_bias.data[5] = 0.0
-    w_before, ids_before = glm(h)
+    w_before, ids_before, _ = glm(h)
     glm.finalize_weights()
-    w_after, ids_after = glm(h)
+    w_after, ids_after, _ = glm(h)
     assert torch.equal(w_before, w_after) and torch.equal(ids_before, ids_after)
 
 
@@ -207,7 +206,7 @@ def test_bf16_combine_keeps_fp32_routing_weights():
             ]
         else:
             deq = list(zip(blk.experts.gate_up_proj, blk.experts.down_proj, strict=True))
-        topk_weights, topk_ids = blk.gate(x)
+        topk_weights, topk_ids, _ = blk.gate(x)
         assert topk_weights.dtype == torch.float32
         ref = _hf_routed(x, topk_weights, topk_ids, deq) + blk.shared_expert(x)
         assert torch.equal(blk(x), ref), f"fp8_experts={blk.fp8_experts}"

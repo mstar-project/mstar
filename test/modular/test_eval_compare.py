@@ -1454,6 +1454,24 @@ def test_requires_can_call_the_servers_own_loader(tmp_path, monkeypatch):
     assert f"def {fn}(" in Path(module.replace(".", "/") + ".py").read_text()
 
 
+
+def test_requires_reads_only_its_result_line_whatever_an_import_prints(tmp_path, monkeypatch):
+    """qwen_tts prints transformers' docstring warnings to stdout while the codec loads; the model was skipped
+    as lacking its loader. Output can land before or after the check's own line."""
+    from benchmark.eval.e2e import arm
+
+    (tmp_path / "noisy.py").write_text(
+        "import atexit\n"
+        "print('[ERROR] `cache_position` is part of the forward signature, but not documented.')\n"
+        "atexit.register(print, '[ERROR] printed at exit')\n"
+        "def load():\n    return 1\n")
+    (tmp_path / "dies.py").write_text("import os\nos._exit(3)\n")
+    for requires, want in ((["noisy:load"], ""), (["noisy:load", "no_such_module_xyz"],
+                                                   "no_such_module_xyz: ModuleNotFoundError"),
+                           (["dies"], "requirement check exited 3")):
+        monkeypatch.setattr(arm, "job", {"python": sys.executable, "model": {"requires": requires}})
+        assert arm.requirements_problem({"src": str(tmp_path)}) == want
+
 def test_results_pulls_work_with_an_rsync_older_than_3_2_3(tmp_path, monkeypatch):
     """RHEL 8's rsync 3.1.3 has no --mkpath; every push and pull lands in a directory whose parents may not exist."""
     real = subprocess.run(["bash", "-c", "command -v rsync"], capture_output=True, text=True,

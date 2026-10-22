@@ -466,7 +466,7 @@ class Wan22Model(Model):
         }
 
     def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
-        """Emit one vllm-style line per request at generation start, echoing every
+        """Emit one ``key=value`` log line per request at generation start, echoing every
         resolved setting so an operator can read back exactly what ran instead of
         asserting the knobs. ``decode`` is the configured tiling POLICY
         (auto/tiled/untiled, resolved from config + env); the actual per-request
