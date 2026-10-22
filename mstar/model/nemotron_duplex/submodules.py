@@ -2,8 +2,9 @@
 
 Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources``):
 
-    conformer_encoder  encoder_state,             16 kHz speech -> per-frame LLM embeds (+ RNN-T); per
-                       encoder_front              session, its layers' state and its audio / mel tails
+    conformer_encoder  encoder_kv,                16 kHz speech -> per-frame LLM embeds (+ RNN-T); per
+                       encoder_state,             session, its attention window, its layers' conv state
+                       encoder_front              and its audio / mel tails
     nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
                        nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
@@ -14,8 +15,8 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
 
 Both autoregressive nodes keep their whole state in engine resources and capture
 their decode step as a CUDA graph (the talker's with its codec decode). The
-encoder keeps a call's state in its two pools, and a live step (or its layer
-stack) replays a piecewise CUDA graph.
+encoder keeps a call's state in its bounded KV and two pools, and a live step
+(or its layer stack) replays a piecewise CUDA graph.
 """
 from __future__ import annotations
 
