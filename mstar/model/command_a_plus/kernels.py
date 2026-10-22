@@ -1,8 +1,9 @@
 """Fused Triton kernels for the Command A+ decoder layer.
 
-Each kernel replaces a chain of small PyTorch ops in the eager layer and
-rounds to bf16 at the same points the eager chain does, so a fused layer and
-an unfused layer differ only by the order of fp32 reductions.
+Each kernel replaces a chain of small PyTorch ops in the eager layer. The
+fused layer keeps sums in fp32 and rounds to bf16 fewer times than the unfused
+one (``moe_combine`` rounds once, after the sum), so the two can produce
+different greedy outputs.
 """
 from __future__ import annotations
 

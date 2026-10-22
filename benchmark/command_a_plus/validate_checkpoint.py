@@ -340,9 +340,9 @@ def main():
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--lengths", type=int, nargs="*", default=[])
     parser.add_argument("--benchmark-tokens", type=int, default=32)
-    parser.add_argument("--max-rmse", type=float, default=0.15)
+    parser.add_argument("--max-rmse", type=float, default=0.25)
     parser.add_argument("--max-abs", type=float, default=1.0)
-    parser.add_argument("--min-cosine", type=float, default=0.999)
+    parser.add_argument("--min-cosine", type=float, default=0.995)
     parser.add_argument("--trace", action="store_true",
                         help="save activations and diagnose M* with saved HF routing choices and weights")
     args = parser.parse_args()
