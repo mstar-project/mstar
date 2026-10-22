@@ -327,7 +327,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.enable_nvtx = False
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched = False
+    w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
@@ -598,7 +598,7 @@ def test_pending_rows_are_the_backlog_and_the_ready_rows_not_in_a_step():
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 4
 
     sched.fail_rids({"r2"})
-    sched.pending_removes.add("r5")
+    sched.pending_removes["r5"] = None
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 2
 
 

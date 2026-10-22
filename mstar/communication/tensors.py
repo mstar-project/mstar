@@ -255,8 +255,8 @@ class TransferReadInfo:
 class AsyncMooncakeReader:
     """Background thread for non-blocking mooncake READ operations.
 
-    Follows SGLang's pattern: caller records CUDA event on default stream,
-    submits write task to thread pool. Worker thread waits on event via
+    The caller records a CUDA event on the default stream and
+    submits the write task to a thread pool. Worker thread waits on event via
     dedicated CUDA stream, then does blocking mooncake PUTs.
     The default stream is never blocked by store writes.
     """
