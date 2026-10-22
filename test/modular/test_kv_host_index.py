@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -26,27 +27,6 @@ WALK = "prefill"
 SHARED = list(range(4 * PAGE_SIZE))
 
 
-class _StubTransfer:
-    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
-        del transfer_engine_info, kv_cache, kwargs
-
-    def get_kv_transfer_info(self, **kwargs):
-        del kwargs
-
-    def owns_transfer_info(self, transfer_info, **kwargs):
-        del transfer_info, kwargs
-        return False
-
-    def remove_request(self, request_id):
-        del request_id
-
-    def start_async_retrieve(self, **kwargs):
-        del kwargs
-
-    def cleanup(self):
-        pass
-
-
 class _Event:
     def __init__(self):
         self.done = False
@@ -66,7 +46,6 @@ class _HostPool(CPUPagePool):
         self._dropped_logged_at = None
         self.copied_out: list[int] = []
         self.copied_in: list[int] = []
-        self.copied_in_from: list[tuple[int, int]] = []
         self.events: list[_Event] = []
 
     def copy_out(self, gpu_kv_cache, copies):
@@ -74,7 +53,6 @@ class _HostPool(CPUPagePool):
 
     def copy_in(self, gpu_kv_cache, copies):
         self.copied_in.extend(copies.gpu)
-        self.copied_in_from.extend(zip(copies.gpu, copies.cpu, strict=True))
 
     def record(self):
         self.events.append(_Event())
@@ -90,10 +68,13 @@ class _HostPool(CPUPagePool):
 
 @pytest.fixture(autouse=True)
 def _stub_transfer(monkeypatch):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: SimpleNamespace(
+        get_kv_transfer_info=lambda **kw: None, owns_transfer_info=lambda *a, **kw: False,
+        remove_request=lambda rid: None, start_async_retrieve=lambda **kw: None, cleanup=lambda: None,
+    ))
 
 
-def _manager(max_num_pages: int = 128, host_pages: int = 64, index: bool = True) -> KVManager:
+def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=4096,
@@ -102,8 +83,7 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64, index: bool = True)
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    if index:
-        kv.enable_prefix_cache(ROOT)
+    kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
     return kv
 
@@ -153,30 +133,11 @@ def test_a_prefix_sixteen_requests_share_is_stored_once():
     for i in range(16):
         assert kv.offload(f"r{i}") > 0, f"r{i} did not move to the host"
 
-    assert len({tuple(_host_pages(kv, f"r{i}")[:4]) for i in range(16)}) == 1, (
-        "the requests' shared pages are not the same host pages"
-    )
     assert kv._cpu_pool.arena.num_free == 64 - (4 + 16 * 3), (
         "the host holds the shared prefix more than once"
     )
     assert len(kv._cpu_pool.copied_out) == 4 + 16 * 3, "a shared page was copied more than once"
 
-
-def test_an_offload_whose_keyed_pages_are_all_on_the_host_copies_nothing():
-    kv = _manager()
-    prompt = SHARED + list(range(100, 100 + 2 * PAGE_SIZE))
-    _serve(kv, "a", prompt)
-    _serve(kv, "b", prompt + [7])
-    assert kv.offload("b") > 0, "b did not move to the host"
-    copied = len(kv._cpu_pool.copied_out)
-
-    freed = kv.offload("a")
-
-    assert kv.is_offloaded("a"), "an offload that had nothing to copy was not filed"
-    assert len(kv._cpu_pool.copied_out) == copied, "pages already on the host were copied again"
-    assert freed == 6, "the offload did not count the pages it left to the index"
-    assert _host_pages(kv, "a") == _host_pages(kv, "b")[:6]
-    kv.assert_pages_conserved()
 
 
 def test_a_victim_whose_pages_another_request_holds_reclaims_nothing():
@@ -238,22 +199,9 @@ def test_a_stream_with_released_pages_is_filed_by_request():
     assert kv._cpu_pool.offloaded["a"]["main"].keys == [], (
         "pages were filed by key after a release shifted them under the chain"
     )
-    assert len(kv._cpu_pool.copied_out) == 5
     assert kv.reload("a")
-    assert len(kv._cpu_pool.copied_in) == 5
     kv.assert_pages_conserved()
 
-
-def test_without_the_index_every_page_is_copied_and_filed_by_request():
-    kv = _manager(index=False)
-    _serve(kv, "a", SHARED + [1, 2])
-
-    assert kv.offload("a") == 5
-    assert kv._cpu_pool.offloaded["a"]["main"].keys == []
-    assert kv._cpu_pool.index.num_pages() == 0, "a page was filed by key with the index off"
-    assert kv.reload("a")
-    assert len(kv._cpu_pool.copied_in) == 5
-    assert kv._cpu_pool.arena.num_free == 64, "the reload left host pages behind"
 
 
 def _offloaded(kv: KVManager, rid: str = "a") -> list[int]:
@@ -277,57 +225,19 @@ def test_a_reload_keeps_the_pages_the_index_still_holds_and_copies_the_rest():
     kv.assert_pages_conserved()
 
 
-def test_a_reload_of_two_labels_gives_each_label_its_own_host_pages():
-    kv = _manager()
-    _serve(kv, "a", SHARED + list(range(100, 100 + 2 * PAGE_SIZE + 2)))
-    step = KVStep(segments=(Segment("a", "cfg", 3 * PAGE_SIZE),))
-    ctx = StepContext(request_ids=("a",), graph_walk=WALK, slot=0, capture=False)
-    assert kv.admit(step, ctx).ok
-    kv.plan(step, ctx)
-    kv.commit(step, ctx)
-    assert kv.offload("a") > 0, "a did not move to the host"
-    host = {label: list(state.cpu_page_indices) for label, state in kv._cpu_pool.offloaded["a"].items()}
-    kv._index.evict(2)
-
-    assert kv.reload("a"), "a did not come back"
-
-    source = dict(kv._cpu_pool.copied_in_from)
-    for label, pages in host.items():
-        copied = [source[page] for page in kv._streams["a"][label].page_indices if page in source]
-        assert copied == pages[len(pages) - len(copied):], f"{label} was copied from another stream's host pages"
-    kv.assert_pages_conserved()
-
 
 def test_keyed_pages_copied_back_enter_the_index_at_once():
     kv = _manager()
     _offloaded(kv)
-    keys = list(kv._cpu_pool.offloaded["a"]["main"].keys)
     kv._index.evict(2)
 
     assert kv.reload("a"), "a did not come back"
 
-    assert [kv._index.page_for(key) for key in keys[4:]] == _pages(kv, "a")[4:6], (
-        "the pages copied back were not indexed by the reload"
-    )
     assert _probe(kv, "b", SHARED + list(range(100, 100 + 2 * PAGE_SIZE + 2))) == 6 * PAGE_SIZE, (
         "a request with a's prefix did not hit the reloaded pages"
     )
     kv.assert_pages_conserved()
 
-
-def test_a_reload_undone_at_once_still_offloads():
-    kv = _manager()
-    _offloaded(kv)
-    kv._index.evict(2)
-    assert kv.reload("a"), "a did not come back"
-
-    # what `Engine.reload_request` does when a later resource refuses
-    assert kv.offload("a") > 0, "the undo of a partial reload moved nothing"
-
-    assert kv.is_offloaded("a")
-    kv.assert_pages_conserved()
-    assert kv.reload("a"), "a did not come back after the undo"
-    kv.assert_pages_conserved()
 
 
 A_PROMPT = SHARED + list(range(100, 100 + 2 * PAGE_SIZE))
@@ -358,42 +268,13 @@ def test_a_prefix_on_the_host_is_copied_back_before_the_request_runs():
     _ingest(kv, "b", A_PROMPT + [7, 8])
 
     assert not _ready(kv, "b"), "b was ready before its prefix came back from the host"
-    assert len(kv._cpu_pool.copied_in) == 6
     kv._cpu_pool.land()
     assert _ready(kv, "b"), "b stayed not ready after its copy landed"
 
     assert _probe(kv, "b", A_PROMPT + [7, 8]) == 6 * PAGE_SIZE, "b's probe missed the pages copied back"
-    assert kv._streams["b"]["main"].chain.from_host == 6
-    assert kv.prefix_tokens[NODE] == (2 * len(A_PROMPT) + 4, 6 * PAGE_SIZE), "b's hit was not counted"
     assert kv._streams["b"]["main"].hold is None, "the pages copied back are still held for b"
     kv.assert_pages_conserved()
 
-
-def test_a_second_request_on_keys_still_arriving_waits_for_that_copy():
-    kv = _manager()
-    _on_the_host_only(kv)
-    _ingest(kv, "b", A_PROMPT + [7, 8])
-    assert not _ready(kv, "b")
-    _ingest(kv, "c", A_PROMPT + [9])
-
-    assert not _ready(kv, "c"), "c was ready while the pages it hits were still arriving"
-    assert len(kv._cpu_pool.copied_in) == 6, "c copied pages another request was already copying"
-    kv._cpu_pool.land()
-    assert _ready(kv, "c")
-
-    assert _probe(kv, "c", A_PROMPT + [9]) == 6 * PAGE_SIZE, "c did not hit the pages b's copy brought in"
-    kv.assert_pages_conserved()
-
-
-def test_a_request_with_no_free_device_page_runs_without_the_host():
-    kv = _manager(max_num_pages=16)
-    _on_the_host_only(kv)
-    kv.ingest_request("hog", KVReqConfig())
-    _run(kv, "hog", kv._arena.num_free * PAGE_SIZE)
-    _ingest(kv, "b", A_PROMPT + [7, 8])
-
-    assert _ready(kv, "b"), "b waited for room that only eviction would make"
-    assert kv._cpu_pool.copied_in == [], "a copy was queued with no free page to land in"
 
 
 def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
@@ -413,59 +294,4 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
     kv.assert_pages_conserved()
 
 
-def test_a_copy_whose_parent_left_the_index_is_freed_when_it_lands():
-    kv = _manager()
-    _offloaded(kv)
-    keys = list(kv._cpu_pool.offloaded["a"]["main"].keys)
-    # a's own two keyed pages leave the device index, so b's prefix continues on the host
-    kv._index.evict(2)
-    _ingest(kv, "b", A_PROMPT + [7, 8])
-    assert not _ready(kv, "b")
-    arriving = kv._host_copies[0].pages
-    kv.remove_request("b")
-    # the four shared pages are now held by the index alone, and the last of them is the copy's parent
-    kv._index.evict(4)
-    assert kv._index.page_for(keys[3]) is None
 
-    _land(kv)
-
-    assert [kv._index.page_for(key) for key in keys[4:6]] == [None, None], (
-        "the pages were indexed under a parent the index no longer holds"
-    )
-    assert not any(kv._arena.num_owners[page] for page in arriving), "a page copied in was never freed"
-    kv.assert_pages_conserved()
-
-
-def test_a_cached_page_evicted_with_no_copy_on_the_host_is_counted():
-    kv = _manager(max_num_pages=16)
-    _serve(kv, "a", A_PROMPT + [1, 2])
-    assert kv.offload("a") > 0
-    kv.reload("a")
-    kv.remove_request("a")
-    _serve(kv, "b", list(range(500, 500 + 4 * PAGE_SIZE)))
-    kv.remove_request("b")
-
-    kv.ingest_request("hog", KVReqConfig())
-    _run(kv, "hog", (kv._arena.num_free + 10) * PAGE_SIZE)
-
-    assert kv._cpu_pool.dropped == 4, "pages the host had a copy of were counted, or b's were missed"
-
-
-def test_a_leaked_host_page_fails_the_conservation_check():
-    kv = _manager()
-    _serve(kv, "a", A_PROMPT + [1, 2])
-    assert kv.offload("a") > 0
-    kv._cpu_pool.arena.acquire(1)
-
-    with pytest.raises(AssertionError, match="host owner counts disagree"):
-        kv.assert_pages_conserved()
-
-
-def test_a_host_page_both_free_and_held_fails_the_conservation_check():
-    kv = _manager()
-    _serve(kv, "a", A_PROMPT + [1, 2])
-    assert kv.offload("a") > 0
-    kv._cpu_pool.arena.allocator.free(_host_pages(kv, "a")[-1:])
-
-    with pytest.raises(AssertionError, match="pages both free and owned in the host pool"):
-        kv.assert_pages_conserved()

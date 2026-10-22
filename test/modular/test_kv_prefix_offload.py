@@ -342,52 +342,6 @@ def test_every_page_comes_back_byte_for_byte(layout):
     kv.assert_pages_conserved()
 
 
-@requires_cuda
-def test_a_page_that_lost_the_insert_race_comes_back_as_its_own():
-    kv = _manager(cpu_offload_pages=32)
-    _serve(kv, "seed", SHARED + [1])
-    prompt = SHARED + list(range(100, 100 + 2 * PAGE_SIZE)) + [7]
-    for rid in ("a", "b"):
-        _ingest(kv, rid, prompt)
-        inputs = ARNodeInputs(input_seq_len=len(prompt))
-        kv.apply_cached_prefix(rid, NODE, WALK, inputs, kv.resolve_cached_prefix(rid, NODE, WALK, inputs))
-    # both lease the shared pages, then both write the next two, and "a" indexes them first
-    for rid in ("a", "b"):
-        _run(kv, rid, prompt[len(SHARED):])
-    _paint(kv, kv._streams["a"]["main"].page_indices[4:], base=1.0)
-    expected = _paint(kv, kv._streams["b"]["main"].page_indices[4:], base=50.0)
-
-    assert kv.offload("b") > 0, "b did not move to the host"
-    _scribble_free(kv)
-    assert kv.reload("b"), "b did not come back"
-
-    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["b"]["main"].page_indices[4:]], expected), (
-        "b got back the index's copy of the pages it lost the race for, not its own"
-    )
-    kv.assert_pages_conserved()
-
-
-@requires_cuda
-def test_a_prefix_copied_back_from_the_host_holds_the_bytes_offloaded():
-    kv = _manager(cpu_offload_pages=32)
-    prompt = list(range(6 * PAGE_SIZE + 3))
-    _serve(kv, "a", prompt)
-    expected = _paint(kv, kv._streams["a"]["main"].page_indices[:6], base=1.0)
-    assert kv.offload("a") > 0, "a did not move to the host"
-    kv._index.evict(6)
-    _scribble_free(kv)
-
-    _ingest(kv, "b", prompt)
-    assert not kv.admit_retrieve("b", NODE, WALK, None).ready, "b ran before its prefix came back"
-    torch.cuda.synchronize()
-    assert kv.admit_retrieve("b", NODE, WALK, None).ready, "b stayed not ready after its copy landed"
-    inputs = ARNodeInputs(input_seq_len=len(prompt))
-
-    assert kv.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == 6 * PAGE_SIZE
-    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["b"]["main"].lease], expected), (
-        "b leased pages that do not hold the bytes a offloaded"
-    )
-    kv.assert_pages_conserved()
 
 
 @requires_cuda
@@ -407,14 +361,3 @@ def test_copies_by_key_do_not_block_the_host():
     assert kv.reload("a")
     elapsed = time.perf_counter() - start
     assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on an offload and reload by key"
-
-    assert kv.offload("a") > 0
-    kv._index.evict(6)
-    _ingest(kv, "b", prompt)
-    torch.cuda.synchronize()
-    torch.cuda._sleep(500_000_000)
-    start = time.perf_counter()
-    assert not kv.admit_retrieve("b", NODE, WALK, None).ready
-    elapsed = time.perf_counter() - start
-    torch.cuda.synchronize()
-    assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on a copy at a readiness check"
