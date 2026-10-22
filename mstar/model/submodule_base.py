@@ -847,11 +847,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # (`AcceleratorGraphRunner.recompile_limit`).
     compiled_entries_per_shape: int = 1
 
-    # Set True on a submodule that must run in its own parameter dtype — e.g. a
-    # numerically sensitive fp32 vocoder. The engine then neither casts its
-    # params to the autocast dtype nor wraps its forward (or capture) in
-    # autocast, and explicitly disables any ambient one.
-    disable_autocast: bool = False
     # Walks whose steps may run beside the worker's main chain, on a second
     # stream (``StepPipeline._launch_side``); they do where the node's group in
     # the serving config sets ``side_stream: true``. For a stream-fed walk that
@@ -1280,17 +1275,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return StepOrder.ARRIVAL
 
-    def get_autocast_dtype(self) -> torch.dtype | None:
-        """This node's dtype in place of the model's: the engine manager casts
-        the node's params to it, and every forward, warm-up and capture runs
-        under autocast in it. Read once at load (``resolve_node_dtype``).
-
-        Default: ``None`` (inherit the model's dtype). Ignored when
-        ``disable_autocast`` is set; to run a node without autocast, in the
-        dtype it was built in, set that instead.
-        """
-        return None
-
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
@@ -1302,11 +1286,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
-        ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
-        allocate each input buffer in the dtype the eager path hands the region,
-        often that one. The replay copies into the buffer and refuses a value the
-        buffer may round.
+        ``autocast_dtype`` is this node's param dtype (``NodePrecision``),
+        float32 for a node that keeps its build dtype, passed so a config's
+        ``make_static_inputs`` can allocate each input buffer in the dtype the
+        eager path hands the region, often that one. The replay copies into the
+        buffer and refuses a value the buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

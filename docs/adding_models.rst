@@ -203,12 +203,44 @@ You must implement these abstract methods:
    ``MoeParallelConfig``. It is passed only to an EP-enabled node whose group sets one,
    so a model without MoE layers never receives it. See `Expert parallelism (MoE)`_.
 
-   ``autocast_dtype`` is the dtype in which the node's parameters must be allocated. If
-   you build the module on the ``meta`` device, cast it to this dtype before calling
-   ``to_empty(device)``. Casting after ``to_empty`` allocates every parameter in float32
-   first, which doubles the peak VRAM during loading.
+   ``autocast_dtype`` is the node's param dtype from ``get_node_precision`` (after any
+   YAML override; the name predates the policy), or ``None`` for a node that keeps the
+   dtype it is built in. If you build the module on the ``meta`` device, apply the node's
+   policy before calling ``to_empty(device)``:
+   ``apply_precision(module, self.get_node_precision(node_name))`` (from
+   ``mstar.engine.precision``). Casting after ``to_empty`` allocates every parameter in
+   float32 first, which doubles the peak VRAM during loading. The engine applies the same
+   policy to the module you return, which is a no-op once you have.
 
    See `Step 4 — Implement the submodules`_.
+
+``get_node_precision(self, node_name) -> NodePrecision``
+   How the node's numbers are stored and computed. ``NodePrecision`` has three fields:
+
+   - ``param_dtype`` is the dtype the node's floating parameters and buffers are cast to:
+     float32, bfloat16 or float16. ``None`` keeps the dtype the node was built in. An fp8
+     or fp4 dtype is refused: it needs scales and a kernel that reads them, not a cast. A
+     tensor already in such a format (from a pre-quantized checkpoint) is left as it is.
+   - ``fp32_modules`` is a tuple of ``fnmatch`` globs over the node's module, parameter
+     and buffer names. Whatever they match stays fp32, a module with everything under it.
+     A glob that matches nothing is a load error.
+   - ``autocast`` wraps every forward, warm-up and capture in
+     ``torch.amp.autocast(param_dtype)``. It defaults to ``False``: every op runs in its
+     inputs' dtypes, so where the model needs fp32 (a softmax, a norm, a timestep
+     embedding) it says so in ``fp32_modules`` or with an explicit ``.float()``. Keep
+     ``autocast=True`` only for a node whose reference numerics depend on autocast's
+     implicit fp32 ops and that has not been checked without them.
+
+   The policy is known before the submodule exists, so ``get_submodule`` can build in
+   it. The default is ``NodePrecision(torch.bfloat16)``. Nodes that share a module must
+   agree on its dtypes; the engine refuses to load otherwise. A deployment can tighten
+   a node's policy in YAML (see :ref:`Step 6 <config-yaml>`). Orpheus runs its LLM in
+   bf16 and its vocoder in fp32::
+
+      def get_node_precision(self, node_name):
+          if node_name == "LLM":
+              return NodePrecision(torch.bfloat16)
+          return NodePrecision(torch.float32)   # snac_decoder, as the reference
 
 .. note::
 
@@ -251,7 +283,7 @@ You must implement these abstract methods:
 The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
-``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
+``get_max_output_tokens``, ``get_node_precision``, ``load_image``, ``load_audio``,
 ``load_video``, ``load_decoded_image``, and the partition methods described at the end
 of this page. The default ``load_audio`` decodes an upload to mono at the class attribute
 ``AUDIO_INPUT_RATE`` (16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30
@@ -959,13 +991,10 @@ kernel is planned in. The engine resolves each resource's dtype once, at load:
    they read, because the kernel is planned against those pages;
 3. otherwise, the dtype that every local node of the resource resolved to.
 
-If none of these gives a dtype, loading fails. This happens when the resource's nodes run
-without autocast (``disable_autocast``, or a model whose ``get_autocast_dtype`` returns
-``None``), or when they run in different dtypes. The engine never falls back to the
-model-wide dtype, and never silently allocates fp32. Declare the dtype on the spec in
-those cases. For example, Waypoint's DiT runs without autocast, so its ring declares
-``RingKVConfig(..., dtype=torch.bfloat16)``. Its attention, which declares nothing, then
-follows the ring.
+If none of these gives a dtype, loading fails. This happens when the resource's nodes keep
+their build dtype (``param_dtype=None``), or when they have different param dtypes. The
+engine never silently allocates fp32. Declare the dtype on the spec in those cases. A
+node's ``param_dtype`` applies whether or not it runs under autocast.
 
 A resource can also store in a different dtype from the one its nodes compute in. A node
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
@@ -1749,13 +1778,11 @@ methods are:
    ``fullgraph`` still compiles in model code. Qwen3.5's vision encoder and
    Omnilingual ASR are examples.
 
-   Some submodules must run in their own parameter dtype. One example is an fp32 vocoder
-   that is numerically sensitive. Such a submodule sets ``disable_autocast = True``. The
-   engine then does not cast its parameters to the autocast dtype, does not wrap its
-   forward in autocast, and explicitly disables any enclosing autocast. These two class
-   attributes replace the removed ``get_stateless_flavor`` method. Such a node has no
-   dtype for its resources to inherit, so every resource it uses must declare one (see
-   :ref:`Step 2a <Step 2a — Declare your resources>`).
+   A submodule's dtypes are not its own attribute: the model declares them for its node
+   with ``get_node_precision`` (see `Step 2 — Implement the ``Model`` class`_). A numerically
+   sensitive fp32 vocoder, for example, is a node with ``NodePrecision(torch.float32)``.
+   With autocast off, the engine also shuts out any enclosing autocast, so the forward
+   runs in exactly the dtypes it was given.
 
    The engine runs float32 matmuls as TF32 in every process
    (``torch.set_float32_matmul_precision("high")``). A node that needs full fp32, for
@@ -2520,11 +2547,11 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   replay, it copies your real tensors into them by name. ``shape`` provides ``bs``,
   ``seq_lens`` and ``total_tokens`` for the bucket being built. Allocate each buffer in the
   dtype of the tensor you pass for it, which for a hidden state is usually
-  ``autocast_dtype``. The copy before replay casts a value into a wider dtype of its kind
-  (int32 token ids into an int64 buffer, a bf16 table into an fp32 one). A value the
-  buffer may round (a narrower dtype, such as an fp32 hidden state into a bf16 buffer, or
-  an integer into a floating-point or complex buffer) is refused with a ``ValueError``
-  naming the buffer.
+  ``autocast_dtype`` (the node's param dtype, float32 for a node that keeps its build
+  dtype). The copy before replay casts a value into a wider dtype of its kind (int32 token
+  ids into an int64 buffer, a bf16 table into an fp32 one). A value the buffer may round (a
+  narrower dtype, such as an fp32 hidden state into a bf16 buffer, or an integer into a
+  floating-point or complex buffer) is refused with a ``ValueError`` naming the buffer.
 - ``forward_kwargs`` holds static keyword arguments that are passed to ``capture_fn`` on
   every call, for example a layer count or an ``is_causal`` flag.
 - ``required`` refuses to start the worker when any of the region's shapes is left out of
@@ -2855,6 +2882,27 @@ request's lease, pages and index entries at dispatch, an item's end inside a pag
 them, and exists only where a walk keying the cache runs and ``opening_prefix_caches``
 says the workers open it.
 
+Tuning a node's precision
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``nodes:`` block, keyed by node name, overrides the model's ``get_node_precision`` for
+one deployment:
+
+.. code-block:: yaml
+
+   nodes:
+     LLM:
+       precision:
+         param_dtype: float32          # or bfloat16 / float16
+         fp32_modules: ["*.norm"]       # added to the model's islands
+         autocast: false
+
+A deployment may tighten a policy but not loosen it: it may turn autocast off but never
+on, add fp32 modules but not drop the model's, and change ``param_dtype`` only on a node
+that has one (``None`` pins the dtype the node is built in). A node the deployment does
+not place, or an unknown key, is a load error. The model-wide ``autocast_dtype:`` key is
+no longer read; it raises an error naming this block.
+
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -3108,14 +3156,14 @@ Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder converts them into 24 kH
 
 The two nodes have different needs. The LLM declares the four standard resources, shown
 under :ref:`Step 2a <Step 2a — Declare your resources>`. No spec names ``snac_decoder``,
-so that node receives no resources. The SNAC decoder instead declares how it must be run,
-using two class attributes on the submodule:
+so that node receives no resources. The SNAC decoder runs in fp32 (its policy, shown
+under ``get_node_precision`` above) and without compilation, a class attribute on the
+submodule:
 
 .. code-block:: python
 
    class SNACDecoderSubmodule(NodeSubmodule):
-       disable_torch_compile = True   # runs in fp32, without compilation
-       disable_autocast = True
+       disable_torch_compile = True
 
 There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, plus a
 ``snac_chunk`` node that emits audio to the client:

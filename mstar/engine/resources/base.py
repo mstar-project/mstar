@@ -66,7 +66,7 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     # the dtype this resource's local nodes were cast to and run in; None when they
-    # disagree or one keeps its own (``disable_autocast``)
+    # disagree or one keeps its build dtypes (no ``param_dtype``)
     compute_dtype: torch.dtype | None = None
     # each local node's resolved dtype, to name them when there is no common one
     node_dtypes: "Mapping[str, torch.dtype | None]" = field(default_factory=dict)

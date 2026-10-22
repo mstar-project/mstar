@@ -381,7 +381,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     from mstar.engine.resources import StepRunner
 
     sub = _submodule_class()(group, rank)
-    engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
+    engine = Engine(graph_runtime=graph_runtime)
     if rank == 0:
         engine._tp_leader_nodes, engine._resident_delta = {NODE}, OffloadDelta.new()
         # as `Engine.__init__` wires it on rank 0, so the follower replays rank 0's reservations

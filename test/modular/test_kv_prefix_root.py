@@ -31,6 +31,7 @@ import torch
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import (
@@ -149,12 +150,15 @@ def _open_caches(engine: Engine, specs: dict, model, instance: dict) -> None:
     engine._open_prefix_caches(specs, model, instance, opened, checkpoint)
 
 
-def _root(kv=None, rope=None, model=None, instance=None) -> bytes:
+def _root(kv=None, rope=None, model=None, instance=None, precisions=None) -> bytes:
     """Run the engine's fold over one KV resource and one resource above it, on
     nodes whose lockstep instances are ``instance`` (one rank by default)."""
     kv = kv or _kv()
     rope = rope or _rope()
-    engine = make_engine(_resources={KV: kv, ROPE: rope})
+    engine = make_engine(
+        _resources={KV: kv, ROPE: rope},
+        **({"_node_precisions": precisions} if precisions is not None else {}),
+    )
     specs = {
         KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config),
         ROPE: PositionSpec(
@@ -187,6 +191,21 @@ def test_the_root_changes_with_a_resource_planned_against_the_cache():
         "the position config is not in the root, so a re-scaled rope would "
         "match pages written under the old one"
     )
+
+
+def test_the_root_changes_with_the_precision_its_writers_run_in():
+    bf16 = {"LLM": NodePrecision(torch.bfloat16)}
+    assert _root(precisions=bf16) == _root(precisions=dict(bf16))
+    assert _root(precisions=bf16) != _root(precisions={"LLM": NodePrecision(torch.float32)}), (
+        "the writing node's param dtype is not in the root, so pages written in "
+        "fp32 would match a bf16 deployment of the same checkpoint"
+    )
+    assert _root(precisions=bf16) != _root(
+        precisions={"LLM": NodePrecision(torch.bfloat16, fp32_modules=("*.norm",))},
+    ), "the writing node's fp32 islands are not in the root"
+    assert _root(precisions=bf16) == _root(
+        precisions={**bf16, "vocoder": NodePrecision(torch.float32)},
+    ), "a node that does not write the cache moved its root"
 
 
 def test_the_root_changes_with_the_preprocessing_identity():
