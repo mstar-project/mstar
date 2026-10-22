@@ -38,6 +38,7 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E40
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -47,9 +48,9 @@ from mstar.model.glm52.dsa import (  # noqa: E402
     Glm52DsaRequestSpan,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Glm52DsaKStore
@@ -103,21 +104,17 @@ def test_cleanup_request_evicts_kstore():
     sub._mtp_checked = {"r0": 7}
     sub._mtp_max_tokens = {"r0": 32}
     sub._mtp_ignore_eos = {"r0": False}
-    sub._token_budget = {"r0": 20}
-    sub._ended_at_prefill = {"r0"}
     sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
     sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
-    sub.request_state("r0")  # base per-request state exists too
+    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
     assert sub.request_states == {}
     assert sub._mtp_emitted == {}
     assert sub._mtp_max_tokens == {}
     assert sub._mtp_ignore_eos == {}
-    assert sub._token_budget == {}
-    assert sub._ended_at_prefill == set()
     assert not (sub._mtp_pending or sub._mtp_verdict or sub._mtp_trimmed or sub._mtp_slot)
     assert sub._mtp_free_slots == [5]  # the seed slot goes back
     sub.cleanup_request("r0")  # idempotent, like the base hook
@@ -127,11 +124,11 @@ def test_cleanup_request_evicts_kstore():
 # preprocess guard, both flag states
 # ---------------------------------------------------------------------------
 
-class _FakeKV:
+class _FakePositions:
     def __init__(self, starts):
         self._starts = starts
 
-    def stored_len(self, rid, label="main"):
+    def position(self, rid, label):
         return self._starts[rid]
 
 
@@ -161,7 +158,7 @@ def _preprocess(sub, starts, seq_len, tables=None):
     ]
     engine_inputs = SimpleNamespace(
         request_ids=list(starts),
-        resources={KV_RESOURCE: _FakeKV(starts)},
+        resources={POS_RESOURCE: _FakePositions(starts)},
         step=_fake_step(tables or [[0, 1, 2] for _ in starts]),
     )
     return sub.preprocess("prefill", engine_inputs, inputs)
@@ -362,7 +359,7 @@ def test_declared_step_under_dsa_is_the_plain_one():
     sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
     step = sub.declare_step("prefill", ["r0"], [ar])
-    assert set(step.keys()) == {KV_RESOURCE, ATTN_RESOURCE, SAMPLER_RESOURCE}
+    assert set(step.keys()) == {KV_RESOURCE, ATTN_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE}
     assert step.segments[0].span == 3
 
 
@@ -376,11 +373,11 @@ def test_full_to_shared_threading_order(monkeypatch):
 
     trace = []
 
-    def spy(self, dsa_ctx, selection, q_nope, q_pe, kv_c, k_pe):
+    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_ctx=None, dsa_selection=None):
         trace.append((self.layer_idx, selection))
         return torch.zeros_like(q_nope)
 
-    monkeypatch.setattr(Glm52MLAAttention, "_run_sparse_absorbed", spy)
+    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", spy)
 
     compute_calls = []
     layer0_indexer = model.model.layers[0].self_attn.indexer
@@ -407,7 +404,7 @@ def test_full_to_shared_threading_order(monkeypatch):
     # FULL layer appended prompt + decode token; SHARED layer appended nothing.
     assert sub._dsa_k_store.tokens("r0", 0) == 5
     assert sub._dsa_k_store.tokens("r0", 1) == 0
-    assert driver.resources[KV_RESOURCE].stored_len("r0") == 5
+    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 5
 
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
@@ -444,7 +441,7 @@ def _independent_masked_reference(latent_cache, pages, page_size, positions,
                                   selection_row, q_all, scale, latent_dim):
     """Dense MQA over ALL cached positions with an additive mask keeping only
     the selected ones — written from scratch, sharing no code with
-    ``_run_sparse_absorbed``."""
+    ``_attend_selected``."""
     pos = torch.arange(positions)
     flat = latent_cache[pages[pos // page_size], pos % page_size].float()
     scores = q_all.float() @ flat.T * scale  # (H, positions)
@@ -502,7 +499,7 @@ def test_sparse_gather_matches_masked_reference(selection_row, autocast):
     selection = torch.tensor([selection_row], dtype=torch.int32)
 
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        out = attn._run_sparse_absorbed(ctx, selection, q_nope, q_pe, kv_c, k_pe)
+        out = attn._attend_selected(selection, q_nope, q_pe, kv_c, k_pe, dsa_ctx=ctx)
 
     # The scatter half: position 9's slot now holds this step's latent.
     written = cache[pages[current // page_size], current % page_size]
@@ -534,12 +531,12 @@ def test_sparse_path_refuses_prefill_shape():
     )
     h = attn.num_heads
     with pytest.raises(RuntimeError, match="decode-only"):
-        attn._run_sparse_absorbed(
-            ctx, torch.zeros(2, 4, dtype=torch.int32),
+        attn._attend_selected(
+            torch.zeros(2, 4, dtype=torch.int32),
             torch.randn(2, h, cfg.kv_lora_rank),
             torch.randn(2, h, cfg.qk_rope_head_dim),
             torch.randn(2, 1, cfg.kv_lora_rank),
-            torch.randn(2, 1, cfg.qk_rope_head_dim))
+            torch.randn(2, 1, cfg.qk_rope_head_dim), dsa_ctx=ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +562,7 @@ def test_decode_across_topk_prefix_property_and_divergence():
     assert not flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     sparse_logits = _serve_steps(driver, prompt, decode)
     assert sub._dsa_k_store.tokens("r0", 0) == 3 + len(decode)
-    assert driver.resources[KV_RESOURCE].stored_len("r0") == 3 + len(decode)
+    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 3 + len(decode)
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
 
