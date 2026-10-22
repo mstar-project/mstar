@@ -456,11 +456,6 @@ def test_slots_take_the_nodes_compute_dtype(adapters):
     assert LoraAdapterPool(make_spec(paths), "cpu", dtype=torch.float16).dtype is torch.float64
     with pytest.raises(ValueError, match="no dtype"):
         LoraAdapterPool.build(spec, EngineResourceInfo(device=CPU))
-    # the serving config's autocast_dtype, as the worker reads it
-    from mstar.model.base import parse_autocast_dtype
-
-    assert parse_autocast_dtype("float16") is torch.float16
-    assert parse_autocast_dtype("torch.bfloat16") is torch.bfloat16
 
 
 def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):

@@ -349,7 +349,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     from mstar.engine.resources import StepRunner
 
     sub = _submodule_class()(group, rank)
-    engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
+    engine = Engine(graph_runtime=graph_runtime)
     if rank == 0:
         engine._tp_leader_nodes = {NODE}
     else:

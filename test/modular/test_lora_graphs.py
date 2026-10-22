@@ -15,6 +15,7 @@ pytest.importorskip("safetensors")
 import test_lora_pool as P  # noqa: E402
 
 from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraBaseOnly, LoraStep  # noqa: E402
 from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
@@ -194,7 +195,7 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     bind_module_lora(node, {"lora": pool})
     engine = object.__new__(Engine)
     engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
-    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
+    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, precision=NodePrecision(None),
                                                lora_pools=(pool,))}
     engine._compile_regions()
     assert pool._current is None and pool.active

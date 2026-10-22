@@ -30,7 +30,6 @@ DEVICE = torch.device("cuda", 0)
 class _MatmulChain(NodeSubmodule):
     """``x @ w1 @ w2`` in fp32: TF32 rounding shows at about 1e-3 relative."""
 
-    disable_autocast = True
 
     def __init__(self, precision=None, compile_capture=False):
         super().__init__()
@@ -99,7 +98,7 @@ def setup():
     }
     for node in nodes.values():
         node.to(DEVICE)
-    engine = Engine(None, autocast_dtype=None)
+    engine = Engine(None)
     engine.load_model(
         submodules=nodes, specs=[], parallel_groups=_Groups(),
         device=DEVICE, transfer_engine_info=None,
