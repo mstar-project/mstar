@@ -4,6 +4,8 @@ import dataclasses
 import functools
 from dataclasses import dataclass, field
 
+from mstar.engine.resources.kv.config import AuxPlanes
+
 # fp8 e4m3 with [128, 128] `weight_scale_inv` block scales and dynamic
 # activation scaling: the checkpoint's quantization scheme.
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
@@ -154,7 +156,7 @@ class Glm5NextModelConfig:
     # where dense MLA computes exactly what DSA would (selecting
     # <= topk/kpool pools out of <= topk/kpool is the identity, tail
     # included). On: contexts up to max_seq_len, every MLA layer through
-    # the k-pool indexer and sparse MLA (mstar/engine/resources/dsa/kpool.py).
+    # the k-pool indexer and sparse MLA (the DSA resource, mstar/engine/resources/dsa).
     dsa_long_context: bool = False
     # dsa_long_context: a prefill step runs its tokens through the model in windows of
     # this many, so activations stay bounded however long the prompt.
@@ -354,27 +356,23 @@ class Glm5NextModelConfig:
         return self.max_seq_len if self.dsa_long_context else self.index_topk
 
     @property
-    def index_plane_offset(self) -> int:
-        """dsa_long_context: the first index plane of the MLA cache, after the latent planes
-        (the MTP layer's included)."""
+    def num_kv_planes(self) -> int:
+        """Latent planes of the MLA cache: one per full-attention layer and the MTP layer's.
+        With dsa_long_context each has an index plane on the same pages (``index_planes``)."""
         return len(self.full_attn_layer_indices) + (1 if self.mtp_num_draft_tokens > 0 else 0)
 
     @property
-    def num_kv_planes(self) -> int:
-        """Planes of the MLA cache: a latent plane per full-attention layer and the MTP
-        layer's, and with dsa_long_context an index plane for each of them."""
-        index = self.index_plane_offset if self.dsa_long_context else 0
-        return self.index_plane_offset + index
+    def index_planes(self) -> AuxPlanes | None:
+        """dsa_long_context: the MLA cache's index planes, a row ``[k | gate | key of the
+        pool ending here]`` per token, beside each latent plane."""
+        if not self.dsa_long_context:
+            return None
+        return AuxPlanes(num_layers=self.num_kv_planes, width=3 * self.index_head_dim)
 
     def check_long_context(self, page_size: int | None = None) -> None:
         """Refuse a dsa_long_context setup the index planes cannot hold."""
         if not self.dsa_long_context:
             return
-        width = self.kv_lora_rank + self.mla_cache_kpe
-        if 3 * self.index_head_dim > width:
-            raise ValueError(
-                f"an index plane row holds 3 x index_head_dim={self.index_head_dim} values; "
-                f"the MLA cache row is {width} wide")
         if self.max_seq_len <= self.index_topk:
             # dense MLA already serves index_topk: the window is model_kwargs.max_seq_len
             raise ValueError(

@@ -1,9 +1,10 @@
-"""GLM-5.3-Flash k-pool indexer kernels over the index planes of the paged MLA cache.
+"""DSA indexer kernels over the index planes on the paged MLA cache's pages.
 
-An index plane row ``t`` holds ``[k_t | gate_t | key of the pool ending at t | unused]``
-(``D`` = index_head_dim each). Pools are ``KP`` consecutive tokens from position 0; pool ``j``
-covers ``[KP*j, KP*j + KP)`` and its key lives in the row of its last token. Pages hold a
-multiple of ``KP`` tokens, so a pool never straddles a page.
+Pools are ``KP`` consecutive tokens from position 0: pool ``j`` covers ``[KP*j, KP*j + KP)`` and
+its key lives in the row of its last token, at column ``KEY``. With ``KP == 1`` a plane row is
+the token's key (``KEY == 0``). With ``KP > 1`` (GLM-5.3-Flash's k-pool indexer) row ``t``
+holds ``[k_t | gate_t | key of the pool ending at t]`` (``D`` = index_head_dim each, ``KEY ==
+2 * D``). Pages hold a multiple of ``KP`` tokens, so a pool never straddles a page.
 
 ``pool_keys`` writes the key of every pool a step's row completes: per channel, a softmax over
 the members of ``gate + ape`` (fp32, rounded to bf16), times the member keys (each product
@@ -45,7 +46,7 @@ def _pool_keys_kernel(plane, pages, page_start, row_req, pos, ape,
 
 @triton.jit(do_not_specialize=["splits"])
 def _decode_scores_kernel(q, w, plane, pages, page_start, row_req, pos, out, max_pools, splits,
-                          NH: tl.constexpr, D: tl.constexpr, W: tl.constexpr,
+                          NH: tl.constexpr, D: tl.constexpr, W: tl.constexpr, KEY: tl.constexpr,
                           KP: tl.constexpr, PAGE: tl.constexpr, BP: tl.constexpr):
     """Program (row, split): the split walks every ``splits``-th block of BP pools the row
     sees."""
@@ -62,7 +63,7 @@ def _decode_scores_kernel(q, w, plane, pages, page_start, row_req, pos, out, max
         live = jj < n
         last = jj * KP + KP - 1                                                # pools' last tokens
         page = tl.load(pages + start + last // PAGE, mask=live, other=0).to(tl.int64)
-        kv = tl.load(plane + (page * PAGE + last % PAGE)[:, None] * W + 2 * D + d[None, :],
+        kv = tl.load(plane + (page * PAGE + last % PAGE)[:, None] * W + KEY + d[None, :],
                      mask=live[:, None], other=0.0)
         dots = tl.maximum(tl.dot(qv, tl.trans(kv)), 0.0)                       # (NH, BP)
         sc = tl.sum(dots * wv[:, None], 0)
@@ -72,8 +73,8 @@ def _decode_scores_kernel(q, w, plane, pages, page_start, row_req, pos, out, max
 @triton.jit(do_not_specialize=["splits"])
 def _prefill_scores_kernel(q, w, plane, pages, start, pos, out, R, max_pools, splits,
                            NH: tl.constexpr, D: tl.constexpr, W: tl.constexpr,
-                           KP: tl.constexpr, PAGE: tl.constexpr, BR: tl.constexpr,
-                           BP: tl.constexpr):
+                           KEY: tl.constexpr, KP: tl.constexpr, PAGE: tl.constexpr,
+                           BR: tl.constexpr, BP: tl.constexpr):
     """Program (BR rows of one request, split): the rows' heads sit on the dot's M side, and
     the split walks every ``splits``-th block of BP pools up to the rows' last, so a row
     block's queries load once."""
@@ -93,7 +94,7 @@ def _prefill_scores_kernel(q, w, plane, pages, start, pos, out, R, max_pools, sp
         live_j = j < n_max
         last = j * KP + KP - 1
         page = tl.load(pages + start + last // PAGE, mask=live_j, other=0).to(tl.int64)
-        kv = tl.load(plane + (page * PAGE + last % PAGE)[:, None] * W + 2 * D + d[None, :],
+        kv = tl.load(plane + (page * PAGE + last % PAGE)[:, None] * W + KEY + d[None, :],
                      mask=live_j[:, None], other=0.0)                          # (BP, D)
         dots = tl.maximum(tl.dot(qv, tl.trans(kv)), 0.0)                      # (BR*NH, BP)
         sc = tl.sum(tl.reshape(dots * wv[:, None], [BR, NH, BP]), 1)          # (BR, BP)
@@ -134,9 +135,14 @@ def expand_slots(first: torch.Tensor, pos: torch.Tensor, row_req: torch.Tensor,
     return out
 
 
+def key_column(d: int, kp: int) -> int:
+    """Where a pool's key starts in its plane row."""
+    return 0 if kp == 1 else 2 * d
+
+
 def _check_plane(plane: torch.Tensor, d: int, kp: int) -> None:
     assert plane.dtype == torch.bfloat16 and plane.is_contiguous()
-    assert plane.shape[-1] >= 3 * d and plane.shape[1] % kp == 0
+    assert plane.shape[-1] >= key_column(d, kp) + d and plane.shape[1] % kp == 0
 
 
 def pool_keys(plane: torch.Tensor, pages: torch.Tensor, page_start: torch.Tensor,
@@ -166,8 +172,8 @@ def decode_scores(q: torch.Tensor, w: torch.Tensor, plane: torch.Tensor, pages: 
     splits = max(1, min(triton.cdiv(max_pools, bp), triton.cdiv(2048, rows)))
     _decode_scores_kernel[(rows, splits)](
         q, w, plane, pages, page_start, row_req, pos, out, max_pools, splits,
-        NH=nh, D=d, W=plane.shape[-1], KP=kp, PAGE=plane.shape[1], BP=bp,
-        num_warps=4, num_stages=2)
+        NH=nh, D=d, W=plane.shape[-1], KEY=key_column(d, kp), KP=kp, PAGE=plane.shape[1],
+        BP=bp, num_warps=4, num_stages=2)
     return out
 
 
@@ -186,6 +192,6 @@ def prefill_scores(q: torch.Tensor, w: torch.Tensor, plane: torch.Tensor, pages:
     splits = max(1, min(triton.cdiv(max_pools, bp), triton.cdiv(1024, blocks)))
     _prefill_scores_kernel[(blocks, splits)](
         q, w, plane, pages, start, pos, out, rows, max_pools, splits,
-        NH=nh, D=d, W=plane.shape[-1], KP=kp, PAGE=plane.shape[1], BR=br, BP=bp,
-        num_warps=4, num_stages=2)
+        NH=nh, D=d, W=plane.shape[-1], KEY=key_column(d, kp), KP=kp, PAGE=plane.shape[1],
+        BR=br, BP=bp, num_warps=4, num_stages=2)
     return out

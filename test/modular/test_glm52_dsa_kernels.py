@@ -1,8 +1,9 @@
-"""paged_kernels vs the indexer's fp32 score math (dsa/topk.py) on a paged key store."""
+"""dsa/kernels.py's score kernels with a key per token (GLM-5.2's indexer, kp=1) vs the
+indexer's fp32 score math (index_topk's) on a paged index plane."""
 import pytest
 import torch
 
-from mstar.engine.resources.dsa.topk import select_topk_causal
+from mstar.model.glm52._testing import select_topk_causal
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
 
@@ -11,6 +12,7 @@ DEV = torch.device("cuda")
 
 
 def _store(num_pages, gen):
+    """An index plane of a key per token: ``[pages, page, D]``, the key at column 0."""
     return torch.randn(num_pages, PAGE, D, device=DEV, generator=gen).bfloat16()
 
 
@@ -38,8 +40,15 @@ def _rows_agree(got, ref, bounds):
     assert same >= 0.999 * a.numel()
 
 
+def _flat(table):
+    """A ``[requests, pages]`` table as the step's flat page list and each request's start."""
+    reqs, width = table.shape
+    starts = torch.arange(reqs, dtype=torch.int32, device=DEV) * width
+    return table.reshape(-1).contiguous(), starts
+
+
 def test_decode_scores_follow_each_rows_request_and_bound():
-    from mstar.engine.resources.dsa.paged_kernels import decode_scores
+    from mstar.engine.resources.dsa.kernels import decode_scores
 
     gen = torch.Generator(device="cuda").manual_seed(0)
     lens = [300, 1000, 2500]
@@ -52,8 +61,9 @@ def test_decode_scores_follow_each_rows_request_and_bound():
     row_req = torch.tensor([2, 0, 1], dtype=torch.int32, device=DEV)  # rows out of request order
     bounds = [lens[int(i)] for i in row_req]
     max_len = max_pages * PAGE
-    got = decode_scores(q, w, k_pages, table, row_req,
-                        torch.tensor(bounds, dtype=torch.int32, device=DEV), max_len)
+    pages, starts = _flat(table)
+    pos = torch.tensor(bounds, dtype=torch.int32, device=DEV) - 1
+    got = decode_scores(q, w, k_pages, pages, starts, row_req, pos, max_len, 1)
     keys = k_pages[table.long()].view(len(lens), max_len, D)
     ref = torch.stack([_reference(q[r], w[r], keys[int(row_req[r])], bounds[r])
                        for r in range(len(lens))])
@@ -62,7 +72,7 @@ def test_decode_scores_follow_each_rows_request_and_bound():
 
 def test_decode_scores_stride_over_more_blocks_than_programs():
     """64 rows leave a few programs per row, each striding over many key blocks."""
-    from mstar.engine.resources.dsa.paged_kernels import decode_scores
+    from mstar.engine.resources.dsa.kernels import decode_scores
 
     gen = torch.Generator(device="cuda").manual_seed(2)
     rows, max_pages = 64, 40
@@ -74,7 +84,9 @@ def test_decode_scores_stride_over_more_blocks_than_programs():
     w = torch.randn(rows, NH, device=DEV, generator=gen) * (D ** -0.5 * NH ** -0.5)
     row_req = torch.arange(rows, dtype=torch.int32, device=DEV)
     max_len = max_pages * PAGE
-    got = decode_scores(q, w, k_pages, table, row_req, lens.to(torch.int32), max_len)
+    pages, starts = _flat(table)
+    got = decode_scores(q, w, k_pages, pages, starts, row_req, (lens - 1).to(torch.int32),
+                        max_len, 1)
     keys = k_pages[table.long()].view(rows, max_len, D)
     bounds = lens.tolist()
     ref = torch.stack([_reference(q[r], w[r], keys[r], bounds[r]) for r in range(rows)])
@@ -82,18 +94,20 @@ def test_decode_scores_stride_over_more_blocks_than_programs():
 
 
 def test_prefill_scores_are_causal_per_row():
-    from mstar.engine.resources.dsa.paged_kernels import prefill_scores
+    from mstar.engine.resources.dsa.kernels import prefill_scores
 
     gen = torch.Generator(device="cuda").manual_seed(1)
     ctx, rows = 3000, 70  # a chunk that ends the prompt; 70 is not a multiple of the row block
     pages = -(-ctx // PAGE)
     k_pages = _store(pages + 2, gen)
     table = torch.randperm(pages + 2, device=DEV, generator=gen)[:pages].to(torch.int32)
+    # the request's pages sit after another request's in the step's flat list
+    flat = torch.cat([torch.tensor([pages, pages + 1], dtype=torch.int32, device=DEV), table])
     positions = torch.arange(ctx - rows, ctx, dtype=torch.int32, device=DEV)
     q = torch.randn(rows, NH, D, device=DEV, generator=gen).bfloat16()
     w = torch.randn(rows, NH, device=DEV, generator=gen) * (D ** -0.5 * NH ** -0.5)
     max_len = pages * PAGE
-    got = prefill_scores(q, w, k_pages, table, positions, max_len)
+    got = prefill_scores(q, w, k_pages, flat, 2, positions, max_len, 1)
     keys = k_pages[table.long()].view(max_len, D)
     bounds = (positions + 1).tolist()
     ref = torch.stack([_reference(q[r], w[r], keys, bounds[r]) for r in range(rows)])
