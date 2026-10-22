@@ -358,6 +358,18 @@ there. The keys stop at a prompt's first input that is not a token, so a BAGEL p
 keyed over its leading text only. A stream under a sliding window files pages only up to
 its protected prefix, which the window never releases.
 
+A request on a LoRA adapter fills different KV for the same tokens, so its keys chain from
+a root that names the adapter's weights: a SHA-256 over every module's A, B (with dtype
+and shape) and alpha, read once when the adapter is registered (``AdapterPrefixRoots`` in
+``mstar/engine/resources/lora/identity.py``, built by the preprocess worker at startup).
+The root travels with the request as ``KVReqConfig.prefix_root`` so that a page
+generation fills is keyed under it too. The same tokens under two adapters, or under an
+adapter and the base model, never share pages; two names for identical weights do; and a
+name registered again with other weights misses everything the old weights filled. A
+base-model request chains from the empty root, so its keys are what they were before
+LoRA. A request whose adapter has no registered root is not keyed at all. Nothing on the
+model side is needed for this.
+
 .. _Step 2a — Declare your resources:
 
 Step 2a — Declare your resources
@@ -458,6 +470,12 @@ The spec types are:
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above.
+   * - ``LoraSpec``
+     - Per-request LoRA adapters on the node's linears: a pool of device
+       slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
+       Returned from ``get_lora_specs`` (one per node), not this list, and built only
+       when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
+       adapters`_.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -696,6 +714,134 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Per-request LoRA adapters
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``LoraSpec`` serves LoRA adapters per request over frozen base weights: each target
+linear adds ``scaling * (x @ A^T) @ B^T`` for the adapter of the token's request, so rows of
+one batch can run different adapters, or none. The engine owns the adapter weights. A
+model declares which linears adapters may touch; it never indexes the pool itself.
+
+A model returns its specs from ``Model.get_lora_specs``: a spec per node the adapters
+reach, the first keyed ``"lora"`` and the others apart. They are built only when the
+serving YAML has a ``resources: lora:`` block, so a deployment without one builds exactly
+what it did before. The node declares each step's rows in ``declare_step``, a
+``LoraStep`` under the pool's key (a segment per request, its span the tokens that
+request puts through the adapted linears, in the order they are packed), and each
+adapted linear adds ``pool.layer_delta(target, layer)(x, y)`` to its base output before
+anything reads it: before a column-parallel gather, before a row-parallel all-reduce.
+
+The pool keeps the last step's addressing after commit, so a delta called outside a step
+would add another step's adapters to these rows. The engine brackets every planned step's
+``preprocess`` and forward, and every capture, in ``StepRunner.compute_scope``
+(``Resource.enter_compute`` / ``exit_compute``); an engine-built pool refuses a delta
+called outside one.
+
+A ``LoraSpec``'s parts:
+
+- **Targets.** ``LoraTarget`` gives the unsharded linear's shape and how the base layer is
+  split under tensor parallelism. For a column-parallel linear, A is replicated and B is
+  split by output rows, per slice (a slice with fewer heads than ranks is replicated, as
+  ``QKVParallelLinear`` does with K/V). For a row-parallel linear, A is split along the
+  input and B is replicated; the delta is a partial sum, added to the partial base output
+  *before* the all-reduce. LoRA adds no collective to the forward. ``layers`` restricts a
+  target to some layers of a hybrid stack. A checkpoint tensor that packs several of the
+  target's slices, each split across ranks on its own, is named in ``slice_packs``
+  (Qwen3.5's delta-net ``in_proj_qkv``: one A for the three, B cut by their widths), and
+  a base linear that pads a slice per rank for alignment says so in ``slice_align``.
+  ``parallel="none"`` is a target whole on every rank, its delta added to an output that
+  is already whole.
+- **Target kinds and rows.** ``kind="embedding"`` is a token embedding: ``in_features``
+  is the vocabulary, the layer passes token ids as ``x``, and the shrink is a gather of
+  A's column per token (``mstar::lora_gather_shrink``), PEFT's ``lora_embedding_A`` /
+  ``_B``; an id outside the vocabulary (an image position's ``-1``) adds nothing.
+  ``per_segment`` is one row per segment and ``token_fold=k`` one row per ``k``
+  consecutive tokens of a segment. The pool plans an addressing per grouping its targets
+  use; the call checks the rows it gets.
+- **Checkpoint layouts.** Adapters are validated from the safetensors header: modules
+  map to targets, shapes fit them (an adapter for another model size is a 400, not an
+  admit failure), and a conv adapter whose kernel is its stride flattens to the linear
+  over the patch. DoRA (``lora_magnitude_vector``), ``modules_to_save``, trainable
+  tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
+  the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
+  touching a dropped target is refused, and its modules stay unbound. Without the list,
+  a deployment keeps the targets its configured adapters touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
+  every worker with that list, so every process builds the same pools; an adapter it
+  cannot read fails the deployment.
+- **Requests.** Nothing per model. The conductor opens every request with a
+  ``LoraReqConfig`` from the ``lora_adapter`` request kwarg (``None`` for the base
+  model), which the OpenAI ``model`` field maps onto. ``validate`` refuses, with a 400, an
+  unknown adapter, one whose rank exceeds ``max_rank``, and one that touches a module the
+  model did not declare as a target. A request on an adapter is prefix-cached in its
+  adapter's own namespace (see **Cross-request prefix reuse**).
+- **Capture and compile.** Nothing per model: a node serving adapters captures the same
+  buckets and compiles the same as one that does not. A capture plans every row on the
+  zero adapter; a replay's plan writes each row's slot into the buffers that capture
+  recorded, so a captured graph serves any mix of adapters without recapture. The
+  kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
+  latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
+  without a graph break. Under Triton the launch grid depends on the token count and
+  the slot count alone. The engine captures every bucket of a node serving adapters a
+  second time, keyed ``LoraBaseOnly(<the node's own key>)``, with no LoRA kernel in it: a
+  step none of whose rows names an adapter replays that one (or runs its deltas as
+  ``y`` untouched, eagerly), and falls back to the LoRA capture when its twin was not
+  captured. The choice reads only which adapter each request named, the same on every
+  rank, and the pool checks it again at plan; ``cg_key_info`` and ``declare_step`` still
+  state only the node's own key.
+- **dtype.** The slot weights take the nodes' compute dtype (the serving config's
+  ``autocast_dtype``, e.g. ``float16``). A node that runs outside autocast sets
+  ``LoraSpec.dtype`` to its weights' dtype.
+
+A request takes its adapter's slot on its first admit and holds it until it is removed.
+Slot 0 is a zero adapter (rank 0) that base-model rows and capture padding rows address,
+and the kernels skip it. A miss loads the adapter from the host tier into a free slot, or
+into the unheld slot released longest ago. A request whose adapter cannot get a slot (every
+slot held by running requests, or promised to requests already let through) is not ready
+(``LoraAdapterPool.admit_retrieve``), so the scheduler leaves it out of the steps it builds
+and the rows already running keep stepping; the admit's ``AllocationFailed`` stays only as
+a backstop. Once a request has waited ``slot_wait_steps`` of the pool's steps for a slot,
+no other adapter may take one, and new requests on one held slot (the one with the fewest
+holders) are held back until it drains and the cold adapter takes it, so a cold adapter is
+not starved by steady traffic on resident ones; requests on the other held slots keep
+running meanwhile. Only a request held for want of a slot ages, and a waiting request the
+scheduler no longer screens (failed, in a backoff) holds no one back. An adapter with
+nothing for a pool's targets (a text-only adapter on a vision tower's pool) takes no slot
+there once an admit has read it: its rows address the zero adapter. Only the rank that
+chooses batches screens:
+on a lockstep instance the leader, whose choice the followers run as sent, so the
+screening needs no agreement across ranks.
+The plan writes each step's addressing (for each row grouping its targets read, per token,
+per segment or per fold, the rows grouped by slot: the only thing the kernels read) into
+one fixed buffer per capture slot, sized to its bucket, so a captured replay
+reads stable addresses; a replay's padding rows address the zero adapter and its tail
+tokens no slot. The pool admits and plans on the GPU thread only (no pre-plan), in step
+order, and every write it makes to the device (an adapter load, the addressing) goes on
+the stream the forwards run on, so a load into a slot lands after every step queued
+before it. ``backend`` picks the kernels: ``"triton"`` (slot-grouped shrink and expand,
+the default on CUDA) or ``"torch"`` (a reference with no data-dependent shapes, the
+default elsewhere).
+
+Under tensor parallelism each rank of the node's lockstep instance keeps its own pool and
+makes its own slot decisions, with nothing journalled from rank 0, and they come out the
+same on every rank: admits run in the order rank 0 broadcasts, and the worker lands each
+teardown between the same two admits on every rank (the ``after_tp_seq`` stamp on a
+forwarded remove, honoured on rank 0 by waiting for the admit of the step it is stamped
+behind). That is why the LRU clock counts admits rather than commits, which may land on
+either side of a teardown. Which adapters are resident, which slot a miss takes and
+whether an admit refuses then follow from the same state on every rank. Reading an
+adapter from disk is the one step that can fail on one rank only, so the pool ANDs its
+outcome across the instance (one gloo all-reduce per adapter installed, none in steady
+state) and every rank installs it or refuses the request. Files are read on the pool's own
+reader thread: every rank starts reading an adapter into the host tier when it ingests a
+request that names it, the leader's screen keeps the request out of steps until its copy
+is in, and an admit never reads a file itself (a follower whose read is still in flight
+waits for it). Neither that wait nor the agreement holds the pool's lock, so the main
+thread's ingests and removes go on meanwhile.
+
+A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
+out per request, while each SP rank holds a shard of the tokens, so building the pool
+refuses the deployment.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -1456,6 +1602,18 @@ that a misspelled setting is never silently ignored:
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
        memory-against-coverage trade the deployment makes, not the model.
+   * - ``LoraSpec``
+     - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
+       ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
+       (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
+       path: the names requests can ask for), ``targets`` (the subset of the model's
+       targets to allocate; by default the targets the configured adapters touch; a
+       secondary node's spec
+       left with none builds no pool, while a YAML list leaving the model's first spec
+       (its LLM's) none is an error),
+       ``slot_wait_steps`` (default 256: how many of the pool's steps a request may
+       wait for a slot before a held slot is drained for it). One ``lora:`` block sizes
+       every LoRA spec of the model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
@@ -1870,7 +2028,8 @@ exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` 
 attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
 family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
-also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
+also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``; the checkpoint
+parsing it uses is shared, in ``mstar/engine/resources/lora/checkpoint.py``).
 
 On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
