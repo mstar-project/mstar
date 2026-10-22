@@ -525,8 +525,12 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
 
 
 def test_vision_block_loop_replays_exactly_when_leased():
-    """A leased step declares nothing of its own, so the forward replays
-    then and runs eagerly otherwise, whatever the runner's buckets allow."""
+    """A leased step declares no attention of its own, so the forward replays
+    then, and a step that declares the vision attention runs eagerly, whatever
+    the runner's buckets allow."""
+    from mstar.engine.resources.attn.config import AttentionStep
+    from mstar.engine.resources.step import SubmoduleStep
+    from mstar.model.qwen3_5.config import VISION_ATTN
     from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
 
     class Runner:
@@ -548,7 +552,7 @@ def test_vision_block_loop_replays_exactly_when_leased():
         )
         return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, (4, 4))
 
-    assert replay(step=object()) is None
+    assert replay(step=SubmoduleStep(segments=[], steps={VISION_ATTN: AttentionStep(causal=False)})) is None
     assert not hasattr(runner, "ran")
     # no declaration but no bucket either (a forward driven outside the engine)
     runner.has_bucket = False
