@@ -32,7 +32,14 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import (
+    KVSpec,
+    PagedKVConfig,
+    refuse_past_context,
+    refuse_undeclared_labels,
+    without_layouts,
+)
+from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -592,6 +599,18 @@ class Conductor:
             specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
             self._resource_specs_cache = specs
         return specs
+
+    def _context(self) -> dict[str, int]:
+        """Each paged pool's ``max_seq_len`` after this deployment's YAML."""
+        context = getattr(self, "_context_cache", None)
+        if context is None:
+            specs = self.model.get_node_resources() or []
+            apply_yaml_overrides(specs, self.model_config)
+            context = self._context_cache = {
+                spec.resource_key: spec.config.max_seq_len
+                for spec in specs if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+            }
+        return context
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -1228,6 +1247,7 @@ class Conductor:
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
             )
+        refuse_past_context(self._context(), request_data.resource_configs)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True

@@ -338,6 +338,21 @@ def refuse_undeclared_labels(
         if missing := sorted(configs[key].opened_labels() - laid_out):
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
+
+def refuse_past_context(context: Mapping[str, int], configs: Mapping[str, ResourceReqConfig]) -> None:
+    """``ValueError`` (a 400) when a label would hold more positions at the request's caps
+    than its pool's ``max_seq_len``. A label under retention releases old positions as it goes, so it is left out."""
+    for key, config in configs.items():
+        if key not in context or not isinstance(config, KVReqConfig):
+            continue
+        for label, layout in (config.kv_layout or {}).items():
+            positions = layout.slots(config.loop_caps or {})
+            if layout.retention is None and positions > context[key]:
+                raise ValueError(
+                    f"this request needs {positions} positions of {label!r}, past the model's context of {context[key]}"
+                )
+
+
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
     """Only the KV manager's ingest reads the layouts and caps, so they are dropped
     before the configs go out with every frame between workers."""

@@ -344,8 +344,10 @@ text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label w
    return ProcessPromptOutput(result, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
-   The iterations each named loop may run for this request. A loop runs the smaller of its
-   graph ``max_iters`` and its cap, and speculation never runs past it. A model whose stop
+   The iterations each named loop may run for this request. The conductor refuses a request
+   whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
+   positions than its pool's ``max_seq_len``, with a 400. Speculation never runs past a
+   cap. A model whose stop
    check ends a loop at a count returns that count, so the cap and the stop check end the
    loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
    every model. Growth on an uncapped loop is counted to its graph ``max_iters``.

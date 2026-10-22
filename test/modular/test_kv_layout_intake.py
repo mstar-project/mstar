@@ -59,12 +59,12 @@ class _ScriptDoneError(Exception):
 
 class _Model(Model):
 
-    def __init__(self, layout=LAYOUT):
-        self._layout = layout
+    def __init__(self, layout=LAYOUT, max_seq_len=4096):
+        self._layout, self._max_seq_len = layout, max_seq_len
 
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=PS,
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,
         ))]
 
     def kv_labels(self):
@@ -194,6 +194,15 @@ def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
     failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
     assert [body.status for body in failed] == [400], "a request the loop would end short was served"
     assert not any(getattr(msg.message_type, "name", "") == "NEW_REQUEST" for msg in sent)
+
+
+def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch):
+    model = _Model(max_seq_len=PROMPT + 29)
+
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 30}), tmp_path, monkeypatch).sent
+
+    failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [body.status for body in failed] == [400], "a request past the model's context was served"
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
