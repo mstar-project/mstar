@@ -213,11 +213,6 @@ model, so they are named for it.
        ``0`` captures the eager forward and runs the uncaptured steps
        uncompiled, an escape hatch for an Inductor failure that would
        otherwise fail every capture and serve eager.
-   * - ``MSTAR_GLM52_MOE_FUSED_ALLREDUCE``
-     - ``0``
-     - GLM-5.2: add the shared-expert output to the routed partial before the
-       TP all-reduce and reduce once per MoE layer instead of twice. Changes
-       the bf16 rounding order, so it is opt-in.
 
 Serving (Python frontend)
 -------------------------
