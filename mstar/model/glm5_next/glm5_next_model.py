@@ -22,6 +22,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnConfig,
@@ -215,6 +216,10 @@ class Glm5NextModel(Model):
                     layout=KVLayout.MLA,
                     kv_lora_rank=self.config.kv_lora_rank,
                     qk_rope_head_dim=self.config.mla_cache_kpe,
+                    aux_planes=(
+                        {INDEX_PLANES: self.config.index_planes}
+                        if self.config.dsa_long_context else {}
+                    ),
                 ),
             ),
             AttentionSpec(

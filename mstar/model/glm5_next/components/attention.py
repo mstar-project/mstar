@@ -9,6 +9,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
 from mstar.engine.resources.dsa import kpool
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -131,11 +132,9 @@ class Glm5NextMLAAttention(nn.Module):
         # cursor through the stack.
         self.kv_plane = kv_plane
         self.indexer = Glm5NextIndexer(config)
-        # dsa_long_context: this layer's index plane, and the DSA resource whose context the
-        # submodule opens per forward
-        self.index_plane = (
-            config.index_plane_offset + kv_plane
-            if config.dsa_long_context and kv_plane is not None else None)
+        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
+        # and the DSA resource whose context the submodule opens per forward
+        self.index_plane = kv_plane if config.dsa_long_context else None
         self.dsa: kpool.KPoolDSA | None = None
         self.dsa_group = comm_group if config.dsa_shard_prefill else None
 
@@ -211,7 +210,8 @@ class Glm5NextMLAAttention(nn.Module):
         kpool.write_index(self.kv, self.index_plane, LABEL, k, gate,
                         self.indexer.index_kpool_compress_ape, ctx)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
-        slots = kpool.select(q, w, self.kv.layer_view(self.index_plane), ctx, self.dsa_group)
+        slots = kpool.select(q, w, self.kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
+                             self.dsa_group)
         return kpool.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
                                  self.softmax_scale)
 

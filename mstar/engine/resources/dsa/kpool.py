@@ -5,9 +5,9 @@ that, each query attends to the members of its top ``index_topk / index_kpool`` 
 (``index_kpool`` consecutive tokens each, from position 0) plus the incomplete pool at its end,
 which the reference indexer always selects (``Glm5NextTextIndexer``).
 
-The indexer's state lives in the MLA cache, in one index plane per full-attention layer next to
-the latent planes: row ``t`` holds ``[k_t | gate_t | key of the pool ending at t | unused]``.
-Both kinds of plane share the request's pages, so one flat page list serves the key writes,
+The indexer's state lives on the MLA cache's pages, in its aux planes ``INDEX_PLANES`` (one
+per full-attention layer): row ``t`` holds ``[k_t | gate_t | key of the pool ending at t]``.
+The index rows sit at their tokens' latent slots, so one flat page list serves the key writes,
 the scores, the top-k and the sparse gather.
 
 On CUDA: ``kpool_kernels`` for the pool keys and the scores, flashinfer's fused top-k + page-table
@@ -25,7 +25,7 @@ import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.config import DSAConfig, DSASpec
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
 from mstar.engine.resources.step import StepContext
 from mstar.utils.h2d import PinnedStager
 
@@ -86,13 +86,13 @@ def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:
 
 def write_index(kv, plane: int, label: str, k: torch.Tensor, gate: torch.Tensor,
                 ape: torch.Tensor, ctx: KPoolContext) -> None:
-    """Write the step's ``k`` and ``gate`` rows to the index plane, then the key of every pool
-    a row completes (its members may sit in earlier steps)."""
-    width = kv.layer_view(plane).shape[-1]
+    """Write the step's ``k`` and ``gate`` rows to index plane ``plane``, then the key of every
+    pool a row completes (its members may sit in earlier steps)."""
+    view = kv.aux_view(INDEX_PLANES, plane)
     d = k.shape[-1]
-    rows = torch.cat([k, gate.to(k.dtype), k.new_zeros(k.shape[0], width - 2 * d)], dim=-1)
-    kv.write_kv(rows, None, layer_idx=plane, label=label)
-    view = kv.layer_view(plane)
+    rows = torch.cat([k, gate.to(k.dtype), k.new_zeros(k.shape[0], view.shape[-1] - 2 * d)],
+                     dim=-1)
+    kv.write_aux(INDEX_PLANES, rows, layer_idx=plane, label=label)
     if view.is_cuda and view.dtype == torch.bfloat16:
         from mstar.engine.resources.dsa.kpool_kernels import pool_keys
 
@@ -130,7 +130,8 @@ def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
            ctx: KPoolContext, group=None) -> torch.Tensor:
     """``[rows, width]`` int32 MLA-cache slots each row attends: the tokens of its top ``topk /
     kpool`` pools, then its tail; entries past ``attn_lens`` are unused. ``q (rows, NH, D)``,
-    ``w (rows, NH)`` fp32 with the scales folded in, ``view`` the layer's index plane. A TP
+    ``w (rows, NH)`` fp32 with the scales folded in, ``view`` the layer's index plane
+    (``kv.aux_view(INDEX_PLANES, plane)``). A TP
     ``group`` splits a prefill's rows across ranks (``sparse_mla.select_rows``)."""
     if ctx.spans is None or all(n == 1 for _, n, _ in ctx.spans):  # decode: capturable
         scores = _decode_scores(q, w, view, ctx)
@@ -271,11 +272,12 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
 # -- the resource ------------------------------------------------------------------------------
 
 class KPoolDSA(Resource):
-    """Pooled-key DSA over a node's MLA cache (``config.kv_cache``), whose index planes hold the
-    indexer's keys. Each step the submodule stages its rows (``step_inputs``: preprocess outputs,
-    which a CUDA graph interns and every replay restages) and sets the forward's context built
-    from them (``context``) as ``ctx``, which the MLA layers read; under CUDA graphs the resource
-    keeps each capture slot's sparse-attention plans."""
+    """Pooled-key DSA over a node's MLA cache (``config.kv_cache``), whose aux planes
+    ``INDEX_PLANES`` hold the indexer's keys. Each step the submodule stages its rows
+    (``step_inputs``: preprocess outputs, which a CUDA graph interns and every replay restages)
+    and sets the forward's context built from them (``context``) as ``ctx``, which the MLA
+    layers read; under CUDA graphs the resource keeps each capture slot's sparse-attention
+    plans."""
 
     @classmethod
     def build(cls, spec: DSASpec, info: EngineResourceInfo):

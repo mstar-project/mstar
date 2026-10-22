@@ -77,7 +77,10 @@ class _Planes:
     def layer_view(self, plane):
         return self.cache[plane]
 
-    def write_kv(self, rows, v, layer_idx, label):
+    def aux_view(self, name, plane):
+        return self.cache[plane]
+
+    def write_aux(self, name, rows, layer_idx, label):
         page, off = self.slots
         self.cache[layer_idx][page, off] = rows.to(self.cache.dtype)
 

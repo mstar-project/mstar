@@ -12,6 +12,9 @@ from mstar.engine.resources.step import ResourceStep
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
+# the MLA cache's aux planes (``PagedKVConfig.aux_planes``) that hold the index keys
+INDEX_PLANES = "dsa_index"
+
 
 @dataclass
 class DSAConfig:
