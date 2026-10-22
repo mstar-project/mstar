@@ -2298,7 +2298,9 @@ class KVManager(AttentionResource):
         cache.step_segments = step.segments
         cache.pending = 0
         stats["hit"] += 1
-        return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
+        return KVPlanOutputs(
+            out, pre_forks=step.pre_forks, post_forks=step.post_forks, fork_rids=step.fork_rids,
+        )
 
     @staticmethod
     def _same_plan(a: "KVPlanOutputs", b: "KVPlanOutputs") -> bool:
@@ -2422,6 +2424,7 @@ class KVManager(AttentionResource):
                 },
                 pre_forks=step.pre_forks,
                 post_forks=step.post_forks,
+                fork_rids=step.fork_rids,
             )
             if res is not None and not self._same_plan(res, full):
                 self.plan_cache_stats["mismatch"] += 1
