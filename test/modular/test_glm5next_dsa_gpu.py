@@ -156,7 +156,7 @@ def test_prefill_scores_compile_once_whatever_the_split():
 def test_metadata_slices_compile_each_kernel_once():
     """A window's pos and row_req are slices of the step's, at any offset: the kernels that read
     per-row metadata compile once whatever its alignment and the counts."""
-    from mstar.model.glm5_next import dsa_kernels as k
+    from mstar.engine.resources.dsa import kpool_kernels as k
 
     lens = [3000, 2000]
     plane, tables, ape = _store(lens, seed=10)

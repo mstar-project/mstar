@@ -36,7 +36,8 @@ class DSAManager(Resource):
                 "DSA with a key per token stores its keys in a KV resource of their own: "
                 "set DSAConfig.index_cache")
         kv_config = info.dependency(spec.config.kv_cache).config
-        kv_config.shard(info.joint_comm_group.world_size)
+        if info.joint_comm_group is not None:
+            kv_config.shard(info.joint_comm_group.world_size)
         index_config = info.dependency(spec.config.index_cache).config
         return cls(spec.config, kv_config, index_config, info.device)
 

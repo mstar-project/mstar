@@ -293,7 +293,8 @@ class KPoolDSA(Resource):
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
         # `dependency` hands back the SPEC; its `.config` is the KV config, sharded once
         kv_config = info.dependency(spec.config.kv_cache).config
-        kv_config.shard(info.joint_comm_group.world_size)
+        if info.joint_comm_group is not None:
+            kv_config.shard(info.joint_comm_group.world_size)
         return cls(spec.config, kv_config, info.device)
 
     def __init__(self, config: DSAConfig, kv_config, device: torch.device):
