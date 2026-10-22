@@ -1,13 +1,13 @@
-"""GLM-5.2 DSA past ``index_topk`` (``dsa_long_context``): paged index keys, slot selection,
+"""DSA with a key per token (GLM-5.2's indexer) past ``topk``: paged index keys, slot selection,
 sparse MLA.
 
-The index keys live in a second KV resource (``INDEX_KV_RESOURCE``, one ``index_head_dim``
+The index keys live in a second KV resource (``DSAConfig.index_cache``, one ``index_head_dim``
 latent per token per FULL layer). Each query row scores its request's keys and keeps its top
-``index_topk`` as slots of the MLA latent cache, and attention runs over just those slots. Every
-query row selects over its own causal prefix, so a prefill beyond ``index_topk`` is the same
-computation as prefilling ``index_topk`` tokens and decoding the rest one at a time.
+``topk`` as slots of the MLA latent cache, and attention runs over just those slots. Every
+query row selects over its own causal prefix, so a prefill beyond ``topk`` is the same
+computation as prefilling ``topk`` tokens and decoding the rest one at a time.
 
-On CUDA: ``dsa_kernels`` for the scores (decode rows in one launch, prefill rows in chunks of
+On CUDA: ``paged_kernels`` for the scores (decode rows in one launch, prefill rows in chunks of
 one request), flashinfer's fused top-k + page-table transform for the slots, and
 ``sparse_mla``. Elsewhere, torch versions of the same math (the CPU tests' reference).
 """
@@ -18,8 +18,8 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.attn import sparse_mla
-from mstar.model.glm52.components.indexer import select_topk_causal
+from mstar.engine.resources.dsa import sparse_mla
+from mstar.engine.resources.dsa.topk import select_topk_causal
 
 # Prefill rows scored per launch: a chunk's scores are [rows, its last row's keys] fp32, so a
 # chunk takes at most this many rows and this many bytes of scores (fewer rows as keys grow).
@@ -28,8 +28,8 @@ SCORE_BUDGET_BYTES = 256 << 20
 
 
 @dataclass
-class Glm52DsaPagedContext:
-    """Per-forward DSA state, built by the submodule's preprocess.
+class PagedContext:
+    """Per-forward DSA state, from the inputs the resource staged (``DSAManager.step_inputs``).
 
     Per query row (device): ``row_req`` its request's page-table row, ``lens`` the keys it
     sees (position + 1); ``host_lens`` the same on the host. Per request (device, int32,
@@ -62,7 +62,7 @@ class Glm52DsaPagedContext:
         """Keys each row attends: its top ``topk``, or all it sees below that."""
         return [min(n, self.topk) for n in self.host_lens]
 
-    def rows(self, c0: int, c1: int) -> Glm52DsaPagedContext:
+    def rows(self, c0: int, c1: int) -> PagedContext:
         """The context of rows ``[c0, c1)`` alone, for a pass over them after the rows before
         them have written the cache. Every row takes the sparse path (its own selection)."""
         spans = []
@@ -73,7 +73,7 @@ class Glm52DsaPagedContext:
         idx = torch.arange(c0, c1, device=self.lens.device)
         return self._subset(idx, self.host_lens[c0:c1], spans)
 
-    def pick(self, rows: list[int]) -> Glm52DsaPagedContext:
+    def pick(self, rows: list[int]) -> PagedContext:
         """The context of the given rows (ascending) alone, one row per span."""
         starts = [r0 for r0, _, _ in self.spans]
         req = [self.spans[bisect.bisect_right(starts, r) - 1][2] for r in rows]
@@ -82,8 +82,8 @@ class Glm52DsaPagedContext:
                             [(i, 1, q) for i, q in enumerate(req)])
 
     def _subset(self, idx: torch.Tensor, host_lens: list[int],
-                spans: list[tuple[int, int, int]]) -> Glm52DsaPagedContext:
-        return Glm52DsaPagedContext(
+                spans: list[tuple[int, int, int]]) -> PagedContext:
+        return PagedContext(
             row_req=self.row_req[idx], lens=self.lens[idx], host_lens=host_lens,
             kv_table=self.kv_table, index_table=self.index_table, spans=spans,
             width=max(host_lens), page_size=self.page_size, topk=self.topk,
@@ -91,7 +91,7 @@ class Glm52DsaPagedContext:
             step_rows=idx if self.step_rows is None else self.step_rows[idx])
 
 
-def write_rows(kv, layer_idx: int, rows: torch.Tensor, ctx: Glm52DsaPagedContext) -> None:
+def write_rows(kv, layer_idx: int, rows: torch.Tensor, ctx: PagedContext) -> None:
     """``kv.write_kv`` of a forward's rows (per-token latents): the whole step's, or under
     ``ctx.step_rows`` a subset's, at its rows of the step's planned slots."""
     if ctx.step_rows is None:
@@ -103,7 +103,7 @@ def write_rows(kv, layer_idx: int, rows: torch.Tensor, ctx: Glm52DsaPagedContext
 
 
 def select(q: torch.Tensor, w: torch.Tensor, index_layer: torch.Tensor,
-           ctx: Glm52DsaPagedContext, group=None) -> torch.Tensor:
+           ctx: PagedContext, group=None) -> torch.Tensor:
     """``[rows, topk]`` int32 latent-cache slots of every row's top keys (entries past a row's
     ``attn_lens`` are unused). Single-row spans (decode) score in one launch; longer spans
     (prefill) in chunks of one request's rows, each chunk as wide as its last row's context.
@@ -176,7 +176,7 @@ def _kernel_fits(q) -> bool:
 
 def _decode_scores(q, w, index_layer, index_table, row_req, lens, width):
     if _kernel_fits(q):
-        from mstar.model.glm52.dsa_kernels import decode_scores
+        from mstar.engine.resources.dsa.paged_kernels import decode_scores
 
         return decode_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(),
                              index_layer.contiguous(), index_table, row_req, lens, width)
@@ -186,7 +186,7 @@ def _decode_scores(q, w, index_layer, index_table, row_req, lens, width):
 
 def _prefill_scores(q, w, index_layer, table_row, lens, width):
     if _kernel_fits(q):
-        from mstar.model.glm52.dsa_kernels import prefill_scores
+        from mstar.engine.resources.dsa.paged_kernels import prefill_scores
 
         return prefill_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(),
                               index_layer.contiguous(), table_row.contiguous(),
@@ -216,7 +216,7 @@ def select_slots(scores: torch.Tensor, kv_table: torch.Tensor, row_req: torch.Te
 
 
 def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent_layer: torch.Tensor,
-                  slots: torch.Tensor, ctx: Glm52DsaPagedContext, sm_scale: float) -> torch.Tensor:
+                  slots: torch.Tensor, ctx: PagedContext, sm_scale: float) -> torch.Tensor:
     """Absorbed MLA of each row over its selected latents: ``[rows, heads, kv_lora_rank]``.
     ``latent_layer`` is the MLA cache's layer view ``[pages, page_size, ckv + kpe]``."""
     if not sparse_mla.uses_kernel(q_nope, latent_layer):
