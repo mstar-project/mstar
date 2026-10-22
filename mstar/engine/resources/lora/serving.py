@@ -72,8 +72,8 @@ def drop_lora_specs_without_targets(specs: list[NodeResourceSpec]) -> list[NodeR
 
 
 def served_lora_targets(lora: list[LoraSpec]) -> list[str] | None:
-    """The targets a deployment keeps when its YAML lists no ``targets``: those one of
-    its configured adapters touches, as the
+    """The targets a deployment keeps when its adapters are fixed at startup (runtime
+    updates off, no YAML ``targets``): those one of its adapters touches, as the
     ``targets`` list every process then applies. Every other target would hold zero
     weights in every slot, yet cost its kernels on every step and its memory (the LM
     head's and the embedding's are vocabulary-sized). The first spec (the LLM's) keeps
@@ -86,7 +86,7 @@ def served_lora_targets(lora: list[LoraSpec]) -> list[str] | None:
     name either one uses."""
     from mstar.engine.resources.lora.store import adapter_targets
 
-    if not lora or lora[0].dropped_targets or not lora[0].adapters:
+    if not lora or lora[0].runtime_updates or lora[0].dropped_targets or not lora[0].adapters:
         return None
     kept: set[str] = set()
     for i, spec in enumerate(lora):

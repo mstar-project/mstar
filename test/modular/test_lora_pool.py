@@ -454,14 +454,16 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
 
 
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
-    """The conductor keeps only the targets the configured adapters touch and every
-    worker builds just those."""
+    """With runtime updates off, the conductor keeps only the targets the adapters touch
+    and every worker builds just those."""
     from types import SimpleNamespace
 
     from mstar.conductor.conductor import Conductor
+    from mstar.engine.resources.lora.serving import served_lora_targets
     from mstar.model.base import serving_resources
 
     _, paths = adapters
+    assert served_lora_targets([make_spec({"a3": paths["a3"]}, runtime_updates=True)]) is None
     model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
     conductor = Conductor.__new__(Conductor)

@@ -31,7 +31,8 @@ LORA_ADAPTER_KWARG = "lora_adapter"
 
 
 def lora_enabled(model_config: Mapping[str, Any]) -> bool:
-    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block)."""
+    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block), with or
+    without adapters named in it: adapters may also be loaded at runtime."""
     return LORA_RESOURCE_KEY in (model_config.get("resources") or {})
 
 
@@ -305,6 +306,12 @@ class LoraSpec(NodeResourceSpec):
     cpu_capacity: int = 16
     slot_wait_steps: int = 256
     adapters: dict[str, str] = field(default_factory=dict)
+    # serve /v1/load_lora_adapter and /v1/unload_lora_adapter, which make the server read
+    # client-named paths; off, they answer 404 as vLLM's do without its opt-in
+    runtime_updates: bool = False
+    # how long the conductor waits for every worker to answer a runtime load or unload
+    # before it gives up on it (a load is then undone everywhere)
+    runtime_update_timeout_s: float = 120.0
     # adapter name -> the digest (``identity.adapter_digest``) its weights were checked
     # and prefix-keyed under; every read must match it. The conductor fills these in for
     # the serving config's adapters, and a runtime load carries its own.
@@ -356,6 +363,8 @@ class LoraSpec(NodeResourceSpec):
         adapters: dict[str, str] | None = None,
         slot_wait_steps: int | None = None,
         adapter_digests: dict[str, str] | None = None,
+        runtime_updates: bool | None = None,
+        runtime_update_timeout_s: float | None = None,
         targets: list[str] | None = None,
     ):
         """How many adapters stay resident, the largest rank served, which adapters this
@@ -373,6 +382,18 @@ class LoraSpec(NodeResourceSpec):
             self.cpu_capacity = cpu_capacity
         if slot_wait_steps is not None:
             self.slot_wait_steps = slot_wait_steps
+        if runtime_updates is not None:
+            if not isinstance(runtime_updates, bool):
+                raise ValueError(f"runtime_updates must be true or false; got {runtime_updates!r}")
+            self.runtime_updates = runtime_updates
+        if runtime_update_timeout_s is not None:
+            if isinstance(runtime_update_timeout_s, bool) or not isinstance(
+                runtime_update_timeout_s, int | float,
+            ) or runtime_update_timeout_s <= 0:
+                raise ValueError(
+                    f"runtime_update_timeout_s must be a positive number; got {runtime_update_timeout_s!r}"
+                )
+            self.runtime_update_timeout_s = float(runtime_update_timeout_s)
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
