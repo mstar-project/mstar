@@ -44,7 +44,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.pinned_staging import to_device_async
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # FULL layers each forward when dsa_long_context is on; evicted in
         # cleanup_request.
         self._dsa_k_store = Glm52DsaKStore()
+        # the step's positions and row ends, in one pinned H2D each
+        self._index_stager = PinnedStager(torch.long)
         # Per request, in its request_state: "token_budget", max_tokens capped at the
         # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop);
         # "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no loop
@@ -340,8 +342,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             pos_ids_list.extend(range(start, start + sl))
         # pinned staging: a pageable torch.tensor(..., device=cuda) here
         # drains the stream before the step even starts
-        position_ids = to_device_async(pos_ids_list, torch.long, device)
-        seq_len_t = to_device_async(seq_lens, torch.long, device)
+        position_ids = self._index_stager.to_device(pos_ids_list, device)
+        seq_len_t = self._index_stager.to_device(seq_lens, device)
         return {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
             "position_ids": position_ids,
