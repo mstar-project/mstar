@@ -221,7 +221,7 @@ class ShardingConfig:
                         tp_rank=dest_worker_to_tp_rank.get(worker, 0)
                     ))
         else:  # sharded
-            # like in vLLM, we will enforce that the TP size divides the shard dim size
+            # we enforce that the TP size divides the shard dim size
             total_sizes = [s * source_tp_size for s in shard_dim_sizes]
             assert all([s % dest_tp_size == 0 for s in total_sizes]), (
                 f"some total shard dim size from {total_sizes} not divisible by "

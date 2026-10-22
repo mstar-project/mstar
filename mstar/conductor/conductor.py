@@ -156,6 +156,35 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     )
 
 
+def _run_worker(worker) -> None:
+    """``worker.run()``, then unlink the tensor files the worker still owns.
+
+    A stop (the conductor's SIGTERM, a Ctrl-C) leaves the files of requests in
+    flight waiting for a TENSOR_RECEIVED or REMOVE_REQUEST that will not come,
+    in a RAM-backed dir. Only while the conductor lives: it holds the
+    deployment's IPC lock and ports until it has joined its workers, so no
+    other deployment can be using these names yet. An orphaned worker leaves
+    them, as a new deployment on the same prefix may already reuse them.
+    """
+    try:
+        worker.run()
+    finally:
+        # A Ctrl-C reaches the conductor too, and its SIGTERM lands here within
+        # milliseconds, often already pending. Finish unlinking (it resumes
+        # where it was cut), then leave with that stop.
+        stop = None
+        while True:
+            try:
+                parent = mp.parent_process()
+                if parent is not None and parent.is_alive():
+                    worker.tensor_manager.unlink_owned_files()
+                break
+            except (KeyboardInterrupt, SystemExit) as e:
+                stop = e
+        if stop is not None:
+            raise stop
+
+
 def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
     """The device string a worker rank runs on: its own number unless the
     deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
@@ -196,7 +225,8 @@ def _worker_process_target(
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
     # the box. Turning it into SystemExit unwinds the interpreter normally,
-    # which runs the transport's cleanup. The main process gets this for
+    # which runs the transport's cleanup (``_run_worker`` for per-tensor
+    # files, the arena's Drop for its segments). The main process gets this for
     # free from SIGINT -> KeyboardInterrupt, which is why only the workers
     # leaked.
     def _graceful_exit(_signum, _frame):
@@ -244,7 +274,7 @@ def _worker_process_target(
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
-    worker.run()
+    _run_worker(worker)
 
 
 @dataclass

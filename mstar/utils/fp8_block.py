@@ -1,4 +1,9 @@
-"""FP8 block-scale helpers for the GLM-5.2 checkpoint."""
+"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized.
+
+A block-scale checkpoint (DeepSeek-V3's format, GLM-5.x's) stores each linear weight as e4m3 with one fp32
+``weight_scale_inv`` per ``weight_block_size`` block. Triton-free, so a model's config can import it on a
+CPU-only install; the activation quantizer that feeds the block-scale GEMMs is ``quant_fp8``.
+"""
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
@@ -14,7 +19,7 @@ FP8_DTYPE = torch.float8_e4m3fn
 
 @dataclass(frozen=True)
 class Fp8BlockQuantConfig:
-    """Subset of the HF fp8 quantization_config used by GLM-5.2."""
+    """The fields of an HF fp8 ``quantization_config`` a block-scale checkpoint carries."""
 
     weight_block_size: tuple[int, int] = (128, 128)
     fmt: str = "e4m3"
@@ -105,14 +110,3 @@ def dequant_fp8_block_stream(
             f"fp8 stream ended with unpaired quantized tensors (weight without "
             f"weight_scale_inv or vice versa): {missing}"
         )
-
-
-def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
-    """Finalize kernel layouts across a freshly loaded module tree: any submodule exposing
-    ``process_weights_after_loading(device)`` gets it called (the attention layers build
-    their absorbed w_kc/w_vc here).
-    """
-    for module in root.modules():
-        hook = getattr(module, "process_weights_after_loading", None)
-        if callable(hook):
-            hook(device)

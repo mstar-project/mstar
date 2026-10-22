@@ -5,7 +5,7 @@ import torch
 
 from mstar.engine.resources.base import AttentionResource, Resource
 from mstar.engine.resources.runner import StepRunner
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
 
 def fake_quantize_fp8_block(
@@ -118,20 +118,23 @@ def build_cpu_resources(
     config, request_ids: list[str] = (), max_num_pages: int = 64,
     page_size: int = 8,
 ) -> tuple[dict[str, Resource], StepRunner]:
-    """The node's three resources on CPU: a real ``KVManager`` (MLA latent or
+    """The node's four resources on CPU: a real ``KVManager`` (MLA latent or
     NHD, per ``config.mla_absorb``), the matching attention resource (the
-    real MLA one on its torch fallback, or the reference K/V one) and a
-    greedy sampler, plus a ``StepRunner`` over them. Requests in
-    ``request_ids`` are ingested.
+    real MLA one on its torch fallback, or the reference K/V one), the
+    positions over the cache and a greedy sampler, plus a ``StepRunner`` over
+    them. Requests in ``request_ids`` are ingested.
     """
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.position.config import PositionConfig
+    from mstar.engine.resources.position.manager import RopeManager
     from mstar.model.glm52.config import (
         ATTN_RESOURCE,
         INDEX_KV_RESOURCE,
         KV_RESOURCE,
+        POS_RESOURCE,
         SAMPLER_RESOURCE,
     )
 
@@ -193,7 +196,11 @@ def build_cpu_resources(
             )
     finally:
         manager_mod.KVTransferManager = stub
-    resources = {KV_RESOURCE: kv, ATTN_RESOURCE: attn, SAMPLER_RESOURCE: GreedySampler()}
+    pos = RopeManager(
+        config=PositionConfig(kv_cache=KV_RESOURCE), device=device, max_seq_len=config.max_seq_len)
+    resources = {
+        KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos, SAMPLER_RESOURCE: GreedySampler(),
+    }
     if index is not None:
         resources[INDEX_KV_RESOURCE] = index
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
@@ -207,7 +214,7 @@ def build_random_model(cfg, seed: int):
     ``torch.empty`` at construction — garbage in them NaNs the logits)."""
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-    from mstar.model.glm52.quantization import process_weights_after_loading
+    from mstar.model.utils import process_weights_after_loading
 
     torch.manual_seed(seed)
     model = Glm52ForCausalLM(cfg)

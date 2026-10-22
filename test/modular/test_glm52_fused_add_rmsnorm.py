@@ -25,8 +25,8 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E40
 from mstar.model.glm52.components.language_model import build_dense_mlp  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
 def _fused(cfg: Glm52ModelConfig) -> Glm52ModelConfig:

@@ -29,10 +29,10 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
-from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
+from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and fused_decode._HAS_TRITON

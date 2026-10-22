@@ -19,9 +19,11 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
     find_server_binary,
     launch_rust_server,
+    openai_adapter_class,
 )
 
 try:
@@ -330,7 +332,8 @@ def test_admission_permit_is_held_through_streaming_body():
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_adm_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_admup_")
-    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1",
+               **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
@@ -469,6 +472,32 @@ def _generate(port, urlencoded: bool, timeout=30):
         return r.status, r.read()
 
 
+# The Python /generate's 400s (test_video_frame_protocol checks the same text there).
+_STREAMING_ONLY = ("Output modality video_frame requires streaming=true; raw frame "
+                   "chunks cannot be returned as an aggregated response.")
+_OUTPUT_ONLY = "'video_frame' is an output-only modality"
+
+
+@pytest.mark.parametrize("fields,detail", [
+    ({"output_modalities": "video_frame", "streaming": "false"}, _STREAMING_ONLY),
+    ({"input_modalities": "video_frame", "output_modalities": "text"}, _OUTPUT_ONLY),
+], ids=["output-not-streamed", "input"])
+def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields, detail):
+    """The API server's own check would raise a ValueError, which reaches
+    the client as a 500."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", **fields}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert (e.value.code, json.loads(e.value.read())) == (400, {"detail": detail})
+    assert stub.submitted == []
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the
@@ -509,8 +538,9 @@ def _model_stack(model, stub, env=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
+    env = {OPENAI_ADAPTER_ENV: openai_adapter_class(model), **(env or {})}
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **env))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()

@@ -26,6 +26,9 @@ use crate::tokenizer::{IncrementalDecoder, Tok};
 #[derive(Clone)]
 pub struct AppState {
     pub model_name: String,
+    /// The model's adapter class in Python's `ADAPTER_REGISTRY`
+    /// (`MSTAR_OPENAI_ADAPTER`, set by the launcher); empty when it has none.
+    pub python_adapter: String,
     pub upload_dir: PathBuf,
     /// Fetching arbitrary http(s) media is SSRF surface; off by default.
     pub allow_remote: bool,

@@ -37,7 +37,7 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     stream: bool | None = False
 
-    # Multimodal output (vllm-omni / sglang-omni style)
+    # Multimodal output (OpenAI chat-completions ``modalities`` and ``audio``)
     modalities: list[str] | None = None
     audio: dict[str, Any] | None = None  # {"voice": ..., "format": "wav"}
 
