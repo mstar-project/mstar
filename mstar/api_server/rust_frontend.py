@@ -68,6 +68,18 @@ logger = logging.getLogger(__name__)
 #: message ends the wait immediately.
 BRIDGE_RECV_WAIT_S = 0.05
 
+#: The model's adapter class in ``ADAPTER_REGISTRY``; ``mstar-server`` picks
+#: its OpenAI translation by it (``Adapter::from_python``).
+OPENAI_ADAPTER_ENV = "MSTAR_OPENAI_ADAPTER"
+
+
+def openai_adapter_class(model_name: str) -> str:
+    """The class name of ``model_name``'s OpenAI adapter, "" when it has none."""
+    from mstar.api_server.openai.adapters import get_adapter
+
+    adapter = get_adapter(model_name)
+    return "" if adapter is None else type(adapter).__name__
+
 
 
 
@@ -99,6 +111,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
     if api_key:
         env[API_KEY_ENV] = api_key
+    env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)

@@ -310,7 +310,7 @@ def _fused_experts_fp8_impl(
         config.update(BLOCK_SIZE_N=64, GROUP_SIZE_M=8, num_warps=4, num_stages=5)
         config_down.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=1, num_warps=4, num_stages=2)
     else:
-        # vLLM's block-fp8 defaults. BLOCK_SIZE_M stays shape-picked: both
+        # The usual block-fp8 tile defaults. BLOCK_SIZE_M stays shape-picked: both
         # launches read the same alignment, so it must match across them.
         config.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=32, num_warps=4, num_stages=3)
         config_down = dict(config)

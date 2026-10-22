@@ -801,10 +801,9 @@ class KVManager(AttentionResource):
             or chain is None
         ):
             return
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and (
-            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
-        ) not in walks:
+        if walks is not None and walk not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -824,7 +823,7 @@ class KVManager(AttentionResource):
             end = chain.consumed + chain.spans[chain.done].length
             # Checking every span would end the chain at the first one the cache filled rather than this walk.
             if chain.consumed < stream.stored_len and end > start and (
-                chain.spans[chain.done].walk != ctx.graph_walk
+                chain.spans[chain.done].walk != walk
             ):
                 stream.chain = None
                 return
@@ -1473,7 +1472,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
+                if segment.span == 0 or self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1501,7 +1500,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1588,7 +1587,7 @@ class KVManager(AttentionResource):
         page_size = self.kv_cache.page_size
         pending_forks = pending_forks or {}
         for s in segments:
-            if ctx is not None and ctx.is_padding_row(s.request_id):
+            if ctx is not None and self._on_sink(ctx, s.request_id):
                 # A padding row reads and writes SINK_PAGE; the engine
                 # discards its output.
                 views.append(SequenceView(
@@ -2149,9 +2148,17 @@ class KVManager(AttentionResource):
         """The step's real rows its forks apply to: all of them unless it names some."""
         return [
             rid for rid in ctx.padded_request_ids
-            if not ctx.is_padding_row(rid)
+            if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _on_sink(ctx: StepContext, rid) -> bool:
+        """Whether ``rid`` runs against SINK_PAGE and holds no pages: a
+        replay's padding row, or any row of a capture. A capture's rows are the
+        padding rows its replays will run, so they run the same way, and no
+        bucket's sizing or capture depends on how many pages the pool has."""
+        return ctx.capture or ctx.is_padding_row(rid)
 
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
@@ -2204,7 +2211,7 @@ class KVManager(AttentionResource):
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
             for segment in step.segments:
-                if ctx.is_padding_row(segment.request_id):
+                if self._on_sink(ctx, segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing
                 stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
