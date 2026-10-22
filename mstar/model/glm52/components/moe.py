@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 import torch.nn.functional as F
@@ -150,12 +149,8 @@ class Glm52SparseMoeBlock(nn.Module):
         # per-rank partial is summed with the routed partial and reduced once.
         # Off by default — sum-then-reduce rounds differently from
         # reduce-then-sum in bf16, so the emitted tokens can shift at ties.
-        # model_kwargs.moe_fused_allreduce turns it on; a set
-        # MSTAR_GLM52_MOE_FUSED_ALLREDUCE overrides it either way.
-        env = os.environ.get("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "")
-        self._fused_allreduce = self.tp_size > 1 and (
-            env == "1" if env else config.moe_fused_allreduce
-        )
+        # model_kwargs.moe_fused_allreduce turns it on.
+        self._fused_allreduce = self.tp_size > 1 and config.moe_fused_allreduce
         # the two partials are summed before any reduce: one here, or none
         self._sum_partials = self.tp_size > 1 and (self._fused_allreduce or not reduce_results)
         shared_inter = config.moe_intermediate_size * config.n_shared_experts
