@@ -4,11 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.quantization import (
-    FP8_DTYPE,
-    Fp8BlockQuantConfig,
-    dequantize_fp8_block_weight,
-)
+from mstar.utils.fp8_block import FP8_DTYPE, Fp8BlockQuantConfig, dequantize_fp8_block_weight
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),

@@ -11,11 +11,11 @@ import torch
 from torch import nn
 
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.quantization import dequant_fp8_block_stream
 from mstar.model.loader.base import StackedParamRule
+from mstar.utils.fp8_block import dequant_fp8_block_stream
 
 if TYPE_CHECKING:
-    from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
+    from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 logger = logging.getLogger(__name__)
 

@@ -101,7 +101,7 @@ def allreduce_add_rmsnorm(
         weight_bias=weight_bias,
         # Complete at the end: with an early trigger a PDL-launched consumer
         # can read the one-shot Lamport buffer before it is committed (see
-        # vLLM's allreduce_rms_fusion and flashinfer-ai/flashinfer#1223).
+        # flashinfer-ai/flashinfer#1223).
         trigger_completion_at_end=True,
     )
     return norm_out, residual_out

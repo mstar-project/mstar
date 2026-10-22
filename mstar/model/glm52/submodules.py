@@ -23,6 +23,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
+    PositionStep,
     SamplerStep,
     Segment,
     SlotLease,
@@ -31,6 +32,7 @@ from mstar.engine.resources import (
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
@@ -93,12 +95,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_checked: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
-        # per request: max_tokens capped at the context limit (prompt-aware,
-        # set by the prefill's preprocess); read by check_stop for every k
-        self._token_budget: dict[str, int] = {}
-        # requests whose prefill sampled a stop token: the prefill walk has no loop
-        # to stop, so the first decode step stops decode_loop and emits nothing
-        self._ended_at_prefill: set[str] = set()
+        # Per request, in its request_state: "token_budget", max_tokens capped at the
+        # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop for
+        # every k); "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no
+        # loop to stop, so the first decode step stops decode_loop and emits nothing.
         # Which trunk stream the MTP plane pairs drafts against (see
         # _mtp_pair_rows): the post-final-norm one by default.
         self._mtp_pair_postnorm = (
@@ -129,8 +129,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_checked.pop(request_id, None)
         self._mtp_max_tokens.pop(request_id, None)
         self._mtp_ignore_eos.pop(request_id, None)
-        self._token_budget.pop(request_id, None)
-        self._ended_at_prefill.discard(request_id)
         for state in (self._mtp_pending, self._mtp_verdict, self._mtp_trimmed):
             state.pop(request_id, None)
         slot = self._mtp_slot.pop(request_id, None)
@@ -156,6 +154,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _kv(self, engine_inputs: ModelInputsFromEngine | None = None):
         res = engine_inputs.resources if engine_inputs is not None else self.node_resources
         return res[KV_RESOURCE]
+
+    def _pos(self, engine_inputs: ModelInputsFromEngine | None = None):
+        res = engine_inputs.resources if engine_inputs is not None else self.node_resources
+        return res[POS_RESOURCE]
 
     def _attn(self, engine_inputs: ModelInputsFromEngine | None = None):
         res = engine_inputs.resources if engine_inputs is not None else self.node_resources
@@ -186,7 +188,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             prefill_tokens = {
                 rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
             }
-        steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)}
+        steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True),
+                 POS_RESOURCE: PositionStep()}
         if self.mtp_k > 0 and graph_walk == "decode":
             # Under TP async the plan thread declares, admits and plans this step before
             # prepare_inputs runs, so the last verdict's trim lands here. The verify and the
@@ -392,7 +395,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 )
             # capped by the prefill's context-limit clamp once that has run
             self._mtp_max_tokens[rid] = min(
-                fwd_info.max_tokens, self._token_budget.get(rid, fwd_info.max_tokens))
+                fwd_info.max_tokens, self.request_state(rid).get("token_budget", fwd_info.max_tokens))
             self._mtp_ignore_eos[rid] = sampling.ignore_eos
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
@@ -426,7 +429,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 "request %s: max_tokens %d capped to %d by the context limit %d",
                 rid, asked, budget, self._context_limit(),
             )
-        self._token_budget[rid] = budget
+        self.request_state(rid).add("token_budget", budget)
         if rid in self._mtp_max_tokens:
             self._mtp_max_tokens[rid] = min(self._mtp_max_tokens[rid], budget)
 
@@ -443,7 +446,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         self._apply_recompile_limit()
-        kv = self._kv(engine_inputs)
+        pos = self._pos(engine_inputs)
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]
         device = self.get_device()
@@ -459,7 +462,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         q_start = 0
         page_tables = self._page_tables(engine_inputs) if long_context else None
         for i, (rid, sl) in enumerate(zip(request_ids, seq_lens, strict=True)):
-            start = kv.stored_len(rid)
+            start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
                 raise RuntimeError(
                     f"request {rid}: context {start + sl} exceeds {limit}, "
@@ -785,6 +788,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         _, accepted = self._read_verdicts([rid])[0]
         if accepted < self.mtp_k:
             self._kv().correct_len(rid, _MAIN, accepted - self.mtp_k)
+            self._pos().correct_len(rid, _MAIN, accepted - self.mtp_k)
         self._mtp_trimmed[rid] = pending[0]
 
     def unpack_packed_outputs(
@@ -862,7 +866,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # an MTP verify step's forward returned the next input (the token after the
         # accepted drafts); new_token is the host's cut of the verdict
         outputs.setdefault("text_inputs", outputs["new_token"])
-        if request_id in self._ended_at_prefill:
+        if self.request_state(request_id).get("ended_at_prefill"):
             # the reply already ended: this step only closes the decode loop
             del outputs["new_token"]
 
@@ -871,13 +875,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if request_id in self._ended_at_prefill:
+        state = self.request_state(request_id)
+        if state.get("ended_at_prefill"):
             return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
         # the prompt-aware cap from the prefill's preprocess, else the request's own
-        budget = self._token_budget.get(request_id, request_info.max_tokens)
+        budget = state.get("token_budget", request_info.max_tokens)
         if self.mtp_k > 0:
             # multi-token emission: in-step truncation guarantees a stop id
             # can only be the LAST element; totals live in the per-request
@@ -897,7 +902,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # no decode_loop on this walk to stop: a stop token ends the reply at the first
             # decode step, and the conductor ends a max_tokens of 1 here
             if not ignore_eos and is_eos:
-                self._ended_at_prefill.add(request_id)
+                state.add("ended_at_prefill", True)
             return set()
         if (not ignore_eos and is_eos) or generated >= budget:
             return {"decode_loop"}

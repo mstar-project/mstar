@@ -7,10 +7,7 @@ from mstar.model.components.distributed import (
     ColumnParallelLinear,
     VocabParallelEmbedding,
 )
-from mstar.model.glm5_next.components.moe import (
-    Glm5NextGatedMLP,
-    Glm5NextSparseMoeBlock,
-)
+from mstar.model.glm5_next.components.moe import Glm5NextGatedMLP, Glm5NextSparseMoeBlock
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 
 

@@ -292,6 +292,13 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # own work; the lease only tells the outer declaration which resources are
     # already spoken for, so it can leave them out.
     lease_before_step: bool = False
+    # For a `lease_before_step` region: whether this batch may take a slot at
+    # all, beyond fitting a captured bucket. For a limit the bucket key does
+    # not express, such as how many attention segments a replay's plan holds.
+    # A batch it rejects gets no lease, so its forward runs the region eagerly
+    # (`ModelInputsFromEngine.step` is the declaration that tells it so).
+    # None: every batch that fits a bucket.
+    can_lease: Callable[[list[NodeInputs]], bool] | None = None
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets

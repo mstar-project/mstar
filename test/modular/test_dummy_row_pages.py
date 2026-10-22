@@ -1,10 +1,10 @@
-"""Capture-time padding rows don't keep their pages after warmup.
+"""Capture-time padding rows don't keep pages after warmup.
 
 A capture hands its padding rows real spans — a packed bucket splits its whole
-token budget across them — so they take pages proportional to the largest
-bucket. A replay pads with zero-length rows (`pad_inputs` asks the config for
-0 tokens), so none of that storage is ever read again; left resident it is
-just cache the traffic can't have.
+token budget across them — and runs them on SINK_PAGE, as a replay runs its
+padding rows, so they take no pages. A replay pads with zero-length rows
+(`pad_inputs` asks the config for 0 tokens). `release_all` still frees every
+row it opened, so nothing a capture did stays resident.
 """
 
 from __future__ import annotations
@@ -118,9 +118,10 @@ def _admit(kv: KVManager, rids, spans):
     assert kv.admit(step, ctx).ok
 
 
-def test_capture_spans_come_back_to_the_arena():
-    """The whole point: a packed capture's padding rows take pages by the
-    bucket's token budget, and warmup hands them back."""
+def test_capture_spans_take_no_pages_and_leave_the_arena_whole():
+    """A packed capture's padding rows carry the bucket's token budget but run
+    on SINK_PAGE, so no bucket depends on the pool's size, and warmup leaves
+    every page free."""
     kv = _kv_manager()
     free_before = kv._arena.num_free
     rids = ["__cg_a_0__", "__cg_a_1__"]
@@ -134,7 +135,7 @@ def test_capture_spans_come_back_to_the_arena():
     pool._held["0_slot0"] = list(rids)
 
     _admit(kv, rids, [512, 256])
-    assert kv._arena.num_free < free_before, "capture must actually take pages"
+    assert kv._arena.num_free == free_before, "a capture's rows must take no pages"
 
     pool.release_all()
 
