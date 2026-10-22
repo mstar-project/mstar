@@ -1,7 +1,6 @@
 
 import json
 import logging
-import math
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
@@ -424,45 +423,3 @@ def load_generation_defaults(
     if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
         out[stage + "temperature"] = 0.0
     return out
-
-
-# the request kwargs the sampler and the conductor read as numbers
-SAMPLING_NUMBERS = {
-    "temperature": float, "top_p": float, "top_k": int, "min_p": float,
-    "repetition_penalty": float, "max_output_tokens": int, "seed": int,
-}
-# the sampler keeps top_k and seed in int32 / int64 rows, where one past them raises on every
-# rank; max_output_tokens is an int64 in the Rust server, and past 2**64 fails the wire as a 500
-SAMPLING_INT_BOUNDS = {"top_k": 2**31, "seed": 2**63, "max_output_tokens": 2**63}
-# past these sampling is garbage: a negative temperature inverts the logits, a top_p at or
-# below 0 samples token 0, and a penalty at or below 0 divides by 0 or flips its sign
-SAMPLING_RANGES = {
-    "temperature": ("at least 0", lambda v: v >= 0),
-    "top_p": ("in (0, 1]", lambda v: 0 < v <= 1),
-    "repetition_penalty": ("above 0", lambda v: v > 0),
-}
-
-
-def sampling_kwargs(model_kwargs: dict | None) -> dict:
-    """``model_kwargs`` with None read as unset and each sampling knob a number;
-    any other value for one raises ValueError."""
-    kwargs = {k: v for k, v in (model_kwargs or {}).items() if v is not None}
-    for key, kind in SAMPLING_NUMBERS.items():
-        value = kwargs.get(key)
-        if value is None:
-            continue
-        if not (kind is int and isinstance(value, int) and not isinstance(value, bool)):
-            try:
-                number = float(value)
-            except (TypeError, ValueError, OverflowError):
-                raise ValueError(f"{key} must be a number; got {value!r}") from None
-            if not math.isfinite(number) or (kind is int and not number.is_integer()):
-                raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
-            kwargs[key] = kind(number)
-        bound = SAMPLING_INT_BOUNDS.get(key)
-        if bound is not None and not -bound <= kwargs[key] < bound:
-            raise ValueError(f"{key} must fit in a signed {bound.bit_length()}-bit integer; got {value!r}")
-        allowed = SAMPLING_RANGES.get(key)
-        if allowed is not None and not allowed[1](kwargs[key]):
-            raise ValueError(f"{key} must be {allowed[0]}; got {value!r}")
-    return kwargs
