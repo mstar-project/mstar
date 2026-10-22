@@ -26,18 +26,17 @@ class PrefixIndex:
         self._key: list[bytes | None] = [None] * num_pages
         self._parent: list[int | None] = [None] * num_pages
         self._children: list[int] = [0] * num_pages
+        # how many of a page's children are held, or have a held page below them
+        self._held_below: list[int] = [0] * num_pages
         self._stamp: list[int] = [0] * num_pages
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
+        self._evictable: set[int] = set()
+        arena.index = self
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
-        pages: list[int] = []
-        for key in keys:
-            page = self._by_key.get(key)
-            if page is None:
-                break
-            pages.append(page)
+        pages = self.peek(keys)
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
@@ -63,6 +62,7 @@ class PrefixIndex:
         self._key[page] = key
         self._parent[page] = parent
         self._children[page] = 0
+        self._held_below[page] = 0
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
@@ -71,9 +71,60 @@ class PrefixIndex:
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
+    def peek(self, keys: Sequence[bytes]) -> list[int]:
+        """Like `lookup`, but leaves the matched pages' stamps alone."""
+        pages: list[int] = []
+        for key in keys:
+            page = self._by_key.get(key)
+            if page is None:
+                break
+            pages.append(page)
+        return pages
+
     def page_for(self, key: bytes) -> int | None:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
+
+    def evictable(self) -> set[int]:
+        """Return the live set of pages `evict` could free, cascading from the leaves.
+        Callers read it and don't keep it.
+
+        A page only the index holds is out of reach while a page below it is held,
+        since eviction takes leaves only.
+        """
+        return self._evictable
+
+    def set_shared(self, page: int, shared: bool) -> None:
+        """Called when ``page`` gains or loses its one owner besides the index."""
+        if self._key[page] is None or self._held_below[page]:
+            # nothing changes for a page that isn't indexed or is pinned from below
+            return
+        if shared:
+            self._evictable.discard(page)
+            self._pin_above(page)
+        else:
+            self._evictable.add(page)
+            self._unpin_above(page)
+
+    def _pin_above(self, page: int) -> None:
+        """Mark the pages above a newly held ``page`` as not evictable."""
+        parent = self._parent[page]
+        while parent is not None:
+            self._held_below[parent] += 1
+            if self._held_below[parent] > 1 or self._arena.num_owners[parent] > 1:
+                return
+            self._evictable.discard(parent)
+            parent = self._parent[parent]
+
+    def _unpin_above(self, page: int) -> None:
+        """Mark the pages above ``page`` evictable again once nothing below them is held."""
+        parent = self._parent[page]
+        while parent is not None:
+            self._held_below[parent] -= 1
+            if self._held_below[parent] or self._arena.num_owners[parent] > 1:
+                return
+            self._evictable.add(parent)
+            parent = self._parent[parent]
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
@@ -124,6 +175,7 @@ class PrefixIndex:
         return None
 
     def _remove(self, page: int) -> None:
+        self._evictable.discard(page)
         del self._by_key[self._key[page]]
         self._key[page] = None
         parent = self._parent[page]
