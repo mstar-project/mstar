@@ -1217,6 +1217,13 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   argument. The region still declares, plans and commits its own work. The lease only
   tells the outer declaration which resources are already taken, so that it can exclude
   them.
+- ``can_lease`` has signature ``(inputs: list[NodeInputs]) -> bool``. It applies only with
+  ``lease_before_step``, and lets the region refuse a batch for a limit that the
+  capture bucket key doesn't express, such as Qwen3.5's per-request segment count. The
+  engine then gives the region no lease for that step. Your forward must replay only
+  when the region was leased, for example when the outer step is ``None``, and not
+  whenever ``runner.can_run`` is true: a refused batch can still fit a bucket, and
+  replaying it would declare the region's resources twice.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is

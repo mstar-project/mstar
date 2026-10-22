@@ -226,6 +226,10 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         submodule.postprocess(serve.rid, info, out)
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
+        # as the runtime: the prefill walk's stop check (it ends no loop, but marks a stop
+        # token for the first decode step), then the decode walk's
+        submodule.check_stop(serve.rid, info, out)
+        info.graph_walk = "decode"
 
         for step in range(max_tokens + 4):  # +slack; check_stop must break first
             out = serve.step("decode", info, next_token)

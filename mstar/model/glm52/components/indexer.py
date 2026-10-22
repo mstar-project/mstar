@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
+from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
 
 
@@ -61,7 +61,7 @@ class Glm52Indexer(nn.Module):
 
         # Same interleaved rotation, theta, and absolute positions as the
         # main MLA rope (indexer_rope_interleave=True => GPT-J pairing).
-        self.rotary = Glm52RotaryEmbedding(
+        self.rotary = InterleavedRotaryEmbedding(
             rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
         # Both the softmax scale (head_dim^-0.5) and n_heads^-0.5 fold into
         # the per-head weights, as the reference implementation does; the

@@ -92,6 +92,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_tts_base``
      - ``Qwen/Qwen3-TTS-12Hz-1.7B-Base``
      - 1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).
+   * - ``fish_s2_pro``
+     - ``fishaudio/s2-pro``
+     - Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over 10 codebooks),
+       44.1 kHz causal DAC codec, voice cloning from one reference clip, inline ``[tag]``
+       prosody control. Weights under the Fish Audio Research License (non-commercial use
+       only); check it before deploying.
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -213,12 +219,46 @@ Omnilingual ASR notes
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
-Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
-not supported yet; video is refused). Served on both ``POST /generate`` and
-``/v1/chat/completions`` (image parts included). Images may be interleaved with
-text anywhere in the prompt, and prefill follows the order they were written::
+Text, image and video chat on the Qwen3.5 dense family (five sizes; MoE
+variants are not supported yet). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (``image_url`` and ``video_url`` parts). Images and
+videos may be interleaved with text anywhere in the prompt, and prefill follows
+the order they were written::
 
     mstar serve qwen3_5_4b --gpus 0
+
+Video follows transformers' ``Qwen3VLProcessor`` exactly: frames are decoded
+with torchcodec on the host (FFmpeg's shared libraries must be installed;
+without them a video request gets a 400, as there is no fallback decoder),
+sampled at the checkpoint's ``video_preprocessor_config.json`` rate (2 fps,
+4 to 768 frames for the released checkpoints), resized within its pixel
+budget, and paired into temporal groups of two frames. Each group is preceded
+by a ``<t seconds>`` timestamp in the prompt and placed in MRoPE like a
+one-frame image. The prompt layout is the one transformers uses from 5.10
+(and vLLM and SGLang): the template's ``<|vision_start|>``/``<|vision_end|>``
+around a video stay, with each group's own pair inside. Earlier transformers
+replaced the outer pair too; mstar keeps the 5.10 layout whatever version is
+installed. Resizing follows the installed transformers version:
+transformers 5.22 turns on the per-frame pixel cap of qwen-vl-utils by
+default, which lowers the token count of short clips. Notes:
+
+- The vision encoder attends within each image and each video frame group
+  separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
+  segments per prompt. A prompt over either limit runs the encoder without the
+  graph: a long video at ordinary resolution exceeds the patches, and one over
+  ~64 s with frames resized below ~256x256 pixels exceeds the segments.
+- A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
+  beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
+  eagerly.
+- Size the KV pool for video. ``configs/qwen3_5_*.yaml`` keep the default
+  2048 pages of 128 tokens (262k tokens per deployment); 32 concurrent long
+  videos need about twice that. Measured on Qwen3.8-27B at TP4: 32 concurrent
+  long videos on the default pool gave 67 tok/s with most requests timing out,
+  and 1,585 tok/s with none failing on 8192 pages. Raise
+  ``resources: kv_cache: max_num_pages`` to fit the concurrency you serve.
+- Decoding happens in the API server process, before the request is queued,
+  and counts against ``MSTAR_MAX_VIDEO_PIXELS``: at the default, a 1080p
+  video over about 259 s gets a 400.
 
 Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
 well as a KV allocation. Set ``gdn_state.max_slots`` in
@@ -226,7 +266,7 @@ well as a KV allocation. Set ``gdn_state.max_slots`` in
 CUDA-graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint's
-``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
@@ -242,7 +282,7 @@ code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
 Its ``output_gate_type: swish`` names the gated DeltaNet norm's activation,
 which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
-the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
@@ -323,7 +363,7 @@ Qwen3-TTS notes
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
   own (first audio one Talker step after prefill), the next windows add 3, 8
   and 16 frames, then 25 new frames behind up to 72 frames of already decoded
-  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  left context, the decoder transformer's sliding window. The
   transformer stacks 8 such layers, so a window still differs slightly from a
   whole-utterance decode once an utterance outgrows the context; 25 frames of
   context differed far more. Each window size is a CUDA-graph bucket captured
@@ -416,6 +456,36 @@ the saved WAVs with ``benchmark/tts_speech_wer.py``::
    python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
        --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
        --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+
+Fish Audio S2-Pro notes
+-----------------------
+
+- The ``fishaudio/s2-pro`` weights are under the Fish Audio Research License:
+  research and non-commercial use only. M* downloads them at runtime and does
+  not redistribute them; read the license before deploying.
+- ``pip install -e '.[fish_s2_pro]'`` then ``mstar serve fish_s2_pro --gpus 0``.
+- The voice-clone warmup at startup uses ``samples/af_heart_0.wav`` from
+  ``hexgrad/Kokoro-82M``. An offline deployment that pre-fills its HF cache
+  needs that file as well; without it the warmup is skipped with a warning and
+  the first clone request pays the one-time cost.
+- Requests: ``/v1/audio/speech`` with ``input``; inline ``[tag]`` prosody
+  control is part of the text. Clone a voice with ``ref_audio`` (data URL,
+  base64, or an http(s) URL when the server allows remote fetch) and its transcript in
+  ``ref_text``; with the SDK, ``client.tts(text, reference_audio="ref.wav",
+  ref_text="...")``. ``voice`` and ``speed`` are ignored.
+- Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
+  ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
+  temperature first and takes top-k and top-p over the tempered probabilities,
+  while the reference takes top-p over the untempered ones, so at the same
+  values M\* keeps a slightly different set of tokens per step. The top-p
+  boundary differs as well: M\*'s sampler (FlashInfer) keeps the token whose
+  probability carries the running total past top-p, while the reference drops
+  it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
+  4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
+- Streamed audio matches the whole-utterance decode to within one int16 step:
+  each codec window carries the decoder's whole receptive field as context, and
+  the codec runs in fp32 with TF32 off.
+
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
 

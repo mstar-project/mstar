@@ -120,8 +120,7 @@ class RMSNormGated(nn.Module):
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.variance_epsilon)
         # HF's casts, but the weight stays fp32 (see GatedDeltaNet._apply), so
-        # this product is fp32 where HF's is model dtype: within a bf16 ulp,
-        # and what vLLM's fused gated norm does.
+        # this product is fp32 where HF's is model dtype: within a bf16 ulp.
         x = self.weight * x.to(input_dtype)
         x = x * F.silu(gate.to(torch.float32))
         return x.to(input_dtype)

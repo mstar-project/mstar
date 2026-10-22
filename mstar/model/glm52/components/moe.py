@@ -1,4 +1,4 @@
-"""GLM-5.2 fine-grained MoE: groupless sigmoid router + FP8-resident experts."""
+"""GLM-5.2 fine-grained MoE: the noaux_tc router (components/moe.py) + FP8-resident experts."""
 from __future__ import annotations
 
 import logging
@@ -11,23 +11,24 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.components.moe import (
+    NoAuxTcRouter,
     _dispatch,
+    _down_proj_fp8_weight_loader,
     _down_proj_weight_loader,
+    _gate_up_fp8_weight_loader,
     _gate_up_weight_loader,
     dispatch_experts_fused,
 )
-from mstar.model.glm52.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import dequantize_fp8_block_weight
 
 logger = logging.getLogger(__name__)
 
 _BACKEND_LOGGED = False
 # accepted moe_quant_kernel values; see Glm52ModelConfig.moe_quant_kernel
 MOE_QUANT_KERNELS = ("reference", "triton", "auto")
-# bf16 x bf16 -> fp32 mm (aten::mm.dtype); older torch lacks the overload
-_MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # the weight scale block fused_experts_fp8 compiles for
 _FUSED_FP8_BLOCK = (128, 128)
 
@@ -50,122 +51,6 @@ _DECODE_MAX_TOKENS = 64
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
-
-
-def _gate_up_fp8_loader(
-    tp_rank: int, tp_size: int, full_inter: int, row_unit: int,
-    param: nn.Parameter, loaded_weight: torch.Tensor,
-    loaded_shard_id: str | int | None = None,
-):
-    """Route one expert's gate/up tensor into the stacked per-rank param."""
-    assert loaded_shard_id is not None
-    kind, expert_str = str(loaded_shard_id).split(":")
-    expert_idx = int(expert_str)
-    rows = divide(divide(full_inter, tp_size), row_unit)
-    full_rows = divide(full_inter, row_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    if loaded_weight.shape[0] == full_rows:
-        start = tp_rank * rows
-        loaded_weight = loaded_weight[start:start + rows, :]
-    elif loaded_weight.shape[0] != rows:
-        raise ValueError(
-            f"expert gate/up tensor has {loaded_weight.shape[0]} rows; expected "
-            f"the full {full_rows} or the per-rank {rows}"
-        )
-    if kind == "gate":
-        param.data[expert_idx, :rows, :] = loaded_weight
-    else:
-        param.data[expert_idx, rows:2 * rows, :] = loaded_weight
-
-
-def _down_fp8_loader(
-    tp_rank: int, tp_size: int, full_inter: int, col_unit: int,
-    param: nn.Parameter, loaded_weight: torch.Tensor,
-    loaded_shard_id: str | int | None = None,
-):
-    """Column (contraction-dim) sharding twin of :func:`_gate_up_fp8_loader`."""
-    assert loaded_shard_id is not None
-    expert_idx = int(str(loaded_shard_id).split(":")[1])
-    cols = divide(divide(full_inter, tp_size), col_unit)
-    full_cols = divide(full_inter, col_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    if loaded_weight.shape[1] == full_cols:
-        start = tp_rank * cols
-        loaded_weight = loaded_weight[:, start:start + cols]
-    elif loaded_weight.shape[1] != cols:
-        raise ValueError(
-            f"expert down tensor has {loaded_weight.shape[1]} cols; expected "
-            f"the full {full_cols} or the per-rank {cols}"
-        )
-    param.data[expert_idx, :, :] = loaded_weight
-
-
-class Glm52MoEGate(nn.Module):
-    """DeepSeek-V3 noaux_tc sigmoid router, groupless (n_group=1)."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        n_routed_experts: int,
-        num_experts_per_tok: int,
-        routed_scaling_factor: float,
-        norm_topk_prob: bool = True,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.n_routed_experts = n_routed_experts
-        self.top_k = num_experts_per_tok
-        self.routed_scaling_factor = routed_scaling_factor
-        self.norm_topk_prob = norm_topk_prob
-
-        self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(n_routed_experts, dtype=torch.float32)
-        )
-        # mstar::moe_router_topk once the fused path resolves with moe_router_kernel
-        self._topk_op = None
-        # fp32 copy of ``weight``, built once by ``finalize_weights``: the
-        # forward needs fp32 and the router never changes, so casting it once
-        # per layer per step is pure waste. A plain attribute, not a buffer,
-        # so model.to(bf16) cannot downcast it.
-        self._weight_fp32: torch.Tensor | None = None
-
-    def finalize_weights(self) -> None:
-        """Cache the fp32 router weight; call after the weights are loaded."""
-        self._weight_fp32 = self.weight.detach().float()
-
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flat = hidden_states.reshape(-1, self.hidden_size)
-        # the engine's bf16 autocast would run F.linear in bf16 and round the logits
-        with torch.autocast(flat.device.type, enabled=False):
-            if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
-                # bf16 x bf16 products are exact in fp32: the fp32 router in another
-                # summation order, without an fp32 copy of the tokens
-                logits = torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
-            else:
-                w = self._weight_fp32
-                if w is None or w.device != self.weight.device:
-                    w = self.weight.float()
-                logits = F.linear(flat.float(), w)
-        if self._topk_op is not None and logits.is_cuda:
-            return self._topk_op(logits, self.e_score_correction_bias, self.top_k,
-                                 self.routed_scaling_factor, self.norm_topk_prob)
-        scores = logits.sigmoid()  # (T, E)
-
-        biased = scores + self.e_score_correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_ids)
-
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        if self.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * self.routed_scaling_factor
-
-        return topk_weights, topk_ids
 
 
 class Glm52SparseMoeBlock(nn.Module):
@@ -207,7 +92,7 @@ class Glm52SparseMoeBlock(nn.Module):
         self._router_kernel = bool(getattr(config, "moe_router_kernel", False))
         self._prefill_kernel = bool(getattr(config, "moe_prefill_kernel", False))
 
-        self.gate = Glm52MoEGate(
+        self.gate = NoAuxTcRouter(
             hidden_size=config.hidden_size,
             n_routed_experts=config.n_routed_experts,
             num_experts_per_tok=config.num_experts_per_tok,
@@ -297,16 +182,16 @@ class Glm52SparseMoeBlock(nn.Module):
         if self.fp8_experts:
             bo, bi = self.block_size
             self.experts.gate_up_proj_fp8.weight_loader = partial(
-                _gate_up_fp8_loader, self.tp_rank, self.tp_size, full_inter, 1,
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
             )
             self.experts.gate_up_proj_scale_inv.weight_loader = partial(
-                _gate_up_fp8_loader, self.tp_rank, self.tp_size, full_inter, bo,
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bo,
             )
             self.experts.down_proj_fp8.weight_loader = partial(
-                _down_fp8_loader, self.tp_rank, self.tp_size, full_inter, 1,
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
             )
             self.experts.down_proj_scale_inv.weight_loader = partial(
-                _down_fp8_loader, self.tp_rank, self.tp_size, full_inter, bi,
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bi,
             )
         else:
             self.experts.gate_up_proj.weight_loader = partial(
@@ -333,7 +218,7 @@ class Glm52SparseMoeBlock(nn.Module):
             return out.view(input_shape)
 
         # topk_weights stay fp32 into the combine, as in HF's experts.
-        topk_weights, topk_ids = self.gate(flat)
+        topk_weights, topk_ids, _ = self.gate(flat)
         if self.fp8_experts:
             if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
                 routed = self._dispatch_prefill(flat, topk_weights, topk_ids)

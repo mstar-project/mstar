@@ -62,6 +62,12 @@ class _FlashInferRaggedBase:
         )
 
     @property
+    def max_segments_per_request(self) -> int:
+        """Segments one request may bring to a captured plan, as configured
+        (after YAML overrides); a captured wrapper holds this many per row."""
+        return self._config.max_segments_per_request
+
+    @property
     def force_double_buffer(self):
         # FlashInfer's plan stages the schedule into a pinned buffer it holds
         # per wrapper and H2Ds it on the stream
