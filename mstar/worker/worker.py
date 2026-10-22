@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import time as _time
+from array import array
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -32,8 +33,14 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
-from mstar.engine.resources.kv.config import without_layouts
+from mstar.engine.resources import (
+    AdmitFailedReason,
+    AllocationFailed,
+    ResourceReqConfig,
+    SamplerStep,
+    StepContext,
+)
+from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -265,6 +272,18 @@ class Speculation:
     # TP async scheduling: the broadcast seq of this speculation (leader:
     # assigned at broadcast; follower: the head's). PendingBatch.tp_seq on submit.
     tp_seq: int = -1
+
+
+@dataclass(slots=True)
+class KeptIds:
+    """A request's token ids on one node as int32: its prompt, then each sample it kept."""
+    prompt: bytes
+    sampled: array
+
+
+# The output a sampling node returns its token under. A decode input such as `text_inputs` gets the
+# token only in the per-request `postprocess`, so a step's host rows lack that input.
+_SAMPLED = "new_token"
 
 
 class EvictionPolicy(Enum):
@@ -595,6 +614,30 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
+        # Kept so a dropped request can be rebuilt from its token ids.
+        # `_kv_keys`: node -> the keys of its paged KV caches.
+        # `_kept_ids`: node -> handle -> the request's ids on that node. Per node, since a colocated node
+        #   of another partition samples tokens of its own.
+        # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
+        #   prefill walk's single input, such as `text_inputs`.
+        # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
+        self._kv_keys: dict[str, list[str]] = defaultdict(list)
+        for kv in self.engine_manager.engine.paged_kv_caches():
+            for node_name in kv.nodes:
+                self._kv_keys[node_name].append(kv.key)
+        self._kept_ids: dict[str, dict[int, KeptIds]] = {node_name: {} for node_name in self._kv_keys}
+        self._walk_inputs: dict[tuple[str, str], set[str]] = {}
+        self._growth_loops: dict[tuple[str, str], str] = {}
+        if model is not None:
+            for walk_name, section in model.get_graph_walk_graphs().items():
+                for node_name, node in section.get_nodes().items():
+                    self._walk_inputs[(walk_name, node_name)] = node.input_names
+            labels = model.kv_labels()
+            for node_name, keys in self._kv_keys.items():
+                for kv_label in (label for key in keys for label in labels.get(key, {}).values()):
+                    for walk_name, loop in kv_label.growth:
+                        self._growth_loops[(walk_name, node_name)] = loop
+
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
         # from _process_messages on any iter — reads/writes them.
@@ -818,6 +861,7 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
             self._process_unprocessed(body.request_id)
             return
+        self._keep_ids(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
@@ -958,10 +1002,67 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
+        for kept in self._kept_ids.values():
+            kept.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+    def _keep_ids(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        """Keep the prompt's ids on each node where one prefill row can recompute the request's KV
+        from them. The node's paged KV caches must lay out one label, written by one walk and grown
+        by one loop. The node must also read a single input, with the same name in that walk and in
+        every walk the loop grows in, since the rebuild row's ids go under that name."""
+        for node_name, keys in self._kv_keys.items():
+            kept = self._kept_ids[node_name]
+            if request_id in kept:
+                continue  # its other partition's NewRequest
+            prompts = [
+                (layout, (config.prompt_ids or {}).get(label))
+                for key in keys if isinstance(config := configs.get(key), KVReqConfig)
+                for label, layout in (config.kv_layout or {}).items()
+            ]
+            if len(prompts) != 1 or prompts[0][1] is None:
+                continue
+            layout, ids = prompts[0]
+            walks = {span.walk for span in layout.spans}
+            if len(layout.growth) != 1 or len(walks) != 1:
+                continue
+            ((loop, _),) = layout.growth
+            reads = self._walk_inputs.get((*walks, node_name), set())
+            grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
+            if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
+                kept[request_id] = KeptIds(ids, array("i"))
+
+    def _drop(self, request_id: int, node_name: str) -> int:
+        """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
+        the pages freed."""
+        if request_id not in self._kept_ids.get(node_name, {}):
+            raise RuntimeError(
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} keeps no ids on {node_name} to rebuild it from"
+            )
+        backlogged = any(
+            request_id in batch.request_to_worker_graph
+            for (node, _), batch in self.scheduler.backlog.items() if node == node_name
+        )
+        if request_id in self._in_flight_rids or backlogged:
+            raise RuntimeError(
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step or a backlog on {node_name}"
+            )
+        # The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
+        # discards the row's sample only under decode-time metadata, so the request must be in the walk
+        # that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
+        # holds all but the last sample.
+        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
+        loop = self._growth_loops.get((info.graph_walk, node_name))
+        kept = self._kept_ids[node_name][request_id]
+        if loop is None or len(kept.sampled) != info.dynamic_loop_iter_counts.get(loop, 0) + 1:
+            raise RuntimeError(
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} on {node_name} is in walk "
+                f"{info.graph_walk!r}, which grows no KV, or its {len(kept.sampled)} kept samples don't cover its KV"
+            )
+        return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -3184,6 +3285,7 @@ class Worker:
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+        self._keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -3329,6 +3431,36 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    def _keep_samples(
+        self, node_batch: ExecutingBatch, cpu_outputs, host_rows: "HostRows | None",
+    ) -> None:
+        """Append each kept row's sample, from the stop check's host copy, to its kept ids."""
+        kept_ids = self._kept_ids.get(node_batch.node_name)
+        if not kept_ids:
+            return
+        step = node_batch.step
+        kept_rows = None if step is None else next(
+            (s.kept_rids for s in step.steps.values() if isinstance(s, SamplerStep)), None,
+        )
+        ctx = node_batch.step_context
+        if host_rows is not None:
+            tokens = host_rows.buffers.get(_SAMPLED)
+            if not torch.is_tensor(tokens) or tokens.dim() == 0:
+                return
+            # the sampler's [B] output skips the reshape, which costs more than the rest of this method
+            values = tokens.tolist() if tokens.dim() == 1 else tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+            pairs = zip(host_rows.request_ids, values, strict=False)
+        else:
+            pairs = (
+                (rid, int(out[_SAMPLED][0])) for rid in node_batch.request_ids
+                if isinstance(out := cpu_outputs.get(rid), dict) and out.get(_SAMPLED)
+            )
+        for rid, token in pairs:
+            kept = kept_ids.get(rid)
+            # the host rows are the forward's, which can hold a row the worker has since taken out of the step
+            if kept is not None and ctx.is_real_row(rid) and (kept_rows is None or rid in kept_rows):
+                kept.sampled.append(token)
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
