@@ -725,9 +725,9 @@ class KVManager(AttentionResource):
                     end, key = image_end
                     cached = self._retain_cached(rid, stream, self._index.lookup([key]))
                     if cached:
-                        own = self._arena.acquire(1)
-                        if own is None and self._index.evict(1):
-                            own = self._arena.acquire(1)
+                        # The lease isn't on the stream yet, so ``remaining`` still counts the pages the
+                        # lease took. Check this page against the whole allowance instead.
+                        own = self._grant(rid, label, 1, 0) if self._allowance(rid) > 0 else None
                         if own is None:
                             self._release(rid, stream, cached)
                         else:
@@ -2726,17 +2726,10 @@ class KVManager(AttentionResource):
             needed = self._reload_pages_needed(rid)
             if needed > self._room():
                 return False
-            if needed > self._arena.num_free and self._index is not None:
-                # as `_alloc` does: once the pool is all cached pages, nothing
-                # else would ever free one for this request to come back to
-                self._index.evict(needed - self._arena.num_free)
-            if needed > self._arena.num_free:
-                return False
             for label in labels:
                 stream = self._ensure_label(rid, label)
-                pages = self._arena.acquire(
-                    self._cpu_pool.num_pages(rid, label)
-                )
+                # the room covers every label, so `_grant` needs no check of its own
+                pages = self._grant(rid, label, self._cpu_pool.num_pages(rid, label), 0)
                 if pages is None:
                     # lost the race for pages against another consumer
                     return False
@@ -3431,14 +3424,12 @@ class KVManager(AttentionResource):
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
             if num_new_pages > 0:
-                new_pages = self._arena.acquire(num_new_pages)
-                if new_pages is None and self._index is not None:
-                    # cached pages are the only ones that can be given back
-                    # without failing a request that is already running
-                    self._index.evict(num_new_pages - self._arena.num_free)
-                    new_pages = self._arena.acquire(num_new_pages)
+                allotment = self._allotments.get(request_id)
+                within = 0 if allotment is None else min(num_new_pages, allotment.remaining)
+                new_pages = self._grant(request_id, label, num_new_pages, num_new_pages - within)
                 if new_pages is None:
-                    pages_short = num_new_pages - self._arena.num_free
+                    available = self._allowance(request_id)
+                    pages_short = num_new_pages - available
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(
@@ -3447,24 +3438,43 @@ class KVManager(AttentionResource):
                             label=label,
                             message=(
                                 f"Not enough free pages: requested {num_new_pages}, "
-                                f"available {self._arena.num_free} for request {request_id}, "
+                                f"available {available} for request {request_id}, "
                                 f"label {label}."
                             ),
                         )
                     )
                 stream.page_indices.extend(new_pages)
-                allotment = self._allotments.get(request_id)
-                if allotment is not None and allotment.remaining:
+                if within:
                     # what `_recount` would count, without its pass over the streams
-                    used = min(num_new_pages, allotment.remaining)
-                    allotment.remaining -= used
-                    self._unused -= used
+                    allotment.remaining -= within
+                    self._unused -= within
                 stream.generation += 1
                 if stream.footprint is not None and len(stream.page_indices) > stream.footprint:
                     self._report_overrun(request_id, label, stream)
                 if _DEBUG_ASSERTS:
                     stream.peak = max(stream.peak, len(stream.page_indices))
         return AllocResult(new_pages=new_pages)
+
+    def _grant(self, rid: str, label: str, n: int, past: int) -> list[int] | None:
+        """Take ``n`` free pages for ``rid``, of which ``past`` go beyond what its allotment has
+        left, evicting cached pages if too few are free. None when the pool is short, which on a deciding
+        pool means ``past`` is more than the room. The pages within the allotment need
+        no check, since the allotments never count more than the pool has."""
+        if past and self._decides and past > self._room():
+            return None
+        pages = self._arena.acquire(n)
+        if pages is None and self._index is not None:
+            # cached pages are the only ones that can be given back
+            # without failing a request that is already running
+            self._index.evict(n - self._arena.num_free)
+            pages = self._arena.acquire(n)
+        if pages is None and self._decides:
+            raise RuntimeError(
+                f"KV {self.name}: {rid}/{label} could not take {n} pages that its allotment and the room "
+                f"covered, so the allotments count pages the pool can't reach: {self._arena.num_free} free, "
+                f"{len(self._index.evictable()) if self._index else 0} evictable, {self._unused} allotted but unused"
+            )
+        return pages
 
     def _assert_scratch(self, step: KVStep, ctx: StepContext) -> None:
         for segment in step.segments:
