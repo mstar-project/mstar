@@ -1156,19 +1156,36 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread (PendingRequest.notify) when the request
+        # finishes, as the streaming handler is. Polling every 5 ms per request
+        # (lock, cancel scope, timer) held the event loop at high concurrency,
+        # so the timeout and a disconnect are checked only when no wake came.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
         while True:
+            # Cleared before the read: a notification that lands after this
+            # point stays set and the wait below returns at once.
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
             if done:
                 break
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=0.1)
+                continue
+            except asyncio.TimeoutError:
+                pass
             if time.time() - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
             if raw_request is not None and await raw_request.is_disconnected():
                 self.abort_submission(key)
                 return []
-            await asyncio.sleep(0.005)
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
