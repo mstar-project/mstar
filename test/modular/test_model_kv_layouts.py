@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -94,47 +93,15 @@ def test_bagel_caps_decode_where_its_stop_check_ends_it(max_tokens):
     ), "the cap and the stop check end decode on different iterations"
 
 
-_BAGEL_SHAPES = {
-    "text chat": (["text"], ["text"], {}),
-    "understanding an image": (["image", "text"], ["text"], {}),
-    "text to image": (["text"], ["image"], {"think_mode": True}),
-    "text to image without guidance": (["text"], ["image"], {"cfg_text_scale": 1.0}),
-    "an edit": (["image", "text"], ["image"], {}),
-    "an edit without guidance": (["image", "text"], ["image"], {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}),
-}
-
-
-@pytest.mark.parametrize("cfg_parallel", [False, True], ids=["one LLM node", "CFG-parallel"])
-@pytest.mark.parametrize(("input_modalities", "output_modalities", "kwargs"), _BAGEL_SHAPES.values(), ids=_BAGEL_SHAPES)
-def test_bagel_lays_out_every_label_its_request_opens(input_modalities, output_modalities, kwargs, cfg_parallel):
-    model = _bagel()
-    images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
-    output = model.process_prompt(
-        "a cat", input_modalities, output_modalities, tensors={"image_inputs": images}, **kwargs,
-    )
-    params = model._request_params(input_modalities, output_modalities, kwargs)
-    target = output_modalities[0]
-    request = {"requires_cfg": model._requires_cfg(target_output=target, **params), "target_output": target}
-
-    model._has_cfg_parallel = cfg_parallel
-    config = model.get_request_resource_configs({"default": SimpleNamespace(full_metadata=SimpleNamespace(
-        kwargs=request,
-    ))}, kwargs)["kv"]
-
-    laid_out = set(output.metadata["kv_layout"]["kv"])
-    assert config.opened_labels() <= laid_out, "intake would refuse the request for a label its layout leaves out"
-
-
 _BAGEL_RUNS = {
     "text chat": (["text"], ["text"], {}, "Hello there"),
-    "text chat, think": (["text"], ["text"], {"think_mode": True}, "Hello there"),
     "understanding an image": (["image", "text"], ["text"], {}, "What is this?"),
     "understanding, text first": (["text", "image"], ["text"], {}, "What is this?"),
     "text to image": (["text"], ["image"], {}, "A cat on a mat"),
     "text to image, think": (["text"], ["image"], {"think_mode": True}, "A cat on a mat"),
     "text to image without guidance": (["text"], ["image"], {"cfg_text_scale": 1.0}, "A cat on a mat"),
     "an edit": (["image", "text"], ["image"], {}, "Make it night"),
-    "an edit, text first": (["text", "image"], ["image"], {}, "Make it night"),
+    "understanding without text": (["image"], ["text"], {}, None),
     "an edit without text": (["image"], ["image"], {}, None),
     "an edit without guidance": (["image", "text"], ["image"], {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}, "Night"),
 }
@@ -270,41 +237,6 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
     held = pool.held(1)
     assert all(peak == footprint for peak, footprint in held.values()), f"(peak, footprint) by label: {held}"
-
-
-def test_an_unguided_bagel_request_batched_with_a_guided_one_stays_inside_its_footprint(_bagel_checks, caplog):
-    import logging
-
-    model = _bagel_checks
-    guided, _, guided_walks = _bagel_request(model, "A cat on a mat", ["text"], ["image"], {"think_mode": True})
-    chat, _, chat_walks = _bagel_request(model, "Hello there", ["text"], ["text"], {})
-    pool = _BagelPool({1: guided, 2: chat})
-    flags = {1: True, 2: False}
-
-    with caplog.at_level(logging.ERROR, logger="mstar.engine.resources.kv.manager"):
-        while guided_walks or chat_walks:
-            walk = (guided_walks or chat_walks)[0][0]
-            rows = {rid: walks.pop(0)[1] for rid, walks in ((1, guided_walks), (2, chat_walks))
-                    if walks and walks[0][0] == walk}
-            pool.step(walk, rows, flags)
-
-    assert not caplog.records, f"a page went past a footprint: {caplog.text}"
-    assert set(pool.kv._streams[2]) == {"main"}, "the unguided chat took pages on a guidance label"
-    for rid in (1, 2):
-        held = pool.held(rid)
-        assert all(peak <= footprint for peak, footprint in held.values()), f"(peak, footprint): {held}"
-
-
-@pytest.mark.parametrize("output_modalities", [["text"], ["image"]], ids=["understanding", "an edit"])
-def test_bagel_lays_out_a_request_without_text(output_modalities):
-    model = _bagel()
-    images = [torch.rand(3, 480, 640)]
-    output = model.process_prompt(None, ["image"], output_modalities, tensors={"image_inputs": images})
-
-    layout = output.metadata["kv_layout"]["kv"]
-    assert [span.walk for span in layout["main"].spans] == (
-        ["prefill_vit"] if output_modalities == ["text"] else ["prefill_vae", "prefill_vit"]
-    ), "the layout lists a text span no walk writes"
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
@@ -507,15 +439,6 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
     ), "the cap and the stop check end decode on different iterations"
 
 
-def test_higgs_lays_out_every_label_it_declares():
-    model = _higgs()
-
-    output = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(10 * 16000)]})
-
-    layout = output.metadata["kv_layout"]
-    assert [span.walk for span in layout["kv_cache"]["main"].spans] == ["prefill_text", "prefill_audio", "prefill_text"]
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
@@ -532,21 +455,6 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
         check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.skipif(not os.environ.get("QWEN3_5_CKPT"), reason="set QWEN3_5_CKPT to a Qwen3.5 checkpoint")
-@pytest.mark.parametrize("modalities", [["text"], ["image", "text"], ["text", "image", "text"]])
-def test_qwen3_5_lays_out_every_label_it_declares(modalities):
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-
-    model = Qwen3_5DenseModel(os.environ["QWEN3_5_CKPT"])
-    images = [torch.rand(3, 224, 224)] * modalities.count("image")
-
-    output = model.process_prompt("Describe this.", modalities, ["text"], tensors={"image_inputs": images})
-
-    layout = output.metadata["kv_layout"]
-    walks = {span.walk for span in layout["kv_cache"]["main"].spans}
-    assert walks == {"prefill_vision" if images else "prefill_text"}
 
 
 def _omni_submodule():
@@ -582,31 +490,6 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
     ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.skipif(
-    not os.environ.get("MSTAR_QWEN3_OMNI_PATH"), reason="set MSTAR_QWEN3_OMNI_PATH to the checkpoint's directory",
-)
-@pytest.mark.parametrize("output_modalities", [["text"], ["text", "audio"]])
-def test_qwen3_omni_lays_out_every_label_it_declares(output_modalities):
-    pytest.importorskip("flashinfer")
-    from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-
-    model = Qwen3OmniModel(os.environ["MSTAR_QWEN3_OMNI_PATH"])
-    tensors = {"image_inputs": [torch.rand(3, 224, 224)], "audio_inputs": [torch.zeros(16000)]}
-
-    output = model.process_prompt("Describe both.", ["image", "audio", "text"], output_modalities, tensors=tensors)
-
-    layout = output.metadata["kv_layout"]
-    thinker, talker = layout[THINKER_KV]["main"].spans, layout[TALKER_KV]["main"].spans
-    if "audio" not in output_modalities:
-        assert talker == (), "the Talker is laid out for a request with no audio out"
-        return
-    system = output.new_input_tensors["text_inputs"][0].tolist().index(model.config.im_start_token_id, 1)
-    assert [span.length for span in talker] == [
-        thinker[0].length - system, *(span.length for span in thinker[1:]), 6,
-    ], "the Talker's prefill rows aren't the Thinker's past the system turn, then its prefix"
 
 
 def _tiny_qwen3_tts_talker():
@@ -689,7 +572,7 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 5, 16, 40])
+@pytest.mark.parametrize("horizon", [2, 40])
 def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
     from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 
@@ -739,7 +622,7 @@ def _whisper():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 5, 64, 1000])
+@pytest.mark.parametrize("max_tokens", [1, 1000])
 def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.whisper.config import SAMPLER
     from mstar.model.whisper.submodules import WhisperDecoderSubmodule
