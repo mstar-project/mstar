@@ -399,9 +399,10 @@ on the head).
 Every target is sized into each slot and runs its kernels on every step that has an
 adapter row, whether that row's adapter uses it or not. The LM head and embedding are
 vocabulary-sized: at ``max_rank: 16`` and 4 slots, about 40 MB each per GPU (the head's
-split over TP ranks, the embedding's whole on each). So the pools keep only the targets
-the configured adapters touch, and a vision encoder whose adapters are all text-only
-builds no pool, unless the YAML lists the ones to keep::
+split over TP ranks, the embedding's whole on each). So with ``runtime_updates`` off
+(no adapter can arrive after startup), the pools keep only the targets the configured
+adapters touch, and a vision encoder whose adapters are all text-only builds no pool.
+With it on, every target is kept unless the YAML lists the ones to keep::
 
     resources:
       lora:
@@ -433,6 +434,40 @@ at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encod
 on one GPU in every shipped config.
 LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
 block).
+
+Adapters can also be loaded and unloaded while the server runs, with vLLM's
+endpoints and bodies. They make the server read paths a client names, so they are off
+unless the ``lora`` block opts in, and answer 404 otherwise (as vLLM's do without
+``VLLM_ALLOW_RUNTIME_LORA_UPDATING``). The block may name no adapters at all
+(``resources: {lora: {max_slots: 4, runtime_updates: true}}``)::
+
+    curl -X POST localhost:8000/v1/load_lora_adapter -H 'Content-Type: application/json' \
+        -d '{"lora_name": "sql", "lora_path": "/adapters/qwen3_5-4b-sql"}'
+    curl -X POST localhost:8000/v1/unload_lora_adapter -H 'Content-Type: application/json' \
+        -d '{"lora_name": "sql"}'
+
+``lora_path`` is a PEFT directory (its ``adapter_model.safetensors`` is read) or a
+safetensors file, readable at the same path by the API server, the conductor (which
+reads the adapter's header to check requests on it) and every worker. A load is checked
+first (LoRA layers present, rank within ``max_rank``, only the targets above, shapes
+that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM's
+or the vision encoder's); the name is selectable, and listed by ``/v1/models``, once all
+of them have it. A load that fails on any worker is undone on all of them and answered
+with a 400, as is a name that is already loaded. A refusal says why the adapter cannot be
+served (its rank, its modules, its shapes); a file that cannot be read at all gets the
+same answer whether it is missing, unreadable or not an adapter, and the details go to
+the server log. A worker that does not answer within ``runtime_update_timeout_s``
+(default 120) fails the load with a 504, and the load is undone everywhere, so the name
+is free to try again.
+
+To change an adapter's weights, unload it and load it again: each adapter is pinned to
+the digest of the weights checked when it was configured or loaded, and a worker that
+reads other weights from its path (the file overwritten in place) refuses them, on every
+rank, rather than serve them under the old name and prefix-cache entries. An unload stops
+new requests on the name at once (they get the 400 an unknown adapter gets; an unknown
+name in the unload is a 404); if the conductor refuses it, the name is selectable again.
+Requests already running on it finish on its weights, after which its slot and host copy
+are freed; loading the name again before then is a 400 that says so.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
