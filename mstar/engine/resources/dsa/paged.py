@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -75,6 +75,8 @@ class DSAContext:
     pad_slot: int | None = None
     last_selection: torch.Tensor | None = None
     last_selection_layer: int | None = None
+    # row_meta's, for the rows it was built from
+    _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def width(self) -> int:
@@ -83,6 +85,18 @@ class DSAContext:
 
     def attn_lens(self) -> list[int]:
         return attn_lens(self.host_pos, self.topk, self.kpool)
+
+    def row_meta(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per row, int32, what the top-k takes: the pools it sees, its request's first entry
+        in ``pages``, and its row of the one-row page table (0). Every layer of a forward
+        selects with the same rows, so they are built once (each launch is a few us)."""
+        if self._row_meta is None or self._row_meta[0] is not self.pos \
+                or self._row_meta[1] is not self.row_req:
+            self._row_meta = (
+                self.pos, self.row_req, ((self.pos + 1) // self.kpool).to(torch.int32),
+                self.page_start[self.row_req.long()].to(torch.int32),
+                torch.zeros_like(self.row_req))
+        return self._row_meta[2:]
 
     def rows(self, c0: int, c1: int) -> DSAContext:
         """This eager step's rows ``[c0, c1)`` alone, for a pass over them after the rows
@@ -261,26 +275,23 @@ def top_pools(scores: torch.Tensor, ctx: DSAContext, rows=slice(None)) -> torch.
     """``[rows, topk / kpool]`` int32: each row's top pools (ties to the earlier pool) as the
     slot of their first token over kpool, -1 past ``min(pools, topk / kpool)``. With ``kpool
     == 1``, each row's top ``topk`` token slots."""
-    pos, req = ctx.pos[rows], ctx.row_req[rows]
-    n = ((pos + 1) // ctx.kpool).to(torch.int32)
+    n, starts, batch = (t[rows] for t in ctx.row_meta())
     k = ctx.topk // ctx.kpool
     if scores.is_cuda:
         import flashinfer
 
         pool_slots = flashinfer.top_k_page_table_transform(
-            scores, ctx.pages[None, :], n, k,
-            row_to_batch=torch.zeros_like(req), deterministic=True,
+            scores, ctx.pages[None, :], n, k, row_to_batch=batch, deterministic=True,
             tie_break=flashinfer.TopKTieBreak.SMALL, dsa_graph_safe=True,
-            page_table_row_starts=ctx.page_start[req.long()].to(torch.int32),
-            page_size=ctx.page_size // ctx.kpool)
+            page_table_row_starts=starts, page_size=ctx.page_size // ctx.kpool)
         return pool_slots  # the transform's own unit, a pool: expand_slots scales it
     # stable sort: equal scores keep pool order, so ties go to the earlier pool
     order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :k]
     if order.shape[1] < k:
         order = torch.cat([order, order.new_zeros(order.shape[0], k - order.shape[1])], 1)
     live = torch.arange(k, device=scores.device)[None, :] < n[:, None]
-    first = _token_slots(ctx, req[:, None].long(), torch.where(live, order * ctx.kpool, 0),
-                         ctx.page_size)
+    first = _token_slots(ctx, ctx.row_req[rows][:, None].long(),
+                         torch.where(live, order * ctx.kpool, 0), ctx.page_size)
     return torch.where(live, first // ctx.kpool, -1).to(torch.int32)
 
 

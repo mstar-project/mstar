@@ -88,7 +88,7 @@ def test_decode_selection_matches_torch(lens):
     q = torch.randn(len(lens), NH, D, device=DEV).bfloat16()
     w = torch.randn(len(lens), NH, device=DEV)
     ctx = _ctx(tables, list(range(len(lens))), positions, DEV)
-    scores = dsa._decode_scores(q, w, view, ctx)
+    scores = dsa._decode_scores(q, w, view, ctx, ctx.pos, ctx.row_req, ctx.max_pools)
     ref = dsa._scores_torch(q, w, view, ctx, ctx.row_req.long(), ctx.pos, ctx.max_pools)
     for r, p in enumerate(positions):
         n = (p + 1) // KP
