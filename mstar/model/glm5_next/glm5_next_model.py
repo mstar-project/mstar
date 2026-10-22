@@ -599,7 +599,7 @@ class Glm5NextModel(Model):
         """Adopt the checkpoint's fp8-block quant config from its config.json."""
         import json
 
-        from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
+        from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
         if self.config.quantization_config is not None:
             return

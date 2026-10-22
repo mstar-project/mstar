@@ -7,7 +7,7 @@ from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components import moe as moe_module
 from mstar.model.glm5_next.components.moe import Glm5NextMoEGate, Glm5NextSparseMoeBlock
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import Fp8BlockQuantConfig, dequantize_fp8_block_weight
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and fused_decode._HAS_TRITON),

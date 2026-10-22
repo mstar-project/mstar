@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 # fp8 e4m3 with [128, 128] `weight_scale_inv` block scales and dynamic
 # activation scaling: the checkpoint's quantization scheme.
-from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
+from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "deepseek_sparse_attention"
