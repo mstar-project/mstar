@@ -12,6 +12,8 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    DSAConfig,
+    DSASpec,
     KVLayout,
     KVSpec,
     NodeResourceSpec,
@@ -37,6 +39,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.glm5_next.config import (
     ATTN,
+    DSA,
     KDA,
     KDA_STATE,
     KV_CACHE,
@@ -110,7 +113,7 @@ class Glm5NextModel(Model):
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if kwargs.get("dsa_long_context", False):
-            # Contexts past index_topk through the k-pool indexer and sparse MLA (dsa.py).
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
             self.config.dsa_long_context = True
@@ -199,7 +202,7 @@ class Glm5NextModel(Model):
             kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
             )
-        return [
+        specs = [
             KVSpec(
                 resource_key=KV_CACHE,
                 nodes={"LLM"},
@@ -249,6 +252,19 @@ class Glm5NextModel(Model):
                 ),
             ),
         ]
+        if self.config.dsa_long_context:
+            # past index_topk: the k-pool indexer's keys in KV_CACHE's index planes
+            specs.append(DSASpec(
+                resource_key=DSA,
+                nodes={"LLM"},
+                config=DSAConfig(
+                    kv_cache=KV_CACHE,
+                    topk=self.config.index_topk,
+                    kpool=self.config.index_kpool,
+                    sm_scale=self.config.qk_head_dim ** -0.5,
+                ),
+            ))
+        return specs
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
