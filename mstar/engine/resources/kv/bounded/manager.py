@@ -120,7 +120,7 @@ class BoundedKVManager(Resource):
         plan = plan or self.current
         cache = self._cache[layer_idx]
         self._check_attend(q, k, v, cache, source, plan, rel_bias, row_source)
-        if not q.is_cuda:
+        if q.device.type == "cpu":
             return self._attend_torch(q, k, v, cache, source, plan, rel_bias, row_source)
         from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
 
