@@ -156,6 +156,67 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
 
+Per-request LoRA adapters
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``resources: lora:`` block in a serving config serves PEFT adapters per request
+(sized and loaded as described under Qwen3.5 below). A request picks one with the
+``model`` field on any OpenAI route, or with ``lora_adapter: <name>`` in ``extra_body``
+or ``/generate``'s ``model_kwargs``; an adapter the deployment does not serve is a 400.
+Without the block a model runs exactly as before. The table lists the models that take
+one and their targets, by the names a ``targets:`` list in the block uses. Every row is
+validated on CPU (each model's own stack against merged weights at simulated tensor
+parallelism); the GPU checks are in ``benchmark/lora/README.md``. Qwen3.5, Orpheus and
+Higgs Audio pass them; the rows marked *not validated* do not yet, and serve adapters at
+your own risk:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 40 42
+
+   * - Model (node)
+     - Targets
+     - Notes
+   * - Qwen3.5 / Qwen3.8 (``LLM``, ``vision_encoder``)
+     - every linear of the text stack, ``lm_head``, ``embed_tokens``; the vision tower's
+       blocks, merger and patch embed
+     - See the Qwen3.5 notes.
+   * - Orpheus (``LLM``)
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head``,
+       ``embed_tokens``
+     - Hub Orpheus adapters (PEFT on ``q/k/v/o/gate/up/down``, ranks 8 to 512) are
+       served; set ``max_rank`` to the largest.
+   * - Higgs Audio (``LLM``)
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head`` (the
+       checkpoint's ``audio_decoder_proj.text_lm_head``)
+     - No embedding target: text prefill embeds before the step.
+   * - Qwen3-Omni (``Thinker``), *not validated*
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
+     - Attention only on MoE layers: an adapter on the routed experts or the router is
+       refused. Talker, code predictor and encoders take none. Not validated: on GPU the
+       checks cannot yet separate an adapter's error from the base rows' own difference
+       to the reference on this MoE model.
+   * - Qwen3-TTS (``Talker``), *not validated*
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
+     - Not the text projection (runs before the step) or the CodePredictor. Not
+       validated: transformers has no reference for the talker, and the check against
+       merged weights fails on some adapter rows.
+   * - Chatterbox (``T3``), *not validated*
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``speech_head``
+     - English and multilingual; a request's guidance (uncond) rows run its adapter too.
+       Not Turbo (GPT-2's fused ``c_attn``), nor the conditioning encoder. Not
+       validated: one adapter row disagrees with transformers + PEFT (cosine 0.65,
+       reproducibly) while agreeing with merged weights; which side is wrong is open.
+
+Not yet: Whisper (its encoder node plans no step rows, and the decoder's cross-attention
+K/V run over encoder rows, so the usual ``q_proj`` / ``v_proj`` adapters cannot be served
+whole), BAGEL and Cosmos3 (mixture-of-transformers weights chosen per row inside one
+forward, and guidance branches run as separate forwards), π0.5 (openpi's adapters are
+not PEFT), Nemotron VoiceChat (not yet validated), Fish Audio S2-Pro (declares no LoRA
+specs yet), and the diffusion and flow models
+(FLUX.2 [klein] merges a LoRA into its weights at load; the rest take none), Kokoro,
+Omnilingual ASR, OmniVoice and V-JEPA 2.
+
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
@@ -271,6 +332,99 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
+
+**LoRA adapters.** A ``resources: lora:`` block in the serving config serves
+per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
+from the ``adapter_config.json`` beside it). The OpenAI ``model`` field picks one,
+as in vLLM: the base model's name (or its HF repo id, or no ``model`` at all) runs
+the base model, an adapter's name runs that adapter, and any other name is a 400.
+``GET /v1/models`` lists the adapters beside the base model. On ``POST /generate``,
+pass ``model_kwargs: {lora_adapter: <name>}``, checked the same way. Rows on different adapters, and on
+none, share a batch::
+
+    resources:
+      lora:
+        max_slots: 4        # adapters resident on the GPU at once
+        max_rank: 16        # the largest rank served; slots are sized to it
+        cpu_capacity: 16    # adapters kept in pinned host memory
+        slot_wait_steps: 256  # steps a request waits for a slot before a held slot is drained for it
+        adapters:
+          sql: /adapters/qwen3_5-4b-sql/adapter_model.safetensors
+          chat: /adapters/qwen3_5-4b-chat   # a PEFT directory names its adapter_model.safetensors
+
+Every adapter the config names is checked at startup, before any worker starts (LoRA
+layers present, rank within ``max_rank``, only the targets below, shapes that fit them),
+and one that fails stops the server with an error naming it.
+
+Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:
+
+* every linear of the text stack, as ``target_modules="all-linear"`` picks them: the
+  full-attention layers' ``q_proj`` (its output gate included), ``k_proj``, ``v_proj``
+  and ``o_proj``, the gated DeltaNet layers' ``linear_attn.in_proj_qkv`` (or
+  ``in_proj_q`` / ``_k`` / ``_v`` split, as Tinker trains them), ``in_proj_z``,
+  ``in_proj_a``, ``in_proj_b`` and ``out_proj``, and every layer's ``gate_proj``,
+  ``up_proj`` and ``down_proj``;
+* the LM head (``lm_head``, or Tinker's ``unembed_tokens``) and the token embedding
+  (PEFT's ``lora_embedding_A`` / ``_B`` on ``embed_tokens``). With tied weights (0.8B,
+  2B, 4B) each delta stays on its own side, as PEFT applies them;
+* the vision tower, as unsloth's vision fine-tunes adapt it: each block's
+  ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1`` and ``mlp.linear_fc2``, the merger's
+  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. The vision
+  encoder node has its own pool (``vision_lora``), sized by the same ``lora:`` block,
+  and runs the request's adapter too.
+
+Module names may be in any layout PEFT writes for the model: the released checkpoint's
+(``model.language_model.layers.*``, ``model.visual.*``), the text-only causal LM's
+(``model.layers.*``), the inner model's (``language_model.layers.*``) or the bare text
+model's (``layers.*``). An adapter on the MTP head is accepted and that part ignored
+(the head never runs). The DeltaNet in-projections are one fused GEMM, so their deltas
+are one shrink and one expand per layer, added before the conv reads the output.
+
+Refused with a 400 that says why, when the adapter is named: DoRA (``use_dora``),
+``modules_to_save`` (full copies of a module, e.g. a classifier ``score`` head or a
+retrained ``lm_head``), trainable tokens, bias LoRA, other PEFT methods (OFT), a module
+outside the list above, a module whose shapes do not fit (an adapter for another size),
+and a linear-shaped LoRA on ``embed_tokens`` (``lora_A.weight`` of ``[r, hidden]``, as
+some Tinker exports name a tied head's LoRA; rename its keys to ``lm_head`` to serve it
+on the head).
+
+Every target is sized into each slot and runs its kernels on every step that has an
+adapter row, whether that row's adapter uses it or not. The LM head and embedding are
+vocabulary-sized: at ``max_rank: 16`` and 4 slots, about 40 MB each per GPU (the head's
+split over TP ranks, the embedding's whole on each). So the pools keep only the targets
+the configured adapters touch, and a vision encoder whose adapters are all text-only
+builds no pool, unless the YAML lists the ones to keep::
+
+    resources:
+      lora:
+        targets: [qkv_proj, o_proj, in_proj_fused, out_proj, gate_up_proj, down_proj,
+                  attn_qkv, attn_proj, mlp_fc1, mlp_fc2, merger_fc1, merger_fc2, patch_embed]
+
+An adapter deployment captures and compiles the LLM node, and the vision encoder's
+block loop, as one without adapters does.
+
+Every size takes the same ``resources: lora:`` block; ``max_rank`` must cover the
+largest adapter served. Example blocks (Hub adapters, ranks as published; no shipped
+config has one, so add the line to that size's serving config)::
+
+    # e.g. in configs/qwen3_5_0.8b.yaml: a vision fine-tune (blocks and merger, rank 16)
+    lora: {max_slots: 4, max_rank: 16, adapters: {agnews: <hammamwahab/jev-agnews-lora>/adapter_model.safetensors}}
+    # e.g. in configs/qwen3_5_2b.yaml: vision with the conv patch embed (rank 32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {comma: <wjbmattingly/comma-qwen-3.5-2b>/adapter_model.safetensors}}
+    # e.g. in configs/qwen3_5_4b.yaml: LM head and embedding (rank 8), Tinker (rank 32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {pirate: <William-Gao1/qwen3.5-4b-pirate-lora>/...,
+                                                  oneinbox: <dKhRr/oneinbox-qwen3.5-4b-lora>/...}}
+    # e.g. in configs/qwen3_5_9b.yaml or qwen3_5_9b_tp2.yaml: released layout (16), Tinker (32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {nimble: <bespokelabs/Bespoke-Nimble-9B>/...,
+                                                  rlvr: <lucabaroni/qwen3.5-9b-rlvr-reward-hacking>/...}}
+    # e.g. in configs/qwen3_5_27b_tp4.yaml: text and vision (rank 16)
+    lora: {max_slots: 4, max_rank: 16, adapters: {tcg: <heftyTuna/qwen35-27b-tcg-lora>/...}}
+
+Under TP the LLM's targets split as its linears do (the 27B's single K/V head per rank
+at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
+on one GPU in every shipped config.
+LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
+block).
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::

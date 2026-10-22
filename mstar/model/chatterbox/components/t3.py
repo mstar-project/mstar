@@ -47,7 +47,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     RowParallelLinear,
 )
-from mstar.model.loader import LLAMA_STACKED_PARAMS
+from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
 
 # ---------------------------------------------------------------------------
 # Backbone
@@ -353,20 +353,24 @@ class T3Model(nn.Module):
 
     # -- weights ------------------------------------------------------------
 
+    def checkpoint_rules(self) -> CheckpointRules:
+        """How the reference checkpoint lands here (after GPT-2's fused projections are
+        split, ``_split_gpt2_projections``), and where LoRA adapters land."""
+        remap = _remap_gpt2_name if self.config.backbone.is_gpt2 else _remap_llama_name
+        return CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=remap)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream the reference checkpoint (``t3_cfg.safetensors`` or
         ``t3_turbo_v1.safetensors``) into this module, exactly."""
         if self.config.backbone.is_gpt2:
             weights = _split_gpt2_projections(weights)
-            remapper = _remap_gpt2_name
-        else:
-            remapper = _remap_llama_name
+        rules = self.checkpoint_rules()
         return load_component(
             self,
             weights,
             component=f"T3 ({self.config.backbone.kind})",
-            name_remapper=remapper,
-            stacked_params=LLAMA_STACKED_PARAMS,
+            name_remapper=rules.remap,
+            stacked_params=list(rules.stacked_params),
         )
 
 

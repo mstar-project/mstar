@@ -115,14 +115,19 @@ class OrpheusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, label=label)
 
+    def checkpoint_rules(self):
+        """How the HF Llama checkpoint lands here (and where LoRA adapters land):
+        separate q/k/v and gate/up into the fused projections."""
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS))
+
     def load_weights(self, weights) -> set[str]:
         """Load HF Llama-style weights into the fused parameters; tie the
         head to the embedding when the checkpoint does and stores no head
         (``save_pretrained`` drops a tied ``lm_head.weight``); raise on
         anything left unloaded."""
-        from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
-
-        loaded = load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+        loaded = self.checkpoint_rules().load(self, weights)
         if "lm_head.weight" not in loaded and "model.embed_tokens.weight" in loaded:
             if not self.config.tie_word_embeddings:
                 raise RuntimeError("Orpheus checkpoint has no lm_head.weight and does not tie embeddings")

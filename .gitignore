@@ -10,6 +10,7 @@ uv.lock
 *.prof
 *.json
 !examples/observability/grafana/dashboards/*.json
+!test/modular/fixtures/*.json
 profiler/
 traces/
 
