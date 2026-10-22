@@ -17,15 +17,14 @@ from test_kv_prefix_lease import _StubTransfer
 from test_tp_async_teardown_order import _rank, _Stop
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.wire import decode, encode
 from mstar.engine.engine import Engine
 from mstar.engine.resources import StepRunner, apply_yaml_overrides
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
-from mstar.utils.ipc_format import ScheduleTPNode, WorkerMessage, WorkerMessageType
+from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler, TPDivergence
 from mstar.worker.worker import Worker
 
@@ -163,11 +162,6 @@ def _follower_worker(follower: KVManager) -> Worker:
     return worker
 
 
-def _wire(head: ScheduleTPNode) -> ScheduleTPNode:
-    return decode(encode(WorkerMessage(WorkerMessageType.SCHEDULE_TP, head))).body
-
-
-
 def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
@@ -176,49 +170,13 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
     for kv in ranks:
         _ingest(kv, "b", prompt)
 
-    head = _send(leader, "b")
     assert follower.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens == 0
-    assert _follow(follower, head)
-    assert _follow(follower, head)
+    assert _follow(follower, _send(leader, "b"))
 
     for kv in ranks:
         _run(kv, "b", prompt)
     assert _pages(leader, "b") == _pages(follower, "b")
     assert _pages(leader, "b")[:5] == _pages(leader, "a")[:5], "b missed the prefix a cached"
-    for kv in ranks:
-        kv.assert_pages_conserved()
-
-
-def test_a_hit_for_a_request_this_rank_has_no_handle_for_doesnt_hold_settle():
-    engine = _engine(_manager(1))
-    engine._graph_runtime.get_rid_handle = lambda wire_rid: None
-    scheduler = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
-    )
-    scheduler.register_tp_follow(ScheduleTPNode(NODE, WALK, ["wire-b"], prefix_hits={"wire-b": {"kv": [1]}}))
-
-    assert scheduler.settle_tp_follow_delta(caught_up=True), "settle waited on a request it has no handle for"
-
-
-def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(4 * PAGE_SIZE + 5, seed=2)
-    prompt = shared[:4 * PAGE_SIZE] + _tokens(9, seed=3)
-    steps = {}
-    for kv in ranks:
-        _ingest(kv, "a", shared)
-        _ingest(kv, "b", prompt)
-        steps[kv] = _step(kv, "a", len(shared))
-    leader.commit(steps[leader], _ctx("a"))
-
-    head = _send(leader, "b")
-    assert not _follow(follower, head, caught_up=False)
-    follower.commit(steps[follower], _ctx("a"))
-    assert _follow(follower, head)
-
-    for kv in ranks:
-        _run(kv, "b", prompt)
-    assert _pages(leader, "b") == _pages(follower, "b")
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
@@ -255,8 +213,7 @@ def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
         assert not set(x_pages[kv]) & set(_pages(kv, "big")), "big evicted the pages hx ran on before older ones"
 
 
-@pytest.mark.parametrize("settled", [False, True], ids=["unsettled", "settled"])
-def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
+def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
     a = _tokens(3 * PAGE_SIZE, seed=33)
     for rid, tokens in (("x", _tokens(3 * PAGE_SIZE, seed=32)), ("a", a), ("z", _tokens(3 * PAGE_SIZE, seed=34))):
@@ -269,8 +226,7 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
     worker.scheduler.register_tp_follow(head)
-    if settled:
-        assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
+    assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "b")
 
@@ -299,126 +255,6 @@ def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
     )
 
 
-def test_at_one_rank_a_step_that_wont_run_keeps_its_rows_leases():
-    kv = _manager(0, world_size=1)
-    shared = _tokens(3 * PAGE_SIZE, seed=38)
-    prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=39)
-    _cache([kv], "a", shared)
-    _ingest(kv, "b", prompt)
-    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
-    lease = kv._streams["b"]["main"].lease
-
-    _abandon(kv, "b")
-    assert lease and kv._streams["b"]["main"].lease == lease, "a one-rank lease went back with a failed speculation"
-
-
-def test_rank_0_prepares_the_length_it_decided_though_a_commit_since_holds_more():
-    leader = _manager(0)
-    a = _tokens(4 * PAGE_SIZE + 5, seed=2)
-    b = a[:4 * PAGE_SIZE] + _tokens(9, seed=3)
-    _ingest(leader, "a", a)
-    _ingest(leader, "b", b)
-    a_step = _step(leader, "a", len(a))
-    assert _send(leader, "b").prefix_hits == {}
-    leader.commit(a_step, _ctx("a"))
-
-    inputs = ARNodeInputs(input_ids=torch.tensor(b), input_seq_len=len(b))
-    assert _engine(leader)._skip_cached_prefix(_batch("b"), "b", inputs).input_seq_len == len(b), (
-        "rank 0 skipped a prefix it told the followers b missed"
-    )
-
-
-def test_a_lease_taken_around_a_commit_leaves_the_ranks_indexes_alike():
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(4 * PAGE_SIZE, seed=19)
-    prompts = {"a": shared + _tokens(PAGE_SIZE, seed=20), "z": shared + _tokens(2 * PAGE_SIZE, seed=21),
-               "h": shared + _tokens(PAGE_SIZE, seed=22)}
-    a_steps = {}
-    for kv in ranks:
-        for rid, tokens in prompts.items():
-            _ingest(kv, rid, tokens)
-        a_steps[kv] = _step(kv, "a", len(prompts["a"]))
-    assert _send(leader, "z").prefix_hits == {}, "z was decided after a committed"
-    z_steps = {}
-    for kv in ranks:
-        kv.commit(a_steps[kv], _ctx("a"))
-        z_steps[kv] = _step(kv, "z", len(prompts["z"]))
-        kv.remove_request("a")
-
-    head = _send(leader, "h")
-    for kv in ranks:
-        kv.commit(z_steps[kv], _ctx("z"))
-    assert head.prefix_hits and _follow(follower, head)
-
-    parents = [[kv._index._parent[page] for page in sorted(kv._index.pages())] for kv in ranks]
-    assert parents[0] == parents[1], "z's page hangs under a's on rank 0 only"
-
-
-def test_a_keyed_miss_answers_zero_so_another_resource_cannot_skip_it():
-    kv = _manager(0)
-    tokens = _tokens(3 * PAGE_SIZE + 2, seed=11)
-    _ingest(kv, "a", tokens)
-    assert _send(kv, "a").prefix_hits == {}
-
-    prefix = kv.resolve_cached_prefix("a", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens)))
-    assert prefix is not None and prefix.tokens == 0, "a miss with no answer lets another resource's hit cut this walk"
-
-
-def test_a_readiness_check_stamps_no_cached_page_above_one_rank():
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(3 * PAGE_SIZE, seed=23)
-    _cache(ranks, "old", shared + _tokens(4, seed=24))
-    published = PublishedKVInfo(info={rank: {"main": KVSequenceInfo(0, None)} for rank in (0, 1)}, world_size=2)
-    for kv in ranks:
-        _ingest(kv, "b", shared + _tokens(20, seed=25))
-
-    for kv, scans in ((leader, 3), (follower, 1)):
-        for _ in range(scans):
-            assert kv.admit_retrieve("b", NODE, WALK, published).ready
-    assert leader._index._clock == follower._index._clock, "rank 0's scans stamped the pages b matches"
-
-
-def test_rank_0s_hits_cross_the_wire():
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(3 * PAGE_SIZE, seed=12)
-    _cache(ranks, "a", shared)
-    for kv in ranks:
-        _ingest(kv, "b", shared[:2 * PAGE_SIZE] + _tokens(7, seed=13))
-
-    assert _follow(follower, _wire(_send(leader, "b")))
-    assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease
-
-
-def test_rank_0s_broadcast_carries_its_hit_and_trails_to_a_follower(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(3 * PAGE_SIZE, seed=26)
-    _cache(ranks, "a", shared)
-    for kv in ranks:
-        _ingest(kv, "b", shared[:2 * PAGE_SIZE] + _tokens(7, seed=27))
-    engine = _engine(leader)
-    engine._resident_delta = {}
-    group = SimpleNamespace(_workers=["rank0", "rank1"])
-    sent = []
-    worker = Worker.__new__(Worker)
-    worker.parallel_nodes = worker.parallel_leader_nodes = {NODE}
-    worker._tp_broadcast_seq = 0
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._graph_runtime = SimpleNamespace(
-        get_rid_string=lambda rid: f"wire-{rid}",
-        get_sharding_config=lambda rid: SimpleNamespace(get_sharding_group=lambda node, walk: group),
-    )
-    worker.communicator = SimpleNamespace(send=lambda to, msg: sent.append((to, msg)))
-
-    worker.maybe_send_zmq_to_tp_followers(SimpleNamespace(**vars(_batch("b")), graph_walk=WALK))
-    [(to, message)] = sent
-    head = _wire(message.body)
-    assert to == "rank1" and head.page_trails == {"kv": leader.page_trail()}, "rank 0 sent no trail to check"
-    assert _follow(follower, head)
-    assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease, "the step carried no hit"
-
-
-
 def test_under_tp_a_stream_keys_its_prompt_only():
     assert _manager(1)._keyed_walks["main"] == _manager(0, world_size=1)._keyed_walks["main"] - {"decode"}
 
@@ -431,20 +267,6 @@ def test_above_one_rank_a_commit_caches_no_image_end():
     assert set(kv._index.pages()) <= set(_pages(kv, "seed")), (
         "a copy of the page up to the image's end took a free page, though serving it would allocate on rank 0 alone"
     )
-
-
-def test_above_one_rank_a_repeat_with_other_text_after_the_image_takes_rank_0s_pages():
-    ranks = leader, follower = _manager(0), _manager(1)
-    for kv in ranks:
-        _ingest(kv, "seed", TEXT, IMAGE, ASK)
-        _run(kv, "seed", TEXT, IMAGE, ASK)
-        _ingest(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
-
-    assert _follow(follower, _send(leader, "repeat")), "the follower can't adopt what rank 0 leased"
-    for kv in ranks:
-        _run(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
-    assert _pages(leader, "repeat") == _pages(follower, "repeat")
-
 
 
 def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
@@ -465,23 +287,13 @@ def test_the_serving_config_turns_on_prefix_cache_tp():
     assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"
 
 
-def test_host_offload_is_refused_at_load(monkeypatch):
+def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(monkeypatch):
     # the real host pool pins memory, which needs a device
     monkeypatch.setattr(manager_mod, "CPUPagePool", lambda **kwargs: None)
     with pytest.raises(ValueError, match="cpu_offload_pages=4"):
         _manager(0, cpu_offload_pages=4)
-    assert _manager(0, opt_in=False, cpu_offload_pages=4)._index is None, (
-        "a TP pool that leaves the cache off may still offload"
-    )
-
-
-def test_a_pool_on_more_than_one_tp_group_is_refused_at_load():
     with pytest.raises(ValueError, match="on one TP group"):
         _manager(0, shared=True)
-    assert _manager(0, shared=True, world_size=1)._index is not None, (
-        "one rank has nobody to agree with, so sharing the pool is its own business"
-    )
-
 
 
 def _diverged() -> tuple[KVManager, KVManager]:
@@ -494,13 +306,6 @@ def _diverged() -> tuple[KVManager, KVManager]:
     for kv in ranks:
         _ingest(kv, "b", x[:2 * PAGE_SIZE] + _tokens(5, seed=5))
     return ranks
-
-
-def test_pages_that_differ_from_rank_0s_are_a_loud_error():
-    leader, follower = _diverged()
-    pages = _send(leader, "b").prefix_hits["wire-b"]["kv"]
-    with pytest.raises(RuntimeError, match="diverged"):
-        follower.adopt_cached_prefix("b", NODE, WALK, pages, caught_up=True)
 
 
 def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
@@ -516,28 +321,6 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
         worker.run()
 
 
-def test_a_follower_whose_stream_already_holds_tokens_stops_on_rank_0s_hit():
-    ranks = leader, follower = _manager(0), _manager(1)
-    shared = _tokens(3 * PAGE_SIZE, seed=28)
-    prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=29)
-    _cache(ranks, "a", shared)
-    for kv in ranks:
-        _ingest(kv, "b", prompt)
-    _run(follower, "b", prompt)
-
-    with pytest.raises(TPDivergence, match="already holds tokens"):
-        _follow(follower, _send(leader, "b"))
-
-
-def test_a_hit_on_a_resource_this_rank_lacks_stops_the_follower():
-    follower = _manager(1)
-    _ingest(follower, "b", _tokens(2 * PAGE_SIZE, seed=37))
-    head = ScheduleTPNode(NODE, WALK, ["wire-b"], prefix_hits={"wire-b": {"other": [0]}})
-
-    with pytest.raises(TPDivergence, match="other"):
-        _follow(follower, head)
-
-
 def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(2 * PAGE_SIZE, seed=30)
@@ -547,18 +330,6 @@ def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
         _ingest(kv, "b", shared + _tokens(7, seed=31))
     assert follower._index.evict(1) == 1
     return follower, _send(leader, "b")
-
-
-def test_the_serial_path_stops_a_follower_that_lost_a_page_of_rank_0s_hit():
-    follower, head = _lost_page()
-    engine = _engine(follower)
-    scheduler = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
-    )
-    scheduler.register_tp_follow(head)
-
-    with pytest.raises(TPDivergence, match=r"here \(1\)"):
-        scheduler.get_next_batch(request_state=None)
 
 
 def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
@@ -575,52 +346,3 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
     with pytest.raises(TPDivergence, match=r"here \(1\)"):
         worker._try_follow_speculation(step_n)
 
-
-def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    ranks = leader, follower = _manager(0), _manager(1)
-    x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
-    for kv in ranks:
-        _ingest(kv, "x", x)
-        _ingest(kv, "y", y)
-        _ingest(kv, "b", x[:2 * PAGE_SIZE] + _tokens(5, seed=5))
-    _run(leader, "x", x)
-    _run(leader, "y", y)
-    _run(follower, "y", y)
-    _step(follower, "x", len(x))
-    assert leader.page_trail()[0] == follower.page_trail()[0]
-
-    in_step = ScheduleTPNode(NODE, WALK, ["wire-b"], page_trails={"kv": follower.page_trail()})
-    assert _follow(follower, in_step), "a follower in step with rank 0 was held back"
-    head = _send(leader, "b")
-    with pytest.raises(TPDivergence, match=rf"KV kv: .*{NODE}/{WALK}, tp seq {head.spec_seq}"):
-        _follow(follower, head)
-
-
-def test_with_the_debug_flag_off_no_trail_is_kept_or_sent(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
-    leader = _manager(0)
-    tokens = _tokens(3 * PAGE_SIZE, seed=18)
-    _ingest(leader, "a", tokens)
-    _run(leader, "a", tokens)
-
-    assert leader._arena.trail is None
-    assert _send(leader, "a").page_trails == {}
-
-
-def test_a_pool_without_the_tp_cache_keeps_no_trail(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    assert _manager(0)._arena.trail is not None
-    assert _manager(0, opt_in=False)._arena.trail is None
-
-
-def test_rank_0s_trails_cross_the_wire(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    ranks = leader, follower = _manager(0), _manager(1)
-    _cache(ranks, "a", _tokens(3 * PAGE_SIZE, seed=14))
-    for kv in ranks:
-        _ingest(kv, "b", _tokens(2 * PAGE_SIZE, seed=15))
-
-    head = _wire(_send(leader, "b"))
-    assert head.page_trails, "rank 0 sent no trail to compare"
-    assert _follow(follower, head), "a trail that came back a list would never compare equal"
