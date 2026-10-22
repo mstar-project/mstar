@@ -54,10 +54,10 @@ def test_config_default_buckets_unchanged():
 
 
 def _gate(hidden=256, experts=32, device="cpu"):
-    from mstar.model.glm52.components.moe import Glm52MoEGate
+    from mstar.model.components.moe import NoAuxTcRouter
 
     torch.manual_seed(3)
-    gate = Glm52MoEGate(hidden, experts, 8, routed_scaling_factor=2.5).to(device)
+    gate = NoAuxTcRouter(hidden, experts, 8, routed_scaling_factor=2.5).to(device)
     with torch.no_grad():
         gate.weight.normal_(0.0, 0.05)
         gate.e_score_correction_bias.normal_(0.0, 0.5)
@@ -80,7 +80,7 @@ def _fp32_reference(gate, x):
 
 def _check(gate, x, device):
     with torch.autocast(device, dtype=torch.bfloat16):
-        w, ids = gate(x)
+        w, ids, _ = gate(x)
     w_ref, ids_ref, gap = _fp32_reference(gate, x)
     clear = gap > 1e-5
     assert clear.float().mean() > 0.99
