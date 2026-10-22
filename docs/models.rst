@@ -322,16 +322,39 @@ plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
 top-p 0.95 and repetition penalty 1.04. The model reasons before answering
 (``<|START_THINKING|>...<|END_THINKING|><|START_TEXT|>...<|END_TEXT|>``), so
 give it a generous ``max_output_tokens``. A prompt plus ``max_output_tokens``
-longer than ``max_seq_len`` is rejected.
+(2048 when unset) longer than ``max_seq_len`` is rejected.
 
 Decode runs in CUDA graphs over a fused path that concatenates each layer's
 projections into two GEMMs, all-reduces once per layer, and uses Triton
 kernels for the norms, routing, SwiGLU and output projection. The all-reduce
-is FlashInfer's one-shot kernel up to 2048 tokens when every GPU has peer
-access, and NCCL otherwise. On 4x GB200 at TP4 with ``MSTAR_TP_ASYNC_SCHED=1``
-it decodes 277 tok/s for one request and 1650 tok/s across eight, with a
-37 ms time to first token. Above ~32 concurrent requests the TP leader's CPU,
-not the GPUs, is the limit.
+is FlashInfer's fused kernel (``CommGroup.init_allreduce_fusion``) up to 2048
+tokens, and NCCL when that workspace can't be set up. On 4x GB200 at TP4 with
+``MSTAR_TP_ASYNC_SCHED=1`` and the Rust graph runtime, ``bench_http.py`` with
+256-token replies measures:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Concurrent requests
+     - Total tok/s
+     - Time to first token
+     - Time per output token
+   * - 1
+     - 287
+     - 40 ms
+     - 3.3 ms
+   * - 8
+     - 1557
+     - 115 ms
+     - 4.7 ms
+   * - 32
+     - 3173
+     - 169 ms
+     - 9.4 ms
+   * - 64
+     - 3647
+     - 262 ms
+     - 16.4 ms
 
 Against the Hugging Face reference (``benchmark/command_a_plus/validate_checkpoint.py``,
 three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output
