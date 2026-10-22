@@ -342,11 +342,11 @@ def test_full_to_shared_threading_order(monkeypatch):
 
     trace = []
 
-    def spy(self, dsa_ctx, selection, q_nope, q_pe, kv_c, k_pe):
+    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_ctx=None, dsa_selection=None):
         trace.append((self.layer_idx, selection))
         return torch.zeros_like(q_nope)
 
-    monkeypatch.setattr(Glm52MLAAttention, "_run_sparse_absorbed", spy)
+    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", spy)
 
     compute_calls = []
     layer0_indexer = model.model.layers[0].self_attn.indexer
@@ -410,7 +410,7 @@ def _independent_masked_reference(latent_cache, pages, page_size, positions,
                                   selection_row, q_all, scale, latent_dim):
     """Dense MQA over ALL cached positions with an additive mask keeping only
     the selected ones — written from scratch, sharing no code with
-    ``_run_sparse_absorbed``."""
+    ``_attend_selected``."""
     pos = torch.arange(positions)
     flat = latent_cache[pages[pos // page_size], pos % page_size].float()
     scores = q_all.float() @ flat.T * scale  # (H, positions)
@@ -468,7 +468,7 @@ def test_sparse_gather_matches_masked_reference(selection_row, autocast):
     selection = torch.tensor([selection_row], dtype=torch.int32)
 
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        out = attn._run_sparse_absorbed(ctx, selection, q_nope, q_pe, kv_c, k_pe)
+        out = attn._attend_selected(selection, q_nope, q_pe, kv_c, k_pe, dsa_ctx=ctx)
 
     # The scatter half: position 9's slot now holds this step's latent.
     written = cache[pages[current // page_size], current % page_size]
@@ -500,12 +500,12 @@ def test_sparse_path_refuses_prefill_shape():
     )
     h = attn.num_heads
     with pytest.raises(RuntimeError, match="decode-only"):
-        attn._run_sparse_absorbed(
-            ctx, torch.zeros(2, 4, dtype=torch.int32),
+        attn._attend_selected(
+            torch.zeros(2, 4, dtype=torch.int32),
             torch.randn(2, h, cfg.kv_lora_rank),
             torch.randn(2, h, cfg.qk_rope_head_dim),
             torch.randn(2, 1, cfg.kv_lora_rank),
-            torch.randn(2, 1, cfg.qk_rope_head_dim))
+            torch.randn(2, 1, cfg.qk_rope_head_dim), dsa_ctx=ctx)
 
 
 # ---------------------------------------------------------------------------

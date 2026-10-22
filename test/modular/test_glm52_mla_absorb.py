@@ -284,6 +284,23 @@ def _build_pair(seed):
     return (naive, naive_cfg), (absorbed, absorbed_cfg)
 
 
+@pytest.mark.parametrize("absorb", [False, True])
+def test_the_shared_mla_is_glm52s_dense_path(absorb):
+    """GLM-5.2's layer is the shared MLAAttention plus DSA: with DSA off, the base class on the
+    same weights and resources gives the same output, bitwise."""
+    from mstar.model.components.mla import MLAAttention
+
+    (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=11)
+    glm, cfg = (absorbed, absorbed_cfg) if absorb else (naive, naive_cfg)
+    base = MLAAttention(cfg, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE)
+    base.load_state_dict(naive.state_dict())
+    base.process_weights_after_loading()
+    torch.manual_seed(12)
+    h = torch.randn(6, cfg.hidden_size) * 0.1
+    a, b = _Path(glm, cfg, 8).step(h, 0), _Path(base, cfg, 8).step(h, 0)
+    assert torch.equal(a, b)
+
+
 def test_absorbed_resource_path_matches_naive_and_dense_reference():
     """Prefill 7 tokens, then decode at positions 7, 8, 9 (page size 8: the last two land
     on a second page).
