@@ -833,8 +833,7 @@ def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
     """When every call is one frame on and the whole-step region is captured
     for the batch, the region's own step owns the resources: the node declares
     nothing, so no second plan is built and thrown away. Otherwise it declares
-    every call in each, and in the KV its new frames at its position, save a
-    call the region serves, which writes its frame there and here only reads."""
+    every call in each, and in the KV its new frames at its position."""
     enc = _Encoder()
     wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
     for at in (0, 1280):
@@ -854,14 +853,14 @@ def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
     mixed = [enc.prepare(1, torch.randn(640) * 0.1), enc.prepare(2, torch.randn(1280) * 0.1)]
     step = enc.declare([1, 2], mixed)
     assert set(step.keys()) == {ENCODER_FRONT, ENCODER_STATE, ENCODER_KV}
-    assert _kv_spans(step) == [mixed[0].kwargs["n"], 0]
+    assert _kv_spans(step) == [mixed[0].kwargs["n"], 1]
 
 
-def test_encoder_a_step_mixes_the_steady_region_with_eager_chunks_past_the_window():
-    """One step holds a call one frame on (the whole-step region), a call whose
-    chunk adds more frames than the attention window (the eager layers, a step
-    of T > 1 where each frame sees only the window before it) and a call under
-    a frame a step: each gets its offline frames."""
+def test_encoder_a_step_mixes_a_steady_call_with_eager_chunks_past_the_window():
+    """One step holds a call one frame on, a call whose chunk adds more frames
+    than the attention window (the eager layers, a step of T > 1 where each
+    frame sees only the window before it, which the call one frame on then
+    joins) and a call under a frame a step: each gets its offline frames."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
     window = enc.node.perception.config.att_context_size[0]
@@ -880,6 +879,54 @@ def test_encoder_a_step_mixes_the_steady_region_with_eager_chunks_past_the_windo
     assert enc.regions[ConformerEncoderSubmodule.STEP_REGION].calls > 0 and max(widths) > window
     for h, wav in wavs.items():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
+    """A call one frame on whose window has wrapped, in a step where another
+    call's chunk makes several frames: this step's KV plan, which the eager
+    layers run on, writes both calls' frames, so the steady call can't also
+    take the whole-step region (whose write of its frame would follow one from
+    padding into the ring entry the region reads)."""
+    enc = _Encoder()
+    sub = ConformerEncoderSubmodule
+    enc.regions = _encoder_regions(enc, sub.STEP_REGION, sub.LAYERS_REGION)
+    window = enc.node.perception.config.att_context_size[0]
+    at = 1280 * (window + 4)
+    wavs = {1: torch.randn(at + 1280 * 3) * 0.1, 2: torch.randn(9000) * 0.1}
+    got = {1: [], 2: []}
+    for pos in range(0, at, 1280):
+        got[1] += enc.encode(1, wavs[1][pos:pos + 1280])
+    out = _encode_batch(enc, [(1, wavs[1][at:at + 1280], False), (2, wavs[2], False)])
+    assert len(out[2]) > 1
+    for h in (1, 2):
+        got[h] += out[h]
+    got[1] += enc.encode(1, wavs[1][at + 1280:], final=True)
+    got[2] += enc.encode(2, None, final=True)
+    for h in (1, 2):
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
+
+
+def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
+    """The whole-step region leases the batch's bucket, but replays only the
+    steady calls: when the runner dropped the capture for that sub-batch (here
+    one call's), they take the eager path, which this step's plans cover."""
+    enc = _Encoder()
+    sub = ConformerEncoderSubmodule
+    enc.regions = _encoder_regions(enc, sub.STEP_REGION, sub.LAYERS_REGION)
+    step_region = enc.regions[sub.STEP_REGION]
+    step_region._graphs = {k: v for k, v in step_region._graphs.items() if k.bs != 1}
+    wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
+    got = {1: [], 2: []}
+    for at in (0, 1280, 2560):
+        for h, frames in _encode_batch(enc, [(h, wavs[h][at:at + 1280], False) for h in (1, 2)]).items():
+            got[h] += frames
+    # call 1 is one frame on (steady), call 2 appends half a frame
+    out = _encode_batch(enc, [(1, wavs[1][3840:5120], False), (2, wavs[2][3840:4480], False)])
+    for h in (1, 2):
+        got[h] += out[h]
+    for h, end in ((1, 5120), (2, 4480)):
+        got[h] += enc.encode(h, wavs[h][end:], final=True)
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
 
 
 @pytest.mark.parametrize("b_end_rides", [False, True])

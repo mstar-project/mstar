@@ -450,7 +450,9 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
     other calls take the front end eagerly, then the layer stack as a graph
     (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    call's end), else eagerly (a one-shot upload, a large append).
+    call's end), else eagerly (a one-shot upload, a large append). In a step
+    whose other calls take the eager layers, or when the whole-step region has
+    no graph for its calls, those calls run eagerly too.
 
     Holds the perception stack plus the RNN-T decoder/joint (loaded; the
     user-transcript channel is not emitted yet).
@@ -519,6 +521,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             "chunk": [inp.tensor_inputs.get("chunk") for inp in inputs],
             "final": [inp.kwargs.get("final", False) for inp in inputs],
             "steady": [inp.kwargs.get("steady", False) for inp in inputs],
+            "n": [inp.kwargs.get("n", 0) for inp in inputs],
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
@@ -569,18 +572,15 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # over the whole batch, at the bucket its lease names, and the region's
         # own step owns every resource. Each such call already holds its slots,
         # from a first step declared below, so that step's admit reserves nothing.
-        to_region = self.STEP_REGION in (piecewise_leases or {})
-        if to_region and all(inp.kwargs["steady"] for inp in inputs):
+        if self.STEP_REGION in (piecewise_leases or {}) and all(inp.kwargs["steady"] for inp in inputs):
             return None
-        # Otherwise this step reserves and plans every call's slots, and the
-        # eager path reads that plan. A region the forward still replays for
-        # some calls re-plans their rows into its own buffers, after the eager
-        # path has read this plan. It can't own those rows instead: its lease
-        # names the whole batch's bucket, not the sub-batch's, and its admit
-        # can't refuse a call that has no slot yet. A steady call STEP_REGION
-        # serves writes its frame there, so here it only reads (span 0); the
-        # forward sends exactly those calls to the region.
-        spans = [0 if to_region and inp.kwargs["steady"] else inp.kwargs["n"] for inp in inputs]
+        # Otherwise this step reserves and plans every call's slots and new
+        # frames, and the eager path reads that plan. A region the forward still
+        # replays for some calls re-plans their rows into its own buffers, after
+        # the eager path has read this plan. It can't own those rows instead: its
+        # lease names the whole batch's bucket, not the sub-batch's, which may
+        # have no graph, and its admit can't refuse a call that has no slot yet.
+        spans = [inp.kwargs["n"] for inp in inputs]
         positions = {rid: StreamPosition(source_len=0, written=inp.kwargs["frames"])
                      for rid, inp in zip(request_ids, inputs, strict=True)}
         return self._declare(request_ids, (ENCODER_FRONT, ENCODER_STATE),
@@ -667,7 +667,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 moved[i] = part
         return moved
 
-    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, **kwargs):
+    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, n=None, **kwargs):
         rids = list(engine_inputs.request_ids)
         device = self.perception.proj.weight.device
         streamer = self.streamer
@@ -676,21 +676,29 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         runners = engine_inputs.piecewise_runners or {}
         frames: list[torch.Tensor | None] = [None] * len(rids)
 
-        # calls one frame of audio further on the frame grid: the whole step as one graph, run last.
-        # Which those are, the declaration settled: it gave them no write here (span 0).
-        step_runner = runners.get(self.STEP_REGION)
-        kv_step = None if engine_inputs.step is None else engine_inputs.step.get(ENCODER_KV)
-        if kv_step is None:
-            # declare_step left every resource to the region (see there)
+        # calls one frame of audio further on the frame grid: the whole step as one graph, run last
+        step_runner, layers_runner = runners.get(self.STEP_REGION), runners.get(self.LAYERS_REGION)
+
+        def layers_graph(rows) -> bool:
+            """Whether the layer region takes these calls' new frames: at most one each."""
+            new = [i for i in rows if n[i]]
+            return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
+                    and layers_runner.can_run(len(new)))
+
+        if engine_inputs.step is None:
+            # declare_step left every resource to the region, which its lease says can replay the batch
             assert all(steady), "an encoder step declared nothing but is not all steady"
             steady = list(range(len(rids)))
         else:
-            steady = [i for i, (s, seg) in enumerate(zip(steady, kv_step.segments, strict=True))
-                      if s and seg.span == 0]
-        if steady and (step_runner is None or not step_runner.can_run(len(steady))):
-            # their frames can't go through the eager path: its plan writes none for them
-            raise RuntimeError(f"no {self.STEP_REGION} graph for {len(steady)} calls, though the step "
-                               f"leased one for its {len(rids)}")
+            # This step's KV plan writes every call's new frames, so the region (which
+            # writes its calls' under its own plan) may serve the steady calls only when
+            # that plan goes unused: the other calls' frames, if any, all go through the
+            # layer region. Otherwise, or with no graph for them, they run eagerly too.
+            rest = [i for i, s in enumerate(steady) if not s]
+            steady = [i for i, s in enumerate(steady) if s]
+            if steady and not (step_runner is not None and step_runner.can_run(len(steady))
+                               and (not any(n[i] for i in rest) or layers_graph(rest))):
+                steady = []
         steady_chunks = [chunks[i] for i in steady]
         for i in steady:
             chunks[i] = None            # the eager pass leaves these calls as they are
@@ -702,18 +710,16 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         enc = None
         if len(steady) < len(rids):
             enc = streamer.front(states, chunks, final, *self._pool(engine_inputs, ENCODER_FRONT))
-        if kv_step is not None:
-            # prepare_inputs counted each call's new frames on the host for the declaration
-            assert (enc.n if enc is not None else [0] * len(rids)) == [seg.span for seg in kv_step.segments], (
-                "the encoder's front end made other frame counts than its step declared")
+        # prepare_inputs counted each call's new frames on the host for the declaration
+        assert (enc.n if enc is not None else [0] * len(rids)) == [0 if i in steady else k for i, k in enumerate(n)], (
+            "the encoder's front end made other frame counts than its step declared")
         if enc is not None:
-            runner = runners.get(self.LAYERS_REGION)
-            new = [i for i, n in enumerate(enc.n) if n]
-            if runner is not None and enc.x.shape[1] == 1 and runner.can_run(len(new)):
+            new = [i for i, k in enumerate(enc.n) if k]
+            if layers_graph(new):
                 # only the calls with a frame: the region plans its own rows
-                y = runner.run(static_inputs={"x": torch.stack([enc.x[i] for i in new]),
-                                              "n": torch.ones(len(new), dtype=torch.long, device=device)},
-                               request_ids=[rids[i] for i in new])["y"]
+                y = layers_runner.run(static_inputs={"x": torch.stack([enc.x[i] for i in new]),
+                                                     "n": torch.ones(len(new), dtype=torch.long, device=device)},
+                                      request_ids=[rids[i] for i in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
                 y = self._eager_layers(enc, engine_inputs.resources[ENCODER_KV],
