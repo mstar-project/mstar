@@ -330,7 +330,10 @@ A layout has five fields:
 The footprint adds the spans, the growth at each loop's iterations and the scratch, and
 rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
+is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
+length of a request that asks for none until it fits. With every loop at 0 iterations, the
+same sum is the prompt a request reserves when its pool admits it.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
