@@ -19,6 +19,7 @@ stops the worker.
 from __future__ import annotations
 
 import sys
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -41,6 +42,7 @@ from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
 from mstar.utils.ipc_format import ScheduleTPNode, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, TPDivergence
+from mstar.worker.worker import Worker
 
 WALKS = {"main": (WALK, "decode", IMAGE_WALK)}
 
@@ -137,9 +139,9 @@ def _engine(kv: KVManager) -> Engine:
     return engine
 
 
-def _batch(rid: str) -> SimpleNamespace:
+def _batch(rid: str, walk: str = WALK) -> SimpleNamespace:
     return SimpleNamespace(
-        node_name=NODE, request_ids=(rid,), step_context=_ctx(rid),
+        node_name=NODE, request_ids=(rid,), step_context=_ctx(rid, walk),
         per_request_info_wrapped={rid: None}, cached_rids=set(),
     )
 
@@ -162,6 +164,29 @@ def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -
     )
     scheduler.register_tp_follow(head)
     return scheduler.settle_tp_follow_delta(caught_up)
+
+
+def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
+    """Settle a failed speculation of ``rid``'s step on this rank, as the worker does for a built step it drops."""
+    engine = _engine(kv)
+    worker = SimpleNamespace(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        _graph_runtime=SimpleNamespace(commit_speculation=lambda *args, **kwargs: None),
+    )
+    speculation = SimpleNamespace(
+        scheduled_batch=SimpleNamespace(node_name=NODE), node_batch=_batch(rid, walk), spec_id=0,
+        consumed_streaming_edges={},
+    )
+    Worker._settle_speculation(worker, speculation, success=False)
+
+
+def _follower_worker(follower: KVManager) -> Worker:
+    engine = _engine(follower)
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker.scheduler = MicroScheduler(engine_manager=worker.engine_manager, parallel_leader_nodes=set())
+    worker._tp_nospec = set()
+    return worker
 
 
 def _wire(head: ScheduleTPNode) -> ScheduleTPNode:
@@ -252,6 +277,72 @@ def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
     assert _pages(leader, "big") == _pages(follower, "big"), "the ranks evicted different pages, or in another order"
     for kv in ranks:
         assert not set(x_pages[kv]) & set(_pages(kv, "big")), "big evicted the pages hx ran on before older ones"
+
+
+@pytest.mark.parametrize("settled", [False, True], ids=["unsettled", "settled"])
+def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
+    """Rank 0 leased b's hit as it sent head N+1, and then N raised, so neither rank runs the head. The
+    follower took the hit only if it settled the head before N raised, and drops the head unbuilt either way.
+    Each rank gives back what it took, so a request that then needs most of the pool evicts the same
+    pages on both."""
+    ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
+    a = _tokens(3 * PAGE_SIZE, seed=33)
+    for rid, tokens in (("x", _tokens(3 * PAGE_SIZE, seed=32)), ("a", a), ("z", _tokens(3 * PAGE_SIZE, seed=34))):
+        _cache(ranks, rid, tokens)
+    for kv in ranks:
+        for rid in ("x", "a", "z"):
+            kv.remove_request(rid)
+        _ingest(kv, "b", a[:2 * PAGE_SIZE] + _tokens(7, seed=35))
+    head = _send(leader, "b")
+    head.speculative, head.spec_from_seq = True, 4
+    worker = _follower_worker(follower)
+    worker.scheduler.register_tp_follow(head)
+    if settled:
+        assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
+    worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
+    _abandon(leader, "b")
+
+    # x is oldest, then a. Six evictions take x's pages and then a's, including both pages of b's hit.
+    big = _tokens(8 * PAGE_SIZE, seed=36)
+    for kv in ranks:
+        _ingest(kv, "big", big)
+        _run(kv, "big", big)
+    assert _pages(leader, "big") == _pages(follower, "big"), "one rank kept pages the other evicted"
+
+
+def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
+    """The cache served the repeat's text walk whole, so that walk's KV lives only in the lease,
+    which the follower took with that walk's step. The image walk's head then won't run."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    for kv in ranks:
+        _ingest(kv, "seed", TEXT, IMAGE, ASK)
+        _run(kv, "seed", TEXT, IMAGE, ASK)
+        _ingest(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
+    assert _follow(follower, _send(leader, "repeat"))
+    for kv in ranks:
+        assert _step(kv, "repeat", len(TEXT)) is None, "the cache didn't serve the text walk whole"
+    leases = [kv._streams["repeat"]["main"].lease for kv in ranks]
+
+    for kv in ranks:
+        _abandon(kv, "repeat", IMAGE_WALK)
+    assert leases[0] and [kv._streams["repeat"]["main"].lease for kv in ranks] == leases, (
+        "giving back the lease would lose the text walk's KV"
+    )
+
+
+def test_at_one_rank_a_step_that_wont_run_keeps_its_rows_leases():
+    """At one rank only `resolve_cached_prefix` takes a lease, and preparing the step again reuses it,
+    so a step that won't run leaves it alone."""
+    kv = _manager(0, world_size=1)
+    shared = _tokens(3 * PAGE_SIZE, seed=38)
+    prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=39)
+    _cache([kv], "a", shared)
+    _ingest(kv, "b", prompt)
+    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
+    lease = kv._streams["b"]["main"].lease
+
+    _abandon(kv, "b")
+    assert lease and kv._streams["b"]["main"].lease == lease, "a one-rank lease went back with a failed speculation"
 
 
 def test_rank_0_prepares_the_length_it_decided_though_a_commit_since_holds_more():
@@ -434,6 +525,60 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
     worker._handle_main_loop_error = _caught
     with pytest.raises(TPDivergence, match="diverged"):
         worker.run()
+
+
+def test_a_hit_on_a_resource_this_rank_lacks_stops_the_follower():
+    """A missing resource raises a KeyError, not a RuntimeError, but the error repeats on every
+    pass over the head just the same."""
+    follower = _manager(1)
+    _ingest(follower, "b", _tokens(2 * PAGE_SIZE, seed=37))
+    head = ScheduleTPNode(NODE, WALK, ["wire-b"], prefix_hits={"wire-b": {"other": [0]}})
+
+    with pytest.raises(TPDivergence, match="other"):
+        _follow(follower, head)
+
+
+def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
+    """A follower whose index dropped a page, and the head carrying rank 0's hit for b, which
+    includes that page. Nothing will index the page here again."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(2 * PAGE_SIZE, seed=30)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        kv.remove_request("a")
+        _ingest(kv, "b", shared + _tokens(7, seed=31))
+    assert follower._index.evict(1) == 1
+    return follower, _send(leader, "b")
+
+
+def test_the_serial_path_stops_a_follower_that_lost_a_page_of_rank_0s_hit():
+    """Nothing is in flight on the serial path, so no commit can still index the page."""
+    follower, head = _lost_page()
+    engine = _engine(follower)
+    scheduler = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
+    )
+    scheduler.register_tp_follow(head)
+
+    with pytest.raises(TPDivergence, match=r"here \(1\)"):
+        scheduler.get_next_batch(request_state=None)
+
+
+def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
+    """Of the steps before the head, only the step in flight may still index the page, so the
+    follower waits until that step commits, and then stops."""
+    follower, head = _lost_page()
+    head.speculative, head.spec_from_seq = True, 4
+    worker = _follower_worker(follower)
+    worker.scheduler.register_tp_follow(head)
+    step_n = SimpleNamespace(
+        tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=threading.Event()),
+    )
+
+    assert worker._try_follow_speculation(step_n) is None, "a page N could still index was called lost"
+    step_n.node_batch.commit_done.set()
+    with pytest.raises(TPDivergence, match=r"here \(1\)"):
+        worker._try_follow_speculation(step_n)
 
 
 def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monkeypatch):
