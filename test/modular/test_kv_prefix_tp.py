@@ -26,7 +26,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
-from test_kv_prefix_layout_lease import IMAGE_WALK, _config, _walks
+from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
@@ -338,3 +338,37 @@ def test_rank_0s_hits_cross_the_wire():
 
     assert _follow(follower, _wire(_send(leader, "b")))
     assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease
+
+
+# ── what the cache keys above one rank ──────────────────────────────────
+
+
+def test_under_tp_a_stream_keys_its_prompt_only():
+    assert _manager(1)._keyed_walks["main"] == _manager(0, world_size=1)._keyed_walks["main"] - {"decode"}
+
+
+def test_above_one_rank_a_commit_caches_no_image_end():
+    kv = _manager(0)
+    _ingest(kv, "seed", TEXT, IMAGE, ASK)
+    _run(kv, "seed", TEXT, IMAGE, ASK)
+
+    assert set(kv._index.pages()) <= set(_pages(kv, "seed")), (
+        "a copy of the page up to the image's end took a free page, though nothing above one rank serves it"
+    )
+
+
+def test_above_one_rank_a_cached_image_end_is_never_served():
+    ranks = leader, follower = _manager(0), _manager(1)
+    for kv in ranks:
+        # seed at world size 1, since above one rank a commit caches no image end
+        kv._world_size = 1
+        _ingest(kv, "seed", TEXT, IMAGE, ASK)
+        _run(kv, "seed", TEXT, IMAGE, ASK)
+        kv._world_size = 2
+        assert set(kv._index.pages()) - set(_pages(kv, "seed")), "the seed cached no image end to serve"
+        _ingest(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
+
+    assert _follow(follower, _send(leader, "repeat")), "the follower can't adopt what rank 0 leased"
+    for kv in ranks:
+        _run(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
+    assert _pages(leader, "repeat") == _pages(follower, "repeat")
