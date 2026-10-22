@@ -98,12 +98,23 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ):
         prefill_tokens = {
             rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
             if (inp.graph_walk or graph_walk) == "prefill"
         }
+        kept_rids = None
+        if graph_walk != "decode":
+            # Decode rows and the prompt's prefill keep their token. A prefill row whose `is_prefill` is
+            # false is a rebuild row, which only recomputes KV.
+            info = per_request_info or {}
+            kept_rids = frozenset(
+                rid for rid, inp in zip(request_ids, inputs, strict=True)
+                if (inp.graph_walk or graph_walk) == "decode"
+                or (rid in info and info[rid].step_metadata.get("is_prefill", False))
+            )
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -117,7 +128,8 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 SAMPLER: SamplerStep(
                     apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens
+                    prefill_tracked_tokens=prefill_tokens,
+                    kept_rids=kept_rids,
                 ),
                 ROPE: PositionStep()
             }
