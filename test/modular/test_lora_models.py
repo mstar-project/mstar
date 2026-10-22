@@ -300,7 +300,7 @@ def _prompt(sub):
 
 
 def _engine(rid):
-    return SimpleNamespace(request_ids=[rid], piecewise_runners={})
+    return SimpleNamespace(request_ids=[rid], piecewise_runners={}, step=None)
 
 
 def _encode(sub, rid="r"):
