@@ -423,8 +423,10 @@ def test_a_padding_row_writes_its_real_rows_token():
     temperature)."""
     from mstar.model.glm5_next.submodules import _real_row_values
     from mstar.model.submodule_base import ARNodeInputs
+    from mstar.utils.h2d import PinnedStager
 
-    sub = types.SimpleNamespace(lm_head=types.SimpleNamespace(weight=torch.zeros(1)))
+    sub = types.SimpleNamespace(lm_head=types.SimpleNamespace(weight=torch.zeros(1)),
+                                _int_stager=PinnedStager(torch.int32))
     rows = [ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long), input_seq_len=n)
             for n in (5, 3, 4, 0)]
     last = Glm5NextLLMSubmodule._last_rows(sub, rows).long()
