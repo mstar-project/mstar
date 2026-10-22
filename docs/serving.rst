@@ -432,8 +432,9 @@ that the model does not declare, or sets a key that the resource does not accept
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
 
-``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype. KV caches,
-attention, ragged attention and position resources accept it. Without it, a resource takes
+``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype; fp8 and fp4
+are refused, since a quantized cache needs scales, not a cast. KV caches,
+attention and ragged attention resources accept it. Without it, a resource takes
 the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
 run without autocast, or in different dtypes, and that declares no dtype fails at load.
