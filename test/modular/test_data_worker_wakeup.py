@@ -9,12 +9,16 @@ import threading
 import time
 from concurrent.futures import Future
 
-from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread
 from mstar.communication.event import EventWakeup
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.model.base import Model
 
 
 class _Model:
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
@@ -108,7 +112,7 @@ def test_a_signalled_producer_ends_the_idle_wait_at_once():
     worker, stop, t = _thread(comm, wakeup, idle_wait_ms=2000)
     assert _wait_until(lambda: comm.waits >= 1, 1.0)  # the thread is parked
     t0 = time.monotonic()
-    worker.result_tensor_queue.put(InlineToken("req", 7, _loop(0), "text"))
+    worker.result_tensor_queue.put(InlineTokens(["req"], [7], "text"))
     wakeup.signal()
     chunk = worker.out_queue.get(timeout=1.0)
     assert time.monotonic() - t0 < 0.5  # far below the 2 s backstop
@@ -162,7 +166,7 @@ def test_a_finished_read_wakes_the_thread():
 
 def test_without_a_wakeup_the_thread_keeps_the_sleep():
     worker, stop, t = _thread(_BareComm(), None)
-    worker.result_tensor_queue.put(InlineToken("req", 3, _loop(0), "text"))
+    worker.result_tensor_queue.put(InlineTokens(["req"], [3], "text"))
     chunk = worker.out_queue.get(timeout=1.0)
     assert chunk.data == b"<3>"
     stop.set()

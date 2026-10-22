@@ -168,7 +168,15 @@ You must implement these abstract methods:
 
 ``postprocess(self, output, modality) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on.
+   images, raw PCM for audio, and so on. A text chunk may end inside a character: the
+   API server joins a request's text chunks before decoding them, so a byte-level BPE
+   model should emit each token's raw bytes (``mstar.model.utils.TokenBytes``) rather
+   than ``tokenizer.decode([id])``, which turns a split character into U+FFFD.
+
+``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]`` (optional)
+   ``postprocess`` for one decode step's inline values (one sampled token id per
+   request), called once per step. The default builds a one-element tensor per value
+   and calls ``postprocess``; a text model can map ids to bytes directly.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load

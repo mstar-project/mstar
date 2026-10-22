@@ -740,27 +740,28 @@ class APIServer:
                         continue
 
                     if message.message_type == "result_tokens":
-                        # One frame for the step: every request's value.
-                        # A request that is gone needs nothing acked back.
+                        # One frame for the step: every request's value,
+                        # handed to the data worker as one item. A request
+                        # that is gone needs nothing acked back.
                         body = message.body
-                        queued = False
                         with self.request_lock:
-                            for i, rid in enumerate(body.request_ids):
-                                if rid in self.pending_requests:
-                                    # one wake-up for the frame, after every
-                                    # request's value is queued
-                                    self.preprocess_worker.new_result_token(
-                                        rid, body.values[i],
-                                        body.loop_indices[i],
-                                        body.signal, body.modality, wake=False,
-                                    )
-                                    queued = True
-                                elif rid not in self.recently_completed:
-                                    logger.warning(
-                                        "Token for unknown request %s dropped", rid,
-                                    )
-                        if queued:
-                            self.preprocess_worker.wake()
+                            pending = self.pending_requests
+                            if all(rid in pending for rid in body.request_ids):
+                                rids, values = body.request_ids, body.values
+                            else:
+                                rids, values = [], []
+                                for rid, value in zip(body.request_ids, body.values, strict=True):
+                                    if rid in pending:
+                                        rids.append(rid)
+                                        values.append(value)
+                                    elif rid not in self.recently_completed:
+                                        logger.warning(
+                                            "Token for unknown request %s dropped", rid,
+                                        )
+                            if rids:
+                                self.preprocess_worker.new_result_tokens(
+                                    rids, values, body.signal, body.modality,
+                                )
                         continue
 
                     if message.message_type == "conductor_status":
