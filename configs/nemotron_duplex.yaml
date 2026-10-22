@@ -13,9 +13,17 @@ max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 # on admit and wedges every session. Keep the two equal; the overflow queues.
 max_concurrent_requests: 32
 
-# Sessions longer than max_session_s get a 400. The talker KV pool is sized so
-# 32 sessions that long fit at once (160 s: 1025 pages, 28 GiB); a longer cap
-# grows it in step. A full talker pool stalls every session.
+# A live call's input files over its whole life; past it the call ends with a
+# 400. 160 s of 16 kHz audio is about 10 MB as float32 WAV: 32 leaves room for
+# stereo or a 48 kHz opening clip. A file is decoded at most one frame past
+# max_session_s and refused if it gets there (a header that understates its
+# length cuts it short instead).
+max_call_input_mb: 32
+
+# An upload longer than max_session_s gets a 400, and so does a live call whose
+# appends pass it (audio_in's max_items, in samples). The talker KV pool is
+# sized so 32 sessions that long fit at once (160 s: 1025 pages, 28 GiB); a
+# longer cap grows it in step. A full talker pool stalls every session.
 model_kwargs:
   max_session_s: 160
   # Longer system prompts get a 400; the prompt prefills in one step that

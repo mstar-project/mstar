@@ -29,6 +29,13 @@ TALKER_KV = "talker_kv"             # paged KV of the talker's 28 Gemma3 layers 
 TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
 TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
 TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
+AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
+
+
+def session_too_long(max_session_s: float) -> ValueError:
+    """The one error for a call whose audio outgrows ``max_session_s``, whichever
+    stage sees it first."""
+    return ValueError(f"the call's audio passed {max_session_s:g} s, the longest session this server takes")
 
 
 @dataclass

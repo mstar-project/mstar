@@ -25,6 +25,7 @@ from mstar.model.nemotron_duplex.config import (
 from mstar.model.nemotron_duplex.submodules import (
     NO_PROMPT,
     AudioCodecDecoderSubmodule,
+    ConformerEncoderSubmodule,
     NemotronHLLMSubmodule,
 )
 from mstar.model.submodule_base import BatchedModelOutput
@@ -207,6 +208,54 @@ def test_nano_captures_the_decode_step():
     nano.embeddings = nn.Embedding(64, nano.config.nano.hidden_size)  # match the frame width
     pre = nano.preprocess("decode", _ENGINE, rows)
     assert pre["input_embeds"].shape == (3, nano.config.nano.hidden_size) and pre["seq_lens"] == [1, 1, 1]
+
+
+@pytest.mark.parametrize("done_before_last_pop", [True, False])
+def test_nano_emits_one_token_per_frame_however_the_stream_ends(done_before_last_pop):
+    """The audio stream's end can reach the LLM's buffer after its last frame was
+    taken; the buffer then releases an empty final chunk, whose step only ends
+    the loop. Either way the call gets one token per frame, as offline."""
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    nano = _make_nano()
+    buf = StreamBuffer(request_id="r", edge_name="audio_frame", from_partition="Encoder",
+                       policy=FixedChunkPolicy(chunk_size=1, continue_after_done=False))
+    for k in range(3):
+        buf.pre_read_register(f"f{k}")
+        buf.put(f"f{k}", torch.randn(H))
+    emitted, finals = [], 0
+    while True:
+        if len(emitted) == (2 if done_before_last_pop else 3):
+            buf.signal_done()
+        if not buf.has_chunk_ready():
+            break
+        chunk = buf.pop_chunk()
+        data = chunk.data["data"]
+        inputs = {"audio_frame": [] if data is None else [data], "prev_text": [torch.tensor([3])],
+                  "prev_func": [torch.tensor([4])], "text_inputs": [torch.tensor([NO_PROMPT])]}
+        ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=chunk.is_final)
+        out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])],
+               "text_inputs": [torch.tensor([NO_PROMPT])]}
+        nano.postprocess("r", None, out, inputs=ni)
+        emitted += out.get("new_token", [])
+        finals += chunk.is_final
+        if chunk.is_final:
+            break
+    assert finals == 1 and len(emitted) == 3
+
+
+@pytest.mark.parametrize("final", [True, False])
+def test_nano_drops_the_token_of_an_empty_chunk_only_when_it_is_final(final):
+    """The engine's final flag, not a missing frame, marks the step that only
+    ends the loop."""
+    nano = _make_nano()
+    inputs = {"audio_frame": [], "prev_text": [torch.tensor([3])], "prev_func": [torch.tensor([4])],
+              "text_inputs": [torch.tensor([NO_PROMPT])]}
+    ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=final)
+    out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])]}
+    nano.postprocess("r", None, out, inputs=ni)
+    assert ("new_token" in out) is not final
 
 
 def test_nano_postprocess_feeds_tokens_back():
@@ -402,3 +451,218 @@ def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():
     per_request = torch.cat([nano._fuse(inp, torch.device("cpu")) for inp in inputs])
     assert pre["seq_lens"] == [1, 1, 1, 1]
     torch.testing.assert_close(pre["input_embeds"], per_request)
+
+
+def _small_perception():
+    """A real Perception, shrunk, with random weights: the streamer runs its modules."""
+    from mstar.model.nemotron_duplex.components.conformer import Perception
+    from mstar.model.nemotron_duplex.config import ConformerSTTConfig
+
+    torch.manual_seed(0)
+    stt = ConformerSTTConfig(d_model=64, num_heads=4, num_layers=3, n_mels=32, feat_in=32,
+                             subsampling_conv_channels=8, output_dim=48, att_context_size=(6, 0))
+    p = Perception(stt)
+    with torch.no_grad():
+        for t in p.parameters():
+            t.copy_(torch.randn_like(t) * 0.2)
+        p.preprocessor.featurizer.window.copy_(torch.hann_window(stt.win_length, periodic=False))
+        p.preprocessor.featurizer.fb.copy_(torch.rand_like(p.preprocessor.featurizer.fb))
+    return p.eval()
+
+
+def _make_encoder(max_session_samples=16000 * 10) -> ConformerEncoderSubmodule:
+    return ConformerEncoderSubmodule(_small_perception(), nn.Identity(), nn.Identity(),
+                                     config=NemotronDuplexConfig(), max_session_samples=max_session_samples)
+
+
+def _prepare(enc, handle, chunk, final=False):
+    inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
+    return enc.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs, is_final_stream_chunk=final)
+
+
+def _encode(enc, handle, chunk, final=False):
+    """One encoder step for one call, as the engine runs one unbatched:
+    prepare_inputs, preprocess, forward."""
+    ni = _prepare(enc, handle, chunk, final)
+    eng = SimpleNamespace(request_ids=[handle])
+    with torch.no_grad():
+        out = enc.forward("encode", eng, **enc.preprocess("encode", eng, [ni]))
+    return out["audio_frame"]
+
+
+def _encode_batch(enc, steps):
+    """One batched encoder step, as the engine runs it: each ``(handle, chunk,
+    final)`` row through prepare_inputs, then one preprocess and forward_batched
+    over all of them. Returns each row's frames by handle."""
+    nis = [_prepare(enc, h, c, f) for h, c, f in steps]
+    eng = SimpleNamespace(request_ids=[h for h, _c, _f in steps])
+    with torch.no_grad():
+        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, nis))
+    return {h: out.per_rid_outputs[h]["audio_frame"] for h, _c, _f in steps}
+
+
+def _offline(enc, wav):
+    with torch.no_grad():
+        return enc.perception(wav.unsqueeze(0), torch.tensor([wav.numel()]))[0][0]
+
+
+@pytest.mark.parametrize("end_rides_last_chunk", [False, True])
+@pytest.mark.parametrize("n", [16000 * 2 + 777, 16000 * 2])
+def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
+    """Chunks of any size, smaller than a frame included, then the end of input,
+    on an empty final chunk or on the last chunk of audio (as an upload's usually
+    is): the frames emitted in order are the offline encoding of the call, and
+    the mel frames the offline featurizer's, the reflected right edge included
+    (a length on the hop grid is the one whose last frame reads it)."""
+    enc = _make_encoder()
+    wav = torch.randn(n) * 0.1
+    want = _offline(enc, wav)
+    with torch.no_grad():
+        mel = enc.perception.preprocessor(wav.unsqueeze(0), torch.tensor([n]))[0][0].T
+    for handle, size in enumerate((320, 1280, 2560, 9000, 64000)):
+        got = []
+        for at in range(0, wav.numel(), size):
+            last = at + size >= wav.numel()
+            got += _encode(enc, handle, wav[at:at + size], final=last and end_rides_last_chunk)
+        if not end_rides_last_chunk:
+            got += _encode(enc, handle, None, final=True)
+        assert len(got) == want.shape[0]
+        assert torch.allclose(torch.stack(got), want, atol=1e-5), size
+        st = enc.request_state(handle).get(enc.STATE_KEY)
+        assert st.mels == mel.shape[0]
+        assert torch.allclose(st.mel[:st.mels], mel, atol=1e-5), size
+
+
+def test_encoder_batches_calls_at_different_points():
+    """Two calls in one step, each with its own chunking, each get their own
+    offline frames."""
+    enc = _make_encoder()
+    a, b = torch.randn(16000 * 2) * 0.1, torch.randn(16000 * 3) * 0.1
+    got = {1: [], 2: []}
+    pos = {1: 0, 2: 0}
+    size = {1: 1280, 2: 4000}
+    wav = {1: a, 2: b}
+    while any(pos[h] < wav[h].numel() for h in (1, 2)):
+        rids, chunks, finals = [], [], []
+        for h in (1, 2):
+            if pos[h] < wav[h].numel():
+                ni = _prepare(enc, h, wav[h][pos[h]:pos[h] + size[h]])
+                pos[h] += size[h]
+                rids.append(h)
+                chunks.append(ni.tensor_inputs["chunk"])
+                finals.append(False)
+        with torch.no_grad():
+            out = enc.forward_batched("encode", SimpleNamespace(request_ids=rids), chunk=chunks, final=finals)
+        for h in rids:
+            got[h] += out.per_rid_outputs[h]["audio_frame"]
+    for h in (1, 2):
+        got[h] += _encode(enc, h, None, final=True)
+        want = _offline(enc, wav[h])
+        assert torch.allclose(torch.stack(got[h]), want, atol=1e-5)
+
+
+@pytest.mark.parametrize("b_end_rides", [False, True])
+@pytest.mark.parametrize("a_chunk", [1280, 9000])
+@pytest.mark.parametrize("b_len", [16000 * 2, 16000 * 2 + 640, 16000 * 2 + 777])
+def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, b_end_rides):
+    """Call B ends in the same step as call A's longer chunk, A still mid-call:
+    B's last frames, which read past its audio, are still its offline ones."""
+    enc = _make_encoder()
+    starts = list(range(0, b_len, 1280))
+    steps = len(starts) + (0 if b_end_rides else 1)
+    a, b = torch.randn(a_chunk * steps) * 0.1, torch.randn(b_len) * 0.1
+    enc.max_session_samples = a.numel()
+    got_b = []
+    for k, pb in enumerate(starts):
+        b_final = b_end_rides and k == len(starts) - 1
+        rows = [(1, a[k * a_chunk:(k + 1) * a_chunk], False), (2, b[pb:pb + 1280], b_final)]
+        got_b += _encode_batch(enc, rows)[2]
+    if not b_end_rides:
+        got_b += _encode_batch(enc, [(1, a[-a_chunk:], False), (2, None, True)])[2]
+    want = _offline(enc, b)
+    assert len(got_b) == want.shape[0]
+    assert torch.allclose(torch.stack(got_b), want, atol=1e-5)
+
+
+def test_encoder_runs_a_chunk_over_a_second_in_a_pass_of_its_own():
+    """A streamer pass pads every call to its longest chunk: an upload or a large
+    append runs alone, and only the calls with a second or less share a pass."""
+    enc = _make_encoder()
+    enc.forward_batched("encode", SimpleNamespace(request_ids=[]), chunk=[], final=[])   # builds the streamer
+    steps = []
+    step = enc._streamer.step
+    enc._streamer.step = lambda sts, chunks, final: steps.append(
+        sorted(0 if c is None else c.numel() for c in chunks)) or step(sts, chunks, final)
+    wav = {1: torch.randn(16000 * 5) * 0.1, 2: torch.randn(1280) * 0.1, 3: torch.randn(16001) * 0.1,
+           4: torch.randn(16000) * 0.1}
+    ni = [_prepare(enc, h, w, final=True) for h, w in wav.items()]
+    eng = SimpleNamespace(request_ids=list(wav))
+    with torch.no_grad():
+        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, ni))
+    assert sorted(steps) == [[1280, 16000], [16001], [16000 * 5]]
+    for h, w in wav.items():
+        assert torch.allclose(torch.stack(out.per_rid_outputs[h]["audio_frame"]), _offline(enc, w), atol=1e-5)
+
+
+def test_encoder_offers_nothing_to_the_stop_check():
+    """The encoder has no check_stop and its stream ends with the client's: its
+    frames are not copied to the host every step for one."""
+    enc = _make_encoder()
+    ni = _prepare(enc, 1, torch.randn(4000) * 0.1)
+    eng = SimpleNamespace(request_ids=[1])
+    with torch.no_grad():
+        out = enc.forward_batched("encode", eng, **enc.preprocess("encode", eng, [ni]))
+    assert isinstance(out, BatchedModelOutput) and out.check_stop_buffers == {}
+    assert len(out.per_rid_outputs[1]["audio_frame"]) > 0
+
+
+def test_encoder_projects_the_relative_positions_once_per_layer():
+    """The positions a query can see are fixed, so each layer's projection of
+    them is computed once, not every step."""
+    enc = _make_encoder()
+    calls = []
+    for layer in enc.perception.encoder.layers:
+        layer.self_attn.linear_pos.register_forward_hook(lambda *a: calls.append(1))
+    wav = torch.randn(16000) * 0.1
+    for at in range(0, wav.numel(), 1280):
+        _encode(enc, 1, wav[at:at + 1280])
+    assert len(calls) == len(enc.perception.encoder.layers)
+
+
+def test_encoder_waits_for_enough_audio_to_featurize():
+    enc = _make_encoder()
+    assert _encode(enc, 1, torch.zeros(10)) == []
+
+
+@pytest.mark.parametrize("n", [257, 1000, 1279, 1281])
+def test_encoder_a_short_call_gets_the_offline_frames(n):
+    """Offline encodes any call longer than n_fft/2 samples, under one frame too."""
+    enc = _make_encoder()
+    wav = torch.randn(n) * 0.1
+    want = _offline(enc, wav)
+    for handle, size in enumerate((100, n)):
+        got = []
+        for at in range(0, n, size):
+            got += _encode(enc, handle, wav[at:at + size])
+        got += _encode(enc, handle, None, final=True)
+        assert len(got) == want.shape[0]
+        assert torch.allclose(torch.stack(got), want, atol=1e-5), size
+
+
+@pytest.mark.parametrize("chunks", [[], [torch.zeros(256)], [torch.zeros(100), torch.zeros(156)]])
+def test_encoder_fails_a_call_that_ends_without_enough_audio(chunks):
+    """No audio, or no more than n_fft/2 samples (which offline can't featurize):
+    the call fails rather than reply to nothing."""
+    enc = _make_encoder()
+    for chunk in chunks:
+        _encode(enc, 1, chunk)
+    with pytest.raises(ValueError, match="ended with"):
+        _encode(enc, 1, None, final=True)
+
+
+def test_encoder_state_is_per_call_and_cleaned_up():
+    enc = _make_encoder()
+    _encode(enc, 1, torch.randn(4000) * 0.1)
+    _encode(enc, 2, torch.randn(4000) * 0.1)
+    enc.cleanup_request(1)
+    assert 1 not in enc.request_states and 2 in enc.request_states

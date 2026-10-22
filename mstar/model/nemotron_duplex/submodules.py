@@ -40,7 +40,9 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState
 from mstar.model.nemotron_duplex.config import (
+    AUDIO_IN,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -215,6 +217,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        is_final_stream_chunk: bool = False,
         **kwargs,
     ) -> ARNodeInputs:
         """Host-side bookkeeping only; the embedding lookups and AddFusion run in
@@ -225,20 +228,22 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
                 "prev_text": self._tok(inputs, "prev_text", cfg.text_bos_id),
                 "prev_func": self._tok(inputs, "prev_func", cfg.text_pad_id),
             }
-            # The terminal stream chunk (producer_done race) can arrive with the
-            # key present but no tensor: run a no-audio step, the loop stops
-            # this iteration on the final-chunk signal.
+            # The terminal stream chunk is empty when the stream's last frame
+            # was taken before its end reached this worker: run a no-audio step,
+            # which ends the loop (postprocess drops what it samples).
             frames = inputs.get("audio_frame") or []
             if frames:
                 tensors["audio_frame"] = frames[0].reshape(1, -1)
+            ends_loop = bool(is_final_stream_chunk) and not frames
             # The system prompt rides the loop as ``text_inputs``: real ids on
             # the session's first step, the NO_PROMPT sentinel afterwards.
             prompt = self._prompt_ids(inputs)
             if prompt is not None:
                 tensors["prompt_ids"] = prompt
                 return ARNodeInputs(input_seq_len=int(prompt.numel()) + 1, tensor_inputs=tensors,
-                                    kwargs={"mode": _MODE_PROMPT_FRAME})
-            return ARNodeInputs(input_seq_len=1, tensor_inputs=tensors, kwargs={"mode": _MODE_FRAME})
+                                    kwargs={"mode": _MODE_PROMPT_FRAME, "ends_loop": ends_loop})
+            return ARNodeInputs(input_seq_len=1, tensor_inputs=tensors,
+                                kwargs={"mode": _MODE_FRAME, "ends_loop": ends_loop})
         if "combined_embeds" in inputs:
             emb = inputs["combined_embeds"][0]
             return ARNodeInputs(input_embeds=emb, input_seq_len=emb.shape[0], kwargs={"mode": _MODE_EMBEDS})
@@ -393,6 +398,12 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         # frame's AddFusion (the decode loop's prev_text / prev_func edges).
         # The prompt, if any, went with this step. Later steps use the capture.
         self.request_state(request_id).add(self.PROMPT_DONE_KEY, True)
+        inputs = kwargs.get("inputs")
+        if inputs is not None and inputs.kwargs.get("ends_loop"):
+            # the empty terminal chunk's step only ends the loop: one token per
+            # frame, as offline, so nothing it sampled leaves the node
+            outputs.clear()
+            return
         if "new_token" in outputs:
             outputs["prev_text"] = outputs["new_token"]
         if "new_func" in outputs:
@@ -408,44 +419,111 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
 # ---------------------------------------------------------------------------
 
 class ConformerEncoderSubmodule(NodeSubmodule):
-    """Fast-Conformer streaming STT encoder: raw 16 kHz audio -> per-frame
-    LLM-space embeddings, emitted one frame per stream item so the LLM's
-    ``FixedChunkPolicy(1)`` paces the frame-synchronous decode loop.
+    """Fast-Conformer streaming STT encoder: the call's 16 kHz audio ->
+    per-frame LLM-space embeddings, emitted one frame per stream item so the
+    LLM's ``FixedChunkPolicy(1)`` paces the frame-synchronous decode loop.
+
+    Audio arrives as the client streams it, one chunk per step, and the live
+    calls' chunks run in one batched streamer pass (``ConformerStreamer``, which
+    describes the state a call carries across chunks and its numerics), except
+    that a chunk of more than a second (an upload, a large append) runs in a
+    pass of its own within the same engine step.
 
     Holds the perception stack plus the RNN-T decoder/joint (loaded; the
-    user-transcript channel is not emitted yet). Declares no resources.
+    user-transcript channel is not emitted yet). Declares no resources: a
+    call's state lives in its per-request state.
     """
 
-    # Variable-length per-utterance audio: torch.compile would recompile per
-    # shape (and inductor raised on some shapes). Runs once per request, so
-    # eager is fine; revisit with the batched-encoder perf pass.
+    # Variable-length chunks; eager. Revisit (compile, capture) once the
+    # one-frame step dominates.
     disable_torch_compile = True
 
+    STATE_KEY = "encoder_stream"         # a call's StreamState
+    # Longest chunk batched with other calls': a pass pads every call to its
+    # longest chunk. One second is a judgement, not a measured crossover.
+    BATCHED_CHUNK_S = 1.0
+
     def __init__(self, perception: nn.Module, rnnt_decoder: nn.Module, rnnt_joint: nn.Module,
-                 config: NemotronDuplexConfig):
+                 config: NemotronDuplexConfig, max_session_samples: int):
         super().__init__()
         self.perception = perception
         self.rnnt_decoder = rnnt_decoder
         self.rnnt_joint = rnnt_joint
         self.config = config
+        self.max_session_samples = max_session_samples
+        self._streamer = None
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
-        # ``audio_features`` is the raw 16 kHz mono waveform; the perception
-        # stack does mel + subsampling + encoder internally.
-        wav = inputs["audio_features"][0]
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)                                     # (1, N)
-        if "audio_seqlens" in inputs:
-            lens = inputs["audio_seqlens"][0].to(wav.device)
-        else:
-            lens = torch.tensor([wav.shape[-1]], device=wav.device)
-        return NodeInputs(tensor_inputs={"wav": wav, "lens": lens})
+    def prepare_inputs(
+        self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs,
+    ) -> NodeInputs:
+        # ``audio_in`` is one chunk of raw 16 kHz mono audio
+        chunk = inputs.get(AUDIO_IN)
+        wav = chunk[0].reshape(-1) if chunk else None
+        # the client stream releases one item per step; only its final flush is empty
+        assert wav is not None or is_final_stream_chunk, "an empty chunk before the end of the stream"
+        # The session cap is audio_in's max_items, which the client stream
+        # enforces before a sample reaches here. Read, not counted here: admit
+        # can refuse the step and run this again. The previous step's forward
+        # has returned, so the state is current.
+        st = self.request_state(fwd_info.rid_handle).get(self.STATE_KEY)
+        samples = (st.samples if st is not None else 0) + (wav.numel() if wav is not None else 0)
+        stt = self.perception.config
+        if is_final_stream_chunk and samples <= stt.n_fft // 2:
+            # too short to featurize (offline can't either): fail rather than reply to nothing
+            raise ValueError(
+                f"the call ended with {1000 * samples / stt.sample_rate:g} ms of audio; "
+                f"it needs more than {1000 * (stt.n_fft // 2) / stt.sample_rate:g} ms"
+            )
+        return NodeInputs(
+            tensor_inputs={} if wav is None else {"chunk": wav},
+            kwargs={"final": bool(is_final_stream_chunk)},
+        )
 
-    def forward(self, graph_walk, engine_inputs, wav=None, lens=None, **kwargs) -> NameToTensorList:
-        audio_embeds, _ = self.perception(wav, lens)                  # (1, T, H)
-        # One stream item per frame: a single (T, H) tensor would be ONE item
-        # (the whole utterance), which the chunk policy could not slice.
-        return {"audio_frame": list(audio_embeds[0])}                # T x (H,)
+    def preprocess(self, graph_walk, engine_inputs, inputs):
+        return {
+            "chunk": [inp.tensor_inputs.get("chunk") for inp in inputs],
+            "final": [inp.kwargs.get("final", False) for inp in inputs],
+        }
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        return True
+
+    def _stream_state(self, rid, device) -> StreamState:
+        state = self.request_state(rid)
+        st = state.get(self.STATE_KEY)
+        if st is None:
+            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else torch.float32
+            st = StreamState(self.perception.config, self.max_session_samples, device, dtype)
+            state.add(self.STATE_KEY, st)
+        return st
+
+    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs):
+        if self._streamer is None:
+            self._streamer = ConformerStreamer(self.perception)
+        rids = list(engine_inputs.request_ids)
+        device = self.perception.proj.weight.device
+        states = [self._stream_state(rid, device) for rid in rids]
+        chunks = [c.to(device) if c is not None else None for c in chunk]
+        longest = int(self.BATCHED_CHUNK_S * self.perception.config.sample_rate)
+        alone = [c is not None and c.numel() > longest for c in chunks]
+        shared = [i for i, a in enumerate(alone) if not a]
+        frames: list[torch.Tensor | None] = [None] * len(rids)
+        for rows in [[i] for i, a in enumerate(alone) if a] + ([shared] if shared else []):
+            step = self._streamer.step([states[i] for i in rows], [chunks[i] for i in rows], [final[i] for i in rows])
+            for i, f in zip(rows, step, strict=True):
+                frames[i] = f
+        # One stream item per frame: a single (T, H) tensor would be ONE item,
+        # which the chunk policy could not slice. No check_stop, so nothing to
+        # copy to the host for one.
+        return BatchedModelOutput(
+            per_rid_outputs={rid: {"audio_frame": list(f)} for rid, f in zip(rids, frames, strict=True)},
+            check_stop_buffers={},
+        )
+
+    def forward(self, graph_walk, engine_inputs, chunk=None, final=None, **kwargs) -> NameToTensorList:
+        # one call's step: preprocess's lists of one row
+        rid = engine_inputs.request_ids[0]
+        return self.forward_batched(graph_walk, engine_inputs, chunk=chunk, final=final).per_rid_outputs[rid]
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
@@ -543,20 +621,23 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         del graph_walk
         return None if any(self._is_first_step(rid) for rid in per_request_info) else self.DECODE_KEY
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> ARNodeInputs:
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
         # session's first step also prefills the speaker warm-up.
         chunk = inputs.get("new_token")
         if chunk:
             tok = chunk[0].reshape(1)
         else:
-            # a very short clip ends the token stream on an empty chunk; run a PAD
-            # frame, since a skipped rid in a stream-ended loop breaks the stop
+            # The token stream ends on an empty chunk when its last token was
+            # taken before its end reached this worker (or the clip yielded no
+            # token). Run a PAD frame, since a skipped rid in a stream-ended loop
+            # breaks the stop; it only ends the loop, so postprocess drops it.
             dev = self.talker.embed_code.weight.device
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
         first = self._is_first_step(fwd_info.rid_handle)
         span = self.warmup_len + 1 if first else 1
-        return ARNodeInputs(input_ids=tok, input_seq_len=span, kwargs={"first": first})
+        return ARNodeInputs(input_ids=tok, input_seq_len=span,
+                            kwargs={"first": first, "ends_loop": bool(is_final_stream_chunk) and not chunk})
 
     def declare_step(
         self,
@@ -665,6 +746,12 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         return _first_row(self.forward_batched(graph_walk, engine_inputs, **kwargs))
 
     def postprocess(self, request_id, request_info, outputs, **kwargs):
+        inputs = kwargs.get("inputs")
+        if inputs is not None and inputs.kwargs.get("ends_loop"):
+            # one audio frame per text token, as offline: the codec flushes on
+            # the empty final chunk this leaves
+            outputs.clear()
+            return
         # This frame's codes are the next frame's ``prev_codes`` (metadata only:
         # the tensor is already a copy out of the graph's output buffer).
         if "codec_tokens" in outputs:

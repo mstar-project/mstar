@@ -29,7 +29,9 @@ INFERENCE PATHS (all live, verified vs the NeMo reference):
 
 The M* serving path is the walk graphs below: four async partitions
 (Encoder → LLM → Talker → Codec) joined by ``StreamingGraphEdge``s, with the nano
-decode loop consuming one encoder frame per step. ``get_node_resources`` declares
+decode loop consuming one encoder frame per step. The user's audio is a client
+stream into the Encoder, so a call can stream live over ``/generate/ws``; a
+one-shot upload is a stream of one chunk. ``get_node_resources`` declares
 the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
 slots), the Mamba-2 resource and the sampler, and the talker's paged KV cache,
 attention and positions. Both decode steps are CUDA graphs.
@@ -65,9 +67,10 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.config import (
+    AUDIO_IN,
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
@@ -77,10 +80,17 @@ from mstar.model.nemotron_duplex.config import (
     TALKER_KV,
     TALKER_POS,
     NemotronDuplexConfig,
+    session_too_long,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy
-from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import (
+    CLIENT,
+    ClientStreamLimits,
+    Connection,
+    PartitionTopology,
+    StreamingGraphEdge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -409,20 +419,29 @@ class NemotronDuplexModel(Model):
     # + 1 final PAD frame fit 16 pages a stream; 32 sessions x 2 streams x 16 =
     # 1024 pages (+ the sink) = 28 GiB.
     max_session_s = 160.0
+    # Most channels an upload may have; the model takes 16 kHz mono speech.
+    max_upload_channels = 2
     # Longest system prompt (``model_kwargs: {max_prompt_tokens: ...}``). The
     # prompt prefills in one step batched with every live session's frame, so
     # it stalls them all for its prefill time
     # TODO(prefill): drop this cap once chunked prefill keeps the prompt out of the frame batch.
     max_prompt_tokens = 512
     TALKER_WARMUP_POSITIONS = 37      # the speaker warm-up each talker stream prefills
+    # One encoder step per stream item (an uploaded file or an append), however
+    # many: the loop ends with the stream, never at this limit (the largest the
+    # Rust runtime's u32 counter takes with room to spare).
+    ENCODE_LOOP_ITERS = 2**31 - 1
     # Headroom over max_session_frames for the loops and the conductor's token
     # cap; a cap reached mid-stream hangs the session instead of ending it.
     LOOP_ITERS_MARGIN = 16
 
     @property
+    def max_session_samples(self) -> int:
+        return int(self.max_session_s * self.config.stt.sample_rate)
+
+    @property
     def max_session_frames(self) -> int:
-        stt = self.config.stt
-        return stt.num_frames(int(self.max_session_s * stt.sample_rate))
+        return self.config.stt.num_frames(self.max_session_samples)
 
     def talker_kv_pages(self, page_size: int) -> int:
         """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
@@ -431,9 +450,9 @@ class NemotronDuplexModel(Model):
         return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
-        # One text token per audio frame, so the audio fixes the length and
-        # process_prompt has already bounded it. A client cap would cut the
-        # text loop short of its stream's end and hang the session.
+        # One text token per audio frame, so the audio fixes the length, within
+        # the session cap (audio_in's max_items, in samples). A client cap would
+        # cut the text loop short of its stream's end and hang the session.
         del model_kwargs
         return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
@@ -534,6 +553,7 @@ class NemotronDuplexModel(Model):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         """Full-duplex S2S pipeline as four async partitions (frame-synchronous):
 
+            client  --[audio_in,    FixedChunk(1)]--> Encoder
             Encoder --[audio_frame, FixedChunk(1)]--> LLM
             LLM     --[new_token,   FixedChunk(1)]--> Talker
             Talker  --[codec_tokens, LeftContext ]--> Codec
@@ -544,11 +564,21 @@ class NemotronDuplexModel(Model):
         the text to the client, streams it to the talker, and feeds both back. An
         optional system-prompt ``prefill_text`` primes the nano cache first.
         """
-        # Encoder: audio chunk -> per-frame embeds, streamed one frame per LLM step.
-        encode = GraphNode(
-            name="conformer_encoder",
-            input_names=["audio_features"],
-            outputs=[StreamingGraphEdge(next_node="nano_llm", name="audio_frame", target_partition="LLM")],
+        # Encoder: one step per chunk of the client's audio stream, batched over
+        # the calls that have one; emits the frames that chunk made final,
+        # streamed one frame per LLM step. Ends with the client's stream. It is
+        # never a speculation target (its input is the client's, not its own
+        # output); async scheduling lets another node's step overlap it.
+        encode = Loop(
+            name="encode_loop",
+            section=GraphNode(
+                name="conformer_encoder",
+                input_names=[AUDIO_IN],
+                consumes_stream=True,
+                outputs=[StreamingGraphEdge(next_node="nano_llm", name="audio_frame", target_partition="LLM")],
+            ),
+            max_iters=self.ENCODE_LOOP_ITERS,
+            outputs=[],
         )
         # LLM: the frame-synchronous decode loop. A system prompt is not a
         # separate walk: the reference feeds the prompt tokens as leading
@@ -626,6 +656,12 @@ class NemotronDuplexModel(Model):
     def get_partition_topology(self) -> PartitionTopology:
         eartts = self.config.eartts
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
+            # the user's audio, one item per uploaded file or append, at most a
+            # session's samples: past them the talker KV and the decode loops run out
+            Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       limits=ClientStreamLimits(max_items=self.max_session_samples,
+                                                 item_size=torch.numel, unit="samples")),
             # one audio frame per nano decode step. continue_after_done=False:
             # the duplex nano text loop is 1:1 with audio frames, so when the
             # encoder's frames are exhausted the decode loop must terminate
@@ -663,8 +699,9 @@ class NemotronDuplexModel(Model):
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        # Duplex request: raw user audio (-> Encoder partition) plus an optional
-        # system-prompt text that primes the nano cache (prefill_text).
+        # Duplex request: an optional system-prompt text that primes the nano
+        # cache, and the user's audio, which streams into the Encoder. An
+        # uploaded clip is the stream's first chunk; a live call appends more.
         out: NameToTensorList = {}
         # The agent always speaks: text-only would need the LLM to stop feeding the talker stream
         if "audio" not in output_modalities or set(output_modalities) - {"text", "audio"}:
@@ -680,34 +717,17 @@ class NemotronDuplexModel(Model):
                     f"takes prompts up to {self.max_prompt_tokens} tokens"
                 )
             out["text_inputs"] = [ids]
-        # The data worker loads audio files under ``audio_inputs`` (f"{modality}_inputs");
-        # expose them as ``audio_features`` — the conformer_encoder node's input.
-        wav = (tensors or {}).get("audio_inputs") or (tensors or {}).get("audio_features")
-        # the duplex loop is driven by audio frames; with none there is nothing to step
-        if not wav:
-            raise ValueError("this model needs an audio input; got none")
-        # one encoder frame; shorter audio breaks the STFT pad and the token stream
-        stt = self.config.stt
-        min_samples = stt.hop_length * stt.subsampling_factor
-        for i, w in enumerate(wav):
-            if not torch.isfinite(w).all():
-                raise ValueError("audio contains NaN or inf samples")
-            # float files can exceed full scale, and loud input silences the agent
-            peak = w.abs().max() if w.numel() else 0.0
-            if peak > 1.0:
-                wav[i] = w = w / peak
-            if w.numel() < min_samples:
-                raise ValueError(
-                    f"audio is {w.numel()} samples; need at least {min_samples} "
-                    f"({min_samples * 1000 // stt.sample_rate} ms at {stt.sample_rate} Hz)"
-                )
-            # past the cap the talker KV and the decode loops run out
-            if stt.num_frames(w.numel()) > self.max_session_frames:
-                raise ValueError(
-                    f"audio is {w.numel() / stt.sample_rate:.1f} s; this server "
-                    f"takes sessions up to {self.max_session_s:g} s"
-                )
-        out["audio_features"] = wav
+        # The data worker loads audio files under ``audio_inputs`` (f"{modality}_inputs").
+        wav = (tensors or {}).get("audio_inputs")
+        if wav:
+            # an upload is one stretch of the call: it may be scaled, as one
+            wav = [self._checked_audio(w) for w in wav]
+            peak = max((w.abs().max() for w in wav if w.numel()), default=0.0)
+            if peak > 1.0:      # float files can exceed full scale, and loud input silences the agent
+                wav = [w / peak for w in wav]
+            # The session cap is audio_in's max_items, which the data worker
+            # charges these samples to as the stream's first chunk.
+            out[AUDIO_IN] = wav
         # Seed the decode loop's iteration-0 fed-back tokens. The frame-
         # synchronous nano step lists prev_text / prev_func as inputs, so
         # without these the readiness gate never fires on the first frame (no
@@ -728,25 +748,56 @@ class NemotronDuplexModel(Model):
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
         return out
 
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        # Each appended file is one stream item, in order; audio_in's max_items
+        # caps the call's samples as its audio grows. A piece of a stream can't
+        # be resampled or scaled alone without a seam at every append. The one
+        # client stream is audio_in, so a file's named stream changes nothing.
+        if chunk.text:
+            raise ValueError("this model takes audio appends only; got text")
+        for key, items in chunk.tensors.items():
+            if items and key != "audio_inputs":
+                raise ValueError(f"this model takes audio appends only; got {key.removesuffix('_inputs')}")
+        rate = self.config.stt.sample_rate
+        for meta in chunk.input_metadata.get("audio_inputs") or []:
+            if meta.get("source_sample_rate", rate) != rate:
+                raise ValueError(f"appends must be {rate} Hz audio; got {meta['source_sample_rate']} Hz")
+        return {AUDIO_IN: [self._checked_audio(w).clamp(-1.0, 1.0) for w in chunk.tensors.get("audio_inputs") or []]}
+
+    @staticmethod
+    def _checked_audio(wav: torch.Tensor) -> torch.Tensor:
+        if not torch.isfinite(wav).all():
+            raise ValueError("audio contains NaN or inf samples")
+        return wav
+
     def load_audio(self, filepath: str, device: str):
         """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
         torchcodec, whose native libs aren't always available). Returns the same
         ``TensorAndMetadata`` shape the data worker expects."""
         import soundfile as sf
 
-        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
+        from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_soundfile_capped
         from mstar.model.base import TensorAndMetadata
 
         try:
-            data, sr = read_soundfile_capped(filepath)   # mono
+            # refused before the decode, which reads every channel of each block
+            info = sf.info(filepath)
+            check_resample_rate(info.samplerate, 16000)
+            if info.channels > self.max_upload_channels:
+                raise ValueError(
+                    f"audio must have at most {self.max_upload_channels} channels; got {info.channels}"
+                )
+            data, sr = read_soundfile_capped(filepath, self.max_session_s)   # mono
+        except AudioTooLongError:
+            raise session_too_long(self.max_session_s) from None
         except sf.SoundFileError as exc:   # garbage or truncated upload
             raise ValueError(f"could not decode the audio file: {exc}") from exc
         audio = torch.from_numpy(data)
-        check_resample_rate(sr, 16000)
         if sr != 16000:
             import torchaudio.functional as AF
             audio = AF.resample(audio, sr, 16000)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1,
+                                                           source_sample_rate=sr))
 
     # -------------------------------------------------------------------
     # Forward-pass-args state machines — one per async partition
@@ -773,12 +824,10 @@ class NemotronDuplexModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        if partition_name == "Encoder":
-            edge = GraphEdge(next_node="conformer_encoder", name="audio_features")
-            edge.tensor_info = input_signals.get("audio_features", [])
+        if partition_name == "Encoder":                    # self-triggered by the client's audio
             return ForwardPassArgs(
                 full_metadata=self._meta(input_modalities, output_modalities, "encode", True),
-                inputs=[edge], unpersist_tensors=list(edge.tensor_info), step_metadata={},
+                inputs=[], unpersist_tensors=[], step_metadata={},
             )
         if partition_name == "LLM":
             # Straight into the frame-synchronous decode loop, self-triggered
@@ -815,10 +864,7 @@ class NemotronDuplexModel(Model):
     ) -> ForwardPassArgs:
         m = partition_metadata
 
-        if partition_name == "Encoder":                    # runs once, then done producing
-            return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=True)
-
-        # LLM, Talker and Codec are stream-terminated: each ends when its node
+        # All four partitions are stream-terminated: each ends when its node
         # consumes the final chunk of its upstream stream, which the worker
         # reports and the conductor turns into the partition's request_done
         # (and producer_done for the next partition). Nothing here guesses the
@@ -839,7 +885,7 @@ class NemotronDuplexModel(Model):
                 request_done=False, step_metadata={"prompt_pending": False},
             )
 
-        if partition_name in ("Talker", "Codec"):          # self-triggered by the upstream stream
+        if partition_name in ("Encoder", "Talker", "Codec"):  # self-triggered by the upstream stream
             return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=False)
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -1153,7 +1199,10 @@ class NemotronDuplexModel(Model):
         perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
         rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
         rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
-        return ConformerEncoderSubmodule(perception, rnnt_dec, rnnt_joint, config=self.config)
+        return ConformerEncoderSubmodule(
+            perception, rnnt_dec, rnnt_joint, config=self.config,
+            max_session_samples=self.max_session_samples,
+        )
 
     def _create_talker_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
