@@ -2667,7 +2667,8 @@ class KVManager(AttentionResource):
                 stream = streams[claim.label]
                 freed += len(claim.pages)
                 stream.page_indices = []
-                self._release(rid, stream, claim.pages)
+                # the offload takes its pages off the allotment too, so every page it frees is room
+                self._release(rid, stream, claim.pages, refund=False)
                 # Offload changes residency, not logical stream contents.
                 stream.reset(content_reset=False)
             self._recount(rid)
@@ -2706,13 +2707,11 @@ class KVManager(AttentionResource):
         )
 
     def can_reload(self, rid: str) -> bool:
-        """Whether the free pages plus what the prefix index could evict cover
-        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        """Whether `_room` covers ``rid``'s offloaded streams."""
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            evictable = 0 if self._index is None else self._index.num_sole_owned()
-            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+            return self._reload_pages_needed(rid) <= self._room()
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
@@ -2726,6 +2725,8 @@ class KVManager(AttentionResource):
         with self._lock:
             labels = self._cpu_pool.labels(rid)
             needed = self._reload_pages_needed(rid)
+            if needed > self._room():
+                return False
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -2746,6 +2747,8 @@ class KVManager(AttentionResource):
                     gpu_page_indices=pages,
                 )
                 stream.page_indices = pages
+                if rid in self._allotments:
+                    self._allotments[rid].pages += len(pages)
                 self._recount(rid)
                 stream.stored_len = state.stored_len
                 stream.position = state.position
