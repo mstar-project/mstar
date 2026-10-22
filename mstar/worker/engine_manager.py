@@ -6,7 +6,14 @@ import torch
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
+from mstar.engine.precision import (
+    NodePrecision,
+    apply_precision,
+    apply_yaml_precision,
+    precision_mismatches,
+    refuse_legacy_autocast_yaml,
+    yaml_precision_blocks,
+)
 from mstar.engine.resources import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -120,6 +127,28 @@ def refuse_combined_walks_across_tp_groups(
             )
 
 
+def _refuse_conflicting_shared_modules(
+    submodules: dict[str, torch.nn.Module], precisions: dict[str, NodePrecision],
+) -> None:
+    """Refuse two nodes that share a module but cast it differently: the one
+    loaded later would silently set the other's numerics."""
+    for name, submodule in submodules.items():
+        bad = precision_mismatches(submodule, precisions[name])
+        if bad:
+            raise ValueError(
+                f"node {name!r} does not hold the dtypes its precision policy gives it; "
+                f"a module it shares with another node was cast differently there: "
+                f"{bad[:5]}{' ...' if len(bad) > 5 else ''}"
+            )
+
+
+def _deployment_nodes(model_config: dict, node_names: set[str]) -> set[str]:
+    """Every node the deployment places, on any worker; this worker's alone
+    when the config names no groups."""
+    groups = model_config.get("node_groups") or []
+    return {n for group in groups for n in group.get("node_names", ())} or set(node_names)
+
+
 def _refuse_unknown_walks(model: Model) -> None:
     """Refuse a declared stream that names a walk the model never runs.
 
@@ -214,18 +243,26 @@ class EngineManager:
         _refuse_unknown_walks(model)
         _refuse_unservable_walks(specs, model)
 
-        # YAML autocast_dtype over the model's own, but never re-enabling
-        # autocast for a model that pinned its numerics (see node_dtype)
-        autocast_dtype = resolve_model_dtype(model, model_config)
+        refuse_legacy_autocast_yaml(model_config)
+        deployment = _deployment_nodes(model_config, node_names) | set(node_names)
+        yaml_blocks = yaml_precision_blocks(model_config, deployment)
+        # every placed node's policy, this worker's or not: a prefix-cache root
+        # names the precision its pages were written under, alike on every worker
+        policies: dict[str, NodePrecision] = {}
+        for name in sorted(deployment):
+            policies[name] = model.get_node_precision(name)
+            if name in yaml_blocks:
+                policies[name] = apply_yaml_precision(policies[name], name, yaml_blocks[name])
 
         # Allocation dtype hint for get_submodule: a node's params should be
-        # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
+        # allocated directly in their param dtype (cast meta -> dtype before
         # ``to_empty``) instead of allocating fp32 then down-casting after
         # return — the latter doubles the load-time VRAM peak. The cast below
-        # applies the same resolved dtype, so allocation and runtime agree.
+        # applies the same resolved policy, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
-        node_dtypes: dict[str, torch.dtype | None] = {}
+        precisions: dict[str, NodePrecision] = {}
         for name in sorted(node_names):
+            precision = policies[name]
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
@@ -236,19 +273,20 @@ class EngineManager:
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),
-                autocast_dtype=autocast_dtype, **extra,
+                # the node's param dtype, under its pre-policy name
+                autocast_dtype=precision.param_dtype,
+                **extra,
             )
             if submodule is None:
                 continue
-            # the one dtype the load cast and every forward and capture use;
-            # None keeps the dtype the node was built in
-            node_dtype = node_dtypes[name] = resolve_node_dtype(submodule, autocast_dtype)
-            submodules[name] = submodule.to(device=device, dtype=node_dtype)
+            # the one policy the load cast and every forward and capture use
+            precisions[name] = precision
+            submodules[name] = apply_precision(submodule.to(device=device), precision)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_conflicting_shared_modules(submodules, precisions)
 
         engine = Engine(
             graph_runtime=graph_runtime,
-            autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
@@ -261,7 +299,7 @@ class EngineManager:
             device=device,
             transfer_engine_info=transfer_engine_info,
             model=model,
-            node_dtypes=node_dtypes,
+            node_precisions=policies,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

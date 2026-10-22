@@ -8,6 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
@@ -23,7 +24,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.node_dtype import resolve_node_dtype
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -126,8 +127,8 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
-    # cast and autocast dtype, None if the node opted out; resolved once at load
-    node_dtype: torch.dtype | None = None
+    # param dtype, fp32 modules and autocast; resolved once at load
+    precision: NodePrecision = field(default_factory=lambda: NodePrecision(None))
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -440,6 +441,10 @@ class ExecutingBatch:
 
 
 class Engine:
+    # node -> its precision policy, every placed node; set by load_model, read
+    # into each prefix-cache root
+    _node_precisions: Mapping[str, NodePrecision] = MappingProxyType({})
+
     @property
     def device_capability(self) -> DeviceCapability:
         capability = getattr(self, "_device_capability", None)
@@ -449,7 +454,6 @@ class Engine:
 
     def __init__(
         self, graph_runtime: GraphRuntime,
-        autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
@@ -460,7 +464,6 @@ class Engine:
         )
         self._device = None
         self._device_capability = device_capability
-        self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
@@ -492,24 +495,28 @@ class Engine:
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         model: "Model | None" = None,
-        node_dtypes: Mapping[str, torch.dtype | None] | None = None,
+        node_precisions: Mapping[str, NodePrecision] | None = None,
     ):
-        """``node_dtypes`` is each node's resolved dtype, as the engine manager
-        cast it; a node missing from it resolves against the engine's dtype.
-        A resource's dtype is its spec's, else its local nodes' common one."""
+        """``node_precisions`` is each node's resolved policy, as the engine
+        manager cast it, for every node the deployment places (a prefix-cache
+        root names the policies of all of a cache's nodes, local or not); a
+        local node missing from it keeps its dtypes and runs without autocast.
+        A resource's dtype is its spec's, else its local nodes' common param
+        dtype."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
 
         node_names = set(submodules.keys())
-        resolved_dtypes = {
+        precisions = {
             name: (
-                node_dtypes[name] if node_dtypes is not None and name in node_dtypes
-                else resolve_node_dtype(submodule, self._autocast_dtype)
+                node_precisions[name] if node_precisions is not None and name in node_precisions
+                else NodePrecision(None)
             )
-            for name, submodule in submodules.items()
+            for name in submodules
         }
+        self._node_precisions = {**(node_precisions or {}), **precisions}
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
 
@@ -541,7 +548,7 @@ class Engine:
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )
-            local_dtypes = {node: resolved_dtypes[node] for node in relevant_nodes}
+            local_dtypes = {node: precisions[node].param_dtype for node in relevant_nodes}
             shared_dtype = set(local_dtypes.values())
             self._resources[spec.resource_key] = build_resource(
                 spec,
@@ -597,7 +604,7 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                node_dtype=resolved_dtypes[node_name],
+                precision=precisions[node_name],
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -661,8 +668,8 @@ class Engine:
                 )
 
     def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
-        """This node's resolved dtype, or None for one that opted out."""
-        return self._submodules[node_name].node_dtype
+        """The dtype this node's forward autocasts in, None for none."""
+        return self._submodules[node_name].precision.autocast_dtype
 
     def warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -830,11 +837,12 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        node_dtype = self._autocast_dtype_for(node_name)
+        param_dtype = submodule_mgmt.precision.param_dtype
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
-            # the dtype the region runs in; an opted-out node keeps its params'
-            node_dtype or torch.float32,
+            # the dtype the region's activations run in; a node that keeps its
+            # build dtype declares none, and gets float32
+            param_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
@@ -853,7 +861,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=node_dtype,
+                autocast_dtype=submodule_mgmt.precision.autocast_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
@@ -899,8 +907,13 @@ class Engine:
                     )
                     continue
             # its own, then its dependents' in key order, so the root does not
-            # move with the order the engine happened to build them in
-            parts = [resource.fingerprint()]
+            # move with the order the engine happened to build them in; then the
+            # precision of every node writing it, since a cast or quantized
+            # weight changes what lands in the pages
+            writers = specs_by_key[key].nodes if key in specs_by_key else ()
+            parts = [resource.fingerprint(), fingerprint(*(
+                f"{node}={self._node_precisions.get(node)!r}" for node in sorted(writers)
+            ))]
             for other in sorted(specs_by_key):
                 if key in specs_by_key[other].depends_on():
                     built = self._resources.get(other)
@@ -1184,7 +1197,6 @@ class Engine:
             with torch.no_grad(), autocast_scope(
                 self._autocast_dtype_for(batch.node_name),
                 device_type=self._device.type,
-                node_name=batch.node_name,
             ):
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)

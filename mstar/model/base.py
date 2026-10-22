@@ -15,6 +15,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -835,17 +836,15 @@ class Model(ABC):
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
 
-        ``autocast_dtype`` is the dtype this node's params should be
-        allocated in. Models that build on the meta device must cast the
-        meta module to this dtype *before* ``to_empty(device)`` so storage
-        is allocated directly in the target dtype — casting after
-        ``to_empty`` first materialises every param in the meta default
-        (float32), doubling the load-time VRAM peak. It is always the
-        model-wide dtype (``get_autocast_dtype``, or YAML ``autocast_dtype``):
-        the submodule does not exist yet, so a node with ``disable_autocast``
-        gets it too. The engine manager's cast afterwards keeps such a node in
-        whatever dtype it was built in, and moves a node with its own
-        ``get_autocast_dtype`` to that dtype.
+        ``autocast_dtype`` is the node's param dtype (``get_node_precision``,
+        after any YAML override; the name predates the policy), None for a node
+        that keeps the dtype it is built in. Models that build on the meta
+        device should apply the node's policy to the meta module
+        (``apply_precision``) *before* ``to_empty(device)``, so storage is
+        allocated directly in its final dtypes: casting after ``to_empty`` first
+        materialises every param in the meta default (float32), doubling the
+        load-time VRAM peak. The engine manager applies the same policy to the
+        returned module, a no-op once the model has.
         """
         pass
 
@@ -871,11 +870,17 @@ class Model(ABC):
         """
         return None
 
-    def get_autocast_dtype(self):
-        """The model-wide dtype nodes are cast to and autocast in. ``None``
-        runs every node without autocast, in the dtype it was built in; YAML
-        ``autocast_dtype`` may then only be ``null``."""
-        return torch.bfloat16
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """``node_name``'s precision policy: its param dtype, the modules kept
+        fp32, and whether its forward runs under autocast. Known before the
+        submodule exists, so ``get_submodule`` can build in it. A deployment may
+        tighten it under ``nodes.<name>.precision``.
+
+        Default: bf16 params, no autocast. Override it per node; a node that
+        needs fp32 somewhere says so in ``fp32_modules`` or in its own code.
+        """
+        del node_name
+        return NodePrecision(torch.bfloat16)
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         """Sample rate (Hz) of audio output produced by ``postprocess``.

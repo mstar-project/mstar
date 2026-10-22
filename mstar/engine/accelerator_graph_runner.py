@@ -23,7 +23,6 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
@@ -44,15 +43,12 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     return sorted(key for key in step.steps if not resources[key].can_capture())
 
 
-@contextmanager
-def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str | None = None):
-    """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
-    submodule in its own dtype and shuts out any ambient autocast.
-    ``node_name`` names the node in implicit-downcast warnings."""
-    with node_scope(node_name), torch.amp.autocast(
+def autocast_scope(dtype: torch.dtype | None, device_type: str):
+    """A forward's autocast scope; ``None`` (a node whose policy has autocast
+    off) runs the submodule in its own dtypes and shuts out any ambient autocast."""
+    return torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
-    ):
-        yield
+    )
 
 
 def agree_across_ranks(
@@ -1125,7 +1121,7 @@ class AcceleratorGraphRunner:
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     returned = _tensor_bytes(run_forward())
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -1972,7 +1968,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # as in `AcceleratorGraphRunner._warmed`
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name):
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     warm_outputs = run_fn()
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the

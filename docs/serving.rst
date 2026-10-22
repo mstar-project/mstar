@@ -292,8 +292,23 @@ are refused, since a quantized cache needs scales, not a cast. KV caches,
 attention, ragged attention and position resources accept it. Without it, a resource takes
 the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
-run without autocast, or in different dtypes, and that declares no dtype fails at load.
-The full resolution order is in :doc:`adding_models`.
+keep their build dtype, or have different param dtypes, and that declares no dtype fails
+at load. The full resolution order is in :doc:`adding_models`.
+
+**Node precision.** Each node runs under the precision policy its model declares: the
+dtype its params are cast to, the modules kept fp32, and whether its forward runs under
+autocast. A ``nodes:`` block tightens it for one deployment:
+
+.. code-block:: yaml
+
+   nodes:
+     LLM:
+       precision:
+         param_dtype: float32     # also: fp32_modules: [...], autocast: false
+
+YAML can turn autocast off but not on, add fp32 modules but not remove the model's, and
+cannot give a param dtype to a node pinned to its build dtype. The old model-wide
+``autocast_dtype:`` key raises an error at load. See :doc:`adding_models`.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's

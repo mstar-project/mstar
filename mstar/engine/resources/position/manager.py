@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, fields
 
 import torch
 
-from mstar.engine.node_dtype import warn_implicit_downcast
 from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotKey,
@@ -479,14 +478,9 @@ class RopeManager(PositionManager):
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
+        # the configured dtype, else q's own; never ambient autocast state
         if rope_dtype is not None:
             q, k = q.to(rope_dtype), k.to(rope_dtype)
-        elif torch.is_autocast_enabled(q.device.type):
-            dtype = torch.get_autocast_dtype(q.device.type)
-            q, k = q.to(dtype), k.to(dtype)
-        elif q.dtype == torch.float32:
-            warn_implicit_downcast("RoPE", q.dtype, torch.bfloat16)
-            q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
         llama31_params = {
             key: value for key, value in kwargs.items()

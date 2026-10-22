@@ -3,12 +3,13 @@
 The operator keeps fused accelerator implementations behind one stable
 ``mstar::rms_norm`` graph boundary. CUDA currently dispatches to FlashInfer,
 XPU dispatches to vllm-xpu-kernels, and other devices use the portable
-PyTorch implementation.
+PyTorch implementation. FlashInfer takes fp16 and bf16 only, so an fp32 input
+on CUDA runs the portable path too.
 """
 
 import torch
 
-from mstar.engine.node_dtype import warn_implicit_downcast
+_FUSED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def _prepare_inputs(
@@ -16,16 +17,11 @@ def _prepare_inputs(
     weight: torch.Tensor,
     norm_dtype: torch.dtype | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
-    """Apply the dtype contract shared by every RMSNorm kernel."""
+    """Apply the dtype contract shared by every RMSNorm kernel: ``norm_dtype``
+    if given, else ``x``'s own; never ambient autocast state."""
     orig_dtype = x.dtype
-    device_type = x.device.type
     if norm_dtype is not None:
         x = x.to(norm_dtype)
-    elif torch.is_autocast_enabled(device_type):
-        x = x.to(torch.get_autocast_dtype(device_type))
-    elif x.dtype == torch.float32 and device_type == "cuda":
-        warn_implicit_downcast("rms_norm", x.dtype, torch.bfloat16)
-        x = x.to(torch.bfloat16)
     if weight.dtype != x.dtype:
         weight = weight.to(x.dtype)
     return x, weight, orig_dtype
@@ -40,9 +36,13 @@ def rms_norm(
 ) -> torch.Tensor:
     """Portable RMSNorm fallback, returned in ``x``'s original dtype."""
     x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
+    return _rms_norm_portable(x, weight, eps).to(orig_dtype)
+
+
+def _rms_norm_portable(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     variance = x.float().pow(2).mean(dim=-1, keepdim=True)
     output = x * torch.rsqrt(variance + eps).to(x.dtype)
-    return (output * weight).to(orig_dtype)
+    return output * weight
 
 
 @torch.library.register_kernel(rms_norm, "cuda")
@@ -52,9 +52,11 @@ def _rms_norm_cuda(
     eps: float,
     norm_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
+    if x.dtype not in _FUSED_DTYPES:
+        return _rms_norm_portable(x, weight, eps).to(orig_dtype)
     import flashinfer
 
-    x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
     return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
 
 
