@@ -208,6 +208,15 @@ qwen3_tts = [
     "transformers>=4.57.3",
 ]
 
+fish_s2_pro = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",  # reference-audio decoding for voice cloning
+    "transformers",
+]
+
 kokoro = [
     # misaki is the G2P (lexicon + spaCy tagger); `misaki[en]` additionally
     # bundles espeak-ng (GPL) for out-of-dictionary words and is optional.

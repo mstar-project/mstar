@@ -95,6 +95,13 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
+            # XPU always rotates from this cache, so it already rounds the
+            # table to cache_dtype; another rope_table_dtype has no kernel here.
+            if config.rope_table_dtype not in (None, cache_dtype):
+                raise NotImplementedError(
+                    f"rope_table_dtype={config.rope_table_dtype} is not implemented for XPU, "
+                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the KV dtype)"
+                )
             self._rope_cache_key = (
                 rotary_dim,
                 config.rope_scale,
@@ -107,6 +114,21 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
+        # CUDA rotates from this table instead of in-kernel angles when set.
+        self._rope_table: torch.Tensor | None = None
+        if config.rope_table_dtype is not None and device.type != "xpu":
+            if config.llama31_params:
+                raise NotImplementedError("rope_table_dtype does not support Llama 3.1 RoPE scaling")
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            self._rope_table = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                config.rope_table_dtype,
+            ).float()
+            self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
@@ -430,6 +452,34 @@ class RopeManager(PositionManager):
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
 
+    def _check_rope_table_args(
+        self,
+        rotary_dim: int,
+        rope_scale: float,
+        rope_theta: float,
+        llama31_params: dict,
+    ) -> None:
+        """Refuse per-call RoPE arguments the ``rope_table_dtype`` table
+        does not encode: the CUDA kernel reads only the table."""
+        runtime = (rotary_dim, rope_scale, rope_theta)
+        if runtime != self._rope_table_key:
+            raise RuntimeError(
+                "RoPE runtime arguments do not match the rope_table_dtype "
+                "table built from PositionConfig: "
+                f"runtime (rotary_dim, rope_scale, rope_theta)={runtime}, "
+                f"configured={self._rope_table_key}"
+            )
+        # Llama 3.1 scaling at rope_scale 1 leaves every frequency unchanged,
+        # which is what Attention passes by default.
+        llama31 = all(
+            llama31_params.get(key) is not None
+            for key in ("low_freq_factor", "high_freq_factor", "old_context_len")
+        )
+        if llama31 and rope_scale != 1.0:
+            raise NotImplementedError(
+                "rope_table_dtype does not support Llama 3.1 RoPE scaling"
+            )
+
     def _build_rope_cache(
         self,
         rotary_dim: int,
@@ -502,7 +552,11 @@ class RopeManager(PositionManager):
             rope_theta if rope_theta is not None else config.rope_theta
         )
 
-        cos_sin_cache = None
+        cos_sin_cache = self._rope_table
+        if cos_sin_cache is not None:
+            self._check_rope_table_args(
+                rotary_dim or q.shape[-1], rope_scale, rope_theta, llama31_params,
+            )
         kernel_pos_ids = pos_ids[:q.shape[0]]
         if q.device.type == "xpu":
             rotary_dim = rotary_dim or q.shape[-1]

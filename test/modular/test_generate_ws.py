@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 
 import msgpack
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -329,3 +331,147 @@ def test_a_live_call_takes_both_append_forms(monkeypatch, tmp_path, record):
     assert (key, streams, end_input, append) == (
         "call", ["audio"], True, {"text": None, "file_streams": None, "model_kwargs": None},
     )
+
+
+def _slow_decode(monkeypatch, seconds=0.2):
+    """A message with files takes ``seconds`` longer to decode, like a large upload."""
+    decode = entrypoint._decode_ws_files
+
+    def slow(files, upload_dir):
+        if files:
+            time.sleep(seconds)
+        return decode(files, upload_dir)
+
+    monkeypatch.setattr(entrypoint, "_decode_ws_files", slow)
+
+
+def _recv_replies(ws, request_ids):
+    """Every reply until each of ``request_ids`` has finished or failed."""
+    open_ids, replies = set(request_ids), []
+    while open_ids:
+        reply = json.loads(ws.receive_text())
+        replies.append(reply)
+        if reply.get("finish") or reply.get("error"):
+            open_ids.discard(reply["request_id"])
+    return replies
+
+
+_OBS = {"name": "obs.png", "data": base64.b64encode(b"PNG").decode()}
+
+
+@pytest.mark.parametrize("slow_first", ["file-decode", "request-id-wait"])
+def test_pipelined_messages_are_submitted_in_send_order(monkeypatch, tmp_path, slow_first):
+    """A message that takes longer before its submission (a large file, an id
+    still in flight) does not let the next message on the socket overtake it."""
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    if slow_first == "file-decode":
+        _slow_decode(monkeypatch)
+    else:
+        async def wait_for_first(request_id):
+            if request_id == "first":
+                await asyncio.sleep(0.2)
+
+        fake.wait_for_request_id = wait_for_first
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "obs 0", "files": [_OBS], "request_id": "first"}))
+        ws.send_text(json.dumps({"text": "obs 1", "request_id": "second"}))
+        _recv_replies(ws, ["first", "second"])
+    assert [s["request_id"] for s in fake.submitted] == ["first", "second"]
+
+
+def test_a_reused_request_id_refuses_the_later_message(monkeypatch, tmp_path):
+    """Two pipelined messages under one id: the one sent first is served and
+    the one sent second gets the 409, whichever decodes faster."""
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    submit = fake.submit_request
+
+    def refuse_a_live_id(**kwargs):
+        if any(s["request_id"] == kwargs["request_id"] for s in fake.submitted):
+            raise HTTPException(status_code=409, detail="request_id 'step' is already in use")
+        return submit(**kwargs)
+
+    fake.submit_request = refuse_a_live_id
+    _slow_decode(monkeypatch)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "obs 0", "files": [_OBS], "request_id": "step"}))
+        ws.send_text(json.dumps({"text": "obs 1", "request_id": "step"}))
+        replies = _recv_replies(ws, ["step"])
+        while not any(r.get("error") for r in replies):
+            replies.append(json.loads(ws.receive_text()))
+    (served,) = fake.submitted
+    assert served["text"] == "obs 0" and served["file_paths"]
+    assert [r["status"] for r in replies if r.get("error")] == [409]
+
+
+def test_a_rejected_message_keeps_the_order_of_the_others(monkeypatch, tmp_path):
+    """A message refused before submission answers at once, and the one after
+    it still waits for the slow one before it."""
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    _slow_decode(monkeypatch)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "obs 0", "files": [_OBS], "request_id": "first"}))
+        ws.send_text(json.dumps({"request_id": "empty"}))
+        ws.send_text(json.dumps({"text": "obs 2", "request_id": "third"}))
+        replies = _recv_replies(ws, ["first", "empty", "third"])
+    assert [s["request_id"] for s in fake.submitted] == ["first", "third"]
+    assert any(r["request_id"] == "empty" and "neither text nor files" in r.get("error", "") for r in replies)
+
+
+def test_a_long_stream_does_not_hold_up_the_next_request(monkeypatch, tmp_path):
+    """Only submissions keep the send order: a request still streaming does not
+    delay the next one's submission or replies."""
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    stream = fake.iter_result_chunks
+    release = asyncio.Event()
+
+    async def held_first(request_id):
+        async for chunk in stream(request_id):
+            yield chunk
+        if request_id == "long":
+            await release.wait()
+
+    fake.iter_result_chunks = held_first
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "obs 0", "request_id": "long"}))
+        assert json.loads(ws.receive_text())["request_id"] == "long"
+        ws.send_text(json.dumps({"text": "obs 1", "request_id": "short"}))
+        replies = _recv_replies(ws, ["short"])
+    assert replies[-1] == {"request_id": "short", "finish": True}
+    assert [s["request_id"] for s in fake.submitted] == ["long", "short"]
+
+
+def test_an_append_is_not_held_up_by_another_message_waiting_its_turn(monkeypatch, tmp_path):
+    """Openings submit in send order, so a live call opened behind a slow
+    upload waits for it, and so do its appends; another call's appends go
+    through meanwhile."""
+    fake = _ListeningFakeServer(tmp_path)
+    log = []
+    submit, stream_input = fake.submit_request, fake.stream_input
+
+    def logged_submit(**kwargs):
+        log.append(("submit", kwargs["request_id"]))
+        return submit(**kwargs)
+
+    def logged_stream_input(key, *args, **kwargs):
+        log.append(("append", key))
+        return stream_input(key, *args, **kwargs)
+
+    fake.submit_request, fake.stream_input = logged_submit, logged_stream_input
+    _slow_decode(monkeypatch, seconds=0.5)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "early", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "upload", "text": "hi", "files": [_OBS], "end_input": True}))
+        ws.send_text(json.dumps({"request_id": "late", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "late", "append": {"text": "hi"}}))
+        ws.send_text(json.dumps({"request_id": "early", "append": {"text": "hi"}, "end_input": True}))
+        ws.send_text(json.dumps({"request_id": "late", "end_input": True}))
+        replies = _recv_replies(ws, ["early", "upload", "late"])
+
+    assert not any(r.get("error") for r in replies)
+    assert log.index(("append", "early")) < log.index(("submit", "upload"))
+    assert [e for e in log if e[1] == "late"] == [("submit", "late"), ("append", "late"), ("append", "late")]

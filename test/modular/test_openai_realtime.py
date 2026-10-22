@@ -246,6 +246,24 @@ def test_bad_events_report_errors_but_keep_the_session(client_and_stub):
         assert json.loads(ws.receive_text())["error"]["message"] == "audio is not base64"
 
 
+@pytest.mark.parametrize("audio", [None, 0, False, []])
+def test_null_or_falsy_audio_is_an_invalid_audio_error(client_and_stub, audio):
+    """A null append is refused as on the bridge and the duplex server, not
+    read as an empty append, and the session keeps its audio."""
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    tone = _tone(1600)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        _append_bytes(ws, tone.tobytes())
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": audio}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+    errors = [e["error"] for e in events if e["type"] == "error"]
+    assert errors == [{"type": "invalid_request_error", "message": "audio is not base64", "code": "invalid_audio"}]
+    assert _close_to(heard[-1], tone)
+
+
 def _step_samples(stub) -> list[np.ndarray]:
     """Make the stub keep the int16 samples each engine step heard."""
     heard: list[np.ndarray] = []
