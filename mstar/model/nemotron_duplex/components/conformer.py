@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, SinkWindow
+from mstar.engine.resources.kv.bounded import BoundedKVConfig, SinkWindow, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.nemotron_duplex.components._util import param
 from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
@@ -339,12 +339,22 @@ class StreamState:
     slice so a step needs no sync. The audio and mel frames a later step still
     reads live in the ``front`` pool (``front_state_blocks``)."""
 
-    __slots__ = ("samples", "mels", "frames")
+    __slots__ = ("samples", "mels", "position")
 
     def __init__(self):
         self.samples = 0        # samples of the call so far
         self.mels = 0           # mel frames computed
-        self.frames = 0         # encoder frames emitted (= the call's position in the bounded KV)
+        # its place in the bounded KV, which a step's declarations share
+        self.position = StreamPosition(source_len=0, written=0)
+
+    @property
+    def frames(self) -> int:
+        """Encoder frames emitted."""
+        return self.position.written
+
+    @frames.setter
+    def frames(self, value: int):
+        self.position = StreamPosition(source_len=0, written=value)
 
 
 def front_state_blocks(config: ConformerSTTConfig) -> dict[str, RecurrentBlockConfig]:
@@ -616,7 +626,8 @@ class ConformerStreamer:
     def advance(sts: list[StreamState], enc: EncoderInputs) -> None:
         """Count the step's frames into each call's state, once its layers ran."""
         for st, n in zip(sts, enc.n, strict=True):
-            st.frames += n
+            if n:
+                st.frames += n
 
     # -- layers --------------------------------------------------------------
 

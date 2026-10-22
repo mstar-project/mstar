@@ -45,7 +45,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
+from mstar.engine.resources.kv.bounded import BoundedKVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState, device_counts
@@ -502,16 +502,17 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 f"it needs more than {1000 * (stt.n_fft // 2) / stt.sample_rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
+        at = st or StreamState()
         return NodeInputs(
             tensor_inputs={} if wav is None else {"chunk": wav},
             kwargs={
                 "final": final,
-                # whether the whole-step region serves the call: decided here,
-                # once, for the declaration and the forward to share
+                # whether the whole-step region can serve the call: decided
+                # here, once, for the declaration and the forward to share
                 "steady": st is not None and self.streamer.is_steady(st, wav, final),
                 # the call's position in ENCODER_KV and the frames this step adds
-                "frames": 0 if st is None else st.frames,
-                "n": self.streamer.new_frames(st or StreamState(), samples, final),
+                "position": at.position,
+                "n": self.streamer.new_frames(at, samples, final),
             },
             input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
@@ -562,7 +563,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             state = self.request_states.get(rid)
             st = None if state is None else state.get(self.STATE_KEY)
             if st is not None:
-                positions[rid] = StreamPosition(source_len=0, written=st.frames)
+                positions[rid] = st.position
         return self._kv_step(request_ids, [1] * len(request_ids), positions)
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
@@ -581,8 +582,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # lease names the whole batch's bucket, not the sub-batch's, which may
         # have no graph, and its admit can't refuse a call that has no slot yet.
         spans = [inp.kwargs["n"] for inp in inputs]
-        positions = {rid: StreamPosition(source_len=0, written=inp.kwargs["frames"])
-                     for rid, inp in zip(request_ids, inputs, strict=True)}
+        positions = {rid: inp.kwargs["position"] for rid, inp in zip(request_ids, inputs, strict=True)}
         return self._declare(request_ids, (ENCODER_FRONT, ENCODER_STATE),
                              self._kv_step(request_ids, spans, positions))
 

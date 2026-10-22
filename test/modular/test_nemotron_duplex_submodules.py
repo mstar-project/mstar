@@ -842,8 +842,10 @@ def test_encoder_an_all_steady_step_leaves_both_pools_to_its_region():
     step = enc.declare([1, 2], nxt)                                           # no region captured
     assert set(step.keys()) == {ENCODER_FRONT, ENCODER_STATE, ENCODER_KV}
     assert _kv_spans(step) == [1, 1]
-    frames = [enc.node.request_state(h).get(enc.node.STATE_KEY).frames for h in (1, 2)]
-    assert [step.get(ENCODER_KV).positions[h].written for h in (1, 2)] == frames
+    states = [enc.node.request_state(h).get(enc.node.STATE_KEY) for h in (1, 2)]
+    assert [step.get(ENCODER_KV).positions[h].written for h in (1, 2)] == [st.frames for st in states]
+    # the call's own position, built when its frames last moved, not one per declaration
+    assert all(step.get(ENCODER_KV).positions[h] is st.position for h, st in zip((1, 2), states, strict=True))
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION)
     assert enc.declare([1, 2], nxt) is None
     for at in range(2560, 1280 * 6, 1280):
