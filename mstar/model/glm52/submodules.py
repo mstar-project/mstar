@@ -47,7 +47,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.pinned_staging import to_device_async
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_checked: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
+        # the step's per-step indices, in one pinned H2D
+        self._index_stager = PinnedStager(torch.long)
         # Per request, in its request_state: "token_budget", max_tokens capped at the
         # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop for
         # every k); "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no
@@ -506,8 +508,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             fields["mtp_slots"] = [self._mtp_slot.get(rid, 0) for rid in request_ids]
             if graph_walk == "decode":
                 fields["mtp_seq"] = [self._mtp_stage_seq(engine_inputs)]
-        staged = to_device_async(
-            [v for values in fields.values() for v in values], torch.long, device)
+        staged = self._index_stager.to_device(
+            [v for values in fields.values() for v in values], device)
         out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
