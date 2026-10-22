@@ -83,7 +83,7 @@ def _dispatch_loader(
         loader(param, loaded_weight, shard_id)
 
 
-def _apply_stacked(
+def apply_stacked(
     name: str, stacked: list[StackedParamRule],
 ) -> tuple[str, str | int | None]:
     """Return ``(target_name, shard_id)`` after applying stacked rules,
@@ -132,7 +132,7 @@ def load_weights_into(
                 continue
             name = mapped
 
-        target, shard_id = _apply_stacked(name, stacked)
+        target, shard_id = apply_stacked(name, stacked)
         if target not in params_dict:
             # Not an error: the checkpoint may carry extra keys (lm_head
             # ties, kv-scale, etc.). Caller can verify completeness via
