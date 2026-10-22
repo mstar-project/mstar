@@ -3,9 +3,9 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 import numpy as np
@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
+from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -2524,6 +2524,49 @@ class KVManager(AttentionResource):
             self.reset_request(rid, free=True)
             self._dropped.add(rid)
             return self._arena.num_free - free
+
+    def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
+        """Lay ``rid``'s label out again as one ids span over ``ids`` without the last id, keyed as a
+        prompt of those ids would be, and return the walk that writes the span.
+
+        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
+        the one at intake. The decode step that samples an id keys it, so a label that keys
+        generation also extends its chain by the last id.
+        """
+        with self._lock:
+            overrides = self._overrides[rid]
+            (label,) = overrides.prompt_ids
+            layout = overrides.kv_layout[label]
+            (walk,) = {span.walk for span in layout.spans}
+            ((loop, slots),) = layout.growth
+            prompt = ids[:-1]
+            length = len(prompt)
+            grown = length - sum(span.length for span in layout.spans)
+            keyed = bool((overrides.prefix_keys or {}).get(label))
+            changes = {}
+            if keyed:
+                page_size = self.config.page_size
+                pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+                changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
+                changes["prefix_tail"] = {
+                    **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
+                }
+            self._overrides[rid] = replace(
+                overrides,
+                kv_layout={
+                    **overrides.kv_layout,
+                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
+                },
+                loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
+                **changes,
+            )
+            stream = self._streams[rid][label]
+            stream.forget_chain()
+            self._lay_out(rid, label, stream)
+            self._seed_keys(rid, label, stream)
+            if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
+                stream.chain.extend([ids[-1]], self.config.page_size)
+            return walk
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
