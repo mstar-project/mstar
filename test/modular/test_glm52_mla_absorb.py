@@ -41,9 +41,9 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
+from mstar.model.components.rope import rotate_gptj  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
-from mstar.model.glm52.components.rope import rotate_gptj  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,

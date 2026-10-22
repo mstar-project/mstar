@@ -10,8 +10,8 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
+from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
-from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
@@ -82,7 +82,7 @@ class Glm52MLAAttention(nn.Module):
             comm_group, h * config.v_head_dim, config.hidden_size,
             bias=False, input_is_parallel=True, reduce_results=True)
 
-        self.rotary = Glm52RotaryEmbedding(
+        self.rotary = InterleavedRotaryEmbedding(
             rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
 
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
