@@ -1,7 +1,7 @@
-"""GLM-5.2 DSA indexer scores over a paged index-key store, in one pass.
+"""DSA indexer scores (a key per token, GLM-5.2's) over a paged index-key store, in one pass.
 
 ``score[r, s] = sum_h w[r, h] * relu(q[r, h] . k[s])`` for a query row ``r`` over its request's
-keys ``s``, the indexer's selection score (components/indexer.py computes the same in fp32 on
+keys ``s``, the indexer's selection score (``topk.index_topk`` computes the same in fp32 on
 a gathered history). The output is ``[rows, max_len]`` fp32, what
 ``flashinfer.top_k_page_table_transform`` takes; it reads a row's first ``lens`` columns only.
 

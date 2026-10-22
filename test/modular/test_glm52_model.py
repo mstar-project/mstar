@@ -46,6 +46,7 @@ from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -502,7 +503,7 @@ def _indexer_params(model):
 
 
 def test_indexer_exists_only_on_the_dsa_path():
-    """Flag-off no forward ever hands a layer a dsa_ctx, so a FULL layer's
+    """Flag-off the model declares no DSA resource, so a FULL layer's
     indexer would be replicated (not TP-sharded) dead weight — ~370 MB per
     rank on the full model. Flag-on FULL layers carry it, SHARED ones never."""
     off = Glm52ForCausalLM(Glm52ModelConfig.reduced())
@@ -524,19 +525,20 @@ def test_indexer_exists_only_on_the_dsa_path():
     assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
 
 
-def test_flag_off_layer_refuses_a_dsa_ctx():
+def test_flag_off_layer_refuses_the_dsa_resource():
+    from mstar.model.glm52._testing import build_cpu_resources
     from mstar.model.glm52.components.attention import Glm52MLAAttention
-    from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
     cfg = Glm52ModelConfig.reduced()
     cfg.mla_absorb = True
+    cfg.dsa_long_context = True
+    resources, _ = build_cpu_resources(cfg)  # a node that declares the DSA resource
+    assert DSA_RESOURCE in resources
+    cfg.dsa_long_context = False
     attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
-    one = torch.ones(1, dtype=torch.int32)
-    ctx = Glm52DsaPagedContext(
-        row_req=one - 1, lens=one, host_lens=[1], kv_table=one[None], index_table=one[None],
-        spans=[(0, 1, 0)], width=1, page_size=8, topk=cfg.index_topk, needs_selection=True)
-    with pytest.raises(RuntimeError, match="dsa_long_context"):
-        attn(torch.randn(1, cfg.hidden_size), torch.tensor([0]), dsa_ctx=ctx)
+    assert attn.indexer is None
+    with pytest.raises(RuntimeError, match="dsa_long_context off"):
+        attn.bind_resources(resources)
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():

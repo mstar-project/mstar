@@ -1,6 +1,7 @@
 """DSA engine half: per-request state, guard states, IndexShare threading and
 the prefix property across index_topk — over the real ``KVManager`` (MLA
-latent layout), the index-key store and the MLA attention resource on CPU.
+latent layout), the index-key store, the DSA resource and the MLA attention
+resource on CPU.
 """
 import sys
 import types
@@ -32,7 +33,10 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
-from mstar.model.glm52 import dsa_paged  # noqa: E402
+from mstar.engine.resources.dsa import paged  # noqa: E402
+from mstar.engine.resources.dsa.config import DSAConfig  # noqa: E402
+from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
+from mstar.engine.resources.dsa.paged import PagedContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
     build_random_model,
@@ -40,23 +44,23 @@ from mstar.model.glm52._testing import (  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     INDEX_KV_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
-def _ctx(needs_selection: bool) -> Glm52DsaPagedContext:
+def _ctx(needs_selection: bool) -> PagedContext:
     """One decode row at position 6 of a single-page request."""
     one = torch.ones(1, dtype=torch.int32)
-    return Glm52DsaPagedContext(
+    return PagedContext(
         row_req=one - 1, lens=one * 7, host_lens=[7], kv_table=one[None], index_table=one[None],
         spans=[(0, 1, 0)], width=7, page_size=8, topk=4, needs_selection=needs_selection)
 
@@ -101,21 +105,26 @@ class _FakePositions:
 
 
 class _FakeKV:
-    def __init__(self, starts, page_size=8):
+    def __init__(self, starts, config, page_size=8):
         self._starts = starts
-        self.config = SimpleNamespace(page_size=page_size)
+        # what the DSA resource reads off its caches' configs
+        self.config = SimpleNamespace(
+            page_size=page_size, max_seq_len=config.max_seq_len,
+            num_qo_heads=config.num_attention_heads, kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim)
 
     def stored_len(self, rid, label="main"):
         return self._starts[rid]
 
 
-def _fake_step(tables):
-    """This step's plans of the latent cache and the index store, as preprocess reads them:
-    one view per request, positionally; an eager step."""
+def _fake_step(rids, tables):
+    """This step's plans of the latent cache and the index store, as the DSA resource reads
+    them: one view per request, positionally; an eager prefill."""
     views = [SimpleNamespace(page_idxs=t) for t in tables]
     plan = {key: {"main": SimpleNamespace(views=views)} for key in (KV_RESOURCE, INDEX_KV_RESOURCE)}
-    return SimpleNamespace(ctx=SimpleNamespace(
-        plan_results=plan, capture=False, slot_lease=None, slot=0))
+    return SimpleNamespace(ctx=StepContext(
+        request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False,
+        plan_results=plan))
 
 
 def _make_submodule(config) -> Glm52LLMSubmodule:
@@ -128,6 +137,7 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
 
 
 def _preprocess(sub, starts, seq_len, tables=None):
+    cfg = sub.config
     sub.get_device = lambda: torch.device("cpu")
     inputs = [
         ARNodeInputs(
@@ -136,16 +146,21 @@ def _preprocess(sub, starts, seq_len, tables=None):
         )
         for _ in starts
     ]
+    resources = {**{key: _FakeKV(starts, cfg) for key in (KV_RESOURCE, INDEX_KV_RESOURCE)},
+                 POS_RESOURCE: _FakePositions(starts)}
+    if cfg.dsa_long_context:  # the one mode that declares the DSA resource
+        resources[DSA_RESOURCE] = DSAManager(
+            DSAConfig(kv_cache=KV_RESOURCE, topk=cfg.index_topk, index_cache=INDEX_KV_RESOURCE),
+            resources[KV_RESOURCE].config, resources[INDEX_KV_RESOURCE].config,
+            torch.device("cpu"))
     engine_inputs = SimpleNamespace(
-        request_ids=list(starts),
-        resources={**{key: _FakeKV(starts) for key in (KV_RESOURCE, INDEX_KV_RESOURCE)},
-                   POS_RESOURCE: _FakePositions(starts)},
-        step=_fake_step(tables or [[0, 1, 2] for _ in starts]),
+        request_ids=list(starts), resources=resources,
+        step=_fake_step(starts, tables or [[0, 1, 2] for _ in starts]),
     )
     return sub.preprocess("prefill", engine_inputs, inputs)
 
 
-def test_guard_flag_off_unchanged_and_no_ctx():
+def test_guard_flag_off_holds_context_to_topk():
     cfg = Glm52ModelConfig()
     assert cfg.dsa_long_context is False
     sub = _make_submodule(cfg)
@@ -164,7 +179,7 @@ def test_guard_flag_on_lifts_cap_to_max_seq_len():
 
     # Decode one past topk: allowed, and the batch is marked for selection.
     ctx = Glm52LLMSubmodule._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=1))
-    assert isinstance(ctx, Glm52DsaPagedContext)
+    assert isinstance(ctx, PagedContext)
     assert ctx.needs_selection is True
     assert ctx.host_lens == [topk + 1]
     assert ctx.last_selection is None  # transient starts clean every forward
@@ -293,7 +308,8 @@ def test_declared_step_under_dsa_adds_the_index_store():
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
     step = sub.declare_step("prefill", ["r0"], [ar])
-    assert set(step.keys()) == {KV_RESOURCE, ATTN_RESOURCE, INDEX_KV_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE}
+    assert set(step.keys()) == {
+        KV_RESOURCE, ATTN_RESOURCE, INDEX_KV_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE, DSA_RESOURCE}
     assert step.segments[0].span == 3
 
 
@@ -304,24 +320,25 @@ def test_full_to_shared_threading_order(monkeypatch):
     model = build_random_model(cfg, seed=0)
     sub = Glm52LLMSubmodule(language_model=model, config=cfg)
     driver = _Driver(sub, cfg)
+    dsa = driver.resources[DSA_RESOURCE]
 
     trace = []
 
-    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_ctx=None, dsa_selection=None):
+    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
         trace.append((self.layer_idx, selection))
         return torch.zeros_like(q_nope)
 
     monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", spy)
 
     select_calls = []
-    original = dsa_paged.select
+    original = paged.select
 
     def counting(*args, **kwargs):
         result = original(*args, **kwargs)
         select_calls.append(result)
         return result
 
-    monkeypatch.setattr(dsa_paged, "select", counting)
+    monkeypatch.setattr(paged, "select", counting)
 
     prompt = torch.randint(0, cfg.vocab_size, (4,))  # ctx 4 == topk: identity
     decode = [torch.tensor(5)]  # ctx 5 > topk: selection engages
@@ -333,6 +350,7 @@ def test_full_to_shared_threading_order(monkeypatch):
     assert [layer for layer, _ in trace] == [0, 1]
     assert trace[0][1] is select_calls[0]
     assert trace[1][1] is select_calls[0]
+    assert dsa.ctx is None  # the forward's context closed with it
 
     # The FULL layer stored prompt + decode keys; the store has no layer for a SHARED one.
     index = driver.resources[INDEX_KV_RESOURCE]
@@ -346,16 +364,32 @@ def test_shared_layer_without_full_selection_raises():
     threading bug and must fail loudly, not attend densely off-spec."""
     cfg = _longctx_reduced_cfg(topk=4)
     model = build_random_model(cfg, seed=1)
+    resources, _ = build_cpu_resources(cfg)
     attn1 = model.model.layers[1].self_attn  # SHARED
-    with pytest.raises(RuntimeError, match="no FULL layer ran"):
-        attn1(torch.randn(1, cfg.hidden_size) * 0.1, torch.tensor([6]), dsa_ctx=_ctx(True))
+    attn1.bind_resources(resources)
+    with resources[DSA_RESOURCE].use(_ctx(True)), pytest.raises(RuntimeError, match="no FULL layer ran"):
+        attn1(torch.randn(1, cfg.hidden_size) * 0.1, torch.tensor([6]))
 
 
-def test_naive_path_refuses_dsa_ctx():
-    cfg = Glm52ModelConfig.reduced()  # mla_absorb False
+def test_a_model_built_flag_off_refuses_the_dsa_resource():
+    """Flag-off, no indexer was built or loaded: bound to a node that declares the DSA
+    resource, a FULL layer would pass for SHARED, so binding fails."""
+    cfg = _longctx_reduced_cfg(topk=4)
+    resources, _ = build_cpu_resources(cfg)
+    cfg.dsa_long_context = False
+    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=1), config=cfg)
+    assert sub.language_model.model.layers[0].self_attn.indexer is None  # FULL slot
+    with pytest.raises(RuntimeError, match="dsa_long_context off"):
+        sub.bind_node_resources(resources)
+
+
+def test_the_naive_path_refuses_the_dsa_resource():
+    cfg = _longctx_reduced_cfg(topk=4)
+    resources, _ = build_cpu_resources(cfg)
+    cfg.mla_absorb = False
     attn = Glm52MLAAttention(cfg, layer_idx=0)
     with pytest.raises(RuntimeError, match="mla_absorb"):
-        attn(torch.randn(2, cfg.hidden_size), torch.arange(2), dsa_ctx=_ctx(False))
+        attn.bind_resources(resources)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +421,7 @@ def test_decode_across_topk_prefix_property_and_divergence():
     cfg.index_topk = 512  # dense comparator: identity regime end to end
     driver2 = _Driver(sub, cfg, page_size=4)  # fresh cache, same weights
     dense_logits = _serve_steps(driver2, prompt, decode)
-    sub.cleanup_request("r0")
+    driver2.runner.remove_request("r0")
 
     for i in range(4):  # prefill + decode steps 0..2
         assert torch.equal(sparse_logits[i], dense_logits[i]), f"step {i}"
