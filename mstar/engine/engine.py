@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -518,6 +518,13 @@ class Engine:
         self._chunking_policies: dict[tuple[str, str], ChunkingPolicy] = {}
         # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
         self._token_budget_overrides: dict[str | tuple[str, str], int | None] = {}
+        # (node, real walk) -> the combined walk the scheduler batches it under
+        self._combined_walk_of: dict[tuple[str, str], str] = {}
+        # nodes whose walks' budgets also cap their rows inside a combined step
+        # (the serving config's can_override_mixed_max_tokens)
+        self._override_mixed: frozenset[str] = frozenset()
+        # (node, combined walk) -> walk -> the cap on that walk's rows in a step
+        self._walk_caps_cache: dict[tuple[str, str], dict[str, int] | None] = {}
 
     def load_model(
         self,
@@ -979,10 +986,13 @@ class Engine:
     def _check_token_budget(
         self, batch: ExecutingBatch, node_inputs: list[NodeInputs],
     ) -> None:
-        """Warn when a step runs over its walk's token budget: the scheduler
-        sizes a speculation merge's continuing rows by estimate, before their
-        inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
+        """Warn when a step runs over the budget it was scheduled under: that of
+        the combined walk it ran in, if any, which a step relabelled to one
+        walk still did. A row too long to cut runs whole, and a speculation
+        merge sizes its continuing rows by estimate, before their inputs
+        exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
         walk = batch.step_context.graph_walk
+        walk = self._combined_walk_of.get((batch.node_name, walk), walk)
         budget = self.get_max_batch_tokens(batch.node_name, walk)
         if budget is None:
             return
@@ -993,8 +1003,9 @@ class Engine:
         count = self._token_budget_overruns[key] = self._token_budget_overruns.get(key, 0) + 1
         if count & (count - 1) == 0:
             logger.warning(
-                "%s/%s: step of %d tokens over its budget of %d (%d overruns so far); "
-                "a speculation merge's continuing rows ran more tokens than estimated",
+                "%s/%s: step of %d tokens over its budget of %d (%d overruns so far): "
+                "a row too long to cut ran whole, or continuing rows ran more tokens "
+                "than estimated",
                 batch.node_name, walk, total, budget, count,
             )
 
@@ -2360,13 +2371,28 @@ class Engine:
                 return self._token_budget_overrides[key]
         return budget
 
-    def set_token_budgets(self, overrides: Mapping[str, Any], walks: set[str]) -> None:
+    def set_token_budgets(
+        self, overrides: Mapping[str, Any], walks: set[str],
+        combined_walk_of: Mapping[tuple[str, str], str] | None = None,
+        override_mixed: Collection[str] = (),
+    ) -> None:
         """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
 
         Per node, one budget for every walk the model budgets, or a mapping of
         walk -> budget; null turns chunking off. Only walks the submodule
         budgets can be overridden: elsewhere the setting would do nothing.
+
+        A walk inside a combined walk runs in the combined walk's steps, under
+        the combined walk's budget, so its own budget applies there only on a
+        node in ``override_mixed`` (``can_override_mixed_max_tokens``), where
+        it caps that walk's rows within the step. Elsewhere a per-walk override
+        of such a walk would do nothing, so it is refused; the combined walk
+        itself can be named instead.
         """
+        self._combined_walk_of = dict(combined_walk_of or {})
+        self._override_mixed = frozenset(override_mixed)
+        self._walk_caps_cache = {}
+        combined_walks = {(node, combined) for (node, _), combined in self._combined_walk_of.items()}
         for node, setting in overrides.items():
             if node not in self._submodules:
                 continue
@@ -2377,13 +2403,42 @@ class Engine:
                 if walk is None:
                     self._token_budget_overrides[node] = budget
                     continue
-                if walk not in walks:
+                if walk not in walks and (node, walk) not in combined_walks:
                     raise ValueError(f"max_batch_tokens names walk {walk!r} of {node}, which the model never runs")
+                combined = self._combined_walk_of.get((node, walk))
+                if combined is not None and node not in self._override_mixed:
+                    raise ValueError(
+                        f"max_batch_tokens for {node}/{walk}: {walk} runs in {combined!r} steps, "
+                        f"under {combined!r}'s budget, so this would do nothing; set "
+                        f"can_override_mixed_max_tokens for {node} to cap {walk}'s rows within "
+                        f"those steps, or budget {node} (or {node}/{combined}) instead"
+                    )
                 if self.chunking_policy(node, walk).max_batch_tokens is None:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._token_budget_overrides[(node, walk)] = budget
 
+    def walk_token_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
+        """Under a combined walk on a node with ``can_override_mixed_max_tokens``:
+        walk -> the most tokens that walk's rows may run in one step, for the
+        walks with a budget of their own. None otherwise."""
+        key = (node_name, graph_walk)
+        if key not in self._walk_caps_cache:
+            caps = None
+            if node_name in self._override_mixed:
+                caps = {
+                    walk: budget
+                    for (node, walk), combined in self._combined_walk_of.items()
+                    if node == node_name and combined == graph_walk
+                    and (budget := self.get_max_batch_tokens(node, walk)) is not None
+                } or None
+            self._walk_caps_cache[key] = caps
+        return self._walk_caps_cache[key]
+
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
+        """The submodule's say, unless the serving config turned the walk's
+        chunking off (a null budget)."""
+        if self._token_budget_overrides.get((node_name, graph_walk), 0) is None:
+            return False
         return self.chunking_policy(node_name, graph_walk).chunkable
 
     def chunked_prefill_output_policies(

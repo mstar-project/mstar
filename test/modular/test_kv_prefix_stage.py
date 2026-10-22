@@ -87,6 +87,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
     # every node keys WALK, as a declaration would name it
     engine._keyed_walks = {node: {WALK} for node in node_resources}
     engine._chunking_policies = {}
+    engine._combined_walk_of = {}
     engine._prefix_model = "_Model"
     engine._loopback_steps = {}
     return engine

@@ -114,6 +114,7 @@ def _engine(resources=(), sub=None, keyed=False) -> Engine:
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"
     eng._chunking_policies = {}
+    eng._combined_walk_of = {}
     return eng
 
 

@@ -336,18 +336,36 @@ It doesn't replace the cap.
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
 budgets. A deployment can override them per node, either with one budget for every walk
-the model budgets or with a budget per walk:
+the model budgets or with a budget per walk; null turns a walk's chunking off.
+
+Most chunked walks run inside a combined walk, which batches a node's prompts and its
+decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
+BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
+walk's budget, so that is the one to set, by naming the node or the combined walk:
 
 .. code-block:: yaml
 
    max_batch_tokens:
-     LLM: 512                    # every budgeted walk of LLM
+     LLM: 512                    # every budgeted walk of LLM, its combined walk's too
      Thinker:
-       prefill_text: 1024
-       prefill_vision: null      # null turns chunking off for this walk
+       thinker_mixed: 1024       # the budget of a Thinker step
 
-Loading fails if a node is not in any node group, if a walk is one the model never runs, or
-if the model sets no budget for that walk.
+A walk inside a combined walk takes a budget of its own only on a node listed in
+``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps
+that walk's rows within each step, under the step's budget, and null keeps its prompts
+whole:
+
+.. code-block:: yaml
+
+   can_override_mixed_max_tokens: {Thinker: true}
+   max_batch_tokens:
+     Thinker:
+       prefill_vision: 512       # vision rows take at most 512 of a step's tokens
+       prefill_audio: null       # audio prompts run whole
+
+Loading fails if a node is not in any node group, if a walk is one the model never runs, if
+the model sets no budget for that walk, or if the walk is inside a combined walk and its
+node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
 
 **Single GPU.** Everything on rank 0:
 

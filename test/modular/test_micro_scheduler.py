@@ -1698,13 +1698,18 @@ def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
 class _ChunkingEngine(_SizedEngine):
     """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
 
-    def __init__(self, cached=None, **kw):
+    def __init__(self, cached=None, walk_caps=None, **kw):
         super().__init__(unready=(), **kw)
         self.cached = cached or {}
+        self.walk_caps = walk_caps
 
     def get_max_batch_tokens(self, node_name, graph_walk):
         del node_name, graph_walk
         return 4
+
+    def walk_token_caps(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self.walk_caps
 
     def supports_chunked_prefill(self, node_name, graph_walk):
         del node_name
@@ -1735,6 +1740,29 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
 
     sched.advance_chunk("p0", NODE, 10)
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
+
+
+def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
+    """can_override_mixed_max_tokens: the prompt's walk is capped at 1 token a
+    step inside a budget of 4, where it would otherwise take the 2 the two
+    decode rows leave."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 1}))
+    sched.get_tensor = lambda uuid: uuid
+
+    first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
+
+    assert first.chunk_ranges == {"p0": (0, 1, 10)}
+    assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
+
+
+def test_a_walk_cap_shares_itself_among_its_rows():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 2}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (0, 1, 10), "p1": (0, 1, 10)}
 
 
 def test_a_chunked_row_starts_past_its_cached_prefix():

@@ -33,6 +33,7 @@ def _engine_with(submodule) -> Engine:
     engine._enable_nvtx = False
     engine._loopback_steps = {}
     engine._chunking_policies = {}
+    engine._combined_walk_of = {}
     return engine
 
 

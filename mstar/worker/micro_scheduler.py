@@ -856,6 +856,10 @@ class MicroScheduler:
             pre_existing_batch_size=pre_existing_batch_size,
             pre_existing_walk=pre_existing_walk,
             max_batch_tokens=max_tokens if row_tokens else None,
+            walk_max_tokens=(
+                self.engine_manager.get_engine(node_walk[0]).walk_token_caps(*node_walk)
+                if row_tokens and max_tokens is not None else None
+            ),
             row_tokens=row_tokens,
             chunkable=chunkable,
         ))

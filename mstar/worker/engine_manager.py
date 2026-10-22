@@ -352,11 +352,19 @@ class EngineManager:
             model=model,
         )
         budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
         known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        unknown = sorted(set(budgets) - known)
-        if unknown:
-            raise ValueError(f"max_batch_tokens names nodes {unknown} that no node group serves")
-        engine.set_token_budgets(budgets, set(model.get_graph_walk_graphs()))
+        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        if not all(isinstance(flag, bool) for flag in override_mixed.values()):
+            raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
+        engine.set_token_budgets(
+            budgets, set(model.get_graph_walk_graphs()),
+            combined_walk_of=model.combined_walk_of(),
+            override_mixed={node for node, flag in override_mixed.items() if flag},
+        )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))

@@ -146,6 +146,7 @@ def test_finished_request_re_queued_fails_alone_instead_of_asserting():
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     eng._chunking_policies = {}
+    eng._combined_walk_of = {}
 
     eng.prepare_inputs(batch)
 

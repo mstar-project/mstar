@@ -94,6 +94,7 @@ def _engine(sub):
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     eng._chunking_policies = {}
+    eng._combined_walk_of = {}
     eng._runner = StepRunner({})
     return eng
 

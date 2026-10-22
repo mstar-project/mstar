@@ -41,6 +41,9 @@ class BatchBuildRequest:
     # Token budget for the step; None for none. With it, each row's remaining
     # tokens, and the rows that may be cut into chunks.
     max_batch_tokens: int | None = None
+    # Under a combined walk: walk -> the most tokens that walk's rows may run
+    # within the step's budget (can_override_mixed_max_tokens); None for none.
+    walk_max_tokens: dict[str, int] | None = None
     row_tokens: dict[int, int] = field(default_factory=dict)
     chunkable: set[int] = field(default_factory=set)
     # `Engine.capture_group` for one rid of this (node, walk).
@@ -197,6 +200,8 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             list(scheduled.request_to_worker_graph), request.row_tokens,
             request.chunkable, request.max_batch_tokens,
         )
+        if request.walk_max_tokens:
+            _cap_walks(scheduled, take, dropped, request.chunkable, request.walk_max_tokens)
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
         }
@@ -249,6 +254,25 @@ def fill_token_budget(
         take[head] = min(need, max(budget, 1)) if head in chunkable else need
         dropped.discard(head)
     return take, dropped
+
+
+def _cap_walks(
+    batch: "ScheduledBatch", take: dict[int, int], dropped: set[int],
+    chunkable: set[int], caps: dict[str, int],
+) -> None:
+    """Hold each capped walk's rows to its cap as well as the step's budget:
+    those rows share the cap as ``fill_token_budget`` shares a budget, from
+    what the step's budget gave them. A token one gives up is not handed to
+    another walk. Updates ``take`` and ``dropped`` in place."""
+    for walk, cap in caps.items():
+        rids = [rid for rid in batch.request_to_worker_graph if rid in take and batch.walk_of(rid) == walk]
+        if sum(take[rid] for rid in rids) <= cap:
+            continue
+        walk_take, walk_dropped = fill_token_budget(rids, {rid: take[rid] for rid in rids}, chunkable, cap)
+        for rid in rids:
+            del take[rid]
+        take.update(walk_take)
+        dropped |= walk_dropped
 
 
 def _single_walk(batch: "ScheduledBatch", request: BatchBuildRequest) -> str | None:

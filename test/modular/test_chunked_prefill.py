@@ -117,6 +117,7 @@ def _engine_with(submodule):
     engine._chunk_inputs = {}
     engine._keyed_walks = {}
     engine._chunking_policies = {}
+    engine._combined_walk_of = {}
     return engine
 
 
@@ -332,6 +333,7 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
     engine._token_budget_overruns = {}
     engine._token_budget_overrides = {}
     engine._chunking_policies = {}
+    engine._combined_walk_of = {}
     engine._submodules = {"LLM": SimpleNamespace(
         submodule=SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=4)),
     )}
@@ -399,6 +401,7 @@ def _budgeted_engine():
     engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
     engine._token_budget_overrides = {}
     engine._chunking_policies = {}
+    engine._combined_walk_of = {}
     return engine
 
 
@@ -428,6 +431,93 @@ def test_a_budget_the_model_does_not_set_is_refused():
         engine.set_token_budgets({"LLM": {"prefil": 8}}, {"prefill"})
     with pytest.raises(ValueError, match="positive int"):
         engine.set_token_budgets({"LLM": 0}, {"prefill"})
+
+
+# ── engine: budgets under a combined walk ──────────────────────────────
+
+COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}
+WALKS = {"prefill", "decode"}
+
+
+def _mixed_engine():
+    from types import SimpleNamespace
+
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    engine = _budgeted_engine()
+    budgets = {"prefill": 512, "mixed": 1024}
+    engine._submodules["LLM"] = SimpleNamespace(submodule=SimpleNamespace(
+        get_chunking_policy=lambda walk: ChunkingPolicy(
+            chunkable=walk == "prefill", max_batch_tokens=budgets.get(walk),
+        ),
+    ))
+    return engine
+
+
+def test_a_walk_budget_inside_a_combined_walk_is_refused_without_the_flag():
+    """Its steps run under the combined walk's budget, so it would do nothing."""
+    import pytest
+
+    engine = _mixed_engine()
+    with pytest.raises(ValueError, match="can_override_mixed_max_tokens for LLM"):
+        engine.set_token_budgets({"LLM": {"prefill": 64}}, WALKS, COMBINED)
+
+
+def test_the_combined_walk_itself_takes_a_budget():
+    engine = _mixed_engine()
+    engine.set_token_budgets({"LLM": {"mixed": 256}}, WALKS, COMBINED)
+
+    assert engine.get_max_batch_tokens("LLM", "mixed") == 256
+    assert engine.walk_token_caps("LLM", "mixed") is None
+
+
+def test_with_the_flag_a_walk_budget_caps_its_rows_in_a_mixed_step():
+    engine = _mixed_engine()
+    engine.set_token_budgets({"LLM": {"prefill": 64}}, WALKS, COMBINED, override_mixed={"LLM"})
+
+    assert engine.get_max_batch_tokens("LLM", "mixed") == 1024
+    assert engine.walk_token_caps("LLM", "mixed") == {"prefill": 64}
+
+
+def test_with_the_flag_the_models_own_walk_budget_caps_too():
+    engine = _mixed_engine()
+    engine.set_token_budgets({}, WALKS, COMBINED, override_mixed={"LLM"})
+
+    assert engine.walk_token_caps("LLM", "mixed") == {"prefill": 512}
+
+
+def test_without_the_flag_a_combined_step_has_no_walk_caps():
+    engine = _mixed_engine()
+    engine.set_token_budgets({}, WALKS, COMBINED)
+
+    assert engine.walk_token_caps("LLM", "mixed") is None
+
+
+def test_with_the_flag_a_null_walk_budget_turns_its_chunking_off():
+    engine = _mixed_engine()
+    engine.set_token_budgets({"LLM": {"prefill": None}}, WALKS, COMBINED, override_mixed={"LLM"})
+
+    assert not engine.supports_chunked_prefill("LLM", "prefill")
+    assert engine.walk_token_caps("LLM", "mixed") is None
+
+
+def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(caplog):
+    """A step of only prompt rows runs as ``prefill`` but was scheduled under
+    ``mixed``'s budget; the walk's own cap is not what the step is held to."""
+    from types import SimpleNamespace
+
+    engine = _mixed_engine()
+    engine._token_budget_overruns = {}
+    engine.set_token_budgets({"LLM": {"prefill": 64}}, WALKS, COMBINED, override_mixed={"LLM"})
+    batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="prefill"))
+
+    with caplog.at_level("WARNING"):
+        engine._check_token_budget(batch, [SimpleNamespace(input_seq_len=600)])
+        assert not caplog.records
+        engine._check_token_budget(batch, [SimpleNamespace(input_seq_len=2000)])
+
+    assert engine._token_budget_overruns == {("LLM", "mixed"): 1}
+    assert "over its budget of 1024" in caplog.records[0].getMessage()
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────
