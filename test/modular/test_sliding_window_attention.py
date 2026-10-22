@@ -1,6 +1,6 @@
 """Window plumbing on CPU, plus opt-in single-GPU numerical and replay tests.
 
-Run with unittest discover -s test/attention. Set MSTAR_TEST_CUDA=1 to also
+Run with pytest test/modular/test_sliding_window_attention.py. Set MSTAR_TEST_CUDA=1 to also
 exercise FlashInfer against an explicit FP32 PyTorch attention reference.
 """
 

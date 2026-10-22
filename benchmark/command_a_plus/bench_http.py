@@ -9,7 +9,7 @@ TTFT is measured separately, as the latency of a ``max_output_tokens=1`` request
 (prefill plus one decode step) — the server's non-streaming ``/generate`` has no
 earlier observable point.
 
-    python -m test.command_a_plus.bench_http --url http://127.0.0.1:8000 \
+    python -m benchmark.command_a_plus.bench_http --url http://127.0.0.1:8000 \
       --concurrency 1 8 32 64 --output bench.json
 """
 

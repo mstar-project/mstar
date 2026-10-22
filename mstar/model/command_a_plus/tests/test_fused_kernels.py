@@ -18,7 +18,7 @@ from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusRouter,
 )
 from mstar.model.command_a_plus.config import CommandAPlusConfig
-from test.command_a_plus.test_backbone import bind_test_resources, dense_reference
+from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources, dense_reference
 
 CUDA = torch.cuda.is_available()
 

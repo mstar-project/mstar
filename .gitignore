@@ -11,7 +11,7 @@ uv.lock
 *.json
 !examples/observability/grafana/dashboards/*.json
 !mstar/utils/fused_moe/configs/*.json
-!test/command_a_plus/fixtures/tiny_config.json
+!mstar/model/command_a_plus/tests/fixtures/tiny_config.json
 profiler/
 traces/
 

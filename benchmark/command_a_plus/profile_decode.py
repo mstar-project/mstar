@@ -4,7 +4,7 @@ Reports per-step latency at several batch sizes, then a torch.profiler
 breakdown (GPU busy time vs wall time, top ops) for batch size 1.
 
     torchrun --standalone --nproc-per-node=4 --module \
-      test.command_a_plus.profile_decode --checkpoint /local/checkpoint --output /scratch/prof
+      benchmark.command_a_plus.profile_decode --checkpoint /local/checkpoint --output /scratch/prof
 """
 
 import argparse
@@ -17,8 +17,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from benchmark.command_a_plus.validate_checkpoint import PROMPTS, Runtime
 from mstar.distributed.communication import CommGroup
-from test.command_a_plus.validate_checkpoint import PROMPTS, Runtime
 
 
 def decode_timings(runtime, batch_size, steps, warmup):

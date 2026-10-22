@@ -335,7 +335,7 @@ not the GPUs, is the limit. See :doc:`environment_variables` for the
 ``COMMAND_A_PLUS_*`` switches that turn the fused path, the one-shot
 all-reduce or decode graphs off.
 
-Against the Hugging Face reference (``test/command_a_plus/validate_checkpoint.py``,
+Against the Hugging Face reference (``benchmark/command_a_plus/validate_checkpoint.py``,
 three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output
 matches on all three prompts. ``bench_http.py``, ``parity_http.py`` and
 ``profile_decode.py`` in the same directory benchmark, diff greedy outputs and
