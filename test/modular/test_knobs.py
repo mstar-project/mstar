@@ -29,18 +29,21 @@ def test_defaults_without_config_or_env():
     assert knobs.kv_chain_lazy_steps() == 1
     assert knobs.kv_plan_cache() == 0
     assert knobs.kv_pinned_indptrs() is False
+    assert knobs.gc_gen0_threshold() == 0
 
 
 def test_config_sets_knobs():
     knobs.configure({
         "device_loopback": False, "ingraph_decode_rope": True,
         "kv_plan_cache": 2, "sampler_slots": 512, "kv_chain_lazy_steps": 16,
+        "gc_gen0_threshold": 50000,
     })
     assert knobs.device_loopback_enabled() is False
     assert knobs.ingraph_decode_rope() is True
     assert knobs.kv_plan_cache() == 2
     assert knobs.sampler_slots() == 512
     assert knobs.kv_chain_lazy_steps() == 16
+    assert knobs.gc_gen0_threshold() == 50000
 
 
 def test_env_overrides_config(monkeypatch):

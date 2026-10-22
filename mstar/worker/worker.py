@@ -112,6 +112,16 @@ _ADMIT_FENCE_TIMEOUT_S = 10.0
 _REMOVED_RIDS_KEEP = 4096
 
 
+def _thread_role() -> str:
+    """The worker thread this runs on, by the executors' name prefixes."""
+    name = threading.current_thread().name
+    if name.startswith("mstar-gpu-"):
+        return "gpu"
+    if name.startswith("mstar-plan-"):
+        return "plan"
+    return "main" if threading.current_thread() is threading.main_thread() else "other"
+
+
 def _make_graph_runtime(
     communicator,
     tensor_manager,
@@ -2031,6 +2041,25 @@ class Worker:
                     self._phase_buf[cpu].append(_time.thread_time() - c0)
             if nvtx:
                 range_pop(synchronize=False)
+
+    # wall time of each collection by generation, on whichever thread ran it;
+    # a per-thread start stamp because collections on two threads can interleave
+    _GC_PHASES = ("gc.gen0", "gc.gen1", "gc.gen2")
+    _gc_t0 = threading.local()
+
+    def _gc_phase_callback(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._gc_t0.t = _time.perf_counter()
+        else:
+            t0 = getattr(self._gc_t0, "t", None)
+            if t0 is not None:
+                dt = _time.perf_counter() - t0
+                name = self._GC_PHASES[info["generation"]]
+                self._phase_buf[name].append(dt)
+                # and by thread: a collection is charged to whatever span
+                # allocated when it triggered, so this says whose spans
+                # carry it (gc.gen0.main / .gpu / .plan)
+                self._phase_buf[f"{name}.{_thread_role()}"].append(dt)
 
     def _phase_record(self, name: str, dt: float) -> None:
         if self._phase_period > 0:
@@ -4345,6 +4374,11 @@ class Worker:
             "Worker %s: gc.freeze() after warmup — %d objects moved to the "
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
+        if gen0 := knobs.gc_gen0_threshold():
+            gc.set_threshold(gen0, *gc.get_threshold()[1:])
+            logger.info("Worker %s: gc thresholds %s", self.worker_id, gc.get_threshold())
+        if self._phase_period:
+            gc.callbacks.append(self._gc_phase_callback)
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main

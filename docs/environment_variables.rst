@@ -503,6 +503,16 @@ Worker scheduling
        one and FlashInfer makes the indices copy blocking. No measurable gain
        at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
        event per plan, which a buffer set waits on before it is rewritten.
+   * - ``MSTAR_GC_GEN0_THRESHOLD``
+     - config's ``knobs: gc_gen0_threshold``, else ``0``
+     - The generation-0 garbage-collection threshold a worker sets after
+       warmup (``0`` keeps CPython's 700). A decode step at 128 rows keeps
+       more than 700 young container objects alive at its peak, so at 700 a
+       collection runs almost every step and escalates to a full one (about
+       10 ms) every few hundred steps; the time lands in whichever span is
+       allocating. ``50000`` removed them on Qwen3.5 0.8B at c=128 (an 8%
+       shorter decode step), at the cost of holding at most that many young
+       objects between collections. Read by ``knobs.gc_gen0_threshold``.
    * - ``MSTAR_KV_PLAN_CACHE``
      - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's
