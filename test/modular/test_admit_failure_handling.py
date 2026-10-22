@@ -139,6 +139,7 @@ def _batches(reason, prepared=("r0", "r1"), cached=()):
     )
     node_batch = SimpleNamespace(
         node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
+        rebuild_rids=frozenset(),
     )
     return batch, node_batch
 

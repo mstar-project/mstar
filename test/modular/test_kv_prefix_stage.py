@@ -95,6 +95,7 @@ def _batch(node_name: str = NODE):
         ),
         per_request_info={RID: None},
         per_request_info_wrapped={RID: None},
+        rebuild_rids=frozenset(),
     )
 
 

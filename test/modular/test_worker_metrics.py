@@ -284,7 +284,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
         return ScheduledBatch(node_name=NODE, graph_walk=name,
                               request_to_worker_graph={f"{name}.{i}": 0 for i in range(rows)})
 
-    def executing(batch):
+    def executing(batch, rebuild=None):
         return ExecutingBatch(
             node_name=NODE,
             per_request_info={rid: SimpleNamespace(rid=rid, n=1) for rid in batch.request_to_worker_graph},
@@ -327,7 +327,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
+    w._in_flight_rids, w._rebuild_rows = set(), {}
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
