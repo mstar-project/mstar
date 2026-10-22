@@ -99,16 +99,12 @@ def test_cleanup_request_evicts_kstore():
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
     sub._dsa_k_store = Glm52DsaKStore()
-    sub._token_budget = {"r0": 20}
-    sub._ended_at_prefill = {"r0"}
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
-    sub.request_state("r0")  # base per-request state exists too
+    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
     assert sub.request_states == {}
-    assert sub._token_budget == {}
-    assert sub._ended_at_prefill == set()
     sub.cleanup_request("r0")  # idempotent, like the base hook
 
 

@@ -280,8 +280,7 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub._dsa_k_store = Glm52DsaKStore()
-    sub._token_budget = {}  # no prefill ran: check_stop falls back to the request's max_tokens
-    sub._ended_at_prefill = set()
+    sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     return sub
 
 

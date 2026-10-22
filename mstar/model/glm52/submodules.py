@@ -75,17 +75,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # FULL layers each forward when dsa_long_context is on; evicted in
         # cleanup_request.
         self._dsa_k_store = Glm52DsaKStore()
-        # per request: max_tokens capped at the context limit (prompt-aware,
-        # set by the prefill's preprocess); read by check_stop
-        self._token_budget: dict[str, int] = {}
-        # requests whose prefill sampled a stop token: the prefill walk has no loop
-        # to stop, so the first decode step stops decode_loop and emits nothing
-        self._ended_at_prefill: set[str] = set()
+        # Per request, in its request_state: "token_budget", max_tokens capped at the
+        # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop);
+        # "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no loop
+        # to stop, so the first decode step stops decode_loop and emits nothing.
 
     def cleanup_request(self, request_id: str):
         self._dsa_k_store.evict(request_id)
-        self._token_budget.pop(request_id, None)
-        self._ended_at_prefill.discard(request_id)
         super().cleanup_request(request_id)
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
@@ -275,7 +271,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 "request %s: max_tokens %d capped to %d by the context limit %d",
                 rid, asked, budget, self._context_limit(),
             )
-        self._token_budget[rid] = budget
+        self.request_state(rid).add("token_budget", budget)
 
     @staticmethod
     def _page_tables(engine_inputs: ModelInputsFromEngine) -> list[list[int]]:
@@ -431,7 +427,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-        if request_id in self._ended_at_prefill:
+        if self.request_state(request_id).get("ended_at_prefill"):
             # the reply already ended: this step only closes the decode loop
             del outputs["new_token"]
 
@@ -440,20 +436,21 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if request_id in self._ended_at_prefill:
+        state = self.request_state(request_id)
+        if state.get("ended_at_prefill"):
             return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
         # the prompt-aware cap from the prefill's preprocess, else the request's own
-        budget = self._token_budget.get(request_id, request_info.max_tokens)
+        budget = state.get("token_budget", request_info.max_tokens)
         token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
         if request_info.graph_walk == "prefill":
             # no decode_loop on this walk to stop: a stop token ends the reply at the first
             # decode step, and the conductor ends a max_tokens of 1 here
             if not ignore_eos and is_eos:
-                self._ended_at_prefill.add(request_id)
+                state.add("ended_at_prefill", True)
             return set()
         # max_tokens counts the token the prefill emits, so the total is
         # 1 + (iters + 1) decode tokens

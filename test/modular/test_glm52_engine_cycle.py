@@ -244,7 +244,7 @@ def test_stream_stops_cleanly_at_the_context_limit():
     stream = _drive(driver, prompt, _fwd_info("r0", 40, True))
     kv = driver.resources[KV_RESOURCE]
     expect_tokens = limit - prompt_len
-    assert sub._token_budget["r0"] == expect_tokens
+    assert sub.request_state("r0")["token_budget"] == expect_tokens
     assert stream.numel() == expect_tokens
     assert kv.stored_len("r0") == limit - 1
     assert len(kv._streams["r0"]["main"].page_indices) == limit // 8
@@ -285,7 +285,7 @@ def test_budget_within_the_window_is_untouched():
     driver = _Driver(sub, cfg, ["r0"])
     prompt = torch.arange(5, dtype=torch.long) + 3
     stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
-    assert sub._token_budget["r0"] == 9
+    assert sub.request_state("r0")["token_budget"] == 9
     assert stream.numel() == 9
 
 
