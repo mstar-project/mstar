@@ -1351,6 +1351,32 @@ def test_refusals_never_hold_up_reading(monkeypatch, tmp_path, frames):
     assert ("submit", "c", True) in fake.calls
 
 
+
+def test_every_append_queued_behind_a_refused_opening_is_answered(monkeypatch, tmp_path):
+    """Appends read before their call's opening was refused each get the late
+    reply, the later ones too: each waits on the call it named when it was
+    read, not on whatever holds that id once it runs."""
+
+    class _Busy(_StreamingFakeServer):
+        def submit_request(self, **kwargs):
+            if kwargs["request_id"] == "b":
+                raise HTTPException(status_code=503, detail="server busy")
+            return super().submit_request(**kwargs)
+
+    fake = _Busy(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    wav = {"name": "c.wav", "data": "UklGRg=="}
+    ws = _QueuedFramesSocket([
+        {"request_id": "b", "output_modalities": "text"},
+        *[{"request_id": "b", "append": [wav]} for _ in range(3)],
+    ])
+    asyncio.run(_serve(ws, until=lambda: sum(1 for m in ws.sent if m.get("append")) == 3))
+
+    late = [m for m in ws.sent if m.get("append")]
+    assert len(late) == 3 and all("not taking input" in m["error"] for m in late)
+    assert [m["status"] for m in ws.sent if not m.get("append")] == [503]
+
+
 def test_an_append_file_that_cannot_be_deleted_does_not_end_the_socket(monkeypatch, tmp_path):
     class _Refuses(_StreamingFakeServer):
         def stream_input(self, key, file_paths=None, end_input=False, **append):

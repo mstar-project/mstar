@@ -992,12 +992,11 @@ class Engine:
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                     has_loopback=loopback is not None and loopback[i],
                 )
-                if req_inputs is not None:
-                    if probe_prefix:
-                        req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
-                    if probe_prefix or mixed:
-                        # the submodule reads a mixed step's rows by their own walk
-                        req_inputs.graph_walk = row_walk
+                if req_inputs is not None and probe_prefix:
+                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                if req_inputs is not None and (probe_prefix or mixed):
+                    # the submodule reads a mixed step's rows by their own walk
+                    req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
@@ -1480,7 +1479,8 @@ class Engine:
         total_tokens = sum(inp.input_seq_len for inp in inputs)
         leases = {}
         for label, runner in runners.items():
-            if not runner.lease_before_step:
+            # a batch the region refuses runs it eagerly, with no slot
+            if not runner.lease_before_step or not runner.can_lease(inputs):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
@@ -1733,7 +1733,7 @@ class Engine:
                         piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
             for rid in batch.cached_rids:
-                self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         return outputs
 
     def check_stop_for_batch(
