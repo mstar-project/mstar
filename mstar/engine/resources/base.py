@@ -197,6 +197,11 @@ class Resource(ABC):
         """
         return ADMIT_OK
 
+    def requeue(self, rid: str) -> None:
+        """Undo what `admit_retrieve` reserved for ``rid`` in the same sweep, because another
+        resource on the node returned an outcome with ``held_back`` set."""
+        return
+
     # Step lifecycle
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
