@@ -580,7 +580,7 @@ def _constructed(name, model_kwargs, **overrides):
 
 def _bagel(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.bagel.bagel_model import BagelModel
-    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50))
+    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50, max_position_embeddings=32768))
 
 
 def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):

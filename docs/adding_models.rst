@@ -809,7 +809,8 @@ Step 3 — Declare the computation graph
   concurrently.
 - ``Loop(name, section, max_iters, outputs)`` is a subgraph that iterates. Its body feeds
   its own outputs back as the inputs of the next iteration. It runs at most ``max_iters``
-  times, and can stop earlier. Give the loop a ``name`` so that a submodule's
+  times, and can stop earlier. A decode loop's ``max_iters`` is the model's context length,
+  and each request's own length is its cap from ``get_loop_caps``. Give the loop a ``name`` so that a submodule's
   ``check_stop`` can register a stop signal against it. This is the usual ``decode`` loop.
 
 A minimal text generator has two walks: a ``prefill`` node that runs once, and a
@@ -832,7 +833,7 @@ A minimal text generator has two walks: a ``prefill`` node that runs once, and a
                input_names=["text_inputs"],
                outputs=[GraphEdge(next_node="LLM", name="text_inputs")],  # loop-back
            ),
-           max_iters=self.get_max_output_tokens(),
+           max_iters=self.config.max_position_embeddings,
            outputs=[],
        )
        return dict(prefill=prefill, decode=decode)

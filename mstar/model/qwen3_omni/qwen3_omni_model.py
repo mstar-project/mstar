@@ -448,7 +448,7 @@ class Qwen3OmniModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
@@ -505,7 +505,7 @@ class Qwen3OmniModel(Model):
                     )
                 ]
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 

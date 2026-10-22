@@ -41,7 +41,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50,
+        num_timesteps=50, max_position_embeddings=32768,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
