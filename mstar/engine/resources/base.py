@@ -62,6 +62,8 @@ class EngineResourceInfo:
     kv_dtype: torch.dtype = torch.bfloat16
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
+    # this resource's local nodes
+    nodes: "frozenset[str] | None" = None
     # the specs this one named in `depends_on`, by resource key
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict

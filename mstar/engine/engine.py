@@ -543,6 +543,7 @@ class Engine:
                             spec.nodes, relevant_nodes
                         )
                     ),
+                    nodes=frozenset(relevant_nodes),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
