@@ -118,13 +118,16 @@ def build_cpu_resources(
     config, request_ids: list[str] = (), max_num_pages: int = 64,
     page_size: int = 8,
 ) -> tuple[dict[str, Resource], StepRunner]:
-    """The node's four resources on CPU: a real ``KVManager`` (MLA latent or
+    """The node's resources on CPU: a real ``KVManager`` (MLA latent or
     NHD, per ``config.mla_absorb``), the matching attention resource (the
     real MLA one on its torch fallback, or the reference K/V one), the
-    positions over the cache and a greedy sampler, plus a ``StepRunner`` over
+    positions over the cache, a greedy sampler and, under
+    ``config.dsa_long_context``, the DSA resource, plus a ``StepRunner`` over
     them. Requests in ``request_ids`` are ingested.
     """
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+    from mstar.engine.resources.dsa.config import DSAConfig
+    from mstar.engine.resources.dsa.manager import DSAManager
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
@@ -132,6 +135,7 @@ def build_cpu_resources(
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.model.glm52.config import (
         ATTN_RESOURCE,
+        DSA_RESOURCE,
         INDEX_KV_RESOURCE,
         KV_RESOURCE,
         POS_RESOURCE,
@@ -203,6 +207,11 @@ def build_cpu_resources(
     }
     if index is not None:
         resources[INDEX_KV_RESOURCE] = index
+        resources[DSA_RESOURCE] = DSAManager(
+            DSAConfig(kv_cache=KV_RESOURCE, topk=config.index_topk,
+                      sm_scale=config.qk_head_dim ** -0.5, index_cache=INDEX_KV_RESOURCE),
+            kv_cfg, index.config, device,
+        )
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:
         runner.ingest_request(rid)

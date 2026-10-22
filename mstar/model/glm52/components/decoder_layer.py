@@ -11,7 +11,6 @@ from mstar.model.glm52.components.language_model import (
     build_rmsnorm,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
 
 class Glm52DecoderLayer(nn.Module):
@@ -41,7 +40,6 @@ class Glm52DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaPagedContext | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         rows: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
@@ -53,11 +51,11 @@ class Glm52DecoderLayer(nn.Module):
         """
         if self.fused_add_rmsnorm:
             return self._forward_fused(
-                hidden_states, residual, position_ids, dsa_ctx, rope_cos_sin, rows)
+                hidden_states, residual, position_ids, rope_cos_sin, rows)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states, position_ids, dsa_ctx=dsa_ctx, rope_cos_sin=rope_cos_sin)
+            hidden_states, position_ids, rope_cos_sin=rope_cos_sin)
         hidden_states = residual + hidden_states
         if rows is not None:
             hidden_states = hidden_states.index_select(0, rows)
@@ -80,7 +78,7 @@ class Glm52DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
-    def _forward_fused(self, hidden_states, residual, position_ids, dsa_ctx, rope_cos_sin, rows):
+    def _forward_fused(self, hidden_states, residual, position_ids, rope_cos_sin, rows):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -88,7 +86,7 @@ class Glm52DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm.forward_residual(
                 hidden_states, residual, self.comm_group)
         hidden_states = self.self_attn(
-            hidden_states, position_ids, dsa_ctx=dsa_ctx, rope_cos_sin=rope_cos_sin)
+            hidden_states, position_ids, rope_cos_sin=rope_cos_sin)
         if rows is None:
             hidden_states, residual = self.post_attention_layernorm.forward_residual(
                 hidden_states, residual, self.comm_group)
