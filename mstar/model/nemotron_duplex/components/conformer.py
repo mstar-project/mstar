@@ -530,11 +530,11 @@ class ConformerStreamer:
         front.scatter_("mel", front_rows, torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
         return self.layers(new, kv, pool, rows, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
-    def front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
+    def front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool], n: list[int],
               front: "RecurrentStatePool", front_rows: "RecurrentAddressing") -> EncoderInputs | None:
-        """Append each call's chunk; the encoder-input frames it made final, or
-        None when no call has one. A call with no chunk and not at its end is
-        left as it is."""
+        """Append each call's chunk; the ``n`` encoder-input frames it made final
+        (``new_frames``, counted before the step), or None when no call has one.
+        A call with no chunk and not at its end is left as it is."""
         c, pad, hop, f = self.c, self.c.n_fft // 2, self.c.hop_length, self.c.subsampling_factor
         keep_sig, keep_mel = self.frame_samples, 2 * f
         busy = [i for i, (ch, fin) in enumerate(zip(chunks, final, strict=True))
@@ -544,7 +544,6 @@ class ConformerStreamer:
         last, sig = front.gather("last", front_rows), front.gather("sig", front_rows)
         mel_tail = front.gather("mel", front_rows)
         new_sig, new_last, new_mel = list(sig), list(last), list(mel_tail)
-        n = [0] * len(sts)
         rows, lo_hi, mel_rows = [], [], []
         for i in busy:
             st, chunk = sts[i], chunks[i]
@@ -586,8 +585,6 @@ class ConformerStreamer:
                 mels = torch.cat([mels, added[i]])
                 st.mels += added[i].shape[0]
                 new_mel[i] = F.pad(mels[-keep_mel:], (0, 0, max(0, keep_mel - mels.shape[0]), 0))
-            # also without a new mel frame: the end of the call can make its last frame final
-            n[i] = max(0, final_encoder_frames(c, st.mels, st.samples, final[i]) - st.frames)
             if n[i]:
                 start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
                 mel_rows.append((i, mels[start - first:], (st.frames - start // f, n[i])))
@@ -606,8 +603,9 @@ class ConformerStreamer:
 
     def new_frames(self, st: StreamState, samples: int, final: bool) -> int:
         """The encoder frames a step makes final for a call at ``st`` that then
-        has ``samples`` of audio, counted as ``front`` counts them, but on the
-        host before the step runs, so its declaration can name them."""
+        has ``samples`` of audio, counted on the host before the step runs, so
+        its declaration can name them and ``front`` make them. Also without a
+        new mel frame: the end of the call can make its last frame final."""
         c = self.c
         if samples <= c.n_fft // 2:
             return 0

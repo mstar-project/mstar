@@ -700,8 +700,9 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                                and (not any(n[i] for i in rest) or layers_graph(rest))):
                 steady = []
         steady_chunks = [chunks[i] for i in steady]
+        eager_n = list(n)
         for i in steady:
-            chunks[i] = None            # the eager pass leaves these calls as they are
+            chunks[i], eager_n[i] = None, 0     # the eager pass leaves these calls as they are
 
         # The rest: the same math eagerly, reading this step's plans where it
         # uses them, before any region plans its own; its layers as a graph when
@@ -709,10 +710,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # a step of its own (see can_batch).
         enc = None
         if len(steady) < len(rids):
-            enc = streamer.front(states, chunks, final, *self._pool(engine_inputs, ENCODER_FRONT))
-        # prepare_inputs counted each call's new frames on the host for the declaration
-        assert (enc.n if enc is not None else [0] * len(rids)) == [0 if i in steady else k for i, k in enumerate(n)], (
-            "the encoder's front end made other frame counts than its step declared")
+            enc = streamer.front(states, chunks, final, eager_n, *self._pool(engine_inputs, ENCODER_FRONT))
         if enc is not None:
             new = [i for i, k in enumerate(enc.n) if k]
             if layers_graph(new):
