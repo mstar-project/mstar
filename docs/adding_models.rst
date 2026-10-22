@@ -691,9 +691,8 @@ writes none), unmasked, and its writes land after. Pass
 ``source`` (``[sources, rows, H, L, 2 * head_dim]``, keys then values) when requests start
 from shared prefixes that the slots should not copy; each row reads the one its
 ``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
-the query-key distance, for Transformer-XL-style relative positions. MiniCPM-o's token2wav
-(``CACHE_FAMILIES`` in ``mstar/model/minicpm_o/components/token2wav.py``) declares three:
-its two conformer caches and its DiT's.
+the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
+like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's.
 
 Two flags cover retention rules that are not quite a token FIFO.
 ``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.

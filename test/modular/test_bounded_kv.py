@@ -350,9 +350,8 @@ def _check_stream(mgr, schedule, ieee, tol):
 ])
 def test_stream_matches_brute_force(device, dtype, per_query):
     """Rows at different positions in one batch, over one-token steps and steps
-    longer than 2 x BLOCK_N (where a per-query window leaves whole key tiles
-    masked for some queries), rows padded past their span, and rows that only
-    read (span 0), at head_dim 128."""
+    longer than 2 x BLOCK_N, rows padded past their span, and rows that only read
+    (span 0), at head_dim 128."""
     torch.manual_seed(0)
     mgr = _manager(WINDOW, per_query, dtype, device, heads=2, head_dim=128)
     schedule = [(1, [1, 1, 0]), (5, [5, 2, 0]), (150, [150, 0, 150]), (3, [3, 3, 1]),
