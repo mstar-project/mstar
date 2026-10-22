@@ -340,6 +340,17 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
     thing at B = 1 and keeps a request independent of its neighbours (R12).
     """
 
+    # Under autocast `vlln` runs in fp32 and its output *is* the residual
+    # stream, so all four blocks and both spans come out fp32. NVIDIA runs the
+    # bridge in plain bf16; so does this node, which then matches it bitwise
+    # on SDPA and hands the denoise loop bf16 rows (D14).
+    disable_autocast = True
+    # Compiled in plain bf16, a request's spans changed once a prompt of
+    # another length had been served (the recompile for dynamic shapes rounds
+    # differently), so the same request stopped returning the same actions
+    # (C11). Eager is also the arithmetic D14 matches; a captured graph keeps it.
+    disable_torch_compile = True
+
     def __init__(self, model: Gr00tN17VLBridge, config: Gr00tN17Config):
         super().__init__()
         self.model = model

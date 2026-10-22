@@ -23,8 +23,9 @@ Four traps, each of which gives a test that passes and says nothing:
 2. **The served build and the served dtype, not a hand-built module.** Each node comes from
    ``Gr00tN17Model.get_submodule``, which loads its weights strictly, and is then cast with
    ``.to(device=, dtype=)`` and run under ``autocast_scope``, as ``engine_manager.py`` and
-   ``engine.py`` do. Autocast changes the numbers: it runs LayerNorm in fp32, and C10 saw the
-   served bridge emit fp32. A path that bypassed ``get_submodule`` hid two live bugs.
+   ``engine.py`` do, both skipped for a node that sets ``disable_autocast`` (the bridge, D14).
+   Autocast changes the numbers: it runs LayerNorm in fp32, which made the bridge emit fp32
+   (C10). A path that bypassed ``get_submodule`` hid two live bugs.
 3. **Attention is a per-segment SDPA stand-in**, planned from the node's own ``declare_step``:
    its spans, and causal only where the step says so. The ragged kernels are not exercised here.
    C03 measured FlashInfer at the vision floor, and mixing a kernel swap into a stage bar would
@@ -234,7 +235,9 @@ def _build(name: str) -> Iterator[_Built]:
     """
     model = Gr00tN17Model(model_path_hf=str(_GR00T), backbone_path_hf=_BACKBONE)
     node = model.get_submodule(name, device=str(_DEVICE), autocast_dtype=_BF16)
-    built = _Built(node=node.to(device=_DEVICE, dtype=_BF16), config=model.config)
+    # an opted-out node keeps its built dtype (`engine_manager.py`)
+    cast = {} if node.disable_autocast else {"dtype": _BF16}
+    built = _Built(node=node.to(device=_DEVICE, **cast), config=model.config)
     del model, node
     gc.collect()
     yield built
@@ -279,7 +282,7 @@ def _staged(node: NodeSubmodule, key: str, inputs: dict) -> dict:
 
 def _forward(node: NodeSubmodule, tensors: dict) -> dict:
     """The forward, under the scope the engine runs it in (``engine.py``'s ``autocast_scope``)."""
-    with torch.no_grad(), autocast_scope(_BF16, _DEVICE.type):
+    with torch.no_grad(), autocast_scope(None if node.disable_autocast else _BF16, _DEVICE.type):
         return node.forward(_WALK, _ENGINE, **tensors)
 
 
