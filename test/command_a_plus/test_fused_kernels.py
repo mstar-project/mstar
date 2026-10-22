@@ -93,7 +93,7 @@ class FusedKernelTests(unittest.TestCase):
         for tokens, block_m in ((1, 16), (3, 16), (8, 16), (16, 32)):
             logits = self.randn(tokens, 128).to(torch.bfloat16)
             logits[0, 5] = logits[0, 9] = logits[0].max() + 1  # tie: lowest index first
-            weights, ids, (sorted_ids, expert_ids, post_pad) = route_align(logits, 8, block_m, torch.bfloat16)
+            weights, ids, (sorted_ids, expert_ids, post_pad, _) = route_align(logits, 8, block_m, torch.bfloat16)
             ref_weights, ref_ids = sigmoid_topk(logits, 8, torch.bfloat16)
             self.assertTrue(torch.equal(ids, ref_ids))
             self.assertTrue(torch.equal(weights, ref_weights))
