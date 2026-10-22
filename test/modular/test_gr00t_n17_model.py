@@ -91,6 +91,7 @@ import torch
 from safetensors.torch import save_file
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
     AttentionStep,
     RaggedAttentionConfig,
@@ -135,7 +136,7 @@ from mstar.model.gr00t_n17.submodules import (
     Gr00tN17VLBridgeSubmodule,
 )
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
-from mstar.model.submodule_base import NodeInputs
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 _HUB = Path.home() / ".cache/huggingface/hub"
 _GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -1524,6 +1525,77 @@ def test_the_served_vision_node_holds_the_vision_config_and_prepares_a_grid(tmp_
     grid = {"image_grid_thw": [torch.tensor([[1, 4, 6]])], "pixel_values": [torch.zeros(24, patch)]}
     inputs = node.prepare_inputs(_PREFILL, fwd, grid)
     assert inputs.input_seq_len == 24
+
+
+def test_only_the_bridge_opts_out_of_autocast_and_it_is_built_in_the_engines_dtype(tmp_path):
+    """The engine keeps an opted-out node in the dtype it was built in
+    (``engine_manager.py:245-252``), so ``get_submodule`` has to build the bridge
+    in the engine's bf16 itself. Left in fp32 it runs with autocast off in fp32:
+    not NVIDIA's bf16 bridge either (D14). The other four still take autocast,
+    and their cast is still the engine's."""
+    model, _ = _served(tmp_path)
+    for name in _SUBMODULES:
+        node = model.get_submodule(name, autocast_dtype=torch.bfloat16)
+        assert node.disable_autocast is (name == VL_BRIDGE), name
+        # compiled, the bridge's answer moved once a prompt of another length was served (C11)
+        assert node.disable_torch_compile is (name in (VL_BRIDGE, DENOISE_STEP)), name
+        expected = torch.bfloat16 if name == VL_BRIDGE else torch.float32
+        assert {p.dtype for p in node.parameters()} == {expected}, name
+
+
+class _OneRequestAttention:
+    """The ragged resource's stand-in for a single request's segment: every row sees every
+    other (the bridge is unmasked). Local rather than imported from another test file (C08)."""
+
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # the kernel's layout is [tokens, heads, dim]; SDPA wants heads first
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+        ).transpose(0, 1)
+
+
+def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
+    """Run as the engine runs an opted-out node -- moved without a dtype, then
+    ``autocast_scope(None)`` -- both spans come out bf16, as NVIDIA's do (D14).
+
+    The control is what the opt-out removes. On CUDA, autocast runs ``vlln`` in
+    fp32 and its output is the residual stream, so all four blocks and both
+    spans came out fp32. CPU autocast leaves LayerNorm alone (torch 2.12), so the
+    control gives it CUDA's fp32 policy by hand and keeps bf16 autocast for the rest.
+    """
+    model, _ = _served(tmp_path)
+    node = model.get_submodule(VL_BRIDGE, autocast_dtype=torch.bfloat16).to("cpu")
+    rows, image = 10, [2, 3, 4, 5]
+    inputs = {
+        "backbone_features": [torch.randn(rows, model.config.backbone_embedding_dim, dtype=torch.bfloat16)],
+        "image_rows": [torch.tensor(image)],
+    }
+    fwd = CurrentForwardPassInfo(request_id="r0", graph_walk=_PREFILL, fwd_index=0, random_seed=0, max_tokens=0)
+    engine = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
+    prepared = node.prepare_inputs(_PREFILL, fwd, inputs)
+    step = node.declare_step(_PREFILL, ["r0"], [prepared])
+    assert [seg.span for seg in step.segments] == [rows]
+    node.bind_node_resources({BRIDGE_ATTN: _OneRequestAttention()})
+    tensors = node.preprocess(_PREFILL, engine, [prepared])
+
+    def spans(autocast_dtype):
+        with torch.no_grad(), autocast_scope(autocast_dtype, "cpu"):
+            out = node.forward(_PREFILL, engine, **tensors)
+        return out["vl_text"][0], out["vl_image"][0]
+
+    text, img = spans(None)
+    assert (text.shape[0], img.shape[0]) == (rows - len(image), len(image))
+    assert (text.dtype, img.dtype) == (torch.bfloat16, torch.bfloat16)
+
+    layer_norm = torch.nn.functional.layer_norm
+
+    def fp32_layer_norm(x, shape, weight=None, bias=None, eps=1e-5):
+        # what CUDA autocast does to `layer_norm`: every operand up to fp32
+        return layer_norm(x.float(), shape, weight.float(), bias.float(), eps)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.nn.functional, "layer_norm", fp32_layer_norm)
+        assert {t.dtype for t in spans(torch.bfloat16)} == {torch.float32}
 
 
 # ----------------------------------------------------------------------------

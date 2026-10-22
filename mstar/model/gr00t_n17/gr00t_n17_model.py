@@ -365,6 +365,10 @@ class Gr00tN17Model(Model):
         if submodule is None:
             return None
         submodule = submodule.eval()
+        if submodule.disable_autocast and autocast_dtype is not None:
+            # the engine keeps an opted-out node in the dtype it was built in
+            # (`engine_manager.py`), and the bridge runs in the engine's bf16
+            submodule = submodule.to(dtype=autocast_dtype)
         self._submodules[node_name] = submodule
         logger.info("built gr00t_n17 submodule for %s", node_name)
         return submodule
