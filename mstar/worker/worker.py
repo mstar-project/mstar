@@ -3410,7 +3410,8 @@ class Worker:
     ) -> bool:
         """Hold back a row whose node needs more chunks: its outputs wait in
         the accumulator and its node goes back to the ready queue, unrouted. A
-        final chunk takes the held outputs back. False when no row is left."""
+        final chunk takes the held outputs back. False when nothing is left to
+        route: no row that ran, and no row the prefix cache served whole."""
         batch, node = batch_N.batch, batch_N.node_name
         outputs = step_outputs.per_rid_outputs
         for rid, (_, end, _) in batch.chunk_ranges.items():
@@ -3440,7 +3441,8 @@ class Worker:
         ]
         for rid in held:
             batch_N.node_batch.per_request_info.pop(rid, None)
-        return bool(batch_N.node_batch.request_ids)
+        # a served row's walk completes only when it is routed (#768)
+        return bool(batch_N.node_batch.request_ids or batch_N.node_batch.cached_rids)
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
