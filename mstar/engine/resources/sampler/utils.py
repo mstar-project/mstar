@@ -889,7 +889,8 @@ def sample_tokens(
             0 = greedy (argmax) for that request. >0 = scaled sampling.
         top_k: Scalar or per-request tensor [batch_size]. 0 = disabled.
         top_p: Scalar or per-request tensor [batch_size]. 1.0 = disabled.
-        repetition_penalty: vLLM-style sign-aware penalty (1.0 = disabled).
+        repetition_penalty: Sign-aware penalty: divides positive logits and
+            multiplies negative ones (1.0 = disabled).
         seen_token_mask: [batch_size, vocab_size] bool. None = penalty skipped.
         any_greedy: CPU-side hint. When False, skips the argmax/masked_fill/where
             branch entirely. None = unknown → run the full path.
@@ -996,7 +997,7 @@ def sample_accelerator_graphable_gpu(
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
     Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
-    so the CUDA-graph path can apply the same vLLM-style repetition penalty as
+    so the CUDA-graph path can apply the same sign-aware repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
     — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy rows keep

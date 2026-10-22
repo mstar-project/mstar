@@ -66,8 +66,8 @@ def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
     from test_glm52_serve_e2e import _build_reference, _hf_checkpoint
 
     from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.quantization import process_weights_after_loading
     from mstar.model.glm52.submodules import Glm52LLMSubmodule
+    from mstar.model.utils import process_weights_after_loading
 
     torch.manual_seed(0)
     model = Glm52Model(
