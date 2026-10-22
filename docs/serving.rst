@@ -413,8 +413,8 @@ Restarts and the compile cache
 
 Most of a first start is compiling: Inductor compiles every capture bucket and autotunes
 its GEMMs, and FlashInfer JIT-builds its kernels. Both cache the results, and a start that
-finds them skips that work. Qwen3.5-0.8B on one H200 took about 22 minutes to start with
-empty caches and about 1.5 minutes with warm ones.
+finds them skips that work. In one measurement, Qwen3.5-0.8B on an H200 took about 22 minutes
+to start with an empty Inductor cache and about 1.5 minutes reusing the previous start's cache.
 
 To keep that across restarts, persist ``~/.cache`` (``$XDG_CACHE_HOME`` if you set it), which
 holds all of it:
