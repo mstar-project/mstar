@@ -58,6 +58,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -444,6 +445,23 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
     # Model ABC: resources
     # -----------------------------------------------------------------------
+
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the Talker: every linear of its stack and the
+        codec-group-0 head (one row per request: the last token's), named as the
+        checkpoint does (``talker.*``) or as the Talker alone does. The text projection
+        takes none: it runs in ``prepare_inputs``, outside the step. The CodePredictor's
+        depth loop and the speaker / codec models are not served."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+
+        root = meta_root(lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"Talker"}, root_path="model",
+            rows={"codec_head": PER_SEGMENT},
+            exclude={"text_projection": "runs in prepare_inputs, outside the planned step"},
+        )]
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Talker paged KV + attention/position/sampler resources.
@@ -1174,18 +1192,16 @@ class Qwen3TTSModel(Model):
 
         # The top-level checkpoint interleaves Talker and CodePredictor under
         # ``talker.*``. Stream only the non-CodePredictor keys into this model.
+        rules = talker.checkpoint_rules()
+
         def talker_weights():
             for name, tensor in iter_safetensors_shards(
-                self.local_dir, device=device, prefix="talker."
+                self.local_dir, device=device, prefix=rules.prefix
             ):
                 if not name.startswith("talker.code_predictor."):
-                    yield name.removeprefix("talker."), tensor
+                    yield name.removeprefix(rules.prefix), tensor
 
-        loaded = load_hf_weights(
-            talker,
-            talker_weights(),
-            stacked_params=LLAMA_STACKED_PARAMS,
-        )
+        loaded = rules.load(talker, talker_weights())
         cp_prefix = "talker.code_predictor."
         talker_keys = {
             key for key in _checkpoint_keys(self.local_dir, "talker.")

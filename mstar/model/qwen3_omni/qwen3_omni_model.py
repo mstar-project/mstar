@@ -53,6 +53,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -209,6 +210,23 @@ class Qwen3OmniModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the Thinker: its attention, any dense MLP layers and
+        the LM head (one row per request: the last token's). The routed experts and the
+        router take none (packed expert tensors, run by the fused-MoE kernel), so an
+        adapter touching them is refused with that reason; so is one touching the
+        Talker or the encoders, which are other nodes. Modules are named as the full
+        model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+
+        root = meta_root(lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"Thinker"}, root_path="model",
+            rows={"lm_head": PER_SEGMENT},
+        )]
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         thinker_kv = PagedKVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
@@ -1444,81 +1462,20 @@ class Qwen3OmniModel(Model):
 
     @staticmethod
     def _thinker_remap(name: str) -> str | None:
-        """Map HF checkpoint keys (after ``thinker.`` prefix strip) to model param paths.
+        from mstar.model.qwen3_omni.components.thinker import thinker_remap
 
-        Handles the ``block_sparse_moe`` → ``mlp`` rename and the per-expert
-        weight fusion: ``experts.{N}.{gate,up,down}_proj.weight`` becomes a
-        shard_id-carrying key that the MoE weight_loaders consume via
-        ``StackedParamRule``.
-        """
-        import re
-
-        if "rotary_emb" in name:
-            return None
-        name = name.replace("block_sparse_moe.", "mlp.")
-        # Per-expert weights: experts.N.{gate,up,down}_proj.weight
-        # → experts.{gate_up_proj,down_proj} with shard_id handled by stacked rules.
-        # We rewrite the name so StackedParamRule suffix matching works:
-        # "experts.N.gate_proj.weight" → "experts.gate_proj.__N__.weight"
-        # The weight_loader on the fused param extracts the expert index from shard_id.
-        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", name)
-        if m:
-            prefix, expert_idx, proj = m.groups()
-            return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
-        return name
-
-    # MoE stacked param rules: route per-expert projections into fused params.
-    # The shard_id encodes both the projection type AND the expert index.
-    # The __expertN__ marker is injected by _thinker_remap; weight_loaders
-    # parse it to determine the expert slot.
-    _THINKER_STACKED_PARAMS: list = []  # populated lazily below
+        return thinker_remap(name)
 
     def _get_thinker_stacked_params(self):
-        from mstar.model.loader.base import StackedParamRule
+        from mstar.model.qwen3_omni.components.thinker import thinker_stacked_params
 
-        if self._THINKER_STACKED_PARAMS:
-            return self._THINKER_STACKED_PARAMS
-        E = self.config.thinker_text.num_experts
-        # MoE expert rules MUST come before dense MLP rules because
-        # the dense ".gate_proj" suffix would also match the remapped
-        # MoE key "experts.gate_proj.__expertN__.weight". _apply_stacked
-        # returns on first match, so longer/more-specific rules go first.
-        rules = []
-        for i in range(E):
-            # source_suffix includes ".weight" so the replacement strips it —
-            # the target params (experts.gate_up_proj, experts.down_proj) are
-            # bare nn.Parameters, not Linear submodules, so they have no
-            # ".weight" suffix in named_parameters().
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.gate_proj.__expert{i}__.weight",
-                shard_id=f"gate:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.up_proj.__expert{i}__.weight",
-                shard_id=f"up:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight",
-                shard_id=f"down:{i}",
-            ))
-        # Dense MLP gate/up fusion and attention qkv fusion.
-        rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
-        rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
-        rules.append(StackedParamRule(".qkv_proj", ".q_proj", "q"))
-        rules.append(StackedParamRule(".qkv_proj", ".k_proj", "k"))
-        rules.append(StackedParamRule(".qkv_proj", ".v_proj", "v"))
-        self._THINKER_STACKED_PARAMS = rules
-        return rules
+        return list(thinker_stacked_params(self.config.thinker_text.num_experts))
 
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
         moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
-        from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
@@ -1536,14 +1493,10 @@ class Qwen3OmniModel(Model):
             self.local_dir, device=device,
             prefix="thinker."
         )
-        # Strip the "thinker." prefix from checkpoint keys.
-        weights = ((k.removeprefix("thinker."), v) for k, v in weights)
-
-        load_hf_weights(
-            thinker_model, weights,
-            stacked_params=self._get_thinker_stacked_params(),
-            name_remapper=self._thinker_remap,
-        )
+        rules = thinker_model.checkpoint_rules()
+        # the shard selector picked the prefix; the rules apply below it
+        weights = ((k.removeprefix(rules.prefix), v) for k, v in weights)
+        rules.load(thinker_model, weights)
         thinker_model.eval()
 
 
