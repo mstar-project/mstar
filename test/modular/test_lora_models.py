@@ -386,6 +386,28 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
         assert (want - _encode(_vision_node(tower()))).abs().max() > 1e-3
 
 
+def test_qwen3_5_vision_replays_the_block_loop_only_when_leased(tmp_path):
+    """With adapters, a leased step still declares the engine's LoRA rows; it must replay
+    the captured block loop, while an unleased one runs the eager tower on the attention
+    plan it declared."""
+    path, _ = write_vision_adapter(tmp_path / "v")
+    sub = _vision_node(tower(), {VISION_LORA: _vision_pool({"v": path})})
+    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 32, VISION_BLOCK_LOOP))
+    replays = []
+
+    def run(**kwargs):
+        replays.append(kwargs)
+        return SimpleNamespace(get_view=lambda name: kwargs["static_inputs"][name])
+
+    runner = SimpleNamespace(can_run=lambda bs, tokens: True, run=run)
+    rows = torch.zeros(PATCHES, 1)
+    for leases, replayed in (({VISION_BLOCK_LOOP: lease}, True), (None, False)):
+        step = declared_step(sub, "encode", ["r"], [_prompt(sub)], piecewise_leases=leases)
+        engine = SimpleNamespace(request_ids=["r"], piecewise_runners={VISION_BLOCK_LOOP: runner}, step=step)
+        assert (sub._replay_block_loop(engine, rows, rows, rows, (PATCHES,)) is not None) is replayed
+    assert len(replays) == 1
+
+
 def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
     """An adapter with nothing for the tower is rank 0 on the vision pool. A row on it
     held back for want of a slot before its adapter was read leaves the wait list once a
