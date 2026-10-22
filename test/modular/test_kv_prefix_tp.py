@@ -372,3 +372,29 @@ def test_above_one_rank_a_cached_image_end_is_never_served():
     for kv in ranks:
         _run(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
     assert _pages(leader, "repeat") == _pages(follower, "repeat")
+
+
+# ── what is refused at load ─────────────────────────────────────────────
+
+
+def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
+    assert _manager(0, opt_in=False)._index is None
+    assert _manager(0)._index is not None
+
+
+def test_host_offload_is_refused_at_load(monkeypatch):
+    # the real host pool pins memory, which needs a device
+    monkeypatch.setattr(manager_mod, "CPUPagePool", lambda **kwargs: None)
+    with pytest.raises(ValueError, match="cpu_offload_pages=4"):
+        _manager(0, cpu_offload_pages=4)
+    assert _manager(0, opt_in=False, cpu_offload_pages=4)._index is None, (
+        "a TP pool that leaves the cache off may still offload"
+    )
+
+
+def test_a_pool_on_more_than_one_tp_group_is_refused_at_load():
+    with pytest.raises(ValueError, match="on one TP group"):
+        _manager(0, shared=True)
+    assert _manager(0, shared=True, world_size=1)._index is not None, (
+        "one rank has nobody to agree with, so sharing the pool is its own business"
+    )
