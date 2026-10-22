@@ -1742,6 +1742,40 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
 
 
+def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
+    """An OOM refusal holds the rows and readies them again; nothing landed,
+    so the chunk's progress has not moved and the retry runs the same tokens."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10)}
+
+    sched.hold_requests(["p0"])
+    manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
+    held = _next_batch(sched, manager)
+    assert "p0" not in held.request_to_worker_graph and not held.chunk_ranges
+
+    sched.held_until["p0"] = 0.0  # the backoff ran out
+    manager.queues["wg0"]._ready.update({"d0": {NODE}, "d1": {NODE}})
+    retry = _next_batch(sched, manager)
+    assert retry.chunk_ranges == {"p0": (0, 2, 10)}
+
+
+def test_a_request_removed_mid_prompt_leaves_no_chunk_state():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p1": 4}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    _next_batch(sched, manager)
+    sched.chunk_outputs.hold("p0", NODE, {"hidden": ["a held chunk"]})
+    assert ("p0", NODE) in sched.chunk_progress
+
+    for rid in ("p0", "p1"):
+        sched.clear_rid(rid, rid)
+
+    assert not sched.chunk_progress and not sched.cached_prefix
+    assert not sched.chunk_outputs.holds("p0", NODE)
+
+
 def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
     """can_override_mixed_max_tokens: the prompt's walk is capped at 1 token a
     step inside a budget of 4, where it would otherwise take the 2 the two

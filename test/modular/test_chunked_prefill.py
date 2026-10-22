@@ -175,6 +175,24 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
     assert not engine._chunk_inputs
 
 
+def test_a_request_removed_mid_prompt_drops_its_prepared_input():
+    """Cancelled or failed between chunks: nothing else would release it."""
+    from types import SimpleNamespace
+
+    class _Sub(_Prompt):
+        def cleanup_request(self, request_id):
+            pass
+
+    engine = _engine_with(_Sub(10))
+    engine._loopback_steps = {}
+    engine._runner = SimpleNamespace(remove_request=lambda rid: None)
+    engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 10))
+
+    engine.remove_request(0)
+
+    assert not engine._chunk_inputs
+
+
 # ── engine: a chunked row starts past its cached prefix ────────────────
 
 
