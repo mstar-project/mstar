@@ -37,6 +37,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.model.components.lora.capable import apply_lora
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
@@ -163,6 +164,7 @@ class LLMSubmodule(ARNodeSubmodule):
             walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._sentinel_ids: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -252,6 +254,7 @@ class LLMSubmodule(ARNodeSubmodule):
             )
             embeds = self.model.model.embed_tokens(ids)
             self._vision_sentinels = (embeds[:1], embeds[1:])
+            self._sentinel_ids = (ids[:1], ids[1:])
         return self._vision_sentinels
 
     def _vision_inputs(
@@ -289,6 +292,10 @@ class LLMSubmodule(ARNodeSubmodule):
         embeds: list[torch.Tensor] = []
         pos_ids: list[torch.Tensor] = []
         tracked: list[torch.Tensor] = []
+        # each position's token id (-1 on an image or video frame), for the adapter's
+        # embedding delta, which `preprocess` adds once the step's adapters are planned
+        embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None) is not None
+        ids_at: list[torch.Tensor] = []
         text_i = grid_i = 0
         # frame groups of the video at `grid_i` already placed
         group = 0
@@ -303,6 +310,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 embeds.append(self.model.model.embed_tokens(ids))
                 pos_ids.append(text_position_ids(span, pos))
                 tracked.append(ids)
+                if embed_lora:
+                    ids_at.append(ids)
                 pos += span
                 continue
             t, h, w = grids[grid_i]
@@ -317,6 +326,11 @@ class LLMSubmodule(ARNodeSubmodule):
             span = t * (h // merge) * (w // merge)
             advance = vision_position_advance(grid, merge)
             embeds += [start_embed, packed[cursor:cursor + span], end_embed]
+            if embed_lora:
+                start_id, end_id = self._sentinel_ids
+                ids_at += [
+                    start_id, torch.full((span,), -1, dtype=torch.long, device=device), end_id,
+                ]
             # built on the host, copied once below
             pos_ids += [
                 text_position_ids(1, pos),
@@ -328,20 +342,23 @@ class LLMSubmodule(ARNodeSubmodule):
             pos += advance + 2
 
         input_embeds = torch.cat(embeds, dim=0)
+        tensor_inputs = {
+            "mrope_advance": pos - start_pos,
+            # Ids cannot ride `input_ids` — that is what `preprocess` keys
+            # the embeds-vs-ids branch on — so the repetition penalty
+            # takes them from here.
+            "text_token_ids": (
+                torch.cat(tracked) if tracked
+                else torch.zeros(0, dtype=torch.long, device=device)
+            ),
+        }
+        if embed_lora:
+            tensor_inputs["embed_ids"] = torch.cat([i.to(torch.long) for i in ids_at])
         return ARNodeInputs(
             input_seq_len=input_embeds.shape[0],
             input_embeds=input_embeds,
             custom_pos_ids=to_device_nonblocking(torch.cat(pos_ids, dim=1), device),
-            tensor_inputs={
-                "mrope_advance": pos - start_pos,
-                # Ids cannot ride `input_ids` — that is what `preprocess` keys
-                # the embeds-vs-ids branch on — so the repetition penalty
-                # takes them from here.
-                "text_token_ids": (
-                    torch.cat(tracked) if tracked
-                    else torch.zeros(0, dtype=torch.long, device=device)
-                ),
-            },
+            tensor_inputs=tensor_inputs,
         )
 
     # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
@@ -479,6 +496,16 @@ class LLMSubmodule(ARNodeSubmodule):
             out["input_embeds"] = torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0,
             )
+            embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None)
+            # a capture's dummy rows carry no ids, and add no delta
+            if embed_lora is not None and all("embed_ids" in inp.tensor_inputs for inp in inputs):
+                # the spliced text embeddings take their rows' adapters' embedding delta
+                # here, where the step's addressing is planned; images' -1 ids take none
+                out["input_embeds"] = apply_lora(
+                    embed_lora,
+                    torch.cat([inp.tensor_inputs["embed_ids"] for inp in inputs]),
+                    out["input_embeds"],
+                )
 
         laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
@@ -582,7 +609,7 @@ class LLMSubmodule(ARNodeSubmodule):
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
-            self.model.model.embed_tokens(input_ids)
+            self.model.model.embed(input_ids)
             if input_embeds is None
             else input_embeds
         )
@@ -779,8 +806,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
+        # Leased, the captured block loop plans its own attention per replay. A node
+        # serving adapters still declares its frames, so the engine adds their LoRA
+        # rows (`lora_rows`) for the patch embed and merger outside the loop.
+        leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
+        if leased and not self.lora_keys:
             return None
         # one segment per frame: a frame attends to itself alone
         segments = [
@@ -790,7 +820,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         ]
         return SubmoduleStep(
             segments=segments,
-            steps={VISION_ATTN: AttentionStep(causal=False)},
+            steps={} if leased else {VISION_ATTN: AttentionStep(causal=False)},
         )
 
     def can_batch(
