@@ -12,6 +12,7 @@ import json
 import math
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 import pytest
@@ -355,6 +356,24 @@ class _Ops(torch.utils._python_dispatch.TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
+@contextmanager
+def _dispatch_flags_restored():
+    """Torch keeps "inside a dispatch mode" in module globals, not per thread, so a mode
+    entered on several rank threads at once can leave them set; dynamo then skips every
+    later frame in the process (this test's compile, and other tests on the worker)."""
+    from torch.utils import _python_dispatch as dispatch
+    names = (
+        "_is_in_torch_dispatch_mode", "_is_in_non_infra_torch_dispatch_mode",
+        "_is_in_any_mode_without_ignore_compile_internals",
+    )
+    saved = {n: getattr(dispatch, n) for n in names if hasattr(dispatch, n)}
+    try:
+        yield
+    finally:
+        for n, value in saved.items():
+            setattr(dispatch, n, value)
+
+
 def _guards(module, x) -> list[str]:
     torch._dynamo.reset()
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
@@ -377,7 +396,9 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
             old = OLD[name](module, inp)
         return new_ops.ops, old_ops.ops, new, old
 
-    for new_ops, old_ops, new, old in run_ranks(world, rank_run):
+    with _dispatch_flags_restored():
+        ranks = run_ranks(world, rank_run)
+    for new_ops, old_ops, new, old in ranks:
         assert new_ops == old_ops
         assert torch.equal(new, old)
 
@@ -425,7 +446,7 @@ def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_
 
     # a spec not built by `module_lora_spec`: nothing would bind it, so no rows or deltas
     with pytest.raises(ValueError, match="module_lora_spec"):
-        bind_module_lora(_Node(root), {"lora": pool(replace(spec, module_map=lambda m: None))})
+        bind_module_lora(_Node(root), {"lora": pool(replace(spec, module_map=lambda m: None, adapters={}))})
     assert type(root.layers[0].qkv_proj) is QKVParallelLinear
 
 
