@@ -153,7 +153,7 @@ def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
     )
 
 
-def _follow(follower: KVManager, head: ScheduleTPNode) -> bool:
+def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -> bool:
     """Settle ``head`` at the front of the follower's queue, as before building the step. False
     while the follower can't yet take rank 0's hit."""
     engine = _engine(follower)
@@ -161,7 +161,7 @@ def _follow(follower: KVManager, head: ScheduleTPNode) -> bool:
         engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
     )
     scheduler.register_tp_follow(head)
-    return scheduler.settle_tp_follow_delta()
+    return scheduler.settle_tp_follow_delta(caught_up)
 
 
 def _wire(head: ScheduleTPNode) -> ScheduleTPNode:
@@ -207,7 +207,7 @@ def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
 
     head = _send(leader, "b")
     # rank 0 has committed a, and the follower has only admitted it
-    assert not _follow(follower, head)
+    assert not _follow(follower, head, caught_up=False)
     follower.commit(steps[follower], _ctx("a"))
     assert _follow(follower, head)
 
@@ -422,7 +422,7 @@ def test_pages_that_differ_from_rank_0s_are_a_loud_error():
     leader, follower = _diverged()
     pages = _send(leader, "b").prefix_hits["wire-b"]["kv"]
     with pytest.raises(RuntimeError, match="diverged"):
-        follower.adopt_cached_prefix("b", NODE, WALK, pages)
+        follower.adopt_cached_prefix("b", NODE, WALK, pages, caught_up=True)
 
 
 def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):

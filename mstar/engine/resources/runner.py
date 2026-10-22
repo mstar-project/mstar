@@ -155,12 +155,12 @@ class StepRunner:
         return leases
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[int]],
+        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[int]], caught_up: bool,
     ) -> bool:
         """Take rank 0's lease on each resource in ``leases``. False until every resource holds its lease."""
         ready = True
         for key, pages in leases.items():
-            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages)
+            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
         return ready
 
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:

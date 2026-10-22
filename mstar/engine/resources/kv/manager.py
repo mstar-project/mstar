@@ -758,14 +758,15 @@ class KVManager(AttentionResource):
             return stream.lease
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int],
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
     ) -> bool:
         """On a TP follower, lease ``pages`` as rank 0 did.
 
-        False until this rank's index holds them, since its commit of the step that wrote
-        them can lag rank 0's. Raises if the index holds other pages under those keys: a
-        sharded prefill gathers cache slots across ranks, so the pages have to agree, not
-        only their count.
+        False while this rank's index lacks some of them and ``caught_up`` is False, since its commit
+        of the step that wrote them can lag rank 0's. Once ``caught_up`` is True nothing will index
+        them, so it raises on a page still missing rather than leave the follower waiting for ever.
+        Raises too if the index holds other pages under those keys: a sharded prefill gathers cache
+        slots across ranks, so the pages have to agree, not only their count.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -785,12 +786,12 @@ class KVManager(AttentionResource):
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
             matched = self._index.lookup(chain.rooted[:len(pages)], stamp=False)
-            if len(matched) < len(pages):
+            if len(matched) < len(pages) and not caught_up:
                 return False
             if matched != pages:
                 raise RuntimeError(
                     f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
-                    f"pages {matched[:4]}... here, {pages[:4]}... there"
+                    f"pages {matched[:4]}... here ({len(matched)}), {pages[:4]}... there ({len(pages)})"
                 )
             self._arena.retain(matched)
             stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size

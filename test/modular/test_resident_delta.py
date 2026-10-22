@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1104,6 +1105,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
+        self.node_batch = SimpleNamespace(commit_done=threading.Event())
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():

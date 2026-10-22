@@ -1121,11 +1121,10 @@ class Engine:
                 hits[self._graph_runtime.get_rid_string(rid)] = leases
         return hits
 
-    def adopt_cached_prefix(self, head: ScheduleTPNode) -> bool:
+    def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
         """A TP follower takes rank 0's cached-prefix leases before it builds the step.
 
-        False until every page is here: a request this rank has not ingested yet, or
-        pages its own commit of an earlier step has not indexed yet.
+        False until every request in the hits has a handle here and every resource holds its lease.
         """
         walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
         ready = True
@@ -1135,7 +1134,7 @@ class Engine:
                 ready = False
                 continue
             walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
-            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases)
+            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
         return ready
 
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:

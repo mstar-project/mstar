@@ -2800,7 +2800,10 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.scheduler.settle_tp_follow_delta():
+        if not self.scheduler.settle_tp_follow_delta(
+            # Of the steps before the head, only N may still index a page of the head's hit
+            caught_up=pending.node_batch.commit_done.is_set(),
+        ):
             return None
 
         batch_N = pending.batch

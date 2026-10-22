@@ -164,9 +164,10 @@ class Resource(ABC):
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int],
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too."""
+        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        raises if it still lacks them once ``caught_up``."""
         return True
 
     def page_trail(self) -> tuple[int, int] | None:
