@@ -377,6 +377,9 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
+    # more per request than the leader's pool, as long as the leader offloads nothing.
+    leader: str | None = None
 
     @property
     def resource_class(self) -> "type[Resource]":
