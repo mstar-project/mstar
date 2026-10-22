@@ -5,7 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -106,6 +106,11 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
+
+    @property
+    def request_pages(self) -> int:
+        """Pages requests can hold: all but the sink page the KV manager takes at build."""
+        return self.max_num_pages - 1
 
     @property
     def latent_dim(self) -> int:
@@ -323,11 +328,21 @@ class KVReqConfig(ResourceReqConfig):
             return self.needed_labels
         return ["main"]
 
-    def opened_labels(self) -> set[str]:
+    def opened_labels(self, nodes: Collection[str] | None = None) -> set[str]:
+        """The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""
         labels = set(self.needed_labels or ["main"])
-        for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
-            labels.update(named)
+        for node, named in self.needed_labels_per_node.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
+        for (node, _), named in self.needed_labels_per_node_walk.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
         return labels
+
+    def pages(self, nodes: Collection[str] | None, caps: Mapping[str, int], page_size: int) -> int:
+        """The most pages the request holds in a pool shared by ``nodes``, at ``caps``."""
+        layouts = self.kv_layout or {}
+        return sum(layouts[label].pages(caps, page_size) for label in self.opened_labels(nodes) if label in layouts)
 
     def get_publish_labels(
         self,
