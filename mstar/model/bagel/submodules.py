@@ -130,7 +130,8 @@ def vae_latents(
     height: int, width: int, image_preprocess: str,
     latent_downsample: int, max_latent_size: int,
 ) -> int:
-    """How many latents the VAE encodes an image of this size into. Its ``prepare_inputs`` asserts the same count."""
+    """How many latents the VAE encodes an image of this size into. The VAE's
+    ``prepare_inputs`` asserts the same count."""
     if image_preprocess == "vllm":
         height, width = vllm_vae_size(height, width, latent_downsample, max_latent_size * latent_downsample)
     else:
@@ -1010,11 +1011,8 @@ class LLMSubmodule(ARNodeSubmodule):
         info = per_request_info or {}
         guided = sink = frozenset()
         if requires_cfg:
-            # An unguided row in a guided batch never reads its guidance
-            # labels, so they run against SINK_PAGE. Whether a row is guided
-            # comes from its request, as in `cg_key_info`, not from its inputs:
-            # a pre-plan declares over the bucket's template rows, which are
-            # all guided.
+            # A pre-plan declares over the bucket's template rows, which are all
+            # guided, so whether a row is guided comes from its request.
             guided = frozenset(
                 rid for rid, inp in zip(request_ids, inputs, strict=True)
                 if (info[rid].step_metadata.get("requires_cfg", False) if rid in info else inp.resource_step_info)

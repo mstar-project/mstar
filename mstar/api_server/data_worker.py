@@ -791,7 +791,7 @@ class PreprocessWorkerThread:
         self, prefix_keys: PrefixKeys, layout: tuple[Span, ...],
         digests: list[bytes | None], tensors: dict, page_size: int,
     ) -> tuple[list[list[int]], dict[int, list[PageItem]]]:
-        """Check the keyed spans and return each page's ids and items."""
+        """Check the layout's spans and return each page's ids and items."""
         walks = set(prefix_keys.walks)
         entries: dict[str, int] = {}
         total = sum(span.length for span in layout)

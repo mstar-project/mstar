@@ -1252,7 +1252,6 @@ class Qwen3OmniModel(Model):
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
         if not attached:
-            # a call without tensors has no attachments to lay out
             return ProcessPromptOutput(result, {})
         return ProcessPromptOutput(result, {"kv_layout": self._kv_layout(plan, result, "audio" in output_modalities)})
 
@@ -1275,7 +1274,7 @@ class Qwen3OmniModel(Model):
                 span = Span("ids", "prefill_text", len(ids), len(ids), "text_inputs")
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
-                # the encoder's rows, as it slices them, between two sentinels
+                # the encoder's rows between two sentinels
                 rows = int(_get_feat_extract_output_lengths(tensors["audio_seqlens"][step.index])) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
@@ -1304,7 +1303,6 @@ class Qwen3OmniModel(Model):
         }
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the Thinker's and the Talker's stop checks end their decode loops after their max-token counts
         return {
             "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
             "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),

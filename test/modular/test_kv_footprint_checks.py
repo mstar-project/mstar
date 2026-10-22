@@ -1,12 +1,4 @@
-"""A write past a request's layout is logged, and the debug checks report where.
-
-The always-on line names the label and its layout the first time a stream takes
-a page past its footprint. Under ``MSTAR_KV_DEBUG_ASSERTS`` each commit is
-checked against the layout itself: the walk that wrote each span, the growth
-after the spans, the scratch of a step that commits nothing, and the retention a
-step declares. A span may fill over several steps, from a chunked prompt or the
-tail a cache hit leaves, and neither is a violation.
-"""
+"""A write past a request's layout is logged, and the debug checks report where."""
 
 from __future__ import annotations
 
@@ -38,12 +30,10 @@ def debug(monkeypatch):
 
 @pytest.fixture
 def always_on(monkeypatch):
-    """Turn the debug checks off. These tests write past a layout on purpose, and the checks would fail that commit."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
 
 
 def _laid_out(kv, rid: str, spans=(PrefixSpan(20, 20, WALK),), **layout) -> None:
-    """Ingest ``rid`` with one layout on ``main``, whose ``decode_loop`` runs 3 times."""
     kv.ingest_request(rid, KVReqConfig(
         kv_layout={"main": StreamLayout(spans=spans, **layout)}, loop_caps={"decode_loop": 3},
     ))
@@ -137,8 +127,6 @@ def test_the_tail_after_a_cache_hit_fires_nothing(debug, monkeypatch):
 
 
 def test_intake_drops_the_layout_of_a_label_the_request_does_not_open():
-    """BAGEL lays out its guidance labels for every request, for the deployments where the
-    request opens them. A request is held only to the labels it opens."""
     config = KVReqConfig(needed_labels=["main"])
     config.apply_conductor_config(kv_layout={
         "main": [[[20, 20, WALK]], [["decode_loop", 1]], 0, None, 0],
@@ -149,8 +137,6 @@ def test_intake_drops_the_layout_of_a_label_the_request_does_not_open():
 
 
 def test_a_label_the_request_does_not_open_holds_no_pages(debug, caplog, monkeypatch):
-    """A batch can write a label for a row that never reads it. Those pages are outside the
-    request's footprint, which the always-on line says."""
     checked = []
     check = manager_mod.KVManager._assert_layout
     monkeypatch.setattr(manager_mod.KVManager, "_assert_layout", lambda self, segment, *args: (
@@ -189,7 +175,6 @@ def test_a_label_the_request_does_not_open_does_not_hide_a_real_overrun(always_o
 
 
 def test_a_keyed_label_the_request_does_not_open_gets_no_chain():
-    """A prefix chain reads its stream's span cursor, which a label the request doesn't open never gets."""
     kv = _manager()
     kv.ingest_request("r0", KVReqConfig(
         prefix_keys={"cfg_img": _keys(list(range(40)))}, kv_layout=_layout(40), loop_caps={},

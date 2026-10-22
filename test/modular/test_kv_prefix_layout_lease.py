@@ -60,7 +60,7 @@ def _walks(parts: list) -> list[tuple[str, int]]:
 
 
 def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK, decode: int = 0) -> KVReqConfig:
-    """What the preprocess worker sends for ``parts`` and ``decode`` decode steps, keyed by its own code."""
+    """What the preprocess worker sends for ``parts``, keyed by its own code."""
     layouts = {"kv": {"main": LabelLayout(spans=tuple(
         Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
         # The span's source holds the digest itself, which the stand-in `_digest` returns.
@@ -87,8 +87,7 @@ def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WAL
 
 class _Node(_TextNode):
     """One request's cache and positions under a real runner, after an earlier
-    request ran every walk of ``seeded`` and indexed what it filled. The earlier
-    request is laid out for ``decode`` decode steps after them."""
+    request ran every walk of ``seeded`` and indexed what it filled."""
 
     def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
         super().__init__()

@@ -1,13 +1,4 @@
-"""A paged label the model leaves undeclared is refused, at load or at intake.
-
-A request's pages come from its layout, so nothing can size a label that nobody
-declared or that a request writes without laying out. So a paged pool with no
-labels fails the worker's load, and so does a declaration naming a walk or a
-loop the graphs don't run, since a loop takes its cap by name. A request that
-opens a label its layout leaves out, or lays out a label the model doesn't
-declare, fails at the conductor with a 500, because the model got it wrong, not
-the client.
-"""
+"""A paged label the model leaves undeclared is refused, at load or at intake."""
 
 from __future__ import annotations
 
@@ -27,7 +18,6 @@ LLM = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
 
 
 class _Declaring:
-    """Declares ``labels`` on ``kv``, over a prefill and a decode that loops on ``decode_loop``."""
 
     def __init__(self, labels: dict, decode: Loop | None = None):
         self._labels = labels

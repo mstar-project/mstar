@@ -68,8 +68,6 @@ class _StubTensorManager:
 
 
 class _Model:
-    """A model that declares one id-keyed label unless ``declares`` is False, and lays it out
-    unless ``lays_out`` is False."""
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,

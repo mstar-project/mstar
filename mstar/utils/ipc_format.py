@@ -50,7 +50,6 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
-    # loop name -> the most iterations it runs for this request (`Model.get_loop_caps`)
     loop_caps: dict[str, int]
 
 

@@ -435,7 +435,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     assert torch.equal(row.custom_pos_ids.long(), positions[:, 0])
     # decode resumes where transformers' rope delta puts it
     assert row.tensor_inputs["mrope_advance"] == int(positions.max()) + 1
-    # the layout's spans cover the rows the walk writes and advance the position as far as the walk does
     spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
     assert sum(span.length for span in spans) == row.input_seq_len
     assert sum(span.advance for span in spans) == row.tensor_inputs["mrope_advance"]

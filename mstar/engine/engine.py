@@ -859,8 +859,7 @@ class Engine:
         ]
         declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on. Each keyed label names them in its
-        # keys, for every cache the node uses.
+        # node -> the walks a probe may run on, from the keys of every label on a cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:

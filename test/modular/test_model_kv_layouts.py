@@ -1,12 +1,4 @@
-"""Each model lays out every label it declares, and caps each growth loop where its stop check ends it.
-
-A footprint is computed from the layout, so a request's layout names every
-label it opens, empty where the request writes nothing. A growth loop's cap must
-end the loop on the iteration the model's own stop check does: an earlier cap
-would cut an output short, and a later one would let speculation write a slot
-the footprint doesn't count. Each test calls the
-model's real `check_stop` with the loop's count, as the worker hands it over.
-"""
+"""Each model lays out every label it declares, and caps each growth loop where its stop check ends it."""
 
 from __future__ import annotations
 
@@ -26,7 +18,6 @@ NOT_EOS = 42
 
 
 def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict, **info) -> int:
-    """How many iterations of ``loop`` ``check_stop`` allows: the first it stops at, plus one."""
     resource_configs = info.pop("resource_configs", {"sampler": SamplingReqConfig(ignore_eos=True)})
     for k in range(max_iters):
         request_info = ForwardPassInfoWrapper(
@@ -39,9 +30,6 @@ def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict
         if loop in check_stop("r", request_info, outputs):
             return k + 1
     return max_iters
-
-
-# ── Orpheus ─────────────────────────────────────────────────────────────
 
 
 def _orpheus():
@@ -71,9 +59,6 @@ def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
         llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
-
-
-# ── Bagel ───────────────────────────────────────────────────────────────
 
 
 def _bagel():
@@ -122,8 +107,6 @@ _BAGEL_SHAPES = {
 @pytest.mark.parametrize("cfg_parallel", [False, True], ids=["one LLM node", "CFG-parallel"])
 @pytest.mark.parametrize(("input_modalities", "output_modalities", "kwargs"), _BAGEL_SHAPES.values(), ids=_BAGEL_SHAPES)
 def test_bagel_lays_out_every_label_its_request_opens(input_modalities, output_modalities, kwargs, cfg_parallel):
-    """The layout is built in the API process, where the deployment isn't known, and the
-    labels a request opens come from the conductor's config, where it is."""
     model = _bagel()
     images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
     output = model.process_prompt(
@@ -167,9 +150,6 @@ def _pointer(tensor: torch.Tensor):
 
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
-    """A request's KV config, laid out and capped, whether it is guided, and its walks in order with the
-    rows each writes: Bagel's own schedule, the ViT count from `vit_patches`, the VAE count from
-    `VAEEncoderSubmodule.prepare_inputs`, a decode row per cap, and three denoise steps."""
     from mstar.conductor.request_info import DEFAULT_PARTITION
     from mstar.model.bagel.submodules import IMAGE_SENTINELS, VAEEncoderSubmodule, vit_patches, vit_preprocess
 
@@ -222,7 +202,6 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
 
 
 class _BagelPool:
-    """A CPU `KVManager` under a `StepRunner`, stepped by Bagel's own `LLMSubmodule.declare_step`."""
 
     def __init__(self, configs: dict):
         from test_bagel_guidance_sink import _llm
@@ -243,7 +222,6 @@ class _BagelPool:
         self.llm = _llm()
 
     def step(self, walk: str, rows: dict, guided: dict) -> None:
-        """One step of ``walk`` over ``rows`` (request -> rows it writes), each row guided or not."""
         from mstar.engine.resources import StepContext
         from mstar.engine.resources.step import SubmoduleStep
         from mstar.model.submodule_base import ARNodeInputs
@@ -284,9 +262,6 @@ def _bagel_checks(monkeypatch):
 def test_bagel_peaks_at_its_footprint_on_every_label(
     input_modalities, output_modalities, kwargs, prompt, _bagel_checks,
 ):
-    """Bagel's own schedule, steps and forks, run through a `KVManager`, take each label to its footprint.
-    ``cfg_text`` forks before a text walk and after an image walk, so what it holds depends on what the
-    prompt ends on."""
     config, guided, walks = _bagel_request(_bagel_checks, prompt, input_modalities, output_modalities, kwargs)
     pool = _BagelPool({1: config})
 
@@ -298,8 +273,6 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
 
 def test_an_unguided_bagel_request_batched_with_a_guided_one_stays_inside_its_footprint(_bagel_checks, caplog):
-    """A guided batch runs the guidance labels for every row. The unguided chat runs them against
-    SINK_PAGE, so it holds only ``main`` and the always-on line stays silent."""
     import logging
 
     model = _bagel_checks
@@ -324,7 +297,6 @@ def test_an_unguided_bagel_request_batched_with_a_guided_one_stays_inside_its_fo
 
 @pytest.mark.parametrize("output_modalities", [["text"], ["image"]], ids=["understanding", "an edit"])
 def test_bagel_lays_out_a_request_without_text(output_modalities):
-    """The walks prefill the attachments alone, so the layout holds their spans, on every label the request opens."""
     model = _bagel()
     images = [torch.rand(3, 480, 640)]
     output = model.process_prompt(None, ["image"], output_modalities, tensors={"image_inputs": images})
@@ -335,12 +307,8 @@ def test_bagel_lays_out_a_request_without_text(output_modalities):
     ), "the layout lists a text span no walk writes"
 
 
-# ── Chatterbox ──────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    """Chatterbox stops on a count its own postprocess keeps. The count starts at the prefill's token."""
     from test_chatterbox_model import _make_model
 
     from mstar.model.chatterbox.submodules import SPEECH_TOKENS, T3Submodule
@@ -365,14 +333,12 @@ def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(variant):
-    """Turbo writes the clip's S3 tokens raw, so its layout counts them, and the voice encoder asserts the count."""
     from mstar.model.chatterbox.components.audio_frontend import resample, trim_reference
     from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
     from mstar.model.chatterbox.config import S3_SR, ChatterboxConfig
     from mstar.model.chatterbox.submodules import reference_tokens
 
     config = ChatterboxConfig.from_variant(variant)
-    # the count is the encoder's length arithmetic, which the weights don't change
     tokenizer = S3Tokenizer(config.s3_tokenizer).eval()
     for samples in (14_400, 144_001, 720_000):
         wav16 = trim_reference(resample(torch.rand(samples), config.sample_rate, S3_SR), S3_SR, config.enc_cond_seconds)
@@ -395,11 +361,7 @@ def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
     assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
 
 
-# ── Cosmos3 ─────────────────────────────────────────────────────────────
-
-
 class _Cosmos3Tokenizer:
-    """The three calls `tokenize_prompt` makes, with one token per character."""
 
     eos_token_id = 1
 
@@ -439,8 +401,6 @@ _COSMOS3_COMMITS = {
 
 @pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
 def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
-    """Each label's prompt span is the DiT's text prefix, and its scratch is one denoise step's tokens.
-    In kv window mode, its later spans and its retention follow the windows the DiT commits."""
     from test_cosmos3_edge_model import _model
 
     from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL, Cosmos3DiTSubmodule
@@ -476,12 +436,8 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
 
 
-# ── Fish S2-Pro ─────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    """The AR stops on a frame count its own stop check keeps. The count starts at the prefill's frame."""
     from test_fish_s2_pro_model import tiny_ar, tiny_model
 
     ar = tiny_ar()
@@ -506,7 +462,6 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     from mstar.model.fish_s2_pro.config import AR_KV, PROMPT_LAYOUT_KEY
 
     model = tiny_model()
-    # 21 codec frames
     tensors = {"audio_inputs": [torch.zeros(20 * model.config.codec.hop_length + 1)]} if clone else None
 
     output = model.process_prompt("hi", ["text", "audio"] if clone else ["text"], ["audio"], tensors, ref_text="r")
@@ -515,14 +470,11 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     [span] = layout[AR_KV]["main"].spans
     assert span.walk == ("ar_prefill_clone" if clone else "ar_prefill")
     prefix_len, frames = output.metadata[PROMPT_LAYOUT_KEY]
-    # the tiny AR's vocabulary stands in for the prompt's ids
     prefill = tiny_ar()._build_prefill(
         torch.zeros_like(output.new_input_tensors["prompt_ids"][0]), prefix_len, frames,
         torch.zeros(frames, 4, dtype=torch.long) if frames else None,
     )
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
-
-# ── Higgs Audio ─────────────────────────────────────────────────────────
 
 
 def _higgs():
@@ -532,7 +484,6 @@ def _higgs():
     model = object.__new__(HiggsAudioModel)
     model.config = HiggsAudioModelConfig()
     model.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens=False: [ord(c) for c in text])
-    # 100 mel frames a second, padded to the longest chunk, as the whisper extractor gives
     model.feature_extractor = lambda chunks, **kwargs: {
         "input_features": torch.zeros(len(chunks), 128, 3000),
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
@@ -564,9 +515,6 @@ def test_higgs_lays_out_every_label_it_declares():
     assert [span.walk for span in layout["kv_cache"]["main"].spans] == ["prefill_text", "prefill_audio", "prefill_text"]
 
 
-# ── Qwen3.5 ─────────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
@@ -588,7 +536,6 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
 @pytest.mark.skipif(not os.environ.get("QWEN3_5_CKPT"), reason="set QWEN3_5_CKPT to a Qwen3.5 checkpoint")
 @pytest.mark.parametrize("modalities", [["text"], ["image", "text"], ["text", "image", "text"]])
 def test_qwen3_5_lays_out_every_label_it_declares(modalities):
-    """An image prompt is one prefill_vision walk, so every span of it names that walk."""
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
     model = Qwen3_5DenseModel(os.environ["QWEN3_5_CKPT"])
@@ -601,11 +548,7 @@ def test_qwen3_5_lays_out_every_label_it_declares(modalities):
     assert walks == {"prefill_vision" if images else "prefill_text"}
 
 
-# ── Qwen3-Omni ──────────────────────────────────────────────────────────
-
-
 def _omni_submodule():
-    """What the Thinker's and the Talker's stop checks read off their submodule."""
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
@@ -645,7 +588,6 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
 )
 @pytest.mark.parametrize("output_modalities", [["text"], ["text", "audio"]])
 def test_qwen3_omni_lays_out_every_label_it_declares(output_modalities):
-    """With audio out, the Talker writes every Thinker prefill row but the system turn's, then its prefix."""
     pytest.importorskip("flashinfer")
     from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -660,14 +602,10 @@ def test_qwen3_omni_lays_out_every_label_it_declares(output_modalities):
     if "audio" not in output_modalities:
         assert talker == (), "the Talker is laid out for a request with no audio out"
         return
-    # the system turn runs to where the user's turn starts
     system = output.new_input_tensors["text_inputs"][0].tolist().index(model.config.im_start_token_id, 1)
     assert [span.length for span in talker] == [
         thinker[0].length - system, *(span.length for span in thinker[1:]), 6,
     ], "the Talker's prefill rows aren't the Thinker's past the system turn, then its prefix"
-
-
-# ── Qwen3-TTS ───────────────────────────────────────────────────────────
 
 
 def _tiny_qwen3_tts_talker():
@@ -682,7 +620,6 @@ def _tiny_qwen3_tts_talker():
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_qwen3_tts_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    """The Talker stops on a frame count its own postprocess keeps. The count starts at the prefill's frame."""
     from test_qwen3_tts_model import _make_model
 
     talker = _tiny_qwen3_tts_talker()
@@ -722,7 +659,6 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
 
     model = _variant_model(variant)
     clone = variant == "base"
-    # 1 s and a sample: 13 codec frames
     tensors = {"audio_inputs": [torch.zeros(24000 + 1)]} if clone else None
 
     output = model.process_prompt(
@@ -733,7 +669,6 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
     [span] = layout[TALKER_KV]["main"].spans
     assert span.walk == ("talker_prefill_clone" if clone else "talker_prefill")
     frames = metadata[PROMPT_LAYOUT_KEY][4]
-    # the tiny Talker's codec vocabulary stands in for the speaker and language tags
     prefill = _tiny_qwen3_tts_talker()._build_prefill(
         "r", torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
         speaker_id=40 if metadata[SPEAKER_ID_KEY] >= 0 else -1,
@@ -742,9 +677,6 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
         ref_codes=torch.randint(0, 32, (frames, 4)) if frames else None,
     )
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
-
-
-# ── V-JEPA2-AC ──────────────────────────────────────────────────────────
 
 
 def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
@@ -772,7 +704,6 @@ def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
 
 @pytest.mark.parametrize("extrinsics", [False, True])
 def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
-    """Each iteration writes what the rollout step declares for one frame of context. No other walk writes."""
     from mstar.model.vjepa2.config import KV_CACHE
     from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 
@@ -795,9 +726,6 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
 
 
-# ── Whisper ─────────────────────────────────────────────────────────────
-
-
 def _whisper():
     from transformers import WhisperFeatureExtractor
 
@@ -812,7 +740,6 @@ def _whisper():
 
 @pytest.mark.parametrize("max_tokens", [1, 5, 64, 1000])
 def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    """The cap is the request's own bound, which the learned positions hold to 444."""
     from mstar.model.whisper.config import SAMPLER
     from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 
@@ -828,7 +755,6 @@ def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
 @pytest.mark.parametrize("seconds", [1.0, 29.0, 45.0])
 def test_whisper_lays_out_the_forced_prompt_and_the_encoders_whole_window(seconds):
-    """Any clip is padded or cut to the window, so the context is the encoder's rows for any length."""
     from transformers import WhisperConfig
     from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
@@ -841,7 +767,6 @@ def test_whisper_lays_out_the_forced_prompt_and_the_encoders_whole_window(second
 
     layout = output.metadata["kv_layout"]
     assert [span.length for span in layout[KV_CACHE]["main"].spans] == [len(output.new_input_tensors["text_inputs"][0])]
-    # the encoder's length arithmetic, which neither its width nor its weights change
     encoder = WhisperEncoder(WhisperConfig(
         d_model=16, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=32,
         num_mel_bins=model.config.num_mel_bins, max_source_positions=model.config.max_source_positions,

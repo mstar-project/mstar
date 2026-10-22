@@ -554,14 +554,13 @@ class Qwen3_5DenseModel(Model):
             result["video_grid_thw"] = [video.grid for video in videos]
             # the decoded frames are spent; don't hold them for the request's life
             result["video_inputs"] = []
-        # with an image or a video the whole prompt is one prefill_vision walk (see `_prefill_schedule`)
         walk = "prefill_vision" if images or videos else "prefill_text"
         merge = self.vision_config.spatial_merge_size
         owners = group_owners(groups)
 
         def media(step: PromptPart) -> tuple[Span]:
-            # the encoder's merged tokens and their two sentinels, as the LLM's prefill_vision splices them.
-            # Each temporal group of a video is placed like a one-frame image.
+            # A span is the merged tokens and two sentinels, and each temporal group of a video
+            # is placed like a one-frame image.
             video = step.modality == VIDEO
             grid = result["video_grid_thw"][owners[step.index]] if video else result["image_grid_thw"][step.index]
             grid = grid[0] if grid.dim() == 2 else grid
@@ -577,7 +576,6 @@ class Qwen3_5DenseModel(Model):
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the decode stop check ends the loop after max_tokens iterations
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

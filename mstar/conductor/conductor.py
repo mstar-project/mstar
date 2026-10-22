@@ -642,7 +642,6 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        # the largest max_iters of each loop name, so a cap clamped to it never cuts a longer loop of that name
         self._loop_max_iters: dict[str, int] = {}
         for worker_graph in self.worker_graphs.values():
             for name, loop in worker_graph.section.get_loops().items():
@@ -1117,9 +1116,8 @@ class Conductor:
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
         caps = self.model.get_loop_caps(**model_kwargs)
-        # Clamp every cap to its loop's max_iters. Rust's graph runtime holds a cap
-        # as a u32, so a cap from a large max_output_tokens would fail the request
-        # there but not in Python.
+        # Rust's graph runtime holds a cap as a u32, so an unclamped cap from a large
+        # max_output_tokens would fail the request there but not in Python.
         loop_caps = {name: min(n, caps.get(name, n)) for name, n in self._loop_max_iters.items()}
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
@@ -1273,7 +1271,6 @@ class Conductor:
                     ),
                 )
 
-        # each worker's KV resource opens with the layouts on its NewRequest, so later messages go without them
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         # After the loop: a tensor's reader count must cover every worker and

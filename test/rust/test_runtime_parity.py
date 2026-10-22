@@ -350,7 +350,6 @@ def test_loop_iters_agree(pair):
 
 
 def _decode_graph():
-    """prefill, then ``ar_loop`` for at most 4 iterations, emitting each token."""
     return Sequential(sections=[
         GraphNode(
             name="prefill", input_names={"prompt"},
@@ -393,8 +392,6 @@ def decode(request):
 
 
 def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
-    """Feed ``rid`` a prompt and run each ready node until none is ready, calling
-    ``on_decode`` before each decode iteration completes."""
     def fresh():
         u = next(uuids)
         book.put_tensor(u, _info(u))
@@ -428,8 +425,6 @@ def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
 
 
 def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
-    """A request's cap lowers only its own copy of the loop, and survives the
-    reset at the end of a pass. Another request keeps the graph's 4."""
     rt, book = decode
     uuids = iter(range(1, 500))
     capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
@@ -444,8 +439,6 @@ def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
 
 
 def test_speculation_stops_at_the_cap(decode):
-    """Speculating the iteration past a stop check writes KV the request
-    then drops, so a capped loop never speculates past its cap."""
     rt, book = decode
     rid = _admit(rt, loop_caps={"ar_loop": 2})
     speculated = []
