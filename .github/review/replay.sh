@@ -87,8 +87,8 @@ claude -p "Read .github/review/review-prompt.md from the repository root and fol
 
    DRY RUN: nothing will be posted, and you have no posting tools. Where the prompt
    says to call create_inline_comment, print the call instead as a fenced json block
-   with keys path, line, startLine, side and body. Where it says to post the summary
-   with gh pr comment, print the summary markdown instead. Print nothing else." \
+   with keys path, line, startLine, side and body. Where it says to return the summary
+   fields, print them as one fenced json block instead. Print nothing else." \
   --model "$MODEL" \
   --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch | tee "$OUT"
 

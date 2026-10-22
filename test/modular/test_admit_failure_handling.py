@@ -132,13 +132,13 @@ class _FakeWorker:
         self.scheduler.hold_requests(list(batch.request_to_worker_graph))
 
 
-def _batches(reason, prepared=("r0", "r1")):
+def _batches(reason, prepared=("r0", "r1"), cached=()):
     batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared),
+        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
     )
     return batch, node_batch
 
@@ -279,6 +279,21 @@ def test_a_rid_prepare_dropped_is_not_requeued(reason):
 
     assert worker._graph_runtime.pushed_back == ["r0"]
     assert "r1" not in worker.held
+
+
+@pytest.mark.parametrize(
+    "reason", [_alloc_failed("r0"), _offloading("r0")], ids=["allocation", "offloading"]
+)
+def test_a_rid_the_cache_served_is_requeued(reason):
+    worker = _RefusedWorker()
+    batch, node_batch = _batches(reason, prepared=["r0"], cached=["r1"])
+    node_batch.failed_resource = None
+
+    worker._handle_admit_failure(batch, node_batch)
+
+    assert sorted(worker._graph_runtime.pushed_back) == ["r0", "r1"], (
+        "a row the cache served left the refused step, so its walk never completes"
+    )
 
 
 def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplog):

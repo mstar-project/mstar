@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     WorkspacePool,
+    captured_page_capacity,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.wrappers import (
@@ -95,11 +96,9 @@ class FlashInferManager(AttentionManager):
 
         bucket = lease.bucket
         buffer = self._workspaces.get(label, lease.slot)
-        # per row, not per pool: rows that matched one cached prefix all name
-        # its pages, so a step can name more page ids than the pool holds
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
-            "max_num_pages": num_rows * self._kv_config.max_num_pages,
+            "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config),
         }
         split = self._splits.get(bucket.graph_walk)
         if split is not None:

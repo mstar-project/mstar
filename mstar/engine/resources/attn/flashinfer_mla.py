@@ -14,7 +14,12 @@ import logging
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, WorkspacePool
+from mstar.engine.resources.attn.base import (
+    AttentionManager,
+    EagerSlotKey,
+    WorkspacePool,
+    captured_page_capacity,
+)
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
@@ -271,10 +276,8 @@ class FlashInferMLAManager(AttentionManager):
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is None:
-            # per row, not per pool: rows that matched one cached prefix all
-            # name its pages, so a step can name more page ids than the pool holds
-            kwargs = {**self._wrapper_kwargs,
-                      "max_num_pages": num_rows * self._kv_config.max_num_pages}
+            kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
+                num_rows, lease.bucket.num_tokens, self._kv_config)}
             wrapper = FlashInferMLAWrapper(
                 workspace_buffer=self._workspaces.get(label, lease.slot),
                 batch_size=num_rows, use_cuda_graph=True, **kwargs,

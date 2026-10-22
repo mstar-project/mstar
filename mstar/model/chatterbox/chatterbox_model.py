@@ -121,7 +121,7 @@ MAX_REPETITION_PENALTY = 2.0
 MAX_CFG_WEIGHT = 1.0
 MAX_EXAGGERATION = 2.0
 # Dividing the logits by a smaller value overflows the same way: a temperature
-# under it samples greedily (vLLM's convention), a penalty under it is refused
+# under it samples greedily, a penalty under it is refused
 MIN_TEMPERATURE = 1e-5
 MIN_REPETITION_PENALTY = 1e-5
 

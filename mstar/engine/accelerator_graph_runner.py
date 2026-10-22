@@ -2123,6 +2123,10 @@ class PiecewiseAcceleratorGraphRunner:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
 
+    def can_lease(self, inputs: list[NodeInputs]) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none."""
+        return self._config.can_lease is None or self._config.can_lease(inputs)
+
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
     ) -> SlotLease | None:
