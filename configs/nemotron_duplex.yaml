@@ -10,10 +10,10 @@ model: "nemotron_duplex"
 max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 
 # Sessions at once; the overflow queues. Each session holds a slot in
-# resources mamba_state, encoder_state, encoder_front and codec_state and its pages in
-# nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to raise the cap,
-# raise their max_slots (cap + 1, for the sink) and the KV pools' max_num_pages
-# with it.
+# resources mamba_state, encoder_state, encoder_front, codec_state and encoder_kv
+# and its pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to
+# raise the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
+# sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
 # The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
 

@@ -447,7 +447,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
   ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
-  more than the sessions, for the sink) and its pages in ``nano_kv`` and
+  more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
+  no sink), and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
   nano's from ``max_prompt_tokens`` too). The shipped configs set
   ``max_concurrent_requests: 32`` to match; to serve more, raise the cap and
@@ -538,9 +539,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (inferred from those frames, not measured on served text); under the served
   bf16 a different chunking can flip a knife-edge frame such as the agent's
   turn start.
-- The encoder keeps each call's state in two recurrent-state pools, a slot per
-  session each: its layer state (attention keys / values and conv inputs,
-  ``encoder_state``) and its newest audio and mel frames (``encoder_front``). A
+- The encoder keeps each call's state in a slot per session of three
+  resources: its attention keys and values in a bounded KV (``encoder_kv``),
+  which keeps a call's last 70 frames per layer and runs the attention, each new
+  frame over the 70 before it, with the relative-position term as a band of
+  distances; its conv inputs (``encoder_state``); and its newest audio and mel
+  frames (``encoder_front``), the last two recurrent-state pools. A
   call that appends one frame of audio (1280 samples) on the frame grid, every
   live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
   the call's start: an opening clip or append that is not a multiple of 1280

@@ -25,12 +25,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.resources.kv.bounded import BoundedKVConfig, SinkWindow, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.nemotron_duplex.components._util import param
 from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
 from mstar.model.nemotron_duplex.config import ConformerSTTConfig
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
     from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 
 # Pure numerical constants (not architecture dims / not in config.json).
@@ -337,12 +339,22 @@ class StreamState:
     slice so a step needs no sync. The audio and mel frames a later step still
     reads live in the ``front`` pool (``front_state_blocks``)."""
 
-    __slots__ = ("samples", "mels", "frames")
+    __slots__ = ("samples", "mels", "position")
 
     def __init__(self):
         self.samples = 0        # samples of the call so far
         self.mels = 0           # mel frames computed
-        self.frames = 0         # encoder frames emitted (= frames in the layers' state)
+        # its place in the bounded KV, which a step's declarations share
+        self.position = StreamPosition(source_len=0, written=0)
+
+    @property
+    def frames(self) -> int:
+        """Encoder frames emitted."""
+        return self.position.written
+
+    @frames.setter
+    def frames(self, value: int):
+        self.position = StreamPosition(source_len=0, written=value)
 
 
 def front_state_blocks(config: ConformerSTTConfig) -> dict[str, RecurrentBlockConfig]:
@@ -360,16 +372,24 @@ def front_state_blocks(config: ConformerSTTConfig) -> dict[str, RecurrentBlockCo
 
 def encoder_state_blocks(config: ConformerSTTConfig,
                          dtype: torch.dtype | None = None) -> dict[str, RecurrentBlockConfig]:
-    """A call's layer state, per layer: the last ``att_context`` keys and values
-    of its attention and the last ``kernel - 1`` inputs of its depthwise conv.
+    """A call's conv state, per layer: the last ``kernel - 1`` inputs of its
+    depthwise conv (its attention window is the bounded KV, ``ENCODER_KV``).
     By default in the engine's compute dtype, which the layers compute it in:
     stored in another, a call's frames drift from the offline ones."""
-    ctx = config.att_context_size[0]
     return {
-        "k": RecurrentBlockConfig(shape=(config.num_heads, ctx, config.head_dim), dtype=dtype),
-        "v": RecurrentBlockConfig(shape=(config.num_heads, ctx, config.head_dim), dtype=dtype),
         "conv": RecurrentBlockConfig(shape=(config.d_model, config.conv_kernel_size - 1), dtype=dtype),
     }
+
+
+def encoder_kv_config(config: ConformerSTTConfig, max_slots: int) -> BoundedKVConfig:
+    """A call's attention keys and values, per layer: each new frame attends the
+    ``att_context_size[0]`` frames before it and itself, so the KV keeps that
+    many. In the engine's compute dtype, as ``encoder_state_blocks``."""
+    return BoundedKVConfig(
+        num_layers=config.num_layers, num_heads=config.num_heads, head_dim=config.head_dim, rows_per_request=1,
+        max_source_len=0, retention=SinkWindow(0, config.att_context_size[0]),
+        query_window=config.att_context_size[0], max_slots=max_slots, dtype=None,
+    )
 
 
 def final_mel_frames(config: ConformerSTTConfig, samples: int, final: bool) -> int:
@@ -400,9 +420,8 @@ def device_counts(values, device: torch.device) -> torch.Tensor:
 
 class EncoderInputs(NamedTuple):
     """A step's new encoder-input frames, ``x (B, t, D)`` zero-padded to the
-    most any call got, and per call its frames before the step and new ones."""
+    most any call got, and per call its new ones."""
     x: torch.Tensor
-    frames: list[int]
     n: list[int]
 
 
@@ -418,12 +437,15 @@ class ConformerStreamer:
       15 mel frames, so the first two outputs of the window are discarded and
       the rest are exact; the window starts on a multiple of 8 so the strides
       line up with the offline ones.
-    - Layers: attention reads the cached keys/values of the last 70 frames,
-      the depthwise conv its cached last 8 inputs.
+    - Layers: each new frame attends the 70 frames before it and itself in the
+      bounded KV, which keeps a call's last 70 keys/values per layer; the
+      depthwise conv reads its cached last 8 inputs.
 
-    A call's state is its host counters (``StreamState``) and two pool slots:
-    the front end's (``front_state_blocks``) and the layers'
-    (``encoder_state_blocks``). ``steady_step`` is a whole step for calls that
+    A call's state is its host counters (``StreamState``), two pool slots, the
+    front end's (``front_state_blocks``) and the conv tails
+    (``encoder_state_blocks``), and its bounded-KV slot. The resources' plans
+    for a step come from the positions its declaration gives
+    (``StreamState.frames``). ``steady_step`` is a whole step for calls that
     append exactly one frame of audio, all device work over fixed shapes, so it
     can replay as a CUDA graph; ``front`` + ``layers`` take any step.
     """
@@ -491,9 +513,8 @@ class ConformerStreamer:
         return (self.has_steady_step and not final and chunk is not None and chunk.numel() == fs
                 and st.samples >= 2 * fs and st.samples % fs == 0)
 
-    def steady_step(self, chunk: torch.Tensor, frames: torch.Tensor, front: "RecurrentStatePool",
-                    front_rows: "RecurrentAddressing", pool: "RecurrentStatePool",
-                    rows: "RecurrentAddressing") -> torch.Tensor:
+    def steady_step(self, chunk: torch.Tensor, front: "RecurrentStatePool", front_rows: "RecurrentAddressing",
+                    kv: "BoundedKVManager", pool: "RecurrentStatePool", rows: "RecurrentAddressing") -> torch.Tensor:
         """One frame for each call, from ``chunk (B, frame_samples)``: the new
         mel frames, the subsampling window and the layers, all on the device.
         It is captured, so its STFT is a matmul: a graph must not hold a cuFFT
@@ -517,13 +538,13 @@ class ConformerStreamer:
         front.scatter_("sig", front_rows, y)
         front.scatter_("last", front_rows, x[:, -1:])
         front.scatter_("mel", front_rows, torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
-        return self.layers(new, pool, rows, frames, torch.ones_like(frames))
+        return self.layers(new, kv, pool, rows, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
-    def front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
+    def front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool], n: list[int],
               front: "RecurrentStatePool", front_rows: "RecurrentAddressing") -> EncoderInputs | None:
-        """Append each call's chunk; the encoder-input frames it made final, or
-        None when no call has one. A call with no chunk and not at its end is
-        left as it is."""
+        """Append each call's chunk; the ``n`` encoder-input frames it made final
+        (``new_frames``, counted before the step), or None when no call has one.
+        A call with no chunk and not at its end is left as it is."""
         c, pad, hop, f = self.c, self.c.n_fft // 2, self.c.hop_length, self.c.subsampling_factor
         keep_sig, keep_mel = self.frame_samples, 2 * f
         busy = [i for i, (ch, fin) in enumerate(zip(chunks, final, strict=True))
@@ -533,8 +554,6 @@ class ConformerStreamer:
         last, sig = front.gather("last", front_rows), front.gather("sig", front_rows)
         mel_tail = front.gather("mel", front_rows)
         new_sig, new_last, new_mel = list(sig), list(last), list(mel_tail)
-        n = [0] * len(sts)
-        frames_before = [st.frames for st in sts]
         rows, lo_hi, mel_rows = [], [], []
         for i in busy:
             st, chunk = sts[i], chunks[i]
@@ -576,8 +595,6 @@ class ConformerStreamer:
                 mels = torch.cat([mels, added[i]])
                 st.mels += added[i].shape[0]
                 new_mel[i] = F.pad(mels[-keep_mel:], (0, 0, max(0, keep_mel - mels.shape[0]), 0))
-            # also without a new mel frame: the end of the call can make its last frame final
-            n[i] = max(0, final_encoder_frames(c, st.mels, st.samples, final[i]) - st.frames)
             if n[i]:
                 start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
                 mel_rows.append((i, mels[start - first:], (st.frames - start // f, n[i])))
@@ -592,52 +609,50 @@ class ConformerStreamer:
         x = out.new_zeros(len(sts), max(n), out.shape[-1])
         for row, (i, _, (at, k)) in enumerate(mel_rows):
             x[i, :k] = out[row, at: at + k]
-        return EncoderInputs(x=x, frames=frames_before, n=n)
+        return EncoderInputs(x=x, n=n)
+
+    def new_frames(self, st: StreamState, samples: int, final: bool) -> int:
+        """The encoder frames a step makes final for a call at ``st`` that then
+        has ``samples`` of audio, counted on the host before the step runs, so
+        its declaration can name them and ``front`` make them. Also without a
+        new mel frame: the end of the call can make its last frame final."""
+        c = self.c
+        if samples <= c.n_fft // 2:
+            return 0
+        mels = max(st.mels, final_mel_frames(c, samples, final))
+        return max(0, final_encoder_frames(c, mels, samples, final) - st.frames)
 
     @staticmethod
     def advance(sts: list[StreamState], enc: EncoderInputs) -> None:
         """Count the step's frames into each call's state, once its layers ran."""
         for st, n in zip(sts, enc.n, strict=True):
-            st.frames += n
+            if n:
+                st.frames += n
 
     # -- layers --------------------------------------------------------------
 
-    def _mask(self, frames: torch.Tensor, n: torch.Tensor, t: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Which keys each new frame may attend to, and their relative positions.
-        Keys are the ``ctx`` cached frames (slot s holds frame ``frames - ctx + s``)
-        then the ``t`` new ones (the first ``n`` real); the same for every layer."""
-        ctx, device = self._ctx, frames.device
-        qi = torch.arange(t, device=device).view(t, 1)
-        kj = torch.arange(ctx + t, device=device).view(1, ctx + t)
-        dist = qi + ctx - kj                                                  # (t, ctx + t)
-        frames, n = frames.view(-1, 1, 1), n.view(-1, 1, 1)
-        outside = ((dist < 0) | (dist > ctx)).view(1, t, ctx + t)
-        mask = outside | (frames - ctx + kj.view(1, 1, -1) < 0) | (kj.view(1, 1, -1) - ctx >= n)
-        return mask.unsqueeze(1), dist.clamp(0, ctx)
-
-    def _attend(self, layer: "ConformerLayer", x: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                mask: torch.Tensor, dist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _attend(self, layer: "ConformerLayer", li: int, x: torch.Tensor, kv: "BoundedKVManager") -> torch.Tensor:
+        """Self-attention of the new frames ``x (B, t, D)``: each attends the
+        ``ctx`` frames before it and itself, the older ones from ``kv``, which
+        then keeps this step's keys and values. Transformer-XL's position term
+        depends on the distance alone, so it goes in as the band of distances
+        ``0..ctx`` (``bd_all``), unscaled: the kernel scales the sum."""
         attn = layer.self_attn
         b, t, _ = x.shape
         h, dk, ctx = attn.n_heads, attn.head_dim, self._ctx
         q = attn.linear_q(x).view(b, t, h, dk)
-        k_new = attn.linear_k(x).view(b, t, h, dk).transpose(1, 2)
-        v_new = attn.linear_v(x).view(b, t, h, dk).transpose(1, 2)
-        k = torch.cat([k_cache.to(k_new.dtype), k_new], dim=2)                # (B, h, ctx+t, dk)
-        v = torch.cat([v_cache.to(v_new.dtype), v_new], dim=2)
+        k = attn.linear_k(x).view(b, t, h, dk).transpose(1, 2)
+        v = attn.linear_v(x).view(b, t, h, dk).transpose(1, 2)
         key = (attn, x.dtype, torch.is_autocast_enabled(x.device.type))
         p = self._pos.get(key)
         if p is None:                                                         # (h, ctx+1, dk)
             p = self._pos[key] = attn.linear_pos(self._pe.to(x.dtype)).view(ctx + 1, h, dk).transpose(0, 1)
-        q_u = (q + attn.pos_bias_u).transpose(1, 2)
+        # in k's dtype: under autocast the bias add promotes q, and the kernel takes one dtype
+        q_u = (q + attn.pos_bias_u).to(k.dtype).transpose(1, 2)
         q_v = (q + attn.pos_bias_v).transpose(1, 2)
-        ac = torch.matmul(q_u, k.transpose(-2, -1))                           # (B, h, t, ctx+t)
         bd_all = torch.matmul(q_v, p.transpose(-2, -1))                       # (B, h, t, ctx+1)
-        bd = torch.gather(bd_all, 3, dist.view(1, 1, t, ctx + t).expand(b, h, t, ctx + t))
-        scores = ((ac + bd) / attn.s_d_k).masked_fill(mask, -INF_VAL)
-        w = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
-        out = torch.matmul(w, v).transpose(1, 2).reshape(b, t, h * dk)
-        return attn.linear_out(out), k, v
+        out = kv.attend(li, q_u, k, v, rel_bias=bd_all, ieee=k.dtype == torch.float32)
+        return attn.linear_out(out.reshape(b, t, h * dk))
 
     def _conv(self, layer: "ConformerLayer", x: torch.Tensor,
               conv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -651,33 +666,25 @@ class ConformerStreamer:
         z = F.silu(z)
         return conv.pointwise_conv2(z).transpose(1, 2), tails
 
-    def layers(self, x: torch.Tensor, pool: "RecurrentStatePool", rows: "RecurrentAddressing",
-               frames: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        """The layer stack over ``x (B, t, D)`` and the projection, reading and
-        writing each call's state in ``pool`` at ``rows``. ``frames`` / ``n`` are
-        device ``(B,)`` counts: frames before the step, new frames (``n <= t``; a
-        call with none keeps its state as it was)."""
+    def layers(self, x: torch.Tensor, kv: "BoundedKVManager", pool: "RecurrentStatePool",
+               rows: "RecurrentAddressing", n: torch.Tensor) -> torch.Tensor:
+        """The layer stack over ``x (B, t, D)`` and the projection. Attention
+        runs on ``kv`` under the plan its step declared; the conv tails are read
+        and written in ``pool`` at ``rows``. ``n`` is each call's new frames,
+        a device ``(B,)`` count (``n <= t``; a call with none keeps its conv
+        tails as they were)."""
         b, t, _ = x.shape
-        ctx, keep = self._ctx, self.c.conv_kernel_size - 1
-        mask, dist = self._mask(frames, n, t)
-        # each call keeps the newest ctx keys/values and kernel-1 conv inputs:
-        # positions n .. n + keep of each concatenation
-        shift = n.view(b, 1, 1, 1)
-        kv_idx = (shift + torch.arange(ctx, device=x.device).view(1, 1, ctx, 1)).expand(
-            b, self.c.num_heads, ctx, self.c.head_dim)
-        conv_idx = (shift.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
+        keep = self.c.conv_kernel_size - 1
+        # each call keeps its newest kernel-1 conv inputs: positions n .. n + keep of the concatenation
+        conv_idx = (n.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
             b, self.c.d_model, keep)
         for li, layer in enumerate(self.p.encoder.layers):
-            k_cache, v_cache = pool.gather("k", rows, li), pool.gather("v", rows, li)
             conv_cache = pool.gather("conv", rows, li)
             r = x + layer.FC_FACTOR * layer.feed_forward1(layer.norm_feed_forward1(x))
-            a, k, v = self._attend(layer, layer.norm_self_att(r), k_cache, v_cache, mask, dist)
-            r = r + a
+            r = r + self._attend(layer, li, layer.norm_self_att(r), kv)
             cv, tails = self._conv(layer, layer.norm_conv(r), conv_cache)
             r = r + cv
             r = r + layer.FC_FACTOR * layer.feed_forward2(layer.norm_feed_forward2(r))
             x = layer.norm_out(r)
-            pool.scatter_("k", rows, k.gather(2, kv_idx).to(k_cache.dtype), li)
-            pool.scatter_("v", rows, v.gather(2, kv_idx).to(v_cache.dtype), li)
             pool.scatter_("conv", rows, tails.gather(2, conv_idx).to(conv_cache.dtype), li)
         return self.p.proj(x)
