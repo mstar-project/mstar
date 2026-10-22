@@ -76,6 +76,17 @@ class KVConfig(ABC):
         """
 
 
+@dataclass(frozen=True)
+class AuxPlanes:
+    """Per-token state that lives on the cache's pages beside the KV: ``num_layers`` planes
+    of ``width`` values per token, in the cache's dtype. A token's aux rows sit at its KV
+    slot, so they share the page table and are allocated, copied and freed with the pages
+    (DSA's index keys, for one)."""
+
+    num_layers: int
+    width: int
+
+
 @dataclass(kw_only=True)
 class PagedKVConfig(KVConfig):
     """Fixed-size pages, appended to as a sequence grows. The default."""
@@ -95,6 +106,8 @@ class PagedKVConfig(KVConfig):
     # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
     # the attention backend would plan; a cache only stored (index keys) needs no query heads
     qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+    # named per-token planes on the same pages (``AuxPlanes``)
+    aux_planes: dict[str, AuxPlanes] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.layout == KVLayout.MLA:
