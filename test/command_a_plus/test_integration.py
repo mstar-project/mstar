@@ -86,16 +86,27 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
-    def test_prefill_eos_and_one_token_budget_do_not_publish_decode_seed(self):
-        for token, maximum, ignore_eos, continues in (
-            (3, 5, False, False), (3, 5, True, True),
-            (7, 1, False, False), (7, 2, False, True),
-        ):
-            with self.subTest(token=token, maximum=maximum, ignore_eos=ignore_eos):
-                output = {"new_token": [torch.tensor([token])]}
-                self.node.postprocess("a", info(max_tokens=maximum, ignore_eos=ignore_eos), output)
-                self.assertEqual("decode_input" in output, continues)
-                self.assertIn("new_token", output)
+    def test_prefill_publishes_a_decode_seed_without_reading_the_token(self):
+        for maximum, continues in ((1, False), (2, True)):
+            output = {"new_token": [torch.tensor([3])]}
+            self.node.postprocess("a", info(max_tokens=maximum), output)
+            self.assertEqual("decode_input" in output, continues)
+            self.assertIn("new_token", output)
+
+    def test_eos_from_prefill_ends_the_reply_at_the_first_decode_step(self):
+        for ignore_eos, ends in ((False, True), (True, False)):
+            with self.subTest(ignore_eos=ignore_eos):
+                prefill = {"new_token": [torch.tensor([3])]}
+                self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), set())
+                request = info("decode", ignore_eos=ignore_eos)
+                decode = {"new_token": [torch.tensor([7])]}
+                self.node.postprocess("a", request, decode)
+                self.assertEqual("new_token" not in decode, ends)
+                self.assertEqual(self.node.check_stop("a", request, decode), {"decode_loop"} if ends else set())
+        self.assertEqual(self.node._ended_at_prefill, set())
+        self.node.check_stop("a", info(), {"new_token": [torch.tensor([3])]})
+        self.node.cleanup_request("a")
+        self.assertEqual(self.node._ended_at_prefill, set())
 
     def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
         for token, maximum, index, ignore_eos, stops in (
