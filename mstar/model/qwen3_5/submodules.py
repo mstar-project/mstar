@@ -937,13 +937,15 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ) -> torch.Tensor | None:
         """The block loop replayed once per prompt, or None if not leased.
 
-        A leased step declares nothing of its own (`declare_step`), so
-        ``engine_inputs.step`` is None; a bucket that fits is not enough, as
-        ``can_lease`` may have refused the batch. The bucket check keeps a
-        forward driven outside the engine (no declaration either) eager.
+        A leased step declares no attention of its own (`declare_step`: no step,
+        or only the engine's LoRA rows); a bucket that fits is not enough, as
+        ``can_lease`` may have refused the batch, and the eager tower then needs
+        the attention plan its step declared. The bucket check keeps a forward
+        driven outside the engine (no declaration either) eager.
         """
         runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None or engine_inputs.step is not None or not runner.can_run(
+        step = engine_inputs.step
+        if runner is None or (step is not None and VISION_ATTN in step.steps) or not runner.can_run(
             len(engine_inputs.request_ids), int(hidden.shape[0]),
         ):
             return None
