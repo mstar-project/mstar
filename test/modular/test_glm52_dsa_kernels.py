@@ -1,8 +1,8 @@
-"""dsa_kernels vs the indexer's fp32 score math (components/indexer.py) on a paged key store."""
+"""paged_kernels vs the indexer's fp32 score math (dsa/topk.py) on a paged key store."""
 import pytest
 import torch
 
-from mstar.model.glm52.components.indexer import select_topk_causal
+from mstar.engine.resources.dsa.topk import select_topk_causal
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
 
@@ -15,7 +15,7 @@ def _store(num_pages, gen):
 
 
 def _reference(q, w, keys, bound):
-    """compute_selection's scores: fp32 per-head relu dots, weighted head sum; -inf past
+    """index_topk's scores: fp32 per-head relu dots, weighted head sum; -inf past
     ``bound`` (keys a row sees)."""
     dots = torch.einsum("hd,sd->hs", q.float(), keys.float()).relu()
     sc = w @ dots
@@ -39,7 +39,7 @@ def _rows_agree(got, ref, bounds):
 
 
 def test_decode_scores_follow_each_rows_request_and_bound():
-    from mstar.model.glm52.dsa_kernels import decode_scores
+    from mstar.engine.resources.dsa.paged_kernels import decode_scores
 
     gen = torch.Generator(device="cuda").manual_seed(0)
     lens = [300, 1000, 2500]
@@ -62,7 +62,7 @@ def test_decode_scores_follow_each_rows_request_and_bound():
 
 def test_decode_scores_stride_over_more_blocks_than_programs():
     """64 rows leave a few programs per row, each striding over many key blocks."""
-    from mstar.model.glm52.dsa_kernels import decode_scores
+    from mstar.engine.resources.dsa.paged_kernels import decode_scores
 
     gen = torch.Generator(device="cuda").manual_seed(2)
     rows, max_pages = 64, 40
@@ -82,7 +82,7 @@ def test_decode_scores_stride_over_more_blocks_than_programs():
 
 
 def test_prefill_scores_are_causal_per_row():
-    from mstar.model.glm52.dsa_kernels import prefill_scores
+    from mstar.engine.resources.dsa.paged_kernels import prefill_scores
 
     gen = torch.Generator(device="cuda").manual_seed(1)
     ctx, rows = 3000, 70  # a chunk that ends the prompt; 70 is not a multiple of the row block

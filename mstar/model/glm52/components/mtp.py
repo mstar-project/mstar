@@ -10,7 +10,6 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.glm52.components.decoder_layer import Glm52DecoderLayer
 from mstar.model.glm52.components.language_model import build_rmsnorm
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
 
 class Glm52SharedHead(nn.Module):
@@ -74,7 +73,6 @@ class Glm52MTPModule(nn.Module):
         token_embeds: torch.Tensor,
         prev_hidden: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaPagedContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(head_input, raw_hidden)``: the shared_head-normed
         state for ``lm_head`` (applied by the caller that owns the head),
@@ -84,9 +82,7 @@ class Glm52MTPModule(nn.Module):
         the fusion input and drops acceptance to nothing.
         """
         hidden_states = self.fuse(token_embeds, prev_hidden)
-        hidden_states = self.transformer_layer(
-            hidden_states, position_ids, dsa_ctx=dsa_ctx
-        )
+        hidden_states = self.transformer_layer(hidden_states, position_ids)
         return self.shared_head(hidden_states), hidden_states
 
     def forward_block_row(

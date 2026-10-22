@@ -1,4 +1,4 @@
-"""glm5_next DSA past index_topk (dsa.py) on CPU: the k-pool selection and pool keys against the
+"""glm5_next DSA past index_topk (dsa/kpool.py) on CPU: the k-pool selection and pool keys against the
 reference indexer (transformers' Glm5NextTextIndexer, ported below), and the long-context engine
 path against itself (one-shot prefill vs stepwise decode vs windowed prefill) and against dense
 MLA where they must agree.
@@ -19,12 +19,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.attn import sparse_mla
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
-from mstar.model.glm5_next import dsa
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import ATTN, KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
@@ -85,7 +85,7 @@ class _Planes:
 def _ctx(page_table, positions, page_size, topk, kpool, spans=None):
     """A one-request context over ``page_table`` for rows at ``positions``."""
     n = len(positions)
-    return dsa.Glm5NextDsaContext(
+    return dsa.KPoolContext(
         pos=torch.tensor(positions, dtype=torch.int32),
         row_req=torch.zeros(n, dtype=torch.int32),
         pages=torch.tensor(page_table, dtype=torch.int32),
@@ -202,7 +202,7 @@ def test_decode_rows_select_like_prefill_rows():
     dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
     prefill = dsa.select(q, w, planes.layer_view(0), ctx)
     rows = [7, 64, 119, 33]
-    dec = dsa.Glm5NextDsaContext(
+    dec = dsa.KPoolContext(
         pos=torch.tensor(rows, dtype=torch.int32), row_req=torch.zeros(4, dtype=torch.int32),
         pages=torch.tensor(pages, dtype=torch.int32), page_start=torch.zeros(1, dtype=torch.int32),
         host_pos=rows, spans=[(i, 1, 0) for i in range(4)], host_page_start=[0],
