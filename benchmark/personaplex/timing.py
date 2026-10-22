@@ -222,29 +222,34 @@ def main():
                        prepare_frame_ms_p50=statistics.median(host_ms))
             return out
 
-        clips = [c.split("=", 1) for c in a.clip]
-        warm_audio, warm_static, warm_meta = prepare(clips[0][1])
+        clips = {name: prepare(path) for name, path in (c.split("=", 1) for c in a.clip)}
+        warm_audio, warm_static, warm_meta = next(iter(clips.values()))
         warm_meta = {**warm_meta, "num_user_frames": 16, "num_samples": 16 * cfg.FRAME_SIZE}
         warm_audio = warm_audio[: 16 * cfg.FRAME_SIZE]
-        for graphs in (True, False):
-            nvidia(warm_audio, warm_static, warm_meta, graphs)
-        mstar(warm_audio, warm_static, warm_meta, "warmup")
-        report["warmup"] = "16-frame run per system, excluded"
-        save()
-        for name, path in clips:
-            audio, static, meta = prepare(path)
+        for name, (_, _, meta) in clips.items():
             report["results"][name] = {"request": meta}
-            for system in ("nvidia-cuda-graphs", "nvidia-eager", "mstar-direct"):
-                runs = []
-                for r in range(a.repeats):
-                    if system == "mstar-direct":
-                        runs.append(mstar(audio, static, meta, f"{name}-{r}"))
-                    else:
-                        runs.append(nvidia(audio, static, meta, system == "nvidia-cuda-graphs"))
+        report["warmup"] = "16-frame run before each system, excluded"
+        # One system at a time: both LMGen variants share NVIDIA's LM, whose streaming
+        # state lives on the shared modules, so a second generator invalidates buffers
+        # the first one captured into CUDA graphs. M* runs first so its numbers survive
+        # a reference-side failure.
+        for system in ("mstar-direct", "nvidia-cuda-graphs", "nvidia-eager"):
+            graphs = system == "nvidia-cuda-graphs"
+
+            def run(audio, static, meta, rid, system=system, graphs=graphs):
+                if system == "mstar-direct":
+                    return mstar(audio, static, meta, rid)
+                return nvidia(audio, static, meta, graphs)
+
+            run(warm_audio, warm_static, warm_meta, f"warmup-{system}")
+            for name, (audio, static, meta) in clips.items():
+                runs = [run(audio, static, meta, f"{name}-{r}") for r in range(a.repeats)]
                 report["results"][name][system] = median_runs(runs)
                 save()
                 print(name, system, {k: round(v, 3) for k, v in report["results"][name][system].items()
                                      if isinstance(v, float)}, flush=True)
+            generators.clear()
+            torch.cuda.empty_cache()
     report["completed"] = True
     save()
 
