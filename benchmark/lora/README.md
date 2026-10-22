@@ -226,10 +226,10 @@ Pass: exit 0, which includes `failed == 0` for the base traffic. Results:
 latency overall and while each load or unload was in flight) and
 `server_runtime_load.log`. Copy both off the box when it finishes.
 
-Worth reading even on a pass: `base_traffic.during_load_*`. A worker reads the adapter
-on its main loop as the load arrives, so a large adapter could stall that worker's steps
-for the read's duration; for these rank-16 0.8B adapters it should be small. A bump
-there is the number that would justify moving the read off the main loop.
+Worth reading even on a pass: `base_traffic.during_load_*`. Each pool reads the adapter
+on its own reader thread and the worker's main loop only acknowledges once it lands, so
+serving should not stall during a load; a bump there would be contention for the host
+(the read, pinning, the GIL), worth chasing for large adapters.
 
 Qwen3.5 keys no prefix-cache stream, so no adapter has a prefix-cache root in this run.
 That a reload of the same weights keeps its root, and of other weights does not, is the

@@ -142,8 +142,8 @@ class _BaseTraffic:
             "latency_p50_s": pct(lat, 0.5), "latency_p99_s": pct(lat, 0.99),
             "latency_max_s": lat[-1] if lat else None,
         }
-        # requests in flight during each admin call: a slow adapter read on a worker's
-        # main loop would show here as a latency bump (worth knowing, not a pass/fail)
+        # requests in flight during each admin call: the read is off the workers' main
+        # loops, so a latency bump here is host contention (worth knowing, not a pass/fail)
         for name, (a, b) in windows.items():
             overlap = sorted(end - start for start, end, err in self.log
                              if err is None and start < b and end > a)
