@@ -1,0 +1,176 @@
+"""A ChunkSink takes its requests' chunks once per message pass.
+
+The Rust-frontend bridge relays every chunk the message thread drained in a
+pass as one message, instead of each request's handler waking per chunk.
+The handler still owns completion, errors and the timeout."""
+import asyncio
+import types
+
+from api_server_helpers import make_test_api_server
+
+from mstar.api_server import entrypoint as ep
+from mstar.api_server.entrypoint import PendingRequest
+from mstar.api_server.request_types import ResultChunk
+
+
+class _PreprocessWorker:
+    """Hands the message thread a fixed list of chunks on its next pass."""
+
+    def __init__(self):
+        self.chunks: list[ResultChunk] = []
+
+    def get_profile_updates(self):
+        return []
+
+    def get_result_chunks(self):
+        out, self.chunks = self.chunks, []
+        return out
+
+    def has_pending_tensors(self, rid):
+        return False
+
+    def received_final_chunks(self, rid, counts):
+        return True
+
+    def finished_reading(self, rid, drained=True):
+        pass
+
+    def abort_request(self, rid):
+        pass
+
+
+class _Comm:
+    def get_all_new_messages(self):
+        return []
+
+
+class _Sink:
+    def __init__(self, loop):
+        self.loop = loop
+        self.calls: list[tuple[list, list[bytes]]] = []
+
+    def relay(self, tags, chunks):
+        self.calls.append((list(tags), [c.data for c in chunks]))
+
+
+def _server():
+    return make_test_api_server(preprocess_worker=_PreprocessWorker(), communicator=_Comm())
+
+
+def _register(server, key):
+    req = PendingRequest(
+        streaming=True, input_modalities=["text"], output_modalities=["text"], profile=None,
+    )
+    req.profile = types.SimpleNamespace(timing=types.SimpleNamespace(
+        first_chunk_time=None, last_chunk_time=None,
+    ))
+    server.pending_requests[key] = req
+    server._live[key] = key
+    server._client_ids[key] = key
+    return req
+
+
+def _chunk(key, data, modality="text", **metadata):
+    return ResultChunk(request_id=key, modality=modality, data=data, metadata=metadata)
+
+
+def _one_pass(server, monkeypatch):
+    """``_process_messages`` for one pass: its end-of-pass sleep stops it."""
+    shim = types.SimpleNamespace(
+        monotonic=ep.time.monotonic, time=ep.time.time, perf_counter=ep.time.perf_counter,
+        sleep=lambda _s: setattr(server, "running", False),
+    )
+    monkeypatch.setattr(ep, "time", shim)
+    server.running = True
+    server._process_messages()
+    monkeypatch.undo()
+
+
+def test_a_pass_hands_the_sink_every_request_s_chunks_in_one_call(monkeypatch):
+    async def run():
+        server = _server()
+        sink = _Sink(asyncio.get_running_loop())
+        a, b, c = (_register(server, k) for k in ("A", "B", "C"))
+        server.relay_chunks_to("A", sink, 1)
+        server.relay_chunks_to("B", sink, 2)
+        c.loop, c.wake = asyncio.get_running_loop(), asyncio.Event()
+        a.loop, a.wake = asyncio.get_running_loop(), asyncio.Event()
+        server.preprocess_worker.chunks = [
+            _chunk("A", b"a1"), _chunk("B", b"b1"), _chunk("C", b"c1"), _chunk("A", b"a2"),
+        ]
+        _one_pass(server, monkeypatch)
+        await asyncio.sleep(0)
+        assert sink.calls == [([1, 1, 2], [b"a1", b"a2", b"b1"])]
+        assert a.consumed_chunks == 2 and b.consumed_chunks == 1
+        # a sink request's handler is not woken per chunk; anyone else's is
+        assert not a.wake.is_set() and c.wake.is_set()
+        assert c.consumed_chunks == 0
+
+    asyncio.run(run())
+
+
+def test_an_error_chunk_and_what_follows_stay_for_the_handler(monkeypatch):
+    async def run():
+        server = _server()
+        sink = _Sink(asyncio.get_running_loop())
+        _register(server, "A")
+        server.relay_chunks_to("A", sink, 1)
+        server.preprocess_worker.chunks = [
+            _chunk("A", b"a1"), _chunk("A", b"boom", modality="error", status=400),
+        ]
+        handler = server.iter_result_chunks("A")
+        _one_pass(server, monkeypatch)
+        await asyncio.sleep(0)  # the sink's callback
+        rest = [c async for c in handler]
+        assert sink.calls == [([1], [b"a1"])]
+        assert [(c.modality, c.data) for c in rest] == [("error", b"boom")]
+        assert "A" not in server.pending_requests
+
+    asyncio.run(run())
+
+
+def test_the_handler_finishes_a_relayed_request_with_nothing_left(monkeypatch):
+    async def run():
+        server = _server()
+        sink = _Sink(asyncio.get_running_loop())
+        req = _register(server, "A")
+        server.relay_chunks_to("A", sink, 1)
+        handler = server.iter_result_chunks("A")
+        first = asyncio.ensure_future(handler.__anext__())
+        await asyncio.sleep(0)  # the handler is waiting
+        server.preprocess_worker.chunks = [_chunk("A", b"a1"), _chunk("A", b"a2")]
+        _one_pass(server, monkeypatch)
+        await asyncio.sleep(0)
+        assert sink.calls == [([1, 1], [b"a1", b"a2"])]
+        # completion, as _prune_recently_completed signals it
+        with server.request_lock:
+            req.event.set()
+            req.notify()
+        try:
+            leftover = [await first] + [c async for c in handler]
+        except StopAsyncIteration:
+            leftover = []
+        assert leftover == []
+        assert "A" not in server.pending_requests
+
+    asyncio.run(run())
+
+
+def test_chunks_the_handler_already_took_are_not_relayed_again(monkeypatch):
+    async def run():
+        server = _server()
+        sink = _Sink(asyncio.get_running_loop())
+        req = _register(server, "A")
+        server.relay_chunks_to("A", sink, 1)
+        server.preprocess_worker.chunks = [_chunk("A", b"a1")]
+        _one_pass(server, monkeypatch)
+        # the handler's backstop wake runs before the sink's callback
+        batches = server.iter_result_chunk_batches("A")
+        got = await batches.__anext__()
+        assert [c.data for c in got] == [b"a1"]
+        await asyncio.sleep(0)
+        assert sink.calls == []
+        assert req.consumed_chunks == 1
+        await batches.aclose()
+
+    asyncio.run(run())
