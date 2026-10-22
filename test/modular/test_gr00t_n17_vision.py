@@ -327,3 +327,47 @@ def test_driving_the_node_runs_the_encoders_own_forward():
     # one embedding and one feature per tap, each a row per 2x2 block: (2 * 2 + 4 * 6) / 4
     shape = (7, node.config.out_hidden_size)
     assert [tuple(t.shape) for t in out["vision_embeds"] + out["deepstack_embeds"]] == [shape] * 4
+
+
+# ----------------------------------------------------------------------------
+# The rope the blocks get
+# ----------------------------------------------------------------------------
+
+
+def _rope_into_blocks(encoder: Gr00tN17VisionEncoder, args: tuple[torch.Tensor, ...]):
+    """The encoder's output, and the (cos, sin) each block was called with."""
+    seen = []
+    hooks = [b.register_forward_pre_hook(lambda _, a: seen.append(a[1:])) for b in encoder.tower.blocks]
+    embeds, _ = encoder(*args)
+    for hook in hooks:
+        hook.remove()
+    return embeds, seen
+
+
+@torch.no_grad()
+def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
+    """transformers' Qwen3-VL, which GR00T runs, keeps the vision rope in fp32 into
+    the blocks; ``embed`` rounds it to the hidden dtype. In bf16 that rounding alone
+    put vision_embeds at 1.25x the bf16 floor, so the blocks must get the fp32 table."""
+    encoder = Gr00tN17VisionEncoder(_config((0,), depth=2)).to(torch.bfloat16)
+    args = _inputs(encoder.tower.config, [(1, 4, 4)])
+    args = (args[0].to(torch.bfloat16), *args[1:])
+    for block in encoder.tower.blocks:
+        block.attn.bind_resources({VISION_ATTN: _FrameAttention((16,))})
+    rope = encoder.tower.rotary_pos_emb
+    table = rope(args[3])
+
+    def fp32_table(seen):
+        pairs = [(r, t) for got in seen for r, t in zip(got, table, strict=True)]
+        return all(r.dtype == torch.float32 and torch.equal(r, t) for r, t in pairs)
+
+    embeds, seen = _rope_into_blocks(encoder, args)
+    assert len(seen) == 2 and fp32_table(seen)
+
+    # the old wiring: every block gets `embed`'s rounded copy
+    fp32 = rope.forward
+    monkeypatch.setattr(rope, "forward", lambda p: [t.to(torch.bfloat16) for t in fp32(p)])
+    rounded_embeds, seen = _rope_into_blocks(encoder, args)
+    assert not fp32_table(seen)
+    # and the rounding reaches the output at this size
+    assert not torch.equal(embeds, rounded_embeds)
