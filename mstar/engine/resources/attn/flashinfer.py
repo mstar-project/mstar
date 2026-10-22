@@ -23,6 +23,7 @@ from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.profiler import PhaseLaps
 
 
 class FlashInferManager(AttentionManager):
@@ -190,6 +191,7 @@ class FlashInferManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        laps = PhaseLaps("res.pre_plan.attn." if ctx.is_preplan else "res.plan.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if lease is not None:
@@ -201,12 +203,11 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
+            kwargs = indptrs.to_kwargs_dict()
+            laps.lap("wrapper")
             # TODO: cache the latest plan state
-            wrapper.plan(
-                causal=step.causal,
-                dtype=self._dtype,
-                **indptrs.to_kwargs_dict()
-            )
+            wrapper.plan(causal=step.causal, dtype=self._dtype, **kwargs)
+            laps.lap("wrapper_plan")
             plan_states[label] = wrapper
 
         self._preplanned = ctx.is_preplan
