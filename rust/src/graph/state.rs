@@ -756,8 +756,12 @@ impl RequestState {
         self.loops[lid as usize].curr_iter
     }
 
+    /// True once the loop is done or its finish signal is set. Setting the
+    /// finish signal leaves `done` false, and Python's `_can_continue_loop`
+    /// reads the finish signal too.
     pub fn loop_finished(&self, lid: LoopId) -> bool {
-        self.loops[lid as usize].done
+        let st = &self.loops[lid as usize];
+        st.done || st.finish_signal
     }
 
     pub fn loop_indices(&self) -> Vec<u32> {
@@ -1003,7 +1007,7 @@ mod tests {
         assert_eq!(lb, vec![(it.get("tok").unwrap(), dec)]);
         st.clear_consumed_inputs(&g, dec);
         let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
-        assert!(st.loop_finished(0));
+        assert!(st.loops[0].done);
         assert_eq!(st.loop_iter(0), 0);
         assert!(done.freed.is_empty());
         let out: Vec<Vec<u64>> = done.edges.iter()

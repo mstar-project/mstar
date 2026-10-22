@@ -158,7 +158,7 @@ def test_a_replay_after_release_allocates_only_the_real_rows():
 
     runner.run({"x": torch.ones(5)}, request_ids=["real"], seq_lens=[5])
 
-    assert kv.stored_len("real") == 5
+    assert kv._streams["real"]["main"].stored_len == 5
     assert kv._arena.num_free == free - 2, "padding rows took pages at replay"
 
 
@@ -200,4 +200,4 @@ def test_a_batched_region_keeps_its_padding_rows():
 
     runner.run({"x": torch.ones(1, 8)}, request_ids=["real"], real_bs=1)
 
-    assert kv.stored_len("real") == 8
+    assert kv._streams["real"]["main"].stored_len == 8

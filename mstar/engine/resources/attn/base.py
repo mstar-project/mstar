@@ -200,6 +200,20 @@ class EagerSlotKey(NamedTuple):
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
+def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
+    """Page ids a captured wrapper's index buffer holds for a bucket of
+    ``num_rows`` rows and ``num_tokens`` tokens.
+
+    Per row, not per pool: rows that matched one cached prefix all name its
+    pages, so a step can name more page ids than the pool holds. And at least
+    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
+    whatever the pool's size."""
+    return max(
+        num_rows * kv_config.max_num_pages,
+        -(-num_tokens // kv_config.page_size) + num_rows,
+    )
+
+
 class WorkspacePool:
     """FlashInfer workspace buffers, one per (plan label, cg slot).
 

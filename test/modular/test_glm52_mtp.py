@@ -53,9 +53,7 @@ from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
 )
-from mstar.model.glm52.quantization import (  # noqa: E402
-    process_weights_after_loading,
-)
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 # The collapsed key inventory under model.layers.78. from the real
 # checkpoint's model.safetensors.index.json (experts collapsed to one
@@ -269,7 +267,7 @@ def test_mtp_forward_writes_the_plane_layer():
     assert plane.abs().sum(-1).gt(0).all()
     for layer in range(cfg.num_hidden_layers):
         assert not kv.layer_view(layer).any()
-    assert kv.stored_len("r0") == n
+    assert kv._streams["r0"]["main"].stored_len == n
 
 
 # --- greedy verify truth table ---------------------------------------------

@@ -8,10 +8,15 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
-from mstar.model.components.moe import _down_proj_weight_loader, _gate_up_weight_loader
+from mstar.model.components.moe import (
+    _down_proj_fp8_weight_loader,
+    _down_proj_weight_loader,
+    _gate_up_fp8_weight_loader,
+    _gate_up_weight_loader,
+)
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import dequantize_fp8_block_weight
 
 # HF Glm5NextTextTopkRouter: denominator = topk_weights.sum(...) + 1e-20.
 _TOPK_NORM_EPS = 1e-20
@@ -25,56 +30,6 @@ _DECODE_MAX_TOKENS = 64
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
-
-
-def _gate_up_fp8_loader(
-    tp_rank: int, tp_size: int, full_inter: int, row_unit: int,
-    param: nn.Parameter, loaded_weight: torch.Tensor,
-    loaded_shard_id: str | int | None = None,
-):
-    """Route one expert's gate/up tensor into the stacked per-rank param."""
-    assert loaded_shard_id is not None
-    kind, expert_str = str(loaded_shard_id).split(":")
-    expert_idx = int(expert_str)
-    rows = divide(divide(full_inter, tp_size), row_unit)
-    full_rows = divide(full_inter, row_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    if loaded_weight.shape[0] == full_rows:
-        start = tp_rank * rows
-        loaded_weight = loaded_weight[start:start + rows, :]
-    elif loaded_weight.shape[0] != rows:
-        raise ValueError(
-            f"expert gate/up tensor has {loaded_weight.shape[0]} rows; expected "
-            f"the full {full_rows} or the per-rank {rows}"
-        )
-    if kind == "gate":
-        param.data[expert_idx, :rows, :] = loaded_weight
-    else:
-        param.data[expert_idx, rows:2 * rows, :] = loaded_weight
-
-
-def _down_fp8_loader(
-    tp_rank: int, tp_size: int, full_inter: int, col_unit: int,
-    param: nn.Parameter, loaded_weight: torch.Tensor,
-    loaded_shard_id: str | int | None = None,
-):
-    """Column (contraction-dim) sharding twin of :func:`_gate_up_fp8_loader`."""
-    assert loaded_shard_id is not None
-    expert_idx = int(str(loaded_shard_id).split(":")[1])
-    cols = divide(divide(full_inter, tp_size), col_unit)
-    full_cols = divide(full_inter, col_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    if loaded_weight.shape[1] == full_cols:
-        start = tp_rank * cols
-        loaded_weight = loaded_weight[:, start:start + cols]
-    elif loaded_weight.shape[1] != cols:
-        raise ValueError(
-            f"expert down tensor has {loaded_weight.shape[1]} cols; expected "
-            f"the full {full_cols} or the per-rank {cols}"
-        )
-    param.data[expert_idx, :, :] = loaded_weight
 
 
 class Glm5NextGatedMLP(ParallelGatedMLP):
@@ -278,16 +233,16 @@ class Glm5NextSparseMoeBlock(nn.Module):
         if self.fp8_experts:
             bo, bi = self.block_size
             self.experts.gate_up_proj_fp8.weight_loader = partial(
-                _gate_up_fp8_loader, self.tp_rank, self.tp_size, full_inter, 1,
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
             )
             self.experts.gate_up_proj_scale_inv.weight_loader = partial(
-                _gate_up_fp8_loader, self.tp_rank, self.tp_size, full_inter, bo,
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bo,
             )
             self.experts.down_proj_fp8.weight_loader = partial(
-                _down_fp8_loader, self.tp_rank, self.tp_size, full_inter, 1,
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
             )
             self.experts.down_proj_scale_inv.weight_loader = partial(
-                _down_fp8_loader, self.tp_rank, self.tp_size, full_inter, bi,
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bi,
             )
         else:
             self.experts.gate_up_proj.weight_loader = partial(

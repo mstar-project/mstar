@@ -1,0 +1,59 @@
+name: PR labels
+
+# Labels each PR with the areas it touches (area/*, model/*) and its size
+# (size/*), from the PR's file list. The rules are in .github/labels/label_prs.py.
+# type/* labels come from the review bot (claude-review.yml), not from here.
+#
+# pull_request_target so fork PRs can be labelled. GitHub runs the default
+# branch's copy of this file for it, stacked PRs included, and the job checks
+# out only the default branch: the script reads the PR's file list through the
+# API and never runs its code. Run it by hand (workflow_dispatch) to relabel
+# every open PR, e.g. after changing the rules.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Creates labels and adds and removes them on PRs.
+      pull-requests: write
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      # Labels come from the review bot's app, like its comments, when the app
+      # is set up (.github/review/README.md), and from the job's token until then.
+      - name: Mint the review app's token
+        if: vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Label
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$PR" ]; then
+            python3 .github/labels/label_prs.py --repo "$GITHUB_REPOSITORY" "$PR"
+          else
+            python3 .github/labels/label_prs.py --repo "$GITHUB_REPOSITORY" --all
+          fi
