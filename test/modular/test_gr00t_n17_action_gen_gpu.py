@@ -17,7 +17,7 @@ measured here rather than written down, and the T3 bar is mean abs error within 
 read: ``input_ids`` (which rows are the image), ``embodiment_id``, the embodiment tag and the
 raw state the decode composes onto.
 
-Five things are measured, and two are deliberately broken:
+Five things are measured, and four are deliberately broken:
 
 * **R11, the served chunk.** All 20 recorded DROID requests, ours in bf16 against the fp32
   oracle, at the T3 bar. This is the only bar in the port that reads the whole loop at once:
@@ -26,6 +26,10 @@ Five things are measured, and two are deliberately broken:
   ``unapply`` and compared **per joint group**. The 132-wide chunk is mostly padding, so a
   group-sized error is a few percent of the chunk and invisible in the bar above; after the
   decode it is the whole of one joint.
+* **R11's two controls.** Our loop on another seed's noise, and our loop with the cameras
+  blanked, each scored against the oracle exactly as R11 is; both have to fail its bar. The
+  wrong noise is an ``oracle_{fp32,bf16}_seedN`` set's: NVIDIA's model on the noise M\\*'s
+  server draws for seed N (``tools/oracle/oracle_nvidia.py --seed``).
 * **The bucket count.** The 20 requests occupy exactly **two** buckets by (text rows, image
   rows). A batch in this engine shares its span lengths, so the bucket count is what the
   served deployment pays for, and it is a stated C08 bar.
@@ -33,7 +37,7 @@ Five things are measured, and two are deliberately broken:
 * **R10, mixed loop iterations.** One shared forward with each row at its own iteration index,
   against each row run alone -- what the scaffold's loop does whenever two requests arrive a
   step apart.
-* **The two controls.** Hand the text blocks the image rows (a span-assignment bug, which has
+* **The batching controls.** Hand the text blocks the image rows (a span-assignment bug, which has
   to sit orders above the batching gap), and perturb one row's conditioning (after which the
   *other* row has to stay bit-identical).
 
@@ -80,6 +84,7 @@ not in the repo, and it is skipped without any of them.
 from __future__ import annotations
 
 import glob
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,19 +108,30 @@ _BACKBONE = next(iter(glob.glob(str(_HUB / "models--nvidia--Cosmos-Reason2-2B/sn
 _RUNS = Path.home() / "gr00t-runs"
 _ORACLE_FP32, _ORACLE_BF16, _DUMP = _RUNS / "oracle_fp32", _RUNS / "oracle_bf16", _RUNS / "dump"
 _REQUESTS = 20
+# Every oracle recording set, as its (fp32, bf16) pair. `recorded` started from the dump's own
+# noise and is what every test but R11's reads; the seed sets are the oracle re-run on the
+# noise M*'s server draws for that seed. R11 itself runs on `recorded` only: per D11 the
+# per-seed statistic is a mean over seeds, in the served check, not a one-seed gate here.
+_SETS = {
+    "recorded": (_ORACLE_FP32, _ORACLE_BF16),
+    **{
+        f"seed{s}": (_RUNS / f"oracle_fp32_seed{s}", _RUNS / f"oracle_bf16_seed{s}")
+        for s in (7, 8, 9, 10, 11)
+    },
+}
+# The wrong-noise control: seed 7's conditioning and oracle, seed 8's noise.
+_RIGHT_SET, _WRONG_NOISE_SET = "seed7", "seed8"
 
 
-def _recorded() -> bool:
-    """Whether all three recordings are complete. A partial set would silently shrink the
-    sample the bars are measured over, so the count is checked rather than the directory."""
-    return all(
-        d.is_dir() and len(list(d.glob("req_*.pt"))) == _REQUESTS
-        for d in (_ORACLE_FP32, _ORACLE_BF16, _DUMP)
-    )
+def _complete(*dirs: Path) -> bool:
+    """Whether every recording is complete. A partial set would silently shrink the sample
+    the bars are measured over, so the count is checked rather than the directory."""
+    return all(d.is_dir() and len(list(d.glob("req_*.pt"))) == _REQUESTS for d in dirs)
 
 
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and _GR00T.exists() and bool(_BACKBONE) and _recorded()),
+    not (torch.cuda.is_available() and _GR00T.exists() and bool(_BACKBONE)
+         and _complete(_ORACLE_FP32, _ORACLE_BF16, _DUMP)),
     reason=(
         f"the full action_gen loop needs CUDA, the cached checkpoint and the {_REQUESTS} recorded "
         f"requests in {_RUNS}/{{oracle_fp32,oracle_bf16,dump}} (see docs-local/c08/qa/)"
@@ -152,6 +168,12 @@ _MIXED_ITERS = (1, 3)
 # the point of the number is only that a wiring bug and a re-blocking difference are not the
 # same order, and the measurement says they are apart by more than one.
 _CONTROL_MARGIN = 10
+# How far past its floor R11 has to put our loop when it is run on the wrong seed's noise.
+# Hand-chosen with headroom from one-off QA (C10), seed 8's noise against seed 7's oracle:
+# chunk 222-315x, decoded worst group 3.7-44x (req 00 the closest). The decoded figure is the
+# small one because a group's error is a few dims of a mostly-padding chunk. A reviewer
+# should ask whether 2.5x is enough distance from the 1.2x bar; it is what req 00 leaves room for.
+_WRONG_NOISE_CHUNK, _WRONG_NOISE_DECODED = 50, 2.5
 
 
 # ----------------------------------------------------------------------------
@@ -187,17 +209,19 @@ class _Request:
         return (self.rounded - self.want).abs().mean().item()
 
 
-def _load(config: Gr00tN17Config, index: int) -> _Request:
-    """One request, with its conditioning taken from the **bf16** oracle (trap 1 in the
-    banner) and the image rows picked out by the dump's ``input_ids``.
+def _load(
+    config: Gr00tN17Config, index: int, fp32: Path = _ORACLE_FP32, bf16: Path = _ORACLE_BF16,
+) -> _Request:
+    """One request of one recording set, with its conditioning taken from the **bf16** oracle
+    (trap 1 in the banner) and the image rows picked out by the dump's ``input_ids``.
 
     Which rows are the image is the reference's own predicate, ``input_ids == image_token_id``
     (``gr00t/model/modules/qwen3_backbone.py:364``), and ``test_gr00t_n17_bridge.py`` is where it is pinned against
     the reference. Here it is simply applied, to split the one recorded ``vl_embeds`` tensor
     into the two spans the DT's cross blocks read.
     """
-    oracle32 = torch.load(_ORACLE_FP32 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
-    oracle16 = torch.load(_ORACLE_BF16 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
+    oracle32 = torch.load(fp32 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
+    oracle16 = torch.load(bf16 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
     dump = torch.load(_DUMP / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
 
     is_image = dump["collated"]["inputs"]["input_ids"][0] == config.text.image_token_id
@@ -275,11 +299,27 @@ def loop() -> _Loop:
 
 
 @pytest.fixture(scope="session")
-def requests(loop: _Loop) -> list[_Request]:
-    """All 20 recordings, loaded once. The conditioning is ~2 MB of device memory per request
-    against the step's 2.55 GiB, and re-reading the dumps per test would cost more than the
-    forwards do."""
-    return [_load(loop.config, index) for index in range(_REQUESTS)]
+def recordings(loop: _Loop) -> Callable[[str], list[_Request]]:
+    """A recording set's 20 requests by its ``_SETS`` name, each set loaded once, and a skip
+    for a set that is not complete (the seed sets are written by a separate run). The
+    conditioning is ~2 MB of device memory per request against the step's 2.55 GiB, and
+    re-reading the dumps per test would cost more than the forwards do."""
+    loaded: dict[str, list[_Request]] = {}
+
+    def get(name: str) -> list[_Request]:
+        if name not in loaded:
+            if not _complete(*_SETS[name]):
+                pytest.skip(f"recording set {name} is not {_REQUESTS} requests in {_SETS[name]}")
+            loaded[name] = [_load(loop.config, index, *_SETS[name]) for index in range(_REQUESTS)]
+        return loaded[name]
+
+    return get
+
+
+@pytest.fixture(scope="session")
+def requests(recordings: Callable[[str], list[_Request]]) -> list[_Request]:
+    """The ``recorded`` set, which every test but R11's reads."""
+    return recordings("recorded")
 
 
 @pytest.fixture(scope="session")
@@ -366,6 +406,35 @@ def _ratio_within_t3(gap: torch.Tensor, floor: torch.Tensor, what: str) -> None:
         )
 
 
+def _chunk_error(ours: torch.Tensor, request: _Request) -> float:
+    """R11 on the chunk: our mean abs error against the fp32 oracle. Its floor is
+    ``request.floor``."""
+    return (ours - request.want).abs().mean().item()
+
+
+def _decoded_error(
+    loop: _Loop, ours: torch.Tensor, request: _Request,
+) -> tuple[float, float, dict[str, tuple[float, float]]]:
+    """R11 after the decode: the worst joint group's mean abs error, the worst group's bf16
+    floor, and every group's (error, floor). Why it is read this way is the decoded test's
+    docstring."""
+
+    def decode(chunk: torch.Tensor) -> dict[str, np.ndarray]:
+        return loop.preprocessor.unapply(request.tag, chunk.numpy(), request.raw_state)
+
+    got, want, rounded = decode(ours), decode(request.want), decode(request.rounded)
+    assert got.keys() == want.keys() and got, got.keys()
+    per_group = {
+        group: (
+            float(np.abs(got[group] - want[group]).mean()),
+            float(np.abs(rounded[group] - want[group]).mean()),
+        )
+        for group in want
+    }
+    worst, floor = (max(side) for side in zip(*per_group.values(), strict=True))
+    return worst, floor, per_group
+
+
 # ----------------------------------------------------------------------------
 # R11: the loop against the oracle
 # ----------------------------------------------------------------------------
@@ -387,8 +456,9 @@ def test_the_recordings_share_one_seeded_trajectory(requests: list[_Request]):
         )
 
 
+@pytest.mark.parametrize("recording", ["recorded"])
 def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
-    loop: _Loop, requests: list[_Request],
+    loop: _Loop, recordings: Callable[[str], list[_Request]], recording: str,
 ):
     """R11: ours in bf16 against the fp32 oracle, all 20 requests, at the T3 bar.
 
@@ -409,22 +479,23 @@ def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
     wide enough to pass anything -- and on this side of the comparison the answer comes off
     disk, so the guard is on the recording rather than on the forward.
     """
-    for request in requests:
+    for request in recordings(recording):
         rms = request.want.pow(2).mean().sqrt().item()
         assert _ACTION_RMS[0] < rms < _ACTION_RMS[1], (
             f"req {request.index}: oracle action rms {rms:.3g} outside {_ACTION_RMS}, so the "
             "recording is not the trained model's actions"
         )
         ours = _run(loop, [request]).cpu()
-        error, floor = (ours - request.want).abs().mean().item(), request.floor
+        error, floor = _chunk_error(ours, request), request.floor
         assert error <= _T3 * floor, (
             f"req {request.index}: mean abs error {error:.3e} past the T3 bar {_T3 * floor:.3e} "
             f"({_T3}x its measured bf16 floor {floor:.3e})"
         )
 
 
+@pytest.mark.parametrize("recording", ["recorded"])
 def test_the_decoded_actions_match_the_oracle_in_every_joint_group(
-    loop: _Loop, requests: list[_Request],
+    loop: _Loop, recordings: Callable[[str], list[_Request]], recording: str,
 ):
     """R11 after the decode: ours, the fp32 oracle and the bf16 oracle each through
     ``Gr00tN17Preprocessor.unapply``, compared **per joint group**.
@@ -457,26 +528,70 @@ def test_the_decoded_actions_match_the_oracle_in_every_joint_group(
     If this fails while the bar above passes, the error is concentrated in one group -- which
     is the shape a decode-side bug has, and the shape a chunk-wide mean cannot see.
     """
-    for request in requests:
-        ours = _run(loop, [request]).cpu()
-
-        def decode(chunk: torch.Tensor, request: _Request = request) -> dict[str, np.ndarray]:
-            return loop.preprocessor.unapply(request.tag, chunk.numpy(), request.raw_state)
-
-        got, want, rounded = decode(ours), decode(request.want), decode(request.rounded)
-        assert got.keys() == want.keys() and got, got.keys()
-        per_group = {
-            group: (
-                float(np.abs(got[group] - want[group]).mean()),
-                float(np.abs(rounded[group] - want[group]).mean()),
-            )
-            for group in want
-        }
-        worst, floor = (max(side) for side in zip(*per_group.values(), strict=True))
+    for request in recordings(recording):
+        worst, floor, per_group = _decoded_error(loop, _run(loop, [request]).cpu(), request)
         assert worst <= _T3 * floor, (
             f"req {request.index}: worst joint group's mean abs error {worst:.3e} past the T3 "
             f"bar {_T3 * floor:.3e} ({_T3}x the worst group's measured bf16 floor {floor:.3e}); "
             f"per group {({g: f'{e:.2e}/{f:.2e}' for g, (e, f) in per_group.items()})}"
+        )
+
+
+def test_r11_rejects_our_loop_on_another_seeds_noise(
+    loop: _Loop, recordings: Callable[[str], list[_Request]],
+):
+    """R11's negative control on the noise: seed 7's conditioning and oracle, seed 8's noise.
+
+    A parity pass is evidence only if the bar fails what it should. The noise is the one input
+    R11 has that no stage bar sees, and a served request on the wrong draw -- a seed dropped,
+    a generator shared across requests -- still returns a plausible chunk at the trained rms.
+    So ours runs on the right request with the wrong trajectory, and both R11 readings have to
+    put it far past the floor on **every** request, not past the bar on average.
+
+    Seed 8's noise is checked to differ from seed 7's first, or the control would be R11 itself.
+
+    This control alone cannot see the conditioning: with no weights loaded, seed 7 and seed 8
+    once scored the same, because a loop that ignores its conditioning still follows its noise.
+    The image-row control below is the other half.
+    """
+    right = recordings(_RIGHT_SET)
+    wrong = recordings(_WRONG_NOISE_SET)
+    for request, other in zip(right, wrong, strict=True):
+        assert not torch.equal(request.noise, other.noise), (
+            f"req {request.index}: {_RIGHT_SET} and {_WRONG_NOISE_SET} have the same noise"
+        )
+        ours = _run(loop, [_Request(**{**vars(request), "noise": other.noise})]).cpu()
+        chunk = _chunk_error(ours, request) / request.floor
+        worst, floor, _ = _decoded_error(loop, ours, request)
+        assert chunk > _WRONG_NOISE_CHUNK and worst / floor > _WRONG_NOISE_DECODED, (
+            f"req {request.index} on {_WRONG_NOISE_SET}'s noise: chunk {chunk:.1f}x its floor "
+            f"(must exceed {_WRONG_NOISE_CHUNK}x), decoded worst group {worst / floor:.1f}x "
+            f"(must exceed {_WRONG_NOISE_DECODED}x), so R11 does not read the noise"
+        )
+
+
+def test_r11_rejects_our_loop_with_the_image_rows_blanked(
+    loop: _Loop, requests: list[_Request],
+):
+    """R11's negative control on the conditioning: the right noise, the cameras gone dark.
+
+    The wrong-noise control above passes just as well for a loop that never reads its
+    conditioning. So this keeps the trajectory and zeroes the 448 image rows, and both R11
+    readings have to reject it on every request. Zeroing, not scaling: the batching control
+    below explains why an affine perturbation is nearly vacuous through ``AdaLayerNorm``.
+
+    The bar is R11's own, 1.2x the floor, because this is the claim "R11 fails it". How far
+    past the bar it lands has not been measured on the 20 yet.
+    """
+    for request in requests:
+        blind = _Request(**{**vars(request), "image": torch.zeros_like(request.image)})
+        ours = _run(loop, [blind]).cpu()
+        chunk = _chunk_error(ours, request) / request.floor
+        worst, floor, _ = _decoded_error(loop, ours, request)
+        assert chunk > _T3 and worst / floor > _T3, (
+            f"req {request.index} with its image rows zeroed: chunk {chunk:.2f}x its floor, "
+            f"decoded worst group {worst / floor:.2f}x, where R11's bar is {_T3}x, so R11 "
+            "does not read the conditioning"
         )
 
 
