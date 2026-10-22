@@ -212,7 +212,8 @@ Not yet: Whisper (its encoder node plans no step rows, and the decoder's cross-a
 K/V run over encoder rows, so the usual ``q_proj`` / ``v_proj`` adapters cannot be served
 whole), BAGEL and Cosmos3 (mixture-of-transformers weights chosen per row inside one
 forward, and guidance branches run as separate forwards), π0.5 (openpi's adapters are
-not PEFT), Nemotron VoiceChat (not yet validated), and the diffusion and flow models
+not PEFT), Nemotron VoiceChat (not yet validated), Fish Audio S2-Pro (declares no LoRA
+specs yet), and the diffusion and flow models
 (FLUX.2 [klein] merges a LoRA into its weights at load; the rest take none), Kokoro,
 Omnilingual ASR, OmniVoice and V-JEPA 2.
 
