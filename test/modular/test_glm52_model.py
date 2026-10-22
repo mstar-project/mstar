@@ -53,6 +53,7 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
 def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
@@ -332,6 +333,8 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
+    sub._index_stager = PinnedStager(torch.long)
+    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 

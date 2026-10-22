@@ -28,7 +28,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
 from mstar.engine.resources.step import Segment, StepContext
-from mstar.utils.pinned_staging import pinned, to_device_async
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,8 @@ class KDAManager(LinearAttnManager):
 
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
+        self._layout_stager = PinnedStager(torch.int32)
+        self._rows_stager = PinnedStager(torch.long)
         self._current: dict[str, KDAPlan] = {}
         # Pre-planning: the plan mutates no live state, so staging is caching
         # it. Follows the pool, which it depends on.
@@ -238,7 +240,7 @@ class KDAManager(LinearAttnManager):
         same size."""
         lease = ctx.slot_lease
         if lease is None:
-            return to_device_async(host, torch.int32, self._device)
+            return self._layout_stager.to_device(host, self._device)
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_layout.get(key)
         if buf is None:
@@ -249,7 +251,7 @@ class KDAManager(LinearAttnManager):
             f"kda layout for {key} holds {buf.numel()} entries but this step "
             f"planned {len(host)}"
         )
-        buf.copy_(pinned(host, torch.int32), non_blocking=True)
+        self._layout_stager.copy_(buf, host)
         return buf
 
     def current_plan(self, label: str | None = None) -> KDAPlan:
@@ -273,7 +275,7 @@ class KDAManager(LinearAttnManager):
             label = self._default_label
         full = self.current_plan(label)
         assert not (full.is_decode or full.is_verify), "kda: a token window splits a prefill"
-        rows = to_device_async([row for row, _ in pieces], torch.long, self._device)
+        rows = self._rows_stager.to_device([row for row, _ in pieces], self._device)
         spans = tuple(n for _, n in pieces)
         plan = KDAPlan(
             slot_ids=full.slot_ids.index_select(0, rows),
@@ -283,7 +285,7 @@ class KDAManager(LinearAttnManager):
         if self.kernels is not None:
             host = self.kernels.layout(spans, plan.num_tokens, False)
             if host is not None:
-                plan.layout = to_device_async(host, torch.int32, self._device)
+                plan.layout = self._layout_stager.to_device(host, self._device)
         self._current[label] = plan
         try:
             yield

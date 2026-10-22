@@ -57,7 +57,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.pinned_staging import to_device_async
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
+        # the step's small host indices, one pinned H2D each
+        self._long_stager = PinnedStager(torch.long)
+        self._int_stager = PinnedStager(torch.int32)
+        self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
         # dsa_long_context: the forward's DSA context, which the MLA layers read, and under
@@ -475,7 +479,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             parts.append(torch.zeros(pad, dtype=torch.int32))
         device = self.lm_head.weight.device
         n_pos, n_req = len(pos), indptr.numel() - 1
-        staged = to_device_async(torch.cat(parts), torch.int32, device)
+        staged = self._int_stager.to_device(torch.cat(parts), device)
         lens = attn_lens(pos, cfg.index_topk, cfg.index_kpool)  # a padding row's is 1
         if cfg.mtp_trims and walk == "decode":
             # these rows sit at or past their true ones (_trim_on_device): plan each for the
@@ -549,7 +553,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
-        return to_device_async(keep, self.lm_head.weight.dtype, self.lm_head.weight.device)
+        # staged in fp32 (no bf16 host view), cast on the device
+        return self._keep_stager.to_device(keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
 
     def _mailbox_key(self, engine_inputs: ModelInputsFromEngine) -> int | None:
         """A captured step's capture slot, None eager: each has its own mailbox, which a
@@ -578,7 +583,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
                     self.request_state(rid).add("mtp_pending", (seq, key, row))
-        return to_device_async([seq], torch.long, self.lm_head.weight.device)
+        return self._long_stager.to_device([seq], self.lm_head.weight.device)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -587,7 +592,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         for inp in inputs:
             end += inp.input_seq_len
             last.append(max(end - 1, 0))  # a padding row repeats the one before
-        return to_device_async(last, torch.int32, self.lm_head.weight.device)
+        return self._int_stager.to_device(last, self.lm_head.weight.device)
 
     def _forward(
         self,
@@ -665,8 +670,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         scope.enter_context(kv.token_window(start, end, LABEL))
                         scope.enter_context(kda.token_window(
                             [(req, b - a) for a, b, req in pieces], LABEL))
-                    rows = to_device_async([r for _, r in ends] or [end - start - 1], torch.long,
-                                           input_ids.device)
+                    rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
                     if nxt is None:
                         out = lm.model(input_ids[start:end], rows=rows)
                     else:
@@ -685,7 +689,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                     with kv.token_window(r, r + 1, LABEL):
                         embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
                         seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
-                stored = ctx.pos.index_select(0, to_device_async(last, torch.long, ctx.pos.device)) + 1
+                stored = ctx.pos.index_select(0, self._long_stager.to_device(last, ctx.pos.device)) + 1
                 self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
         finally:
             self._dsa.ctx = ctx

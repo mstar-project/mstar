@@ -50,6 +50,7 @@ from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
+from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
 def _ctx(needs_selection: bool) -> Glm52DsaPagedContext:
@@ -121,6 +122,8 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub._prefix_hits = set()
+    sub._index_stager = PinnedStager(torch.long)
+    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 
