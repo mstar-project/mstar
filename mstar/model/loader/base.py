@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -48,6 +49,33 @@ class StackedParamRule:
     target_suffix: str
     source_suffix: str
     shard_id: str | int
+
+
+class CheckpointRules(NamedTuple):
+    """How a checkpoint's tensors land on a module's parameters: the prefix the
+    checkpoint names them under (stripped before anything else), then ``remap``, then
+    the stacked-shard rules. A weights root states its rules once
+    (``checkpoint_rules()``), for its weight loader and for anything else that must
+    place checkpoint names the same way (LoRA adapters: ``module_lora_spec``)."""
+
+    stacked_params: tuple[StackedParamRule, ...] = ()
+    remap: Callable[[str], str | None] | None = None
+    prefix: str = ""
+
+    def native(self, name: str) -> str | None:
+        """The checkpoint name ``name`` (prefix included) as the module's parameter
+        name, before the stacked rules; None for a name the remap drops."""
+        if self.prefix:
+            if not name.startswith(self.prefix):
+                return None
+            name = name[len(self.prefix):]
+        return name if self.remap is None else self.remap(name)
+
+    def load(self, module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]], **kw) -> set[str]:
+        """``load_hf_weights`` under these rules (names already stripped of ``prefix``)."""
+        return load_hf_weights(
+            module, weights, stacked_params=list(self.stacked_params), name_remapper=self.remap, **kw,
+        )
 
 
 def default_weight_loader(

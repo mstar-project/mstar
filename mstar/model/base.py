@@ -642,10 +642,9 @@ class Model(ABC):
 
         Built only when the deployment's YAML has a ``resources: lora:`` block (see
         ``serving_resources``): a deployment without one builds exactly what it did
-        before. The node declares its rows in ``declare_step`` (a ``LoraStep`` under each
-        pool's key) and adds each target's delta (``LoraAdapterPool.layer_delta``). The
-        conductor opens each request with a ``LoraReqConfig`` from the ``lora_adapter``
-        kwarg.
+        before. Usually by ``module_lora_spec`` from each node's weights root, whose
+        LoRA-capable modules the node then binds itself (``lora_segment_rows``). The conductor
+        opens each request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
         """
         return []
 
