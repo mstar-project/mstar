@@ -558,8 +558,8 @@ class _RecordingGroup:
         return t
 
 
-def test_fused_allreduce_reduces_once_and_keeps_local_math(monkeypatch):
-    """MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1: the block issues ONE all-reduce
+def test_fused_allreduce_reduces_once_and_keeps_local_math():
+    """moe_fused_allreduce: the block issues ONE all-reduce
     (of routed_partial + shared_partial) instead of two, and what it reduces
     equals the sum of what the unfused block reduced — the local arithmetic
     is unchanged; only the reduction order moves.
@@ -567,12 +567,12 @@ def test_fused_allreduce_reduces_once_and_keeps_local_math(monkeypatch):
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
 
-    monkeypatch.delenv("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", raising=False)
     g0 = _RecordingGroup()
     plain = Glm52SparseMoeBlock(cfg, comm_group=g0)
-    monkeypatch.setenv("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "1")
+    fused_cfg = Glm52ModelConfig.reduced()
+    fused_cfg.moe_fused_allreduce = True
     g1 = _RecordingGroup()
-    fused = Glm52SparseMoeBlock(cfg, comm_group=g1)
+    fused = Glm52SparseMoeBlock(fused_cfg, comm_group=g1)
     assert not plain._fused_allreduce and fused._fused_allreduce
     assert plain.shared_expert.down_proj.reduce_results
     assert not fused.shared_expert.down_proj.reduce_results
