@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.layers import (
     FP32_MODULE_PATHS,
@@ -29,6 +30,10 @@ from mstar.model.waypoint.components.layers import (
 )
 from mstar.model.waypoint.components.rope import OrthoRoPEAngles
 from mstar.model.waypoint.config import WaypointConfig
+
+# The DiT's serving dtypes, relative to its own root. The dit node's policy is
+# this with the paths under the node's ``dit`` attribute.
+DIT_PRECISION = NodePrecision(torch.bfloat16, fp32_modules=FP32_MODULE_PATHS, autocast=False)
 
 __all__ = ["WaypointDiT", "WaypointDiTBlock", "WaypointPosIds"]
 
@@ -175,17 +180,14 @@ class WaypointDiT(nn.Module):
         return self.patchify.weight.dtype
 
     def cast_serving_dtypes(self) -> "WaypointDiT":
-        """bf16 everywhere, then the fp32 islands back to fp32.
+        """Apply ``DIT_PRECISION``: bf16 everywhere but the fp32 islands.
 
         Called on the **meta** module before ``to_empty(device)`` so storage is
-        allocated directly in the serving dtype. ``.to(dtype)`` on meta
-        preserves the ``cond_proj`` aliasing (``to_empty`` does not), so no
-        retie is needed here.
+        allocated directly in the serving dtype. The cast keeps each param's
+        identity, so the ``cond_proj`` aliasing survives it (``to_empty`` does
+        not), and no retie is needed here.
         """
-        self.to(torch.bfloat16)
-        for path in FP32_MODULE_PATHS:
-            self.get_submodule(path).to(torch.float32)
-        return self
+        return apply_precision(self, DIT_PRECISION)
 
     def retie_cond_proj(self) -> "WaypointDiT":
         """Alias blocks 1..23's six ``cond_proj`` matrices onto block 0's.

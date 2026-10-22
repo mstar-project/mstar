@@ -143,7 +143,8 @@ class TimestepEmbedder(nn.Module):
             t_freq = torch.cat(
                 [t_freq, torch.zeros_like(t_freq[:, :1])], dim=-1
             )
-        return self.mlp(t_freq)
+        # the fp32 sinusoids, in the mlp's dtype
+        return self.mlp(t_freq.to(self.mlp[0].weight.dtype))
 
 
 class BagelMLPconnector(nn.Module):

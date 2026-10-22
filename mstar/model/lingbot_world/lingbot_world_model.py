@@ -32,6 +32,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -52,6 +53,14 @@ logger = logging.getLogger(__name__)
 ENCODE_TEXT_WALK = "encode_text"
 _SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
+
+
+_NODE_PRECISION = {
+    # wan22's UMT5 text encoder, loaded bf16 throughout
+    "text_encoder": NodePrecision(torch.bfloat16, autocast=False),
+    # the bf16 DiT, and the fp32 VAEs the node decodes and encodes with
+    "dit": NodePrecision(torch.bfloat16, fp32_modules=("vae", "encoder_vae"), autocast=False),
+}
 
 
 class LingBotWorldModel(Model):
@@ -347,8 +356,10 @@ class LingBotWorldModel(Model):
     # Submodule loading
     # ------------------------------------------------------------------
 
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision | None:
+        """No node runs under engine autocast: the DiT enters the reference's
+        bf16 autocast itself, and its two Wan2.1 VAEs stay fp32."""
+        return _NODE_PRECISION.get(node_name)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -378,7 +389,10 @@ class LingBotWorldModel(Model):
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
 
             require_flash_attn()
-            dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
+            dit = build_lingbot_dit(
+                self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
+                dtype=_NODE_PRECISION["dit"].param_dtype,
+            )
             return LingBotDitSubmodule(
                 dit, self._load_vae().to(device), self.config, encoder_vae=self._load_vae().to(device),
             )

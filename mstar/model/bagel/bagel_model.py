@@ -41,6 +41,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -924,6 +925,16 @@ class BagelModel(Model):
                 repetition_penalty=sampling.repetition_penalty,
             ),
         }
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast; the AE and the CFG renorm keep the
+        reference's fp32 steps themselves. The timestep sinusoid table is fp32,
+        on every node that holds the shared time embedder."""
+        if node_name in ("LLM", "LLM_cfg_text", "LLM_cfg_img", "vae_encoder"):
+            return NodePrecision(
+                torch.bfloat16, fp32_modules=("time_embedder.timestep_freqs",), autocast=False,
+            )
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

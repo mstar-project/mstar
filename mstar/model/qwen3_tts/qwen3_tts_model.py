@@ -46,6 +46,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -1104,6 +1105,20 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
     # Lazy worker-side submodule and weight loading
     # -----------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        if node_name == "Talker":
+            return NodePrecision(torch.bfloat16, autocast=False)
+        if node_name == "RefEncoder":
+            # the speaker encoder runs in the Talker's dtype, as the reference
+            # does; the mel front end and the codec encoder stay fp32
+            return NodePrecision(
+                torch.bfloat16, fp32_modules=("mel_front_end", "codec_encoder"), autocast=False,
+            )
+        if node_name == "Codec":
+            # the loader sets the decoder to codec_dtype; nothing else casts it
+            return NodePrecision(None, autocast=False)
+        raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
 
     def get_submodule(
         self,

@@ -94,7 +94,7 @@ def code2wav():
     model.eval()
     eager_forward = type(model).forward.__get__(model)
     model.consolidate()
-    # what the engine manager does with a disable_autocast node: device only
+    # what the engine manager does with Code2Wav (param_dtype None): device only
     model.to(device="cuda:0")
     try:
         yield model, eager_forward, config

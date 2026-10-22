@@ -39,6 +39,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -51,6 +52,7 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.wan22.components.dit import FP32_ISLANDS
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
@@ -62,6 +64,17 @@ from mstar.model.wan22.submodules import (
 )
 
 logger = logging.getLogger(__name__)
+
+_NODE_PRECISION = {
+    # UMT5 and the encode VAE load bf16 throughout (transformers keeps UMT5's
+    # ``wo`` in fp32 only for an fp16 load)
+    "text_encoder": NodePrecision(torch.bfloat16, autocast=False),
+    "vae_encoder": NodePrecision(torch.bfloat16, autocast=False),
+    "dit": NodePrecision(
+        torch.bfloat16, fp32_modules=tuple(f"transformer.{g}" for g in FP32_ISLANDS), autocast=False,
+    ),
+    "vae_decoder": NodePrecision(None, autocast=False),
+}
 
 
 class Wan22Model(Model):
@@ -638,11 +651,11 @@ class Wan22Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
-    # None disables both autocast and the engine's blanket cast, so numerics are
-    # governed by the load-time dtypes (bf16 with fp32 islands) rather than by the
-    # engine — which is what keeps them equal to the reference pipeline.
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision | None:
+        """No node runs under autocast: numerics are governed by the load-time
+        dtypes, which is what keeps them equal to the reference pipeline. The
+        VAE decoder keeps the dtype it picks from the cuDNN version."""
+        return _NODE_PRECISION.get(node_name)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -695,6 +708,7 @@ class Wan22Model(Model):
             self._refresh_checkpoint_defaults()
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
+                dtype=_NODE_PRECISION["dit"].param_dtype,
             )
             return Wan22DitSubmodule(transformer, self.config)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)

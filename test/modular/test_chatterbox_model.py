@@ -15,6 +15,7 @@ import yaml
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec
@@ -664,7 +665,9 @@ def test_t3_dtype_switch():
     from mstar.model.chatterbox.chatterbox_model import _parse_dtype
 
     model = _make_model()
-    assert model.get_autocast_dtype() == torch.bfloat16
+    assert model.get_node_precision("T3") == NodePrecision(torch.bfloat16, autocast=False)
+    assert model.get_node_precision("voice_encoder") == NodePrecision(torch.float32, autocast=False)
+    assert model.get_node_precision("s3gen") == NodePrecision(None, autocast=False)
     assert _parse_dtype("float32") == torch.float32 and _parse_dtype("bf16") == torch.bfloat16
     with pytest.raises(ValueError, match="t3_dtype"):
         _parse_dtype("int8")
@@ -674,7 +677,7 @@ def test_t3_dtype_switch():
         ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", t3_dtype="float32")
     assert ChatterboxModel(
         model_path_hf="ResembleAI/chatterbox", variant="chatterbox", t3_dtype="float16",
-    ).get_autocast_dtype() == torch.float16
+    ).get_node_precision("T3").param_dtype == torch.float16
 
 
 def test_postprocess_encodes_pcm16():

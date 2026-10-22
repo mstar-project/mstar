@@ -41,7 +41,8 @@ class Pi05TimeMLP(nn.Module):
         self.linear_out = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, time_emb: torch.Tensor) -> torch.Tensor:
-        h = nn.functional.silu(self.linear_in(time_emb))
+        # the sincos embedding is fp32; the MLP runs in its weights' dtype
+        h = nn.functional.silu(self.linear_in(time_emb.to(self.linear_in.weight.dtype)))
         h = self.linear_out(h)
         return nn.functional.silu(h)
 

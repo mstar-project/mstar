@@ -13,6 +13,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -54,6 +55,7 @@ from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
     KV_CACHE,
+    LINEAR_ATTENTION,
     LINEAR_ATTN,
     LLM_MIXED,
     ROPE,
@@ -673,6 +675,15 @@ class Qwen3_5DenseModel(Model):
             groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
         )
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast: the norms compute in fp32 themselves and
+        every kernel takes its dtype explicitly. FlashInfer's GDN kernels assert
+        on the three gated-delta-net params, so they stay fp32."""
+        fp32 = ()
+        if node_name == "LLM" and LINEAR_ATTENTION in self.config.layer_types:
+            fp32 = ("*.self_attn.A_log", "*.self_attn.dt_bias", "*.self_attn.norm.weight")
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=False)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -715,6 +726,7 @@ class Qwen3_5DenseModel(Model):
                 )
             tower = self._build(
                 lambda: Qwen3_5VisionModel(self.vision_config), dtype, device,
+                self.get_node_precision(node_name),
             )
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
@@ -725,6 +737,7 @@ class Qwen3_5DenseModel(Model):
 
         model = self._build(
             lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+            self.get_node_precision(node_name),
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
@@ -735,12 +748,13 @@ class Qwen3_5DenseModel(Model):
         return LLMSubmodule(model, self.config, self.vision_config)
 
     @staticmethod
-    def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
+    def _build(make, dtype: torch.dtype, device: str, precision: NodePrecision) -> torch.nn.Module:
         """Construct under `dtype` so no fp32 copy of the weights is
-        allocated. fp32-only parameters restore themselves in `_apply`."""
+        allocated, then apply the node's policy before the weights load, so its
+        fp32 islands receive the checkpoint's values unrounded."""
         torch.set_default_dtype(dtype)
         try:
-            return make().to(device)
+            return apply_precision(make().to(device), precision)
         finally:
             torch.set_default_dtype(torch.float32)
 

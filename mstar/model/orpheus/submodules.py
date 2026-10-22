@@ -235,10 +235,8 @@ class SNACDecoderSubmodule(NodeSubmodule):
     mixes sizes anyway decodes each size apart, eagerly.
     """
 
-    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
-    # stateless engine, stated directly now that the v1 engine reads these.
+    # uncompiled (fp32 is the model's precision policy for this node)
     disable_torch_compile = True
-    disable_autocast = True
 
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 

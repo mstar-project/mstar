@@ -1429,7 +1429,6 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert encoder_configs
     assert all(cfg.compile for cfg in encoder_configs)
     assert encoder.disable_torch_compile is True
-    assert encoder.disable_autocast is True
 
     # The fused dit+decode node compiles its own two reference-shaped regions
     # (WaypointDiT.compile_regions, gated by config.compile_dit); letting the
@@ -1438,7 +1437,6 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert fused_configs
     assert all(cfg.compile is False for cfg in fused_configs)
     assert decoder.disable_torch_compile is True
-    assert decoder.disable_autocast is True
 
 
 def test_ae_nodes_declare_no_capture_when_accelerator_graph_is_disabled(

@@ -48,6 +48,7 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -1069,6 +1070,18 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
     # Submodule loading
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        if node_name in ("nano_llm", "conformer_encoder", "eartts_talker"):
+            # bf16 without autocast; the conformer's fp32 LayerNorms/softmax and
+            # the talker's fp32 norms, pooling and MoG sampling are explicit in
+            # their code (components/conformer.py, components/eartts_talker.py)
+            return NodePrecision(torch.bfloat16, autocast=False)
+        if node_name == "audio_codec":
+            # bf16 as it is served today (meta-cast like the other nodes),
+            # although the reference decodes in fp32
+            return NodePrecision(torch.bfloat16, autocast=False)
+        raise ValueError(f"Unknown Nemotron duplex node {node_name!r}")
 
     def get_submodule(
         self,

@@ -30,6 +30,24 @@ _ACT2FN = {
     "silu": nn.SiLU(),
 }
 
+class FP32LayerNorm(nn.LayerNorm):
+    """LayerNorm computed in fp32 with an fp32 output, whatever the input and
+    param dtypes: the node runs without autocast, so this is explicit here."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(x.float(), self.normalized_shape, weight, bias, self.eps)
+
+
+class CastLinear(nn.Linear):
+    """Linear that casts its input to the weight dtype, so an fp32 norm output
+    or client tensor feeds bf16 weights."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x.to(self.weight.dtype), self.weight, self.bias)
+
+
 # TODO: replace with SDPA (flashInfer does not support float32 precision)
 # x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
@@ -85,9 +103,9 @@ class VJEPA2MLP(nn.Module):
     def __init__(self, config: VJepa2Config, hidden_size: int, mlp_ratio: float):
         super().__init__()
         hidden_features = int(hidden_size * mlp_ratio)
-        self.fc1 = nn.Linear(hidden_size, hidden_features, bias=True)
+        self.fc1 = CastLinear(hidden_size, hidden_features, bias=True)
         self.activation = _ACT2FN[config.hidden_act]
-        self.fc2 = nn.Linear(hidden_features, hidden_size, bias=True)
+        self.fc2 = CastLinear(hidden_features, hidden_size, bias=True)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.activation(self.fc1(hidden_state)))
@@ -117,10 +135,10 @@ class VJEPA2RopeAttention(nn.Module):
         self.attention_head_size = hidden_size // num_attention_heads
         self.all_head_size = num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.key = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.value = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.query = CastLinear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = CastLinear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = CastLinear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.proj = CastLinear(hidden_size, hidden_size)
 
         self.grid_size = config.crop_size // config.patch_size
         self.grid_depth = config.frames_per_clip // config.tubelet_size
@@ -196,7 +214,8 @@ class VJEPA2RopeAttention(nn.Module):
         k = self.apply_rotary_embeddings(k, pos_ids)
 
         # context = _eager_attention(q, k, v, self.scaling)
-        context = _sdpa_attention(q, k, v)
+        # RoPE leaves q/k in fp32; the kernel runs in v's dtype
+        context = _sdpa_attention(q.to(v.dtype), k.to(v.dtype), v)
         context = context.reshape(*input_shape, self.all_head_size)
         return self.proj(context)
 
@@ -212,9 +231,9 @@ class VJEPA2Layer(nn.Module):
         mlp_ratio: float,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = FP32LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.attention = VJEPA2RopeAttention(config, hidden_size, num_attention_heads)
-        self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = FP32LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio)
 
     def forward(

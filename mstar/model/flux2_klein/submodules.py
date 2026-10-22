@@ -5,10 +5,10 @@
     dit          -> KleinDenoiseSubmodule      DenoiseLoopSubmodule + the klein transformer + Euler step
     vae_decoder  -> KleinVaeDecoderSubmodule   packed tokens -> uint8 image; batches equal shapes
 
-Numerics are governed by the checkpoint dtypes (bf16 everywhere), not by the
-engine: ``Flux2KleinModel.get_autocast_dtype`` returns None, so nothing is
-autocast or blanket-cast, and each forward mirrors the reference pipeline's op
-order (see ``notes`` in the PR description and the equivalence tests).
+Numerics are governed by the load-time dtypes (bf16 everywhere), not by
+autocast: ``Flux2KleinModel.get_node_precision`` runs every node without it, and
+each forward mirrors the reference pipeline's op order (see ``notes`` in the PR
+description and the equivalence tests).
 """
 
 from __future__ import annotations

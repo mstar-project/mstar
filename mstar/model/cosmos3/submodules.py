@@ -300,17 +300,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             logger.info("Cosmos3 denoise compute torch.compile enabled")
 
-    def to(self, *args, **kwargs):
-        # The engine casts this submodule to bf16; the timestep embedder must stay
-        # fp32 (diffusers keeps it in _keep_in_fp32_modules, and the multi-step
-        # video denoise scrambles when it runs in bf16), so re-assert fp32 after
-        # any cast — paired with the autocast-disabled forward below.
-        super().to(*args, **kwargs)
-        te = getattr(self.transformer, "time_embedder", None)
-        if te is not None:
-            te.float()
-        return self
-
     def cg_key_info(
         self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None, **kwargs,
     ) -> object | None:
@@ -1552,11 +1541,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run in the model's native bf16, NOT the engine autocast: autocast keeps
-    # norms in fp32, perturbing the velocity ~1 ULP/step — harmless for one
-    # image step but amplified geometrically over the multi-step video denoise.
-    # The reference pipeline runs pure bf16; parity requires matching it.
-    @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
         present, else the submodule's own store (paths that build their own
@@ -1944,8 +1928,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self.max_gen_batch_size
         return None
 
-    # Native bf16, not the engine autocast — see the note on forward(). The
-    # cross-request batched denoise must match the per-request path exactly.
+    # Native bf16, not autocast: autocast keeps norms in fp32, perturbing the
+    # velocity ~1 ULP/step, amplified geometrically over the multi-step video
+    # denoise. The node's policy runs it without autocast; this also covers a
+    # direct call. The cross-request batched denoise must match the per-request
+    # path exactly.
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
@@ -2591,10 +2578,7 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         self, graph_walk, engine_inputs: ModelInputsFromEngine, vision,
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
-        vae = self.vae
-        # The engine may cast the submodule; re-assert the fp32 encode weights.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
+        vae = self.vae  # fp32, the node's precision policy
         device = vision.device
         mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
         inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
@@ -2668,6 +2652,19 @@ def _wan_vae():
     return wan_vae
 
 
+def vae_decode_dtype() -> torch.dtype:
+    """The Wan-VAE decode dtype. cuDNN ships fast Hopper bf16 conv3d for it only
+    from 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
+    single-variable cuDNN swap), so gate on the live version, and an upgrade
+    flips it. COSMOS3_VAE_DECODE_FP32 overrides."""
+    override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
+    if override is not None:
+        on = override.lower() not in ("0", "false", "no", "off")
+        return torch.float32 if on else torch.bfloat16
+    ver = torch.backends.cudnn.version() or 0
+    return torch.bfloat16 if ver >= 91600 else torch.float32
+
+
 class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     """Wan VAE decode node: final denoised latents -> pixel frames.
 
@@ -2708,37 +2705,23 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
     def _decode_dtype(self):
-        # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
-        # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
-        # single-variable cuDNN swap), so gate on the live version — an upgrade
-        # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
-        if self._decode_dtype_cached is not None:
-            return self._decode_dtype_cached
-        override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
-        if override is not None:
-            on = override.lower() not in ("0", "false", "no", "off")
-            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
-        else:
-            ver = torch.backends.cudnn.version() or 0
-            self._decode_dtype_cached = torch.bfloat16 if ver >= 91600 else torch.float32
-        logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
-                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        if self._decode_dtype_cached is None:
+            self._decode_dtype_cached = vae_decode_dtype()
+            logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
+                        self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
 
     def _vae_input(self, latents: torch.Tensor) -> torch.Tensor:
-        """DiT latents -> the VAE's raw latents ``z``, in the decode dtype."""
+        """DiT latents -> the VAE's raw latents ``z``, in the decode dtype (the
+        node's precision policy casts the VAE to it at load)."""
         vae = self.vae
         vae_dtype = self._decode_dtype()
-        if next(vae.parameters()).dtype != vae_dtype:
-            vae = vae.to(vae_dtype)
         mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
         inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        # Force z to the VAE dtype: the engine's outer autocast promotes the
-        # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
-        # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
-        # on the fp32-decode path.
+        # z in the VAE dtype: a fp32 z into a bf16 conv3d fails ("Input type
+        # (float) and bias type (BFloat16)"). No-op on the fp32-decode path.
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         if self._channels_last:
             # Also the layout the compiled decode's warm-up traces with.

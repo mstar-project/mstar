@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.model.vjepa2.components.layers import CastLinear, FP32LayerNorm
 from mstar.model.vjepa2.components.rope_utils import rotate_queries_or_keys, rotate_queries_or_keys_BNHD
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
 
@@ -54,9 +55,9 @@ def build_action_block_causal_attention_mask(
 class _MLP(nn.Module):
     def __init__(self, in_features: int, hidden_features: int):
         super().__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = CastLinear(in_features, hidden_features)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.fc2 = CastLinear(hidden_features, in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
@@ -77,8 +78,8 @@ class ACRoPEAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = CastLinear(dim, dim * 3, bias=qkv_bias)
+        self.proj = CastLinear(dim, dim)
 
         third = 2 * ((self.head_dim // 3) // 2)
         self.d_dim = third
@@ -219,7 +220,8 @@ class ACRoPEAttention(nn.Module):
             k = merge_(k, action_k)
             v = merge_(v, action_v)
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # RoPE leaves q/k in fp32; the kernel runs in v's dtype
+        x = F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v, attn_mask=attn_mask)
         x = x.transpose(1, 2).reshape(b, n, c)
         return self.proj(x)
 
@@ -316,14 +318,14 @@ class ACBlock(nn.Module):
         grid_size: int,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=layer_norm_eps)
+        self.norm1 = FP32LayerNorm(dim, eps=layer_norm_eps)
         self.attn = ACRoPEAttention(
             dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             grid_size=grid_size,
         )
-        self.norm2 = nn.LayerNorm(dim, eps=layer_norm_eps)
+        self.norm2 = FP32LayerNorm(dim, eps=layer_norm_eps)
         self.mlp = _MLP(in_features=dim, hidden_features=int(dim * mlp_ratio))
 
     def forward(
@@ -371,11 +373,11 @@ class VisionTransformerPredictorAC(nn.Module):
         self.grid_width = config.img_size[1] // config.patch_size
 
         # Input projections
-        self.predictor_embed = nn.Linear(config.embed_dim, config.predictor_embed_dim, bias=True)
-        self.action_encoder = nn.Linear(config.action_embed_dim, config.predictor_embed_dim, bias=True)
-        self.state_encoder = nn.Linear(config.action_embed_dim, config.predictor_embed_dim, bias=True)
+        self.predictor_embed = CastLinear(config.embed_dim, config.predictor_embed_dim, bias=True)
+        self.action_encoder = CastLinear(config.action_embed_dim, config.predictor_embed_dim, bias=True)
+        self.state_encoder = CastLinear(config.action_embed_dim, config.predictor_embed_dim, bias=True)
         # Extrinsics encoder uses one fewer input dim (matches upstream).
-        self.extrinsics_encoder = nn.Linear(config.action_embed_dim - 1, config.predictor_embed_dim, bias=True)
+        self.extrinsics_encoder = CastLinear(config.action_embed_dim - 1, config.predictor_embed_dim, bias=True)
 
         # Transformer blocks
         self.predictor_blocks = nn.ModuleList(
@@ -392,8 +394,8 @@ class VisionTransformerPredictorAC(nn.Module):
             ]
         )
 
-        self.predictor_norm = nn.LayerNorm(config.predictor_embed_dim, eps=config.layer_norm_eps)
-        self.predictor_proj = nn.Linear(config.predictor_embed_dim, config.embed_dim, bias=True)
+        self.predictor_norm = FP32LayerNorm(config.predictor_embed_dim, eps=config.layer_norm_eps)
+        self.predictor_proj = CastLinear(config.predictor_embed_dim, config.embed_dim, bias=True)
 
         # Causal attention mask is fully derived from config, so we cache it
         # lazily on the first forward rather than storing a buffer.  A buffer

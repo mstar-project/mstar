@@ -5,9 +5,9 @@
     vae_decoder   -> LTXVideoDecoderSubmodule  packed video latents -> uint8 frames
     audio_decoder -> LTXAudioDecoderSubmodule  packed audio latents -> mel -> 48 kHz stereo waveform
 
-Numerics follow the checkpoint dtypes (bf16 weights, fp32 latents between steps and
-fp32 step math), not the engine's autocast: ``LTX25Model.get_autocast_dtype`` is
-None. Each forward mirrors ``LTX2Pipeline``'s op order; ``test/ltx2_5/parity_harness.py``
+Numerics follow the load-time dtypes (bf16 weights, fp32 latents between steps and
+fp32 step math), not autocast: ``LTX25Model.get_node_precision`` runs every node
+without it. Each forward mirrors ``LTX2Pipeline``'s op order; ``test/ltx2_5/parity_harness.py``
 checks each stage against recordings of it.
 """
 

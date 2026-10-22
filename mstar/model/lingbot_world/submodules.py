@@ -20,9 +20,9 @@ Neither declares engine resources: the rolling self-attention K/V and the text
 K/V live in the request's ``PerRequestState`` (dense, model-owned, freed with the
 request), the VAE encoder's and decoder's causal-conv caches likewise.
 
-Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
-returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
-runs fp32 as the reference does.
+Numerics are the model's, not the engine's: ``LingBotWorldModel.get_node_precision``
+runs no node under autocast, the DiT enters the reference's bf16 autocast itself,
+and the VAE runs fp32 as the reference does.
 """
 
 import logging

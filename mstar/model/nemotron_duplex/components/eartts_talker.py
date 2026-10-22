@@ -21,6 +21,12 @@ backbones): cosine > 0.9999 on the backbone hidden state, the MoG head params
 and the pooled subword embeddings. The stochastic code-sampling loop
 (``generate_step``: Gumbel mixture pick + iterative RVQ unmasking) is not
 implemented here.
+
+Precision: the node runs in bf16 without autocast. The places that leave bf16
+are explicit: every RMSNorm and the attention softmax compute in fp32, the
+subword pooling sums in fp32, and the MoG head's mixture softmaxes and its
+``exp(log_std)`` run in fp32, so the sampled latent reaches the RVQ quantizer in
+fp32. Matmuls and linears run in the weight dtype.
 """
 from __future__ import annotations
 
@@ -62,8 +68,9 @@ def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     beyond cumulative ``top_p`` with ``-inf`` (keeps at least the top token).
     Mirrors HF ``TopPLogitsWarper`` used by the reference MoG sampler."""
     sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-    cum = sorted_logits.softmax(-1).cumsum(-1)
-    remove = cum - sorted_logits.softmax(-1) > top_p          # keep tokens whose left-cum <= top_p
+    probs = sorted_logits.float().softmax(-1)                  # fp32, the knife-edge sum
+    cum = probs.cumsum(-1)
+    remove = cum - probs > top_p                               # keep tokens whose left-cum <= top_p
     remove[..., 0] = False                                     # always keep the top token
     mask = torch.zeros_like(remove).scatter(-1, sorted_idx, remove)
     return logits.masked_fill(mask, float("-inf"))
@@ -249,7 +256,9 @@ class _Attn(nn.Module):
             v = torch.cat((past_kv[1], v), dim=2)
         new_kv = (k, v) if return_kv else None
         t_tot = k.shape[2]
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling
+        # rope with fp32 cos/sin promotes q and k; the scores matmul runs in the weight dtype
+        w = self.q_proj.weight.dtype
+        scores = torch.matmul(q.to(w), k.transpose(-1, -2).to(w)) * self.scaling
         if causal:
             offset = t_tot - t   # absolute index of the first query position
             neg = torch.full((t, t_tot), float("-inf"), device=x.device, dtype=scores.dtype)
@@ -422,9 +431,9 @@ class EmbedSubword(nn.Module):
             x = layer(x, cos, sin, attn_bias)
         x = _gemma_rmsnorm(x, self.backbone.encoder.norm.weight, self.eps)
 
-        masked_sum = (x * char_mask.unsqueeze(-1)).sum(dim=1)
+        masked_sum = (x * char_mask.unsqueeze(-1)).float().sum(dim=1)   # pooled in fp32
         mean_emb = masked_sum / char_lengths.unsqueeze(-1).clamp(min=1)
-        return self.proj_embedding(mean_emb)
+        return self.proj_embedding(mean_emb.to(self.proj_embedding.weight.dtype))
 
     def forward(
         self,
@@ -581,7 +590,7 @@ class MogHead(nn.Module):
             logits = _top_p_filter(logits, top_p)
         if (top_p is not None and top_p < 1.0) or (temperature and temperature > 0.0):
             temp = temperature if (temperature and temperature > 0.0) else 1.0
-            logp = F.log_softmax(logits, dim=-1) / temp
+            logp = F.log_softmax(logits.float(), dim=-1) / temp
             if u is None:   # else pre-drawn by the caller (a captured step draws outside the graph)
                 u = _rand_rows(logp.shape, logp.device, logp.dtype, generator, torch.rand)
             gumbel = -torch.log(-torch.log(u + 1e-8) + 1e-8)
@@ -598,7 +607,7 @@ class MogHead(nn.Module):
 
         mu_res = F.linear(x, self.proj_else.weight)                        # [b, t, out_size]
         logs = F.linear(x, self.proj_logs.weight).clamp_min(self.min_log_std)  # [b, t, 1]
-        return mu * torch.exp(logs) + mu_res, logs
+        return mu * torch.exp(logs.float()) + mu_res, logs
 
 
 class _Backbone(nn.Module):
@@ -764,7 +773,7 @@ class EarTTSTalker(nn.Module):
             z = mu
             if noise_scale:
                 eps = eps_i if eps_i is not None else _rand_rows(mu.shape, device, mu.dtype, generator, torch.randn)
-                z = z + torch.exp(logs) * eps * noise_scale
+                z = z + torch.exp(logs.float()) * eps * noise_scale
             code = self._rvq_quantize(z, code, cnt, k)
             cnt += k
         return code

@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.precision import NodePrecision  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, ZImageConfig  # noqa: E402
@@ -72,7 +73,7 @@ def test_resources_and_dummy_mode():
     assert _make_model(attention_backend="sdpa").get_node_resources() == []
     model = _make_model()
     assert all(model.get_submodule(n) is None for n in model.nodes)
-    assert model.get_autocast_dtype() is None
+    assert all(model.get_node_precision(n) == NodePrecision(torch.bfloat16, autocast=False) for n in model.nodes)
 
 
 def test_process_prompt_and_validation():

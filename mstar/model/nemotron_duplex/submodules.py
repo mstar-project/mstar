@@ -486,19 +486,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up.
-        Computed once per speaker, under the serving autocast (bf16 on CUDA) no
-        matter who asks first: the CUDA-graph capture's first preprocess runs
-        outside the engine's autocast scope, and a warm-up computed there
-        differs in the last bits from one computed under it -- enough to move
-        a session's first frame (the talker's frame-0 decision is a knife-edge)."""
+        Computed once per speaker. The talker states its precision explicitly
+        (no autocast), so the warm-up is the same bits whoever asks first, in
+        the engine's scope or out of it (the CUDA-graph capture's first
+        preprocess) -- which matters: the talker's frame-0 decision is a
+        knife-edge that last-bit changes move."""
         if self._warmup is None:
             cfg = self.config
-            dev = self.talker.embed_code.weight.device
-            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                self._warmup = self.talker.warmup_inputs(
-                    self.SPEAKER, self._s2c, self._char_pad,
-                    text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
-                )
+            self._warmup = self.talker.warmup_inputs(
+                self.SPEAKER, self._s2c, self._char_pad,
+                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
+            )
         return self._warmup
 
     @property
@@ -689,9 +687,8 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     call. Declares no resources.
     """
 
-    # Per-request context is keyed by request id -> eager; fp32 codec.
+    # Per-request context is keyed by request id -> eager.
     disable_torch_compile = True
-    disable_autocast = True
 
     CONTEXT_KEY = "codec_ctx"
     TAIL_KEY = "codec_tail"              # the last chunk's held-back samples, int16

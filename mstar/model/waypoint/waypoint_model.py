@@ -41,6 +41,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -62,6 +63,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.media_limits import read_image
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.waypoint.components.layers import FP32_MODULE_PATHS
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
     WAYPOINT_VARIANT_720P,
@@ -661,12 +663,17 @@ class WaypointModel(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
-    def get_autocast_dtype(self):
-        """None: every node disables autocast, and the dtype layout is settled
-        at build time (``cast_serving_dtypes()`` pins fp32 islands after
-        casting the rest to bf16). The ring declares its own bf16 on its spec.
-        """
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 without autocast. The dit keeps ``FP32_MODULE_PATHS`` fp32, cast
+        on meta at build (``cast_serving_dtypes``); the TAEHV both nodes share
+        is bf16. The ring declares its own bf16 on its spec."""
+        if node_name == DIT_NODE:
+            return NodePrecision(
+                torch.bfloat16,
+                fp32_modules=tuple(f"dit.{path}" for path in FP32_MODULE_PATHS),
+                autocast=False,
+            )
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

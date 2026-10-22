@@ -40,6 +40,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -79,6 +80,9 @@ IMAGE_GEN_WALK = "image_gen"
 IMAGE_EDIT_WALK = "image_edit"
 
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
+
+
+_PRECISION = NodePrecision(torch.bfloat16, autocast=False)
 
 
 class Flux2KleinModel(Model):
@@ -425,10 +429,12 @@ class Flux2KleinModel(Model):
         return encode_image(output, request_kwargs)
 
     # ------------------------------------------------------------- loading
-    def get_autocast_dtype(self):
-        # None: the engine neither autocasts nor casts modules; numerics follow the
-        # checkpoint dtypes, which is what the parity tests pin.
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        # bf16 throughout with no autocast: numerics follow the load-time dtypes,
+        # which is what the parity tests pin (vae_encoder and vae_decoder share
+        # one VAE, so they must agree)
+        del node_name
+        return _PRECISION
 
     def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.accelerator_graph:
@@ -460,7 +466,7 @@ class Flux2KleinModel(Model):
         if self._vae is None:
             from mstar.model.flux2_klein.weight_loader import build_vae
 
-            self._vae = build_vae(self.config, self.snapshot, device)
+            self._vae = build_vae(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype)
         return self._vae
 
     def _create_submodule(self, node_name: str, device) -> NodeSubmodule | None:
@@ -469,7 +475,7 @@ class Flux2KleinModel(Model):
         from mstar.model.flux2_klein.weight_loader import build_text_encoder, build_transformer
 
         if node_name == "text_encoder":
-            encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
+            encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device, dtype=_PRECISION.param_dtype)
             return KleinTextEncoderSubmodule(encoder, self.config, max_batch_size=self.max_batch_size)
         if node_name == "vae_encoder":
             return KleinVaeEncoderSubmodule(self._vae_module(device), self.config)
@@ -483,7 +489,7 @@ class Flux2KleinModel(Model):
                 decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],
             )
         if node_name == "dit":
-            transformer = build_transformer(self.config, self.snapshot, device)
+            transformer = build_transformer(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype)
             if self.loras:
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 

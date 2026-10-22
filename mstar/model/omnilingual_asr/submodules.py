@@ -52,9 +52,6 @@ class OmniASRCTCSubmodule(NodeSubmodule):
     # Every request has its own length, so a compiled forward would recompile
     # per shape; the encoder runs eagerly.
     disable_torch_compile = True
-    # The model runs in its own dtype end to end, as the reference does (only
-    # the conv stack's LayerNorms upcast to fp32), not under autocast.
-    disable_autocast = True
 
     def __init__(self, model: Wav2Vec2CTC, max_batch_size: int, max_batch_seconds: float):
         super().__init__()

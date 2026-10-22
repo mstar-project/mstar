@@ -154,20 +154,10 @@ class GatedDeltaNet(nn.Module):
             proj.weight[offset:offset + pad].zero_()
 
     def _apply(self, fn, recurse: bool = True):
-        """Keep the fp32 parameters fp32 through any ``.to(dtype)``.
-
-        FlashInfer's GDN kernels assert on these three; the engine's bf16
-        module cast at load would otherwise downcast them and fail at the first
-        decode.
-        """
+        """Re-attach the weight loaders a conversion drops. FlashInfer's GDN
+        kernels assert that A_log, dt_bias and norm.weight are fp32; the model
+        keeps them so through its precision policy's fp32 islands."""
         out = super()._apply(fn, recurse)
-        for param in (
-            getattr(self, "A_log", None),
-            getattr(self, "dt_bias", None),
-            getattr(getattr(self, "norm", None), "weight", None),
-        ):
-            if param is not None and param.dtype != torch.float32:
-                param.data = param.data.float()
         self._attach_weight_loaders()
         return out
 

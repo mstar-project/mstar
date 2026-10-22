@@ -30,6 +30,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -618,14 +619,18 @@ class OmniVoiceModel(Model):
             request_done=request_done,
         )
 
-    def get_autocast_dtype(self):
-        """No engine autocast: the fused kernels need one dtype throughout.
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No autocast anywhere: the backbone's fused flashinfer kernels need
+        one dtype throughout (RMSNorm rejects autocast's mixed dtypes).
 
-        Returning None disables both autocast and the engine's blanket cast, so
-        numerics follow the load dtype -- the same call wan22 makes to keep its
-        numerics equal to the reference pipeline.
+        No blanket dtype: the loader casts only the backbone's llm, audio
+        embeddings and heads to ``load_dtype`` and leaves the codec (the
+        reference's ``audio_tokenizer``, shared with the two codec nodes) fp32,
+        since in float16 the DAC decoder underflows to silence.
         """
-        return None
+        if node_name not in ("backbone", "ref_encoder", "code2wav"):
+            raise ValueError(f"Unknown OmniVoice node {node_name!r}")
+        return NodePrecision(None, autocast=False)
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate

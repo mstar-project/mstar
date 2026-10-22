@@ -27,7 +27,7 @@ def rotate_queries_or_keys(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
 
     omega = torch.arange(D // 2, dtype=x.dtype, device=x.device)
     omega /= D / 2.0
-    omega = 1.0 / 10000**omega
+    omega = 1.0 / 10000 ** omega.float()
     freq = pos.unsqueeze(-1) * omega
 
     emb_sin = freq.sin()
@@ -46,7 +46,7 @@ def rotate_queries_or_keys_BNHD(x: torch.Tensor, pos: torch.Tensor) -> torch.Ten
     _, _, _, D = x.size()
     omega = torch.arange(D // 2, dtype=x.dtype, device=x.device)
     omega /= D / 2.0
-    omega = 1.0 / 10000**omega
+    omega = 1.0 / 10000 ** omega.float()
 
     if pos.dim() == 1:
         freq = pos.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) * omega

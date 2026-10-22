@@ -190,8 +190,10 @@ def test_dummy_mode_returns_no_submodules():
     assert all(model.get_submodule(node) is None for node in model.nodes)
 
 
-def test_autocast_is_off_so_numerics_follow_the_checkpoint():
-    assert _make_model().get_autocast_dtype() is None
+def test_autocast_is_off_so_numerics_follow_the_load_dtypes():
+    model = _make_model()
+    assert all(not model.get_node_precision(node).autocast for node in model.nodes)
+    assert model.get_node_precision("dit").param_dtype is torch.bfloat16
 
 
 # ----------------------------------------------------------------------

@@ -13,6 +13,7 @@ sys.path.insert(0, ".")
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.waypoint.checkpoint import (
@@ -452,7 +453,11 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
     )
     try:
         assert manager.node_names == {DIT_NODE, VAE_ENCODER_NODE}
-        assert manager.engine._autocast_dtype is None
+        # every node bf16 without autocast; the dit keeps its noise conditioner fp32
+        assert model.get_node_precision(DIT_NODE) == NodePrecision(
+            torch.bfloat16, fp32_modules=("dit.denoise_step_emb",), autocast=False,
+        )
+        assert model.get_node_precision(VAE_ENCODER_NODE) == NodePrecision(torch.bfloat16, autocast=False)
         assert model.config.reference_compat is True
         assert model.config.compile_dit is True
         assert model.config.accelerator_graph is True

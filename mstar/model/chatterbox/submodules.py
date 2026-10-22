@@ -117,7 +117,6 @@ class VoiceEncoderSubmodule(NodeSubmodule):
     ``prepare_conditionals`` computes them."""
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, encoder: nn.Module, s3_tokenizer: nn.Module, config: ChatterboxConfig):
         super().__init__()
@@ -576,7 +575,6 @@ class S3GenSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(
         self, s3gen: nn.Module, s3_tokenizer: nn.Module, config: ChatterboxConfig,

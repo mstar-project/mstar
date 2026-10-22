@@ -37,6 +37,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -931,6 +932,19 @@ class VJepa2Model(Model):
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast, on every node (the predictor nodes share
+        one predictor, so they must agree).
+
+        What autocast used to supply is explicit in the components: LayerNorms
+        compute and return fp32 (``FP32LayerNorm``; the encoder's last norm and
+        the ``F.layer_norm`` the encoder and rollout nodes apply reach the client
+        as fp32), Linears cast their input to the weight dtype (``CastLinear``),
+        the RoPE ``10000 ** omega`` runs in fp32, and SDPA runs in v's dtype.
+        """
+        del node_name
+        return NodePrecision(torch.bfloat16)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

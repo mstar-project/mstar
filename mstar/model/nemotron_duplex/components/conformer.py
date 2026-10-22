@@ -15,6 +15,12 @@ LayerNorm over channels -- which is why the checkpoint has only weight+bias and
 no running stats), Macaron 0.5 FF scaling, ``xscaling=False``, ``use_bias=False``
 on all FF/attn/conv linears, Swish (SiLU) activations, mel power spectrum with
 preemphasis 0.97.
+
+Precision: the node runs in bf16 without autocast, and the code says where it
+leaves bf16 -- the dtypes autocast used to pick. Linear and conv inputs are cast
+to the weight dtype; every LayerNorm and the attention softmax compute in fp32
+and return fp32, so the residual stream is fp32 after the first ``norm_out``;
+the mel filterbank matmul runs in the weight dtype and its log in fp32.
 """
 from __future__ import annotations
 
@@ -32,6 +38,18 @@ INF_VAL = 10000.0        # attention mask fill value (NeMo RelPos MHA)
 LOG_GUARD = 2.0 ** -24   # log-mel zero guard (NeMo FilterbankFeatures log_zero_guard_value)
 
 
+def _w(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
+    """``x`` in ``module``'s weight dtype, the input a linear or conv runs in."""
+    return x.to(module.weight.dtype)
+
+
+class _LayerNorm(nn.LayerNorm):
+    """LayerNorm computed in fp32, returning fp32 whatever the param dtype."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x.float(), self.normalized_shape, self.weight.float(), self.bias.float(), self.eps)
+
+
 class _CausalConv2d(nn.Conv2d):
     """nn.Conv2d with NeMo ``CausalConv2D`` padding (left=k-1, right=stride-1 on
     both time and freq axes). Keeps ``weight``/``bias`` param names for loading."""
@@ -43,7 +61,7 @@ class _CausalConv2d(nn.Conv2d):
 
     def forward(self, x):
         x = F.pad(x, (self._left_padding, self._right_padding, self._left_padding, self._right_padding))
-        return super().forward(x)
+        return super().forward(_w(x, self))
 
 
 class _Featurizer(nn.Module):
@@ -76,8 +94,8 @@ class _Featurizer(nn.Module):
         mag = torch.sqrt(spec.pow(2).sum(-1))
         if cfg.mag_power != 1.0:
             mag = mag.pow(cfg.mag_power)
-        mel = torch.matmul(self.fb.to(mag.dtype), mag)     # (B, n_mels, T)
-        mel = torch.log(mel + LOG_GUARD)                    # normalize="NA" -> no-op
+        mel = torch.matmul(self.fb, mag.to(self.fb.dtype))  # (B, n_mels, T), in the weight dtype
+        mel = torch.log((mel + LOG_GUARD).float())          # normalize="NA" -> no-op
         max_len = mel.size(-1)
         mask = torch.arange(max_len, device=mel.device).expand(mel.size(0), -1) >= out_len.unsqueeze(1)
         mel = mel.masked_fill(mask.unsqueeze(1), 0.0)
@@ -153,6 +171,7 @@ class _RelPosMHA(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
         n_batch = x.size(0)
         h, dk, d = self.n_heads, self.head_dim, self.n_heads * self.head_dim
+        x = _w(x, self.linear_q)
         q = self.linear_q(x).view(n_batch, -1, h, dk)
         k = self.linear_k(x).view(n_batch, -1, h, dk).transpose(1, 2)
         v = self.linear_v(x).view(n_batch, -1, h, dk).transpose(1, 2)
@@ -168,10 +187,10 @@ class _RelPosMHA(nn.Module):
         if mask is not None:
             m = mask.unsqueeze(1)
             scores = scores.masked_fill(m, -INF_VAL)
-            attn = torch.softmax(scores, dim=-1).masked_fill(m, 0.0)
+            attn = torch.softmax(scores.float(), dim=-1).masked_fill(m, 0.0)
         else:
-            attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(n_batch, -1, d)
+            attn = torch.softmax(scores.float(), dim=-1)
+        out = torch.matmul(attn.to(v.dtype), v).transpose(1, 2).reshape(n_batch, -1, d)
         return self.linear_out(out)
 
 
@@ -182,7 +201,7 @@ class _FeedForward(nn.Module):
         self.linear2 = nn.Linear(config.ff_dim, config.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(F.silu(self.linear1(x)))
+        return self.linear2(F.silu(self.linear1(_w(x, self.linear1))))
 
 
 class _ConvModule(nn.Module):
@@ -196,12 +215,12 @@ class _ConvModule(nn.Module):
         self.pointwise_conv1 = nn.Conv1d(d, 2 * d, kernel_size=1, bias=False)
         # causal depthwise: left pad k-1, right pad 0
         self.depthwise_conv = nn.Conv1d(d, d, kernel_size=self.kernel_size, padding=0, groups=d, bias=False)
-        self.batch_norm = nn.LayerNorm(d)
+        self.batch_norm = _LayerNorm(d)
         self.pointwise_conv2 = nn.Conv1d(d, d, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None) -> torch.Tensor:
         x = x.transpose(1, 2)                    # (B, D, T)
-        x = self.pointwise_conv1(x)
+        x = self.pointwise_conv1(_w(x, self.pointwise_conv1))
         x = F.glu(x, dim=1)
         if pad_mask is not None:
             x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
@@ -211,7 +230,7 @@ class _ConvModule(nn.Module):
         x = self.batch_norm(x)                    # LayerNorm over channels
         x = x.transpose(1, 2)                     # (B, D, T)
         x = F.silu(x)
-        x = self.pointwise_conv2(x)
+        x = self.pointwise_conv2(_w(x, self.pointwise_conv2))
         return x.transpose(1, 2)                  # (B, T, D)
 
 
@@ -221,15 +240,15 @@ class ConformerLayer(nn.Module):
     def __init__(self, config: ConformerSTTConfig):
         super().__init__()
         d = config.d_model
-        self.norm_feed_forward1 = nn.LayerNorm(d)
+        self.norm_feed_forward1 = _LayerNorm(d)
         self.feed_forward1 = _FeedForward(config)
-        self.norm_self_att = nn.LayerNorm(d)
+        self.norm_self_att = _LayerNorm(d)
         self.self_attn = _RelPosMHA(config)
-        self.norm_conv = nn.LayerNorm(d)
+        self.norm_conv = _LayerNorm(d)
         self.conv = _ConvModule(config)
-        self.norm_feed_forward2 = nn.LayerNorm(d)
+        self.norm_feed_forward2 = _LayerNorm(d)
         self.feed_forward2 = _FeedForward(config)
-        self.norm_out = nn.LayerNorm(d)
+        self.norm_out = _LayerNorm(d)
 
     def forward(self, x, att_mask, pos_emb, pad_mask):
         residual = x + self.FC_FACTOR * self.feed_forward1(self.norm_feed_forward1(x))
@@ -308,7 +327,7 @@ class Perception(nn.Module):
         if processed_signal is None:
             processed_signal, processed_signal_lens = self.preprocessor(input_signal, input_signal_lens)
         encoder_emb, encoded_len = self.encoder(processed_signal, processed_signal_lens)
-        encoded = self.proj(encoder_emb.transpose(1, 2))              # (B, T', 4480)
+        encoded = self.proj(_w(encoder_emb.transpose(1, 2), self.proj))  # (B, T', 4480)
         return encoded, encoded_len
 
     @staticmethod

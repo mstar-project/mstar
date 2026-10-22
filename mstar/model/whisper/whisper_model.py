@@ -32,6 +32,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -442,6 +443,12 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast. The LayerNorms emit bf16 where autocast
+        emitted fp32, which every consumer rounded to bf16 at its next matmul."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

@@ -139,8 +139,9 @@ class AudioEncoderSubmodule(NodeSubmodule):
             audio_features.shape,
         )
         extra_kwargs = {"return_dict": True} if self._encoder_takes_return_dict else {}
+        # the feature extractor's fp32 mel, in the encoder's dtype
         audio_out = self.audio_encoder(
-            audio_features,
+            audio_features.to(next(self.audio_encoder.parameters()).dtype),
             feature_lens=audio_seqlens,
             **extra_kwargs,
         )
@@ -1695,10 +1696,9 @@ class Code2WavSubmodule(NodeSubmodule):
     vocoder, trims overlap context, and returns the PCM audio chunk.
     """
 
-    # Runs in the checkpoint's bf16 without autocast. ``consolidate()``
-    # compiles the forward itself, so the engine must not compile it again.
+    # ``consolidate()`` compiles the forward itself, so the engine must not
+    # compile it again.
     disable_torch_compile = True
-    disable_autocast = True
 
     # No capture carries this key, so a batch of terminal flushes runs eager
     # and skips the decode when none of its windows has a new frame.

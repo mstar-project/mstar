@@ -117,9 +117,6 @@ class KokoroSynthSubmodule(NodeSubmodule):
     # it, so the whole method is not compilable; its two static halves are
     # captured piecewise instead.
     disable_torch_compile = True
-    # fp32 end to end, as the reference: the phase-sensitive vocoder does not
-    # tolerate reduced precision.
-    disable_autocast = True
 
     def __init__(self, model: KokoroTTS, config: KokoroModelConfig):
         super().__init__()

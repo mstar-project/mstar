@@ -25,6 +25,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -50,6 +51,9 @@ logger = logging.getLogger(__name__)
 ENCODE_TEXT_WALK = "encode_text"
 IMAGE_GEN_WALK = "image_gen"
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
+
+
+_PRECISION = NodePrecision(torch.bfloat16, autocast=False)
 
 
 class ZImageModel(Model):
@@ -274,8 +278,10 @@ class ZImageModel(Model):
         return encode_image(output, request_kwargs)
 
     # ------------------------------------------------------------- loading
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        # bf16 throughout with no autocast: numerics follow the load-time dtypes
+        del node_name
+        return _PRECISION
 
     def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.accelerator_graph:
@@ -299,18 +305,20 @@ class ZImageModel(Model):
         from mstar.model.z_image.weight_loader import build_text_encoder, build_transformer, build_vae
 
         if node_name == "text_encoder":
-            return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
-                                              max_batch_size=self.max_batch_size)
+            encoder = build_text_encoder(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype)
+            return ZImageTextEncoderSubmodule(encoder, self.config, max_batch_size=self.max_batch_size)
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
-                build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,
+                build_vae(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype), self.config,
+                max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
                 decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],  # see klein
             )
         if node_name == "dit":
             return ZImageDenoiseSubmodule(
-                build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
+                build_transformer(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype), self.config,
+                loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,

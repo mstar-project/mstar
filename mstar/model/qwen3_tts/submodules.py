@@ -873,7 +873,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
-        capture_dtype = autocast_dtype or self.model.model.codec_embedding.weight.dtype
+        capture_dtype = autocast_dtype
 
         def make_static_inputs(
             shape: PiecewiseCaptureShape,
@@ -952,10 +952,8 @@ class CodecSubmodule(ARNodeSubmodule):
     of the window.
     """
 
-    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
-    # stateless engine, stated directly now that the v1 engine reads these.
+    # uncompiled; the decoder runs in the deployment's codec_dtype
     disable_torch_compile = True
-    disable_autocast = True
 
     # The conv stack decodes at most chunk + conv_context frames (35 for the
     # 12 Hz decoder, 2.8 s of audio) whatever the window, so its activations stay small
@@ -1344,10 +1342,9 @@ class RefEncoderSubmodule(NodeSubmodule):
     Runs once per request, before the clone prefill, and owns no resources.
     The x-vector comes from the ECAPA-TDNN encoder over a log-mel spectrogram
     of the 24 kHz clip; for in-context cloning the codec encoder also turns
-    the clip into ``ref_frames`` 16-group frames. The node keeps the dtypes it
-    was built with (``disable_autocast``): the mel front end and the codec
-    encoder stay in float32, the speaker encoder runs in the Talker's dtype
-    as the reference does.
+    the clip into ``ref_frames`` 16-group frames. The mel front end and the
+    codec encoder stay in float32, the speaker encoder runs in the Talker's
+    dtype as the reference does (the model's precision policy for the node).
 
     The same clip recurs: a voice is reused across a session, and every
     sentence chunk of a long clone request carries it. The conditioning is
@@ -1356,7 +1353,6 @@ class RefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     CONDITIONING_CACHE_SIZE = 64
 
     def __init__(

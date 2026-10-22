@@ -10,11 +10,11 @@ three wrapped nodes run once per request with no graph to amortize, and the dit'
 forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its inner
 transformer region alone (``config.compile_dit``), leaving the solver eager.
 
-Numerics are governed by the checkpoint dtypes, not by the engine.
-``Wan22Model.get_autocast_dtype`` returns None so the engine neither autocasts
-nor blanket-casts the modules, and each forward enters ``_inference_ctx``
-itself — reference parity must not depend on what context wraps the call, and
-the v1 engine supplies neither the autocast nor the no-grad wrapper.
+Numerics are governed by the load-time dtypes, not by autocast.
+``Wan22Model.get_node_precision`` declares each node's dtypes (bf16 with the
+DiT's fp32 islands) and runs every node without autocast, and each forward
+enters ``_inference_ctx`` itself — reference parity must not depend on what
+context wraps the call, and the v1 engine supplies no no-grad wrapper.
 """
 
 import logging
@@ -84,32 +84,6 @@ def _inference_ctx():
         yield
 
 
-class _Fp32IslandMixin:
-    """Re-pin the fp32 islands after a blanket ``.to(dtype=...)`` cast.
-
-    ``EngineManager`` casts a submodule wholesale when its engine has autocast,
-    which would drag the fp32 islands to bf16 and change every fp32-path result
-    downstream. This restores the islands' dtype, not their values — a cast that
-    actually fired has already rounded them. wan22 never casts
-    (``get_autocast_dtype`` returns None), so this is a backstop against
-    engine-config drift, not a license to serve under autocast.
-    """
-
-    def _record_fp32_islands(self):
-        self._fp32_param_names = {n for n, p in self.named_parameters() if p.dtype == torch.float32}
-        self._fp32_buffer_names = {n for n, b in self.named_buffers() if b.dtype == torch.float32}
-
-    def to(self, *args, **kwargs):
-        result = super().to(*args, **kwargs)
-        for name, param in result.named_parameters():
-            if name in self._fp32_param_names and param.dtype != torch.float32:
-                param.data = param.data.float()
-        for name, buf in result.named_buffers():
-            if name in self._fp32_buffer_names and buf.dtype != torch.float32:
-                _set_buffer(result, name, buf.float())
-        return result
-
-
 class _SingleRequestMixin:
     """Serve one request per step, through the engine's batched entry point.
 
@@ -148,12 +122,6 @@ class _SingleRequestMixin:
         }
 
 
-def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
-    owner_path, _, attr = dotted_name.rpartition(".")
-    owner = module.get_submodule(owner_path) if owner_path else module
-    setattr(owner, attr, value)
-
-
 def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> int:
     """The denoise iteration this step runs, from the engine's loop counter.
 
@@ -181,7 +149,7 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22TextEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
     """UMT5-XXL prompt encoder.
 
     Consumes ``text_inputs`` = ``[positive_ids, negative_ids]``; emits
@@ -199,7 +167,6 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
         super().__init__()
         self.text_encoder = text_encoder
         self.config = config
-        self._record_fp32_islands()
 
     def prepare_inputs(
         self,
@@ -255,7 +222,7 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
 # vae_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
     """Wan2.2-VAE first-frame encoder (I2V requests only).
 
     Consumes ``image_inputs`` (one ``[C, H, W]`` image, float in ``[0, 1]`` or
@@ -273,7 +240,6 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         super().__init__()
         self.vae = vae
         self.config = config
-        self._record_fp32_islands()
 
     def prepare_inputs(
         self,
@@ -324,7 +290,7 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
 # dit
 # ---------------------------------------------------------------------------
 
-class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22DitSubmodule(_SingleRequestMixin, NodeSubmodule):
     """Dense 5B video DiT with the UniPC step run inline.
 
     One loop iteration is one batch-2 transformer forward (the positive and
@@ -368,7 +334,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         super().__init__()
         self.transformer = transformer
         self.config = config
-        self._record_fp32_islands()
         # Compile the inner DiT region only (tensors in, tensor out; nothing
         # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
         # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
@@ -577,7 +542,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeDecoderSubmodule(_SingleRequestMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
     Consumes the loop's final ``latents`` and emits ``video_output``
@@ -621,14 +586,11 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         self.config = config
         self._decode_dtype_cached = None
         # Resolve the decode dtype now (a cheap cuDNN-version read) so the
-        # choice is fixed at startup rather than on the first request. Cast
-        # BEFORE recording the fp32 islands: the recorded set must describe
-        # the dtype the decode will actually run in, not the checkpoint's
-        # load dtype, or the mixin re-pins the weights back afterwards.
+        # choice is fixed at startup rather than on the first request; the
+        # node's precision policy keeps whatever dtype this picks.
         # ``vae`` is never None here: dummy mode returns from
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
-        self._record_fp32_islands()
         self._fast_step = None
         self._fast_sizes = config.fast_decode_sizes()
         if config.vae_decode_fast:

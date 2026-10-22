@@ -46,34 +46,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
-    disable_autocast = True
-
     def __init__(self, encoder: Pi05SiglipEncoder, config: Pi05Config):
         super().__init__()
         self.encoder = encoder
         self.config = config
-
-    def to(self, *args, **kwargs):
-        """Override ``to()`` to always keep the SigLIP vision tower and
-        connector in float32, matching lerobot's
-        ``to_bfloat16_for_selected_params`` which explicitly preserves
-        ``vision_tower`` and ``multi_modal_projector`` in fp32.
-
-        Running SigLIP in bf16 produces ~64 abs delta on the image features
-        (27-layer vision transformer accumulates bf16 rounding), which then
-        propagates through the prefix KV cache and causes ~0.2 abs delta on
-        the final actions — too large for production use.
-        """
-        # Move to device but FORCE fp32 for all parameters.
-        # First apply the standard .to() for device placement:
-        result = super().to(*args, **kwargs)
-        # Then upcast all parameters back to fp32:
-        for param in result.parameters():
-            param.data = param.data.to(torch.float32)
-        for buf in result.buffers():
-            if buf.is_floating_point():
-                buf.data = buf.data.to(torch.float32)
-        return result
 
     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
         """Resize one request's stack of camera images with aspect-preserving
@@ -275,17 +251,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                         denoised action tensor is emitted as ``action_output``.
     """
 
-    # Parameter name fragments whose weights must stay in float32 even when
-    # the rest of the model is bf16. Matches lerobot's
-    # ``to_bfloat16_for_selected_params`` — keeping norms in fp32 prevents
-    # the per-layer precision loss that otherwise compounds across 18 layers
-    # and causes ~0.2 abs delta on the final actions.
-    _FLOAT32_PARAM_SELECTORS = (
-        "input_layernorm",
-        "post_attention_layernorm",
-        ".norm.",   # final RMSNorm / adaRMS norm
-    )
-
     # For the default image size and a simple text prompt, one request is about 400 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
@@ -336,19 +301,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # every step, so torch.empty suffices (no zeroing needed).
         self._fraction: torch.Tensor | None = None
         self._time_emb_buffer: torch.Tensor | None = None
-
-    def to(self, *args, **kwargs):
-        """Apply standard ``to()`` then upcast norm parameters back to fp32.
-
-        Matches lerobot's ``to_bfloat16_for_selected_params`` which keeps
-        ``input_layernorm``, ``post_attention_layernorm``, and ``model.norm``
-        in float32 while the rest of the transformer runs in bfloat16.
-        """
-        result = super().to(*args, **kwargs)
-        for name, param in result.named_parameters():
-            if any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS):
-                param.data = param.data.to(torch.float32)
-        return result
 
     def can_batch(
         self,
@@ -754,7 +706,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         )
         adarms_cond = self.time_mlp(time_emb)
 
-        suffix = self.action_in_proj(noisy_actions)
+        # the flow state stays fp32; the projection runs in its weights' dtype
+        suffix = self.action_in_proj(noisy_actions.to(self.action_in_proj.weight.dtype))
 
         suffix_out = self.action_expert(
             query_sequence=suffix,

@@ -9,7 +9,7 @@ Numerics contract (bf16 weights with fp32 islands):
 
   * fp32 islands, matching the reference's ``_keep_in_fp32_modules``: the
     time embedder's two Linears, every ``scale_shift_table``, and each block's
-    ``norm2`` affine. ``cast_serving_dtypes()`` pins them; the rest is bf16.
+    ``norm2`` affine (``FP32_ISLANDS``); the rest is bf16.
   * The fp32 -> bf16 boundaries are the reference's ``type_as`` calls, and they
     must stay where they are: the timestep embedding and modulation run fp32
     and cast back per block, RoPE is applied fp32, the self-attention and FFN
@@ -272,10 +272,20 @@ class Wan22DiTBlock(nn.Module):
         return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 
 
+# The checkpoint's ``_keep_in_fp32_modules``, as fp32 globs on the DiT's names:
+# the time embedder, every scale_shift_table, and each block's norm2 affine.
+FP32_ISLANDS = (
+    "condition_embedder.time_embedder",
+    "scale_shift_table",
+    "blocks.*.norm2",
+    "blocks.*.scale_shift_table",
+)
+
+
 class Wan22DiT(nn.Module):
     """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
-    ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
+    ``weight_loader.build_wan22_dit`` (meta -> the node's precision policy ->
     ``to_empty(device)`` -> checkpoint load)."""
 
     def __init__(self, config: Wan22Config):
@@ -309,19 +319,6 @@ class Wan22DiT(nn.Module):
         """Bulk compute dtype (the non-island weights); callers cast inputs
         to this, mirroring diffusers ``ModelMixin.dtype``."""
         return self.patch_embedding.weight.dtype
-
-    def cast_serving_dtypes(self) -> "Wan22DiT":
-        """bf16 everywhere except the fp32 islands (the checkpoint's
-        ``_keep_in_fp32_modules``: time_embedder, scale_shift_tables, block
-        norm2 affines). Called on the meta module BEFORE ``to_empty`` so
-        storage is allocated directly in the serving dtypes."""
-        self.to(torch.bfloat16)
-        self.condition_embedder.time_embedder.to(torch.float32)
-        self.scale_shift_table.data = self.scale_shift_table.data.to(torch.float32)
-        for block in self.blocks:
-            block.norm2.to(torch.float32)
-            block.scale_shift_table.data = block.scale_shift_table.data.to(torch.float32)
-        return self
 
     def forward(
         self,

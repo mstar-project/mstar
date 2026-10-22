@@ -223,7 +223,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         hidden = hidden.view(B, T, -1, D).flatten(1, 2)
         # Post-encoder LayerNorm — matches notebook Cell 5 forward_target
         # and WorldModel.encode (world_model_wrapper.py:50-51).
-        hidden = F.layer_norm(hidden, (D,))
+        hidden = F.layer_norm(hidden.float(), (D,))
         # Slice to the first frame's tokens — the rollout uses single-frame
         # context (notebook Cell 5: z_hat = z[:, :tokens_per_frame]).
         tokens_per_frame = hidden.size(1) // T
@@ -1202,7 +1202,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         # published configs/train/vitg16/droid-256px-8f.yaml, so this
         # F.layer_norm puts each rollout step's output back in the
         # distribution the next step's predictor expects.
-        return F.layer_norm(new_tg, (new_tg.size(-1),))
+        return F.layer_norm(new_tg.float(), (new_tg.size(-1),))
 
     def forward(
         self,

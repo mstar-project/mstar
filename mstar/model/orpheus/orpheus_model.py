@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -477,6 +478,14 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        if node_name == "LLM":
+            return NodePrecision(torch.bfloat16, autocast=False)
+        if node_name == "snac_decoder":
+            # fp32 as the reference decoder
+            return NodePrecision(torch.float32, autocast=False)
+        raise ValueError(f"Unknown Orpheus node {node_name!r}")
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

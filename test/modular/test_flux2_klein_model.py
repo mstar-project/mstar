@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.precision import NodePrecision  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, DIT_ATTN, Flux2KleinConfig  # noqa: E402
@@ -261,8 +262,10 @@ def test_postprocess_encodes_png():
         _make_model().postprocess(torch.zeros(1), "text")
 
 
-def test_autocast_is_off_so_numerics_follow_the_checkpoint():
-    assert _make_model().get_autocast_dtype() is None
+def test_autocast_is_off_so_numerics_follow_the_load_dtypes():
+    model = _make_model()
+    for node in ("text_encoder", "vae_encoder", "dit", "vae_decoder"):
+        assert model.get_node_precision(node) == NodePrecision(torch.bfloat16, autocast=False)
 
 
 # ----------------------------------------------------------------------

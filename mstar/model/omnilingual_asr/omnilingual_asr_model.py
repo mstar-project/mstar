@@ -32,6 +32,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -132,8 +133,12 @@ class OmnilingualASRModel(Model):
             ),
         }
 
-    def get_autocast_dtype(self) -> torch.dtype:
-        return self.dtype
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        # the model runs in its own dtype end to end, as the reference does
+        # (only the conv stack's LayerNorms upcast to fp32), not under autocast
+        if node_name != ENCODER_NODE:
+            raise ValueError(f"Unknown Omnilingual ASR node: {node_name!r}")
+        return NodePrecision(self.dtype, autocast=False)
 
     # -- request preprocessing (API data worker) -----------------------------
 

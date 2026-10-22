@@ -41,6 +41,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -1285,6 +1286,15 @@ class Qwen3OmniModel(Model):
     # -----------------------------------------------------------------------
     # Model ABC: submodule loading
     # -----------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast. Code2Wav keeps the checkpoint's dtypes.
+        Routing softmax and the norms pin fp32 themselves, and the encoders'
+        LayerNorms emit bf16 where autocast emitted fp32 for the next matmul
+        to round."""
+        if node_name == "Code2Wav":
+            return NodePrecision(None, autocast=False)
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

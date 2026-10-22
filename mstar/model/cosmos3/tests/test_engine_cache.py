@@ -1091,12 +1091,12 @@ def _run_accelerator_graph_denoise(ctx):
     groups = JointGroups(
         tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(),
     )
-    # The runner's autocast scope is the engine's: none for a node that pins
-    # its own precision (the DiT forwards run native bf16), else the model's.
+    # The runner's autocast scope is the engine's: the node policy's (the DiT
+    # runs native bf16, without autocast).
     cg_runner = AcceleratorGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev,
-        autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
+        autocast_dtype=model.get_node_precision("dit").autocast_dtype,
         joint_comm_group=groups, num_slots=1,
     )
     cg_runner.warmup_and_capture()
