@@ -114,10 +114,9 @@ def test_fused_wiring_leaves_the_row_parallel_outputs_partial():
     assert all(layer.self_attn.o_proj.reduce_results for layer in plain.model.layers)
 
 
-def test_moe_partial_is_what_the_fused_allreduce_block_reduces(monkeypatch):
+def test_moe_partial_is_what_the_fused_allreduce_block_reduces():
     """reduce_results=False: no collective in the block, and the returned partial is the
     routed + shared sum a moe_fused_allreduce block hands its one all-reduce."""
-    monkeypatch.delenv("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", raising=False)
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
     cfg.moe_fused_allreduce = True
