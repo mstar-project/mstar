@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -28,3 +31,17 @@ def test_recompile_limit_env(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("MSTAR_RECOMPILE_LIMIT", raw)
     assert recompile_limit() == expected
+
+
+# the API server's process, and the module a spawned worker imports to find its target
+@pytest.mark.parametrize("entry", ["mstar.api_server.entrypoint", "mstar.conductor.conductor"])
+def test_compile_cache_defaults_under_the_user_cache(tmp_path, entry):
+    """torch writes its /tmp default into the environment when ``torch._dynamo``
+    is first imported, so mstar's default has to land before any import does."""
+    env = {k: v for k, v in os.environ.items() if k not in ("TORCHINDUCTOR_CACHE_DIR", "XDG_CACHE_HOME")}
+    env["XDG_CACHE_HOME"] = str(tmp_path)
+    code = f"import os, {entry}; print(os.environ['TORCHINDUCTOR_CACHE_DIR'])"
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert out == str(tmp_path / "mstar" / "torchinductor")

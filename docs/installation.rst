@@ -89,6 +89,7 @@ interactive shell and check GPU access:
      -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v "$HOME/.cache/mstar:/root/.cache/mstar" \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
 

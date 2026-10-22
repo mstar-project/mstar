@@ -408,6 +408,29 @@ Pi0.5 DROID variant fixes the action horizon:
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
 
+Restarts and the compile cache
+------------------------------
+
+Most of a first start is compiling: Inductor compiles every capture bucket and autotunes
+its GEMMs, and FlashInfer JIT-builds its kernels. Both cache the results, and a start that
+finds them skips that work. Qwen3.5-0.8B on one H200 took about 22 minutes to start with
+empty caches and about 1.5 minutes with warm ones.
+
+To keep that across restarts, persist ``~/.cache``, which holds all of it:
+
+- ``~/.cache/mstar/torchinductor``: Inductor's compiled graphs, autotune picks and Triton
+  kernels (M* sets ``TORCHINDUCTOR_CACHE_DIR`` to it unless you export one)
+- ``~/.cache/flashinfer``: FlashInfer's JIT builds
+- ``~/.triton/cache``: Triton kernels compiled outside Inductor
+- ``~/.cache/huggingface``: the weights
+
+In a container, mount these from a volume rather than only ``~/.cache/huggingface``. The
+cache is keyed by torch and Triton version, so an upgrade recompiles rather than reusing
+stale kernels. Autotune picks are measured on the GPU that made them, so give each GPU model
+its own cache if one home serves several. If home is on a network filesystem shared by
+concurrent jobs, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local path and copy a warm
+cache in at job start.
+
 .. _tensor-transport:
 
 Tensor transport
