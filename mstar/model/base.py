@@ -61,6 +61,8 @@ class Span(NamedTuple):
     as ``(modality, index)``. ``params`` are the preprocessing arguments that
     change the tensors made from the file. A ``rows`` span writes KV made from
     anything else, such as another node's outputs, and is never keyed.
+    ``scratch`` is the most a non-committing step writes before the span
+    commits into those slots, as a denoised window does.
     """
     kind: str
     walk: str
@@ -68,6 +70,7 @@ class Span(NamedTuple):
     advance: int
     source: str | tuple[str, int]
     params: tuple = ()
+    scratch: int = 0
 
 
 class LabelLayout(NamedTuple):
@@ -92,19 +95,19 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk]``: plain values, which keep a request's kwargs on the
+        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
         wire's msgpack path."""
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
-            if not (isinstance(span.length, int) and isinstance(span.advance, int)):
+            if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
                 raise ValueError(
-                    f"a {span.kind} span's length and advance are "
-                    f"{type(span.length).__name__} and {type(span.advance).__name__}"
+                    f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
+                    f"{type(span.advance).__name__} and {type(span.scratch).__name__}"
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],

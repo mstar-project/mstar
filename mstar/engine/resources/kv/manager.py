@@ -3222,9 +3222,10 @@ class KVManager(AttentionResource):
                 (segment.request_id, segment.label) in step.sink
             ):
                 continue
-            assert segment.span <= layout.scratch, (
+            scratch = max([layout.scratch, *(span.scratch for span in layout.spans)])
+            assert segment.span <= scratch, (
                 f"KV {self.name}: {segment.request_id}/{segment.label}: a step that commits nothing "
-                f"writes {segment.span} slots, past its layout's scratch of {layout.scratch}"
+                f"writes {segment.span} slots, past its layout's scratch of {scratch}"
             )
 
     def _report_overrun(self, rid: str, label: str, stream: CacheStream) -> None:

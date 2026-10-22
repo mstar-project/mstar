@@ -15,6 +15,7 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.windowing import WindowSchedule
 
 PS = 8
 
@@ -98,3 +99,18 @@ def test_a_window_holds_its_peak_not_its_sum():
 
         assert peak <= layout.pages({}, PS), f"{prefix=} {budget=} {window=}: a window outgrew its footprint"
         assert layout.pages({}, PS) - peak <= 1, f"{prefix=} {budget=} {window=}: the footprint over-counts"
+
+
+def test_a_window_denoised_before_its_commit_counts_once():
+    schedule, per_unit, prompt = WindowSchedule(10, 4, overlap_units=1), 3, 6
+    kv = _manager()
+    kv.ingest_request("r")
+    peak = _grow(kv, "r", prompt)
+    windows = []
+    for plan in schedule.windows():
+        commit = (plan.commit_end - plan.commit_start) * per_unit
+        peak = max(peak, _grow(kv, "r", plan.units * per_unit, commit=False), _grow(kv, "r", commit))
+        windows.append(PrefixSpan(commit, commit, "w", scratch=plan.units * per_unit))
+    layout = StreamLayout(spans=(*_spans(prompt), *windows))
+
+    assert peak == layout.pages({}, PS), "the last window's denoise is counted on top of its commit"

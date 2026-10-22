@@ -129,7 +129,7 @@ def test_the_tail_after_a_cache_hit_fires_nothing(debug, monkeypatch):
 def test_intake_drops_the_layout_of_a_label_the_request_does_not_open():
     config = KVReqConfig(needed_labels=["main"])
     config.apply_conductor_config(kv_layout={
-        "main": [[[20, 20, WALK]], [["decode_loop", 1]], 0, None, 0],
+        "main": [[[20, 20, WALK, 0]], [["decode_loop", 1]], 0, None, 0],
         "cfg_img": [[], [["decode_loop", 1]], 40, None, 0],
     }, loop_caps={"decode_loop": 3})
 

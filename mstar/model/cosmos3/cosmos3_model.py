@@ -894,7 +894,8 @@ class Cosmos3Model(Model):
     ) -> dict[str, LabelLayout]:
         """Each guidance branch's writes: its prompt at prefill, one denoise step's
         latents as scratch, and in window mode ``kv`` each window's latents once
-        they are clean, under the schedule's retention."""
+        they are clean, under the schedule's retention, with the window's denoise
+        steps as that span's scratch."""
         config = self.config
         if "video" in input_modalities and "video_inputs" in tensors:
             prefill = self.PREFILL_COND_VIDEO_WALK
@@ -909,12 +910,14 @@ class Cosmos3Model(Model):
                 p["total_latent_units"], p["window_latent_units"],
                 context_units=p["context_latent_units"], overlap_units=p["overlap_latent_units"],
             )
-            scratch = max(plan.units for plan in schedule.windows()) * per_frame
             if p["window_mode"] == "kv":
-                windows = tuple(
-                    Span("rows", self.VIDEO_GEN_AR_WALK, length, length, "latents")
-                    for length in ((plan.commit_end - plan.commit_start) * per_frame for plan in schedule.windows())
-                )
+                scratch = 0
+                for plan in schedule.windows():
+                    commit = (plan.commit_end - plan.commit_start) * per_frame
+                    denoise = plan.units * per_frame
+                    windows += (Span("rows", self.VIDEO_GEN_AR_WALK, commit, commit, "latents", scratch=denoise),)
+            else:
+                scratch = max(plan.units for plan in schedule.windows()) * per_frame
         elif p.get("action_mode") is not None:
             action_chunk = int(p["action_chunk_size"])
             scratch = latent_frames(int(p.get("num_frames") or action_chunk + 1), config) * per_frame + action_chunk

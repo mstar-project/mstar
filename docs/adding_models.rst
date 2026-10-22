@@ -319,7 +319,8 @@ A layout has five fields:
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. ``length`` is the slots the write fills, ``advance`` how far it moves
-  the position counter.
+  the position counter. A span's ``scratch`` is the most one non-committing step writes
+  before the span commits into those slots, as a window's denoise steps do.
 - ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
 - ``scratch``: the most KV slots one non-committing step writes past the committed length.
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
@@ -327,9 +328,9 @@ A layout has five fields:
   before the first ``rows`` span.
 
 The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. It adds the scratch once on top of every span, so it
-counts a step that runs before the last spans as if it ran after them. Under a
-``RetentionPolicy`` it takes the window's peak instead.
+rounds up to whole pages per label. A span's own scratch counts only with the spans before
+it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
+takes the window's peak instead.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
