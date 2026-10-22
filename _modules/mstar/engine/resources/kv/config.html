@@ -1349,6 +1349,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the rows the forks apply to; None is every row (a chunked prompt</span>
     <span class="c1"># pre-forks on its first chunk and post-forks on its last)</span>
     <span class="n">fork_rids</span><span class="p">:</span> <span class="nb">frozenset</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># (request_id, label) pairs that run against SINK_PAGE and hold no pages</span>
+    <span class="n">sink</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
     <span class="c1"># (request_id, label) -&gt; the retention a committing stream declares for</span>
     <span class="c1"># itself this step, applied at commit. It rides with the step rather than</span>
     <span class="c1"># living on the stream, so an offload has nothing to lose.</span>
