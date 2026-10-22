@@ -31,11 +31,13 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.lora import LoraStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.model.components.lora.capable import apply_lora
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
@@ -84,6 +86,8 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
+    # every row's tokens, image tokens included, go through the adapted linears
+    lora_segment_rows = True
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -139,6 +143,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self.config = config
         self.vision_config = vision_config
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._sentinel_ids: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -147,7 +152,10 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        """Decode, text prefill and vision prefill all capture."""
+        """Decode, text prefill and vision prefill all capture. Serving LoRA
+        adapters changes no bucket: a capture's rows address the zero adapter,
+        and a replay reads each row's slot from the pool's per-slot buffers."""
+
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -218,6 +226,7 @@ class LLMSubmodule(ARNodeSubmodule):
             )
             embeds = self.model.model.embed_tokens(ids)
             self._vision_sentinels = (embeds[:1], embeds[1:])
+            self._sentinel_ids = (ids[:1], ids[1:])
         return self._vision_sentinels
 
     def _vision_inputs(
@@ -255,6 +264,10 @@ class LLMSubmodule(ARNodeSubmodule):
         embeds: list[torch.Tensor] = []
         pos_ids: list[torch.Tensor] = []
         tracked: list[torch.Tensor] = []
+        # each position's token id (-1 on an image or video frame), for the adapter's
+        # embedding delta, which `preprocess` adds once the step's adapters are planned
+        embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None) is not None
+        ids_at: list[torch.Tensor] = []
         text_i = grid_i = 0
         # frame groups of the video at `grid_i` already placed
         group = 0
@@ -269,6 +282,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 embeds.append(self.model.model.embed_tokens(ids))
                 pos_ids.append(text_position_ids(span, pos, device))
                 tracked.append(ids)
+                if embed_lora:
+                    ids_at.append(ids)
                 pos += span
                 continue
             grid = grids[grid_i]
@@ -285,6 +300,11 @@ class LLMSubmodule(ARNodeSubmodule):
             span = t * (h // merge) * (w // merge)
             advance = vision_position_advance(grid, merge)
             embeds += [start_embed, packed[cursor:cursor + span], end_embed]
+            if embed_lora:
+                start_id, end_id = self._sentinel_ids
+                ids_at += [
+                    start_id, torch.full((span,), -1, dtype=torch.long, device=device), end_id,
+                ]
             pos_ids += [
                 text_position_ids(1, pos, device),
                 vision_position_ids(grid, merge, pos + 1, device),
@@ -295,20 +315,23 @@ class LLMSubmodule(ARNodeSubmodule):
             pos += advance + 2
 
         input_embeds = torch.cat(embeds, dim=0)
+        tensor_inputs = {
+            "mrope_advance": pos - start_pos,
+            # Ids cannot ride `input_ids` — that is what `preprocess` keys
+            # the embeds-vs-ids branch on — so the repetition penalty
+            # takes them from here.
+            "text_token_ids": (
+                torch.cat(tracked) if tracked
+                else torch.zeros(0, dtype=torch.long, device=device)
+            ),
+        }
+        if embed_lora:
+            tensor_inputs["embed_ids"] = torch.cat([i.to(torch.long) for i in ids_at])
         return ARNodeInputs(
             input_seq_len=input_embeds.shape[0],
             input_embeds=input_embeds,
             custom_pos_ids=torch.cat(pos_ids, dim=1),
-            tensor_inputs={
-                "mrope_advance": pos - start_pos,
-                # Ids cannot ride `input_ids` — that is what `preprocess` keys
-                # the embeds-vs-ids branch on — so the repetition penalty
-                # takes them from here.
-                "text_token_ids": (
-                    torch.cat(tracked) if tracked
-                    else torch.zeros(0, dtype=torch.long, device=device)
-                ),
-            },
+            tensor_inputs=tensor_inputs,
         )
 
     def prepare_inputs(
@@ -453,6 +476,16 @@ class LLMSubmodule(ARNodeSubmodule):
             out["input_embeds"] = torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0,
             )
+            embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None)
+            # a capture's dummy rows carry no ids, and add no delta
+            if embed_lora is not None and all("embed_ids" in inp.tensor_inputs for inp in inputs):
+                # the spliced text embeddings take their rows' adapters' embedding delta
+                # here, where the step's addressing is planned; images' -1 ids take none
+                out["input_embeds"] = apply_lora(
+                    embed_lora,
+                    torch.cat([inp.tensor_inputs["embed_ids"] for inp in inputs]),
+                    out["input_embeds"],
+                )
 
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         cos, sin = self.model.model.build_cos_sin(
@@ -505,6 +538,18 @@ class LLMSubmodule(ARNodeSubmodule):
                 int(inp.tensor_inputs["mrope_advance"]) for inp in inputs
             )
 
+        steps = {
+            KV_CACHE: KVStep(),
+            ATTN: AttentionStep(causal=True),
+            GDN_STATE: RecurrentStep(),
+            LINEAR_ATTN: LinearAttnStep(),
+            SAMPLER: SamplerStep(
+                apply_penalty=True,
+                prefill_tracked_tokens=prefill_tokens,
+                kept_rids=kept_rids,
+            ),
+            ROPE: PositionStep(advance=advance),
+        }
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -514,18 +559,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 )
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                GDN_STATE: RecurrentStep(),
-                LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
-                ),
-                ROPE: PositionStep(advance=advance),
-            },
+            steps=steps,
         )
 
     # ------------------------------------------------------------------
@@ -553,7 +587,7 @@ class LLMSubmodule(ARNodeSubmodule):
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
-            self.model.model.embed_tokens(input_ids)
+            self.model.model.embed(input_ids)
             if input_embeds is None
             else input_embeds
         )
@@ -744,6 +778,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # LLM's 4096 `prefill_vision` bucket; a larger prompt runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
+    # the frames' segments, in order, are the rows the tower's linears see (the
+    # merger's folded); the captured block loop declares its own (see there)
+    lora_segment_rows = True
+
     def __init__(
         self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,
     ):
@@ -794,8 +832,12 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
+        # Leased, the captured block loop plans its own attention per replay. A node
+        # serving adapters still declares its frames: the engine adds their LoRA rows
+        # (this admit is the one that can wait for a slot, and the patch embed and
+        # merger run outside the loop).
+        leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
+        if leased and not self.lora_keys:
             return None
         # one segment per frame: a frame attends to itself alone
         segments = [
@@ -805,7 +847,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         ]
         return SubmoduleStep(
             segments=segments,
-            steps={VISION_ATTN: AttentionStep(causal=False)},
+            steps={} if leased else {VISION_ATTN: AttentionStep(causal=False)},
         )
 
     def can_batch(
@@ -839,9 +881,17 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
         def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
             (rid,) = request_ids
+            steps = {VISION_ATTN: AttentionStep(causal=False)}
+            # The region's step is the model's, not the engine's, so it declares its
+            # LoRA rows itself: the prompt as one row, what the bucket's one row holds.
+            # They address the slot the outer step took; the pool restores the outer
+            # plan when the region commits, for the merger after it.
+            prompt = (Segment(request_id=rid, label="main", span=sum(seq_lens)),)
+            for key in self.lora_keys:
+                steps[key] = LoraStep(segments=prompt)
             return SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps={VISION_ATTN: AttentionStep(causal=False)},
+                steps=steps,
             )
 
         return {
