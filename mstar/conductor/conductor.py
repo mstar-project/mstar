@@ -41,6 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils import knobs
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
@@ -451,6 +452,8 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        # fail here, once, rather than in every worker
+        knobs.check(self.model_config.get("knobs"))
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
