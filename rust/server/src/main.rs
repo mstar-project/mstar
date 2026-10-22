@@ -509,7 +509,9 @@ async fn chat_completions(
     }
 }
 
-/// SSE `chat.completion.chunk`s: role delta, per-chunk deltas, finish, `[DONE]`.
+/// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
+/// rides on the first delta (the finish one when there is none), as in
+/// `serving_chat.py`: clients time the first token from the first chunk.
 fn chat_sse(
     st: AppState,
     args: SubmitArgs,
@@ -519,26 +521,24 @@ fn chat_sse(
     let model = st.model_name.clone();
     let base = result_stream(&st, &args, &request_id, true);
 
-    let head = {
-        let s = chunk_json(&request_id, created, &model, json!({"role": "assistant"}), None);
-        futures::stream::once(async move { Ok(Event::default().data(s)) })
-    };
     // Set if a terminal error is emitted mid-stream, so the tail below does NOT
     // append a clean `finish_reason:"stop"` + `[DONE]` — a failed request must
     // not look cleanly completed to the client.
     let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let role_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let body = {
         let model = model.clone();
         let id = request_id.clone();
         let errored = errored.clone();
+        let role_sent = role_sent.clone();
         base.map(move |item| match item {
-            Out::Chunk(c) => Ok(Event::default().data(chunk_json(
-                &id,
-                created,
-                &model,
-                chat_delta(&c),
-                None,
-            ))),
+            Out::Chunk(c) => {
+                let mut delta = chat_delta(&c);
+                if !role_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    delta["role"] = json!("assistant");
+                }
+                Ok(Event::default().data(chunk_json(&id, created, &model, delta, None)))
+            }
             // Terminal mid-stream failure: an OpenAI error event, and suppress
             // the normal stop/[DONE] tail (mstar's generator exception drops the
             // connection; the explicit error event is strictly more informative).
@@ -552,7 +552,12 @@ fn chat_sse(
         if errored.load(std::sync::atomic::Ordering::SeqCst) {
             futures::stream::iter(Vec::new())
         } else {
-            let finish = chunk_json(&request_id, created, &model, json!({}), Some("stop"));
+            let delta = if role_sent.load(std::sync::atomic::Ordering::SeqCst) {
+                json!({})
+            } else {
+                json!({"role": "assistant"})
+            };
+            let finish = chunk_json(&request_id, created, &model, delta, Some("stop"));
             futures::stream::iter(vec![
                 Ok(Event::default().data(finish)),
                 Ok(Event::default().data("[DONE]")),
@@ -560,7 +565,7 @@ fn chat_sse(
         }
     })
     .flatten();
-    Sse::new(head.chain(body).chain(tail)).keep_alive(KeepAlive::default())
+    Sse::new(body.chain(tail)).keep_alive(KeepAlive::default())
 }
 
 /// One streaming chunk -> its OpenAI delta object.
@@ -1447,6 +1452,49 @@ mod tests {
         .await;
         let (status, _, data) = body(resp).await;
         (status, data)
+    }
+
+    #[tokio::test]
+    async fn a_streamed_chat_puts_the_role_on_its_first_delta() {
+        for (outputs, roles) in [
+            (vec!["text", "audio"], vec![true, false, false]),
+            (vec![], vec![true]),
+        ] {
+            let args = SubmitArgs {
+                text: Some("hi".into()),
+                output_modalities: outputs.iter().map(|m| m.to_string()).collect(),
+                ..SubmitArgs::default()
+            };
+            let (status, _, data) =
+                body(chat_sse(state(None), args, "r".into()).into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            let text = String::from_utf8(data).unwrap();
+            let events: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .map(str::trim)
+                .collect();
+            assert_eq!(events.last(), Some(&"[DONE]"), "{outputs:?}");
+            let chunks: Vec<Value> = events[..events.len() - 1]
+                .iter()
+                .map(|e| serde_json::from_str(e).unwrap())
+                .collect();
+            let got: Vec<bool> = chunks
+                .iter()
+                .map(|c| c["choices"][0]["delta"].get("role").is_some())
+                .collect();
+            assert_eq!(got, roles, "which deltas carry the role, for {outputs:?}");
+            assert_eq!(
+                chunks.last().unwrap()["choices"][0]["finish_reason"],
+                "stop"
+            );
+            if outputs.first() == Some(&"text") {
+                assert_eq!(
+                    chunks[0]["choices"][0]["delta"],
+                    json!({"role": "assistant", "content": "[mock] hi"})
+                );
+            }
+        }
     }
 
     #[tokio::test]

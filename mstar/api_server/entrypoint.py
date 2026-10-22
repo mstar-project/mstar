@@ -1520,21 +1520,15 @@ def _ws_modalities(value, key: str) -> list[str] | None:
 
 
 def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
-    for ps in file_paths.values():
-        for p in ps:
-            try:
-                Path(p).unlink(missing_ok=True)
-            except OSError:
-                pass
+    if file_paths:
+        media_io.remove_uploads(file_paths, api_server.upload_dir)
 
 
-def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
+def _schedule_upload_cleanup(file_paths: dict[str, list[str]]) -> None:
     """Delete a request's uploaded files once the preprocess worker has had
     time to read them. Shared by the HTTP and WebSocket routes."""
-    def _cleanup(paths: dict[str, list[str]]) -> None:
-        time.sleep(delay_s)
-        _remove_uploads(paths)
-    threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
+    if file_paths:
+        media_io.schedule_upload_cleanup(file_paths, api_server.upload_dir)
 
 
 def _ws_input_layout(

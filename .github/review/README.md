@@ -41,9 +41,10 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 
 1. Add `ANTHROPIC_API_KEY` as an **organization** secret on `mstar-project` (Settings → Secrets and variables → Actions), scoped to this repository. Bill it to a project account rather than a personal one so usage is attributable.
 2. Create a `skip-ai-review` label (applying it to a PR skips the automatic review) and an `ai-review-thorough` label (applying it runs one thorough review).
-3. Nothing else. The workflow is advisory, so it needs no branch-protection change.
+3. Give the bot its own name and logo with the `mstar-review` GitHub App, owned by `mstar-project` and installed on this repository only, with contents read and issues and pull requests write. Add its client ID as the repository variable `REVIEW_APP_CLIENT_ID` and a private key as the secret `REVIEW_APP_PRIVATE_KEY`. This workflow and [`../workflows/pr-labels.yml`](../workflows/pr-labels.yml) post with the app's token, and with the job's own token as `github-actions[bot]` until both are set.
+4. Nothing else. The workflow is advisory, so it needs no branch-protection change.
 
-Until the secret exists the job logs a warning and exits green, so the workflow can land first.
+Until the API key exists the job logs a warning and exits green, so the workflow can land first.
 
 ## Tuning loop
 

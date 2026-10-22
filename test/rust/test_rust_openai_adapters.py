@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import types
 import urllib.error
 import urllib.request
@@ -32,7 +33,7 @@ from test_rust_frontend import (
     _wait_healthy,
 )
 
-from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -105,6 +106,10 @@ def test_each_registry_class_serves_its_python_surfaces_or_lists_them_as_not_por
     """Every route answers non-404 exactly when the Python adapter serves it
     and the surface is ported. A new adapter class, or a new surface on one,
     fails here until it is ported or listed in NOT_PORTED."""
+    _check_routes(cls)
+
+
+def _check_routes(cls: str) -> None:
     adapter = _classes()[cls]
     with _mock_server(cls) as (port, _proc):
         for surface, (path, body) in ROUTES.items():
@@ -183,11 +188,33 @@ def _files(paths: dict[str, list[str]] | None) -> dict[str, list[bytes]]:
     return {m: [Path(p).read_bytes() for p in ps] for m, ps in (paths or {}).items()}
 
 
-CHAT_CLASSES = sorted(c for c, a in _classes().items() if a.supports_chat)
+def _chat_classes() -> list[str]:
+    """The classes whose chat mstar-server ports: those NOT_PORTED lists for
+    chat answer it with the 404 that names them, so they reach no backend."""
+    return sorted(c for c, a in _classes().items()
+                  if a.supports_chat and (c, "chat") not in NOT_PORTED)
+
+
+CHAT_CLASSES = _chat_classes()
 
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
     assert CHAT_CLASSES == ["BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter"]
+
+
+class _UnportedChatAdapter(OpenAIAdapter):
+    supports_chat = True
+
+
+def test_a_chat_class_listed_as_not_ported_passes_the_route_and_chat_checks(monkeypatch):
+    """A model PR can register a chat adapter before mstar-server ports it, as
+    long as NOT_PORTED lists it."""
+    cls = _UnportedChatAdapter.__name__
+    monkeypatch.setitem(ADAPTER_REGISTRY, "unported_chat_model", _UnportedChatAdapter())
+    monkeypatch.setattr(sys.modules[__name__], "NOT_PORTED", NOT_PORTED | {(cls, "chat")})
+    assert cls in _classes()
+    assert cls not in _chat_classes()
+    _check_routes(cls)
 
 
 @pytest.mark.parametrize("fields", [{}, {"max_completion_tokens": 0}], ids=["fields", "zero-max"])

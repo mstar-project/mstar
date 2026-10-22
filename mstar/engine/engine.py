@@ -1536,7 +1536,8 @@ class Engine:
         total_tokens = sum(inp.input_seq_len for inp in inputs)
         leases = {}
         for label, runner in runners.items():
-            if not runner.lease_before_step:
+            # a batch the region refuses runs it eagerly, with no slot
+            if not runner.lease_before_step or not runner.can_lease(inputs):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
