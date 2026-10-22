@@ -39,6 +39,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         super().__init__()
         self.language_model = language_model
         self.config = config
+        self._ended_at_prefill: set[str] = set()
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -140,27 +141,38 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         }
 
     def postprocess(self, request_id, request_info, outputs, **kwargs):
+        # Metadata only: check_stop reads the token values, off the GPU thread.
         if "new_token" not in outputs:
             return
         if request_info.graph_walk == "prefill":
-            # The conductor sees tensor pointers, not token values. Decide
-            # once at prefill whether to publish a decode seed. This read may
-            # synchronize CUDA; decode's hot path remains metadata-only.
-            ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-            is_eos = outputs["new_token"][0].item() == self.config.eos_token_id
-            if request_info.max_tokens > 1 and (ignore_eos or not is_eos):
+            if request_info.max_tokens > 1:
                 outputs["decode_input"] = outputs["new_token"]
-        else:
-            outputs["text_inputs"] = outputs["new_token"]
+            return
+        outputs["text_inputs"] = outputs["new_token"]
+        if request_id in self._ended_at_prefill:
+            # The reply ended on its first token; this step only stops the loop.
+            del outputs["new_token"]
 
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        if request_info.graph_walk != "decode" or "new_token" not in outputs:
+        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        if request_info.graph_walk == "prefill":
+            if (request_info.max_tokens > 1 and not ignore_eos
+                    and outputs["new_token"][0].item() == self.config.eos_token_id):
+                self._ended_at_prefill.add(request_id)
+            return set()
+        if request_id in self._ended_at_prefill:
+            self._ended_at_prefill.discard(request_id)
+            return {"decode_loop"}
+        if "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         # The loop index is zero-based; include the prefill token and the
         # token produced by this decode iteration.
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if (not ignore_eos and token == self.config.eos_token_id) or generated >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
+
+    def cleanup_request(self, request_id: str):
+        self._ended_at_prefill.discard(request_id)
+        super().cleanup_request(request_id)
