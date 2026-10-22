@@ -1425,11 +1425,6 @@ class Worker:
         ]
 
         if not candidates:
-            # Either no request holds pages of the resource that ran out, or
-            # offloading any active request would free none of its pages. This
-            # case is logged apart from a full host pool, which looks identical
-            # to the caller but is fixed by a larger cpu_offload_pages rather
-            # than by scheduling less.
             logger.warning(
                 "No eviction candidate on %s for %s: %d active requests, none "
                 "with pages of it to reclaim now.", node_name,

@@ -122,7 +122,6 @@ def _run(kv: KVManager, rid: str, tokens: list[int]) -> None:
 
 
 def _serve(kv: KVManager, rid: str, tokens: list[int]) -> None:
-    """Run ``rid``'s prompt from whatever the index already holds."""
     _ingest(kv, rid, tokens)
     inputs = ARNodeInputs(input_seq_len=len(tokens))
     prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
@@ -136,14 +135,12 @@ def _serve(kv: KVManager, rid: str, tokens: list[int]) -> None:
 
 
 def _paint(kv: KVManager, pages: list[int], base: float) -> torch.Tensor:
-    """Give every page a distinct value, and return the bytes to check a copy against."""
     for i, page in enumerate(pages):
         kv.kv_cache.tensor[:, page] = base + i
     return kv.kv_cache.tensor[:, pages].clone()
 
 
 def _scribble_free(kv: KVManager) -> None:
-    """Poison every free device page, so nothing can be read back off one."""
     kv.kv_cache.tensor[:, list(kv._arena.allocator.free_pages.queue)] = -99.0
 
 
@@ -395,8 +392,6 @@ def test_a_prefix_copied_back_from_the_host_holds_the_bytes_offloaded():
 
 @requires_cuda
 def test_copies_by_key_do_not_block_the_host():
-    """An offload by key, a reload by key and a copy at a readiness check all
-    queue behind the compute stream. None may wait for it to drain."""
     kv = _manager(cpu_offload_pages=32)
     assert not isinstance(kv._cpu_pool._copier, page_copier.TorchCopier), (
         "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"

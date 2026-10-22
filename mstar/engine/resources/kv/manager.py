@@ -72,7 +72,6 @@ class PageArena:
     freeing clears the seal. Every caller holds the manager's `_lock`, so the
     counts and seals need none of their own.
     """
-    # None for the host pool's arena, since `CPUPagePool` makes the host copies
     kv_cache: KVCache | None
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
@@ -150,7 +149,6 @@ class PrefixChain:
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
-    # pages a copy from the host brought into the index for this stream
     from_host: int = 0
 
     @classmethod
@@ -218,8 +216,7 @@ class CacheStream:
     # stays leased until `plan` copies it. `lease_len` counts the tokens the lease holds.
     lease: list[int] | None = None
     lease_len: int = 0
-    # pages a copy from the host is bringing into the index for this stream's
-    # probe, and the indexed pages before them, held until the copy lands
+    # pages held for this stream's probe until its copy from the host lands
     hold: list[int] | None = None
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
@@ -240,7 +237,6 @@ class CacheStream:
     # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
     # miss (a refused admit prepares the step again) is not counted twice
     prefix_counted: bool = False
-    # the copy from the host that this stream's readiness check is still waiting on
     host_copy: "HostCopy | None" = None
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
@@ -293,17 +289,13 @@ class ClaimedStream:
 class HostCopy:
     """A copy from the host for a readiness check, not yet seen to land.
 
-    A reload's `sync()` orders every later reader of its pages behind the
-    copy, but this copy has no `sync()` after it. So ``pages`` enter the index
-    under ``keys`` only once the copy's event completes, and the record holds a
-    reference on each of them until then.
+    No `sync()` follows this copy, as one follows a reload's, so ``pages`` enter
+    the index under ``keys`` only once ``event`` completes. Until then the record
+    holds a reference on ``pages`` and ``host_pages``.
     """
     event: torch.cuda.Event
     pages: list[int]
     keys: list[bytes]
-    # `parent` is the key the first page goes under, None at the root.
-    # `host_pages` are the host pages the copy reads, retained until it lands.
-    # `stream` is the stream whose probe waits on the copy.
     parent: bytes | None
     host_pages: list[int]
     stream: CacheStream
@@ -486,8 +478,7 @@ class KVManager(AttentionResource):
             needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
-        # Copies from the host in flight, and the copy bringing in each rooted
-        # key. Added only once their event is recorded, since an event that
+        # A copy is added only once its event is recorded, since an event that
         # was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
         self._arriving: dict[bytes, HostCopy] = {}
@@ -1448,15 +1439,12 @@ class KVManager(AttentionResource):
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> str | None:
         """If ``rid``'s prompt continues on the host past what the index holds,
-        copy those host pages back so ``rid``'s probe finds them on the device.
-        Returns the label whose stream waits on a copy.
+        copy those pages back so its probe finds them. Returns the label whose
+        stream waits on the copy.
 
-        The host index is searched once per request: the keys rooted here stay on
-        the chain, so a later call returns early and the probe reuses them. Fresh
-        pages come from the free list only: the request is not admitted yet, so
-        evicting cached pages for it could drop pages a running request hits
-        next. When the free list runs short, fewer pages are copied, or none,
-        and the walk computes the rest.
+        Pages come only from the free list, since ``rid`` isn't admitted yet and
+        evicting for it could drop pages a running request hits next. The walk
+        computes whatever isn't copied.
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
@@ -1472,7 +1460,6 @@ class KVManager(AttentionResource):
             return None
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
-            # a published label is read in, which already takes what this cache holds
             if label is None or label in read_in:
                 return None
             stream = self._ensure_label(rid, label)
@@ -1502,8 +1489,6 @@ class KVManager(AttentionResource):
             run = self._index.pages_for(rooted[:cap])
             at = len(run)
             if at < cap and rooted[at] in self._arriving:
-                # A copy already in flight brings the next page in, so wait for
-                # it rather than copying the page twice.
                 stream.host_copy = self._arriving[rooted[at]]
                 stream.read_pending = True
                 return label
@@ -2576,8 +2561,8 @@ class KVManager(AttentionResource):
             return 0
         released: set[str] = set()
         try:
-            # blocking work OUTSIDE the lock: drain the in-flight reads, hash
-            # the keys, then copy each claimed stream to host
+            # blocking work OUTSIDE the lock: drain the in-flight reads, then
+            # copy each claimed stream to host
             if read_futures:
                 wait(read_futures)
             moved = [
@@ -2600,12 +2585,10 @@ class KVManager(AttentionResource):
     def _offload_stream(
         self, rid: str, claim: ClaimedStream, rooted: list[bytes],
     ) -> bool:
-        """Place one claimed stream on the host and queue its copies. False
-        when the host can't hold it."""
+        """False when the host can't hold ``claim``."""
         with self._lock:
-            # Only the stream's leading pages that the index names are filed by
-            # key. A page that lost the insert race is a private copy, so the
-            # host keeps it with the rest of the stream, not under its key.
+            # A page that lost the insert race is a private copy, so the pages
+            # filed by key stop at it.
             keyed = 0
             for key, page in zip(rooted, claim.pages, strict=False):
                 if self._index.page_for(key) != page:
@@ -2761,9 +2744,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             states = dict(self._cpu_pool.offloaded[rid])
-            # A reload is a hit, so `lookup` marks the pages recently used.
-            # They are retained before anything is evicted, so the eviction
-            # can't drop them.
+            # a reload is a hit, so `lookup` marks the pages recently used
             runs = {
                 label: self._index.lookup(state.keys) if self._index is not None else []
                 for label, state in states.items()
@@ -2794,8 +2775,9 @@ class KVManager(AttentionResource):
         # The streams stay marked offloaded while the copies are queued outside
         # the lock, so nothing extends or claims their pages.
         self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
-        # Orders every later reader and writer of the pages behind the copies,
-        # so the keyed ones copied from the host can be indexed at once.
+        # sync outside the lock: orders the reload H2D copies before attention
+        # reads them, but the pages are already assigned so it touches no
+        # shared state
         self._cpu_pool.sync()
         with self._lock:
             for label, state in states.items():
@@ -2809,21 +2791,20 @@ class KVManager(AttentionResource):
         return True
 
     def _add_host_copy(self, copy: HostCopy) -> None:
-        """Under the lock, once ``copy``'s event is recorded."""
         self._arena.retain(copy.pages)
         self._host_copies.append(copy)
         for key in copy.keys:
             self._arriving.setdefault(key, copy)
 
     def _land_host_copies(self) -> None:
-        """Under the lock: for every copy from the host whose event is done, index its pages and drop the
-        references the copy held."""
+        """Under the lock: index the pages of each copy from the host that has landed,
+        and drop that copy's references."""
         pending = []
         for copy in self._host_copies:
             if not copy.event.query():
                 pending.append(copy)
                 continue
-            # The pages go under their parent by key, and only while that parent is indexed.
+            # the parent may have left the index while the copy was in flight
             parent = None if copy.parent is None else self._index.page_for(copy.parent)
             linked = 0
             if copy.parent is None or parent is not None:
@@ -2843,13 +2824,11 @@ class KVManager(AttentionResource):
         self._host_copies = pending
 
     def reclaimable(self, rid: str) -> int:
-        """The device pages ``rid`` holds, or 0 when offloading it would make
-        none of them reusable. An upper bound on what `offload` returns. 0
-        once offloaded, and for one admitted but not yet run."""
+        """The device pages ``rid`` holds, or 0 when offloading it would free none
+        of them, when it is offloaded already, or when it is admitted but hasn't run."""
         with self._lock:
             streams = self._streams.get(rid, {})
             for stream in streams.values():
-                # the newest pages are the likeliest to be the request's own
                 if any(self._reusable(page) for page in reversed(stream.page_indices)):
                     return sum(len(stream.page_indices) for stream in streams.values())
             return 0

@@ -4,9 +4,8 @@ When device pages run out, a cold request's pages move here, into pinned host
 memory, freeing device pages for the requests that are actually running. They
 move back when it is scheduled again.
 
-A page the prefix index names is filed here under the same key, in a host index
-of its own, so a prefix that several requests share is stored and copied once.
-The rest of a stream's pages belong to its request alone.
+Pages the prefix index names are filed here under the same keys, so a prefix
+that several requests share is stored once.
 
 The pool stores pages and the stream metadata that has to survive the round
 trip; which request to evict, and when, is the worker's decision.
@@ -35,8 +34,7 @@ _EXHAUSTED_LOG_INTERVAL = 5.0
 @dataclass
 class OffloadedStream:
     """One (request, label) stream living on the host."""
-    # Every host page of the stream, in order. The first len(keys) are filed
-    # under those keys in the host index, and this stream retains them.
+    # the first len(keys) pages are filed under ``keys`` in the host index
     cpu_page_indices: list[int]
     stored_len: int
     position: int
@@ -46,7 +44,6 @@ class OffloadedStream:
 
 
 class PageCopies(NamedTuple):
-    """Device page ``gpu[i]`` copied to or from host page ``cpu[i]``."""
     gpu: list[int]
     cpu: list[int]
 
@@ -55,7 +52,7 @@ class CPUPagePool:
     """Host mirror of the paged KV cache, holding whatever is offloaded.
 
     ``arena`` and ``index`` take no lock of their own, so every call that
-    changes them holds the manager's lock. The copies run without it.
+    changes them holds the manager's lock.
     """
 
     def __init__(
@@ -69,7 +66,7 @@ class CPUPagePool:
         self.index = PrefixIndex(arena)
 
         # same layout as the device cache, on pinned memory so the copies can
-        # be async. Left unfilled: a host page is read only after a copy writes it.
+        # be async
         self.cpu_kv_cache = torch.empty(
             config.num_layers,
             arena.allocator.max_num_pages,
@@ -100,7 +97,6 @@ class CPUPagePool:
         return bool(self.offloaded.get(rid))
 
     def retain_run(self, keys: list[bytes]) -> list[int]:
-        """The host pages ``keys`` name from the root, each retained for the caller to release."""
         pages = self.index.lookup(keys)
         self.arena.retain(pages)
         return pages
@@ -116,11 +112,7 @@ class CPUPagePool:
         released: int = 0,
         protected_prefix: int = 0,
     ) -> PageCopies | None:
-        """File a stream here and return the copies its offload has to queue.
-        The leading pages that ``keys`` name are copied only where the host
-        index lacks the key. None when the host can't hold the stream even by
-        evicting cached pages.
-        """
+        """None when the host can't hold the stream even after evicting cached pages."""
         # retained before evicting, so the eviction passes over them
         found = self.retain_run(keys)
         n_pages = len(gpu_page_indices) - len(found)
@@ -143,7 +135,7 @@ class CPUPagePool:
         return PageCopies(gpu=gpu_page_indices[len(found):], cpu=cpu_pages)
 
     def insert_keys(self, rid: str, label: str) -> None:
-        """Name a placed stream's keyed pages in the host index, once their copies are queued."""
+        """Call this only after the placed stream's copies are queued."""
         state = self.offloaded[rid][label]
         self.index.insert_run(state.keys, state.cpu_page_indices[:len(state.keys)], None)
 
@@ -164,8 +156,6 @@ class CPUPagePool:
         self._refused_unlogged = 0
 
     def count_dropped(self, keys: list[bytes]) -> None:
-        """Count the ``keys`` the device index just dropped that have no copy on
-        the host. The total is logged at most every few seconds, as refusals are."""
         dropped = sum(self.index.page_for(key) is None for key in keys)
         if not dropped:
             return
@@ -209,7 +199,7 @@ class CPUPagePool:
         return state
 
     def discard(self, rid: str, label: str) -> None:
-        """Drop a stream that was placed here but never committed to.
+        """Drop a stream that was copied here but never committed to.
 
         The offload aborted after the copy, so the device pages stay live and
         these host pages go back to the pool.

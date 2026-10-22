@@ -203,8 +203,6 @@ def test_remove_request_returns_every_page() -> None:
 
 
 class _FakePool(CPUPagePool):
-    """The real host pool minus pinned memory and copies (those need a device)."""
-
     def __init__(self, max_cpu_pages: int = 64):
         self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
         self.index = PrefixIndex(self.arena)

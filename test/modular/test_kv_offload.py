@@ -151,7 +151,7 @@ def _assert_pages_conserved(mgr: KVManager) -> None:
 
 
 def _hook_host_copy(mgr: KVManager, hook):
-    """Run ``hook`` on another thread from inside the first stream's host copy.
+    """Run ``hook`` on another thread from inside a host copy.
 
     The manager lock is not held there, so this reproduces exactly what the
     plan thread can do mid-offload. Joining with a timeout means a regression
