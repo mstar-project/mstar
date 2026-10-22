@@ -43,11 +43,11 @@ from mstar.model.glm52.components.moe import (  # noqa: E402
     Glm52SparseMoeBlock,
 )
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
-from mstar.model.glm52.quantization import dequantize_fp8_block_weight  # noqa: E402
 from mstar.model.glm52.weight_loader import (  # noqa: E402
     load_glm52_hf_weights,
     restore_fp32_params,
 )
+from mstar.utils.fp8_block import dequantize_fp8_block_weight  # noqa: E402
 
 BLOCK = (16, 16)
 

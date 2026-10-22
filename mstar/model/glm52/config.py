@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from mstar.model.glm52.quantization import Fp8BlockQuantConfig
+from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
 # the attention resource planned over it, the token positions over it, the

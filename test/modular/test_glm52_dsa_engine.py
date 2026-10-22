@@ -48,9 +48,9 @@ from mstar.model.glm52.dsa import (  # noqa: E402
     Glm52DsaRequestSpan,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Glm52DsaKStore

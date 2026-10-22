@@ -423,3 +423,14 @@ def load_generation_defaults(
     if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
         out[stage + "temperature"] = 0.0
     return out
+
+
+def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
+    """Finalize kernel layouts across a freshly loaded module tree: any submodule exposing
+    ``process_weights_after_loading(device)`` gets it called (the attention layers build
+    their absorbed w_kc/w_vc here).
+    """
+    for module in root.modules():
+        hook = getattr(module, "process_weights_after_loading", None)
+        if callable(hook):
+            hook(device)

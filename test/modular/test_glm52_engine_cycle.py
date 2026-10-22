@@ -44,9 +44,9 @@ from mstar.model.glm52.config import (  # noqa: E402
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
-from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
 def _cfg(mla_absorb: bool) -> Glm52ModelConfig:

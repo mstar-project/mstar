@@ -137,8 +137,8 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     from mstar.model.glm52._testing import build_cpu_resources
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.config import SAMPLER_RESOURCE
-    from mstar.model.glm52.quantization import process_weights_after_loading
     from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.utils import process_weights_after_loading
 
     _cpu_flashinfer(monkeypatch)
     cfg = Glm52ModelConfig.reduced()

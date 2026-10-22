@@ -5,7 +5,7 @@ import torch
 
 from mstar.engine.resources.base import AttentionResource, Resource
 from mstar.engine.resources.runner import StepRunner
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
 
 def fake_quantize_fp8_block(

@@ -479,8 +479,8 @@ class Glm52Model(Model):
         self._maybe_apply_checkpoint_quant_config(source)
 
         from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
-        from mstar.model.glm52.quantization import process_weights_after_loading
         from mstar.model.glm52.submodules import Glm52LLMSubmodule
+        from mstar.model.utils import process_weights_after_loading
 
         with torch.device("meta"):
             language_model = Glm52ForCausalLM(self.config, comm_group=tp_group)
@@ -531,7 +531,7 @@ class Glm52Model(Model):
         return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        from mstar.model.glm52.quantization import Fp8BlockQuantConfig
+        from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
         if self.config.quantization_config is not None:
             return

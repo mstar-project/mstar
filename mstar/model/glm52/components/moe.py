@@ -18,7 +18,7 @@ from mstar.model.components.moe import (
     dispatch_experts_fused,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
 logger = logging.getLogger(__name__)
 
