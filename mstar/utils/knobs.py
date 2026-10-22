@@ -17,6 +17,7 @@ KNOBS: dict[str, str] = {
     "kv_chain_lazy_steps": "MSTAR_KV_CHAIN_LAZY_STEPS",
     "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
+    "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -135,3 +136,15 @@ def kv_pinned_indptrs() -> bool:
     cost is one CUDA event per plan, which a buffer set waits on before it is
     rewritten."""
     return _setting("kv_pinned_indptrs", "0") == "1"
+
+
+def gc_gen0_threshold() -> int:
+    """``gc_gen0_threshold`` / ``MSTAR_GC_GEN0_THRESHOLD`` (default 0, keep
+    CPython's 700): the generation-0 threshold a worker sets after warmup.
+    A decode step at 128 rows keeps more than 700 young container objects
+    alive at its peak, so at 700 a collection runs almost every step and
+    escalates to a full one (about 10 ms) every few hundred; the time lands
+    in whichever span is allocating. 50000 removed them on Qwen3.5 0.8B at
+    c=128 (8% shorter decode step) for at most that many young objects held
+    between collections."""
+    return max(0, int(_setting("gc_gen0_threshold", "0")))
