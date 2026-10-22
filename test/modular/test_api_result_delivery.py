@@ -329,10 +329,32 @@ def test_a_finish_from_another_thread_wakes_collect_results_at_once():
     assert "r7" not in server.pending_requests
 
 
-def test_collect_results_still_releases_a_request_whose_client_left():
+def _feed_tokens(server, req, rid, every=0.02, until=3.0):
+    """The message thread's per-token path: a chunk and a ``notify_many`` every
+    ``every`` s, until the request leaves ``pending_requests`` (or ``until``)."""
+    from mstar.api_server.entrypoint import notify_many
+
+    def run():
+        end = time.time() + until
+        while time.time() < end and rid in server.pending_requests:
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id=rid, modality="text", data=b"t"))
+            notify_many([req])
+            time.sleep(every)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_releases_a_request_whose_client_left(generating):
+    """Also while the request keeps producing tokens: a wake per token must
+    not keep the handler from asking whether the client left."""
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
-    _register(server, "r8", _pending_request(streaming=False))
+    req = _pending_request(streaming=False)
+    _register(server, "r8", req)
+    if generating:
+        _feed_tokens(server, req, "r8")
 
     start = time.perf_counter()
     assert asyncio.run(server.collect_results("r8", _Client(gone=True))) == []
@@ -341,17 +363,42 @@ def test_collect_results_still_releases_a_request_whose_client_left():
     assert "r8" not in server.pending_requests
 
 
-def test_collect_results_still_times_out():
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_times_out(generating):
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     server.timeout_seconds = 0.3
-    _register(server, "r9", _pending_request(streaming=False))
+    req = _pending_request(streaming=False)
+    _register(server, "r9", req)
+    if generating:
+        _feed_tokens(server, req, "r9")
 
+    start = time.perf_counter()
     with pytest.raises(HTTPException) as e:
         asyncio.run(server.collect_results("r9", _Client()))
+    assert time.perf_counter() - start < 1.5
     assert e.value.status_code == 500
     assert pw.aborted == ["r9"]
     assert "r9" not in server.pending_requests
+
+
+def test_tokens_do_not_wake_a_handler_waiting_for_the_finish():
+    """``collect_results`` reads no chunk before the finish, so a chunk's
+    notification leaves its wake alone; the finish sets it."""
+    from mstar.api_server.entrypoint import notify_many
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    req = _pending_request(streaming=False)
+    req.loop, req.wake, req.wake_on_finish = _Loop(), asyncio.Event(), True
+    notify_many([req])
+    req.notify()
+    assert not req.wake.is_set()
+    req.event.set()
+    notify_many([req])
+    assert req.wake.is_set()
 
 
 def test_notify_many_wakes_every_handler_with_one_loop_call():
