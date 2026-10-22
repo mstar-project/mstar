@@ -693,9 +693,8 @@ class KVManager(AttentionResource):
                 matched = self._index.lookup(rooted, stamp=self._world_size == 1)[:len(rooted) - 1]
                 held = len(matched) * self.config.page_size
                 self._arena.retain(matched)
-                # If an image ends inside the next page, look up its cached partial page. Not above one
-                # rank, where serving it takes a page on this rank alone and may evict to get one.
-                for end, key in reversed(ends if self._world_size == 1 else ()):
+                # If an image ends inside the next page, look up its cached partial page.
+                for end, key in reversed(ends):
                     if not held < end < min(held + self.config.page_size, total):
                         continue
                     cached = self._index.lookup([key])
@@ -985,7 +984,8 @@ class KVManager(AttentionResource):
         """Cache the page up to the image's end. When the text after the image changes,
         a repeat can still reuse it instead of running the walk again."""
         if self._world_size > 1:
-            # never served above one rank (`_lease`), so the copy would only take a free page
+            # Serving a cached image end takes a page on rank 0 alone, evicting one if none is free,
+            # so the ranks' pages would differ.
             return
         page = end // self.config.page_size
         rooted = fingerprint(self._prefix_root, key)

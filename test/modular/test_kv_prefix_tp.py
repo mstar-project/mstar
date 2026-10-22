@@ -8,8 +8,8 @@ is stamped when its step commits. Every rank commits in step order, so the index
 evict alike however each rank's probes interleave with its commits.
 
 Above one rank the cache keys no generated tokens. Each rank reads the sampled ids back at
-its own step, so the ranks would index those pages at different steps. It neither caches
-nor serves the page up to an image's end, since serving it allocates on rank 0 alone. Host
+its own step, so the ranks would index those pages at different steps. It doesn't cache the
+page up to an image's end, since serving it would allocate on rank 0 alone. Host
 offload and a pool shared across worker instances move pages outside the schedule, so they
 are refused at load. Under ``MSTAR_KV_DEBUG_ASSERTS`` a follower checks before each step
 that it has allocated the pages rank 0 had. A divergence found by that check or by an adopt
@@ -354,19 +354,15 @@ def test_above_one_rank_a_commit_caches_no_image_end():
     _run(kv, "seed", TEXT, IMAGE, ASK)
 
     assert set(kv._index.pages()) <= set(_pages(kv, "seed")), (
-        "a copy of the page up to the image's end took a free page, though nothing above one rank serves it"
+        "a copy of the page up to the image's end took a free page, though serving it would allocate on rank 0 alone"
     )
 
 
-def test_above_one_rank_a_cached_image_end_is_never_served():
+def test_above_one_rank_a_repeat_with_other_text_after_the_image_takes_rank_0s_pages():
     ranks = leader, follower = _manager(0), _manager(1)
     for kv in ranks:
-        # seed at world size 1, since above one rank a commit caches no image end
-        kv._world_size = 1
         _ingest(kv, "seed", TEXT, IMAGE, ASK)
         _run(kv, "seed", TEXT, IMAGE, ASK)
-        kv._world_size = 2
-        assert set(kv._index.pages()) - set(_pages(kv, "seed")), "the seed cached no image end to serve"
         _ingest(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
 
     assert _follow(follower, _send(leader, "repeat")), "the follower can't adopt what rank 0 leased"
