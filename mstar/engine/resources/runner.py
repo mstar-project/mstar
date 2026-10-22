@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
+from contextlib import nullcontext
 from time import perf_counter
 from typing import Any
 
@@ -56,6 +57,26 @@ def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
     return tuple(order)
 
 
+_NO_SCOPE = nullcontext()
+
+
+class _ComputeScope:
+    """``StepRunner.compute_scope`` over the resources that track compute."""
+
+    __slots__ = ("_resources",)
+
+    def __init__(self, resources: list[Resource]):
+        self._resources = resources
+
+    def __enter__(self):
+        for resource in self._resources:
+            resource.enter_compute()
+
+    def __exit__(self, *exc):
+        for resource in reversed(self._resources):
+            resource.exit_compute()
+
+
 class StepRunner:
     """drives resources through per-step cycle"""
 
@@ -94,6 +115,13 @@ class StepRunner:
             if type(self._resources[key]).admit_retrieve
             is not Resource.admit_retrieve
         ]
+        # resources that track the planned step's compute (`compute_scope`), and the
+        # share of them each step's resource set holds
+        self._compute_order = [
+            key for key in self._order
+            if type(self._resources[key]).enter_compute is not Resource.enter_compute
+        ]
+        self._compute_keys_cache: dict[frozenset[str], list[str]] = {}
         # Both sweeps run on behalf of one node and have no step to filter by,
         # so settle each node's share of them up front. `node_resources` must
         # name every node, including one that owns nothing — an absent node
@@ -470,6 +498,21 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
         return results
+
+    def compute_scope(self, step: SubmoduleStep | None):
+        """A context manager around a planned step's ``preprocess`` and forward: the
+        resources that track it (``Resource.enter_compute``) know model code is
+        addressing this step. A shared no-op when the step has none of them, so a node
+        without one pays a dict lookup at most."""
+        if step is None or not self._compute_order:
+            return _NO_SCOPE
+        keyset = frozenset(step.keys())
+        keys = self._compute_keys_cache.get(keyset)
+        if keys is None:
+            keys = self._compute_keys_cache[keyset] = [k for k in self._compute_order if k in keyset]
+        if not keys:
+            return _NO_SCOPE
+        return _ComputeScope([self._resources[k] for k in keys])
 
     def pre_admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """admit over the pre-planning subset, a step ahead

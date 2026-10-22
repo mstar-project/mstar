@@ -295,6 +295,29 @@ class JointGroups:
         tensor = self.tp_group.broadcast(tensor, tp_src)
         return self.sp_group.broadcast(tensor, sp_src)
 
+    def all_agree(self, flag: bool) -> bool:
+        """AND ``flag`` across the TP x SP block. Collective: every rank of the
+        block calls it at the same point.
+
+        Over the gloo twins, so the answer costs no device sync. On XPU
+        ``cpu_group`` is the xccl group itself (no gloo twin), which takes
+        only device tensors; there the flag goes through the device, which
+        syncs, so callers keep this out of the steady state."""
+        for group in (self.tp_group, self.sp_group):
+            if group.world_size > 1:
+                t = torch.tensor([int(flag)], device=_collective_device(group.cpu_group))
+                dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group.cpu_group)
+                flag = bool(t.item())
+        return bool(flag)
+
+
+def _collective_device(group) -> torch.device:
+    """Where a tensor reduced over ``group`` lives: the CPU for gloo, else the
+    current accelerator."""
+    if dist.get_backend(group) == dist.Backend.GLOO:
+        return torch.device("cpu")
+    accelerator = torch.accelerator.current_accelerator()
+    return torch.device(accelerator.type, torch.accelerator.current_device_index())
 
 
 @dataclass
