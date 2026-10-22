@@ -565,10 +565,10 @@ Compilation
      - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
        show ``hit config.recompile_limit``.
    * - ``TORCHINDUCTOR_CACHE_DIR``
-     - ``~/.cache/mstar/torchinductor``
+     - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
      - torch's own variable; M* sets this default when importing
        :mod:`mstar.engine` (``_default_compile_cache``), so compiled kernels
-       survive a restart that keeps ``~/.cache``. An exported value wins, and a
+       survive a restart that keeps the cache directory. An exported value wins, and a
        home that can't be written keeps torch's ``/tmp/torchinductor_<user>``.
        Point it at an empty directory to measure a cold start. See
        :ref:`serving:Restarts and the compile cache`.

@@ -416,7 +416,8 @@ its GEMMs, and FlashInfer JIT-builds its kernels. Both cache the results, and a 
 finds them skips that work. Qwen3.5-0.8B on one H200 took about 22 minutes to start with
 empty caches and about 1.5 minutes with warm ones.
 
-To keep that across restarts, persist ``~/.cache``, which holds all of it:
+To keep that across restarts, persist ``~/.cache`` (``$XDG_CACHE_HOME`` if you set it), which
+holds all of it:
 
 - ``~/.cache/mstar/torchinductor``: Inductor's compiled graphs, autotune picks and Triton
   kernels (M* sets ``TORCHINDUCTOR_CACHE_DIR`` to it unless you export one)
