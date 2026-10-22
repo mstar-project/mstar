@@ -1,4 +1,5 @@
-"""DSA indexer: skip formula, selection semantics, sparse == dense, load."""
+"""DSA indexer: skip formula, selection semantics (the indexer's queries scored by the DSA
+resource's ``index_topk``), sparse == dense, load."""
 import sys
 import types
 from pathlib import Path
@@ -28,6 +29,7 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from test_glm52_moe import BLOCK, _fabricate_checkpoint  # noqa: E402
 
+from mstar.engine.resources.dsa.manager import index_topk, select_topk_causal  # noqa: E402
 from mstar.model.glm52.components.attention import (  # noqa: E402
     Glm52MLAAttention,
     masked_reference_attention,
@@ -36,7 +38,6 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E40
 from mstar.model.glm52.components.indexer import (  # noqa: E402
     Glm52Indexer,
     is_full_indexer_layer,
-    select_topk_causal,
 )
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
@@ -103,6 +104,13 @@ def _randomize_indexer(idx):
     idx.k_norm.bias.data.normal_(0, 0.02)
 
 
+def _select(idx, q_c, hidden_states, positions, keys, topk):
+    """The serving path's pick: the indexer's queries and head weights, scored over ``keys`` by
+    the DSA resource."""
+    q, w = idx.compute_query(q_c, hidden_states, positions)
+    return index_topk(q, w, keys, positions, topk)
+
+
 def test_selection_window_includes_self_and_pads_with_minus_one():
     idx, cfg = _build_indexer(seed=0)
     t = 7  # rows 0..3 have prefix <= topk=4; rows 4..6 exceed it
@@ -110,7 +118,7 @@ def test_selection_window_includes_self_and_pads_with_minus_one():
     q_c = torch.randn(t, cfg.q_lora_rank) * 0.1
     pos = torch.arange(t)
 
-    sel = idx.compute_selection(q_c, h, pos, idx.compute_k(h, pos))
+    sel = _select(idx, q_c, h, pos, idx.compute_k(h, pos), cfg.index_topk)
 
     assert sel.shape == (t, cfg.index_topk) and sel.dtype == torch.int32
     for i in range(t):
@@ -201,7 +209,7 @@ def test_sparse_forward_matches_dense_bitwise_within_topk():
 
     q_c = attn.q_a_layernorm(attn.q_a_proj(h))  # the shared q latent
     k_hist = attn.indexer.compute_k(h, pos)
-    sel = attn.indexer.compute_selection(q_c, h, pos, k_hist)
+    sel = _select(attn.indexer, q_c, h, pos, k_hist, cfg.index_topk)
     assert (sel == -1).any()  # early rows really are padded
 
     dense = attn(h, pos)
@@ -270,9 +278,9 @@ def test_load_indexer_flag_off_skips_indexer_keys():
 
 
 # -- batched selection == the original per-token loop ------------------------
-# Verbatim copy of the loop compute_selection ran before it went batched
+# Verbatim copy of the loop the indexer's selection ran before it went batched
 # (one topk launch + one host sync per token); kept here as the reference.
-def _reference_compute_selection(idx, q_c, hidden_states, positions, k_history):
+def _reference_compute_selection(idx, q_c, hidden_states, positions, k_history, topk):
     num_tokens = q_c.shape[0]
     num_keys = k_history.shape[0]
     if num_keys <= int(positions.max()):
@@ -295,7 +303,7 @@ def _reference_compute_selection(idx, q_c, hidden_states, positions, k_history):
     scores = scores.masked_fill(
         key_pos.unsqueeze(0) > positions.unsqueeze(1), float("-inf"))
 
-    return _reference_select_topk_causal(scores, positions, idx.topk), scores
+    return _reference_select_topk_causal(scores, positions, topk), scores
 
 
 def _reference_select_topk_causal(scores, positions, topk):
@@ -350,8 +358,8 @@ def test_batched_selection_matches_the_original_loop(num_tokens, topk, start):
     q_c = torch.randn(num_tokens, cfg.q_lora_rank) * 0.1
     pos = pos_all[start:]
 
-    ref, scores = _reference_compute_selection(idx, q_c, h, pos, k_hist)
-    new = idx.compute_selection(q_c, h, pos, k_hist)
+    ref, scores = _reference_compute_selection(idx, q_c, h, pos, k_hist, topk)
+    new = _select(idx, q_c, h, pos, k_hist, topk)
 
     _assert_same_topk(new, ref, scores)
     # the per-head relu yields exact-zero scores, so real inputs DO tie; on
@@ -429,5 +437,5 @@ def test_bf16_selection_scores_in_fp32(autocast):
         assert ref_scores[t].bfloat16().unique().numel() < num_keys // 2
 
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        sel = idx.compute_selection(q_c, h, pos, k_hist)
+        sel = _select(idx, q_c, h, pos, k_hist, cfg.index_topk)
     assert torch.equal(sel.sort(dim=1).values, ref.sort(dim=1).values)
