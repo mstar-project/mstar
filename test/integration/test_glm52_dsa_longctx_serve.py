@@ -17,13 +17,13 @@ from mstar.engine.resources import (
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
-    INDEX_KV_RESOURCE,
     KV_RESOURCE,
     Glm52ModelConfig,
 )
@@ -43,9 +43,8 @@ PROMPT_LEN = 6
 MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 # 8-token pages, 16 of them (one is the sink page): 120 cached tokens for a
 # 20-token context, and the torch fallback's page table spans every page. The
-# index-key store gets the same geometry.
-KV_YAML = {"resources": {key: {"max_num_pages": 16, "page_size": 8}
-                         for key in (KV_RESOURCE, INDEX_KV_RESOURCE)}}
+# index keys sit on the same pages.
+KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 16, "page_size": 8}}}
 
 
 def _fill_layer(layer, cfg):
@@ -150,10 +149,7 @@ class _Serve:
         self.submodule = submodule
         self.rid = rid
         specs = model.get_node_resources()
-        # the flag-off arm declares no index-key cache
-        declared = {spec.resource_key for spec in specs}
-        apply_yaml_overrides(specs, {"resources": {
-            key: block for key, block in KV_YAML["resources"].items() if key in declared}})
+        apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         transfer = TransferEngineInfo(
@@ -254,12 +250,21 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
             if stop:
                 stopped = True
                 break
-        stored = tuple(serve.resources[key].stored_len(serve.rid)
-                       for key in (KV_RESOURCE, INDEX_KV_RESOURCE))
+        stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
         assert dsa.ctx is None  # each forward closed the context it opened on the resource
     finally:
         serve.close()
     return generated, stopped, stored
+
+
+def _stored_rows(kv, rid):
+    """The request's stored latent rows, and how many of them have their index keys (the first
+    index plane's rows at the same slots)."""
+    n = kv.stored_len(rid)
+    pos = torch.arange(n)
+    pages = torch.tensor(kv._streams[rid]["main"].page_indices)[pos // kv.config.page_size]
+    keys = kv.aux_view(INDEX_PLANES, 0)[pages.to(DEVICE), (pos % kv.config.page_size).to(DEVICE)]
+    return n, int((keys != 0).any(-1).sum())
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
@@ -303,9 +308,8 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert specs[KV_RESOURCE].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
     assert specs[KV_RESOURCE].config.kv_lora_rank == cfg.kv_lora_rank
     assert specs[ATTN_RESOURCE].config.backend is AttnBackend.FLASHINFER_MLA
-    # the index keys: one index_head_dim latent per token per FULL layer
-    assert specs[INDEX_KV_RESOURCE].config.layout == KVLayout.MLA
-    assert specs[INDEX_KV_RESOURCE].config.kv_lora_rank == cfg.index_head_dim
+    # the index keys on the latents' pages: one index_head_dim row per token per FULL layer
+    assert specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES].width == cfg.index_head_dim
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
@@ -315,7 +319,7 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    # the index-key store holds a row per token, as the latent cache does
+    # every stored token has its index keys, at its latent's slot
     # (prefill 6 + one per decode forward)
     assert stored == (PROMPT_LEN + MAX_TOKENS - 1,) * 2  # 6 prompt rows + 13 decode forwards
 

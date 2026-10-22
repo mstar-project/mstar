@@ -29,7 +29,7 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from test_glm52_moe import BLOCK, _fabricate_checkpoint  # noqa: E402
 
-from mstar.engine.resources.dsa.topk import index_topk, select_topk_causal  # noqa: E402
+from mstar.model.glm52._testing import index_topk, select_topk_causal  # noqa: E402
 from mstar.model.glm52.components.attention import (  # noqa: E402
     Glm52MLAAttention,
     masked_reference_attention,
