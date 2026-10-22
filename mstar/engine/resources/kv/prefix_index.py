@@ -10,6 +10,7 @@ is pushed back under the page's own.
 Every caller holds the manager's lock, so none of this takes one of its own.
 """
 
+import copy
 import heapq
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -126,6 +127,18 @@ class PrefixIndex:
             self._evictable.add(parent)
             parent = self._parent[parent]
 
+    def assert_evictable(self) -> None:
+        """Check that `evict`, run on a copy of the index and the owner counts, frees every page
+        in the evictable set."""
+        index = copy.copy(self)
+        for name in ("_by_key", "_key", "_parent", "_children", "_stamp", "_leaves", "_evictable"):
+            setattr(index, name, copy.copy(getattr(self, name)))
+        index._arena = _Owners(self._arena.num_owners)
+        freed = index.evict(len(self._evictable))
+        assert freed == len(self._evictable), (
+            f"eviction reaches {freed} of the {len(self._evictable)} pages the evictable set counts"
+        )
+
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
         return list(self._by_key.values())
@@ -179,3 +192,14 @@ class PrefixIndex:
             self._children[parent] -= 1
             if self._children[parent] == 0 and self._key[parent] is not None:
                 heapq.heappush(self._leaves, (self._stamp[parent], parent))
+
+
+class _Owners:
+    """A copy of the arena's owner counts, which `evict` on a copied index releases."""
+
+    def __init__(self, num_owners: list[int]) -> None:
+        self.num_owners = list(num_owners)
+
+    def release(self, pages: list[int]) -> None:
+        for page in pages:
+            self.num_owners[page] -= 1
