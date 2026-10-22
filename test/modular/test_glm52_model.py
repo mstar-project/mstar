@@ -51,7 +51,6 @@ from mstar.model.glm52.config import (  # noqa: E402
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.glm52.dsa import Glm52DsaKStore  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.utils.h2d import PinnedStager  # noqa: E402
@@ -333,7 +332,6 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     # check_stop / preprocess only read self.config; skip nn.Module init.
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._dsa_k_store = Glm52DsaKStore()
     sub._index_stager = PinnedStager(torch.long)
     sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     return sub
@@ -443,7 +441,6 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
     assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
-    assert out["dsa_ctx"] is None
 
 
 def test_glm52_preprocess_positions_continue_from_the_stream_position():
@@ -503,7 +500,7 @@ def _indexer_params(model):
 
 
 def test_indexer_exists_only_on_the_dsa_path():
-    """Flag-off no forward ever hands a layer a dsa_ctx, so a FULL layer's
+    """Flag-off the model declares no DSA resource, so a FULL layer's
     indexer would be replicated (not TP-sharded) dead weight — ~370 MB per
     rank on the full model. Flag-on FULL layers carry it, SHARED ones never."""
     off = Glm52ForCausalLM(Glm52ModelConfig.reduced())
@@ -523,18 +520,6 @@ def test_indexer_exists_only_on_the_dsa_path():
     cfg.num_hidden_layers = 4  # MTP position lands FULL
     cfg.mtp_num_draft_tokens = 2
     assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
-
-
-def test_flag_off_layer_refuses_a_dsa_ctx():
-    from mstar.model.glm52.components.attention import Glm52MLAAttention
-    from mstar.model.glm52.dsa import Glm52DsaForwardContext
-
-    cfg = Glm52ModelConfig.reduced()
-    cfg.mla_absorb = True
-    attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
-    ctx = Glm52DsaForwardContext(spans=[], k_store=Glm52DsaKStore(), needs_selection=True)
-    with pytest.raises(RuntimeError, match="dsa_long_context"):
-        attn(torch.randn(1, cfg.hidden_size), torch.tensor([0]), dsa_ctx=ctx)
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():

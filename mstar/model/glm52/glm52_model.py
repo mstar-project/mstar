@@ -12,6 +12,8 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    DSAConfig,
+    DSASpec,
     KVLayout,
     KVSpec,
     NodeResourceSpec,
@@ -27,6 +29,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -244,7 +247,7 @@ class Glm52Model(Model):
                 resource_key=ATTN_RESOURCE, nodes=nodes,
                 config=AttentionConfig(kv_cache=KV_RESOURCE),
             )
-        return [
+        specs = [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
             # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
@@ -258,6 +261,13 @@ class Glm52Model(Model):
                 vocab_size=self.config.vocab_size,
             ),
         ]
+        if self.config.dsa_long_context:
+            # past index_topk each query attends its indexer's top index_topk latents
+            specs.append(DSASpec(
+                resource_key=DSA_RESOURCE, nodes=nodes,
+                config=DSAConfig(kv_cache=KV_RESOURCE, topk=self.config.index_topk),
+            ))
+        return specs
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions

@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
+    DSAStep,
     KVStep,
     PositionStep,
     SamplerStep,
@@ -31,15 +32,11 @@ from mstar.engine.resources import (
 )
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
-)
-from mstar.model.glm52.dsa import (
-    Glm52DsaForwardContext,
-    Glm52DsaKStore,
-    Glm52DsaRequestSpan,
 )
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -81,10 +78,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step drafts k tokens, verifies them with the last emitted token and
         # seeds the next step, all in one captured graph; the eager fallback stays uncompiled
         self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
-        # DSA indexer k-cache (dsa.py): per-request index keys, appended by
-        # FULL layers each forward when dsa_long_context is on; evicted in
-        # cleanup_request.
-        self._dsa_k_store = Glm52DsaKStore()
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -126,7 +119,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
 
     def cleanup_request(self, request_id: str):
-        self._dsa_k_store.evict(request_id)
         self._mtp_emitted.pop(request_id, None)
         self._mtp_checked.pop(request_id, None)
         self._mtp_max_tokens.pop(request_id, None)
@@ -201,6 +193,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         else:
             steps[SAMPLER_RESOURCE] = SamplerStep(
                 apply_penalty=True, prefill_tracked_tokens=prefill_tokens)
+        if self.config.dsa_long_context:
+            steps[DSA_RESOURCE] = DSAStep()
         return SubmoduleStep(
             segments=[
                 Segment(rid, _MAIN, inp.input_seq_len)
@@ -297,7 +291,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         if self.config.dsa_long_context:
-            # DSA maintenance is host-side per-request work; a captured
+            # the DSA resource selects per request on the host; a captured
             # decode would skip index upkeep. Eager-only.
             return []
         if self._moe_capture_blocked(tp_world_size):
@@ -435,12 +429,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if rid in self._mtp_max_tokens:
             self._mtp_max_tokens[rid] = min(self._mtp_max_tokens[rid], budget)
 
-    @staticmethod
-    def _page_tables(engine_inputs: ModelInputsFromEngine) -> list[list[int]]:
-        """Each request's KV pages, in request order, from this step's plan."""
-        views = engine_inputs.step.ctx.plan_results[KV_RESOURCE][_MAIN].views
-        return [list(view.page_idxs) for view in views]
-
     def preprocess(
         self,
         graph_walk: str,
@@ -459,11 +447,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         limit = self._context_limit()
         topk = self.config.index_topk
         pos_ids_list: list[int] = []
-        spans: list[Glm52DsaRequestSpan] = []
-        needs_selection = False
-        q_start = 0
-        page_tables = self._page_tables(engine_inputs) if long_context else None
-        for i, (rid, sl) in enumerate(zip(request_ids, seq_lens, strict=True)):
+        for rid, sl in zip(request_ids, seq_lens, strict=True):
             start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
                 raise RuntimeError(
@@ -481,20 +465,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 # Under MTP every step writes a whole block, that one included.
                 room = limit - (start + sl) - (2 * self.mtp_block if self.mtp_k else 0)
                 self._clamp_token_budget(engine_inputs, rid, room)
-            if long_context:
-                if start + sl > topk:
-                    if sl > 1:
-                        raise RuntimeError(
-                            f"request {rid}: prefill context {start + sl} exceeds "
-                            f"index_topk={topk}; sparse attention beyond topk is "
-                            "decode-only."
-                        )
-                    needs_selection = True
-                spans.append(Glm52DsaRequestSpan(
-                    request_id=rid, q_start=q_start, q_len=sl,
-                    ctx_start=start, page_indices=page_tables[i],
-                ))
-                q_start += sl
+            if long_context and start + sl > topk and sl > 1:
+                raise RuntimeError(
+                    f"request {rid}: prefill context {start + sl} exceeds "
+                    f"index_topk={topk}; sparse attention beyond topk is "
+                    "decode-only."
+                )
             pos_ids_list.extend(range(start, start + sl))
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
         # drains the stream before the step even starts): positions; on prefill each
@@ -513,9 +489,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
-        out["dsa_ctx"] = Glm52DsaForwardContext(
-            spans=spans, k_store=self._dsa_k_store, needs_selection=needs_selection,
-        ) if long_context else None
         return out
 
     def _mtp_pair_rows(self, normed: torch.Tensor, prenorm: torch.Tensor) -> torch.Tensor:
@@ -529,12 +502,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
         rows: torch.Tensor | None = None,
         with_prenorm: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.language_model.model(
-            input_ids, position_ids, dsa_ctx=dsa_ctx, rows=rows, return_prenorm=with_prenorm)
+            input_ids, position_ids, rows=rows, return_prenorm=with_prenorm)
 
     @torch.compiler.disable
     def _last_row_index(
@@ -571,7 +543,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        hidden = self._hidden(input_ids, position_ids, kwargs.get("dsa_ctx"))
+        hidden = self._hidden(input_ids, position_ids)
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -595,7 +567,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         rows = None
         if graph_walk == "prefill" and self.config.prefill_last_layer_rows:
             rows = self._last_row_index(engine_inputs, kwargs)
-        hidden = self._hidden(input_ids, position_ids, kwargs.get("dsa_ctx"), rows=rows)
+        hidden = self._hidden(input_ids, position_ids, rows=rows)
         if graph_walk == "prefill" and rows is None:
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
         logits = self.lm_head(hidden)  # (bs, vocab)
