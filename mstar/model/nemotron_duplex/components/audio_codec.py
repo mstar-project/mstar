@@ -23,11 +23,13 @@ channel-dim LayerNorm with eps 1e-6.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from mstar.engine.resources.recurrent import RecurrentBlockConfig
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
 from mstar.model.nemotron_duplex.components.dft import irfft_dim1
 from mstar.model.nemotron_duplex.config import CodecConfig
@@ -54,9 +56,12 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv1 = nn.Conv1d(dim, expand * dim, kernel_size=1)
         self.pwconv2 = nn.Conv1d(expand * dim, dim, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, tail: torch.Tensor | None = None) -> torch.Tensor:
+        """``tail``, for a stream, is the block's previous ``kernel - 1`` inputs
+        ``[B, C, kernel - 1]``; without one the block pads with zeros, as at the
+        stream's start."""
         residual = x
-        x = F.pad(x, [self.kernel - 1, 0])  # causal left pad
+        x = F.pad(x, [self.kernel - 1, 0]) if tail is None else torch.cat([tail.to(x.dtype), x], dim=-1)
         x = self.dwconv(x)
         # Channel-dim LayerNorm: normalize over C (== nn.LayerNorm over the
         # transposed last dim), eps 1e-6, biased variance.
@@ -84,11 +89,23 @@ class _CodecHalf(nn.Module):
         super().__init__()
         self.layers, self._meta = _build_stack(spec, kernel)
 
-    def run(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the conv/block stack to a ``[B, C, T]`` tensor."""
+    def run(self, x: torch.Tensor, tails: list[torch.Tensor] | None = None) -> torch.Tensor:
+        """Apply the conv/block stack to a ``[B, C, T]`` tensor.
+
+        For a stream, ``tails`` holds each block's previous ``kernel - 1`` inputs,
+        in order, and the run replaces them with its own last ones. The resample
+        convs have kernel == stride, so the blocks hold all the state."""
+        block = 0
         for layer, (kind, stride, transpose) in zip(self.layers, self._meta, strict=True):
             if kind == "block":
-                x = layer(x)
+                if tails is None:
+                    x = layer(x)
+                    continue
+                tail, keep = tails[block], tails[block].shape[-1]
+                tails[block] = x[..., -keep:] if x.shape[-1] >= keep else (
+                    torch.cat([tail.to(x.dtype), x], dim=-1)[..., -keep:])
+                x = layer(x, tail)
+                block += 1
             elif transpose:
                 x = F.conv_transpose1d(x, layer.weight, stride=stride)
             else:
@@ -219,6 +236,74 @@ def check_window_envelope(window: torch.Tensor, hop_length: int) -> None:
                              "its inverse STFT cannot normalize")
 
 
+class CodecStreamState(NamedTuple):
+    """What a decode stream carries from one step to the next."""
+
+    # each ConvNeXt block's last ``kernel - 1`` inputs ``[B, C, kernel - 1]``, in decoder order
+    tails: list[torch.Tensor]
+    # ``[B, 2, n_fft - hop]`` float32: the overlap-added signal and squared window
+    # of the samples past the last final one, which the next frames still add to
+    overlap: torch.Tensor
+
+
+class CodecStreamAudio(NamedTuple):
+    """One decode step's samples, float32. ``end_before`` / ``end_after`` are the
+    stream's last ``stream_edge`` samples had it ended before / after this step's
+    frames: the full decode normalizes its right edge by the partial window sum."""
+
+    final: torch.Tensor        # [B, frames * wav_to_token_ratio]
+    end_before: torch.Tensor   # [B, stream_edge]
+    end_after: torch.Tensor    # [B, stream_edge]
+
+
+def codec_state_blocks(config: CodecConfig, dtype: torch.dtype | None = None) -> dict[str, RecurrentBlockConfig]:
+    """A decode stream's state as recurrent-pool blocks: per decoder stage, its
+    blocks' conv tails ``(num_blocks, channels, kernel - 1)`` (by default in the
+    engine's compute dtype, which the blocks compute in), and the inverse STFT's
+    overlap (``CodecStreamState.overlap``, float32)."""
+    blocks = {
+        f"stage{i}": RecurrentBlockConfig(shape=(config.num_blocks, ch, config.kernel_size - 1), dtype=dtype)
+        for i, ch in enumerate(reversed(config.channels))
+    }
+    blocks["overlap"] = RecurrentBlockConfig(shape=(2, config.n_fft - config.hop_length), dtype=torch.float32)
+    return blocks
+
+
+def _overlap_add_stream(
+    spec: torch.Tensor, overlap: torch.Tensor, n_fft: int, hop_length: int,
+) -> tuple[CodecStreamAudio, torch.Tensor]:
+    """``_spec_to_wav`` (window == n_fft, value range constrained, by matmul) for
+    a stream: ``spec``'s frames overlap-add onto the carried ``overlap``. The
+    samples no later frame reaches are final; the next ``n_fft - hop`` become
+    the new overlap."""
+    with torch.autocast(device_type=spec.device.type, enabled=False):
+        frames, held = spec.size(-1), n_fft - hop_length
+        size = frames * hop_length + held
+        window = torch.hann_window(n_fft, device=spec.device).unsqueeze(-1)
+        ifft = irfft_dim1(spec, n_fft)
+        ifft = torch.where(ifft >= 0, torch.minimum(ifft, window), torch.maximum(ifft, -window)) * window
+
+        def fold(x: torch.Tensor) -> torch.Tensor:
+            return F.fold(x, output_size=(1, size), kernel_size=(1, n_fft), stride=(1, hop_length))
+
+        carried = F.pad(overlap, (0, size - held))
+        sig = fold(ifft)[:, 0, 0] + carried[:, 0]
+        env = fold(window.square().expand(-1, frames)).reshape(1, size) + carried[:, 1]
+        out = _normalize(sig, env)
+        done, edge = frames * hop_length, held // 2
+        audio = CodecStreamAudio(
+            final=out[:, :done], end_before=_normalize(overlap[:, 0, :edge], overlap[:, 1, :edge]),
+            end_after=out[:, done:done + edge],
+        )
+        return audio, torch.stack([sig[:, done:], env[:, done:]], dim=1)
+
+
+def _normalize(sig: torch.Tensor, env: torch.Tensor) -> torch.Tensor:
+    """The overlap-added signal over its squared-window sum, 0 where that is ~0
+    (as ``_spec_to_wav``; a fresh stream's empty overlap)."""
+    return torch.where(env > _ENVELOPE_FLOOR, sig / env, torch.zeros_like(sig))
+
+
 class AudioCodec(nn.Module):
     def __init__(self, config: CodecConfig | None = None):
         super().__init__()
@@ -233,6 +318,11 @@ class AudioCodec(nn.Module):
         self.max_magnitude = cfg.max_magnitude
         # on the host: the model builds the codec under torch.device("meta")
         check_window_envelope(torch.hann_window(cfg.n_fft, device="cpu"), cfg.hop_length)
+        if (cfg.n_fft - cfg.hop_length) % 2:
+            # the stream trims half the overlap at each end, as the full decode does
+            raise ValueError(
+                f"the codec's stream needs an even overlap; n_fft {cfg.n_fft} - hop {cfg.hop_length} is odd"
+            )
 
     # ---- autoencoder halves -------------------------------------------------
     def ae_encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -247,8 +337,16 @@ class AudioCodec(nn.Module):
     def ae_decode(self, x: torch.Tensor, constrain_value_range: bool = True, by_matmul: bool = False) -> torch.Tensor:
         """Continuous latents ``[B, T', latent]`` -> waveform ``[B, 1, T]``; ``by_matmul``
         as ``_spec_to_wav`` takes it."""
-        x = x.transpose(-1, -2)
-        x = self.decoder.run(x)
+        spec = self._spectrum(self.decoder.run(x.transpose(-1, -2)))
+        with torch.autocast(device_type=spec.device.type, enabled=False):
+            return _spec_to_wav(
+                spec, self.n_fft, self.hop_length, self.n_fft, constrain_value_range=constrain_value_range,
+                by_matmul=by_matmul,
+            ).unsqueeze(1)
+
+    def _spectrum(self, x: torch.Tensor) -> torch.Tensor:
+        """The decoder stack's output ``[B, 2 * bins, frames]`` (log-magnitude,
+        phase) -> the complex one-sided spectrum ``[B, bins, frames]``, float32."""
         with torch.autocast(device_type=x.device.type, enabled=False):
             mag, ph = x.float().chunk(2, dim=1)
             mag = self.max_magnitude * torch.exp(-F.softplus(-mag + math.log(self.max_magnitude)))
@@ -259,13 +357,29 @@ class AudioCodec(nn.Module):
 
             spec_real = mag_mid * ph_mid
             spec_imag = mag_mid * ph_imag
-            spec = torch.cat([mag_dc * ph_dc, spec_real + 1j * spec_imag, mag_nyquist * ph_nyquist], 1)
+            return torch.cat([mag_dc * ph_dc, spec_real + 1j * spec_imag, mag_nyquist * ph_nyquist], 1)
 
-            x = _spec_to_wav(
-                spec, self.n_fft, self.hop_length, self.n_fft, constrain_value_range=constrain_value_range,
-                by_matmul=by_matmul,
-            ).unsqueeze(1)
-        return x
+    # ---- streaming decode ---------------------------------------------------
+    @property
+    def stream_edge(self) -> int:
+        """Samples the full decode trims off each end of its overlap-add: a
+        stream's first frame emits that many fewer, and its end that many more."""
+        return (self.n_fft - self.hop_length) // 2
+
+    def decode_stream(self, code: torch.Tensor, state: CodecStreamState) -> tuple[CodecStreamAudio, CodecStreamState]:
+        """Decode a stream's next code frames ``[B, T, num_quantizers]`` given its
+        ``state`` (zeros for a stream's first frames, which is the causal zero
+        padding of the full decode): the samples these frames make final, and
+        the state after them. Over a stream, ``audio.final`` (less
+        ``stream_edge`` samples at the first frame) followed by the last step's
+        ``audio.end_after`` is the full decode of all its frames.
+
+        Every step is the same fixed-shape work, so a CUDA graph captures it; the
+        inverse DFT is a matmul (see ``dft``)."""
+        tails = list(state.tails)
+        spec = self._spectrum(self.decoder.run(self.dequantize(code).transpose(-1, -2), tails))
+        audio, overlap = _overlap_add_stream(spec, state.overlap, self.n_fft, self.hop_length)
+        return audio, CodecStreamState(tails=tails, overlap=overlap)
 
     # ---- quantizer wrappers -------------------------------------------------
     def quantize(self, z: torch.Tensor) -> torch.Tensor:

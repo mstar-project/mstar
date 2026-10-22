@@ -1,8 +1,8 @@
 # NVIDIA NemotronLabs VoiceChat-11B — single-GPU full-duplex layout.
 #
-# All four stages (conformer_encoder, nano_llm, eartts_talker, audio_codec)
-# run on rank 0: the encoder + LLM decode loop, the talker loop, and the codec
-# all share one worker/GPU thread. This is the simplest working deployment and
+# All three nodes (conformer_encoder, nano_llm, eartts_talker, which decodes
+# its codes to PCM in the same step) run on rank 0: the encoder + LLM decode
+# loop and the talker loop share one worker/GPU thread. This is the simplest working deployment and
 # produces the same text + audio as the disaggregated layout
 # (configs/nemotron_duplex_disagg.yaml), which instead puts each
 # stream-consuming loop on its own GPU thread for pipeline parallelism.
@@ -10,9 +10,9 @@ model: "nemotron_duplex"
 max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 
 # Sessions at once; the overflow queues. Each session holds a slot in
-# resources mamba_state, encoder_state, encoder_front and encoder_kv and its
-# pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to raise
-# the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
+# resources mamba_state, encoder_state, encoder_front, codec_state and encoder_kv
+# and its pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to
+# raise the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
 # sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
 # The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
@@ -47,6 +47,5 @@ node_groups:
   - node_names:
       - conformer_encoder
       - eartts_talker
-      - audio_codec
     ranks:
       - 0

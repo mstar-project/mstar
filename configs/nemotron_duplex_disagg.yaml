@@ -1,23 +1,24 @@
 # NVIDIA NemotronLabs VoiceChat-11B — disaggregated duplex layout.
 #
 # Each streaming consumer runs on its own GPU / worker thread so the
-# frame-synchronous decode loop, the talker loop, and the codec run in a
-# pipeline instead of serializing on one GPU thread. The colocated single-GPU
-# layout (configs/nemotron_duplex.yaml) also works and produces identical
-# output; this layout trades GPUs for pipeline parallelism / throughput.
+# frame-synchronous decode loop and the talker loop run in a pipeline instead
+# of serializing on one GPU thread. The colocated single-GPU layout
+# (configs/nemotron_duplex.yaml) also works and produces identical output; this
+# layout trades GPUs for pipeline parallelism / throughput.
 # Encoder + LLM share rank 0: encoder steps (one per chunk of the user's audio,
-# all live calls batched) interleave with the LLM's frame steps.
+# all live calls batched) interleave with the LLM's frame steps. The talker
+# decodes its codes to PCM in its own step (a few GFLOP per frame), so the
+# codec needs no GPU of its own.
 #
 #   rank 0: conformer_encoder (Encoder) + nano_llm (LLM)
-#   rank 1: eartts_talker     (Talker)
-#   rank 2: audio_codec       (Codec)
+#   rank 1: eartts_talker     (Talker, with the codec)
 model: "nemotron_duplex"
 max_seq_len: 12288
 
 # Sessions at once; the overflow queues. Each session holds a slot in
-# resources mamba_state, encoder_state, encoder_front and encoder_kv and its
-# pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to raise
-# the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
+# resources mamba_state, encoder_state, encoder_front, codec_state and encoder_kv
+# and its pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to
+# raise the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
 # sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
 # The server refuses to start with a cap one of them cannot hold.
 max_concurrent_requests: 32
@@ -54,8 +55,3 @@ node_groups:
       - eartts_talker
     ranks:
       - 1
-
-  - node_names:
-      - audio_codec
-    ranks:
-      - 2

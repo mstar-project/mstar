@@ -1,16 +1,17 @@
 """NemotronDuplexModel — NVIDIA NemotronLabs VoiceChat-11B in M*.
 
-A full-duplex speech-to-speech model with four nodes:
+A full-duplex speech-to-speech model with three nodes:
 
     conformer_encoder — 16 kHz speech → per-frame LLM embeds (+ RNN-T transcript)
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
                         resources nano_kv / nano_attn (4 attention layers),
                         mamba_state / mamba (27 Mamba-2 layers), nano_sampler
-    eartts_talker     — Gemma3 talker → 31-codebook RVQ codes; resources
+    eartts_talker     — Gemma3 talker → 31-codebook RVQ codes, decoded in the
+                        same step by the RVQ codec → 22.05 kHz PCM; resources
                         talker_kv / talker_attn / talker_pos (two KV labels per
                         session: the text-conditioned and the null-conditioned
-                        stream of classifier-free guidance)
-    audio_codec       — RVQ codes → 22.05 kHz PCM
+                        stream of classifier-free guidance), codec_state (each
+                        call's codec stream state)
 
 Full-duplex: the model consumes user speech continuously and emits agent text +
 agent speech as it generates, frame-synchronously in one backbone, so it handles
@@ -27,16 +28,17 @@ INFERENCE PATHS (all live, verified vs the NeMo reference):
       matches the offline text path and vocalizes with CFG + noise sampling.
     * ``realtime_api`` — OpenAI Realtime-API WebSocket server over ``DuplexStream``.
 
-The M* serving path is the walk graphs below: four async partitions
-(Encoder → LLM → Talker → Codec) joined by ``StreamingGraphEdge``s, with the nano
+The M* serving path is the walk graphs below: three async partitions
+(Encoder → LLM → Talker) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws``; a
 one-shot upload is a stream of one chunk. ``get_node_resources`` declares
 the encoder's bounded KV (each call's attention window) and two recurrent-state
 pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
 conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
-KV cache, attention and positions. Both decode steps are CUDA graphs, and so are
-the encoder's live step and the codec's steady-state decode (piecewise).
+KV cache, attention, positions and codec stream state. Both decode steps are
+CUDA graphs (the talker's with its codec decode), and so is the encoder's live
+step (piecewise).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -74,6 +76,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
+from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.components.conformer import (
     encoder_kv_config,
     encoder_state_blocks,
@@ -81,6 +84,7 @@ from mstar.model.nemotron_duplex.components.conformer import (
 )
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
+    CODEC_STATE,
     ENCODER_FRONT,
     ENCODER_KV,
     ENCODER_STATE,
@@ -197,7 +201,7 @@ class DuplexStream:
         self.perception = model.get_submodule("conformer_encoder", device=device).perception
         self.nano = model.get_submodule("nano_llm", device=device).language_model
         self.talker = model.get_submodule("eartts_talker", device=device).talker
-        self.codec = model.get_submodule("audio_codec", device=device).codec
+        self.codec = model.get_submodule("eartts_talker", device=device).codec
 
         # talker char-vocab conditioning maps (built once)
         tok = model._talker_tokenizer()
@@ -367,8 +371,7 @@ class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
-                 max_session_s: float | None = None, max_prompt_tokens: int | None = None,
-                 **kwargs):
+                 max_session_s: float | None = None, max_prompt_tokens: int | None = None, **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
@@ -418,15 +421,18 @@ class NemotronDuplexModel(Model):
     # and RoPE runs over the full head dim with a per-layer theta the layer
     # passes at call time. conformer_encoder: a bounded KV, each call's
     # attention window, and two recurrent-state pools, its conv tails and its
-    # front end's audio / mel tails (one slot per session each). The codec
-    # declares nothing.
+    # front end's audio / mel tails (one slot per session each). The talker also
+    # holds each call's codec stream state in a recurrent-state pool, codec_state
+    # (one slot per session).
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front / encoder_kv; pages in
-    # nano_kv and talker_kv). A deployment raising it raises all six (see
-    # validate_config_yaml). 32 is the most that keep up with real time on one
-    # H100: a tick takes ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
+    # Nemotron-H, and in encoder_state / encoder_front / codec_state / encoder_kv;
+    # pages in nano_kv and talker_kv). A deployment raising it raises all seven
+    # (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
+    # time on one H100 (a tick takes ~62 ms at 32, and 40+ miss the 80 ms budget).
+    # Live calls paced over /generate/ws cost more per tick: 16 keep up on one
+    # H200, and 32 sit at the edge (all finish, but audio can fall behind).
     DEFAULT_SESSIONS = 32           # padding rows take no slot (#258)
     # Longest session served (``model_kwargs: {max_session_s: ...}``). The
     # talker KV pool is sized so DEFAULT_SESSIONS sessions this long fit at
@@ -478,8 +484,9 @@ class NemotronDuplexModel(Model):
         """Refuse a session cap that a per-session resource cannot hold.
 
         A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``), in ``encoder_kv``, and its nano and
-        talker pages from its first step to its last, so a session past any of them waits on admit until
+        ``encoder_state``, ``encoder_front``, ``codec_state``) and in
+        ``encoder_kv``, and its nano and talker pages from its first step to its
+        last, so a session past any of them waits on admit until
         another ends, and its frames with it. So ``max_concurrent_requests``
         sessions must fit each; the conductor queues the rest.
         """
@@ -589,6 +596,13 @@ class NemotronDuplexModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
+            RecurrentStateSpec(
+                resource_key=CODEC_STATE, nodes={"eartts_talker"},
+                config=RecurrentStateConfig(
+                    num_layers=1, blocks=codec_state_blocks(self.config.codec),
+                    max_slots=self.DEFAULT_SESSIONS + 1,
+                ),
+            ),
             KVSpec(
                 resource_key=TALKER_KV, nodes={"eartts_talker"},
                 config=PagedKVConfig(
@@ -637,12 +651,11 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        """Full-duplex S2S pipeline as four async partitions (frame-synchronous):
+        """Full-duplex S2S pipeline as three async partitions (frame-synchronous):
 
             client  --[audio_in,    FixedChunk(1)]--> Encoder
             Encoder --[audio_frame, FixedChunk(1)]--> LLM
-            LLM     --[new_token,   FixedChunk(1)]--> Talker
-            Talker  --[codec_tokens, LeftContext ]--> Codec
+            LLM     --[new_token,   FixedChunk(1)]--> Talker --[audio_chunk]--> client
 
         The LLM (nano) is a frame-driven decode loop: each iteration fuses one
         streamed audio frame with the fed-back previous agent-text/function tokens
@@ -693,7 +706,9 @@ class NemotronDuplexModel(Model):
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
-        # Talker: each streamed agent token -> RVQ codes, streamed to the codec.
+        # Talker: each streamed agent token -> RVQ codes -> that frame's PCM, to
+        # the client. The codec decodes in the talker's step (no stream hop, no
+        # step of its own), against each call's stream state in codec_state.
         # No speculative scheduling here. The talker keeps the previous frame's
         # codes in per-request state written by postprocess, so a step built
         # while the previous one is still running would read the wrong frame.
@@ -704,20 +719,12 @@ class NemotronDuplexModel(Model):
                 input_names=["new_token"],
                 consumes_stream=True,
                 enable_async_scheduling=False,
-                outputs=[StreamingGraphEdge(next_node="audio_codec", name="codec_tokens",
-                                            target_partition="Codec")],
+                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
-        # Codec: code window -> 22.05 kHz PCM chunk -> client.
-        codec_chunk = GraphNode(
-            name="audio_codec",
-            input_names=["codec_tokens"],
-            consumes_stream=True,
-            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
-        )
-        return dict(encode=encode, decode=decode, talker_decode=talker_decode, codec_chunk=codec_chunk)
+        return dict(encode=encode, decode=decode, talker_decode=talker_decode)
 
     def get_partitions(self) -> list[PartitionDefinition]:
         return [
@@ -733,15 +740,10 @@ class NemotronDuplexModel(Model):
                 name="Talker", graph_walks={"talker_decode"}, initial_walk="talker_decode",
                 producer_partitions=["LLM"],
             ),
-            PartitionDefinition(
-                name="Codec", graph_walks={"codec_chunk"}, initial_walk="codec_chunk",
-                producer_partitions=["Talker"],
-            ),
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        eartts = self.config.eartts
-        return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
+        return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
             # the user's audio, one item per uploaded file or append, at most a
             # session's samples: past them the talker KV and the decode loops run out
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
@@ -763,13 +765,6 @@ class NemotronDuplexModel(Model):
             # whose talker outlives the thinker and self-stops on codec EOS).
             Connection(from_partition="LLM", to_partition="Talker", edge_name="new_token",
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=False)),
-            # Non-overlapping chunks of NEW codec frames; the codec keeps its
-            # own left-context (AudioCodecDecoderSubmodule), so the stream must
-            # NOT re-deliver overlap (a LeftContextChunkPolicy here re-emits the
-            # overlap every chunk and balloons the audio, and is anyway
-            # ill-defined when chunk < left_context).
-            Connection(from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=eartts.codec_chunk_frames)),
         ])
 
     # -------------------------------------------------------------------
@@ -887,7 +882,7 @@ class NemotronDuplexModel(Model):
 
     # -------------------------------------------------------------------
     # Forward-pass-args state machines — one per async partition
-    # (Encoder -> LLM -> Talker -> Codec), mirroring qwen3_omni.
+    # (Encoder -> LLM -> Talker), mirroring qwen3_omni.
     # -------------------------------------------------------------------
 
     @staticmethod
@@ -933,10 +928,9 @@ class NemotronDuplexModel(Model):
                 inputs=edges, unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
                 step_metadata={"prompt_pending": has_prompt},
             )
-        if partition_name in ("Talker", "Codec"):
-            walk = "talker_decode" if partition_name == "Talker" else "codec_chunk"
+        if partition_name == "Talker":
             return ForwardPassArgs(
-                full_metadata=self._meta(input_modalities, output_modalities, walk, False),
+                full_metadata=self._meta(input_modalities, output_modalities, "talker_decode", False),
                 inputs=[], unpersist_tensors=[], request_done=False,
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
@@ -950,7 +944,7 @@ class NemotronDuplexModel(Model):
     ) -> ForwardPassArgs:
         m = partition_metadata
 
-        # All four partitions are stream-terminated: each ends when its node
+        # All three partitions are stream-terminated: each ends when its node
         # consumes the final chunk of its upstream stream, which the worker
         # reports and the conductor turns into the partition's request_done
         # (and producer_done for the next partition). Nothing here guesses the
@@ -971,7 +965,7 @@ class NemotronDuplexModel(Model):
                 request_done=False, step_metadata={"prompt_pending": False},
             )
 
-        if partition_name in ("Encoder", "Talker", "Codec"):  # self-triggered by the upstream stream
+        if partition_name in ("Encoder", "Talker"):  # self-triggered by the upstream stream
             return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=False)
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -983,8 +977,8 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
 
     def prepare_streaming(self, device: str = "cuda"):
-        """Warm (build + load) all four submodules so streaming starts promptly."""
-        for node in ("conformer_encoder", "nano_llm", "eartts_talker", "audio_codec"):
+        """Warm (build + load) all three submodules so streaming starts promptly."""
+        for node in ("conformer_encoder", "nano_llm", "eartts_talker"):
             self.get_submodule(node, device=device)
 
     def encode_prompt(self, system_prompt: str, device: str = "cuda") -> torch.Tensor | None:
@@ -1157,7 +1151,7 @@ class NemotronDuplexModel(Model):
         """Talker (autoregressive RVQ codes with char-vocab text conditioning) ->
         codec (waveform)."""
         talker = self.get_submodule("eartts_talker", device=device).talker
-        codec = self.get_submodule("audio_codec", device=device).codec
+        codec = self.get_submodule("eartts_talker", device=device).codec
         text_stream = gen_text[:, prompt_len:]                 # (1, T') agent text per frame
 
         gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
@@ -1225,8 +1219,6 @@ class NemotronDuplexModel(Model):
             return self._create_conformer_submodule(device, autocast_dtype=autocast_dtype)
         if node_name == "eartts_talker":
             return self._create_talker_submodule(device, autocast_dtype=autocast_dtype)
-        if node_name == "audio_codec":
-            return self._create_codec_submodule(device, autocast_dtype=autocast_dtype)
         return None
 
     def _json_config(self, local_dir: str) -> NemotronDuplexConfig:
@@ -1305,6 +1297,7 @@ class NemotronDuplexModel(Model):
     def _create_talker_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule:
+        from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
         from mstar.model.nemotron_duplex.components.eartts_talker import EarTTSTalker
         from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 
@@ -1312,26 +1305,16 @@ class NemotronDuplexModel(Model):
         cfg = self._json_config(local_dir)
         with torch.device("meta"):
             talker = EarTTSTalker(cfg.eartts)
+            codec = AudioCodec(cfg.codec)
         talker = self._build_and_load(talker, device, autocast_dtype, local_dir)
+        # the codec decodes in the talker's step, in the engine's dtype like the
+        # talker (it turns autocast off itself)
+        codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
         from mstar.model.nemotron_duplex.components.eartts_talker import build_char_vocab, subword_to_char_ids
         tok = self._talker_tokenizer()
         cv = build_char_vocab(tok)
         s2c, _ = subword_to_char_ids(tok, cv)
         # checkpoint config, so the talker samples with its inference_* knobs
         return EarTTSTalkerSubmodule(
-            talker=talker, config=cfg, subword_to_char=s2c, char_pad_idx=len(cv),
+            talker=talker, config=cfg, codec=codec, subword_to_char=s2c, char_pad_idx=len(cv),
         )
-
-    def _create_codec_submodule(
-        self, device: str, autocast_dtype: torch.dtype | None = None,
-    ) -> NodeSubmodule:
-        from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
-        from mstar.model.nemotron_duplex.submodules import AudioCodecDecoderSubmodule
-
-        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
-        cfg = self._json_config(local_dir)
-        with torch.device("meta"):
-            codec = AudioCodec(cfg.codec)
-        codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
-        # the checkpoint's config, as the talker's: the codec decodes the codes it emits
-        return AudioCodecDecoderSubmodule(codec=codec, config=cfg)
