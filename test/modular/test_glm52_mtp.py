@@ -37,6 +37,7 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from mstar.engine.resources import (  # noqa: E402
     AttentionStep,
+    DSAStep,
     KVStep,
     Segment,
     StepContext,
@@ -51,6 +52,7 @@ from mstar.model.glm52.components.mtp import (  # noqa: E402
 )
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
 )
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
@@ -214,10 +216,10 @@ def test_mtp_module_has_no_embedding_or_head():
 
 
 def _plane_step(runner, rid, span, k=0):
-    step = SubmoduleStep(
-        segments=[Segment(rid, "main", span)],
-        steps={KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)},
-    )
+    steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)}
+    if DSA_RESOURCE in runner.resources:  # dsa_long_context: the layers select through it
+        steps[DSA_RESOURCE] = DSAStep()
+    step = SubmoduleStep(segments=[Segment(rid, "main", span)], steps=steps)
     step.set_ctx(StepContext(request_ids=(rid,), graph_walk="decode", slot=0, capture=False))
     assert runner.admit(step).ok
     runner.plan(step)

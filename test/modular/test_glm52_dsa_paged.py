@@ -24,15 +24,19 @@ def _cpu_flashinfer() -> types.ModuleType:
 
 
 from mstar.engine.resources import StepContext  # noqa: E402
+from mstar.engine.resources.dsa import paged, sparse_mla  # noqa: E402
+from mstar.engine.resources.dsa.paged import PagedContext  # noqa: E402
+from mstar.engine.resources.dsa.topk import index_topk  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources, build_random_model  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.indexer import full_indexer_layers  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     INDEX_KV_RESOURCE,
+    KV_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 
@@ -95,9 +99,12 @@ def test_paged_resources_and_step():
     # the KV manager shards every KV config by the TP size; any size the attention heads take
     index.shard(cfg.num_attention_heads)
     assert index.num_kv_heads == 1 and index.latent_dim == cfg.index_head_dim
+    # the DSA resource selects over the index keys and attends over the latent cache
+    assert specs[DSA_RESOURCE].depends_on() == {KV_RESOURCE, INDEX_KV_RESOURCE}
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.zeros(3, dtype=torch.long), input_seq_len=3)
-    assert INDEX_KV_RESOURCE in sub.declare_step("prefill", ["r0"], [ar]).steps
+    steps = sub.declare_step("prefill", ["r0"], [ar]).steps
+    assert INDEX_KV_RESOURCE in steps and DSA_RESOURCE in steps
 
 
 def _positions(slots, table, page_size):
@@ -108,7 +115,7 @@ def _positions(slots, table, page_size):
 
 def _masked_reference(cache, table, page_size, n_keys, picked, query, scale, rank):
     """Dense MQA over a request's first ``n_keys`` cached latents with every position outside
-    ``picked`` masked; shares no code with dsa_paged or sparse_mla."""
+    ``picked`` masked; shares no code with dsa/paged.py or sparse_mla."""
     pos = torch.arange(n_keys)
     flat = cache[table[pos // page_size].long(), pos % page_size].float()
     mask = torch.full((n_keys,), float("-inf"))
@@ -119,29 +126,31 @@ def _masked_reference(cache, table, page_size, n_keys, picked, query, scale, ran
 
 def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     """Every decode step past index_topk: a FULL layer's latents are the reference indexer's
-    top index_topk positions over the stored keys (Glm52Indexer.compute_selection), and every
+    top index_topk positions over the stored keys (its queries scored by index_topk), and every
     layer's attention is a dense softmax over the cache masked to them."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     update, attend = Glm52MLAAttention._dsa_update, Glm52MLAAttention._attend_selected
     selected, attended = [], []
 
-    def checked_update(self, ctx, hidden, q_c, position_ids):
-        selection = update(self, ctx, hidden, q_c, position_ids)
+    def checked_update(self, hidden, q_c, position_ids):
+        selection = update(self, hidden, q_c, position_ids)
         if self.indexer is not None and selection is not None:
+            ctx = self._dsa.ctx  # the forward's, open on the DSA resource
             n, page = ctx.host_lens[0], ctx.page_size
             pos = torch.arange(n)
             store = self._kv_index.layer_view(self.index_layer_idx)
             keys = store[ctx.index_table[0][pos // page].long(), pos % page]
-            want = self.indexer.compute_selection(q_c, hidden, position_ids, keys)[0]
+            q, w = self.indexer.compute_query(q_c, hidden, position_ids)
+            want = index_topk(q, w, keys, position_ids, ctx.topk)[0]
             got = _positions(selection[0, :ctx.topk], ctx.kv_table[0], page)
             assert sorted(got) == sorted(want.tolist()), (self.layer_idx, n)
             selected.append(n)
         return selection
 
-    def checked_attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_ctx=None, dsa_selection=None):
-        ctx = dsa_ctx
-        out = attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_ctx=ctx)
+    def checked_attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
+        ctx = self._dsa.ctx
+        out = attend(self, slots, q_nope, q_pe, kv_c, k_pe)
         n, page = ctx.host_lens[0], ctx.page_size
         picked = _positions(slots[0, :ctx.topk], ctx.kv_table[0], page)
         assert len(picked) == ctx.topk < n  # a strict subset of the keys the row sees
@@ -161,7 +170,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", checked_attend)
     decode = torch.tensor([7, 1, 8, 3, 6, 4])
     _, driver = _serve(sub, cfg, torch.tensor([5, 9, 2]), decode)
-    assert isinstance(driver.last_ctx, Glm52DsaPagedContext)
+    assert isinstance(driver.last_ctx, PagedContext)
     assert driver.resources[INDEX_KV_RESOURCE].stored_len("r0") == 3 + len(decode)
     # contexts 5..9 select: the FULL layer picks, the FULL and the SHARED layer attend
     assert selected == [5, 6, 7, 8, 9]
@@ -189,13 +198,11 @@ def test_prefill_beyond_topk_selects():
 
 def test_prefill_chunks_join_at_their_boundaries(monkeypatch):
     """Prefill rows are scored in chunks; tiny chunks give the same logits."""
-    from mstar.model.glm52 import dsa_paged
-
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    monkeypatch.setattr(dsa_paged, "PREFILL_CHUNK_ROWS", 3)
+    monkeypatch.setattr(paged, "PREFILL_CHUNK_ROWS", 3)
     chunked = _Driver(sub, cfg).step("prefill", tokens)
     torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
 
@@ -203,13 +210,11 @@ def test_prefill_chunks_join_at_their_boundaries(monkeypatch):
 def test_prefill_chunks_narrow_to_the_score_budget(monkeypatch):
     """A chunk's [rows, last row's keys] fp32 scores stay under the byte budget, down to one
     row a chunk, and the logits do not move."""
-    from mstar.model.glm52 import dsa_paged
-
-    monkeypatch.setattr(dsa_paged, "SCORE_BUDGET_BYTES", 4 * 1000)
+    monkeypatch.setattr(paged, "SCORE_BUDGET_BYTES", 4 * 1000)
     lens = list(range(1, 3001))
     c0, chunks = 0, []
     while c0 < len(lens):
-        c1 = dsa_paged._chunk_end(lens, c0, len(lens))
+        c1 = paged._chunk_end(lens, c0, len(lens))
         chunks.append((c0, c1))
         assert (c1 - c0) * lens[c1 - 1] * 4 <= 4 * 1000 or c1 - c0 == 1
         c0 = c1
@@ -219,7 +224,7 @@ def test_prefill_chunks_narrow_to_the_score_budget(monkeypatch):
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    monkeypatch.setattr(dsa_paged, "SCORE_BUDGET_BYTES", 4 * 6)
+    monkeypatch.setattr(paged, "SCORE_BUDGET_BYTES", 4 * 6)
     chunked = _Driver(sub, cfg).step("prefill", tokens)
     torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
 
@@ -340,9 +345,6 @@ class _FakeGroup:
 def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
     """Each rank's block of a long span, gathered rank-major, is the unsharded selection; a
     span below the shard threshold and a decode row are selected whole on every rank."""
-    from mstar.engine.resources.attn import sparse_mla
-    from mstar.model.glm52 import dsa_paged
-
     monkeypatch.setattr(sparse_mla, "SHARD_MIN_ROWS", 4)
     torch.manual_seed(9)
     nh, d, page, topk = 4, 8, 4, 16
@@ -361,16 +363,16 @@ def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
         spans.append((len(row_req), n, i))
         row_req += [i] * n
         lens += list(range(c - n + 1, c + 1))
-    ctx = Glm52DsaPagedContext(
+    ctx = PagedContext(
         row_req=torch.tensor(row_req, dtype=torch.int32), lens=torch.tensor(lens, dtype=torch.int32),
         host_lens=lens, kv_table=table, index_table=table, spans=spans, width=max(lens),
         page_size=page, topk=topk, needs_selection=True)
     q, w = torch.randn(len(lens), nh, d), torch.randn(len(lens), nh)
-    want = dsa_paged.select(q, w, index_layer, ctx)
+    want = paged.select(q, w, index_layer, ctx)
     group = _FakeGroup(4)
     for rank in range(4):  # the last rank's call sees every block
         group.rank = rank
-        got = dsa_paged.select(q, w, index_layer, ctx, group)
+        got = paged.select(q, w, index_layer, ctx, group)
     assert torch.equal(got, want)
 
 
@@ -378,7 +380,6 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them(monkeypatch):
     """A captured prefill bucket's rows: the real ones, then padding staged as position 0 of
     the first request; every row scores on its own over the bucket's width, and a bucket no
     wider than index_topk selects nothing."""
-    from mstar.engine.resources.attn import sparse_mla
     from mstar.engine.resources.step import BucketKey, SlotLease
 
     planned = []

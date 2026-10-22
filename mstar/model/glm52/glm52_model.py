@@ -12,6 +12,8 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    DSAConfig,
+    DSASpec,
     KVLayout,
     KVSpec,
     NodeResourceSpec,
@@ -22,13 +24,14 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.attn.sparse_mla import check_flashinfer
+from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     INDEX_KV_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
@@ -257,7 +260,7 @@ class Glm52Model(Model):
                 # replicated like the latent; its qo count only has to shard evenly under TP,
                 # as the attention heads do
                 num_qo_heads=self.config.num_attention_heads)))
-        return specs + [
+        specs += [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
             # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
@@ -271,6 +274,15 @@ class Glm52Model(Model):
                 vocab_size=self.config.vocab_size,
             ),
         ]
+        if self.config.dsa_long_context:
+            # past index_topk each query attends its indexer's top index_topk latents
+            specs.append(DSASpec(
+                resource_key=DSA_RESOURCE, nodes=nodes,
+                config=DSAConfig(
+                    kv_cache=KV_RESOURCE, topk=self.config.index_topk,
+                    sm_scale=self.config.qk_head_dim ** -0.5, index_cache=INDEX_KV_RESOURCE),
+            ))
+        return specs
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions

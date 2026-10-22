@@ -27,15 +27,15 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.attn import sparse_mla
+from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda import SpecBlocks
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next import fused_decode
-from mstar.model.glm5_next.components.attention import Glm5NextMLAAttention
 from mstar.model.glm5_next.config import (
     ATTN,
+    DSA,
     KDA,
     KDA_STATE,
     KV_CACHE,
@@ -45,7 +45,6 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.glm5_next.dsa import DsaState, Glm5NextDsaContext, attn_lens
 from mstar.model.glm5_next.kda import TorchKDAKernels
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -119,16 +118,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
-        # dsa_long_context: the forward's DSA context, which the MLA layers read, and under
-        # CUDA graphs one sparse-attention plan per (capture slot, rows)
-        self._dsa = DsaState()
-        self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
-        # per (walk, capture slot): the workspace and index buffer its plans share
-        self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        if config.dsa_long_context:
-            for module in language_model.modules():
-                if isinstance(module, Glm5NextMLAAttention):
-                    module.dsa_state = self._dsa
+
+    @property
+    def _dsa(self):
+        """The DSA resource (dsa_long_context), whose ``ctx`` the MLA layers read."""
+        return self.node_resources.get(DSA) if self.config.dsa_long_context else None
 
     @property
     def mtp_block(self) -> int:
@@ -396,7 +390,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
         if self.config.dsa_long_context:
-            # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
+            # every MLA layer attends sparse (the DSA resource): no dense plan over the whole context
             del steps[ATTN]
         return SubmoduleStep(
             segments=[
@@ -422,103 +416,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if self.mtp_k > 0 and graph_walk == "decode":
             out["mtp_seq"] = self._mtp_stage_seq(engine_inputs)
         if self.config.dsa_long_context:
-            out.update(self._dsa_inputs(engine_inputs))
+            # the DSA resource stages its rows off the KV plan; the forward opens them
+            out.update(self._dsa.step_inputs(
+                engine_inputs.step.ctx, engine_inputs.captured, LABEL))
         return out
-
-    def _dsa_inputs(self, engine_inputs: ModelInputsFromEngine) -> dict[str, Any]:
-        """The step's DSA state from the KV plan, as preprocess outputs. The tensors are top
-        level, so a CUDA graph interns them and each replay stages the step's values: per row
-        its position and request, per request its first entry in the flat page list. Under a
-        graph the score width spans the serving window and the sparse plan is the slot's own,
-        re-planned here every step; the host half rides in ``dsa_meta``."""
-        step_ctx = engine_inputs.step.ctx
-        graph = bool(engine_inputs.captured)
-        walk = step_ctx.graph_walk
-        kv_out = step_ctx.plan_results[KV_CACHE][LABEL]
-        page_size = engine_inputs.resources[KV_CACHE].kv_cache.page_size
-        cfg = self.config
-        pos: list[int] = []
-        row_req: list[int] = []
-        spans: list[tuple[int, int, int]] = []
-        for i, view in enumerate(kv_out.views):
-            spans.append((len(pos), view.to_compute, i))
-            pos.extend(range(view.length - view.to_compute, view.length))
-            row_req.extend([i] * view.to_compute)
-        n_real = len(pos)
-        rows = n_real
-        if graph and step_ctx.slot_lease is not None:
-            # a packed prefill bucket's padding rows: position 0 of the first request. Staged, so
-            # they don't keep what a larger bucket left in the shared static buffers
-            rows = step_ctx.slot_lease.bucket.num_tokens
-            pos += [0] * (rows - n_real)
-            row_req += [0] * (rows - n_real)
-        indptr = kv_out.cpu_indptrs.paged_kv_indptr
-        parts = [torch.tensor(pos + row_req, dtype=torch.int32), indptr[:-1].to(torch.int32),
-                 kv_out.cpu_indptrs.paged_kv_indices.to(torch.int32)]
-        if step_ctx.capture:
-            # the static buffer's size: every row's request at the serving window (a replay
-            # stages just its own pages)
-            pad = len(kv_out.views) * -(-cfg.kv_rows // page_size) - parts[-1].numel()
-            parts.append(torch.zeros(pad, dtype=torch.int32))
-        device = self.lm_head.weight.device
-        n_pos, n_req = len(pos), indptr.numel() - 1
-        staged = self._int_stager.to_device(torch.cat(parts), device)
-        lens = attn_lens(pos, cfg.index_topk, cfg.index_kpool)  # a padding row's is 1
-        # score width: the serving window's pools for a decode graph; a captured prefill holds
-        # whole prompts no longer than its bucket
-        max_pools = (max(pos) + 1) // cfg.index_kpool if pos else 1
-        sparse_plan = None
-        if graph:
-            if walk == "prefill":
-                if pos and max(pos) >= rows:
-                    raise RuntimeError(f"a captured prefill row sits at {max(pos)}, past its "
-                                       f"{rows}-token bucket")
-                max_pools = rows // cfg.index_kpool
-            else:
-                max_pools = cfg.kv_rows // cfg.index_kpool
-        if graph and device.type == "cuda":
-            width = cfg.index_topk + cfg.index_kpool - 1
-            key = (walk, step_ctx.slot, rows)
-            sparse_plan = self._sparse_plans.get(key)
-            if sparse_plan is None:
-                buffers = self._sparse_buffers.get(key[:2])
-                if buffers is None or buffers[1].numel() < rows * width + 1:
-                    # captures run largest first, so the first is the slot's size; +1: the
-                    # plan's spare index entry
-                    buffers = self._sparse_buffers[key[:2]] = (
-                        torch.empty(sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8, device=device),
-                        torch.zeros(rows * width + 1, dtype=torch.int32, device=device))
-                sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
-                    rows, width, buffers[0], buffers[1])
-            attn = next(m for m in self.language_model.modules()
-                        if isinstance(m, Glm5NextMLAAttention))
-            sparse_plan.plan(lens, attn.num_heads, cfg.kv_lora_rank, cfg.mla_cache_kpe,
-                             attn.softmax_scale)
-        return {
-            "dsa_pos": staged[:n_pos],
-            "dsa_row_req": staged[n_pos:2 * n_pos],
-            "dsa_page_start": staged[2 * n_pos:2 * n_pos + n_req],
-            "dsa_pages": staged[2 * n_pos + n_req:],
-            "dsa_meta": dict(
-                host_pos=None if graph else pos[:n_real],
-                spans=None if graph else spans,
-                host_page_start=None if graph else indptr[:-1].tolist(),
-                max_pools=max(max_pools, 1),
-                page_size=page_size, sparse_plan=sparse_plan,
-            ),
-        }
-
-    def _dsa_context(self, kwargs: dict[str, Any]) -> Glm5NextDsaContext | None:
-        meta = kwargs.get("dsa_meta")
-        if meta is None:
-            return None
-        return Glm5NextDsaContext(
-            pos=kwargs["dsa_pos"], row_req=kwargs["dsa_row_req"], pages=kwargs["dsa_pages"],
-            page_start=kwargs["dsa_page_start"], host_pos=meta["host_pos"],
-            spans=meta["spans"], host_page_start=meta["host_page_start"],
-            max_pools=meta["max_pools"], page_size=meta["page_size"],
-            topk=self.config.index_topk, kpool=self.config.index_kpool,
-            sparse_plan=meta["sparse_plan"])
 
     def _mtp_keep(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs], num_tokens: int,
@@ -582,11 +483,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         mtp_keep: torch.Tensor | None = None,
         dsa_inputs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
-        self._dsa.ctx = self._dsa_context(dsa_inputs or {})
+        if self._dsa is not None:
+            self._dsa.ctx = self._dsa.context(dsa_inputs or {})
         try:
             return self._forward_inner(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
         finally:
-            self._dsa.ctx = None
+            if self._dsa is not None:
+                self._dsa.ctx = None
 
     def _forward_inner(
         self,
