@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -40,7 +40,12 @@ from mstar.model.components.distributed.linear_attn import _FusedBlockColumnPara
 from mstar.model.components.linear import FusedColumnLinear  # noqa: E402
 from mstar.model.components.linear_attn import GATE_ALIGN, SPLIT_BLOCK_NAMES, SPLIT_SHARD_BLOCKS, gate_pad  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
-from mstar.model.components.lora.modules import PER_SEGMENT, bind_module_lora, module_lora_spec  # noqa: E402
+from mstar.model.components.lora.modules import (  # noqa: E402
+    PER_SEGMENT,
+    _target_names,
+    bind_module_lora,
+    module_lora_spec,
+)
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 
 HIDDEN = 8
@@ -394,7 +399,7 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
 
 # --- what binding refuses ------------------------------------------------------------------
 
-def test_binding_refuses_a_second_delta_a_silent_node_and_a_split_target(tmp_path):
+def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_spec(tmp_path):
     case = CASES["qkv"]
     paths, _ = _adapters(case, tmp_path)
     spec = serve(_spec(case), paths)
@@ -417,6 +422,17 @@ def test_binding_refuses_a_second_delta_a_silent_node_and_a_split_target(tmp_pat
     with pytest.raises(ValueError, match="whole on every rank"):
         bind_module_lora(_Node(root), {"lora": pool(spec, rank=0, world=2)})
     assert type(root.layers[0].qkv_proj) is QKVParallelLinear
+
+    # a spec not built by `module_lora_spec`: nothing would bind it, so no rows or deltas
+    with pytest.raises(ValueError, match="module_lora_spec"):
+        bind_module_lora(_Node(root), {"lora": pool(replace(spec, module_map=lambda m: None))})
+    assert type(root.layers[0].qkv_proj) is QKVParallelLinear
+
+
+def test_target_names_widen_a_role_outside_every_stack():
+    # a stacked role and a top-level module with the same role path
+    names = _target_names([("layers", "attn.proj"), (None, "attn.proj")], {})
+    assert sorted(names.values()) == ["layers_attn_proj", "root_attn_proj"]
 
 
 # --- what the module walk refuses ----------------------------------------------------------
