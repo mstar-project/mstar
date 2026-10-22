@@ -736,8 +736,8 @@ class KVManager(AttentionResource):
             chain.rooted, chain.rooted_ends = rooted, ends
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
-        """The lease is returned with every step until `admit` converts it, so a follower that
-        dropped the first of those steps still adopts it."""
+        """The lease is returned with every step until `admit` converts it. A walk the cache served
+        whole leaves the lease in place for the walks after it."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -796,6 +796,17 @@ class KVManager(AttentionResource):
             self._arena.retain(matched)
             stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size
             return True
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Does nothing at one rank, where only `resolve_cached_prefix` takes a lease and preparing the
+        step again reuses it. A lease also stays once the cache has served one of the stream's walks,
+        since that walk's KV lives only in the lease."""
+        if self._world_size == 1:
+            return
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(self._keyed_label(rid, node_name, graph_walk))
+            if stream is not None and stream.chain is not None and not stream.chain.done:
+                self._release_lease(stream)
 
     def page_trail(self) -> tuple[int, int] | None:
         with self._lock:

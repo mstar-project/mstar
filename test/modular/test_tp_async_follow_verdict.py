@@ -49,7 +49,7 @@ WALK = "decode"
 
 class _FakeEngineManager:
     def get_engine(self, node_name):
-        return types.SimpleNamespace(check_ready=lambda *a: FULL_ADMIT_OK)
+        return types.SimpleNamespace(check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None)
 
 
 class _Communicator:
@@ -81,8 +81,9 @@ def _stub():
     stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
     stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     stub._tp_leader_gap_warned = False
+    stub.engine_manager = _FakeEngineManager()
     stub.scheduler = MicroScheduler(
-        engine_manager=_FakeEngineManager(), parallel_leader_nodes=set(),
+        engine_manager=stub.engine_manager, parallel_leader_nodes=set(),
     )
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None

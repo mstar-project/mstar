@@ -56,6 +56,9 @@ def _fake_worker() -> Worker:
     )
     # No stream buffers in the fake, so _return_streaming_edge no-ops.
     w.request_state = SimpleNamespace(per_request_info={})
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 

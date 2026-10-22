@@ -1126,16 +1126,33 @@ class Engine:
 
         False until every request in the hits has a handle here and every resource holds its lease.
         """
-        walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
         ready = True
-        for wire_rid, leases in head.prefix_hits.items():
-            rid = self._graph_runtime.get_rid_handle(wire_rid)
+        for rid, walk, leases in self._resolve_hits(head):
             if rid is None:
                 ready = False
                 continue
-            walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
             ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
         return ready
+
+    def release_cached_prefix(self, batch: ExecutingBatch) -> None:
+        """On a TP node, give back the cached-prefix leases taken for a step this rank built and will not run."""
+        ctx = batch.step_context
+        for rid in batch.request_ids:
+            self._runner.release_cached_prefix(rid, batch.node_name, ctx.walk_of(rid))
+
+    def drop_cached_prefix(self, head: ScheduleTPNode) -> None:
+        """On a TP follower, give back the leases of ``head``'s hits, which this rank drops unbuilt."""
+        for rid, walk, _ in self._resolve_hits(head):
+            if rid is not None:
+                self._runner.release_cached_prefix(rid, head.node_name, walk)
+
+    def _resolve_hits(self, head: ScheduleTPNode):
+        """Yield this rank's handle, the walk and the leases for each request in ``head``'s hits.
+        The handle is None for a request this rank has not ingested yet or has already removed."""
+        walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
+        for wire_rid, leases in head.prefix_hits.items():
+            walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
+            yield self._graph_runtime.get_rid_handle(wire_rid), walk, leases
 
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
         """Rank 0's trail of page allocations per resource, to send with a step."""

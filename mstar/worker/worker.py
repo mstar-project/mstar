@@ -2481,6 +2481,8 @@ class Worker:
         ``scheduled_batch``, already pruned of the dropped rids, while the undo
         targets exactly those dropped rids. The flag is cleared elsewhere
         (``_clear_in_flight_flag``), on paths with no stage to settle.
+
+        On a TP node a failed speculation also gives back the cached-prefix leases this rank took for its step.
         """
         batch = speculation.scheduled_batch
         rid_to_wg = batch.request_to_worker_graph if success else {}
@@ -2505,6 +2507,8 @@ class Worker:
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
         speculation.consumed_streaming_edges.clear()
+        if not success:
+            self.engine_manager.get_engine(batch.node_name).release_cached_prefix(speculation.node_batch)
 
     @staticmethod
     def _speculated_rids(speculation: Speculation | None) -> frozenset[int]:
@@ -2967,6 +2971,8 @@ class Worker:
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
+            # settle may have adopted some of the head's hit, and the leader releases the whole lease
+            self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
 
     def _await_tp_follow_step(
         self, pending: PendingBatch, arm: Callable[[Speculation], None],

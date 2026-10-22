@@ -163,6 +163,10 @@ class StepRunner:
             ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
         return ready
 
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].release_cached_prefix(rid, node_name, graph_walk)
+
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
         """Each resource's trail of page allocations, by resource key."""
         return {

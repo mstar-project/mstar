@@ -170,6 +170,10 @@ class Resource(ABC):
         raises if it still lacks them once ``caught_up``."""
         return True
 
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
+        return
+
     def page_trail(self) -> tuple[int, int] | None:
         """How many page allocations this resource has made and a hash of their pages in
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
