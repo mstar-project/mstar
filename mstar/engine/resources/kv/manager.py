@@ -1771,6 +1771,7 @@ class KVManager(AttentionResource):
 
             page_size = self.config.page_size
             sink = step.sink
+            ahead = ctx.chunk_tokens_after
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -1781,6 +1782,9 @@ class KVManager(AttentionResource):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
+                if ahead:
+                    # a chunked row reserves the rest of its walk up front
+                    seq_len += ahead.get(segment.request_id, 0)
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
                 if (
