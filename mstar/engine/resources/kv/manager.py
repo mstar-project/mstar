@@ -438,11 +438,9 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
     ):
         self.config = cfg
-        if cfg.aux_planes and (cfg.cpu_offload_pages > 0 or needs_remote_transfer):
-            # both move the KV tensor's pages alone
-            raise ValueError(
-                f"KV {name}: aux_planes need cpu_offload_pages: 0 and no remote KV transfer"
-            )
+        if cfg.aux_planes and cfg.cpu_offload_pages > 0:
+            # offload moves the KV tensor's pages alone (a KV retrieve refuses them too)
+            raise ValueError(f"KV {name}: aux_planes need cpu_offload_pages: 0")
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
