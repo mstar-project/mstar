@@ -1901,6 +1901,16 @@ async def generate_ws(websocket: WebSocket):
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
         key: str | None = None
+
+        def release_turn() -> None:
+            """Let the next message submit, once the one before this one has."""
+            if turn.done():
+                return
+            if after is None or after.done():
+                _pass_turn(turn)
+            else:
+                after.add_done_callback(lambda _: _pass_turn(turn))
+
         try:
             out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
             text = message.get("text")
@@ -1963,10 +1973,11 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
+            # before the send, which can wait on the socket: the call's appends
+            # and the next message wait on these
             if call is not None and not call.done():
-                # before the send, which can wait on the socket: the call's
-                # appends wait on this
                 call.set_result(None)
+            release_turn()
             payload = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
                 payload.update(error=exc.detail, status=exc.status_code)
@@ -1990,17 +2001,14 @@ async def generate_ws(websocket: WebSocket):
                 appends.pop(request_id, None)
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
-            if not turn.done():
-                # refused: the next message still waits for the ones before this one
-                if after is None:
-                    _pass_turn(turn)
-                else:
-                    after.add_done_callback(lambda _: _pass_turn(turn))
+            release_turn()   # cancelled before submitting
 
-    async def append_one(message: dict, binary: bool, before: asyncio.Task | None) -> None:
-        """Feed an append to a call's client streams, after ``before``, the
-        call's previous append. A bad append ends the call: the audio it
-        carried is lost to it."""
+    async def append_one(
+        message: dict, binary: bool, call: asyncio.Future, before: asyncio.Task | None,
+    ) -> None:
+        """Feed an append to ``call``, the live call it named when it was read,
+        after ``before``, that call's previous append. A bad append ends the
+        call: the audio it carried is lost to it."""
         request_id = message["request_id"]
         file_paths: dict[str, list[str]] | None = None
         late = {"request_id": request_id, "append": True,
@@ -2008,7 +2016,7 @@ async def generate_ws(websocket: WebSocket):
         if before is not None:
             await asyncio.wait([before])
         # in order behind the call's own submission, which may still be running
-        key = await live[request_id]
+        key = await call
         # checked before decoding, so a bad append to a call that has ended is
         # answered as late rather than ending anything
         if key is None or not api_server.taking_input(key):
@@ -2087,7 +2095,9 @@ async def generate_ws(websocket: WebSocket):
                 # A task per append, chained per call: awaited here, an append
                 # whose call waits its turn to submit would hold up reading
                 # every other call's.
-                task = asyncio.create_task(append_one(message, binary, appends.get(request_id)))
+                task = asyncio.create_task(
+                    append_one(message, binary, live[request_id], appends.get(request_id)),
+                )
                 appends[request_id] = task
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
