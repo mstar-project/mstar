@@ -56,6 +56,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    declared_step,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -1443,7 +1444,8 @@ class Engine:
                 range_push("engine.declare_step")
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
-                step = submodule.declare_step(
+                step = declared_step(
+                    submodule,
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
@@ -2317,7 +2319,8 @@ class Engine:
             cg_runner.step_ids(lease, batch.request_ids)
         )
         t0 = perf_counter() if PHASE_PERIOD else 0.0
-        step = submodule_mgmt.submodule.declare_step(
+        step = declared_step(
+            submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
