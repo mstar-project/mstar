@@ -1099,11 +1099,8 @@ class Engine:
                 )
 
     def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
-        """Rank 0's cached-prefix leases for a step it is about to send its TP followers, by wire id.
-
-        Taken as the step is scheduled, so the followers can take the same pages before
-        they build it. ``prepare_inputs`` then answers every rank from the leases.
-        """
+        """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
+        followers can take the same pages before they build it."""
         keyed = self._keyed_walks.get(batch.node_name)
         ctx = batch.step_context
         if (
@@ -1122,30 +1119,26 @@ class Engine:
         return hits
 
     def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
-        """A TP follower takes rank 0's cached-prefix leases before it builds the step.
-
-        A request this rank has no handle for is skipped, since `pop_ready_rids` holds the step back
-        for that request and warns.
-        """
+        """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
         ready = True
         for rid, walk, leases in self._resolve_hits(head):
             ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
         return ready
 
     def release_cached_prefix(self, batch: ExecutingBatch) -> None:
-        """On a TP node, give back the cached-prefix leases taken for a step this rank built and will not run."""
+        """Give back the leases of a step this rank built and won't run."""
         ctx = batch.step_context
         for rid in batch.request_ids:
             self._runner.release_cached_prefix(rid, batch.node_name, ctx.walk_of(rid))
 
     def drop_cached_prefix(self, head: ScheduleTPNode) -> None:
-        """On a TP follower, give back the leases of ``head``'s hits, which this rank drops unbuilt."""
+        """On a TP follower, give back the leases of a head it drops without building."""
         for rid, walk, _ in self._resolve_hits(head):
             self._runner.release_cached_prefix(rid, head.node_name, walk)
 
     def _resolve_hits(self, head: ScheduleTPNode):
-        """Yield this rank's handle, the walk and the leases for each request in ``head``'s hits,
-        leaving out a request this rank has not ingested yet or has already removed."""
+        """Yield (handle, walk, leases) per request in ``head``'s hits, skipping a request this rank
+        hasn't ingested or has removed."""
         walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
         for wire_rid, leases in head.prefix_hits.items():
             rid = self._graph_runtime.get_rid_handle(wire_rid)
@@ -1154,15 +1147,13 @@ class Engine:
                 yield rid, walk, leases
 
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
-        """Rank 0's trail of page allocations per resource, to send with a step."""
         return self._runner.page_trails(node_name)
 
     def check_page_trails(
         self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
     ) -> None:
         """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
-        sent this step. Page ids would differ from here on, and a sharded prefill gathers
-        cache slots across ranks."""
+        sent this step."""
         for pool, mine in self._runner.page_trails(node_name).items():
             if trails.get(pool, mine) != mine:
                 raise RuntimeError(

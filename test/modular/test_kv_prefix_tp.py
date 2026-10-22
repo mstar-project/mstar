@@ -1,20 +1,4 @@
-"""Prefix reuse under TP: rank 0 decides each hit, and the other ranks take the same pages.
-
-Every rank indexes its own copy of the cache, and their page tables have to stay
-identical (a sharded prefill gathers cache slots across ranks). So a follower never
-looks a prompt up itself. Rank 0 leases the hit as it sends the step. The follower adopts
-that lease, and waits until it has also committed the step that wrote those pages. A hit
-is stamped when its step commits. Every rank commits in step order, so the indexes age and
-evict alike however each rank's probes interleave with its commits.
-
-Above one rank the cache keys no generated tokens. Each rank reads the sampled ids back at
-its own step, so the ranks would index those pages at different steps. It doesn't cache the
-page up to an image's end, since serving it would allocate on rank 0 alone. Host
-offload and a pool shared across worker instances move pages outside the schedule, so they
-are refused at load. Under ``MSTAR_KV_DEBUG_ASSERTS`` a follower checks before each step
-that it has allocated the pages rank 0 had. A divergence found by that check or by an adopt
-stops the worker.
-"""
+"""Prefix reuse under TP: rank 0 decides each hit, and the other ranks take the same pages."""
 
 from __future__ import annotations
 
@@ -77,7 +61,6 @@ def _tokens(n: int, seed: int) -> list[int]:
 
 
 def _ingest(kv: KVManager, rid: str, *parts) -> None:
-    """Give ``kv`` the keys and layout the preprocess worker sends for a prompt of ``parts``."""
     kv.ingest_request(rid, _config(list(parts)))
 
 
@@ -86,8 +69,6 @@ def _ctx(rid: str, walk: str = WALK) -> StepContext:
 
 
 def _step(kv: KVManager, rid: str, length: int, walk: str = WALK) -> KVStep | None:
-    """Prepare one walk as the engine does, then admit and plan what the cache doesn't hold.
-    None when the cache serves the walk whole."""
     inputs = ARNodeInputs(input_seq_len=length)
     prefix = kv.resolve_cached_prefix(rid, NODE, walk, inputs)
     kv.apply_cached_prefix(rid, NODE, walk, inputs, prefix)
@@ -102,7 +83,6 @@ def _step(kv: KVManager, rid: str, length: int, walk: str = WALK) -> KVStep | No
 
 
 def _run(kv: KVManager, rid: str, *parts) -> None:
-    """Run and commit every walk of a prompt of ``parts``."""
     for walk, length in _walks(list(parts)):
         step = _step(kv, rid, length, walk)
         if step is not None:
@@ -110,7 +90,6 @@ def _run(kv: KVManager, rid: str, *parts) -> None:
 
 
 def _cache(ranks, rid: str, tokens: list[int]) -> None:
-    """Every rank prefills ``tokens``, so its index holds their whole pages."""
     for kv in ranks:
         _ingest(kv, rid, tokens)
         _run(kv, rid, tokens)
@@ -121,8 +100,6 @@ def _pages(kv: KVManager, rid: str) -> list[int]:
 
 
 class _Submodule:
-    """Cuts a prompt as an AR submodule does."""
-
     def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
         return ARNodeSubmodule.split_inputs(self, graph_walk, fwd_info, inputs, start, end)
 
@@ -148,7 +125,6 @@ def _batch(rid: str, walk: str = WALK) -> SimpleNamespace:
 
 
 def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
-    """The step rank 0 sends for ``rid``'s prefill, carrying the hit rank 0 leased and its page trails."""
     engine = _engine(leader)
     return ScheduleTPNode(
         NODE, WALK, [f"wire-{rid}"],
@@ -157,8 +133,6 @@ def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
 
 
 def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -> bool:
-    """Settle ``head`` at the front of the follower's queue, as before building the step. False
-    while the follower can't yet take rank 0's hit."""
     engine = _engine(follower)
     scheduler = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
@@ -168,7 +142,6 @@ def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -
 
 
 def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
-    """Settle a failed speculation of ``rid``'s step on this rank, as the worker does for a built step it drops."""
     engine = _engine(kv)
     worker = SimpleNamespace(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
@@ -194,8 +167,6 @@ def _wire(head: ScheduleTPNode) -> ScheduleTPNode:
     return decode(encode(WorkerMessage(WorkerMessageType.SCHEDULE_TP, head))).body
 
 
-# ── a follower takes rank 0's hit ───────────────────────────────────────
-
 
 def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
     ranks = leader, follower = _manager(0), _manager(1)
@@ -206,10 +177,8 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
         _ingest(kv, "b", prompt)
 
     head = _send(leader, "b")
-    # the follower's own index holds the pages, but only rank 0 decides a hit
     assert follower.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens == 0
     assert _follow(follower, head)
-    # the follower adopts the hit once, so settling it again takes no second reference
     assert _follow(follower, head)
 
     for kv in ranks:
@@ -221,8 +190,6 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
 
 
 def test_a_hit_for_a_request_this_rank_has_no_handle_for_doesnt_hold_settle():
-    """`pop_ready_rids` holds the step back for that request and warns. A settle that waited on the
-    request would hide the warning."""
     engine = _engine(_manager(1))
     engine._graph_runtime.get_rid_handle = lambda wire_rid: None
     scheduler = MicroScheduler(
@@ -245,7 +212,6 @@ def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
     leader.commit(steps[leader], _ctx("a"))
 
     head = _send(leader, "b")
-    # rank 0 has committed a, and the follower has only admitted it
     assert not _follow(follower, head, caught_up=False)
     follower.commit(steps[follower], _ctx("a"))
     assert _follow(follower, head)
@@ -256,9 +222,6 @@ def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
-    """Rank 0 leases two hits before z commits, and the follower adopts them after. hx then
-    runs, and hy's request leaves before it runs. A stamp taken when either rank looks a
-    hit up would age the two indexes differently, and they would evict different pages."""
     ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
     x, y, z = (_tokens(2 * PAGE_SIZE + 1, seed=s) for s in (6, 7, 8))
     hits = {"hx": x[:2 * PAGE_SIZE] + _tokens(3, seed=9), "hy": y[:2 * PAGE_SIZE] + _tokens(3, seed=10)}
@@ -283,7 +246,6 @@ def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
         for rid in ("hx", "hy", "z"):
             kv.remove_request(rid)
 
-    # hx committed last, so a request that needs most of the pool evicts y's and z's pages first
     big = _tokens(9 * PAGE_SIZE, seed=11)
     for kv in ranks:
         _ingest(kv, "big", big)
@@ -295,10 +257,6 @@ def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
 
 @pytest.mark.parametrize("settled", [False, True], ids=["unsettled", "settled"])
 def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
-    """Rank 0 leased b's hit as it sent head N+1, and then N raised, so neither rank runs the head. The
-    follower took the hit only if it settled the head before N raised, and drops the head unbuilt either way.
-    Each rank gives back what it took, so a request that then needs most of the pool evicts the same
-    pages on both."""
     ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
     a = _tokens(3 * PAGE_SIZE, seed=33)
     for rid, tokens in (("x", _tokens(3 * PAGE_SIZE, seed=32)), ("a", a), ("z", _tokens(3 * PAGE_SIZE, seed=34))):
@@ -316,7 +274,6 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "b")
 
-    # x is oldest, then a. Six evictions take x's pages and then a's, including both pages of b's hit.
     big = _tokens(8 * PAGE_SIZE, seed=36)
     for kv in ranks:
         _ingest(kv, "big", big)
@@ -325,8 +282,6 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike(settled):
 
 
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
-    """The cache served the repeat's text walk whole, so that walk's KV lives only in the lease,
-    which the follower took with that walk's step. The image walk's head then won't run."""
     ranks = leader, follower = _manager(0), _manager(1)
     for kv in ranks:
         _ingest(kv, "seed", TEXT, IMAGE, ASK)
@@ -345,8 +300,6 @@ def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
 
 
 def test_at_one_rank_a_step_that_wont_run_keeps_its_rows_leases():
-    """At one rank only `resolve_cached_prefix` takes a lease, and preparing the step again reuses it,
-    so a step that won't run leaves it alone."""
     kv = _manager(0, world_size=1)
     shared = _tokens(3 * PAGE_SIZE, seed=38)
     prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=39)
@@ -360,9 +313,6 @@ def test_at_one_rank_a_step_that_wont_run_keeps_its_rows_leases():
 
 
 def test_rank_0_prepares_the_length_it_decided_though_a_commit_since_holds_more():
-    """Rank 0 decides step N+1's hits while step N still runs, and prepares N+1 after N
-    commits. The followers were told b missed, so b runs whole on rank 0 too, though a's
-    commit has since indexed the prefix they share."""
     leader = _manager(0)
     a = _tokens(4 * PAGE_SIZE + 5, seed=2)
     b = a[:4 * PAGE_SIZE] + _tokens(9, seed=3)
@@ -379,10 +329,6 @@ def test_rank_0_prepares_the_length_it_decided_though_a_commit_since_holds_more(
 
 
 def test_a_lease_taken_around_a_commit_leaves_the_ranks_indexes_alike():
-    """z shares a's prefix but was sent while a ran, so it missed and wrote a copy of its own.
-    a has left when z commits. Rank 0 has by then leased the prefix for h, and the follower
-    adopts the lease after it commits z. If z's commit chained its next page under a's only while
-    a lease held the shared prefix, z's page would hang under a's on rank 0 only."""
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(4 * PAGE_SIZE, seed=19)
     prompts = {"a": shared + _tokens(PAGE_SIZE, seed=20), "z": shared + _tokens(2 * PAGE_SIZE, seed=21),
@@ -419,9 +365,6 @@ def test_a_keyed_miss_answers_zero_so_another_resource_cannot_skip_it():
 
 
 def test_a_readiness_check_stamps_no_cached_page_above_one_rank():
-    """A step refused at admit still publishes its empty stream. Rank 0 then checks the
-    request's readiness on every scan and a follower once, so a lookup there would age
-    rank 0's index alone."""
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(3 * PAGE_SIZE, seed=23)
     _cache(ranks, "old", shared + _tokens(4, seed=24))
@@ -475,8 +418,6 @@ def test_rank_0s_broadcast_carries_its_hit_and_trails_to_a_follower(monkeypatch)
     assert follower._streams["b"]["main"].lease == leader._streams["b"]["main"].lease, "the step carried no hit"
 
 
-# ── what the cache keys above one rank ──────────────────────────────────
-
 
 def test_under_tp_a_stream_keys_its_prompt_only():
     assert _manager(1)._keyed_walks["main"] == _manager(0, world_size=1)._keyed_walks["main"] - {"decode"}
@@ -504,8 +445,6 @@ def test_above_one_rank_a_repeat_with_other_text_after_the_image_takes_rank_0s_p
         _run(kv, "repeat", TEXT, IMAGE, OTHER_ASK)
     assert _pages(leader, "repeat") == _pages(follower, "repeat")
 
-
-# ── what is refused at load ─────────────────────────────────────────────
 
 
 def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
@@ -544,12 +483,8 @@ def test_a_pool_on_more_than_one_tp_group_is_refused_at_load():
     )
 
 
-# ── a follower that diverged from rank 0 ────────────────────────────────
-
 
 def _diverged() -> tuple[KVManager, KVManager]:
-    """Two ranks whose indexes hold x's prefix on different pages, since the follower ran y
-    first. Both have ingested b, which shares x's prefix."""
     ranks = leader, follower = _manager(0), _manager(1)
     x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
     for kv, order in ((leader, (("x", x), ("y", y))), (follower, (("y", y), ("x", x)))):
@@ -569,13 +504,11 @@ def test_pages_that_differ_from_rank_0s_are_a_loud_error():
 
 
 def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
-    """Failing the step's requests would leave the other ranks waiting in the step's collective for good."""
     leader, follower = _diverged()
     worker, _ = _rank(monkeypatch, tp_rank=1, inbox=[])
     worker.scheduler.get_next_batch = lambda request_state, **kwargs: _follow(follower, _send(leader, "b"))
 
     def _caught(error, *args):
-        # the real handler logs the error and runs the next pass
         raise _Stop
 
     worker._handle_main_loop_error = _caught
@@ -584,7 +517,6 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
 
 
 def test_a_follower_whose_stream_already_holds_tokens_stops_on_rank_0s_hit():
-    """b already ran here, so the pages rank 0 leased can't become its prefix."""
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(3 * PAGE_SIZE, seed=28)
     prompt = shared[:2 * PAGE_SIZE] + _tokens(7, seed=29)
@@ -598,8 +530,6 @@ def test_a_follower_whose_stream_already_holds_tokens_stops_on_rank_0s_hit():
 
 
 def test_a_hit_on_a_resource_this_rank_lacks_stops_the_follower():
-    """A missing resource raises a KeyError, not a RuntimeError, but the error repeats on every
-    pass over the head just the same."""
     follower = _manager(1)
     _ingest(follower, "b", _tokens(2 * PAGE_SIZE, seed=37))
     head = ScheduleTPNode(NODE, WALK, ["wire-b"], prefix_hits={"wire-b": {"other": [0]}})
@@ -609,8 +539,6 @@ def test_a_hit_on_a_resource_this_rank_lacks_stops_the_follower():
 
 
 def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
-    """A follower whose index dropped a page, and the head carrying rank 0's hit for b, which
-    includes that page. Nothing will index the page here again."""
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(2 * PAGE_SIZE, seed=30)
     _cache(ranks, "a", shared)
@@ -622,7 +550,6 @@ def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
 
 
 def test_the_serial_path_stops_a_follower_that_lost_a_page_of_rank_0s_hit():
-    """Nothing is in flight on the serial path, so no commit can still index the page."""
     follower, head = _lost_page()
     engine = _engine(follower)
     scheduler = MicroScheduler(
@@ -635,8 +562,6 @@ def test_the_serial_path_stops_a_follower_that_lost_a_page_of_rank_0s_hit():
 
 
 def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
-    """Of the steps before the head, only the step in flight may still index the page, so the
-    follower waits until that step commits, and then stops."""
     follower, head = _lost_page()
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
@@ -652,10 +577,6 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
 
 
 def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monkeypatch):
-    """Both ranks have allocated the same number of times, but on different pages, and nothing
-    fails until a sharded prefill gathers the wrong slots. So the follower checks before each
-    step, and before adopting the step's hit, since a rank out of step may wait on that hit for
-    good."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     ranks = leader, follower = _manager(0), _manager(1)
     x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
@@ -666,7 +587,6 @@ def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monke
     _run(leader, "x", x)
     _run(leader, "y", y)
     _run(follower, "y", y)
-    # admitted and not committed, so this rank's index doesn't hold x yet
     _step(follower, "x", len(x))
     assert leader.page_trail()[0] == follower.page_trail()[0]
 
@@ -689,8 +609,6 @@ def test_with_the_debug_flag_off_no_trail_is_kept_or_sent(monkeypatch):
 
 
 def test_a_pool_without_the_tp_cache_keeps_no_trail(monkeypatch):
-    """A pool without the TP cache may offload to the host. A reload allocates when rank 0 checks
-    readiness and when a follower replays the move, so the two trails would not match."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     assert _manager(0)._arena.trail is not None
     assert _manager(0, opt_in=False)._arena.trail is None

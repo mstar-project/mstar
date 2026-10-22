@@ -31,10 +31,7 @@ class PrefixIndex:
         self._clock = 0
 
     def lookup(self, keys: Sequence[bytes], stamp: bool = True) -> list[int]:
-        """Walk ``keys`` from the root and stop at the first one not indexed.
-
-        ``stamp=False`` leaves recency alone, for a caller that stamps the hit
-        later with ``touch``."""
+        """Walk ``keys`` from the root and stop at the first one not indexed."""
         pages: list[int] = []
         for key in keys:
             page = self._by_key.get(key)
@@ -46,7 +43,6 @@ class PrefixIndex:
         return pages
 
     def touch(self, pages: Sequence[int]) -> None:
-        """Stamp ``pages`` as just used, as a hit does."""
         pages = [page for page in pages if self._key[page] is not None]
         if pages:
             # one stamp for the whole run, so recency stays monotone along it

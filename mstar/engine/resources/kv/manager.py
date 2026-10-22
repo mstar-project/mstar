@@ -76,7 +76,6 @@ class PageArena:
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
-    # None unless `_DEBUG_ASSERTS` is on for a pool with prefix_cache_tp on. See `Resource.page_trail`.
     trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
@@ -603,8 +602,8 @@ class KVManager(AttentionResource):
         self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
-        # Above one rank, key every walk except the decode walk, named[1]. Each rank keys generated tokens
-        # from its own read of the sampled ids, which can land at a different step on each rank.
+        # Above one rank the decode walk, `named[1]`, isn't keyed, since each rank reads its sampled ids
+        # at a different step.
         self._keyed_walks = {
             label: frozenset(
                 walk for walk in (named[:1] + named[2:] if self._world_size > 1 else named)
@@ -668,8 +667,8 @@ class KVManager(AttentionResource):
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
             if self._world_size > 1:
-                # Above one rank only a lease from `lease_cached_prefix` or `adopt_cached_prefix` answers.
-                # A lookup here would see this rank's commits since rank 0 sent the step.
+                # Above one rank, use only the lease taken when rank 0 sent the step. A lookup now
+                # would also see this rank's later commits.
                 return self._answer(label, chain, 0)
         if not self._lease(rid, node_name, label, stream, chain):
             return None
@@ -718,8 +717,7 @@ class KVManager(AttentionResource):
             return True
 
     def _root(self, chain: PrefixChain) -> None:
-        """Hash the chain's keys and image ends under the root into `chain.rooted` and
-        `chain.rooted_ends`, once. Called without the lock held."""
+        """Fill `chain.rooted` and `chain.rooted_ends` once. Called without the lock held."""
         with self._lock:
             if chain.rooted is not None:
                 return
@@ -735,8 +733,7 @@ class KVManager(AttentionResource):
             chain.rooted, chain.rooted_ends = rooted, ends
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
-        """The lease is returned with every step until `admit` converts it. A walk the cache served
-        whole leaves the lease in place for the walks after it."""
+        """Returns the same lease with every step until `admit` converts it."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -759,14 +756,10 @@ class KVManager(AttentionResource):
     def adopt_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did.
-
-        False while this rank's index lacks some of them and ``caught_up`` is False, since its commit
-        of the step that wrote them can lag rank 0's. Once ``caught_up`` is True nothing will index
-        them, so it raises on a page still missing rather than leave the follower waiting for ever.
-        Raises too if the index holds other pages under those keys: a sharded prefill gathers cache
-        slots across ranks, so the pages have to agree, not only their count.
-        """
+        """False while some pages are missing and ``caught_up`` is False, since this rank's commit of
+        the step that wrote them can lag rank 0's. Once ``caught_up`` nothing will index a missing
+        page, so it raises. It raises too if the index holds other pages under those keys,
+        since a sharded prefill gathers cache slots across ranks."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -797,9 +790,8 @@ class KVManager(AttentionResource):
             return True
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
-        """Does nothing at one rank, where only `resolve_cached_prefix` takes a lease and preparing the
-        step again reuses it. A lease also stays once the cache has served one of the stream's walks,
-        since that walk's KV lives only in the lease."""
+        """Does nothing at one rank, where preparing the step again reuses the lease. A lease also
+        stays once the cache has served one of the stream's walks, whose KV lives only in the lease."""
         if self._world_size == 1:
             return
         with self._lock:
@@ -984,8 +976,7 @@ class KVManager(AttentionResource):
         """Cache the page up to the image's end. When the text after the image changes,
         a repeat can still reuse it instead of running the walk again."""
         if self._world_size > 1:
-            # Serving a cached image end takes a page on rank 0 alone, evicting one if none is free,
-            # so the ranks' pages would differ.
+            # Serving a cached image end takes a page on rank 0 alone, so the ranks' pages would differ.
             return
         page = end // self.config.page_size
         rooted = fingerprint(self._prefix_root, key)
@@ -1419,8 +1410,8 @@ class KVManager(AttentionResource):
         overrides = self._overrides[rid]
         needed_labels = overrides.get_labels(node_name, graph_walk)
         rooted: dict[str, list[bytes]] = {}
-        # At one rank only. Above one rank a readiness check runs at a different step on each rank,
-        # so the check must neither stamp nor take cached pages.
+        # Above one rank each rank runs this check at a different step, so it must not stamp or take
+        # cached pages.
         if self._index is not None and overrides.prefix_cache and self._world_size == 1:
             # hashed here, as `resolve_cached_prefix` hashes outside its lock
             for label, keys in (overrides.prefix_keys or {}).items():
@@ -2362,8 +2353,8 @@ class KVManager(AttentionResource):
                         continue
                     stream.stored_len += segment.span
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
-                        # above one rank a converted lease is stamped here, not at lookup: every rank
-                        # commits in step order, so their indexes age alike and evict alike
+                        # Above one rank a hit is stamped at commit, which every rank runs in step order,
+                        # so every rank evicts the same pages.
                         self._index.touch(stream.page_indices[:stream.chain.cursor])
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False

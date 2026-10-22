@@ -159,8 +159,8 @@ class Resource(ABC):
         return
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
-        """On rank 0 of a TP node, lease the request's cached prefix as its step is sent, and
-        return the leased pages for the other ranks to adopt. None where nothing is leased."""
+        """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
+        return the pages, or None."""
         return None
 
     def adopt_cached_prefix(

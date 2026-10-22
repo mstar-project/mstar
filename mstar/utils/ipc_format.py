@@ -195,7 +195,6 @@ class ScheduleTPNode(MessageBody):
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
     prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
-    # under KV debug asserts: each pool's page allocations on rank 0 so far, as (count, hash)
     page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 

@@ -1666,7 +1666,6 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
-        # rank 0's prefix-cache leases: the followers take the same pages before they build it
         prefix_hits = engine.decide_cached_prefix(node_batch)
         page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
@@ -2481,8 +2480,6 @@ class Worker:
         ``scheduled_batch``, already pruned of the dropped rids, while the undo
         targets exactly those dropped rids. The flag is cleared elsewhere
         (``_clear_in_flight_flag``), on paths with no stage to settle.
-
-        On a TP node a failed speculation also gives back the cached-prefix leases this rank took for its step.
         """
         batch = speculation.scheduled_batch
         rid_to_wg = batch.request_to_worker_graph if success else {}
@@ -2991,9 +2988,8 @@ class Worker:
                 return outputs, None
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
-                # Build the head even when N's verdict voids it. The leader
-                # pre-plans every head it sends, and this rank's pages have to
-                # move as the leader's do.
+                # Build the head even when N's verdict voids it, since the leader pre-plans every
+                # head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)

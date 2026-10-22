@@ -425,8 +425,8 @@ class MicroScheduler:
             engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
             return engine.adopt_cached_prefix(head, caught_up)
         except Exception as exc:
-            # Any error here repeats on every pass over the same head, and failing this step's
-            # requests would leave the other ranks in its collective for good.
+            # The error would repeat on every pass over this head, and failing its requests would
+            # leave the other ranks stuck in its collective.
             raise TPDivergence(f"TP ranks diverged: {exc}") from exc
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:

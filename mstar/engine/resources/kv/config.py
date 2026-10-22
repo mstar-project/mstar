@@ -89,8 +89,6 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
-    # Above one rank the prefix cache also needs this. Rank 0 decides each hit and the other
-    # ranks adopt it, so every rank's allocator must match rank 0's.
     prefix_cache_tp: bool = False
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
     kv_lora_rank: int | None = None

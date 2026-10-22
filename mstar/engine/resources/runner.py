@@ -100,8 +100,6 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
-        # Likewise the page trails. Only a resource under debug asserts keeps one, so otherwise
-        # this sweep is empty.
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
         ]
@@ -146,7 +144,6 @@ class StepRunner:
     def lease_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> dict[str, list[int]]:
-        """Each resource's lease of the request's cached prefix, by resource key."""
         leases = {}
         for key in self._sweep(self._node_order, self._order, node_name):
             pages = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
@@ -157,7 +154,6 @@ class StepRunner:
     def adopt_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[int]], caught_up: bool,
     ) -> bool:
-        """Take rank 0's lease on each resource in ``leases``. False until every resource holds its lease."""
         ready = True
         for key, pages in leases.items():
             ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
@@ -168,7 +164,6 @@ class StepRunner:
             self._resources[key].release_cached_prefix(rid, node_name, graph_walk)
 
     def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
-        """Each resource's trail of page allocations, by resource key."""
         return {
             key: self._resources[key].page_trail()
             for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
