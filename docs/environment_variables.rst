@@ -468,7 +468,7 @@ Worker scheduling
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
-     - ``1``
+     - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
        it extends the requests' prefix chains (the per-page keys the prefix
        cache is indexed by), one extend per request per batch of steps instead
@@ -480,7 +480,7 @@ Worker scheduling
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
    * - ``MSTAR_KV_PINNED_INDPTRS``
-     - ``0``
+     - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
        kv_indices, last_page_len) into a ring of page-locked host buffers and
        the decode wrapper copies the indices straight into its captured
@@ -490,7 +490,7 @@ Worker scheduling
        at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
        event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
-     - ``0``
+     - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's
        plan when the batch is the same rows in the same order and nothing
        but that step's commit touched the streams: every length is one
@@ -502,7 +502,7 @@ Worker scheduling
        until measured. ``0`` plans every step from the streams. ``2`` runs
        both and logs a difference, for checking a run.
    * - ``MSTAR_DEVICE_LOOPBACK``
-     - ``1``
+     - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:
        the sampler writes each request's last token to a slot-addressed
        master and the next step reads its input ids from it, so the worker
@@ -515,19 +515,20 @@ Worker scheduling
        synchronous host-to-device copy per step. ``0`` keeps every node on
        the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
-     - ``0``
+     - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured decode step builds its rotary tables inside the graph from
        the position resource's planned positions instead of staging them.
        Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
        postprocess wins). Padding rows then address a trash master row and
-       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
-       requests (default 4096, a hard cap with this on). Only with the device
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
+       ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
+       cap with this on). Only with the device
        loop-back on. An experiment knob; measure before turning it on.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset

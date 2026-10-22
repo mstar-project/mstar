@@ -57,6 +57,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.utils import knobs
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -380,6 +381,8 @@ class Worker:
         dist_init_method=None,
         status_interval_s: float | None = None,
     ):
+        # before anything below builds a resource or a submodule that reads one
+        knobs.configure((model_config or {}).get("knobs"))
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
