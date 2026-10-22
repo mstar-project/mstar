@@ -21,6 +21,11 @@ from typing import Any, Optional
 
 import torch
 from torch import nn
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -173,6 +178,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
+    marks_dynamic_dims = True
+
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -185,7 +192,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        """Extract pixel_values, grid_thw, and compute cu_seqlens.
+        """Extract pixel_values and grid_thw, and build interp_indices, interp_weights,
+        position_ids and cu_seqlens from the grid.
 
         ``pixel_values`` and ``image_grid_thw`` are produced by
         ``Qwen3OmniModel.process_prompt`` from the raw ``image_inputs``
@@ -208,12 +216,24 @@ class VisionEncoderSubmodule(NodeSubmodule):
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)  # (1, 3)
 
-        return NodeInputs(
-            tensor_inputs={
-                "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
-            }
+        # Built here and not in the compiled forward, whose `.tolist()` of the grid would
+        # pin the patch count and compile every image size again.
+        encoder = self.vision_encoder
+        interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+            grid_thw, num_grid_per_side=encoder.num_grid_per_side, mode=encoder.interpolation_mode,
+            align_corners=encoder.interpolation_align_corners, spatial_merge_size=encoder.spatial_merge_size,
         )
+        tensor_inputs = {
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+            "interp_indices": interp_indices,
+            "interp_weights": interp_weights,
+            "position_ids": get_vision_position_ids(grid_thw, encoder.spatial_merge_size),
+            "cu_seqlens": get_vision_cu_seqlens(grid_thw),
+        }
+        for name in ("pixel_values", "interp_indices", "interp_weights", "position_ids"):
+            torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
@@ -240,6 +260,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
         encoder_output = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
+            # the patch count. An image is one segment this long, and no video frame's segment is longer.
+            max_seqlen=pixel_values.shape[0],
+            **kwargs,
         )
 
         if isinstance(encoder_output, tuple):
