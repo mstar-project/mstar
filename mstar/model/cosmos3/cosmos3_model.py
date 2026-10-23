@@ -818,7 +818,7 @@ class Cosmos3Model(Model):
                     GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
                 ],
             ),
-            max_iters=self.config.max_position_embeddings,
+            max_iters=self.config.reasoner.max_position_embeddings,
             outputs=[],
         )
         return {
