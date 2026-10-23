@@ -201,8 +201,14 @@ def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
         if n > 1:
             out[r0:r0 + n] = sparse_mla.select_rows(
                 lambda a, b, req=req: _select_rows(q, w, view, ctx, req, a, b),
-                r0, r0 + n, ctx.width, q.device, group)
+                r0, r0 + n, ctx.width, q.device, group, _request_pages(ctx, req))
     return out
+
+
+def _request_pages(ctx: DSAContext, req: int) -> sparse_mla.RequestPages:
+    starts = ctx.host_page_start
+    end = starts[req + 1] if req + 1 < len(starts) else ctx.pages.numel()
+    return sparse_mla.RequestPages(ctx.pages[starts[req]:end], ctx.page_size)
 
 
 def _select_rows(q, w, view, ctx, req, r0, r1):
