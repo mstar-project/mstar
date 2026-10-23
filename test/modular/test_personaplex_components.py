@@ -1,8 +1,9 @@
-"""T5/T6 fixture-free structure checks; T5/T13-LM compare against NVIDIA fixtures.
+"""Weight map, layer numerics and LM replay checks for PersonaPlex.
 
-R-tier tests replay fixtures recorded by ``test/personaplex/reference_oracle.py``
-from NVIDIA's own ``LMModel``/``LMGen`` with random weights (fixtures/personaplex/README.rst).
-They establish algorithmic equivalence on synthetic weights, not checkpoint or GPU parity.
+Fixture-free tests check structure and numerics on CPU. Fixture-backed tests replay
+recordings made by ``test/personaplex/reference_oracle.py`` from NVIDIA's own
+``LMModel``/``LMGen`` with random weights (fixtures/personaplex/README.rst). They
+establish algorithmic equivalence on synthetic weights, not checkpoint or GPU parity.
 """
 
 import hashlib
@@ -78,15 +79,15 @@ def test_reference_fixture_loader_rejects_changed_tensor_and_source_pin():
         verify_reference_fixture({**data, "source_sha": "0" * 40})
 
 
-# --------------------------------------------------------------------------- T5 (fixture-free part)
+# --------------------------------------------------------------------------- weight map and size (fixture-free)
 
 
-def test_t5_full_size_native_lm_matches_published_parameter_count():
+def test_full_size_native_lm_matches_published_parameter_count():
     with torch.device("meta"):
         lm = PersonaPlexLM(cfg.LMArchConfig())
     manifest = reference_manifest(lm)
     assert len(manifest) == 475
-    # HF's published BF16 count for nvidia/personaplex-7b-v1 (worklog §2 R8).
+    # HF's published BF16 count for nvidia/personaplex-7b-v1.
     assert sum(math.prod(shape) for shape in manifest.values()) == 8_371_408_896
     assert manifest["depformer.layers.0.self_attn.in_proj_weight"] == [16 * 3 * 1024, 1024]
     assert manifest["depformer.layers.5.gating.15.linear_in.weight"] == [2 * 2816, 1024]
@@ -96,7 +97,7 @@ def test_t5_full_size_native_lm_matches_published_parameter_count():
     assert len([k for k in manifest if k.startswith("depformer_emb.")]) == 15
 
 
-def test_t5_key_map_round_trips_and_routes_depth_keys():
+def test_key_map_round_trips_and_routes_depth_keys():
     lm = PersonaPlexLM(TINY)
     for name, _ in lm.named_parameters():
         assert remap_lm_key(reference_lm_key(name)) == name
@@ -106,7 +107,7 @@ def test_t5_key_map_round_trips_and_routes_depth_keys():
     assert remap_lm_key("emb.15.weight") == "temporal.emb.15.weight"
 
 
-def test_t5_strict_loader_rejects_missing_extra_duplicate_and_misshapen_keys():
+def test_strict_loader_rejects_missing_extra_duplicate_and_misshapen_keys():
     pytest.importorskip("safetensors", reason="mstar.model.loader imports safetensors")
     source = _tiny_lm(1)
     target = PersonaPlexLM(TINY)
@@ -125,10 +126,10 @@ def test_t5_strict_loader_rejects_missing_extra_duplicate_and_misshapen_keys():
                                  ("out_norm.alpha", torch.ones(TINY.dim))])
 
 
-# --------------------------------------------------------------------------- T6 (fixture-free)
+# --------------------------------------------------------------------------- layer numerics (fixture-free)
 
 
-def test_t6_rope_rotates_adjacent_pairs_like_complex_multiplication():
+def test_rope_rotates_adjacent_pairs_like_complex_multiplication():
     torch.manual_seed(0)
     q, k = torch.randn(2, 5, 3, 8), torch.randn(2, 5, 3, 8)
     positions = torch.arange(7, 12)
@@ -139,14 +140,14 @@ def test_t6_rope_rotates_adjacent_pairs_like_complex_multiplication():
     for x, out in ((q, qo), (k, ko)):
         expected = torch.view_as_real(torch.view_as_complex(x.double().unflatten(-1, (4, 2))) * phase).flatten(-2)
         torch.testing.assert_close(out.double(), expected, rtol=1e-5, atol=1e-5)
-    # Half-split (NeoX) RoPE rotates (i, i + D/2) instead; the layout is load-bearing (worklog D10).
+    # Half-split (NeoX) RoPE rotates (i, i + D/2) instead; the layout is load-bearing.
     angle = (positions[:, None].double() * freqs)[:, None]
     x1, x2 = q.double()[..., :4], q.double()[..., 4:]
     neox = torch.cat((x1 * angle.cos() - x2 * angle.sin(), x2 * angle.cos() + x1 * angle.sin()), -1)
     assert not torch.allclose(qo.double(), neox, atol=1e-3)
 
 
-def test_t6_rope_keeps_bfloat16_and_computes_in_fp32():
+def test_rope_keeps_bfloat16_and_computes_in_fp32():
     q = torch.randn(1, 3, 2, 8, dtype=torch.bfloat16)
     qo, _ = apply_rope_adjacent(q, q, torch.arange(3), 10000)
     ref, _ = apply_rope_adjacent(q.float(), q.float(), torch.arange(3), 10000)
@@ -154,7 +155,7 @@ def test_t6_rope_keeps_bfloat16_and_computes_in_fp32():
     assert torch.equal(qo, ref.to(torch.bfloat16))
 
 
-def test_t6_rms_norm_is_fp32_with_eps_1e8_and_broadcast_alpha():
+def test_rms_norm_is_fp32_with_eps_1e8_and_broadcast_alpha():
     norm = RMSNormF32(6, cfg.NORM_EPS)
     assert norm.alpha.shape == (1, 1, 6) and norm.eps == 1e-8
     with torch.no_grad():
@@ -167,7 +168,7 @@ def test_t6_rms_norm_is_fp32_with_eps_1e8_and_broadcast_alpha():
     torch.testing.assert_close(y.double(), expected.to(torch.bfloat16).double(), rtol=1e-2, atol=1e-2)
 
 
-def test_t6_gating_activates_first_half_and_embedding_minus_one_is_zero():
+def test_gating_activates_first_half_and_embedding_minus_one_is_zero():
     gating = ActivationGating(4, 3)
     x = torch.randn(2, 4)
     h = x @ gating.linear_in.weight.T
@@ -179,7 +180,7 @@ def test_t6_gating_activates_first_half_and_embedding_minus_one_is_zero():
     assert torch.equal(out[0, 1:], emb.weight[[0, 4]])
 
 
-def test_t6_embed_codes_sums_sixteen_audio_streams_then_text():
+def test_embed_codes_sums_sixteen_audio_streams_then_text():
     lm = _tiny_lm()
     codes = torch.randint(0, 2048, (2, 17, 3))
     codes[0, 5, 1] = -1
@@ -190,7 +191,7 @@ def test_t6_embed_codes_sums_sixteen_audio_streams_then_text():
         lm.temporal.embed_codes(codes[:, :16])
 
 
-def test_t6_temporal_streaming_equals_one_shot_causal_prefill():
+def test_temporal_streaming_equals_one_shot_causal_prefill():
     lm = _tiny_lm()
     x = torch.randn(2, 6, TINY.dim)
     full = lm.temporal.forward_embeddings(x, DenseTemporalCache(TINY.num_layers, TINY.rope_theta))
@@ -209,13 +210,13 @@ def test_t6_temporal_streaming_equals_one_shot_causal_prefill():
     assert not torch.allclose(other[0][:, -1], full[0][:, -1])
 
 
-def test_t6_depth_attention_masks_step_zero_only_at_the_last_step():
+def test_depth_attention_masks_step_zero_only_at_the_last_step():
     assert [depth_attention_start(step) for step in range(16)] == [0] * 15 + [1]
 
 
 @torch.no_grad()
 @pytest.mark.parametrize("step", [0, 7, 14, 15])
-def test_t6_depth_attention_ignores_unwritten_and_expired_slots(step):
+def test_depth_attention_ignores_unwritten_and_expired_slots(step):
     """The fixed-capacity reference mask must hide dirty future slots and expired step 0."""
     torch.manual_seed(24)
     attention = DepformerAttention(dim=16, num_heads=2, steps=16).eval()
@@ -239,7 +240,7 @@ def _frame_inputs(batch=2, seed=3):
     return text, hidden, target, provided
 
 
-def test_t6_depformer_state_resets_every_frame_even_with_dirty_scratch():
+def test_depformer_state_resets_every_frame_even_with_dirty_scratch():
     lm = _tiny_lm()
     args = _frame_inputs()
     tokens, logits = lm.depth.run_frame(*args, _greedy, return_logits=True)
@@ -250,7 +251,7 @@ def test_t6_depformer_state_resets_every_frame_even_with_dirty_scratch():
     torch.testing.assert_close(logits, logits2)
 
 
-def test_t6_depformer_uses_step_weights_and_feeds_forced_tokens():
+def test_depformer_uses_step_weights_and_feeds_forced_tokens():
     lm = _tiny_lm()
     text, hidden, target, provided = _frame_inputs()
     _, base = lm.depth.run_frame(text, hidden, target, provided, _greedy, return_logits=True)
@@ -275,7 +276,7 @@ def test_t6_depformer_uses_step_weights_and_feeds_forced_tokens():
     assert torch.equal(tokens, forced_logits.argmax(-1))
 
 
-# --------------------------------------------------------------------------- T5 / T13-LM (NVIDIA fixtures)
+# ------------------------------------------------------------------- manifest and LM replay vs NVIDIA (fixtures)
 
 
 @pytest.fixture(scope="module")
@@ -286,7 +287,7 @@ def reference_manifest_fixture():
     return data
 
 
-def test_t5_native_keys_and_shapes_equal_nvidia_lmmodel_manifest(reference_manifest_fixture):
+def test_native_keys_and_shapes_equal_nvidia_lmmodel_manifest(reference_manifest_fixture):
     with torch.device("meta"):
         lm = PersonaPlexLM(cfg.LMArchConfig.from_reference_kwargs(reference_manifest_fixture["lm_kwargs"]))
     native = reference_manifest(lm)
@@ -314,7 +315,7 @@ def _close(actual, expected, what):
 
 
 @torch.no_grad()
-def test_t13_temporal_reference_cache_shape_preserves_shared_prefix_bits(reference_lm):
+def test_temporal_reference_cache_shape_preserves_shared_prefix_bits(reference_lm):
     """Isolate temporal numerics using NVIDIA inputs and a matching runtime.
 
     This is a component check, not a free-running trajectory comparison. A
@@ -345,7 +346,7 @@ def test_t13_temporal_reference_cache_shape_preserves_shared_prefix_bits(referen
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("mode", ["token_priming", "embedding_replay"])
 @torch.no_grad()
-def test_t13_lm_greedy_lmgen_replay_matches_nvidia(reference_lm, batch, mode):
+def test_lm_greedy_lmgen_replay_matches_nvidia(reference_lm, batch, mode):
     """Native cache + temporal + depformer, run greedy end to end, against NVIDIA's LMGen.
 
     Each forward compares the model input, hidden state, text logits, depth

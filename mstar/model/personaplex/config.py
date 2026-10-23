@@ -21,11 +21,12 @@
 # DEALINGS IN THE SOFTWARE.
 #
 # Adapted for M* on 2026-09-28 from NVIDIA/personaplex at the pin below:
-# source-cited constants and the PR1 context-budget check.
+# source-cited constants and the context-budget check.
 """Constants verified against NVIDIA/personaplex at the pin below.
 
 [PP] paths are relative to ``moshi/moshi/`` at that commit. Derived values
-state their formula; the public HF config is only a stub (§2 R21).
+state their formula; the checkpoint's ``config.json`` is a 56-byte stub, so
+nothing is read from it.
 """
 
 from dataclasses import dataclass
@@ -175,11 +176,11 @@ AUDIO_TOP_K = 250  # [PP] models/lm.py:654; offline.py:363-374
 
 
 def validate_context_budget(*, voice_embeddings: int, text_tokens: int, user_frames: int) -> int:
-    """Count temporal forwards (§4.5), excluding the no-forward priming step.
+    """Count temporal forwards, excluding the no-forward priming step.
 
     Voice replay runs once per embedding ([PP] models/lm.py:1031-1038),
     followed by two silence blocks, text and user frames (offline.py:241-276).
-    PR1 caps forwards at MAX_TEMPORAL_FORWARDS, the longest span over which the
+    Requests are capped at MAX_TEMPORAL_FORWARDS, the longest span over which the
     reference's ring KV equals M*'s dense causal attention.
     """
     counts = (voice_embeddings, text_tokens, user_frames)

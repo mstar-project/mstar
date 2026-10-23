@@ -1,4 +1,4 @@
-"""Dummy-mode tests for the PersonaPlex model contract (T8-T10, T14).
+"""Dummy-mode tests for the PersonaPlex model contract.
 
 No weights, GPU, network or gated assets. The model is built through its real
 constructor in dummy mode; the SentencePiece tokenizer is replaced by a stub.
@@ -74,10 +74,10 @@ def _signals(n_emb=4, n_text=9, samples=1920 * 20 + 7):
     }
 
 
-# --------------------------------------------------------------------------- T9 walks and schedule
+# --------------------------------------------------------------------------- walks and schedule
 
 
-def test_t9_walks_instantiate_with_one_lm_per_walk_and_async_off():
+def test_walks_instantiate_with_one_lm_per_walk_and_async_off():
     walks = _model().get_graph_walk_graphs()
     assert set(walks) == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS}
     assert set(walks[cfg.ENCODE_USER_AUDIO_WALK].get_nodes()) == {"MimiEncoder"}
@@ -89,13 +89,13 @@ def test_t9_walks_instantiate_with_one_lm_per_walk_and_async_off():
     assert _model().nodes == ["LM", "MimiDecoder", "MimiEncoder"]
 
 
-def test_t9_lm_loop_backs_are_consumed_and_outputs_routed():
+def test_lm_loop_backs_are_consumed_and_outputs_routed():
     walks = _model().get_graph_walk_graphs()
     for walk, loop_backs in ((cfg.CONDITIONING_WALK, {"lm_state"}),
                              (cfg.GENERATE_WALK, {"lm_state", "agent_frame", "text_frame"})):
         lm = walks[walk].get_nodes()["LM"]
         assert {e.name for e in lm.outputs if e.next_node == "LM"} == loop_backs
-        assert loop_backs <= set(lm.input_names)  # consumed, never rejected (§3 M3)
+        assert loop_backs <= set(lm.input_names)  # consumed, never rejected
     cond = walks[cfg.CONDITIONING_WALK]
     assert isinstance(cond, Loop) and cond.max_iters == cfg.MAX_TEMPORAL_FORWARDS
     assert [(e.name, e.next_node, e.persist) for e in cond.outputs] == [("lm_state", EMPTY_DESTINATION, True)]
@@ -121,7 +121,7 @@ def _step(model, metadata, persist):
     return model.get_partition_forward_pass_args("default", metadata, persist, incoming_connections=[])
 
 
-def test_t9_schedule_encode_condition_generate_done_with_persisted_state():
+def test_schedule_encode_condition_generate_done_with_persisted_state():
     model = _model()
     signals = _signals()
     args = model.get_initial_forward_pass_args("default", ["audio"], ["audio", "text"], signals)
@@ -156,14 +156,14 @@ def test_t9_schedule_encode_condition_generate_done_with_persisted_state():
     assert done.request_done and done.inputs == []
 
 
-def test_t9_audio_only_requests_use_the_walk_without_text_emission():
+def test_audio_only_requests_use_the_walk_without_text_emission():
     args = _model().get_initial_forward_pass_args("default", ["audio"], ["audio"], _signals())
     assert args.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_AUDIO_WALK
 
 
 @pytest.mark.parametrize("with_text,reverse_ready", [(False, False), (True, False), (True, True)],
                          ids=["audio-only", "audio-plus-text", "audio-read-first"])
-def test_t9_data_worker_emits_requested_modalities(with_text, reverse_ready):
+def test_data_worker_emits_requested_modalities(with_text, reverse_ready):
     """Exercise transfer setup and the real edge-name to ResultChunk boundary.
 
     The graph runtime sends ``ResultTensors.modality = edge.output_modality``;
@@ -227,7 +227,7 @@ def test_t9_data_worker_emits_requested_modalities(with_text, reverse_ready):
     assert set(worker.tensor_manager.released) == set(tensors)
 
 
-def test_t9_conductor_backstops_budget_and_missing_inputs():
+def test_conductor_backstops_budget_and_missing_inputs():
     model = _model()
     with pytest.raises(ValueError, match="context budget"):
         model.get_initial_forward_pass_args("default", ["audio"], ["audio"],
@@ -240,7 +240,7 @@ def test_t9_conductor_backstops_budget_and_missing_inputs():
         model.get_initial_forward_pass_args("default", ["audio"], ["audio"], signals)
 
 
-def test_t9_worker_graphs_from_yaml_keep_accumulated_edges():
+def test_worker_graphs_from_yaml_keep_accumulated_edges():
     model = _model()
     graphs = model.get_worker_graphs(CONFIG_PATH)
     assert {walk for wg in graphs for walk in wg.graph_walks} == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS}
@@ -268,7 +268,7 @@ def _personaplex_runtime(tensor_manager):
     return runtime, rid
 
 
-def test_t9_python_graph_runtime_admits_personaplex_generate_walk():
+def test_python_graph_runtime_admits_personaplex_generate_walk():
     """The new runtime must accept the split PersonaPlex worker graphs."""
     runtime, rid = _personaplex_runtime(_Comm())
     assert runtime.get_rid_string(rid) == "request"
@@ -278,7 +278,7 @@ def test_t9_python_graph_runtime_admits_personaplex_generate_walk():
     runtime.remove_request(rid)
 
 
-def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
+def test_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
     """Do not defer text backed by the worker's reused stop-check host buffer.
 
     Real Python graph routing and SHM: emulate the GPU worker's borrowed
@@ -358,7 +358,7 @@ def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
     assert [(edge.name, edge.output_modality) for edge in emitted] == [("audio_output", "audio")]
 
 
-# --------------------------------------------------------------------------- T8 accumulated outputs
+# --------------------------------------------------------------------------- accumulated outputs
 
 
 class _Comm:
@@ -464,7 +464,7 @@ def _generate_inputs():
 
 
 @pytest.mark.parametrize("finish_after", [1, 7, 25])
-def test_t8_generate_accumulates_frames_in_order_and_completes(finish_after):
+def test_generate_accumulates_frames_in_order_and_completes(finish_after):
     walk = _model().get_graph_walk_graphs()[cfg.GENERATE_WALK]
     out, runs, refs = _drive(walk, _generate_inputs(), finish_after=finish_after)
     assert runs == {"LM": finish_after, "MimiDecoder": 1}
@@ -480,7 +480,7 @@ def test_t8_generate_accumulates_frames_in_order_and_completes(finish_after):
     assert refs[("lm_state", finish_after - 1)] == 0 and refs[("audio_output", 0)] == 0
 
 
-def test_t8_generate_runs_to_max_iters_without_a_finish_signal():
+def test_generate_runs_to_max_iters_without_a_finish_signal():
     model = _model()
     walk = model._generate_walk(with_text=False)
     walk.sections[0].max_iters = 5
@@ -490,13 +490,13 @@ def test_t8_generate_runs_to_max_iters_without_a_finish_signal():
     assert [name for name, _ in out["client"]] == ["audio_output"]
 
 
-def test_t8_final_iteration_accumulated_tensors_are_released():
+def test_final_iteration_accumulated_tensors_are_released():
     walk = _model().get_graph_walk_graphs()[cfg.GENERATE_WALK]
     _, _, refs = _drive(walk, _generate_inputs(), finish_after=7)
     assert refs[("agent_frame", 6)] == 0 and refs[("text_frame", 6)] == 0
 
 
-def test_t8_conditioning_persists_only_the_final_lm_state():
+def test_conditioning_persists_only_the_final_lm_state():
     walk = _model().get_graph_walk_graphs()[cfg.CONDITIONING_WALK]
     initial = [GraphEdge(next_node="LM", name=n, tensor_info=["external"])
                for n in ("voice_embeddings", "voice_cache", "persona_tokens")]
@@ -508,7 +508,7 @@ def test_t8_conditioning_persists_only_the_final_lm_state():
     assert {k: r for k, r in refs.items() if r and k != ("lm_state", 24)} == {}
 
 
-# --------------------------------------------------------------------------- T10 request validation
+# --------------------------------------------------------------------------- request validation
 
 
 _UNSET = object()
@@ -538,7 +538,7 @@ def _fake_torchcodec(monkeypatch, samples: torch.Tensor, *, header_seconds=_UNSE
     return seen
 
 
-def test_t10_load_audio_keeps_channel_zero_at_24khz(monkeypatch):
+def test_load_audio_keeps_channel_zero_at_24khz(monkeypatch):
     stereo = torch.stack((torch.full((5000,), 0.25), torch.full((5000,), -0.75)))
     seen = _fake_torchcodec(monkeypatch, stereo)
     loaded = _model().load_audio("in.wav", "cpu")
@@ -590,7 +590,7 @@ def _request(model, *, samples=1920 * 3, prompt=None, outputs=("audio", "text"),
                                 **kwargs)
 
 
-def test_t10_process_prompt_builds_conditioning_tensors(tmp_path):
+def test_process_prompt_builds_conditioning_tensors(tmp_path):
     model = _model(tmp_path, voice_frames=5)
     out = _request(model, text_prompt="Be kind.")
     assert set(out) == {"voice_embeddings", "voice_cache", "persona_tokens"}
@@ -618,12 +618,12 @@ def test_t10_process_prompt_builds_conditioning_tensors(tmp_path):
     (dict(greedy="yes"), "greedy"),
     (dict(samples=1920 * 2966), "context budget"),
 ])
-def test_t10_process_prompt_rejects_bad_requests(tmp_path, kwargs, match):
+def test_process_prompt_rejects_bad_requests(tmp_path, kwargs, match):
     with pytest.raises(ValueError, match=match):
         _request(_model(tmp_path), **kwargs)
 
 
-def test_t10_process_prompt_accepts_the_budget_boundary(tmp_path):
+def test_process_prompt_accepts_the_budget_boundary(tmp_path):
     model = _model(tmp_path, voice_frames=5)
     text = len(StubTokenizer().encode(f"<system> {cfg.DEFAULT_TEXT_PROMPT} <system>"))
     frames = cfg.MAX_TEMPORAL_FORWARDS - 4 - 12 - text
@@ -632,7 +632,7 @@ def test_t10_process_prompt_accepts_the_budget_boundary(tmp_path):
         _request(model, samples=1920 * frames + 1)
 
 
-def test_t10_process_prompt_rejects_missing_or_multiple_audio(tmp_path):
+def test_process_prompt_rejects_missing_or_multiple_audio(tmp_path):
     model = _model(tmp_path)
     for tensors in ({}, {"audio_inputs": [torch.zeros(10), torch.zeros(10)]}):
         with pytest.raises(ValueError, match="exactly one user audio"):
@@ -658,13 +658,13 @@ class _Evil:
     (dict(cache=torch.full((1, 17, 4), -3, dtype=torch.long)), "outside"),
     (dict(cache=_Evil()), "cannot load"),
 ])
-def test_t10_voice_preset_validation(tmp_path, overrides, match):
+def test_voice_preset_validation(tmp_path, overrides, match):
     path = _write_voice(tmp_path / "bad.pt", **overrides)
     with pytest.raises(ValueError, match=match):
         load_voice_preset(path)
 
 
-def test_t10_voice_preset_accepts_sentinels_and_initial_tokens(tmp_path):
+def test_voice_preset_accepts_sentinels_and_initial_tokens(tmp_path):
     cache = torch.full((1, 17, 4), 2048, dtype=torch.long)
     cache[0, 0] = 32000
     cache[0, :, 3] = -2
@@ -674,10 +674,10 @@ def test_t10_voice_preset_accepts_sentinels_and_initial_tokens(tmp_path):
     assert resolve_voice_path(tmp_path, "ok.pt") == (tmp_path / "ok.pt").resolve()
 
 
-# --------------------------------------------------------------------------- T14 dummy mode and I/O
+# --------------------------------------------------------------------------- dummy mode and I/O
 
 
-def test_t14_dummy_mode_builds_without_submodules_or_network():
+def test_dummy_mode_builds_without_submodules_or_network():
     model = PersonaPlexModel(skip_weight_loading=True)
     assert model.tokenizer is None and model.model_path_hf == "nvidia/personaplex-7b-v1"
     assert all(model.get_submodule(node) is None for node in model.nodes)
@@ -693,7 +693,7 @@ def test_t14_dummy_mode_builds_without_submodules_or_network():
     assert model.get_max_output_tokens() == 2999 and model.get_autocast_dtype() is torch.bfloat16
 
 
-def test_t14_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
+def test_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
     model = _model()
     configs = model.get_request_resource_configs({}, {})
     text, depth = configs[cfg.TEXT_SAMPLER], configs[cfg.DEPTH_SAMPLER]
@@ -702,7 +702,7 @@ def test_t14_sampling_configs_default_to_reference_and_greedy_is_temperature_zer
     assert greedy[cfg.TEXT_SAMPLER].temperature == 0.0 and greedy[cfg.DEPTH_SAMPLER].temperature == 0.0
 
 
-def test_t14_postprocess_text_pieces_and_pcm16():
+def test_postprocess_text_pieces_and_pcm16():
     model = _model()
     assert model.postprocess(torch.tensor([42]), "text") == b" w42"
     assert [model.postprocess(torch.tensor([t]), "text") for t in range(4)] == [b""] * 4

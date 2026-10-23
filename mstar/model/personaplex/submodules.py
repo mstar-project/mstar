@@ -10,11 +10,11 @@ function of its inputs. Frame ``i`` of the request is:
     conditioning, then 6 + N_text + 6: silence / persona token / silence frames
     generate, j = i - conditioning:   user frame j; sample text and 16 depth codes
 
-Conditioning targets are fully provided (worklog §2 R15), so those frames skip
+Conditioning targets are fully provided (every channel is forced), so those frames skip
 the text head, depformer and samplers: NVIDIA runs them, but only to consume
 RNG, and the cache keeps the forced values either way. Whether a generate
 channel is forced is read from the cache every frame (the first one forces the
-agent acoustic codebooks, R4a).
+agent acoustic codebooks).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class ResourceTemporalBackend:
         self.attend_fn.bind_step(self.label)
 
     def rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Adjacent-pair rotation is FlashInfer's interleave=True (worklog D10).
+        # Moshi's adjacent-pair rotation ([PP] modules/rope.py) is FlashInfer's interleave=True.
         return self.pos.apply_qk(q, k, label=self.label, interleave=True, rope_theta=self.rope_theta)
 
     def attend(self, layer_idx: int, q, k, v) -> torch.Tensor:
@@ -185,7 +185,7 @@ class LMSubmodule(ARNodeSubmodule):
         provided = cache.target_provided[:, :, 0].clone()
         if conditioning:
             if not bool(provided.all()):
-                raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target (worklog R15)")
+                raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target")
             output = cache.commit(target[:, 0], target[:, 1:])
         else:
             sampled_text = _sampled_token_ids(sample_text(text_logits.float()), target[:, 0], "text sampler")
@@ -201,7 +201,7 @@ class LMSubmodule(ARNodeSubmodule):
             cache.load(frame.restore_cache)
         outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
         if not conditioning:
-            # Delay-0 channels from the previous step, delay-1 from this one (R4).
+            # Delay-0 channels from the previous step, delay-1 from this one ([PP] models/lm.py:899-952).
             outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
             # B=1 column views can report contiguous while retaining stride 17;
             # worker byte serialization requires a physical stride of one.
@@ -225,7 +225,7 @@ class LMSubmodule(ARNodeSubmodule):
     ) -> dict[str, Any]:
         del graph_walk, engine_inputs
         if len(inputs) != 1:
-            raise NotImplementedError("PersonaPlex PR1 serves batch size 1")
+            raise NotImplementedError("PersonaPlex serves batch size 1")
         return {"frame": inputs[0].kwargs["frame"]}
 
     def declare_step(
@@ -237,7 +237,7 @@ class LMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        """One causal token per request; samplers only where frames sample (T12)."""
+        """One causal token per request; samplers only where frames sample."""
         del slot_lease, piecewise_leases, kwargs
         steps = {cfg.LM_KV: KVStep(), cfg.LM_ATTN: AttentionStep(causal=True), cfg.LM_POS: PositionStep()}
         if graph_walk in GENERATE_WALKS:
@@ -293,7 +293,7 @@ class _MimiSubmodule(NodeSubmodule):
 
 
 class MimiEncoderSubmodule(_MimiSubmodule):
-    """User PCM -> ``user_audio_codes`` ``[1, 8, N_user]``, the last frame zero-padded (R16)."""
+    """User PCM -> ``user_audio_codes`` ``[1, 8, N_user]``, the last frame zero-padded ([PP] models/lm.py:131-150)."""
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         del graph_walk, kwargs

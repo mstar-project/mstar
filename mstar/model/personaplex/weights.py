@@ -3,7 +3,8 @@
 The native modules keep NVIDIA's ``LMModel`` parameter names and shapes
 ([PP] models/lm.py:279-352), so the map is a prefix route: depformer keys go
 to ``depth.``, everything else to ``temporal.``. The checkpoint already holds
-16 depth slots (worklog §2 R8), so NVIDIA's slot-copy patches
+16 depth slots (its shapes give exactly the published 8,371,408,896
+parameters), so NVIDIA's slot-copy patches
 ([PP] models/loaders.py:218-251) are not reproduced; any missing, extra,
 duplicate or misshapen key is an error.
 """

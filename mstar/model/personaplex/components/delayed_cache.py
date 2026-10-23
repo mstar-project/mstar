@@ -210,7 +210,7 @@ class DelayedTokenCache:
 
         This is the reference .pt replay operation, not a full state restore.
         The preset batch must match the live batch. Broadcasting a real B=1
-        preset into a B=2 cache is deferred; PR1 serves B=1 requests only.
+        preset into a B=2 cache is not supported; the served path runs batch size 1.
         """
         if self._prepared:
             raise RuntimeError("commit the prepared step before loading a voice cache")

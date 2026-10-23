@@ -1,4 +1,4 @@
-"""T1/T2/T4 are fixture-free CPU tests; T3 replays actual NVIDIA LMGen events."""
+"""Delayed token cache: fixture-free CPU tests, plus a replay of actual NVIDIA LMGen events."""
 
 import hashlib
 import json
@@ -29,7 +29,7 @@ def _frame(cache, *, user=None, agent=None, text=None):
     return cache.commit(*_samples(cache.cache.shape[0], offset))
 
 
-def test_t1_source_constants():
+def test_source_constants():
     assert cfg.DELAYS == (0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1)
     assert (cfg.CACHE_SIZE, cfg.MAX_DELAY, cfg.NUM_CODEBOOKS, cfg.DEP_Q) == (4, 1, 17, 16)
     assert (cfg.SAMPLE_RATE, cfg.FRAME_RATE, cfg.FRAME_SIZE, cfg.SILENCE_FRAMES) == (24000, 12.5, 1920, 6)
@@ -48,7 +48,7 @@ def test_t1_source_constants():
 
 
 @pytest.mark.parametrize("batch", [1, 2])
-def test_t2_per_stream_priming_loss(batch):
+def test_per_stream_priming_loss(batch):
     cache = DelayedTokenCache(batch)
     assert (cache.cache == cfg.UNGENERATED_TOKEN_ID).all()
     assert not cache.provided.any()
@@ -76,7 +76,7 @@ def test_t2_per_stream_priming_loss(batch):
 
 
 @pytest.mark.parametrize("batch", [1, 2])
-def test_t2_conditioning_boundary_gather_and_final_step(batch):
+def test_conditioning_boundary_gather_and_final_step(batch):
     cache = DelayedTokenCache(batch)
     # .pt replay's first embedding includes dummy token priming internally.
     for index in range(3):
@@ -133,7 +133,7 @@ def test_t2_conditioning_boundary_gather_and_final_step(batch):
     assert torch.equal(outputs[-1][:, 2:9, 0], last_audio[:, 1:8])
 
 
-def test_t2_forcing_is_per_batch_and_read_from_live_mask():
+def test_forcing_is_per_batch_and_read_from_live_mask():
     cache = DelayedTokenCache(2)
     _frame(cache)
     _frame(cache)
@@ -170,7 +170,7 @@ def test_cache_validation_and_step_lifecycle():
         cache.load(torch.zeros(2, 17, 3, dtype=torch.long))
 
 
-def test_t4_context_budget_boundary():
+def test_context_budget_boundary():
     assert (cfg.CONTEXT_FRAMES, cfg.MAX_TEMPORAL_FORWARDS) == (3000, 2999)
     assert cfg.validate_context_budget(voice_embeddings=5, text_tokens=7, user_frames=2975) == 2999
     with pytest.raises(ValueError) as exc:
@@ -182,7 +182,7 @@ def test_t4_context_budget_boundary():
 
 
 @pytest.mark.parametrize("invalid", [-1, 1.5, True])
-def test_t4_context_budget_invalid_counts(invalid):
+def test_context_budget_invalid_counts(invalid):
     with pytest.raises(ValueError, match="nonnegative integers"):
         cfg.validate_context_budget(voice_embeddings=invalid, text_tokens=1, user_frames=1)
 
@@ -224,7 +224,7 @@ def _assert_state(cache, expected, context):
 
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("mode", ["token_priming", "embedding_replay"])
-def test_t3_actual_lmgen_trace(reference_trace, batch, mode):
+def test_actual_lmgen_trace(reference_trace, batch, mode):
     case = next(c for c in reference_trace["cases"] if c["batch_size"] == batch and c["mode"] == mode)
     commits = [event for event in case["events"] if event["op"] == "commit"]
     for phase, count in (("silence_before_", 6), ("text_", 3), ("silence_after_", 6), ("user_", 20)):
@@ -263,7 +263,7 @@ def test_t3_actual_lmgen_trace(reference_trace, batch, mode):
 
 
 @pytest.mark.parametrize("batch", [1, 2])
-def test_t3_production_embedding_replay(reference_trace, batch, monkeypatch):
+def test_production_embedding_replay(reference_trace, batch, monkeypatch):
     """Drive the production helper; expected calls/states come only from LMGen.
 
     The observer calls the original prepare unchanged, so it checks the helper's

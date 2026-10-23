@@ -1,8 +1,8 @@
-"""T7 conversion/mask checks (fixture-free) and T13-Mimi against NVIDIA's streaming Mimi.
+"""Mimi weight conversion and ring mask, and whole-sequence Mimi against NVIDIA's streaming Mimi.
 
-T13-Mimi replays ``reference_mimi.pt`` from ``test/personaplex/reference_oracle.py --mode mimi``:
+The fixture-backed tests replay ``reference_mimi.pt`` from ``test/personaplex/reference_oracle.py --mode mimi``:
 a shrunken random Mimi run one 1920-sample frame at a time by NVIDIA's code. Synthetic
-weights only; the real ``tokenizer-e351c8d8-checkpoint125.safetensors`` is gated (T15).
+weights only; the real ``tokenizer-e351c8d8-checkpoint125.safetensors`` is gated.
 """
 
 import math
@@ -38,10 +38,10 @@ def _rope_rotate_half(x, positions, theta=10000.0):
     return torch.cat((x1 * ang.cos() - x2 * ang.sin(), x2 * ang.cos() + x1 * ang.sin()), -1)
 
 
-# --------------------------------------------------------------------------- T7 (fixture-free)
+# --------------------------------------------------------------------------- conversion and ring mask (fixture-free)
 
 
-def test_t7_qk_permute_turns_adjacent_pair_rope_into_rotate_half():
+def test_qk_permute_turns_adjacent_pair_rope_into_rotate_half():
     torch.manual_seed(0)
     heads, head_dim, dim, T = 2, 8, 16, 5
     w = torch.randn(heads * head_dim, dim)
@@ -75,7 +75,7 @@ def _synthetic_moshi_state():
     return state, d, h
 
 
-def test_t7_conversion_renames_splits_and_is_strict():
+def test_conversion_renames_splits_and_is_strict():
     state, d, h = _synthetic_moshi_state()
     prefix = "encoder_transformer.layers.0."
     expected_names = {
@@ -137,12 +137,12 @@ def _simulated_ring_visibility(steps, capacity, chunk):
 
 
 @pytest.mark.parametrize(("steps", "capacity", "chunk"), [(12, 5, 1), (24, 8, 2), (40, 16, 1), (64, 10, 2)])
-def test_t7_ring_mask_equals_simulated_ring_cache(steps, capacity, chunk):
+def test_ring_mask_equals_simulated_ring_cache(steps, capacity, chunk):
     mask = ring_attention_mask(steps, dtype=torch.float32, capacity=capacity, chunk=chunk)[0, 0]
     assert torch.equal(mask == 0, _simulated_ring_visibility(steps, capacity, chunk))
 
 
-def test_t7_ring_mask_for_mimi_first_narrows_at_query_248():
+def test_ring_mask_for_mimi_first_narrows_at_query_248():
     visible = ring_attention_mask(320, dtype=torch.float32)[0, 0] == 0
     causal = torch.ones(320, 320).tril().bool()
     assert torch.equal(visible[:248], causal[:248])
@@ -150,7 +150,7 @@ def test_t7_ring_mask_for_mimi_first_narrows_at_query_248():
     assert int(visible[319].sum()) == 249 and int(visible[318].sum()) == 248
 
 
-def test_t7_padding_and_shape_validation():
+def test_padding_and_shape_validation():
     assert pad_to_frames(torch.zeros(1, 1, 1920)).shape[-1] == 1920
     padded = pad_to_frames(torch.ones(1, 1, 1921))
     assert padded.shape[-1] == 3840 and padded[..., 1921:].abs().sum() == 0
@@ -161,7 +161,7 @@ def test_t7_padding_and_shape_validation():
         codec.decode(torch.zeros(1, 7, 3, dtype=torch.long))
 
 
-# --------------------------------------------------------------------------- T13-Mimi (NVIDIA fixture)
+# ------------------------------------------------------------------- whole-sequence vs NVIDIA streaming (fixture)
 
 
 @contextmanager
@@ -200,7 +200,7 @@ def _codec(data):
     return MimiCodec(model)
 
 
-def test_t7_real_mimi_kwargs_map_to_hf_defaults(reference):
+def test_real_mimi_kwargs_map_to_hf_defaults(reference):
     with _without_triton_stub():
         from transformers import MimiConfig
 
@@ -213,7 +213,7 @@ def test_t7_real_mimi_kwargs_map_to_hf_defaults(reference):
     assert MimiConfig(**mapped).frame_rate == 12.5
 
 
-def test_t7_conversion_covers_full_size_nvidia_mimi_keys(reference):
+def test_conversion_covers_full_size_nvidia_mimi_keys(reference):
     real = reference["mimi_kwargs"]["real"]
     shapes = reference["real_state_dict_shapes"]
     assert sum(math.prod(s) for k, s in shapes.items() if "_codebook" not in k) > 70_000_000
@@ -229,7 +229,7 @@ def test_t7_conversion_covers_full_size_nvidia_mimi_keys(reference):
 
 @torch.no_grad()
 @pytest.mark.parametrize("case_index", [0, 1])
-def test_t13_mimi_whole_sequence_matches_nvidia_streaming(reference, case_index):
+def test_mimi_whole_sequence_matches_nvidia_streaming(reference, case_index):
     case = reference["cases"][case_index]
     codec = _codec(reference)
     frames = case["frames"]
@@ -247,7 +247,7 @@ def test_t13_mimi_whole_sequence_matches_nvidia_streaming(reference, case_index)
 
 
 @torch.no_grad()
-def test_t13_mimi_ring_mask_is_required_beyond_124_frames(reference, monkeypatch):
+def test_mimi_ring_mask_is_required_beyond_124_frames(reference, monkeypatch):
     case = reference["cases"][1]
     assert case["frames"] > 125
     codec = _codec(reference)
@@ -260,7 +260,7 @@ def test_t13_mimi_ring_mask_is_required_beyond_124_frames(reference, monkeypatch
 
 
 @torch.no_grad()
-def test_t13_mimi_matches_offline_interleaved_streaming(reference):
+def test_mimi_matches_offline_interleaved_streaming(reference):
     run = reference["interleaved"]
     codec = _codec(reference)
     assert torch.equal(codec.encode(run["audio"]), run["codes"])

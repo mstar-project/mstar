@@ -1,8 +1,8 @@
-"""T12 and submodule checks for PersonaPlex (LM, MimiEncoder, MimiDecoder).
+"""Submodule checks for PersonaPlex (LM, MimiEncoder, MimiDecoder).
 
 The LM's per-iteration logic is driven engine-free with the dense CPU attention
 backend and greedy samplers; the paged-KV/FlashInfer path is only checked for
-its wiring here (fake resources). R-tier tests replay the NVIDIA fixtures of
+its wiring here (fake resources). Fixture-backed tests replay the NVIDIA fixtures of
 test_personaplex_components.py and test_personaplex_mimi.py.
 """
 
@@ -186,7 +186,7 @@ def test_generated_text_frame_serializes_for_worker_transfer():
 
 
 @torch.no_grad()
-def test_t12_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_frame():
+def test_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_frame():
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs()
     run = _Run(sub, meta, voice, persona, codes)
@@ -215,7 +215,7 @@ def test_t12_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_ea
 
 
 @torch.no_grad()
-def test_t12_forward_accepts_eager_int32_sampler_tokens():
+def test_forward_accepts_eager_int32_sampler_tokens():
     """Eager FlashInfer returns int32 IDs; both PersonaPlex samplers feed an int64 cache."""
     class DenseForwardBackend(DenseTemporalCache):
         def begin(self):
@@ -255,7 +255,7 @@ def test_t12_forward_accepts_eager_int32_sampler_tokens():
         assert all(torch.equal(actual, expected) for actual, expected in zip(got[name], want[name], strict=True))
 
 
-def test_t12_sampler_adapter_rejects_malformed_tokens():
+def test_sampler_adapter_rejects_malformed_tokens():
     expected = torch.zeros(1, dtype=torch.long)
     with pytest.raises(ValueError, match="text sampler must return shape \\(1,\\)"):
         _sampled_token_ids(torch.zeros(1, 1, dtype=torch.int32), expected, "text sampler")
@@ -263,7 +263,7 @@ def test_t12_sampler_adapter_rejects_malformed_tokens():
         _sampled_token_ids(torch.zeros(1), expected, "depth sampler step 0")
 
 
-def test_t12_bf16_kv_hint_does_not_autocast_lm_or_mimi():
+def test_bf16_kv_hint_does_not_autocast_lm_or_mimi():
     model = PersonaPlexModel(skip_weight_loading=True)
     # This checks autocast policy, independently of graph-runtime construction.
     engine = Engine.__new__(Engine)
@@ -274,7 +274,7 @@ def test_t12_bf16_kv_hint_does_not_autocast_lm_or_mimi():
     assert engine._autocast_dtype_for(_tiny_submodule()) is None
 
 
-def test_t12_declare_step_declares_samplers_only_on_generate_walks():
+def test_declare_step_declares_samplers_only_on_generate_walks():
     sub = _tiny_submodule()
     inputs = [SimpleNamespace(input_seq_len=1)]
     cond = sub.declare_step(cfg.CONDITIONING_WALK, ["r"], inputs)
@@ -287,7 +287,7 @@ def test_t12_declare_step_declares_samplers_only_on_generate_walks():
 
 
 @torch.no_grad()
-def test_t12_conditioning_rejects_an_unforced_target():
+def test_conditioning_rejects_an_unforced_target():
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs()
     frame = sub.prepare_frame(cfg.CONDITIONING_WALK, meta, {

@@ -26,7 +26,8 @@ equal to that, but the streaming transformers do not: NVIDIA's
 ``RingKVCache`` (context 250, two 25 Hz steps per frame) masks one extra key
 once full, and HF's public ``encode``/``decode`` use full causal attention.
 ``MimiCodec`` therefore composes HF's submodules and passes a 4D mask that
-reproduces the ring (worklog §11 3.1-b). The conversion of NVIDIA's
+reproduces the ring (``ring_attention_mask``); the two diverge beyond 124
+frames. The conversion of NVIDIA's
 moshi-named weights is vendored because the HF script is absent from
 transformers 4.50-4.57.3 and is not an importable API in any version.
 """

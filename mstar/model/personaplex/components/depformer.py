@@ -55,7 +55,7 @@ def depth_attention_start(step: int, capacity: int = DEP_Q) -> int:
     With one key per step, ``RingKVCache.complete`` labels the slot at
     ``end_offset % capacity`` as position ``end_offset`` once the ring is full
     ([PP] modules/transformer.py:263-299), so at ``step = capacity - 1`` the
-    key of step 0 is masked. Executed check: worklog §11 3.1-a.
+    key of step 0 is masked (pinned by the depth-attention tests).
     """
     return max(0, step + 2 - capacity)
 

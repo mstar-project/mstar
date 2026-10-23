@@ -1,10 +1,10 @@
 PersonaPlex reference fixtures
 ==============================
 
-Commit 1: LMGen integer trace (T3)
-----------------------------------
+LMGen integer trace
+-------------------
 
-T3 uses NVIDIA's actual ``LMGen`` at
+The trace replay tests (``test_personaplex_delayed_cache.py``) use NVIDIA's actual ``LMGen`` at
 ``3428dfd95309a7f3c84fd93259ded0f810d1ff91``, with tiny random CPU transformers,
 greedy sampling, production vocabulary sizes, delays and 16 depth slots.
 The recorder imports no M* implementation. It records complete integer cache
@@ -13,7 +13,7 @@ model inputs, targets, sampled tokens, outputs and source/version metadata.
 Schema 2 includes ``content_sha256``: SHA256 of the complete fixture excluding
 ``argv`` and ``content_sha256``, serialized as UTF-8 JSON with sorted keys and compact
 separators. Invocation paths stay in ``argv`` for provenance but do not affect this
-content hash. Regenerate older traces; T3 verifies the hash before replaying.
+content hash. Regenerate older traces; the replay verifies the hash first.
 No checkpoint, voice preset or GPU is required. ``tqdm`` is needed by the reference
 imports but absent from NVIDIA's declared dependencies, so install it explicitly.
 
@@ -39,24 +39,24 @@ and B=2, token priming, synthetic ``.pt`` embedding replay and ``cache.copy_``,
 6 silence / 3 text / 6 silence frames, 20 user frames and the final step.
 The M* tests replay recorded sampled integers, so this tests cache equivalence,
 not M* transformer numerics or real-checkpoint parity.
-T3 covers both raw event replay and production ``prepare_embedding()`` replay.
+The replay covers both raw events and production ``prepare_embedding()`` replay.
 The latter observes every internal prepare call, comparing its supplied dummies,
 state and forward input/target/mask directly with NVIDIA's recorded events.
 
-PR1 serves B=1. B=2 traces use synthetic B=2 presets; loading a real B=1 preset
+The served path runs batch size 1. B=2 traces use synthetic B=2 presets; loading a real B=1 preset
 into a B=2 cache via broadcasting is deferred. The cache currently requires
 the preset batch to match the live batch, unlike NVIDIA's broadcasting ``copy_``.
 
-Until the fixture policy (worklog D9) is resolved, generate traces outside the
-checkout and pass the environment variable above. T3 also discovers a future
-``reference_trace.json`` beside this file. Without either it skips with instructions;
-an explicitly configured missing or invalid fixture fails. T1, T2 and T4 do not
-need a fixture. If macOS cannot install the reference dependencies, run the same
-recorder on Linux CPU and transfer the JSON. Never synthesize a replacement
-trace from M* or the symbolic plan, or claim T3 parity without executing it.
+Fixtures are not committed: generate traces outside the checkout and pass the
+environment variable above. The replay also discovers a ``reference_trace.json``
+beside this file. Without either it skips with instructions; an explicitly
+configured missing or invalid fixture fails. The other delayed-cache tests do
+not need a fixture. If macOS cannot install the reference dependencies, run the
+same recorder on Linux CPU and transfer the JSON. Never synthesize a replacement
+trace from M* or the symbolic plan, or claim trace parity without executing it.
 
-Commit 2: LM manifest (T5) and tiny-model numerics (T13-LM)
------------------------------------------------------------
+LM manifest and tiny-model numerics
+-----------------------------------
 
 The same recorder has two more modes, run with the same reference venv:
 
@@ -82,13 +82,13 @@ The same recorder has two more modes, run with the same reference venv:
   the gathered output, plus the tiny state dict. About 99 MB (``torch.save``,
   loadable with ``weights_only=True``); ``content_sha256`` digests every tensor.
 
-T13-LM loads that state dict through the strict M* key map and replays the
+The LM replay test loads that state dict through the strict M* key map and replays the
 whole greedy loop with M*'s cache, temporal transformer and depformer, so token
 errors cascade instead of being masked. This shows algorithmic equivalence with
 random weights only; it is not checkpoint, bf16 or GPU parity.
 
-Commit 3: Mimi streaming reference (T7, T13-Mimi)
--------------------------------------------------
+Mimi streaming reference
+------------------------
 
 .. code-block:: bash
 

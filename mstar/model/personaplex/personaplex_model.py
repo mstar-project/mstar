@@ -15,7 +15,7 @@ Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
                         MimiDecoder; ``agent_frame`` (and, for ``generate``,
                         ``text_frame``) accumulate across iterations
 
-The LM is one node name in two walks (a walk may hold it once; worklog §3 M4).
+The LM is one node name in two walks (``Sequential`` keys a walk's nodes by name).
 Its loop-backs are consumed and seeded empty at iteration 0, and async
 scheduling is off because an overshoot iteration would append to the temporal
 KV. Loops stop by finish signal from the LM submodule; ``max_iters`` is the
@@ -105,8 +105,7 @@ class PersonaPlexModel(Model):
         return [
             KVSpec(resource_key=cfg.LM_KV, nodes=lm, config=kv),
             AttentionSpec(resource_key=cfg.LM_ATTN, nodes=lm, config=AttentionConfig(kv_cache=cfg.LM_KV)),
-            # interleave=True is FlashInfer's adjacent-pair rotation, matching [PP] modules/rope.py
-            # (worklog D10: verified on CPU against the formula, not yet on the FlashInfer kernel).
+            # Moshi rotates adjacent pairs ([PP] modules/rope.py): FlashInfer's interleave=True.
             PositionSpec(
                 resource_key=cfg.LM_POS, nodes=lm,
                 config=PositionConfig(kv_cache=cfg.LM_KV, interleave=True, rope_theta=float(c.rope_theta)),
@@ -357,7 +356,7 @@ class PersonaPlexModel(Model):
     # ------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # Text frames carry no conductor_new_token, so the 2048 cap never counts them (§3 M5).
+        # Text frames carry no conductor_new_token, so the 2048-token default cap never counts them.
         return cfg.MAX_TEMPORAL_FORWARDS
 
     def get_autocast_dtype(self):
@@ -490,7 +489,7 @@ class PersonaPlexModel(Model):
         return hf_hub_download(self.model_path_hf, filename, cache_dir=self.cache_dir)
 
     def _create_submodule(self, node_name: str, device) -> torch.nn.Module:
-        """Load one node from the (gated) checkpoint. Not yet run on the real files (worklog T15)."""
+        """Load one node from the gated checkpoint."""
         from .submodules import LMSubmodule, MimiDecoderSubmodule, MimiEncoderSubmodule
 
         if node_name == cfg.LM_NODE:
@@ -505,7 +504,8 @@ class PersonaPlexModel(Model):
 
             from .components.mimi import load_mimi_codec
 
-            # Separate instances per node, like Wan2.2's VAEs; NVIDIA's other_mimi is omitted (R18).
+            # Separate instances per node, like Wan2.2's VAEs; NVIDIA's other_mimi is omitted:
+            # offline.py discards its outputs ([PP] offline.py:101,108,120).
             codec = load_mimi_codec(load_file(self._download(MIMI_CHECKPOINT_NAME)), device=device)
             cls = MimiEncoderSubmodule if node_name == cfg.MIMI_ENCODER_NODE else MimiDecoderSubmodule
             return cls(codec)
