@@ -34,3 +34,6 @@ CLAUDE.md
 
 # Optional local CI reports
 .ci-results/
+
+# live-pr-test skill: local provider settings (volume ids, key names, budget)
+.claude/skills/live-pr-test/config.local.json
