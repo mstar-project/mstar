@@ -29,6 +29,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -1125,6 +1126,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
+    input_specs = {
+        "thinker_states": TensorSpec("param"),
+        "talker_input_embeds": TensorSpec("param"),
+    }
 
     def __init__(
         self,
@@ -1318,16 +1323,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
-            dtype = self.model.text_projection.linear_fc1.weight.dtype
-            input_embeds = inputs["talker_input_embeds"][0].to(dtype)
+            input_embeds = inputs["talker_input_embeds"][0]
 
             thinker_states = inputs.get("thinker_states", [])
             rid = fwd_info.rid_handle
             if thinker_states:
                 # Decode is always text → text_projection.
-                text_hidden = self.model.text_projection(
-                    thinker_states[0].to(dtype)
-                )
+                text_hidden = self.model.text_projection(thinker_states[0])
             elif rid not in self._eos_embed_sent:
                 text_hidden = self._tts_eos_embed_cached
                 self._eos_embed_sent.add(rid)

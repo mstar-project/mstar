@@ -25,6 +25,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -57,6 +58,9 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
     projector on the padded batch, then slice each chunk to its valid
     (downsampled) length and concatenate in order.
     """
+
+    # the fp32 mel, taken in the tower's dtype
+    input_specs = {"audio_features": TensorSpec("param")}
 
     def __init__(
         self,
@@ -91,9 +95,7 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         audio_feature_lens: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
-        dtype = next(self.audio_tower.parameters()).dtype
-        feats = audio_features.to(device=device, dtype=dtype)
+        feats = audio_features.to(self.get_device())
         if feats.dim() == 2:
             feats = feats.unsqueeze(0)  # (1, num_mel_bins, T)
 

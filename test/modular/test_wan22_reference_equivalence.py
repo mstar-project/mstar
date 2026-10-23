@@ -42,6 +42,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.input_spec import ingest
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 from mstar.model.wan22.submodules import (
     Wan22DitSubmodule,
@@ -183,8 +184,9 @@ def _drive(
     inputs: dict[str, list[torch.Tensor]],
 ) -> dict[str, list[torch.Tensor]]:
     """One engine-shaped pass: prepare_inputs -> preprocess -> forward
-    (StatelessEngine._execute_sequential's exact call sequence)."""
-    node_inputs = submodule.prepare_inputs(graph_walk=graph_walk, fwd_info=fwd_info, inputs=inputs)
+    (StatelessEngine._execute_sequential's exact call sequence), inputs ingested
+    through the node's input specs first."""
+    node_inputs = submodule.prepare_inputs(graph_walk=graph_walk, fwd_info=fwd_info, inputs=ingest(submodule, inputs))
     engine_inputs = _engine_inputs(fwd_info)
     preprocessed = submodule.preprocess(
         graph_walk=graph_walk, engine_inputs=engine_inputs, inputs=[node_inputs]

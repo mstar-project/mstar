@@ -28,6 +28,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.input_spec import ingest
 from mstar.engine.resources import (
     AttentionSpec,
     AttnBackend,
@@ -443,7 +444,7 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
         )
 
 
-def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, config):
+def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, config, model):
     """``_capture_one`` bakes the config's template; replay re-stages only
     what ``preprocess`` returns into it. A mismatched key, shape, or dtype is
     either a stale-address read or a silent eager fallback -- asserted
@@ -456,7 +457,9 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
 
     for walk, template in templates.items():
-        prepared = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
+        # as the engine ingests them: the fp32 latent in the dit's param dtype
+        ingested = ingest(submodule, inputs, model.get_node_precision(DIT_NODE))
+        prepared = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), ingested)
         assert set(prepared.tensor_inputs) == set(template.tensor_inputs), walk
         assert prepared.input_seq_len == template.input_seq_len, walk
         for name, tensor in prepared.tensor_inputs.items():

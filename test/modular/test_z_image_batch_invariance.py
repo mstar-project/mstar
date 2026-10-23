@@ -162,6 +162,8 @@ def _decode(subs, latents: list[torch.Tensor], batched: bool) -> list[torch.Tens
     decoder = subs["vae_decoder"]
     rids = [f"d{i}" for i in range(len(latents))]
     with torch.inference_mode():
+        # in the VAE's dtype, as the decoder's input spec has the engine cast them
+        latents = [lat.to(decoder.vae.dtype) for lat in latents]
         if batched:
             out = decoder.forward_batched(IMAGE_GEN_WALK, _eng(rids), latents=torch.stack(latents))
             return [out[rid]["image_output"][0][0] for rid in rids]

@@ -177,6 +177,8 @@ def _decode(model, subs, latents: list[torch.Tensor], batched: bool) -> list[tor
         return [img for img in stacked]
 
     with torch.inference_mode():
+        # in the VAE's dtype, as the decoder's input spec has the engine cast them
+        latents = [lat.to(decoder.vae.dtype) for lat in latents]
         if batched:
             return rows(decoder.forward(IMAGE_GEN_WALK, _eng(rids), latents=torch.stack(latents), grid=grid))
         return [rows(decoder.forward(IMAGE_GEN_WALK, _eng([rid]), latents=lat[None], grid=grid))[0]

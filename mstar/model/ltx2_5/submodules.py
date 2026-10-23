@@ -23,6 +23,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import (
     AttentionStep,
     RaggedCrossAttentionStep,
@@ -377,6 +378,8 @@ class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
+        # the VAE keeps the dtype it loaded in (param_dtype None), so name it
+        self.input_specs = {LATENTS: TensorSpec(vae.dtype)}
         # Frames larger than this decode in spatial tiles, bounding the decode's peak
         # memory (the reference tiles its 1080p decodes); smaller ones decode whole, as
         # the single-stage pipeline does. Tiling changes the output near tile seams.
@@ -394,7 +397,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
 
     def run_batch(self, latents: torch.Tensor, shape: LTXShape, **kwargs):
         dtype = self.vae.dtype
-        x = unpack_video(latents.to(device=self.get_device(), dtype=dtype), shape)
+        x = unpack_video(latents.to(self.get_device()), shape)
         mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(x.device, dtype)
         std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(x.device, dtype)
         x = x * std / self.vae.config.scaling_factor + mean
@@ -412,6 +415,8 @@ class LTXAudioDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
 
     disable_torch_compile = True
     output_keys = (AUDIO_OUTPUT,)
+    # denormalized and unpacked in fp32, whatever the audio VAE runs in
+    input_specs = {AUDIO_LATENTS: TensorSpec(torch.float32)}
 
     def __init__(self, audio_vae: nn.Module, vocoder: nn.Module, config: LTX25Config, max_batch_size: int = 4):
         super().__init__()
@@ -430,7 +435,7 @@ class LTXAudioDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
         return {AUDIO_LATENTS: torch.stack([inp.tensor_inputs[AUDIO_LATENTS] for inp in inputs])}
 
     def run_batch(self, audio_latents: torch.Tensor, **kwargs):
-        x = audio_latents.to(device=self.get_device(), dtype=torch.float32)
+        x = audio_latents.to(self.get_device())
         x = x * self.audio_vae.latents_std.to(x.device, x.dtype) + self.audio_vae.latents_mean.to(x.device, x.dtype)
         x = unpack_audio(x, self.config.geometry.audio_latent_mel_bins).to(self.audio_vae.dtype)
         mel = self.audio_vae.decode(x, return_dict=False)[0]

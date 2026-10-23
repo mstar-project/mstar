@@ -105,6 +105,8 @@ def test_trajectory_and_image_match_oracle(model, meta):
             worst = max(worst, diff)
             print(f"step {k}: latents max_abs={diff:.3e}")
         assert worst <= STEP_MAX_ABS
+        # in the VAE's dtype, as the decoder's input spec has the engine cast them
+        latents = latents.to(decoder.vae.dtype)
         image = decoder.forward(IMAGE_GEN_WALK, engine_inputs, latents=latents[None])["image_output"][0][0].cpu()
     import numpy as np
     from PIL import Image

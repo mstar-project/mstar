@@ -159,14 +159,16 @@ def check_decode(device="cuda:1"):
     shape = shape_from_metadata(model.config, meta)
     video_dec = model.get_submodule("vae_decoder", device)
     audio_dec = model.get_submodule("audio_decoder", device)
-    frames = video_dec.run_batch(latents=load("latents_007").to(device), shape=shape)["video_output"][0]
+    # each decoder's input dtype, as its input spec has the engine cast it
+    latents = load("latents_007").to(device, video_dec.vae.dtype)
+    frames = video_dec.run_batch(latents=latents, shape=shape)["video_output"][0]
     ref = load("video").permute(3, 0, 1, 2)  # [F, H, W, 3] -> [3, F, H, W]
     diff = (frames.cpu().float() - ref.float())
     mse = diff.pow(2).mean()
     print(f"video frames  max_abs={diff.abs().max():.0f} psnr={10 * torch.log10(255 ** 2 / mse):.2f} dB "
           f"shape={tuple(frames.shape)}")
     report("vae decode input", _video_decode_input(video_dec, shape, device), load("vae_decode_in"))
-    wave = audio_dec.run_batch(audio_latents=load("audio_final").to(device))["audio_output"][0]
+    wave = audio_dec.run_batch(audio_latents=load("audio_final").to(device, torch.float32))["audio_output"][0]
     report("audio waveform", wave, load("audio_wave"))
 
 

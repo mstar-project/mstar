@@ -180,7 +180,7 @@ def test_denoise_trajectory_and_image_match_oracle(model, meta):
             print(f"step {k}: latents max_abs={diff:.3e}")
         assert worst <= STEP_MAX_ABS, f"per-step latents diverge from the oracle (max {worst:.3e})"
         image = decoder.forward(
-            IMAGE_GEN_WALK, _engine_inputs(), latents=latents[None],
+            IMAGE_GEN_WALK, _engine_inputs(), latents=latents[None].to(decoder.vae.dtype),
             grid=model.config.latent_grid(meta["height"], meta["width"]),
         )["image_output"][0][0].cpu()
     expected_image = _load_png(ORACLE_DIR / "t2i" / "image.png")
@@ -227,7 +227,7 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
             print(f"edit step {k}: latents max_abs={diff:.3e}")
         assert worst <= STEP_MAX_ABS, f"edit per-step latents diverge from the oracle (max {worst:.3e})"
         image = decoder.forward(
-            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
+            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None].to(decoder.vae.dtype),
             grid=model.config.latent_grid(meta["height"], meta["width"]),
         )["image_output"][0][0].cpu()
     dit.cleanup_request(_EDIT_RID)
@@ -272,7 +272,7 @@ def test_multi_reference_edit_matches_oracle(model, meta):
             print(f"multi-ref edit step {k}: latents max_abs={diff:.3e}")
         assert worst <= STEP_MAX_ABS, f"multi-reference edit diverges from the oracle (max {worst:.3e})"
         image = decoder.forward(
-            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
+            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None].to(decoder.vae.dtype),
             grid=model.config.latent_grid(meta["height"], meta["width"]),
         )["image_output"][0][0].cpu()
     dit.cleanup_request(_MULTI_RID)

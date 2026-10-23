@@ -20,6 +20,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.position.manager import PositionManager
@@ -60,6 +61,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     for the decoder's cross-attention. Runs once per request.
     """
 
+    # the fp32 mel, taken in the encoder's dtype
+    input_specs = {"audio_features": TensorSpec("param")}
+
     def __init__(self, audio_encoder: nn.Module, config: WhisperModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
@@ -83,9 +87,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         audio_features: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
-        dtype = next(self.audio_encoder.parameters()).dtype
-        feats = audio_features.to(device=device, dtype=dtype)
+        feats = audio_features.to(self.get_device())
         if feats.dim() == 2:
             feats = feats.unsqueeze(0)  # (1, num_mel_bins, 3000)
         encoder_states = self.audio_encoder(feats).last_hidden_state.squeeze(0)

@@ -29,6 +29,7 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
 )
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -99,6 +100,8 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
+    # the conformer's frames, fused with the embeddings in their dtype
+    input_specs = {"audio_frame": TensorSpec("param")}
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -124,7 +127,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             tensor_inputs={
                 "prev_text": torch.tensor([cfg.text_bos_id], dtype=torch.long),
                 "prev_func": torch.tensor([cfg.text_pad_id], dtype=torch.long),
-                "audio_frame": torch.zeros(1, cfg.nano.hidden_size, device=device),
+                "audio_frame": torch.zeros(1, cfg.nano.hidden_size, device=device, dtype=self.embeddings.weight.dtype),
             },
             kwargs={"mode": _MODE_FRAME},
         )
@@ -263,7 +266,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         t = inp.tensor_inputs
         fused = self.embeddings(t["prev_text"].to(device)) * cfg.agent_text_weight
         if "audio_frame" in t:
-            fused = fused + t["audio_frame"].to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
+            fused = fused + t["audio_frame"].to(device) * cfg.user_audio_weight
         if cfg.use_function_head:
             fused = fused + self.embeddings(t["prev_func"].to(device)) * cfg.function_weight
         if mode == _MODE_PROMPT_FRAME:
@@ -313,8 +316,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             # a row past the end of its audio (the stream closed, the loop
             # still runs on the fed-back text) has no frame: its audio term is 0
             zero = torch.zeros(1, fused.shape[1], device=device, dtype=fused.dtype)
-            audio = torch.cat([zero if f is None else f.reshape(1, -1).to(device=device, dtype=fused.dtype)
-                               for f in frames])                                                  # [N, H]
+            audio = torch.cat([zero if f is None else f.reshape(1, -1).to(device) for f in frames])  # [N, H]
             fused = fused + audio * cfg.user_audio_weight
         if cfg.use_function_head:
             prev_func = torch.cat([t["prev_func"].reshape(-1).to(device) for t in tensors])
