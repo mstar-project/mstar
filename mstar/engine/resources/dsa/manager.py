@@ -56,14 +56,15 @@ class DSAManager(Resource):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
-    def step_inputs(self, step_ctx: StepContext, captured: bool,
-                    label: str = "main") -> dict[str, Any]:
+    def step_inputs(self, step_ctx: StepContext, captured: bool, label: str = "main",
+                    mtp_trims: bool = False) -> dict[str, Any]:
         """The step's DSA state from the KV plan, as preprocess outputs. The tensors are top
         level, so a CUDA graph interns them and each replay stages the step's values: per row
         its position and request, per request its first entry in the flat page list. Under a
         graph every row scores on its own, the score width spans the serving window (a
         prefill bucket's own rows) and the sparse plan is the slot's own, re-planned here every
-        step; the host half rides in ``dsa_meta``."""
+        step; the host half rides in ``dsa_meta``. ``mtp_trims``: a decode step's rows may sit
+        past their true positions (the submodule trims rejected drafts on device)."""
         graph = bool(captured)
         walk = step_ctx.graph_walk
         kv_out = step_ctx.plan_results[self.config.kv_cache][label]
@@ -94,6 +95,10 @@ class DSAManager(Resource):
         n_pos, n_req = len(pos), indptr.numel() - 1
         staged = self._int_stager.to_device(torch.cat(parts), self._device)
         lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
+        if mtp_trims and walk == "decode":
+            # these rows sit at or past their true ones (_trim_on_device): plan each for the
+            # longest it can be there, its spare entries masked
+            lens = [min(p + 1, topk + kpool - 1) for p in pos]
         # score width: the step's most pools; a decode graph's the serving window's, and a
         # captured prefill holds whole prompts no longer than its bucket
         max_pools = (max(pos) + 1) // kpool if pos else 1

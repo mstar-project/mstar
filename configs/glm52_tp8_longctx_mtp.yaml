@@ -1,0 +1,53 @@
+model: "glm52"
+# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module (greedy
+# requests only). A verify step takes its rejected rows back from the KV cache (the latents
+# and, on the same pages, the index keys) before the next step plans, and every verify row and
+# the draft module's own indexer select their top-2048 tokens like the trunk's. MTP's prefill
+# over DSA runs eager.
+#
+# KV per token per rank: 79 MLA layers x (512 + 64) x 2 B + 22 index layers x 128 x 2 B
+# ~= 96 KB, so the pools below hold about one full window, as glm52_tp8_longctx.yaml's.
+max_seq_len: 262144
+max_concurrent_requests: 64
+dist_timeout_s: 7200
+tp_allreduce: "symm_multimem"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  dsa_long_context: true
+  # k=3 was the best of k=2..4 at short context on an 8xH200 node
+  mtp_num_draft_tokens: 3
+  max_seq_len: 262144
+  prefill_chunk_tokens: 8192
+  dsa_shard_prefill: true
+  fused_add_rmsnorm: true
+  dense_fp8: true
+  moe_decode_kernel: true
+  moe_prefill_kernel: true
+  moe_fused_allreduce: true
+  moe_router_kernel: true
+  prefill_token_buckets: [
+    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
+  prefill_capture_batch_sizes: [1, 4, 16]
+  prefill_max_step_tokens: "auto"
+resources:
+  kv:
+    max_num_pages: 2304
+    page_size: 128
+# MTP's prefill over DSA runs eager, a short prompt's too (the buckets above only size
+# prefill_max_step_tokens), in row chunks past prefill_chunk_tokens, and its kernels compile on
+# first use. Four lengths (1k, 6k, 12.5k and 20k tokens) take those compiles before the server
+# binds, not the first request.
+warmup_requests:
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

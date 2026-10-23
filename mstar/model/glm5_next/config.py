@@ -341,7 +341,8 @@ class Glm5NextModelConfig:
     @property
     def mla_cache_kpe(self) -> int:
         """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
-        a 64-wide slot to mask rejected draft rows. FlashInfer plans a cache
+        a 64-wide slot to mask rows a query must not see: rejected draft rows, or
+        under dsa_long_context the sparse plan's padding. FlashInfer plans a cache
         without the slot from 0.6.18, so an older one gets it too (zeros):
         otherwise MLA would run the uncapturable fallback."""
         if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
@@ -372,10 +373,6 @@ class Glm5NextModelConfig:
         """Refuse a dsa_long_context setup the index planes cannot hold."""
         if not self.dsa_long_context:
             return
-        if self.mtp_num_draft_tokens > 0:
-            raise ValueError(
-                "dsa_long_context with MTP is not supported: a verify step leaves rejected "
-                "drafts in the cache as holes, which the k-pool indexer would pool as tokens")
         if self.max_seq_len <= self.index_topk:
             # dense MLA already serves index_topk: the window is model_kwargs.max_seq_len
             raise ValueError(
@@ -391,17 +388,35 @@ class Glm5NextModelConfig:
             # flashinfer's page-table transform takes power-of-two pools per page
             raise ValueError(f"page_size={page_size} over index_kpool={self.index_kpool} "
                              "must be a power of two")
+        if self.mtp_trims and page_size is not None and page_size < self.mtp_num_draft_tokens + 2:
+            # padding requests write the sink page's first k + 1 rows; its last row is the
+            # masked one a sparse plan's spare entries attend
+            raise ValueError(f"page_size={page_size} must exceed an MTP block of "
+                             f"{self.mtp_num_draft_tokens + 1} rows")
         from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 
         check_flashinfer()
+
+    @property
+    def mtp_trims(self) -> bool:
+        """MTP under dsa_long_context: the next step's block overwrites a verify step's
+        rejected rows instead of leaving them as holes, which the k-pool indexer would pool
+        as tokens. The host plans each block after the last one's whole block, before that
+        one's verdict exists, and never takes rows back; the device moves the block to the
+        request's true rows (Glm5NextLLMSubmodule._trim_on_device)."""
+        return self.mtp_num_draft_tokens > 0 and self.dsa_long_context
 
     @property
     def kv_rows(self) -> int:
         """Cache rows a request may hold. Its real context is held to
         max_seq_len; under MTP each verify step also leaves its rejected drafts
         as holes, and twice the rows keeps those from binding first until
-        acceptance falls below about (k + 1) / 2 tokens per step."""
-        return self.max_seq_len * (2 if self.mtp_num_draft_tokens > 0 else 1)
+        acceptance falls below about (k + 1) / 2 tokens per step. Under
+        mtp_trims the host counts a step's whole block the same way, though
+        the device rewrites the rejected rows, within max_seq_len rows: a
+        decode score as wide as twice the window costs its memory twice."""
+        holes = self.mtp_num_draft_tokens > 0 and not self.mtp_trims
+        return self.max_seq_len * (2 if holes else 1)
 
     @property
     def padded_head_dim(self) -> int:

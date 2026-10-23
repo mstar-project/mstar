@@ -1,0 +1,47 @@
+model: "glm5_next"
+# glm5_next_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-45 MTP module (greedy
+# requests only). A verify step's next block overwrites its rejected rows, and the MTP layer
+# selects its tokens with its own indexer, as the trunk's layers do.
+max_seq_len: 1048576
+# One request per KDA slot below, as glm5_next_tp8_longctx.yaml. The KV pool admits by prompt: when
+# the live contexts outgrow it, decode holds requests until they time out (no eviction).
+max_concurrent_requests: 64
+# NVLS multicast for the small decode all-reduces; stays on NCCL, with a
+# warning, where NVLink multicast is unavailable.
+tp_allreduce: "symm_multimem"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  moe_quant_kernel: "auto"
+  mtp_num_draft_tokens: 3
+  dsa_long_context: true
+  # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
+  dsa_shard_prefill: true
+  # Rows a request may hold, prompt and output together. Each verify step takes a whole
+  # block of them, so at 3 tokens a step three quarters of the room past a prompt is output.
+  max_seq_len: 1048576
+  # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
+  # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.
+  prefill_graphs: true
+  prefill_max_step_tokens: "auto"
+resources:
+  kv_cache:
+    # 12 latent planes + 12 index planes (the MTP layer's too), one 576-wide bf16 row per
+    # token each (512 + the rope slot that masks the sparse plan's padding): 27.6 KB per token
+    # per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of others,
+    # ~32 GB/rank next to ~38 GB of weights.
+    max_num_pages: 8960
+    page_size: 128
+  kda_state:
+    max_slots: 65
+# glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill (with its MTP pass) compiles before
+# the server binds, not on the first long request.
+warmup_requests:
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

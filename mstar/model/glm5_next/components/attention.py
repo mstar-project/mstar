@@ -102,8 +102,9 @@ class Glm5NextMLAAttention(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         # Width of the rope slot in the MLA latent cache (config.mla_cache_kpe).
         self.mla_cache_kpe = config.mla_cache_kpe
-        # With MTP a verify step's rejected rows stay in the cache as holes with a very
-        # negative rope slot: a query rope part of ones adds 0 to a real key (its slot is 0).
+        # With MTP the rows a query must not see (rejected drafts left as holes, or a sparse
+        # plan's padding) carry a very negative rope slot: a query rope part of ones adds 0 to
+        # a real key (its slot is 0).
         self.q_pe_value = 1.0 if config.mtp_num_draft_tokens > 0 else 0.0
         h = self.total_num_heads
 
@@ -133,8 +134,9 @@ class Glm5NextMLAAttention(nn.Module):
         # cursor through the stack.
         self.kv_plane = kv_plane
         self.indexer = Glm5NextIndexer(config)
-        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
-        # and the DSA resource whose context the submodule opens per forward
+        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages; the
+        # MTP layer selects with its own indexer too), and the DSA resource whose context the
+        # submodule sets per forward
         self.index_plane = kv_plane if config.dsa_long_context else None
         self.dsa: DSAManager | None = None
         self.dsa_group = comm_group if config.dsa_shard_prefill else None
@@ -216,6 +218,26 @@ class Glm5NextMLAAttention(nn.Module):
         return paged.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
                                    self.softmax_scale)
 
+    def _select_block_row(
+        self, hidden_states: torch.Tensor, q_c: torch.Tensor, row: int,
+        index_rows: tuple[torch.Tensor, torch.Tensor], ctx: paged.DSAContext,
+    ) -> torch.Tensor:
+        """The draft row's slots under dsa_long_context: its index key joins the block's rows
+        so far, then every block row selects (only ``row`` has a query; the rest go unused)."""
+        keys, gates = index_rows
+        n, block = keys.shape[:2]
+        keys[:, row], gates[:, row] = self.indexer.keys_and_gate(hidden_states)
+        paged.write_index(self.kv, self.index_plane, LABEL, keys.view(n * block, -1), ctx,
+                          gate=gates.view(n * block, -1),
+                          ape=self.indexer.index_kpool_compress_ape)
+        q, w = self.indexer.query_and_weights(q_c, hidden_states)
+        qs = q.new_zeros(n, block, *q.shape[1:])
+        ws = w.new_zeros(n, block, w.shape[-1])
+        qs[:, row], ws[:, row] = q, w
+        return paged.select(qs.view(n * block, *q.shape[1:]), ws.view(n * block, -1),
+                            self.kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
+                            self.dsa_group)
+
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         num_tokens, h = attn_latent.shape[:2]
         # bmm writes (T, H, Dv) in place of einsum's (H, T, Dv), so the reshape
@@ -226,12 +248,14 @@ class Glm5NextMLAAttention(nn.Module):
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,
+        index_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One query per request at ``row`` of the step's block: ``hidden_states (N, hidden)``,
         ``latents (N, block, L + kpe)`` this step's cache rows so far. The step plans ``block``
         causal queries per request; the other rows attend with zero queries and rewrite
         ``latents`` unchanged (rows past ``row`` are overwritten before a query reads them).
-        Returns ``(N, hidden)``."""
+        Under dsa_long_context ``index_rows`` are the block's index keys and gates so far, kept
+        the same way. Returns ``(N, hidden)``."""
         n, block = latents.shape[:2]
         h = self.num_heads
         q_c, latent = self._latent_norm(F.linear(hidden_states, self.fused_qkv_a_proj_weight))
@@ -240,11 +264,19 @@ class Glm5NextMLAAttention(nn.Module):
         q_nope[:, row] = torch.einsum("thd,hdl->thl", q, self.w_kc)
         latents[:, row] = latent
         self.kv.write_kv(latents.view(n * block, -1), None, layer_idx=self.kv_plane, label=LABEL)
+        q_pe = q.new_full((n * block, h, self.mla_cache_kpe), self.q_pe_value)
+        ctx = self.dsa.ctx if self.dsa is not None else None
+        if ctx is not None:
+            slots = self._select_block_row(hidden_states, q_c, row, index_rows, ctx)
+            attn_latent = paged.sparse_attend(q_nope.view(n * block, h, -1), q_pe,
+                                              self.kv.layer_view(self.kv_plane), slots, ctx,
+                                              self.softmax_scale)
+            return self._out(attn_latent.view(n, block, h, -1)[:, row])
         attn_latent = self.attn.run(
             q_nope.view(n * block, h, -1),
             label=LABEL,
             kv_cache_layer=self.kv.layer_view(self.kv_plane),
-            q_pe=q.new_full((n * block, h, self.mla_cache_kpe), self.q_pe_value),
+            q_pe=q_pe,
         )
         return self._out(attn_latent.view(n, block, h, -1)[:, row])
 

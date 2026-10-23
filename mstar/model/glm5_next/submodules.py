@@ -1,6 +1,7 @@
 """AR submodule for the GLM-5.3-Flash text backbone on the resource-pool engine."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Mapping
@@ -28,10 +29,13 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.dsa import sparse_mla
+from mstar.engine.resources.dsa.paged import attn_lens_device
+from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda import SpecBlocks
 from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.resources.recurrent.pool import SINK_SLOT
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import (
     ATTN,
@@ -109,6 +113,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step verifies the last token and k drafts per request
         self.mtp_k = config.mtp_num_draft_tokens
         self._mtp_seq = 0
+        # mtp_trims: each KDA slot's tokens in cache, on device (_trim_on_device), and the
+        # sink page's last row, masked, that a row's spare sparse entries attend
+        self._mtp_len: torch.Tensor | None = None
+        self._pad_slot: int | None = None
+        self._pad_kpe: torch.Tensor | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
@@ -123,6 +132,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def _dsa(self):
         """The DSA resource (dsa_long_context), whose ``ctx`` the MLA layers read."""
         return self.node_resources.get(DSA) if self.config.dsa_long_context else None
+
+    @property
+    def _dsa_ctx(self):
+        """The forward's DSA context, or None (no DSA resource, or none set)."""
+        return self._dsa.ctx if self._dsa is not None else None
 
     @property
     def mtp_block(self) -> int:
@@ -143,6 +157,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             raise ValueError(f"dsa_long_context captures prefill buckets up to "
                              f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
+        if self.config.mtp_trims and KV_CACHE in resources:
+            kv, size = resources[KV_CACHE], resources[KV_CACHE].kv_cache.page_size
+            self._mtp_len = torch.zeros(resources[KDA_STATE].config.max_slots, dtype=torch.long,
+                                        device=self.lm_head.weight.device)
+            # nothing writes the sink page's last row in a decode step: padding rows take
+            # its first k + 1
+            self._pad_slot = SINK_PAGE * size + size - 1
+            self._pad_kpe = kv.kv_cache.tensor[:, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
         if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
@@ -418,7 +440,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if self.config.dsa_long_context:
             # the DSA resource stages its rows off the KV plan; the forward opens them
             out.update(self._dsa.step_inputs(
-                engine_inputs.step.ctx, engine_inputs.captured, LABEL))
+                engine_inputs.step.ctx, engine_inputs.captured, LABEL,
+                mtp_trims=self.config.mtp_trims))
         return out
 
     def _mtp_keep(
@@ -502,7 +525,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
         if self.config.dsa_long_context and graph_walk == "prefill" and not engine_inputs.captured:
-            return self._prefill_windows(engine_inputs, input_ids, sampler)
+            return self._prefill_windows(engine_inputs, input_ids, sampler, mtp_keep)
         last = None  # prefill samples each row's last token: the model computes only those
         if last_rows is not None:
             last = last_rows
@@ -525,37 +548,57 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _prefill_windows(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, sampler,
+        mtp_keep: torch.Tensor | None,
     ) -> torch.Tensor:
-        """dsa_long_context's prefill: the step's tokens in windows of prefill_window_tokens,
+        """dsa_long_context's eager prefill: the step's tokens in windows of prefill_window_tokens,
         each through every layer before the next (its KV rows and KDA state land first), so
-        activations stay bounded however long the prompt. Samples each request's last row."""
+        activations stay bounded however long the prompt. Samples each request's last row.
+        With MTP each window's rows also run the MTP pass (row i pairs the trunk at i with token
+        i + 1); a request's last row runs it again once its token is sampled, and seeds."""
         ctx = self._dsa.ctx
         kv, kda = engine_inputs.resources[KV_CACHE], engine_inputs.resources[KDA]
-        size = self.config.prefill_window_tokens
-        total = input_ids.shape[0]
+        lm, size, total = self.language_model, self.config.prefill_window_tokens, input_ids.shape[0]
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
         # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
-        if total <= size or len(ctx.spans) == total:
-            rows = self._long_stager.to_device(last, input_ids.device)
-            hidden = self.language_model.model(input_ids, rows=rows)
-            return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
+        split = total > size and len(ctx.spans) != total
         hidden: list[torch.Tensor | None] = [None] * len(last)
+        nxt = torch.roll(input_ids, -1) if self.mtp_k > 0 else None
         try:
-            for start in range(0, total, size):
-                end = min(start + size, total)
-                pieces = [(max(r0, start), min(r0 + n, end), req)
-                          for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+            for start in range(0, total, size if split else total):
+                end = min(start + size, total) if split else total
                 ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
-                rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
-                self._dsa.ctx = ctx.rows(start, end)
-                with kv.token_window(start, end, LABEL), kda.token_window(
-                        [(req, b - a) for a, b, req in pieces], LABEL):
-                    out = self.language_model.model(input_ids[start:end], rows=rows)
+                with contextlib.ExitStack() as scope:
+                    if split:
+                        pieces = [(max(r0, start), min(r0 + n, end), req)
+                                  for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+                        self._dsa.ctx = ctx.rows(start, end)
+                        scope.enter_context(kv.token_window(start, end, LABEL))
+                        scope.enter_context(kda.token_window(
+                            [(req, b - a) for a, b, req in pieces], LABEL))
+                    rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
+                    if nxt is None:
+                        out = lm.model(input_ids[start:end], rows=rows)
+                    else:
+                        full = lm.model(input_ids[start:end])
+                        keep = mtp_keep[start:end, None]
+                        lm.mtp(lm.model.embed_tokens(nxt[start:end]) * keep, full)
+                        out = full.index_select(0, rows)
                 for k, (i, _) in enumerate(ends):
                     hidden[i] = out[k]
+            last_hidden = torch.stack(hidden)
+            new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
+            if nxt is not None:
+                seeds = []
+                for i, r in enumerate(last):  # its MTP row again, now with the sampled token
+                    self._dsa.ctx = ctx.rows(r, r + 1)
+                    with kv.token_window(r, r + 1, LABEL):
+                        embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
+                        seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
+                stored = ctx.pos.index_select(0, self._long_stager.to_device(last, ctx.pos.device)) + 1
+                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
         finally:
             self._dsa.ctx = ctx
-        return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(torch.stack(hidden)))
+        return new_tokens
 
     # -- MTP device side ---------------------------------------------------
 
@@ -585,14 +628,47 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _mtp_seed(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, prev: torch.Tensor,
+        ends: torch.Tensor | None = None,
     ) -> None:
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
-        the token after ``prev`` (the step's next input)."""
+        the token after ``prev`` (the step's next input). A prefill's ``ends`` (device: each
+        request's tokens in cache) start ``_mtp_len`` under mtp_trims."""
         pool = engine_inputs.resources[KDA_STATE]
         slots = engine_inputs.resources[KDA].current_plan().slot_ids.long()
         seed = pool.block(MTP_HIDDEN)
         seed.index_copy_(0, slots, hidden.to(seed.dtype))
         pool.block(MTP_DRAFT).index_copy_(0, slots, self._draft_tokens(hidden, prev)[:, None])
+        if ends is not None and self._mtp_len is not None:
+            self._mtp_len.index_copy_(0, slots, ends.long())
+
+    def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        """mtp_trims: move this verify step's block to each request's true rows. The host
+        plans every block after the last one's whole block, as with holes, and never takes
+        rows back, so its cache, and every rank's, moves the same whatever was accepted;
+        ``_mtp_len`` (each slot's tokens in cache, advanced by every verify on device) gives
+        the true rows, and the rows' positions and the cache slots their latents and index
+        keys go to follow them. A captured step keeps its plan, made for the longest rows, and
+        masks each row's spare entries; an eager one replans exact rows. Returns each
+        request's ``_mtp_len``."""
+        ctx, kv = self._dsa_ctx, engine_inputs.resources[KV_CACHE]
+        slots = engine_inputs.resources[KDA].current_plan().slot_ids.long()
+        # padding requests: the sink page's first rows, as planned (no host value: it captures)
+        self._mtp_len[SINK_SLOT:SINK_SLOT + 1].zero_()
+        base = self._mtp_len.index_select(0, slots)
+        pos = (base[:, None] + torch.arange(self.mtp_block, device=base.device)).view(-1)
+        size = ctx.page_size
+        pages, offsets = kv.write_slots(LABEL)
+        page = ctx.pages[(ctx.page_start[ctx.row_req.long()] + pos // size).long()]
+        pages.copy_(page.to(pages.dtype))
+        offsets.copy_((pos % size).to(offsets.dtype))
+        ctx.pos = pos.to(ctx.pos.dtype)
+        if engine_inputs.captured:
+            ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
+            ctx.pad_slot = self._pad_slot
+            self._pad_kpe.fill_(HOLE_KPE)
+        else:
+            ctx.host_pos = pos.tolist()
+        return base
 
     def _mtp_prefill(self, engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep) -> None:
         """The MTP pass over the prompt: row i pairs the trunk's state at token i with the
@@ -604,10 +680,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, _real_row_values(last, new_tokens).to(nxt.dtype))
         embeds = lm.model.embed_tokens(nxt) * mtp_keep[:, None]
-        self._mtp_seed(engine_inputs, lm.mtp(embeds, hidden).index_select(0, last), new_tokens)
+        ctx = self._dsa_ctx
+        ends = None if ctx is None else ctx.pos.index_select(0, last) + 1
+        self._mtp_seed(engine_inputs, lm.mtp(embeds, hidden).index_select(0, last), new_tokens,
+                       ends)
 
     def _mtp_decode(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, mtp_seq: torch.Tensor,
+        base: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One verify step: draft k tokens, verify ``[last | drafts]`` with the trunk, then run
         the MTP layer over the block to seed the next step. The verdict (the target's argmax
@@ -624,8 +704,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         drafts = [pool.block(MTP_DRAFT).index_select(0, slots)[:, 0]]
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank + attn.mla_cache_kpe)
+        index_rows = None
+        if self.config.dsa_long_context:  # the MTP layer's own index keys and gates
+            d = attn.indexer.head_dim
+            index_rows = (h.new_zeros(n, block, d), h.new_zeros(n, block, d))
         for row in range(k - 1):
-            h = lm.mtp(lm.model.embed_tokens(drafts[-1]), h, row=row, latents=latents)
+            h = lm.mtp(lm.model.embed_tokens(drafts[-1]), h, row=row, latents=latents,
+                       index_rows=index_rows)
             drafts.append(self._draft_tokens(h, drafts[-1]))
         drafts = self._broadcast(torch.stack(drafts, 1))
 
@@ -637,6 +722,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
         kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
+        if base is not None:  # mtp_trims: the next block starts after the accepted rows
+            self._mtp_len.index_copy_(0, slots, base + accepted + 1)
 
         # The host's copy: the verdict first, then its step number.
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
@@ -651,8 +738,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         h_block = lm.mtp(lm.model.embed_tokens(target.reshape(-1)), hidden)
         self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[rows, accepted], next_input)
 
-        keep = torch.arange(block, device=slots.device)[None, :] <= accepted[:, None]
-        self._mask_holes(engine_inputs, keep)
+        if not self.config.mtp_trims:
+            keep = torch.arange(block, device=slots.device)[None, :] <= accepted[:, None]
+            self._mask_holes(engine_inputs, keep)
         return next_input
 
     def _mask_holes(self, engine_inputs: ModelInputsFromEngine, keep: torch.Tensor) -> None:
@@ -679,7 +767,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         if mtp_seq is not None:
             return self.forward_batched(graph_walk, engine_inputs, input_ids,
-                                        mtp_seq=mtp_seq)[engine_inputs.request_ids[0]]
+                                        mtp_seq=mtp_seq, **kwargs)[engine_inputs.request_ids[0]]
         return {"new_token": self._forward(
             graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)}
 
@@ -699,7 +787,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if mtp_seq is not None:
             # the emitted tokens are cut on the host (unpack_packed_outputs); the next input
             # is the token after the accepted drafts
-            next_input = self._mtp_decode(engine_inputs, input_ids, mtp_seq)
+            if self._dsa is not None:
+                self._dsa.ctx = self._dsa.context(kwargs)
+            try:
+                base = self._trim_on_device(engine_inputs) if self.config.mtp_trims else None
+                next_input = self._mtp_decode(engine_inputs, input_ids, mtp_seq, base)
+            finally:
+                if self._dsa is not None:
+                    self._dsa.ctx = None
             return {
                 rid: {"text_inputs": [next_input[i : i + 1]]}
                 for i, rid in enumerate(engine_inputs.request_ids)
@@ -857,10 +952,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         """Stop on a stop token among this step's tokens, at max_tokens, or while two more
         blocks fit (the next step may already be scheduled when this stop lands): in the
-        context, which counts emitted tokens against index_topk, and in the cache, where every
-        verify step keeps its whole block (rejected rows as holes) against kv_rows. Counts the
-        tokens emitted up to this step itself: the next step is in flight when this one is
-        checked, so the GPU thread's ``mtp_generated`` may already include its tokens."""
+        context, which counts emitted tokens against context_limit, and in the cache, where
+        every verify step keeps its whole block (holes, or rows the device rewrites) against
+        kv_rows. Counts the tokens emitted up to this step itself: the next step is in flight
+        when this one is checked, so the GPU thread's ``mtp_generated`` may already include
+        its tokens."""
         state = self.request_state(request_id)
         before = 0 if request_info.graph_walk == "prefill" else state.get("mtp_checked", 0)
         generated = before + new_token.numel()
@@ -876,8 +972,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
+        # every verify step's block stays in the host's cache, holes or rows the device rewrote
         prompt, room = state.get("prompt_len", 0), 2 * self.mtp_block
-        full = (prompt + generated + room > self.config.index_topk
+        full = (prompt + generated + room > self.config.context_limit
                 or prompt + steps * self.mtp_block + room > self.config.kv_rows)
         if is_eos or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
