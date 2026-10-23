@@ -938,7 +938,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
@@ -1179,6 +1179,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">advance</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">end_key</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
@@ -1209,9 +1210,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefix_tail</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># label -&gt; the output tensor its sampled ids arrive in, if the stream keys generation</span>
     <span class="n">prefix_decode</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># label -&gt; the layout its keys were chained over, one span per write</span>
-    <span class="n">prefix_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">PrefixSpan</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">kv_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"StreamLayout"</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">loop_caps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="KVReqConfig.apply_conductor_config">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.apply_conductor_config">[docs]</a>
@@ -1220,8 +1221,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">prefix_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_tail</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_decode</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">prefix_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">kv_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">loop_caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="k">if</span> <span class="n">prefix_keys</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1230,14 +1232,26 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">prefix_tail</span> <span class="o">=</span> <span class="n">prefix_tail</span>
         <span class="k">if</span> <span class="n">prefix_decode</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">prefix_decode</span> <span class="o">=</span> <span class="n">prefix_decode</span>
-        <span class="k">if</span> <span class="n">prefix_layout</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># sent as plain lists, which keeps the request's kwargs on the wire's plain msgpack path</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_layout</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="n">label</span><span class="p">:</span> <span class="p">[</span><span class="n">PrefixSpan</span><span class="p">(</span><span class="o">*</span><span class="n">row</span><span class="p">)</span> <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">]</span>
-                <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">rows</span> <span class="ow">in</span> <span class="n">prefix_layout</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-            <span class="p">}</span>
         <span class="k">if</span> <span class="n">prefix_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="o">=</span> <span class="n">prefix_cache</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="o">=</span> <span class="n">prefix_cache</span>
+        <span class="k">if</span> <span class="n">kv_layout</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># a model lays out every label the request could open on any deployment, so keep only the ones it opens</span>
+            <span class="n">opened</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="n">label</span><span class="p">:</span> <span class="n">StreamLayout</span><span class="p">(</span>
+                    <span class="n">spans</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">PrefixSpan</span><span class="p">(</span><span class="o">*</span><span class="n">row</span><span class="p">)</span> <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">spans</span><span class="p">),</span>
+                    <span class="n">growth</span><span class="o">=</span><span class="nb">tuple</span><span class="p">((</span><span class="n">loop</span><span class="p">,</span> <span class="n">slots</span><span class="p">)</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="n">growth</span><span class="p">),</span>
+                    <span class="n">scratch</span><span class="o">=</span><span class="n">scratch</span><span class="p">,</span>
+                    <span class="n">retention</span><span class="o">=</span><span class="kc">None</span> <span class="k">if</span> <span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">RetentionPolicy</span><span class="p">(</span><span class="o">*</span><span class="n">retention</span><span class="p">),</span>
+                    <span class="n">keyed_spans</span><span class="o">=</span><span class="n">keyed_spans</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="p">(</span><span class="n">spans</span><span class="p">,</span> <span class="n">growth</span><span class="p">,</span> <span class="n">scratch</span><span class="p">,</span> <span class="n">retention</span><span class="p">,</span> <span class="n">keyed_spans</span><span class="p">)</span> <span class="ow">in</span> <span class="n">kv_layout</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">opened</span>
+            <span class="p">}</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">loop_caps</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="n">loop</span><span class="p">:</span> <span class="n">loop_caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span>
+                <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">growth</span>
+            <span class="p">}</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.get_labels">
@@ -1250,6 +1264,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">needed_labels</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">needed_labels</span>
         <span class="k">return</span> <span class="p">[</span><span class="s2">"main"</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="KVReqConfig.opened_labels">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.opened_labels">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">opened_labels</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="n">labels</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels</span> <span class="ow">or</span> <span class="p">[</span><span class="s2">"main"</span><span class="p">])</span>
+        <span class="k">for</span> <span class="n">named</span> <span class="ow">in</span> <span class="p">(</span><span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node</span><span class="o">.</span><span class="n">values</span><span class="p">(),</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node_walk</span><span class="o">.</span><span class="n">values</span><span class="p">()):</span>
+            <span class="n">labels</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">named</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">labels</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.get_publish_labels">
@@ -1277,6 +1300,33 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">mapping</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">),</span> <span class="p">[])</span></div>
 </div>
 
+
+
+
+<div class="viewcode-block" id="refuse_undeclared_labels">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.refuse_undeclared_labels">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">refuse_undeclared_labels</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">declared</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="n">kv_layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">],</span>
+    <span class="n">configs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500."""</span>
+    <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">|</span> <span class="n">kv_layout</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+        <span class="n">laid_out</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">kv_layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">()))</span>
+        <span class="k">if</span> <span class="n">extra</span> <span class="o">:=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">laid_out</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">declared</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">()))):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model</span><span class="si">}</span><span class="s2"> returned a kv_layout for </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">/</span><span class="si">{</span><span class="n">extra</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, which it does not declare"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">missing</span> <span class="o">:=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">configs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">()</span> <span class="o">-</span> <span class="n">laid_out</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model</span><span class="si">}</span><span class="s2"> returned no kv_layout for </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">/</span><span class="si">{</span><span class="n">missing</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, which the request opens"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="without_layouts">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.without_layouts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">without_layouts</span><span class="p">(</span><span class="n">configs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Only the KV manager's ingest reads the layouts and caps, so they are dropped</span>
+<span class="sd">    before the configs go out with every frame between workers."""</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="n">key</span><span class="p">:</span> <span class="n">replace</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">kv_layout</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">loop_caps</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">)</span> <span class="k">else</span> <span class="n">config</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">config</span> <span class="ow">in</span> <span class="n">configs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+    <span class="p">}</span></div>
 
 
 <div class="viewcode-block" id="KVSpec">
@@ -1332,6 +1382,55 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"context_budget must be &gt; 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">context_budget</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"protected_prefix must be &gt;= 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="StreamLayout">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StreamLayout</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""`LabelLayout` as the KV manager holds it."""</span>
+    <span class="n">spans</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">PrefixSpan</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="n">growth</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">retention</span><span class="p">:</span> <span class="n">RetentionPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">keyed_spans</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
+<div class="viewcode-block" id="StreamLayout.slots">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.slots">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">slots</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span>
+            <span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StreamLayout.pages">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.pages">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.</span>
+
+<span class="sd">        Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves</span>
+<span class="sd">        less than a page over the budget, so the window peaks at the protected prefix plus</span>
+<span class="sd">        the budget, or at the prefix rounded up to a page if that is larger. The bound adds</span>
+<span class="sd">        a page of overrun and the largest step past the prefix to that peak.</span>
+<span class="sd">        """</span>
+        <span class="n">peak</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slots</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
+            <span class="n">peak</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">peak</span><span class="p">,</span> <span class="n">end</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
+            <span class="n">end</span> <span class="o">+=</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">peak</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">pages</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">protected_prefix</span>
+        <span class="n">step</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
+            <span class="n">end</span> <span class="o">+=</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span>
+            <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">prefix</span><span class="p">:</span>
+                <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
+        <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">([</span><span class="n">step</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">slots</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span><span class="p">)])</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">prefix</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">context_budget</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">prefix</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">window</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">step</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">))</span></div>
+</div>
 
 
 

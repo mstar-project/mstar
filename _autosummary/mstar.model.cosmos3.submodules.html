@@ -714,7 +714,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.GenStepInfo.retention"><code class="docutils literal notranslate"><span class="pre">GenStepInfo.retention</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.frame_tokens"><code class="docutils literal notranslate"><span class="pre">frame_tokens()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.latent_frames"><code class="docutils literal notranslate"><span class="pre">latent_frames()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="docutils literal notranslate"><span class="pre">native_flow_sigmas()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.sound_frames"><code class="docutils literal notranslate"><span class="pre">sound_frames()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -774,8 +777,17 @@ matches running the whole transformer each step.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.frame_tokens" title="mstar.model.cosmos3.submodules.frame_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">frame_tokens</span></code></a>(height, width, config)</p></td>
+<td><p>Generation tokens per latent frame of a <code class="docutils literal notranslate"><span class="pre">height</span></code> x <code class="docutils literal notranslate"><span class="pre">width</span></code> request.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.latent_frames" title="mstar.model.cosmos3.submodules.latent_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">latent_frames</span></code></a>(num_frames, config)</p></td>
+<td><p></p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.native_flow_sigmas" title="mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="xref py py-obj docutils literal notranslate"><span class="pre">native_flow_sigmas</span></code></a>(num_inference_steps, ...)</p></td>
 <td><p>The native flow-matching sigma grid: <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code> values linearly spaced from <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">1/T</span></code> toward 0, the endpoint dropped.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.sound_frames" title="mstar.model.cosmos3.submodules.sound_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_frames</span></code></a>(md, config)</p></td>
+<td><p>Resolve a sound request's target sample count and latent frame count.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1634,6 +1646,36 @@ deliberately not part of <code class="docutils literal notranslate"><span class=
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.frame_tokens">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">frame_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">height</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#frame_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.frame_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Generation tokens per latent frame of a <code class="docutils literal notranslate"><span class="pre">height</span></code> x <code class="docutils literal notranslate"><span class="pre">width</span></code> request. <cite>_build_static</cite> asserts the count.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>height</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>width</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.latent_frames">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">latent_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_frames</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#latent_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.latent_frames" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>num_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.native_flow_sigmas">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">native_flow_sigmas</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_inference_steps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_train_timesteps</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#native_flow_sigmas"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.native_flow_sigmas" title="Link to this definition">#</a></dt>
 <dd><p>The native flow-matching sigma grid: <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code> values
@@ -1646,6 +1688,25 @@ to it (a Python list raises inside <code class="docutils literal notranslate"><s
 <li><p><strong>num_inference_steps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_train_timesteps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.sound_frames">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">sound_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">md</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#sound_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.sound_frames" title="Link to this definition">#</a></dt>
+<dd><p>Resolve a sound request’s target sample count and latent frame count.</p>
+<p>The sound duration defaults to the video duration (<code class="docutils literal notranslate"><span class="pre">num_frames</span> <span class="pre">/</span> <span class="pre">fps</span></code>,
+the request’s <code class="docutils literal notranslate"><span class="pre">sound_duration</span></code> overrides), the target sample count is
+that duration at the AVAE sample rate, and the latent frame count rounds
+it up to whole tokenizer hops (the decoded tail past the target is
+trimmed by the audio decode node).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>md</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1774,7 +1835,10 @@ to it (a Python list raises inside <code class="docutils literal notranslate"><s
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.GenStepInfo.retention"><code class="docutils literal notranslate"><span class="pre">GenStepInfo.retention</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.frame_tokens"><code class="docutils literal notranslate"><span class="pre">frame_tokens()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.latent_frames"><code class="docutils literal notranslate"><span class="pre">latent_frames()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="docutils literal notranslate"><span class="pre">native_flow_sigmas()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.sound_frames"><code class="docutils literal notranslate"><span class="pre">sound_frames()</span></code></a></li>
 </ul>
   </nav></div>
 

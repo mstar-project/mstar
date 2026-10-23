@@ -13,7 +13,10 @@ mstar.model.cosmos3.submodules
 
    .. autosummary::
    
+      frame_tokens
+      latent_frames
       native_flow_sigmas
+      sound_frames
    
    
 

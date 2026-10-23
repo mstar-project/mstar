@@ -9,6 +9,13 @@ mstar.engine.resources.kv.config
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      refuse_undeclared_labels
+      without_layouts
+   
    
 
    
@@ -28,6 +35,7 @@ mstar.engine.resources.kv.config
       RingKVConfig
       RingKVLayerConfig
       RingKVStep
+      StreamLayout
    
    
 
