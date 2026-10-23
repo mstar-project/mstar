@@ -1670,7 +1670,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># {UUID -&gt; producer's host copy}, for a ``needs_cpu_tensor`` transport</span>
         <span class="c1"># to send from. Optional and never the only copy; the producer reuses</span>
-        <span class="c1"># its memory after the send, so nothing but the send may read it.</span>
+        <span class="c1"># its memory after the send, so nothing but the send may read it, and</span>
+        <span class="c1"># the worker drops them once its step's sends are done.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensors_cpu</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># Only for teardown: which uuids a request is responsible for, and the</span>
         <span class="c1"># reverse so a single removal does not scan every request. A sliced</span>
@@ -1698,6 +1699,14 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_cpu_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The host copy stored alongside ``uuid``, if the producer gave one."""</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensors_cpu</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="TensorStore.drop_cpu_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.drop_cpu_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop_cpu_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Forget every host copy. A tensor sent after this is read from its</span>
+<span class="sd">        own memory."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensors_cpu</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="TensorStore.put_tensor">

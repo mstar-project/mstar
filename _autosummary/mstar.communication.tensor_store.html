@@ -727,6 +727,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference_batch"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.drop_cpu_tensors"><code class="docutils literal notranslate"><span class="pre">TensorStore.drop_cpu_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_all_uuids"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_all_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_cpu_tensor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_info"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_info()</span></code></a></li>
@@ -1783,6 +1784,18 @@ them, which is what <code class="docutils literal notranslate"><span class="pre"
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensor_store.TensorStore.drop_cpu_tensors">
+<span class="sig-name descname"><span class="pre">drop_cpu_tensors</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensor_store.html#TensorStore.drop_cpu_tensors"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensor_store.TensorStore.drop_cpu_tensors" title="Link to this definition">#</a></dt>
+<dd><p>Forget every host copy. A tensor sent after this is read from its
+own memory.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensor_store.TensorStore.get_all_uuids">
 <span class="sig-name descname"><span class="pre">get_all_uuids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensor_store.html#TensorStore.get_all_uuids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensor_store.TensorStore.get_all_uuids" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -2156,6 +2169,7 @@ crossing, and taking every request at once collapses it to one.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference_batch"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.dereference_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorStore.dereference_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.drop_cpu_tensors"><code class="docutils literal notranslate"><span class="pre">TensorStore.drop_cpu_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_all_uuids"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_all_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_cpu_tensor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensor_store.TensorStore.get_info"><code class="docutils literal notranslate"><span class="pre">TensorStore.get_info()</span></code></a></li>

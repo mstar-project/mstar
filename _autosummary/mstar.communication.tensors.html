@@ -710,6 +710,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.drop_host_copies"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.drop_host_copies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.enable_transfer_metrics"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.enable_transfer_metrics()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.force_cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_ready_tensors()</span></code></a></li>
@@ -1479,6 +1480,20 @@ do: the shm files, the arena slots and the memory unregistration.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.drop_host_copies">
+<span class="sig-name descname"><span class="pre">drop_host_copies</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.drop_host_copies"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.drop_host_copies" title="Link to this definition">#</a></dt>
+<dd><p>Forget the host copies stored with a step’s outputs once that step’s
+sends are done. They are views of buffers the producer reuses on its
+next step, and a tensor can be sent in a later step than the one that
+stored it (a loop’s accumulated output is sent when the loop ends).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.enable_transfer_metrics">
 <span class="sig-name descname"><span class="pre">enable_transfer_metrics</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.enable_transfer_metrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.enable_transfer_metrics" title="Link to this definition">#</a></dt>
 <dd><p>Count what this manager reads from now on (see <code class="docutils literal notranslate"><span class="pre">EdgeTransfers</span></code>).
@@ -2185,6 +2200,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.drop_host_copies"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.drop_host_copies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.enable_transfer_metrics"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.enable_transfer_metrics()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.force_cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_ready_tensors()</span></code></a></li>

@@ -2596,6 +2596,16 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_undo_leading_shard_dim</span><span class="p">(</span><span class="n">shard_dim</span><span class="p">,</span> <span class="n">tensor</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="TensorCommunicationManager.drop_host_copies">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.drop_host_copies">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop_host_copies</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Forget the host copies stored with a step's outputs once that step's</span>
+<span class="sd">        sends are done. They are views of buffers the producer reuses on its</span>
+<span class="sd">        next step, and a tensor can be sent in a later step than the one that</span>
+<span class="sd">        stored it (a loop's accumulated output is sent when the loop ends)."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">drop_cpu_tensors</span><span class="p">()</span></div>
+
+
 <div class="viewcode-block" id="TensorCommunicationManager.set_persist">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.set_persist">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_persist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">persist</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
