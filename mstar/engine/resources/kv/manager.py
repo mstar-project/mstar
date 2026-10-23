@@ -2596,27 +2596,30 @@ class KVManager(AttentionResource):
             return False
         return self._cpu_pool is None or not self.is_offloaded(rid)
 
-    def check_drop(self, rid: str) -> None:
+    def check_drop(self, rid: str) -> str | None:
         if self._world_size > 1:
-            raise RuntimeError(
+            return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
                 "would leave them holding different pages"
             )
         if self.is_offloaded(rid):
-            raise RuntimeError(f"KV {self.name}: {rid} has a host copy, which a drop would leave behind")
+            return f"KV {self.name}: {rid} has a host copy, which a drop would leave behind"
         with self._lock:
             if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
-                raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
+                return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
             layouts = (self._overrides[rid].kv_layout or {}).values()
             if any(span.kind != "ids" for layout in layouts for span in layout.spans):
-                raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
+                return f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids"
+        return None
 
     def drop(self, rid: str) -> int:
         """Take ``rid``'s KV off the device without a host copy, and return the
         number of pages freed. Pages the index also holds stay cached, where they
         can be evicted, and the rest go back to the free list."""
         with self._lock:
-            self.check_drop(rid)
+            refusal = self.check_drop(rid)
+            if refusal is not None:
+                raise RuntimeError(refusal)
             # under the lock, so no other step allocates between the two counts
             free, room = self._arena.num_free, self._room()
             # Unlike an offload, a drop also gives up the unused part of the request's allotment. A dropped request
@@ -3430,6 +3433,9 @@ class KVManager(AttentionResource):
             self._allotments[rid] = Allotment(pages=need, prompt=self._waiting.pop(rid))
             self._recount(rid)
             return True
+
+    def is_victim(self, rid: str) -> bool:
+        return rid in self._victims
 
     def waits(self, rid: str) -> bool:
         """Whether ``rid`` waits for room: no drop could cover its shortage, and the room hasn't grown since."""

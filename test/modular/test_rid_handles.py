@@ -165,7 +165,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._last_active = {}
     w._kv_keys, w._kept_ids, w._rebuild_rows = {"n": ["kv"]}, {"n": {a: None, b: None}}, {a: None}
-    w._dropped = {a: "n"}
+    w._dropped, w._victims = {a: "n"}, {a: "kv"}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -178,7 +178,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert b in w.request_state.per_request_info
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
-    assert w._kept_ids == {"n": {b: None}} and not w._rebuild_rows and not w._dropped, (
+    assert w._kept_ids == {"n": {b: None}} and not w._rebuild_rows and not w._dropped and not w._victims, (
         "the next request would rebuild from these ids"
     )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
@@ -252,7 +252,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     )
     w._draining_rids = set()
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped = {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
     w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
@@ -294,7 +294,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped = {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._consumer_node_cache = {"codec_tokens": "Codec"}
     w._my_consumer_connections = [Connection(

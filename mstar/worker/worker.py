@@ -629,6 +629,7 @@ class Worker:
         #   of another partition samples tokens of its own.
         # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
         # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
+        # `_victims`: handle -> the key of the cache whose shortage chose it, until it is dropped.
         # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
         #   prefill walk's single input, such as `text_inputs`.
         # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
@@ -638,9 +639,9 @@ class Worker:
             self._kv_caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
-        self._kept_ids: dict[str, dict[int, KeptIds]] = {node_name: {} for node_name in self._kv_keys}
         self._rebuild_rows: dict[int, RebuildRow] = {}
         self._dropped: dict[int, str] = {}
+        self._victims: dict[int, str] = {}
         self._walk_inputs: dict[tuple[str, str], set[str]] = {}
         self._growth_loops: dict[tuple[str, str], str] = {}
         if model is not None:
@@ -652,6 +653,9 @@ class Worker:
                 for kv_label in (label for key in keys for label in labels.get(key, {}).values()):
                     for walk_name, loop in kv_label.growth:
                         self._growth_loops[(walk_name, node_name)] = loop
+        self._kept_ids: dict[str, dict[int, KeptIds]] = {
+            node_name: {} for node_name in self._kv_keys if self._can_rebuild_on(node_name, my_walks)
+        }
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -1021,18 +1025,31 @@ class Worker:
             kept.pop(request_id, None)
         self._rebuild_rows.pop(request_id, None)
         self._dropped.pop(request_id, None)
+        self._victims.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+    def _can_rebuild_on(self, node_name: str, my_walks: set[tuple[str, str]]) -> bool:
+        """Whether a rebuild could recompute a request's KV on ``node_name``. Only such a node keeps ids
+        and drops requests, and every other node keeps the offload and the hold.
+
+        A node whose walks this worker doesn't all run, such as a disaggregated decode node, can't run the
+        prefill walk a rebuild needs. A rebuild row recomputes one label, so a node with a second paged KV
+        cache, such as Whisper's decoder with its encoder context, can't be rebuilt either.
+        """
+        return len(self._kv_keys[node_name]) == 1 and all(
+            (node_name, walk) in my_walks for walk, node in self._walk_inputs if node == node_name
+        )
 
     def _keep_ids(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         """Keep the prompt's ids on each node where one prefill row can recompute the request's KV
         from them. The node's paged KV caches must lay out one label, written by one walk and grown
         by one loop. The node must also read a single input, with the same name in that walk and in
         every walk the loop grows in, since the rebuild row's ids go under that name."""
-        for node_name, keys in self._kv_keys.items():
-            kept = self._kept_ids[node_name]
+        for node_name, kept in self._kept_ids.items():
+            keys = self._kv_keys[node_name]
             if request_id in kept:
                 continue  # its other partition's NewRequest
             prompts = [
@@ -1055,9 +1072,10 @@ class Worker:
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
         the pages freed."""
-        if request_id not in self._kept_ids.get(node_name, {}):
+        if not self._rebuildable(request_id, node_name):
             raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} keeps no ids on {node_name} to rebuild it from"
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} keeps no ids on {node_name}, is in a walk "
+                "that grows no KV there, or keeps samples that don't cover its KV"
             )
         backlogged = any(
             request_id in batch.request_to_worker_graph
@@ -1068,21 +1086,63 @@ class Worker:
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step, a backlog or the rebuild queue "
                 f"on {node_name}"
             )
-        # The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
-        # discards the row's sample only under decode-time metadata, so the request must be in the walk
-        # that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
-        # holds all but the last sample.
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        loop = self._growth_loops.get((info.graph_walk, node_name))
-        kept = self._kept_ids[node_name][request_id]
-        if loop is None or len(kept.sampled) != info.dynamic_loop_iter_counts.get(loop, 0) + 1:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} on {node_name} is in walk "
-                f"{info.graph_walk!r}, which grows no KV, or its {len(kept.sampled)} kept samples don't cover its KV"
-            )
         freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
         self._dropped[request_id] = node_name
         return freed
+
+    def _rebuildable(self, request_id: int, node_name: str) -> bool:
+        """Whether the kept ids on ``node_name`` can rebuild the request's KV there.
+
+        The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
+        discards the row's sample only under decode-time metadata, so the request must be in the walk
+        that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
+        holds all but the last sample.
+        """
+        kept = self._kept_ids.get(node_name, {}).get(request_id)
+        if kept is None:
+            return False
+        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
+        loop = self._growth_loops.get((info.graph_walk, node_name))
+        return loop is not None and len(kept.sampled) == info.dynamic_loop_iter_counts.get(loop, 0) + 1
+
+    def _preempt(self, node_batch: ExecutingBatch) -> bool:
+        """Drop newer requests for the one whose grant ran short, or mark them to drop once their step
+        lands, and return True. False where preemption is off, or while no request on the node keeps ids
+        and so nothing there can be dropped, which leaves the offload and the hold to run."""
+        kv = self._kv_caches.get(node_batch.failed_resource)
+        if kv is None or not self._kept_ids.get(node_batch.node_name):
+            return False
+        reason, engine = node_batch.admit_error, self.engine_manager.get_engine(node_batch.node_name)
+        nodes = [node_name for node_name in kv.nodes if node_name in self._kept_ids]
+
+        def droppable(rid: int) -> bool:
+            held = [node_name for node_name in nodes if rid in self._kept_ids[node_name]]
+            return bool(held) and all(
+                self._rebuildable(rid, node_name) and engine.drop_refusal(node_name, rid) is None for node_name in held
+            )
+
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
+        if victims is None:
+            return False
+        self._victims.update(dict.fromkeys(victims, kv.key))
+        self._drop_victims()
+        return True
+
+    def _drop_victims(self) -> None:
+        """Drop each victim no step in flight holds. A backlogged row goes back to the runtime and a
+        queued rebuild row leaves its queue first, so neither runs on pages the drop gave up."""
+        for rid, key in list(self._victims.items()):
+            if rid in self._in_flight_rids:
+                continue
+            del self._victims[rid]
+            kv = self._kv_caches[key]
+            if not kv.cache.is_victim(rid):
+                continue  # the request it was chosen for has left
+            self.scheduler.return_backlogged(rid)
+            self._rebuild_rows.pop(rid, None)
+            for node_name in kv.nodes:
+                if rid in self._kept_ids.get(node_name, ()):
+                    self._drop(rid, node_name)
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
         """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
@@ -2458,6 +2518,8 @@ class Worker:
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
         if self._is_tp_follower_node(batch.node_name):
+            return
+        if self._preempt(node_batch):
             return
 
         # scope the eviction to whichever resource actually ran out, when the
@@ -4660,6 +4722,8 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
+                if self._victims:
+                    self._drop_victims()
                 # Requests a resource declared unservable during last pass's
                 # readiness scans. They are in no batch, so nothing else would
                 # ever fail them.
@@ -4895,6 +4959,8 @@ class Worker:
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     _set_pending(None)
+                    if self._victims:
+                        self._drop_victims()
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held
                         # here, and what it stamped with a step this rank dropped,

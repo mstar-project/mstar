@@ -199,10 +199,13 @@ class _HoldingWorker:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _push_back_batch = Worker._push_back_batch
     _is_tp_follower_node = Worker._is_tp_follower_node
+    _preempt = Worker._preempt
 
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(hold_requests=lambda rids: None)
+        # no paged KV cache, so nothing preempts
+        self._kv_caches = {}
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
         self.parallel_nodes = set()
