@@ -550,7 +550,7 @@ class StepRunner:
         for key in reversed(keys):
             self._resources[key].rollback_admit(step.get(key), step.ctx)
 
-    def plan(self, step: SubmoduleStep) -> dict[str, Any]:
+    def plan(self, step: SubmoduleStep, phase: str = "res.plan") -> dict[str, Any]:
         """plan in dependency order
 
         place plan in `step.ctx.plan_results` before next plan runs
@@ -565,13 +565,13 @@ class StepRunner:
         results.clear()
         for key in self._keys_for(step):
             if self._nvtx:
-                range_push(f"res.plan.{key}")
+                range_push(f"{phase}.{key}")
             t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
                 if t0 is not None:
-                    phase_end(f"res.plan.{key}", t0)
+                    phase_end(f"{phase}.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
