@@ -76,16 +76,6 @@ class PrefixIndex:
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
-    def peek(self, keys: Sequence[bytes]) -> list[int]:
-        """Like `lookup`, but leaves the matched pages' stamps alone."""
-        pages: list[int] = []
-        for key in keys:
-            page = self._by_key.get(key)
-            if page is None:
-                break
-            pages.append(page)
-        return pages
-
     def insert_run(self, keys: Sequence[bytes], pages: Sequence[int], parent: int | None) -> int:
         """Name ``pages`` by ``keys``, each under the one before and the first
         under ``parent``. A key already indexed keeps its page, and the next key

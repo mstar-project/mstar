@@ -740,7 +740,7 @@ class KVManager(AttentionResource):
             spans, ends = chain.spans, chain.rooted_ends
         total = sum(span.length for span in spans)
         if rooted is None:
-            rooted, ends = self._hash_chain(keys, spans)
+            rooted, ends = self._root(keys, spans)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
@@ -782,19 +782,6 @@ class KVManager(AttentionResource):
             if held < end < min(held + self.config.page_size, total):
                 return end, key
         return None
-
-    def _hash_chain(
-        self, keys: list[bytes], spans: list[PrefixSpan],
-    ) -> tuple[list[bytes], list[tuple[int, bytes]]]:
-        """A chain's ``rooted`` and ``rooted_ends``. Called outside the lock: one SHA-256 per
-        page, and admit, commit and remove would wait on it."""
-        rooted = [fingerprint(self._prefix_root, key) for key in keys]
-        ends, at = [], 0
-        for span in spans:
-            at += span.length
-            if span.end_key is not None:
-                ends.append((at, fingerprint(self._prefix_root, span.end_key)))
-        return rooted, ends
 
     def _root(
         self, keys: list[bytes], spans: list[PrefixSpan],
@@ -3456,7 +3443,7 @@ class KVManager(AttentionResource):
         # hashed outside the lock, similar to `resolve_cached_prefix`, so other threads don't wait on it.
         # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
         # once the lock is taken again.
-        hashed = [self._hash_chain(keys, spans) for _, keys, spans in todo]
+        hashed = [self._root(keys, spans) for _, keys, spans in todo]
         with self._lock:
             for (chain, _, _), (rooted, ends) in zip(todo, hashed, strict=True):
                 chain.rooted, chain.rooted_ends = rooted, ends
@@ -3516,19 +3503,19 @@ class KVManager(AttentionResource):
             if chain is None or stream.stored_len or stream.offloaded or stream.lease is not None:
                 continue
             if label in reading and label in needed:
-                pages = self._index.peek(chain.rooted)[:reading[label].seq_len // page_size]
+                pages = self._index.pages_for(chain.rooted)[:reading[label].seq_len // page_size]
                 whole += len(pages)
             elif (
                 cursor.done < len(chain.spans) and not stream.read_pending
                 and overrides.get_labels(node_name, chain.spans[cursor.done].walk) == [label]
                 and self._keyed_label(rid, node_name, chain.spans[cursor.done].walk) == label
             ):
-                pages = self._index.peek(chain.rooted)[:len(chain.rooted) - 1]
+                pages = self._index.pages_for(chain.rooted)[:len(chain.rooted) - 1]
                 whole += len(pages)
                 total = sum(span.length for span in chain.spans)
                 image_end = self._image_end(chain.rooted_ends, len(pages) * page_size, total)
                 if image_end is not None:
-                    pages = pages + self._index.peek([image_end[1]])
+                    pages = pages + self._index.pages_for([image_end[1]])
             else:
                 continue
             charged += sum(1 for page in pages if page in evictable)
