@@ -3759,7 +3759,7 @@ class KVManager(AttentionResource):
         if pages is None and self._index is not None:
             # cached pages are the only ones that can be given back
             # without failing a request that is already running
-            self._index.evict(n - self._arena.num_free)
+            self._evict(n - self._arena.num_free)
             pages = self._arena.acquire(n)
         if pages is None and self._decides:
             raise RuntimeError(
