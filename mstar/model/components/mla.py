@@ -2,14 +2,15 @@
 
 ``config`` carries the MLA dims: ``hidden_size``, ``num_attention_heads``, ``q_lora_rank``,
 ``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``qk_head_dim``, ``v_head_dim``,
-``padded_head_dim``, ``rms_norm_eps``, ``rope_theta`` and ``mla_absorb``, the backend:
+``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale`` and ``mla_absorb``, the backend:
 
 * absorbed: once the weights load, ``kv_b_proj`` folds into the query (``w_kc``) and the output
   (``w_vc``), and the two down projections into one GEMM. Attention runs over the cache's compressed
   rows (the ``kv_lora_rank`` latent and the decoupled RoPE key) through the MLA attention resource.
 * naive: per-head K/V padded to the attention backend's head size, the reduced-dims parity path.
 
-The decoupled RoPE is interleaved, in fp32 (``InterleavedRotaryEmbedding``). A model's sparse
+The decoupled RoPE is the position resource's (``pos_key``; the model's ``PositionConfig`` sets
+its layout and table), at the positions the caller passes. A model's sparse
 attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
 (naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
 """
@@ -24,7 +25,6 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
-from mstar.model.components.rope import InterleavedRotaryEmbedding
 
 
 class MLAAttention(nn.Module):
@@ -36,6 +36,7 @@ class MLAAttention(nn.Module):
         *,
         kv_key: str,
         attn_key: str,
+        pos_key: str,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -73,14 +74,11 @@ class MLAAttention(nn.Module):
             comm_group, h * config.v_head_dim, config.hidden_size,
             bias=False, input_is_parallel=True, reduce_results=True)
 
-        self.rotary = InterleavedRotaryEmbedding(
-            rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
-
         self.layer_idx = layer_idx
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
-        # qk_head_dim**-0.5 into q on the padded path. No Yarn -> no mscale.
-        self.softmax_scale_boost = math.sqrt(self.padded_head_dim / self.qk_head_dim)
-        self.softmax_scale = self.qk_head_dim ** -0.5
+        # softmax_scale into q on the padded path.
+        self.softmax_scale = config.softmax_scale
+        self.softmax_scale_boost = math.sqrt(self.padded_head_dim) * self.softmax_scale
 
         self.mla_absorb = config.mla_absorb
         if self.mla_absorb:
@@ -88,13 +86,25 @@ class MLAAttention(nn.Module):
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
         # engine-built, bound once at load (bind_resources)
-        self._kv_key, self._attn_key = kv_key, attn_key
+        self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv = None
         self._attn = None
+        self._pos = None
 
     def bind_resources(self, resources: dict) -> None:
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
+        self._pos = resources[self._pos_key]
+
+    def _rope(
+        self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate ``q_pe`` / ``k_pe`` at ``position_ids`` through the position resource. Its
+        kernel rotates whole rows in place, so the slices split off q and the latent are
+        copied out first."""
+        return self._pos.apply_qk(
+            q_pe.clone(memory_format=torch.contiguous_format),
+            k_pe.clone(memory_format=torch.contiguous_format), pos_ids=position_ids)
 
     @property
     def cache_layer_idx(self) -> int:
@@ -116,13 +126,11 @@ class MLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         **sparse,
     ) -> torch.Tensor:
-        """``rope_cos_sin``: the forward's shared ``InterleavedRotaryEmbedding.cos_sin``, else
-        computed here. ``sparse``: the subclass's selection inputs, passed to its hooks."""
+        """``sparse``: the subclass's selection inputs, passed to its hooks."""
         if self.mla_absorb:
-            return self._forward_absorbed(hidden_states, position_ids, rope_cos_sin, **sparse)
+            return self._forward_absorbed(hidden_states, position_ids, **sparse)
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
@@ -137,7 +145,7 @@ class MLAAttention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # shared MQA rope key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe)
 
         q = torch.cat([q_nope, q_pe], dim=-1)  # (T, H, Dqk)
         k_pe = k_pe.expand(num_tokens, h, self.qk_rope_head_dim)
@@ -162,7 +170,6 @@ class MLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         **sparse,
     ) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
@@ -197,7 +204,7 @@ class MLAAttention(nn.Module):
         kv_c = self.kv_a_layernorm(kv_a).view(num_tokens, 1, self.kv_lora_rank)  # (T,1,L)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # (T,1,Drope) shared MQA key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe)
 
         selection = self._select(hidden_states, q_c, position_ids, **sparse)
 

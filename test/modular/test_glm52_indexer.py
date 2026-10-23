@@ -25,11 +25,13 @@ def _cpu_flashinfer() -> types.ModuleType:
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 from test_glm52_moe import BLOCK, _fabricate_checkpoint  # noqa: E402
 
 from mstar.engine.resources.dsa.manager import index_topk, select_topk_causal  # noqa: E402
+from mstar.model.glm52._testing import cpu_positions, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import (  # noqa: E402
     Glm52MLAAttention,
     masked_reference_attention,
@@ -42,6 +44,7 @@ from mstar.model.glm52.components.indexer import (  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.weight_loader import load_glm52_hf_weights  # noqa: E402
@@ -96,7 +99,14 @@ def _build_indexer(seed):
     return idx, cfg
 
 
+def _positions():
+    """The position resource the indexer rotates with, past the longest history here (no
+    test changes the RoPE fields)."""
+    return {POS_RESOURCE: cpu_positions(Glm52ModelConfig.reduced(), max_seq_len=4096)}
+
+
 def _randomize_indexer(idx):
+    idx.bind_resources(_positions())
     idx.wq_b.weight.data.normal_(0, 0.05)
     idx.wk.weight.data.normal_(0, 0.05)
     idx.weights_proj.weight.data.normal_(0, 0.05)
@@ -202,7 +212,8 @@ def test_sparse_forward_matches_dense_bitwise_within_topk():
     dense causal attention — bitwise, not merely close."""
     attn, cfg = _build_attention(seed=2)
     dense_resources = _CausalDenseResources()
-    attn.bind_resources({KV_RESOURCE: dense_resources, ATTN_RESOURCE: dense_resources})
+    attn.bind_resources(
+        {KV_RESOURCE: dense_resources, ATTN_RESOURCE: dense_resources, **_positions()})
     t = cfg.index_topk  # ctx <= topk regime
     h = torch.randn(t, cfg.hidden_size) * 0.1
     pos = torch.arange(t)

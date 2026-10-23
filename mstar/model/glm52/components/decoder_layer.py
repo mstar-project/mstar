@@ -32,12 +32,10 @@ class Glm52DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, position_ids, rope_cos_sin=rope_cos_sin)
+        hidden_states = self.self_attn(hidden_states, position_ids)
         hidden_states = residual + hidden_states
 
         residual = hidden_states

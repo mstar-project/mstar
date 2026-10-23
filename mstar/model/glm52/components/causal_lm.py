@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52.components.decoder_layer import Glm52DecoderLayer
 from mstar.model.glm52.components.language_model import (
     build_embedding,
@@ -28,10 +27,6 @@ class Glm52LanguageModel(nn.Module):
             ]
         )
         self.norm = build_rmsnorm(config)
-        # cos/sin for the whole forward are computed ONCE here and handed to
-        # every layer (rope_cos_sin) — same dims/base as each layer's own
-        # rotary, which stays the fallback for single-layer callers.
-        self.rotary = InterleavedRotaryEmbedding(rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
 
     def forward(
         self,
@@ -42,11 +37,8 @@ class Glm52LanguageModel(nn.Module):
         layer's pick is the one the SHARED layers after it reuse, until the next
         FULL layer (the DSA resource keeps it for the forward)."""
         hidden_states = self.embed_tokens(input_ids)
-        rope_cos_sin = self.rotary.cos_sin(position_ids)
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states, position_ids, rope_cos_sin=rope_cos_sin,
-            )
+            hidden_states = decoder_layer(hidden_states, position_ids)
         return self.norm(hidden_states)
 
 

@@ -122,6 +122,9 @@ def _cpu_flashinfer(monkeypatch):
     fi = types.ModuleType("flashinfer")
     fi.norm = types.SimpleNamespace(rmsnorm=rmsnorm)
     monkeypatch.setitem(sys.modules, "flashinfer", fi)
+    from mstar.model.glm52._testing import install_cpu_rope
+
+    install_cpu_rope(monkeypatch)
 
 
 def test_compiled_forward_does_not_recompile_per_request(monkeypatch):

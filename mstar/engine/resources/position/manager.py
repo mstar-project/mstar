@@ -520,17 +520,26 @@ class RopeManager(PositionManager):
     def apply_qk(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        label: str,
+        k: torch.Tensor | None,
+        label: str | None = None,
         rotary_dim: int | None = None,
         interleave: bool | None = None,
         rope_scale: float | None = None,
         rope_theta: float | None = None,
         rope_dtype: torch.dtype | None = None,
+        pos_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        pos_ids = self._current_pos_ids[label]
+        """Rotate ``q`` and ``k`` at ``label``'s planned positions, or at ``pos_ids``, one per
+        row, for a model that threads positions itself (an offset, or a slice of the step).
+        ``k=None`` rotates ``q`` alone and returns ``(q, None)``."""
+        if pos_ids is None:
+            pos_ids = self._current_pos_ids[label]
         config = self._config
+        alone = k is None
+        if alone:
+            # the kernel rotates a (q, k) pair; a one-head scratch key stands in
+            k = q.new_zeros(q.shape[0], 1, q.shape[-1])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
@@ -593,7 +602,7 @@ class RopeManager(PositionManager):
             rope_theta,
             **llama31_params,
         )
-        return q.to(orig_dtype), k.to(orig_dtype)
+        return q.to(orig_dtype), None if alone else k.to(orig_dtype)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings

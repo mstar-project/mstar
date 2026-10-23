@@ -70,7 +70,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # the step's positions and row ends, in one pinned H2D each
+        # the step's row ends, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
         # Per request, in its request_state: "token_budget", max_tokens capped at the
         # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop);
@@ -283,14 +283,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]
 
-        device = self.get_device()
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
-        # engine path is on, where the cap is the serving window.
+        # engine path is on, where the cap is the serving window. The
+        # positions themselves are the position resource's (``_positions``).
         long_context = self.config.dsa_long_context
         limit = self._context_limit()
         topk = self.config.index_topk
-        pos_ids_list: list[int] = []
         for rid, sl in zip(request_ids, seq_lens, strict=True):
             start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
@@ -313,21 +312,24 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     f"index_topk={topk}; sparse attention beyond topk is "
                     "decode-only."
                 )
-            pos_ids_list.extend(range(start, start + sl))
         # pinned staging: a pageable torch.tensor(..., device=cuda) here
         # drains the stream before the step even starts
-        position_ids = self._index_stager.to_device(pos_ids_list, device)
-        seq_len_t = self._index_stager.to_device(seq_lens, device)
+        seq_len_t = self._index_stager.to_device(seq_lens, self.get_device())
         return {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
-            "position_ids": position_ids,
             # eager prefill: the last row per request, when no plan buffer
             # carries qo_indptr
             "last_token_indices": seq_len_t.cumsum(0) - 1,
         }
 
-    def _hidden(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        return self.language_model.model(input_ids, position_ids)
+    def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
+        """The step's positions as the position resource planned them, in the KV plan's
+        order, which ``input_ids`` packs in; captured, a slice of the slot's buffer."""
+        return self._pos(engine_inputs).pos_ids(_MAIN)[:num_tokens]
+
+    def _hidden(self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor) -> torch.Tensor:
+        positions = self._positions(engine_inputs, input_ids.shape[0])
+        return self.language_model.model(input_ids, positions)
 
     def _last_rows(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, kwargs: dict,
@@ -351,10 +353,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        hidden = self._hidden(input_ids, position_ids)
+        hidden = self._hidden(engine_inputs, input_ids)
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -365,10 +366,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        hidden = self._hidden(input_ids, position_ids)
+        hidden = self._hidden(engine_inputs, input_ids)
         if graph_walk == "prefill":
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
         elif graph_walk != "decode":

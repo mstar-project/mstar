@@ -2,6 +2,9 @@
 
 from dataclasses import dataclass, field
 
+import torch
+
+from mstar.engine.resources.position.config import PositionConfig
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
@@ -153,6 +156,21 @@ class Glm52ModelConfig:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     @property
+    def softmax_scale(self) -> float:
+        """MLA's attention scale. Plain RoPE, so no YaRN mscale folds in."""
+        return self.qk_head_dim ** -0.5
+
+    def position_config(self) -> PositionConfig:
+        """The positions over the KV cache and the RoPE the layers rotate with: interleaved
+        over ``qk_rope_head_dim``, from an fp32 cos/sin table built once (the angles as the
+        reference computes them, for every position up to ``max_seq_len``)."""
+        return PositionConfig(
+            kv_cache=KV_RESOURCE, rotary_dim=self.qk_rope_head_dim,
+            interleave=self.rope_interleave, rope_theta=self.rope_theta,
+            rope_table_dtype=torch.float32,
+        )
+
+    @property
     def padded_head_dim(self) -> int:
         """Naive-MLA q/k/v pad target; FlashInfer paged kernels require 64/128/256."""
         for supported in (64, 128, 256):
@@ -243,12 +261,14 @@ class Glm52ModelConfig:
             q_lora_rank=48,
             kv_lora_rank=32,
             qk_nope_head_dim=16,
-            qk_rope_head_dim=8,
+            # the narrowest RoPE FlashInfer's table kernel rotates (the GPU tests run it);
+            # the indexer still rotates only the first half of its heads
+            qk_rope_head_dim=16,
             v_head_dim=16,
             # Indexer at test scale. offset=1 anchors the every-freq series
             # at layer 0, so the 2-layer model is layer 0 FULL / 1 SHARED.
             index_n_heads=4,
-            index_head_dim=16,
+            index_head_dim=32,
             index_topk=64,
             index_topk_freq=4,
             index_skip_topk_offset=1,
