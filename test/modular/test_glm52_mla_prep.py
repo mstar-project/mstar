@@ -1,6 +1,7 @@
 """GLM-5.2's fused MLA pre-attention (mla_prep.py) against the unfused ops it replaces, at
-one TP8 rank's dims: FlashInfer's rmsnorm, the compiled RoPE and the cache scatter bit for
-bit, then a compiled attention layer with ``mla_fused_prep`` on against the same layer off."""
+one TP8 rank's dims: FlashInfer's rmsnorm, the position resource's RoPE and the cache scatter
+bit for bit, then a compiled attention layer with ``mla_fused_prep`` on against the same layer
+off."""
 import copy
 import importlib
 import sys
@@ -8,7 +9,6 @@ import sys
 import pytest
 import torch
 
-from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.model.glm52.components.attention import Glm52MLAAttention
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.utils import mla_prep
@@ -19,6 +19,7 @@ Q, L, R, NOPE, H = 2048, 512, 64, 192, 8  # q_lora, kv_lora, rope, nope; heads p
 EPS = 1e-5
 PAGE = 128
 TOKENS = [1, 8, 32, 64, 1100]
+MAX_POS = 1 << 18
 
 
 _REAL_FLASHINFER = []
@@ -55,12 +56,24 @@ def _norm_weight(n, seed):
     return (1.0 + 0.1 * torch.randn(n, generator=g, device="cuda")).to(torch.bfloat16)
 
 
+_POSITIONS = []
+
+
+def _positions():
+    """GLM-5.2's position resource on the GPU, its fp32 table over MAX_POS positions."""
+    from mstar.engine.resources.position.manager import RopeManager
+
+    if not _POSITIONS:
+        _POSITIONS.append(RopeManager(
+            Glm52ModelConfig().position_config(), torch.device("cuda"), max_seq_len=MAX_POS))
+    return _POSITIONS[0]
+
+
 def _rope_inputs(T, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = (torch.randn(T, H, NOPE + R, generator=g, device="cuda") * 2).to(torch.bfloat16)
-    pos = torch.randint(0, 1 << 20, (T,), generator=g, device="cuda")
-    cos, sin = InterleavedRotaryEmbedding(R, Glm52ModelConfig.rope_theta).cos_sin(pos)
-    return q, cos, sin
+    pos = torch.randint(0, MAX_POS, (T,), generator=g, device="cuda")
+    return q, _positions().cos_sin_table, pos
 
 
 def _slots(T, pages, seed):
@@ -69,8 +82,11 @@ def _slots(T, pages, seed):
     return flat // PAGE, flat % PAGE
 
 
-def _unfused_rope(q_pe, k_pe, cos, sin):
-    return InterleavedRotaryEmbedding(R, Glm52ModelConfig.rope_theta)(None, q_pe, k_pe, cos_sin=(cos, sin))
+def _unfused_rope(q_pe, k_pe, pos):
+    """The unfused path's RoPE: the position resource's (FlashInfer's cos/sin-cache kernel)."""
+    return _positions().apply_qk(
+        q_pe.clone(memory_format=torch.contiguous_format),
+        k_pe.clone(memory_format=torch.contiguous_format), pos_ids=pos)
 
 
 def test_supports_only_the_widths_whose_order_it_matches():
@@ -96,41 +112,44 @@ def test_q_norm_is_flashinfers_rmsnorm_bit_for_bit(T):
 @gpu
 @pytest.mark.parametrize("T", TOKENS)
 def test_kv_write_q_rope_is_the_unfused_path_bit_for_bit(T):
-    """Against FlashInfer's rmsnorm, the compiled RoPE and the advanced-index scatter; the
-    whole cache compares, so a stray write shows too."""
+    """Against FlashInfer's rmsnorm, the position resource's RoPE and the advanced-index
+    scatter; the whole cache compares, so a stray write shows too."""
     from mstar.engine.resources.rms_norm.rms_norm import run_rms_norm
 
     fused = _fused_rows(T, 100 + T)
     w = _norm_weight(L, 2)
-    q, cos, sin = _rope_inputs(T, 200 + T)
+    q, table, pos = _rope_inputs(T, 200 + T)
     num_pages = -(-T // PAGE) + 3
     cache = torch.randn(num_pages, PAGE, L + R, device="cuda").to(torch.bfloat16)
     pages, offsets = _slots(T, num_pages, 300 + T)
 
     kv_c = run_rms_norm(fused[:, Q:Q + L].clone(), w, eps=EPS)
-    q_pe, k_pe = torch.compile(_unfused_rope)(
-        q[..., NOPE:], fused[:, Q + L:].view(T, 1, R), cos, sin)
+    q_pe, k_pe = _unfused_rope(q[..., NOPE:], fused[:, Q + L:].view(T, 1, R), pos)
     expect = cache.clone()
     expect[pages, offsets] = torch.cat([kv_c, k_pe.squeeze(1)], dim=-1)
 
-    out = mla_prep.kv_write_q_rope(fused, w, EPS, cos, sin, q, cache, pages, offsets)
+    out = mla_prep.kv_write_q_rope(fused, w, EPS, table, pos, q, cache, pages, offsets)
     assert out.shape == (T, H, R) and out.is_contiguous()
     assert torch.equal(_bits(cache), _bits(expect))
     assert torch.equal(_bits(out), _bits(q_pe))
 
 
 @gpu
-def test_rope_is_within_an_ulp_of_the_eager_path():
-    """Eager torch rounds x * cos and rotate(x) * sin apart; the kernel (as Inductor) fuses
-    one product into the add."""
+def test_rope_is_within_an_ulp_of_the_cpu_stand_in():
+    """The CPU tests' RoPE stand-in (``_testing.cpu_rope_apply_qk_inplace``) rounds x * cos
+    and rotate(x) * sin apart; the kernel fuses one product into the add."""
+    from mstar.model.glm52._testing import cpu_rope_apply_qk_inplace
+
     T = 1100
-    q, cos, sin = _rope_inputs(T, 7)
+    q, table, pos = _rope_inputs(T, 7)
     fused = _fused_rows(T, 8)
     cache = torch.zeros(-(-T // PAGE), PAGE, L + R, device="cuda", dtype=torch.bfloat16)
     pages, offsets = _slots(T, cache.shape[0], 9)
-    out = mla_prep.kv_write_q_rope(fused, _norm_weight(L, 3), EPS, cos, sin, q, cache, pages,
+    out = mla_prep.kv_write_q_rope(fused, _norm_weight(L, 3), EPS, table, pos, q, cache, pages,
                                    offsets)
-    q_pe, k_pe = _unfused_rope(q[..., NOPE:], fused[:, Q + L:].view(T, 1, R), cos, sin)
+    q_pe = q[..., NOPE:].clone(memory_format=torch.contiguous_format)
+    k_pe = fused[:, Q + L:].view(T, 1, R).clone()
+    cpu_rope_apply_qk_inplace(q_pe, k_pe, pos, table, R, True, 1.0, 0.0)
     for got, ref in ((out, q_pe), (cache[pages, offsets, L:], k_pe.squeeze(1))):
         torch.testing.assert_close(got, ref, rtol=2.0 ** -7, atol=1e-6)
         assert (got != ref).float().mean().item() < 1e-3
@@ -141,11 +160,11 @@ def test_kv_write_stops_at_the_planned_tokens():
     """Rows past ``len(pages)`` (the plan's token count) get q_pe but no cache write."""
     T, n = 8, 5
     fused = _fused_rows(T, 11)
-    q, cos, sin = _rope_inputs(T, 12)
+    q, table, pos = _rope_inputs(T, 12)
     cache = torch.randn(2, PAGE, L + R, device="cuda").to(torch.bfloat16)
     pages, offsets = _slots(T, 2, 13)
     before = cache.clone()
-    mla_prep.kv_write_q_rope(fused, _norm_weight(L, 4), EPS, cos, sin, q, cache, pages[:n],
+    mla_prep.kv_write_q_rope(fused, _norm_weight(L, 4), EPS, table, pos, q, cache, pages[:n],
                              offsets[:n])
     unwritten = torch.ones(2, PAGE, dtype=torch.bool, device="cuda")
     unwritten[pages[:n], offsets[:n]] = False
@@ -170,9 +189,10 @@ def _gpu_resources(cfg, num_pages):
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+    from mstar.engine.resources.position.manager import RopeManager
     from mstar.engine.resources.runner import StepRunner
     from mstar.model.glm52._testing import _StubTransferManager
-    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE
+    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, POS_RESOURCE
 
     dev = torch.device("cuda")
     kv_cfg = PagedKVConfig(
@@ -188,8 +208,9 @@ def _gpu_resources(cfg, num_pages):
     finally:
         manager_mod.KVTransferManager = stub
     attn = FlashInferMLAManager(kv_cache=KV_RESOURCE, device=dev, dtype=torch.bfloat16,
-                                kv_config=kv_cfg, sm_scale=cfg.qk_head_dim ** -0.5)
-    resources = {KV_RESOURCE: kv, ATTN_RESOURCE: attn}
+                                kv_config=kv_cfg, sm_scale=cfg.softmax_scale)
+    pos = RopeManager(cfg.position_config(), dev, max_seq_len=cfg.max_seq_len)
+    resources = {KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos}
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     runner.ingest_request("r0")
     return resources, runner
@@ -207,9 +228,8 @@ def _step(layer, fwd, runner, h, start):
     assert runner.admit(step).ok
     runner.plan(step)
     pos = torch.arange(start, start + n, device="cuda")
-    cos_sin = layer.rotary.cos_sin(pos)
     with torch.no_grad():
-        out = fwd(h, pos, rope_cos_sin=cos_sin)
+        out = fwd(h, pos)
     runner.commit(step)
     return out
 
