@@ -2,6 +2,8 @@
 
 An automatic aid beside listening, not a quality score: a low word error rate
 says the two agents said the same words; it says nothing about how they sound.
+Whisper invents text for silence or near-silence ("Thank you.", runs of dots),
+so transcripts of short or quiet clips say little.
 """
 
 import argparse
@@ -63,7 +65,8 @@ def main():
         rows[directory.name] = {"transcripts": texts, "agent_wer_mstar_vs_nvidia": word_error_rate(
             texts["nvidia"], texts["mstar"])}
     summary = {"status": "PASS", "asr_model": args.asr_model, "stages": rows,
-               "scope": "Transcript agreement between the two agents; not an audio quality measure."}
+               "scope": "Transcript agreement between the two agents; not an audio quality measure. "
+                        "Whisper invents text for near-silence."}
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 
