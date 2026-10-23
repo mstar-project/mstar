@@ -30,6 +30,7 @@ def _cpu_flashinfer() -> types.ModuleType:
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 from mstar.engine.resources import StepContext  # noqa: E402
@@ -41,6 +42,7 @@ from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
     build_random_model,
+    install_cpu_rope,
 )
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402

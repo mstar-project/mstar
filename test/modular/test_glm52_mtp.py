@@ -34,6 +34,7 @@ def _cpu_flashinfer() -> types.ModuleType:
 def _force_cpu_flashinfer(monkeypatch):
     """Force the CPU stub for the duration of every test in this module."""
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 from mstar.engine.resources import (  # noqa: E402
     AttentionStep,
@@ -43,7 +44,7 @@ from mstar.engine.resources import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.mtp import (  # noqa: E402
     Glm52MTPModule,
     mtp_greedy_verify,
