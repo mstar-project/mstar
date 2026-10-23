@@ -691,6 +691,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
+                streaming=input.streaming,
             ),
         )
         self.communicator.send("conductor", msg)

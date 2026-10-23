@@ -234,6 +234,7 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
+    streaming: bool = False
 
 
 @dataclass

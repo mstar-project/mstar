@@ -130,3 +130,4 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    streaming: bool = False

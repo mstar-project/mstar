@@ -597,6 +597,7 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
+            streaming=streaming,
         ))
 
         logger.info(
