@@ -324,15 +324,27 @@ beside the prompts already admitted, and no request behind it starts first. A ca
 a page only the prefix index holds counts as a page the request takes. A request that
 can't fit in its pool at its full output length gets a 400 if it asked for that length,
 and otherwise has the model's default length cut until it fits. The pool
-reserves only prompts, so it still has to hold the decode of every request allowed to run
-at once, and a decode step that finds no page outside the admitted prompts holds its
-requests until they time out.
-``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
+reserves only prompts, so a decode step can find no page outside the admitted prompts. The
+worker then moves the least recently active request to the host if ``cpu_offload_pages`` has
+room for it. Otherwise it drops the newest requests it can rebuild from their token ids. Either
+way, the request that ran short gets the pages freed, up to its shortage, unless it was the request
+moved to the host or dropped. A dropped request waits at its place in the queue until its history and
+one more page fit, then recomputes its KV in one prefill row.
+
+Above one rank, on a worker that runs only some of a node's walks, on a node with a second
+paged KV cache, such as Whisper's decoder, and while no request on a node keeps its token ids,
+as on Qwen3-TTS's Talker, a decode step that finds no page and nothing to offload holds its
+requests until they time out. Elsewhere at one rank, a request that runs short and can't be
+dropped waits for room when nothing can be offloaded and dropping newer requests wouldn't
+cover its shortage. That is the case for a request with an
+image or audio in its KV, and for every request under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``,
+since the sampler then refuses every drop. Several such requests can wait on each other.
+``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
-frees only the device pages no other running request reads, though, so a request that
-shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+safe value. ``cpu_offload_pages`` lets a full pool move a request to the host, and an offload
+comes before any drop. An offload frees only the device pages no other running request reads,
+though, so a request that shares most of its prompt frees little.
+Offload helps a pool that runs short now and then. It doesn't replace the cap.
 
 **Single GPU.** Everything on rank 0:
 
