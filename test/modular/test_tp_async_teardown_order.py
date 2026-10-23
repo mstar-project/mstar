@@ -122,7 +122,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:

@@ -200,6 +200,7 @@ class _HoldingWorker:
     _push_back_batch = Worker._push_back_batch
     _is_tp_follower_node = Worker._is_tp_follower_node
     _preempt = Worker._preempt
+    _log_throttled = Worker._log_throttled
 
     def __init__(self):
         self._graph_runtime = _Runtime()

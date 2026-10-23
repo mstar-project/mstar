@@ -547,6 +547,8 @@ class KVManager(AttentionResource):
         # node -> (prompt tokens looked up in the index, tokens it held), one
         # lookup per request stream; read by the worker's metrics
         self.prefix_tokens: dict[str, tuple[int, int]] = {}
+        # node -> pages a dropped request's rebuild found in the index; read by the worker's metrics
+        self.rebuild_pages: dict[str, int] = {}
         # label -> the walks its keys describe; a label not here is not gated
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
@@ -759,6 +761,8 @@ class KVManager(AttentionResource):
                     # one assignment, so a reader on another thread never sees half of it
                     queried, hit = self.prefix_tokens.get(node_name, (0, 0))
                     self.prefix_tokens[node_name] = (queried + total, hit + held)
+                if rid in self._dropped:
+                    self.rebuild_pages[node_name] = self.rebuild_pages.get(node_name, 0) + len(matched)
                 if not matched:
                     return None
                 stream.lease, stream.lease_len = matched, held
@@ -3445,6 +3449,10 @@ class KVManager(AttentionResource):
 
     def is_victim(self, rid: str) -> bool:
         return rid in self._victims
+
+    def arrival(self, rid: str) -> int | None:
+        overrides = self._overrides.get(rid)
+        return None if overrides is None else overrides.arrival
 
     def waits(self, rid: str) -> bool:
         """Whether ``rid`` waits for room: no drop could cover its shortage, and the room hasn't grown since."""
