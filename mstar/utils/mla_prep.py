@@ -4,13 +4,15 @@ latent's KV-cache write in two kernels, where the unfused path launches seven.
 ``q_norm`` normalizes the q_a slice of the fused q_a/kv_a projection into the contiguous q_c
 that q_b reads. ``kv_write_q_rope`` runs after q_b: per token, one program normalizes the kv_a
 slice, rotates k_pe and stores the ``[kv_c | k_pe]`` latent straight into its planned cache
-slot, and another rotates every head's q_pe.
+slot, and another rotates every head's q_pe. Both RoPEs read the position resource's fp32
+cos/sin table (``RopeManager.cos_sin_table``) at each token's position.
 
-Both reproduce the unfused compiled path bit for bit. The norms sum their squares in the order
-of FlashInfer's rmsnorm for rows of 256 to 3072 (lane i of 32 accumulates the 8-wide vectors
-at ``256 j + 8 i``, then a butterfly across the lanes), and the RoPE rounds as Inductor's
-contraction of it does, ``fma(x, cos, rotate(x) * sin)``. The eager unfused path rounds the
-RoPE without the fma, so against it q_pe / k_pe differ by one bf16 ulp in ~1e-5 of values.
+Both reproduce the unfused path bit for bit. The norms sum their squares in the order of
+FlashInfer's rmsnorm for rows of 256 to 3072 (lane i of 32 accumulates the 8-wide vectors at
+``256 j + 8 i``, then a butterfly across the lanes), and the RoPE rounds as the position
+resource's (FlashInfer's cos/sin-cache kernel) does, ``fma(x, cos, rotate(x) * sin)``. The CPU
+tests' stand-in rounds the two products apart, so against it q_pe / k_pe differ by one bf16
+ulp in ~1e-5 of values.
 """
 from __future__ import annotations
 
@@ -78,7 +80,7 @@ def _q_norm_kernel(x, stride_x, w, out, eps, Q: tl.constexpr, QP: tl.constexpr,
 
 @triton.jit
 def _kv_write_q_rope_kernel(
-    x, stride_x, w, eps, cos, sin, stride_cs, cache, stride_cp, stride_ct, pages, offsets,
+    x, stride_x, w, eps, table, stride_tab, pos, cache, stride_cp, stride_ct, pages, offsets,
     n_write, q, stride_qt, stride_qh, q_pe,
     Q: tl.constexpr, L: tl.constexpr, LP: tl.constexpr, R: tl.constexpr, NOPE: tl.constexpr,
     H: tl.constexpr, HP: tl.constexpr, PDL: tl.constexpr,
@@ -90,8 +92,10 @@ def _kv_write_q_rope_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     d = tl.arange(0, R)
-    c = tl.load(cos + t * stride_cs + d)
-    s = tl.load(sin + t * stride_cs + d)
+    # the table row is R/2 cosines then R/2 sines; the pair (2i, 2i + 1) turns by angle i
+    cs = table + tl.load(pos + t).to(tl.int64) * stride_tab + d // 2
+    c = tl.load(cs)
+    s = tl.load(cs + R // 2)
     if tl.program_id(1) == 0:
         if t < n_write:
             row = x + t * stride_x + Q
@@ -134,27 +138,28 @@ def _(fused, weight, eps):
 
 def kv_write_q_rope(
     fused: torch.Tensor, weight: torch.Tensor, eps: float,
-    cos: torch.Tensor, sin: torch.Tensor, q: torch.Tensor,
+    table: torch.Tensor, positions: torch.Tensor, q: torch.Tensor,
     cache: torch.Tensor, pages: torch.Tensor, offsets: torch.Tensor,
 ) -> torch.Tensor:
     """Store ``[rmsnorm(kv_a) | rope(k_pe)]`` for the first ``len(pages)`` tokens into the
     slots ``cache[pages[t], offsets[t]]``, and return the roped q_pe of every token and head.
 
     ``fused`` is ``(T, Q + L + R)`` rows of ``[q_a | kv_a | k_pe]``, L = ``weight``'s width;
-    ``cos`` / ``sin`` the fp32 ``(T, 1, R)`` tables; ``q`` q_b's ``(T, H, nope + R)``;
+    ``table`` the fp32 ``(max_seq_len, R)`` cos/sin table and ``positions`` each token's row in
+    it; ``q`` q_b's ``(T, H, nope + R)``;
     ``cache`` one layer's ``(pages, page_size, L + R)`` latents. Returns ``(T, H, R)``.
     """
     T, H = q.shape[0], q.shape[1]
-    L, R = weight.shape[0], cos.shape[-1]
+    L, R = weight.shape[0], table.shape[-1]
     n_write = pages.shape[0]
     assert fused.stride(1) == 1 and q.stride(2) == 1 and cache.stride(2) == 1
-    assert cos.stride(-1) == 1 and cos.stride(0) == sin.stride(0) and cos.dtype == torch.float32
+    assert table.stride(-1) == 1 and table.dtype == torch.float32 and positions.shape[0] >= T
     assert cache.shape[-1] == L + R and cache.dtype == fused.dtype and n_write <= T
     q_pe = q.new_empty(T, H, R)
     if T:
         pdl = _pdl(fused.device)
         _kv_write_q_rope_kernel[(T, 2)](
-            fused, fused.stride(0), weight.to(fused.dtype), eps, cos, sin, cos.stride(0),
+            fused, fused.stride(0), weight.to(fused.dtype), eps, table, table.stride(0), positions,
             cache, cache.stride(0), cache.stride(1), pages, offsets, n_write,
             q, q.stride(0), q.stride(1), q_pe,
             Q=fused.shape[1] - L - R, L=L, LP=triton.next_power_of_2(L), R=R,

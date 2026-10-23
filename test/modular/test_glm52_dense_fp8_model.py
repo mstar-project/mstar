@@ -43,7 +43,7 @@ from mstar.engine.resources import (  # noqa: E402
 )
 from mstar.model.components.distributed import ColumnParallelLinear  # noqa: E402
 from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, Fp8ParallelGatedMLP  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig  # noqa: E402
@@ -55,6 +55,7 @@ def cpu_flashinfer(monkeypatch):
     """The CPU forward's RMSNorm; on a box with real flashinfer an earlier import would
     route host tensors into GPU kernels."""
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 def _cfg(dense_fp8=True, block=(16, 16)):

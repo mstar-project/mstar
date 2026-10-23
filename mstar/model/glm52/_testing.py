@@ -1,5 +1,7 @@
-"""Test-support helpers for the GLM-5.2 fp8-block path."""
+"""Test-support helpers for the GLM-5.2 fp8-block path and its CPU resources."""
 from __future__ import annotations
+
+import dataclasses
 
 import torch
 
@@ -78,6 +80,46 @@ def index_topk(
     key_pos = torch.arange(keys.shape[0], device=scores.device)
     scores = scores.masked_fill(key_pos.unsqueeze(0) > positions.unsqueeze(1), float("-inf"))
     return select_topk_causal(scores, positions, topk)
+
+
+def cpu_rope_apply_qk_inplace(
+    q, k, pos_ids, cos_sin_cache, rotary_dim, interleave, rope_scale, rope_theta, **llama31,
+) -> None:
+    """CPU stand-in for ``mstar::rope_apply_qk_inplace``, which has CUDA and XPU kernels only:
+    rotates the first ``rotary_dim`` dims of each head of ``q`` and ``k`` in place from the
+    position resource's fp32 table, in fp32, as FlashInfer's cos/sin-cache kernel does."""
+    del rotary_dim, rope_scale, rope_theta, llama31  # all encoded in the table
+    assert cos_sin_cache is not None, "GLM-5.2 rotates from its fp32 table (position_config)"
+    half = cos_sin_cache.shape[-1] // 2
+    rows = cos_sin_cache[pos_ids.long()]
+    cos, sin = rows[:, None, :half], rows[:, None, half:]
+    for x in (q, k):
+        pe = x[..., : 2 * half].float()
+        if interleave:
+            x1, x2 = pe[..., 0::2], pe[..., 1::2]
+            out = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).flatten(-2)
+        else:
+            x1, x2 = pe[..., :half], pe[..., half:]
+            out = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        x[..., : 2 * half] = out.to(x.dtype)
+
+
+def install_cpu_rope(monkeypatch) -> None:
+    """Route the position resource's RoPE to ``cpu_rope_apply_qk_inplace`` for one test."""
+    from mstar.engine.resources.position import rope  # noqa: F401  (registers the op)
+
+    monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace", cpu_rope_apply_qk_inplace)
+
+
+def cpu_positions(config, max_seq_len: int | None = None) -> Resource:
+    """The model's position resource on CPU. ``rope_dtype=float32``: the tests run fp32, and
+    ``apply_qk`` would otherwise round an fp32 q / k to bf16 before rotating."""
+    from mstar.engine.resources.position.manager import RopeManager
+
+    return RopeManager(
+        config=dataclasses.replace(config.position_config(), rope_dtype=torch.float32),
+        device=torch.device("cpu"), max_seq_len=max_seq_len or config.max_seq_len,
+    )
 
 
 class ReferenceAttentionResource(AttentionResource):
@@ -178,8 +220,6 @@ def build_cpu_resources(
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
-    from mstar.engine.resources.position.config import PositionConfig
-    from mstar.engine.resources.position.manager import RopeManager
     from mstar.model.glm52.config import (
         ATTN_RESOURCE,
         DSA_RESOURCE,
@@ -223,7 +263,7 @@ def build_cpu_resources(
 
             attn = _ReplannedMLA(
                 kv_cache=KV_RESOURCE, device=device, dtype=torch.float32,
-                kv_config=kv_cfg, sm_scale=config.qk_head_dim ** -0.5,
+                kv_config=kv_cfg, sm_scale=config.softmax_scale,
             )
         else:
             kv_cfg = PagedKVConfig(
@@ -239,8 +279,7 @@ def build_cpu_resources(
             attn = ReferenceAttentionResource(KV_RESOURCE)
     finally:
         manager_mod.KVTransferManager = stub
-    pos = RopeManager(
-        config=PositionConfig(kv_cache=KV_RESOURCE), device=device, max_seq_len=config.max_seq_len)
+    pos = cpu_positions(config)
     resources = {
         KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos, SAMPLER_RESOURCE: GreedySampler(),
     }
