@@ -146,11 +146,14 @@ class GDNPrefillWrapper(GDNWrapper):
         self._plan_state: GDNPrefillPlan | None = None
         self._plan_borrowed = 0
 
-        # Conv buffers
+        # Conv buffers: batch_ptr and offset_ptr are the two halves of one
+        # block, staged in one copy
+        self._conv_block: torch.Tensor | None = None
         self._batch_ptr: torch.Tensor | None = None
         self._offset_ptr: torch.Tensor | None  = None
         self._conv_metadata: ConvMetadata | None = None
         self._seqlens_cpu: torch.Tensor | None = None
+        self._stage = _PinnedIndexStage()
 
         # Snapshots: the kernel checkpoints every row's state each `_every`
         # tokens, and the ones a row keeps are scattered into snapshot slots.
@@ -185,24 +188,16 @@ class GDNPrefillWrapper(GDNWrapper):
             capacity = max(needed, 1)
 
         if capacity > self._capacity:
-            i32 = dict(dtype=torch.int32, device=self._device)
-            self._batch_ptr = torch.zeros(capacity, **i32)
-            self._offset_ptr = torch.zeros(capacity, **i32)
+            self._conv_block = torch.zeros(2 * capacity, dtype=torch.int32, device=self._device)
+            self._batch_ptr = self._conv_block[:capacity]
+            self._offset_ptr = self._conv_block[capacity:]
             self._capacity = capacity
 
-        pin = torch.accelerator.is_available()
-        self._batch_ptr.fill_(self._pad_slot_id)
-        self._offset_ptr.fill_(self._pad_slot_id)
-
-        if rows:
-            self._batch_ptr[: len(rows)].copy_(
-                torch.tensor(rows, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
-            self._offset_ptr[: len(offsets)].copy_(
-                torch.tensor(offsets, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
+        # both halves whole, the tail on the pad id, in one copy
+        host = np.full(2 * self._capacity, self._pad_slot_id, dtype=np.int32)
+        host[:needed] = rows
+        host[self._capacity:self._capacity + needed] = offsets
+        self._stage.upload("conv", host, self._conv_block)
 
         self._seqlens_cpu = torch.tensor(spans, dtype=torch.int32)
         self._conv_metadata = ConvMetadata(
@@ -236,18 +231,9 @@ class GDNPrefillWrapper(GDNWrapper):
             )
             self._rows_capacity = capacity
 
-        cu = [0]
-        for span in spans:
-            cu.append(cu[-1] + span)
-
-        # same dtype as the device buffer: a converting copy is staged through
-        # a pageable temporary and stops being asynchronous
-        self._cu_buffer[: len(cu)].copy_(
-            torch.tensor(
-                cu, dtype=torch.int64, pin_memory=torch.accelerator.is_available()
-            ),
-            non_blocking=True,
-        )
+        cu = np.zeros(num_rows + 1, dtype=np.int64)
+        np.cumsum(spans, out=cu[1:])
+        self._stage.upload("cu", cu, self._cu_buffer)
 
     def _build_mask(
         self, total_tokens: int
@@ -262,8 +248,9 @@ class GDNPrefillWrapper(GDNWrapper):
                 capacity, dtype=torch.float32, device=self._device
             )
             self._mask_capacity = capacity
-        self._mask[:total_tokens].fill_(1.0)
-        self._mask[total_tokens:].zero_()
+        host = np.zeros(self._mask_capacity, dtype=np.float32)
+        host[:total_tokens] = 1.0
+        self._stage.upload("mask", host, self._mask)
 
     def plan(
         self,
@@ -283,6 +270,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # buffers by `bs` so these are addressable however full the bucket is.
         spans = [span or 1 for span in spans]
 
+        self._stage.begin()
         self._plan_conv(spans)
         self._build_cu_buffer(spans)
         # a captured graph checkpoints whether or not the step keeps any
@@ -291,6 +279,7 @@ class GDNPrefillWrapper(GDNWrapper):
             self._plan_snapshots(spans, snapshots, checkpoints)
 
         self._build_mask(self._plan_tokens)
+        self._stage.end()
         num_rows = len(spans)
         self._plan_state = GDNPrefillPlan(
             slots=slots,
