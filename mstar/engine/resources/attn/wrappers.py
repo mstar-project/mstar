@@ -636,7 +636,8 @@ class FlashInferMixedWrapper:
         self._perm = self._idx64[:tokens]
         self._dec_src = self._idx64[tokens:tokens + rows]
         self._dec_dst = self._idx64[tokens + rows:]
-        self._host64 = torch.empty(tokens + 2 * rows, dtype=torch.int64, pin_memory=True)
+        pin = device.type == "cuda"
+        self._host64 = torch.empty(tokens + 2 * rows, dtype=torch.int64, pin_memory=pin)
         # the whole step's qo_indptr, which `select_last_hidden` reads
         self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         # an index row holds the step's pages plus one sink page per padding
@@ -651,7 +652,7 @@ class FlashInferMixedWrapper:
             p_idx=pages + max_prefill_rows + tail_pages,
         )
         self._host = {
-            k: torch.empty(n, dtype=torch.int32, pin_memory=True) for k, n in sizes.items()
+            k: torch.empty(n, dtype=torch.int32, pin_memory=pin) for k, n in sizes.items()
         }
         self._np = {k: t.numpy() for k, t in self._host.items()}
         self._d_lens = self._host["d_lens"].as_subclass(HostLens)
