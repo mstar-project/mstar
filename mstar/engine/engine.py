@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -38,6 +38,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -71,6 +72,7 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -146,6 +148,8 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
+    # the LoRA pools bound to the node's modules, set at bind
+    lora_pools: tuple = ()
 
     def __post_init__(self):
         # Two hazards want a second slot, both of them the host running ahead of
@@ -537,6 +541,7 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    compute_dtype=self._compute_dtype(submodules, relevant_nodes),
                     needs_remote_transfer=(
                         parallel_groups.resource_needs_remote_transfer(
                             spec.nodes, relevant_nodes
@@ -585,6 +590,9 @@ class Engine:
                 resources=resources
             )
             submodule.bind_node_resources(resources)
+            self._submodules[node_name].lora_pools = tuple(
+                resources[key] for key in getattr(submodule, "lora_keys", ())
+            )
             if getattr(submodule, "reads_device_loopback", False):
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see NodeSubmodule)
@@ -602,6 +610,12 @@ class Engine:
             for key, resource in self._resources.items()
             if isinstance(resource, KVManager)
         ]
+
+    def lora_pools(self) -> list["LoraAdapterPool"]:
+        """Every LoRA adapter pool this engine built, for runtime adapter loads."""
+        from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+        return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -644,6 +658,14 @@ class Engine:
                     "Engine: torch.compile failed for %s, using eager mode",
                     node_name, exc_info=True
                 )
+
+    def _compute_dtype(
+        self, submodules: Mapping[str, NodeSubmodule], nodes: Collection[str],
+    ) -> torch.dtype | None:
+        """The dtype ``nodes`` were cast to and run in, or None if they differ or one keeps
+        its own (``disable_autocast``)."""
+        dtypes = {submodules[n].compute_dtype(self._autocast_dtype) for n in nodes}
+        return dtypes.pop() if len(dtypes) == 1 else None
 
     def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
         """This node's autocast dtype, or None for one that opted out."""
@@ -1513,7 +1535,7 @@ class Engine:
         rids = list(ctx.padded_request_ids)
 
         if step is not None:
-            if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
+            if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
                 # The slot was leased from `cg_key_info` before the step was
                 # declared. If the two disagree the replay runs a graph that
                 # was planned for a different declaration — silently wrong
@@ -1557,6 +1579,32 @@ class Engine:
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
+        with self._runner.compute_scope(step):
+            raw = self._preprocess_and_forward(
+                batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
+                lease, running_batched, request_ids, set_launch,
+            )
+
+        if step is not None:
+            if nvtx:
+                range_push("engine.commit")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            try:
+                self._runner.commit(step)
+            finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.commit", perf_counter() - t0)
+                if nvtx:
+                    range_pop()
+        return raw, step
+
+    def _preprocess_and_forward(
+        self, batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
+        lease, running_batched, request_ids, set_launch,
+    ):
+        """``preprocess`` then the forward, inside the step's compute scope."""
+        nvtx = self._enable_nvtx
+        submodule = submodule_mgmt.submodule
         if nvtx:
             range_push("engine.preprocess")
         t0 = perf_counter() if PHASE_PERIOD else 0.0
@@ -1582,7 +1630,7 @@ class Engine:
             range_push("engine.forward")
         t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
-            raw = self._forward(
+            return self._forward(
                 batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
@@ -1591,19 +1639,6 @@ class Engine:
                 phase_record("engine.forward", perf_counter() - t0)
             if nvtx:
                 range_pop()
-
-        if step is not None:
-            if nvtx:
-                range_push("engine.commit")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
-            try:
-                self._runner.commit(step)
-            finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.commit", perf_counter() - t0)
-                if nvtx:
-                    range_pop()
-        return raw, step
 
     def _forward(
         self,
@@ -2187,20 +2222,30 @@ class Engine:
         # business (bagel: guidance on/off) — and the lease is taken before the
         # step is declared, so the submodule is asked directly. It answers from
         # the same per-request facts its `declare_step` stamps on the step.
-        batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
+        key = submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info_wrapped,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
-        lease = cg_runner.lease_slot(
-            graph_walk=batch.step_context.graph_walk,
-            bs=len(batch.request_ids),
-            slot=batch.slot,
-            num_tokens=(
-                None if batch.inputs is None
-                else sum(inp.input_seq_len for inp in batch.inputs)
-            ),
-            cg_key_info=batch.cg_key_info,
+        num_tokens = (
+            None if batch.inputs is None
+            else sum(inp.input_seq_len for inp in batch.inputs)
         )
+        lease = None
+        pools = submodule_mgmt.lora_pools
+        if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
+            # no row names an adapter: the graph captured without LoRA kernels, when
+            # there is one (the pool checks the rows again at plan)
+            batch.cg_key_info = LoraBaseOnly(key)
+            lease = cg_runner.lease_slot(
+                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
+                slot=batch.slot, num_tokens=num_tokens, cg_key_info=batch.cg_key_info,
+            )
+        if lease is None:
+            batch.cg_key_info = key
+            lease = cg_runner.lease_slot(
+                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
+                slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
+            )
         if lease is not None:
             batch.lease_slot(lease)
             batch.step_context.force_prefill = cg_runner.is_packed(lease)
@@ -2355,10 +2400,14 @@ class Engine:
     # worker's; the resources only move their own state. A node's resources
     # are reclaimed together, so a request is either resident or not.
 
-    def evictable(self, node_name: str) -> bool:
+    def evictable(self, node_name: str, resources: "Collection[str] | None" = None) -> bool:
+        """Whether offloading a request can free anything on ``node_name``, or, given
+        ``resources``, anything of those (a LoRA pool, say, never evicts)."""
+        owned = self._submodules[node_name].resources
         return any(
             resource.supports_eviction
-            for resource in self._submodules[node_name].resources.values()
+            for key, resource in owned.items()
+            if resources is None or key in resources
         )
 
     def is_offloaded(self, node_name: str, request_id: str) -> bool:

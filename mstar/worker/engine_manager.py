@@ -6,16 +6,12 @@ import torch
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import (
-    NodeResourceSpec,
-    ResourceReqConfig,
-    apply_yaml_overrides,
-)
+from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model
+from mstar.model.base import Model, serving_resources
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -176,6 +172,17 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
                         )
 
 
+def _parse_dtype(value) -> torch.dtype | None:
+    """A dtype from the serving YAML, which spells it as a string (``float16``).
+    ``null`` stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
+
+
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -206,8 +213,7 @@ class EngineManager:
         resources via ``get_node_resources``; the KV cache's shape rides on
         the latter, so there is no separate cache config.
         """
-        specs = model.get_node_resources()
-        apply_yaml_overrides(specs, model_config)
+        specs = serving_resources(model, model_config)
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
         _refuse_unknown_walks(model)
@@ -219,7 +225,7 @@ class EngineManager:
         # without forcing every config file to set the same value).
         autocast_dtype = model.get_autocast_dtype()
         if "autocast_dtype" in model_config:
-            autocast_dtype = model_config["autocast_dtype"]
+            autocast_dtype = _parse_dtype(model_config["autocast_dtype"])
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
@@ -242,13 +248,9 @@ class EngineManager:
             )
             if submodule is None:
                 continue
-            if submodule.disable_autocast:
-                # keeps the dtype it was built in; the engine won't autocast it
-                submodules[name] = submodule.to(device=device)
-                continue
-            # A submodule that must run in its own dtype (an audio codec in
-            # fp32, say) says so; otherwise it takes the engine's.
-            node_dtype = submodule.get_autocast_dtype() or autocast_dtype
+            # A submodule that must run in its own dtype (an audio codec in fp32, say)
+            # says so; one that disables autocast keeps the dtype it was built in.
+            node_dtype = submodule.compute_dtype(autocast_dtype)
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
 

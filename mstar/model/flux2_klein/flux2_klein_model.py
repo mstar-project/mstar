@@ -46,7 +46,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
-from mstar.model.components.diffusion.lora import LoraSpec
+from mstar.model.components.lora import LoraFile
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -141,7 +141,7 @@ class Flux2KleinModel(Model):
         # (wait for the step, then batch everything ready), which is within a few percent.
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
-        self.loras = [LoraSpec.parse(item) for item in (lora or [])]
+        self.loras = [LoraFile.parse(item) for item in (lora or [])]
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None

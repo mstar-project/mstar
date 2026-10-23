@@ -247,6 +247,10 @@ class KVReqConfig(ResourceReqConfig):
     prefix_decode: dict[str, str] | None = None
     # label -> the layout its keys were chained over, one span per write
     prefix_layout: dict[str, list[PrefixSpan]] | None = None
+    # what the request's chains hang from: empty for the base model, a LoRA adapter's
+    # root otherwise. The prompt's keys already include it; generation keys a first
+    # page with it when the prompt filled none.
+    prefix_root: bytes = b""
     prefix_cache: bool = True
 
     def apply_conductor_config(
@@ -255,6 +259,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
         prefix_layout: dict[str, list[list]] | None=None,
+        prefix_root: bytes | None=None,
         prefix_cache: bool | None=None,
         **kwargs,
     ):
@@ -270,6 +275,8 @@ class KVReqConfig(ResourceReqConfig):
                 label: [PrefixSpan(*row) for row in rows]
                 for label, rows in prefix_layout.items()
             }
+        if prefix_root is not None:
+            self.prefix_root = prefix_root
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
 

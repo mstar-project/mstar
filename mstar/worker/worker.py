@@ -89,8 +89,9 @@ logger = logging.getLogger(__name__)
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
 
-# ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
-# releases the event on every exit, so this only fires if that thread died.
+# How long ``_await_admit_settled`` waits before it warns. An admit can block a
+# while (a LoRA load agreement waiting on a peer's adapter read, say), so a
+# lockstep step keeps waiting after the warning; any other step gives up.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
 
 
@@ -593,6 +594,7 @@ class Worker:
         self.eviction_policy = EvictionPolicy.LRU
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
+        self._no_victim_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -1422,7 +1424,9 @@ class Worker:
         when nothing could be reclaimed.
         """
         engine = self.engine_manager.get_engine(node_name)
-        if not engine.evictable(node_name):
+        # quietly: a resource that never evicts (a LoRA pool) ran out, which is
+        # backpressure for the scheduler, not a working set that does not fit
+        if not engine.evictable(node_name, affected_resources):
             return None
 
         candidates = [
@@ -1441,12 +1445,22 @@ class Worker:
             # wrong tool here — the working set does not fit — and saying so
             # separates it from the host pool being full, which looks identical
             # from the caller and wants the opposite response.
+            what = (
+                "any resource" if affected_resources is None
+                else ", ".join(sorted(affected_resources))
+            )
+            # once per interval: a refusal repeats every step until the set shrinks
+            key = (node_name, what)
+            now = _time.monotonic()
+            last, unlogged = self._no_victim_logged.get(key, (None, 0))
+            if last is not None and now - last < _HOLD_LOG_INTERVAL:
+                self._no_victim_logged[key] = (last, unlogged + 1)
+                return None
+            self._no_victim_logged[key] = (now, 0)
             logger.warning(
                 "No eviction candidate on %s for %s: nothing holds reclaimable "
-                "pages of it. The working set does not fit; eviction cannot "
-                "help.", node_name,
-                "any resource" if affected_resources is None
-                else ", ".join(sorted(affected_resources)),
+                "pages of it. The working set does not fit; eviction cannot help%s.",
+                node_name, what, f" ({unlogged} earlier warnings not logged)" if unlogged else "",
             )
             return None
 
@@ -1988,6 +2002,22 @@ class Worker:
         Once the step's work is submitted we record a CUDA event on the
         default stream; anything that reads the output VALUES waits on it.
         """
+        try:
+            return self._run_gpu_step(batch, node_batch, plan_future)
+        finally:
+            # Every exit releases the submitter and the admit fence
+            # (`_await_admit_settled`), a raise before the step began included;
+            # the engine sets it at launch on the normal path.
+            if node_batch.launch_started_event is not None:
+                node_batch.launch_started_event.set()
+
+    def _run_gpu_step(
+        self,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch,
+        plan_future: Future | None,
+    ) -> dict[int, NameToTensorList]:
+        """``_execute_on_gpu_thread``'s body."""
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
@@ -2064,10 +2094,6 @@ class Worker:
                     self._drain_gpu_spans()
             return outputs
         finally:
-            # Safety net: a step that raised before the forward would otherwise
-            # leave the submitter blocked on this for the full wait timeout.
-            if node_batch.launch_started_event is not None:
-                node_batch.launch_started_event.set()
             # Safety net: a step that raised before publishing outputs or
             # committing would otherwise strand the plan thread preparing the
             # next one. The engine does this too on its own paths; here covers
@@ -2095,20 +2121,41 @@ class Worker:
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
         event: that one is a GIL throttle and is meant to expire early. This
         one is for correctness, so it waits out the step.
+
+        A lockstep step (``tp_seq >= 0``) is waited out however long its admit
+        takes: a teardown landing inside the admit would change what the rest
+        of it decides on this rank alone (KV pages, LoRA slots), and the ranks
+        would then diverge or hang in a collective. The GPU thread releases the
+        event on every exit (``_execute_on_gpu_thread``'s outermost ``finally``),
+        so a wait that never ends means a hung admit.
         """
         if pending is None:
             return
         event = pending.node_batch.launch_started_event
-        if event is None or event.is_set():
+        if event is None or event.is_set() or pending.future.done():
             return
+        lockstep = pending.tp_seq >= 0
+        waited = 0.0
         with self._span("worker.await_admit_settled"):
-            settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
-        if not settled:
-            logger.warning(
-                "Worker %s: timed out waiting for node=%s walk=%s to admit "
-                "before scheduling; page moves may diverge across TP ranks",
-                self.worker_id, pending.node_name, pending.graph_walk,
-            )
+            while not event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S):
+                if pending.future.done():
+                    # a belt to the GPU thread's `finally`: a step it is done with
+                    # admits nothing, and its own result surfaces any error
+                    return
+                waited += _ADMIT_FENCE_TIMEOUT_S
+                if not lockstep:
+                    logger.warning(
+                        "Worker %s: timed out waiting for node=%s walk=%s to admit "
+                        "before scheduling",
+                        self.worker_id, pending.node_name, pending.graph_walk,
+                    )
+                    return
+                logger.warning(
+                    "Worker %s: still waiting for node=%s walk=%s (TP seq %d) to "
+                    "admit after %.0f s; teardowns wait for it",
+                    self.worker_id, pending.node_name, pending.graph_walk,
+                    pending.tp_seq, waited,
+                )
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
         """Take a refused speculative step's rows whose loop stopped at N out
@@ -3910,6 +3957,21 @@ class Worker:
             # torn down above, unless its handle was already gone
             self._pending_removes.pop(rid, None)
 
+    def _apply_teardowns_behind(self, spec_pending: "PendingBatch | None") -> None:
+        """Apply the removes and drains deferred behind the step just
+        post-processed, while ``spec_pending`` may still be on the GPU thread.
+
+        A TP leader stamps these removes with ``spec_pending``'s seq, so like
+        the loop top's they wait for its admit (``_await_admit_settled``): its
+        followers apply them after admitting that step, and an admit reads what
+        a teardown releases (KV pages, LoRA slots).
+        """
+        if spec_pending is not None and spec_pending.tp_seq >= 0:
+            self._await_admit_settled(spec_pending)
+        in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+        self._apply_pending_removes_safe_to_drop(in_flight)
+        self._apply_pending_drains(in_flight)
+
     def _drop_failed_rids(
         self, pending: PendingBatch,
         outputs: dict[int, NameToTensorList],
@@ -4594,9 +4656,7 @@ class Worker:
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
-                    in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
-                    self._apply_pending_removes_safe_to_drop(in_flight)
-                    self._apply_pending_drains(in_flight)
+                    self._apply_teardowns_behind(spec_pending)
                     _set_pending(None)
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held

@@ -32,7 +32,11 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
+            model=req.model,
         )
+        if req.model in api.served_models.adapters:
+            # the response names the adapter that served it, as vLLM's does
+            model_name = req.model
         if req.stream:
             return _stream(api, model_name, request_id, sample_rate)
         chunks = await api.collect_results(request_id, raw_request)

@@ -1200,7 +1200,10 @@ class MicroScheduler:
         always False, so speculation can run every iter.
 
         Does NOT pop or modify queue state. Mirrors the ready-scan in
-        get_next_batch but stops at the first match.
+        get_next_batch but stops at the first match. Its engine readiness
+        checks are real ones, though: a resource may act on them (a LoRA pool
+        claims a slot for the row it calls ready, held until that row's admit
+        or removal), as it would for a row the scan schedules.
 
         Backlogged chunks count too: their graph nodes came off the queues
         when they were assembled, so the scan below cannot see them. A chunk
