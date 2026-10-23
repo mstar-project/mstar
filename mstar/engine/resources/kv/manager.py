@@ -307,9 +307,10 @@ class KVPageCounts(NamedTuple):
 
 @dataclass(slots=True)
 class Allotment:
-    """Pages an admitted request may take from free and evictable pages: its prompt, less the
-    cache hits another request holds. ``remaining`` is its share of `KVManager._unused`, and
-    ``prompt`` is the request's prompt in pages, which `requeue` puts back in `_waiting`."""
+    """Pages an admitted request may take from free and evictable pages: its pages in `_waiting`, less
+    the cache hits another request holds. Nothing is taken off for a guaranteed request. ``remaining``
+    is its share of `KVManager._unused`, and ``prompt`` is those pages, which `requeue` puts back in
+    `_waiting`."""
     pages: int
     remaining: int = 0
     prompt: int = 0
@@ -564,9 +565,12 @@ class KVManager(AttentionResource):
         # admit, so a grant could pass on one rank and fail on another.
         self._decides = self._world_size == 1 and leads
         # An allotment covers the labels `_nodes` open.
-        # `_waiting` is the queue in arrival order, each request with its prompt's pages.
+        # `_waiting` is the queue in arrival order, each request with the pages `_enqueue` counted, which its allotment
+        #   is sized from.
+        # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         self._nodes = nodes
+        self.local_loops: Collection[str] = frozenset()
         self._waiting: OrderedDict[str, int] = OrderedDict()
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
@@ -747,7 +751,7 @@ class KVManager(AttentionResource):
                 image_end = self._image_end(ends, held, total)
                 if image_end is not None:
                     end, key = image_end
-                    cached = self._retain_cached(rid, stream, self._index.lookup([key]))
+                    cached = self._retain_cached(rid, stream, self._index.lookup([key]), counted=False)
                     if cached:
                         # The lease isn't on the stream yet, so ``remaining`` still counts the pages the
                         # lease took. Check this page against the whole allowance instead.
@@ -3324,7 +3328,11 @@ class KVManager(AttentionResource):
         with self._lock:
             for (chain, _, _), (rooted, ends) in zip(todo, hashed, strict=True):
                 chain.rooted, chain.rooted_ends = rooted, ends
-            whole, charged = self._hit(rid, node_name, graph_walk, published)
+            # A guaranteed request takes no cache hit off its allotment, since the request holding a hit page can
+            # release it and the index evict it before the lease.
+            whole = charged = 0
+            if not self._overrides[rid].guaranteed:
+                whole, charged = self._hit(rid, node_name, graph_walk, published)
             need = self._waiting[rid] - whole
             if need + charged > self._room():
                 return _WAIT
@@ -3339,14 +3347,17 @@ class KVManager(AttentionResource):
         waiting behind every request ahead of it.
         """
         overrides = self._overrides[rid]
-        prompt = overrides.pages(self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config.page_size)
+        caps = dict.fromkeys(overrides.loop_caps or (), 0)
+        if overrides.guaranteed:
+            caps.update((loop, cap) for loop, cap in (overrides.loop_caps or {}).items() if loop in self.local_loops)
+        pages = overrides.pages(self._nodes, caps, self.config.page_size)
         capacity = self.config.request_pages
-        if prompt > capacity:
+        if pages > capacity:
             return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                f"KV {self.name}: request {rid} needs {prompt} pages for its prompt, "
+                f"KV {self.name}: request {rid} needs {pages} pages to be admitted, "
                 f"and the pool has {capacity} for requests"
             ))
-        self._queue(rid, prompt)
+        self._queue(rid, pages)
         return None
 
     def _queue(self, rid: str, prompt: int) -> None:
@@ -3561,21 +3572,30 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         return (0 if allotment is None else allotment.remaining) + self._room()
 
-    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
+    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int], counted: bool = True) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.
 
         A page that isn't evictable is lent and takes no room. An evictable one comes out
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
+
+        ``counted`` means that ``rid``'s allotment already holds ``pages``. A guaranteed request is
+        then charged for a page another request holds, instead of being lent it. Otherwise a
+        guaranteed request borrows an evictable page from the room, and its allotment grows by
+        that page.
         """
         if self._decides:
             evictable = self._index.evictable()
-            allowance = self._allowance(rid)
+            guaranteed = self._overrides[rid].guaranteed
+            borrow = guaranteed and not counted
+            allowance = self._room() if borrow else self._allowance(rid)
             for at, page in enumerate(pages):
-                if page not in evictable:
+                if page not in evictable and not (guaranteed and counted):
                     stream.lent.add(page)
                 elif allowance > 0:
                     allowance -= 1
+                    if borrow:
+                        self._allotments[rid].pages += 1
                 else:
                     pages = pages[:at]
                     break

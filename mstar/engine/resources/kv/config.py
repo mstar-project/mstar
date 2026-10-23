@@ -336,8 +336,8 @@ class KVReqConfig(ResourceReqConfig):
         the one model that declares one, computes its positions in each forward.
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
-        has for requests. The pool admits on the prompt alone, so such a request would be admitted
-        and then could not finish even alone in an empty pool."""
+        has for requests. The pool admits a preemptible request on its prompt alone, so a request this
+        large would be admitted and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():

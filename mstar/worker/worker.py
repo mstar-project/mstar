@@ -674,6 +674,7 @@ class Worker:
         self._kept_ids: dict[str, dict[int, KeptIds]] = {
             node_name: {} for node_name in self._kv_keys if self._can_rebuild_on(node_name, my_walks)
         }
+        self._set_local_loops(my_walks)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -1089,6 +1090,14 @@ class Worker:
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
             if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
                 kept[request_id] = KeptIds(ids, array("i"))
+
+    def _set_local_loops(self, my_walks: set[tuple[str, str]]) -> None:
+        """Give each paged KV cache the loops that grow in a walk this worker runs on one of the cache's nodes."""
+        for kv in self._kv_caches.values():
+            kv.cache.local_loops = {
+                loop for (walk, node), loop in self._growth_loops.items()
+                if node in kv.nodes and (node, walk) in my_walks
+            }
 
     def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         """Where a node lays out KV for the request and keeps no ids to rebuild it, no drop can free the
