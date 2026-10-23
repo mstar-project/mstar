@@ -29,3 +29,33 @@ def test_apply_qk_uses_autocast_for_the_tensor_device(monkeypatch):
     assert kernel_dtypes == [(torch.float16, torch.float16)]
     assert result_q.dtype == q.dtype
     assert result_k.dtype == k.dtype
+
+
+def test_apply_qk_without_autocast_downcasts_fp32_and_warns_once(monkeypatch, caplog):
+    """With autocast off, fp32 RoPE still runs in bf16 (the kernel needs it),
+    and one warning names the node; under autocast nothing warns."""
+    from mstar.engine import node_dtype
+    from mstar.engine.accelerator_graph_runner import autocast_scope
+
+    kernel_dtypes = []
+    monkeypatch.setattr(
+        torch.ops.mstar, "rope_apply_qk_inplace",
+        lambda q, k, *args, **kwargs: kernel_dtypes.append(q.dtype),
+    )
+    monkeypatch.setattr(node_dtype, "_warned", set())
+    manager = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"), max_seq_len=8)
+    manager._current_pos_ids["main"] = torch.arange(1)
+    q = torch.ones((1, 1, 2), dtype=torch.float32)
+
+    with caplog.at_level("WARNING", logger=node_dtype.__name__):
+        with autocast_scope(torch.bfloat16, "cpu", node_name="thinker"):
+            manager.apply_qk(q, q.clone(), "main")
+        for _ in range(2):
+            with autocast_scope(None, "cpu", node_name="code2wav"):
+                result_q, _ = manager.apply_qk(q, q.clone(), "main")
+
+    assert kernel_dtypes == [torch.bfloat16] * 3
+    assert result_q.dtype == torch.float32
+    warnings = [r.getMessage() for r in caplog.records if r.name == node_dtype.__name__]
+    assert len(warnings) == 1
+    assert "RoPE" in warnings[0] and "code2wav" in warnings[0]

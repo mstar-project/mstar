@@ -23,6 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
+from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -125,6 +126,8 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
+    # cast and autocast dtype, None if the node opted out; resolved once at load
+    node_dtype: torch.dtype | None = None
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -490,7 +493,10 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        node_dtypes: Mapping[str, torch.dtype | None] | None = None,
     ):
+        """``node_dtypes`` is each node's resolved dtype, as the engine manager
+        cast it; a node missing from it resolves against the engine's dtype."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -582,7 +588,11 @@ class Engine:
                 forward=submodule.forward,
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
-                resources=resources
+                resources=resources,
+                node_dtype=(
+                    node_dtypes[node_name] if node_dtypes is not None and node_name in node_dtypes
+                    else resolve_node_dtype(submodule, self._autocast_dtype)
+                ),
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -645,9 +655,9 @@ class Engine:
                     node_name, exc_info=True
                 )
 
-    def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
-        """This node's autocast dtype, or None for one that opted out."""
-        return None if submodule.disable_autocast else self._autocast_dtype
+    def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
+        """This node's resolved dtype, or None for one that opted out."""
+        return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -660,7 +670,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype_for(submodule),
+                autocast_dtype=self._autocast_dtype_for(node_name),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
@@ -815,7 +825,7 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
+        node_dtype = self._autocast_dtype_for(node_name)
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
@@ -1166,8 +1176,9 @@ class Engine:
         try:
             # inference-only, under the same scope the capture path used
             with torch.no_grad(), autocast_scope(
-                self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
+                self._autocast_dtype_for(batch.node_name),
                 device_type=self._device.type,
+                node_name=batch.node_name,
             ):
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
