@@ -2993,9 +2993,10 @@ class KVManager(AttentionResource):
             # committed, so there is nothing left to unwind
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
+            is_pad = ctx.is_padding_row
             sink = step.sink
-            for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
+            for segment in () if ctx.capture else step.segments:
+                if is_pad(segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
                     continue  # ran against SINK_PAGE, holds nothing
                 stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
