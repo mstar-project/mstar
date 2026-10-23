@@ -379,3 +379,150 @@ def test_compiles_without_graph_breaks():
     compiled = torch.compile(node, fullgraph=True)
     torch.testing.assert_close(compiled(x), node(x), atol=0.05, rtol=0.02)
     assert set(KERNELS) >= {"scaled_mm_rowwise", "dequant", "fp8_emulated"}
+
+
+# --- step 5b: fusing the activation quantize into its producer ---------------------------
+
+
+def test_fused_add_norm_quant_reference_is_the_unfused_pair():
+    from mstar.engine.quant.ops import _quant_per_token_portable
+
+    torch.manual_seed(0)
+    h, r = torch.randn(5, 96, dtype=torch.bfloat16), torch.randn(5, 96, dtype=torch.bfloat16)
+    w = torch.randn(96, dtype=torch.bfloat16) * 0.1
+    h2, r2 = h.clone(), r.clone()
+    torch.ops.mstar.fused_add_rms_norm(h2, r2, w, 1e-6, True)
+    q, s = torch.ops.mstar.fused_add_rms_norm_fp8_quant(h, r, w, 1e-6, True)
+    q2, s2 = _quant_per_token_portable(h2)
+    assert torch.equal(h, h2) and torch.equal(r, r2)
+    assert torch.equal(s, s2) and torch.equal(q.view(torch.uint8), q2.view(torch.uint8))
+
+
+def test_fusion_is_off_with_the_env_switch(monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    from mstar.engine.quant import fusion
+
+    monkeypatch.setattr(inductor_config, "post_grad_custom_post_pass", None)
+    monkeypatch.setenv("MSTAR_QUANT_FUSE", "0")
+    fusion.install()
+    assert inductor_config.post_grad_custom_post_pass is None
+    monkeypatch.delenv("MSTAR_QUANT_FUSE")
+    fusion.install()
+    fusion.install()
+    assert isinstance(inductor_config.post_grad_custom_post_pass, fusion.QuantFusionPass)
+
+
+@cuda
+@pytest.mark.parametrize("m,k", [(1, 2048), (37, 5120)])
+def test_fused_add_norm_quant_kernel_matches_flashinfer_then_quantize(m, k):
+    torch.manual_seed(0)
+    h = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    r = torch.randn_like(h) * 4
+    w = torch.randn(k, device="cuda", dtype=torch.bfloat16) * 0.1
+    h2, r2 = h.clone(), r.clone()
+    torch.ops.mstar.fused_add_rms_norm(h2, r2, w, 1e-6, True)
+    q2, s2 = torch.ops.mstar.fp8_quant_per_token(h2)
+    q, s = torch.ops.mstar.fused_add_rms_norm_fp8_quant(h, r, w, 1e-6, True)
+    assert torch.equal(r, r2)
+    # the sum of squares reduces in another order than FlashInfer's: a rare bf16 ulp
+    assert (h != h2).float().mean() < 1e-4
+    torch.testing.assert_close(h, h2, rtol=8e-3, atol=0)
+    torch.testing.assert_close(s, s2, rtol=1e-5, atol=0)
+    assert (q.view(torch.uint8) != q2.view(torch.uint8)).float().mean() < 1e-4
+
+
+class _Decoder(torch.nn.Module):
+    """qwen3_5's pattern: ATen norm, gated MLP, fused add + norm, gated MLP."""
+
+    def __init__(self, hidden=256, inter=512):
+        from mstar.model.components.distributed.mlp import ParallelGatedMLP
+        from mstar.model.components.norm import RMSNorm
+
+        super().__init__()
+        self.n1, self.n2 = RMSNorm(hidden, gemma_mode=True), RMSNorm(hidden, gemma_mode=True)
+        self.mlp1 = ParallelGatedMLP(hidden_size=hidden, intermediate_size=inter, comm_group=TP1)
+        self.mlp2 = ParallelGatedMLP(hidden_size=hidden, intermediate_size=inter, comm_group=TP1)
+
+    def forward(self, x):
+        h, r = self.n2.forward_residual(self.mlp1(self.n1(x)), x * 1)
+        return self.mlp2(h) + r
+
+
+def _compiled_kernels(fuse: bool, x):
+    import torch._inductor.config as inductor_config
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.manual_seed(0)
+    node = _Decoder().cuda().to(torch.bfloat16).requires_grad_(False)
+    for param in node.parameters():
+        param.normal_(std=0.05)
+    _quantize(node, config=QuantConfig("fp8_channel", activations="dynamic_token"), device=DeviceCapability.of("cuda"))
+    saved = inductor_config.post_grad_custom_post_pass
+    if not fuse:
+        inductor_config.post_grad_custom_post_pass = None
+    try:
+        torch._dynamo.reset()
+        compiled = torch.compile(node, dynamic=False)
+        with torch.inference_mode():
+            out = compiled(x)
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                compiled(x)
+                torch.cuda.synchronize()
+    finally:
+        inductor_config.post_grad_custom_post_pass = saved
+    return out, [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+
+
+@sm90
+@pytest.mark.parametrize("rows", [8, 300])
+def test_compiled_node_has_no_standalone_quantize(rows, caplog, monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    # a cached graph skips the pass, and its log line
+    monkeypatch.setattr(inductor_config, "fx_graph_cache", False)
+    x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+    with caplog.at_level("INFO", logger="mstar.engine.quant.fusion"):
+        fused, kernels = _compiled_kernels(True, x)
+    assert "quant fusion: {'norm': 1, 'aten': 3, 'kept': 0}" in caplog.text
+    unfused, unfused_kernels = _compiled_kernels(False, x)
+    assert not any("_quant_per_token_kernel" in k for k in kernels)
+    assert sum("_quant_per_token_kernel" in k for k in unfused_kernels) == 4
+    assert sum("add_rms_norm_quant" in k for k in kernels) == 1
+    # one rounding (fp32 to fp8) where unfused rounds to bf16 first; grows over four layers
+    assert (fused.float() - unfused.float()).norm() / unfused.float().norm() < 0.05
+
+
+@cuda
+def test_quantize_of_a_graph_input_is_kept(caplog, monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    from mstar.engine.quant import fusion
+
+    monkeypatch.setattr(inductor_config, "fx_graph_cache", False)
+    fusion.install()
+    torch._dynamo.reset()
+    x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    with caplog.at_level("INFO", logger="mstar.engine.quant.fusion"), torch.inference_mode():
+        q, s = torch.compile(torch.ops.mstar.fp8_quant_per_token, dynamic=False)(x)
+    assert "'kept': 1" in caplog.text
+    q2, s2 = _quant_per_token_portable(x)
+    assert torch.equal(q.view(torch.uint8), q2.view(torch.uint8)) and torch.equal(s, s2)
+
+
+@cuda
+def test_fused_add_norm_op_keeps_the_compiled_graph_whole():
+    from mstar.model.components.norm import RMSNorm
+
+    norm = RMSNorm(256, gemma_mode=True).cuda().to(torch.bfloat16).requires_grad_(False)
+    h = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    r = torch.randn_like(h)
+    with torch.inference_mode():
+        explain = torch._dynamo.explain(norm.forward_residual)(h.clone(), r.clone())
+        assert explain.graph_break_count == 0
+        h2, r2 = h.clone(), r.clone()
+        from flashinfer.norm import gemma_fused_add_rmsnorm
+
+        gemma_fused_add_rmsnorm(h2, r2, norm.weight, norm.variance_epsilon)
+        got_h, got_r = norm.forward_residual(h.clone(), r.clone())
+    assert torch.equal(got_h, h2) and torch.equal(got_r, r2)

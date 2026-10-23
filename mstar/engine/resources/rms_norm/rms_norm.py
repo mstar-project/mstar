@@ -98,3 +98,27 @@ def run_rms_norm(
         eps,
         rms_norm_dtype,
     )
+
+
+@torch.library.custom_op("mstar::fused_add_rms_norm", mutates_args=("input", "residual"))
+def fused_add_rms_norm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool,
+) -> None:
+    """In place: ``residual += input``, then ``input = rms_norm(residual)``, scaled by
+    ``1 + weight`` if ``gemma``. A custom op so compiled graphs keep it whole."""
+    x = input.float() + residual.float()
+    residual.copy_(x)
+    x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    input.copy_(x * (weight.float() + 1.0 if gemma else weight.float()))
+
+
+@torch.library.register_kernel(fused_add_rms_norm, "cuda")
+def _fused_add_rms_norm_cuda(input, residual, weight, eps, gemma):
+    from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
+
+    (gemma_fused_add_rmsnorm if gemma else fused_add_rmsnorm)(input, residual, weight, eps)
+
+
+@fused_add_rms_norm.register_fake
+def _fused_add_rms_norm_fake(input, residual, weight, eps, gemma):
+    return None

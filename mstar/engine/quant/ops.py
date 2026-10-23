@@ -61,3 +61,35 @@ def _fp8_mm_small_m_cuda(a, scale_a, b, scale_b, bias, n_out, out_dtype):
 @fp8_mm_small_m.register_fake
 def _fp8_mm_small_m_fake(a, scale_a, b, scale_b, bias, n_out, out_dtype):
     return torch.empty((a.shape[0], n_out), dtype=out_dtype, device=a.device)
+
+
+# widest row the fused add + norm + quantize kernel holds in registers
+FUSED_NORM_MAX_K = 8192
+
+
+@torch.library.custom_op("mstar::fused_add_rms_norm_fp8_quant", mutates_args=("input", "residual"))
+def fused_add_rms_norm_fp8_quant(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``mstar::fused_add_rms_norm``, in place as it is, plus ``fp8_quant_per_token`` of
+    the norm in the same pass. The 5b fusion pass emits it."""
+    x = input.float() + residual.float()
+    residual.copy_(x)
+    y = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    input.copy_(y * (weight.float() + 1.0 if gemma else weight.float()))
+    return _quant_per_token_portable(input)
+
+
+@torch.library.register_kernel(fused_add_rms_norm_fp8_quant, "cuda")
+def _fused_add_rms_norm_fp8_quant_cuda(input, residual, weight, eps, gemma):
+    from mstar.engine.quant._triton import add_rms_norm_quant
+
+    return add_rms_norm_quant(input, residual, weight, eps, gemma, FP8_MAX, 1.0 / FP8_MAX, MIN_SCALE)
+
+
+@fused_add_rms_norm_fp8_quant.register_fake
+def _fused_add_rms_norm_fp8_quant_fake(input, residual, weight, eps, gemma):
+    return (
+        torch.empty(input.shape, dtype=FP8, device=input.device),
+        torch.empty((*input.shape[:-1], 1), dtype=torch.float32, device=input.device),
+    )

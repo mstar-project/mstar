@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.quant import fusion
 from mstar.engine.quant.config import QuantConfig
 from mstar.engine.quant.formats import FORMATS, QuantFormat
 from mstar.engine.quant.kernels import KERNELS, QuantKernel
@@ -184,6 +185,8 @@ def quantize_linears(
         return
     dtype = param_dtype or next(iter(fresh.values())).weight.dtype
     kernel = choose_kernel(config, device, dtype)
+    if config.activations is not None:
+        fusion.install()
     quant = LinearQuant(config, fmt, kernel)
     before = after = 0
     errors: list[tuple[float, str]] = []

@@ -282,12 +282,16 @@ class Qwen3_5LanguageModel(nn.Module):
                     hidden, residual, cg,
                 )
             h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(
-                h, residual, cg,
-            )
-            hidden = layer.mlp(h)
+            hidden, residual = self._norm_mlp(layer, h, residual, cg)
         normed, _ = self.norm.forward_residual(hidden, residual, cg)
         return normed
+
+    @staticmethod
+    def _norm_mlp(layer, h, residual, cg):
+        # one frame: the resource calls break this loop's graph, so dynamo compiles each
+        # call separately, and a quantized gate_up then fuses with the norm (step 5b)
+        h, residual = layer.post_attention_layernorm.forward_residual(h, residual, cg)
+        return layer.mlp(h), residual
 
 
 class Qwen3_5ForCausalLM(nn.Module):

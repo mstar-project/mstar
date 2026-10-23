@@ -83,13 +83,10 @@ class RMSNorm(nn.Module):
             # `hidden_states = norm(residual)`. Inductor's own fusion of the
             # pair is a reduction over a few rows that takes ~3x as long at
             # decode batch sizes. Both inputs are consumed by the caller.
-            from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
-
             orig_shape = hidden_states.shape
             h = hidden_states.reshape(-1, orig_shape[-1])
             r = residual.reshape(-1, orig_shape[-1])
-            fused = gemma_fused_add_rmsnorm if self.gemma_mode else fused_add_rmsnorm
-            fused(h, r, self.weight, self.variance_epsilon)
+            torch.ops.mstar.fused_add_rms_norm(h, r, self.weight, self.variance_epsilon, self.gemma_mode)
             return h.reshape(orig_shape), r.reshape(orig_shape)
         r = hidden_states + residual
         return self(r), r
