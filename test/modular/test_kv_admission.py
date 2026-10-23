@@ -33,7 +33,6 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
     StreamLayout,
 )
-from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
@@ -365,21 +364,13 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
 
 
 class _StubHostPool(_HostPoolStub):
-    """`_HostPoolStub` that keeps each offloaded stream, so `reload` can bring it back."""
+    """`_HostPoolStub` that also copies back, and lands each copy at once."""
 
-    def offload_stream(self, rid, label, gpu_kv_cache, gpu_page_indices, **state):
-        self.offloaded.setdefault(rid, {})[label] = OffloadedStream(list(gpu_page_indices), **state)
-        return True
+    def copy_in(self, gpu_kv_cache, copies):
+        pass
 
-    def reload_stream(self, rid, label, **kwargs):
-        streams = self.offloaded[rid]
-        return streams.pop(label) if len(streams) > 1 else self.offloaded.pop(rid)[label]
-
-    def labels(self, rid):
-        return list(self.offloaded.get(rid, ()))
-
-    def num_pages(self, rid, label):
-        return len(self.offloaded[rid][label].cpu_page_indices)
+    def record(self):
+        return SimpleNamespace(query=lambda: True)
 
 
 def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None, preplan: bool = False) -> str:
