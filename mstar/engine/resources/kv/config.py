@@ -6,7 +6,7 @@ without pulling FlashInfer in behind it.
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -221,6 +221,7 @@ class PrefixSpan:
     length: int
     advance: int
     walk: str
+    scratch: int = 0
     digest: bytes | None = None
     end_key: bytes | None = None
 
@@ -248,17 +249,18 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
-    # label -> the layout its keys were chained over, one span per write
-    prefix_layout: dict[str, list[PrefixSpan]] | None = None
     prefix_cache: bool = True
+    kv_layout: dict[str, "StreamLayout"] | None = None
+    loop_caps: dict[str, int] | None = None
 
     def apply_conductor_config(
         self,
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
-        prefix_layout: dict[str, list[list]] | None=None,
         prefix_cache: bool | None=None,
+        kv_layout: dict[str, list] | None=None,
+        loop_caps: Mapping[str, int] | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -267,14 +269,53 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
-        if prefix_layout is not None:
-            # sent as plain lists, which keeps the request's kwargs on the wire's plain msgpack path
-            self.prefix_layout = {
-                label: [PrefixSpan(*row) for row in rows]
-                for label, rows in prefix_layout.items()
-            }
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
+        if kv_layout is not None:
+            # a model lays out every label the request could open on any deployment, so keep only the ones it opens
+            opened = self.opened_labels()
+            self.kv_layout = {
+                label: StreamLayout(
+                    spans=tuple(PrefixSpan(*row) for row in spans),
+                    growth=tuple((loop, slots) for loop, slots in growth),
+                    scratch=scratch,
+                    retention=None if retention is None else RetentionPolicy(*retention),
+                    keyed_spans=keyed_spans,
+                )
+                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                if label in opened
+            }
+        if loop_caps is not None and self.kv_layout is not None:
+            self.loop_caps = {
+                loop: loop_caps[loop]
+                for layout in self.kv_layout.values() for loop, _ in layout.growth
+            }
+
+    def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
+        if spec is None or not isinstance(spec.config, PagedKVConfig):
+            return {}
+        caps, room = self.loop_caps or {}, {}
+        for layout in (self.kv_layout or {}).values():
+            if layout.retention is not None:
+                continue
+            for loop, slots in layout.growth:
+                n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
+                room[loop] = min(n, room.get(loop, n))
+        return room
+
+    def validate(self, spec: "KVSpec | None" = None) -> None:
+        """``ValueError`` (a 400) when a label would hold more positions at the request's caps
+        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
+        the one model that declares one, computes its positions in each forward."""
+        if spec is None or not isinstance(spec.config, PagedKVConfig):
+            return
+        for label, layout in (self.kv_layout or {}).items():
+            positions = layout.positions(self.loop_caps or {})
+            if layout.retention is None and positions > spec.config.max_seq_len:
+                raise ValueError(
+                    f"this request needs {positions} positions of {label!r}, "
+                    f"past the model's context of {spec.config.max_seq_len}"
+                )
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -284,6 +325,12 @@ class KVReqConfig(ResourceReqConfig):
         if self.needed_labels is not None:
             return self.needed_labels
         return ["main"]
+
+    def opened_labels(self) -> set[str]:
+        labels = set(self.needed_labels or ["main"])
+        for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
+            labels.update(named)
+        return labels
 
     def get_publish_labels(
         self,
@@ -307,6 +354,28 @@ class KVReqConfig(ResourceReqConfig):
             return []
         return mapping.get((node, walk), [])
 
+
+
+def refuse_undeclared_labels(
+    model: str, declared: Mapping[str, tuple[str, ...]], kv_layout: Mapping[str, Mapping],
+    configs: Mapping[str, ResourceReqConfig],
+) -> None:
+    """The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500."""
+    for key in declared.keys() | kv_layout.keys():
+        laid_out = set(kv_layout.get(key, ()))
+        if extra := sorted(laid_out - set(declared.get(key, ()))):
+            raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
+        if missing := sorted(configs[key].opened_labels() - laid_out):
+            raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
+
+
+def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
+    """Only the KV manager's ingest reads the layouts and caps, so they are dropped
+    before the configs go out with every frame between workers."""
+    return {
+        key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
+        for key, config in configs.items()
+    }
 
 @dataclass
 class KVSpec(NodeResourceSpec):
@@ -356,6 +425,51 @@ class RetentionPolicy:
 
 
 @dataclass(frozen=True)
+class StreamLayout:
+    """`LabelLayout` as the KV manager holds it."""
+    spans: tuple[PrefixSpan, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()
+    scratch: int = 0
+    retention: RetentionPolicy | None = None
+    keyed_spans: int = 0
+
+    def slots(self, caps: Mapping[str, int]) -> int:
+        return sum(span.length for span in self.spans) + sum(
+            slots * caps[loop] for loop, slots in self.growth
+        )
+
+    def positions(self, caps: Mapping[str, int]) -> int:
+        return sum(span.advance for span in self.spans) + sum(
+            slots * caps[loop] for loop, slots in self.growth
+        )
+
+    def pages(self, caps: Mapping[str, int], page_size: int) -> int:
+        """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.
+
+        Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves
+        less than a page over the budget, so the window peaks at the protected prefix plus
+        the budget, or at the prefix rounded up to a page if that is larger. The bound adds
+        a page of overrun and the largest step past the prefix to that peak.
+        """
+        peak, end = self.slots(caps) + self.scratch, 0
+        for span in self.spans:
+            peak = max(peak, end + span.scratch)
+            end += span.length
+        pages = -(-peak // page_size)
+        if self.retention is None:
+            return pages
+        prefix = self.retention.protected_prefix
+        step, end = self.scratch, 0
+        for span in self.spans:
+            end += span.length
+            if max(end, end - span.length + span.scratch) > prefix:
+                step = max(step, span.length, span.scratch)
+        step = max([step, *(slots for _, slots in self.growth)])
+        window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
+        return min(pages, -(-(window + page_size - 1 + step) // page_size))
+
+
+@dataclass(frozen=True)
 class KVStep(ResourceStep):
     # write: bool # @nsagan: opting to remove this for now bc it's dead code
     commit: bool = True
@@ -367,6 +481,8 @@ class KVStep(ResourceStep):
     # the rows the forks apply to; None is every row (a chunked prompt
     # pre-forks on its first chunk and post-forks on its last)
     fork_rids: frozenset | None = None
+    # (request_id, label) pairs that run against SINK_PAGE and hold no pages
+    sink: frozenset[tuple[str, str]] = frozenset()
     # (request_id, label) -> the retention a committing stream declares for
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.

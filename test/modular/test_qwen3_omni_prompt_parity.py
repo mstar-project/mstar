@@ -161,7 +161,7 @@ def _old_process_prompt(model, prompt, input_modalities):
 def _new_text_inputs(model, prompt, input_modalities, prompt_parts=None):
     return model.process_prompt(
         prompt, input_modalities, ["text"], prompt_parts=prompt_parts,
-    )["text_inputs"]
+    ).new_input_tensors["text_inputs"]
 
 
 def _ids(segments):

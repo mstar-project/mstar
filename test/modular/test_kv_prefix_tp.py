@@ -328,7 +328,7 @@ def _lost_page() -> tuple[KVManager, ScheduleTPNode]:
     for kv in ranks:
         kv.remove_request("a")
         _ingest(kv, "b", shared + _tokens(7, seed=31))
-    assert follower._index.evict(1) == 1
+    assert len(follower._index.evict(1)) == 1
     return follower, _send(leader, "b")
 
 

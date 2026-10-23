@@ -546,9 +546,9 @@ Worker scheduling
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       ``remove_request``, check the KV page bookkeeping against the streams
+       holding the pages, and each commit against its request's layout. Logs a
+       label left under its footprint at removal. Tests and debugging only.
 
 Compilation
 -----------
