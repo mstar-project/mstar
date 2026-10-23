@@ -1259,9 +1259,13 @@ class GlmChatAdapter(TextChatAdapter):
         tools, template_kwargs, forced = self._options(mk)
         # truthiness, as the GLM-5.2 template reads it
         thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
+        params = glm_chat.tool_parameters(tools) if tools else None
+        if forced:
+            # the prompt opened a call to this function: a name the model goes on to write
+            # (get_weather -> get_weather_hourly) is not another tool's call
+            params = {forced: params[forced]}
         return glm_chat.GlmReplyParser(
-            thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None, forced_call=forced,
-            single_call=single_call,
+            thinking=thinking, tools=params, forced_call=forced, single_call=single_call,
         )
 
     def _options(self, mk: dict) -> tuple[list | None, dict, str | None]:

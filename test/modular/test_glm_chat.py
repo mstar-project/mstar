@@ -376,6 +376,19 @@ def test_a_forced_tool_choice_opens_the_call_in_the_prompt(model, choice, tools,
     assert msg["content"] is None and "reasoning_content" not in msg and p.finish_reason == "tool_calls"
 
 
+@pytest.mark.parametrize("model", ["glm52", "glm5_next"])
+def test_a_forced_function_is_the_only_one_its_call_can_name(model):
+    """Forced get_weather beside get_weather_hourly: the model writing on past the prompt's
+    name parsed as a call to the other tool."""
+    hourly = {"type": "function", "function": {
+        "name": "get_weather_hourly", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+    req = _chat(tools=[WEATHER, hourly], tool_choice={"type": "function", "function": {"name": "get_weather"}})
+    p = adapters.get_adapter(model).make_output_parser(req)
+    msg = p.message("_hourly" + ARGS)
+    assert not msg.get("tool_calls") and p.finish_reason == "stop"
+    assert msg["content"].startswith("<tool_call>get_weather_hourly")
+
+
 def test_a_forced_call_to_a_made_up_function_stays_text():
     p = glm_chat.GlmReplyParser(thinking=False, tools=TOOLS, forced_call="")
     msg = p.message("rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>")
