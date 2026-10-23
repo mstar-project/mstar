@@ -25,6 +25,10 @@ STATUSES = {"PASS", "FAIL", "SKIP", "BLOCKED", "NOT RUN"}
 # With --deadline-seconds, stop launching stages this long before the deadline so
 # evidence can be written and servers stopped (smoke stages are shorter).
 STOP_RESERVE_S = {"smoke": 120, "full": 900}
+# Files at most this large are content-hashed for the resume identity; larger
+# ones (the 16 GB checkpoint) are identified by size and modification time.
+HASH_LIMIT_BYTES = 256 << 20
+ASSET_FILES = ("model.safetensors", "tokenizer-e351c8d8-checkpoint125.safetensors", "tokenizer_spm_32k_3.model")
 INTERRUPTED = False
 
 
@@ -56,7 +60,7 @@ def preflight(settings, root):
     for key in ("source", "assets", "voices", "cache", "server_config", "existing_clip"):
         if not Path(settings[key]).exists():
             raise FileNotFoundError(f"Missing {key}: {settings[key]}")
-    for name in ("model.safetensors", "tokenizer-e351c8d8-checkpoint125.safetensors", "tokenizer_spm_32k_3.model"):
+    for name in ASSET_FILES:
         if not (Path(settings["assets"]) / name).is_file():
             raise FileNotFoundError(name)
     if not (Path(settings["voices"]) / "NATF2.pt").is_file():
@@ -91,6 +95,11 @@ def preflight(settings, root):
         "server_config_sha256": hashlib.sha256(Path(settings["server_config"]).read_bytes()).hexdigest(),
         "source_sha": PIN,
         "extension_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in extension},
+        "model_files": {
+            str(path): file_identity(path)
+            for path in [*(Path(settings["assets"]) / name for name in ASSET_FILES),
+                         Path(settings["voices"]) / "NATF2.pt"]
+        },
         "reference_runtime_scope": "Same-runtime reference; supported NVIDIA runtime deferred",
     }
     identity["fingerprint"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -123,6 +132,35 @@ def rust_extension_files(settings):
         raise FileNotFoundError("mstar_rust is not importable: build it (docs/installation.rst) or set extension")
     origin = Path(spec.origin)
     return sorted(origin.parent.glob("mstar_rust*.so")) if origin.name == "__init__.py" else [origin]
+
+
+def file_identity(path, hash_limit=HASH_LIMIT_BYTES):
+    """Content digest of a model file, or its size and mtime when too large to hash on every run."""
+    stat = Path(path).stat()
+    if stat.st_size <= hash_limit:
+        return {"sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+    return {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def run_kind(root, mode):
+    """``smoke`` or ``full``: what a new run is, or what the run being resumed was."""
+    path = root / "run.json"
+    if mode != "resume":
+        if (root / "results.json").exists():
+            raise ValueError("Existing results: use resume or a fresh output directory")
+        write_json(path, {"kind": mode})
+        return mode
+    if not path.exists():
+        raise ValueError(f"Nothing to resume in {root}: no run.json")
+    return json.loads(path.read_text())["kind"]
+
+
+def reusable(prior, command, retry_failed):
+    """A finished stage is reused only if it ran this exact command (and, with
+    ``retry_failed``, only if it passed)."""
+    if prior.get("command") != command or prior.get("status") not in ("PASS", "FAIL"):
+        return False
+    return not (prior["status"] == "FAIL" and retry_failed)
 
 
 def stage_deadline(started, deadline_seconds, smoke):
@@ -295,7 +333,7 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU unavailable; no numerical/serving evidence produced")
-    smoke = args.mode == "smoke"
+    smoke = run_kind(root, args.mode) == "smoke"
     started = time.time()
     deadline = stage_deadline(started, args.deadline_seconds, smoke)
     env = dict(os.environ, MSTAR_SHM_ARENA="1", PYTHONUNBUFFERED="1", PERSONAPLEX_DEADLINE=str(deadline))
@@ -407,15 +445,12 @@ def main():
     )
     result_path = root / "results.json"
     results = json.loads(result_path.read_text()) if args.mode == "resume" and result_path.exists() else {}
-    if args.mode != "resume" and result_path.exists():
-        raise ValueError("Existing results: use resume or a fresh output directory")
     for name, *_ in scenarios:
         results.setdefault(name, {"status": "NOT RUN"})
     results.update(missing_clip_results(entries, smoke))
     write_json(result_path, results)
     for name, command, timeout, minimum in scenarios:
-        prior = results[name]["status"]
-        if prior in ("PASS", "FAIL") and not (prior == "FAIL" and args.retry_failed):
+        if reusable(results[name], command, args.retry_failed):
             continue
         if name in ("soak-rust", "warm-rust") and results.get("lifecycle-rust", {}).get("status") != "PASS":
             results[name] = {"status": "NOT RUN", "reason": "Rust lifecycle failed or incomplete; no escalation"}

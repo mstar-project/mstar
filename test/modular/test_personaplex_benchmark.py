@@ -260,3 +260,42 @@ def test_rust_extension_from_directory_or_installed_module(tmp_path, monkeypatch
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
     with pytest.raises(FileNotFoundError, match="not importable"):
         rust_extension_files({"extension": None})
+
+
+def test_resume_continues_the_original_run_kind(tmp_path):
+    from benchmark.personaplex.suite import run_kind
+
+    assert run_kind(tmp_path, "smoke") == "smoke"
+    assert run_kind(tmp_path, "resume") == "smoke"  # not silently upgraded to a full run
+    (tmp_path / "results.json").write_text("{}")
+    with pytest.raises(ValueError, match="Existing results"):
+        run_kind(tmp_path, "full")
+    assert run_kind(tmp_path, "resume") == "smoke"  # the refused run did not overwrite run.json
+    with pytest.raises(ValueError, match="Nothing to resume"):
+        run_kind(tmp_path / "empty", "resume")
+
+
+def test_finished_stages_are_reused_only_for_the_same_command():
+    from benchmark.personaplex.suite import reusable
+
+    smoke_command = ["python", "-m", "benchmark.personaplex.warm", "--smoke"]
+    full_command = ["python", "-m", "benchmark.personaplex.warm"]
+    passed = {"status": "PASS", "command": smoke_command}
+    assert reusable(passed, smoke_command, retry_failed=False)
+    assert not reusable(passed, full_command, retry_failed=False)  # a smoke PASS is not a full PASS
+    failed = {"status": "FAIL", "command": full_command}
+    assert reusable(failed, full_command, retry_failed=False)
+    assert not reusable(failed, full_command, retry_failed=True)
+    assert not reusable({"status": "BLOCKED", "reason": "x"}, full_command, retry_failed=False)
+
+
+def test_model_file_identity_hashes_small_files_and_stats_large_ones(tmp_path):
+    from benchmark.personaplex.suite import file_identity
+
+    voice = tmp_path / "NATF2.pt"
+    voice.write_bytes(b"voice-a")
+    first = file_identity(voice)
+    voice.write_bytes(b"voice-b")  # same size, replaced in place
+    assert "sha256" in first and file_identity(voice) != first
+    large = file_identity(voice, hash_limit=1)
+    assert set(large) == {"bytes", "mtime_ns"} and large["bytes"] == 7
