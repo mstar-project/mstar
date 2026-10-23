@@ -30,6 +30,7 @@ def _worker(target):
         request_state=None,
         _rebuild_rows={},
         _dropped={},
+        _preempted={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or True,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),

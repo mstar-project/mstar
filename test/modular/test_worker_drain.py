@@ -59,7 +59,7 @@ def _worker(
         ),
     )
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
@@ -397,7 +397,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(

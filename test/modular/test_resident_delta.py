@@ -925,7 +925,8 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
-        self._kv_keys, self._kept_ids, self._rebuild_rows, self._dropped, self._victims = {}, {}, {}, {}, {}
+        self._kv_keys, self._kept_ids, self._rebuild_rows = {}, {}, {}
+        self._dropped, self._victims, self._preempted = {}, {}, {}
         self.streaming_buffers: dict = {}
         self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because

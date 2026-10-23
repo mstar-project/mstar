@@ -99,6 +99,36 @@ PREFIX_CACHE_HIT_TOKENS = Family(
     "Prompt tokens the prefix cache already held at that lookup.",
     ("component",),
 )
+KV_PREEMPTIONS = Family(
+    "mstar_kv_preemptions_total", COUNTER,
+    "Requests chosen to drop when an older request's grant, or their own, ran short of KV pages.",
+    ("component",),
+)
+KV_DROPS = Family(
+    "mstar_kv_drops_total", COUNTER,
+    "Preempted requests whose KV was dropped, to be rebuilt from their token ids.",
+    ("component",),
+)
+KV_REBUILD_TOKENS = Family(
+    "mstar_kv_rebuild_tokens_total", COUNTER,
+    "Tokens of kept history the rebuild rows prefilled, cache hits included.",
+    ("component",),
+)
+KV_REBUILD_CACHED_PAGES = Family(
+    "mstar_kv_rebuild_cached_pages_total", COUNTER,
+    "Pages a rebuild row found in the prefix cache.",
+    ("component",),
+)
+KV_PREEMPTED_AGAIN = Family(
+    "mstar_kv_preempted_again_total", COUNTER,
+    "Requests preempted a second time.",
+    ("component",),
+)
+KV_RETURNS_PREEMPTED = Family(
+    "mstar_kv_returns_preempted_total", COUNTER,
+    "Returned requests preempted again before they kept another token.",
+    ("component",),
+)
 COMPONENT_PENDING_STEPS = Family(
     "mstar_component_pending_steps", GAUGE,
     "Requests whose next step on this graph node is ready (its inputs arrived) "
@@ -144,7 +174,8 @@ TRANSFER_SECONDS = Family(
 WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
         KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
-        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, KV_PREEMPTIONS, KV_DROPS, KV_REBUILD_TOKENS,
+        KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_REBUILD_CACHED_PAGES, COMPONENT_PENDING_STEPS,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )
 }

@@ -90,7 +90,7 @@ from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.worker_metrics import WorkerMetrics
+from mstar.worker.worker_metrics import PreemptionCounts, WorkerMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +280,19 @@ class KeptIds:
     """A request's token ids on one node as int32: its prompt, then each sample it kept."""
     prompt: bytes
     sampled: array
+
+
+@dataclass(slots=True)
+class Preempted:
+    """How often a request was preempted, and how many samples it had kept when it last returned."""
+    times: int = 0
+    returned_at: int = -1
+
+
+class Victim(NamedTuple):
+    """A request chosen to drop: the key of the cache that ran short, and by how many pages."""
+    key: str
+    pages_short: int
 
 
 class RebuildRow(NamedTuple):
@@ -629,7 +642,8 @@ class Worker:
         #   of another partition samples tokens of its own.
         # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
         # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
-        # `_victims`: handle -> the key of the cache whose shortage chose it, until it is dropped.
+        # `_victims`: handle -> the shortage that chose it, until it is dropped.
+        # `_preempted`: handle -> how often it was preempted. `_preemptions`: node -> its counts for the metrics.
         # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
         #   prefill walk's single input, such as `text_inputs`.
         # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
@@ -641,7 +655,11 @@ class Worker:
                 self._kv_keys[node_name].append(kv.key)
         self._rebuild_rows: dict[int, RebuildRow] = {}
         self._dropped: dict[int, str] = {}
-        self._victims: dict[int, str] = {}
+        self._victims: dict[int, Victim] = {}
+        self._preempted: dict[int, Preempted] = {}
+        self._preemptions: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
+        # node -> when its last drop was logged, and the drops since
+        self._drop_logged: dict[str, tuple[float, int]] = {}
         self._walk_inputs: dict[tuple[str, str], set[str]] = {}
         self._growth_loops: dict[tuple[str, str], str] = {}
         if model is not None:
@@ -760,6 +778,7 @@ class Worker:
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
             enable_transfers=self.tensor_manager.enable_transfer_metrics,
+            preemptions=self._preemptions,
         )
 
     @staticmethod
@@ -1026,6 +1045,7 @@ class Worker:
         self._rebuild_rows.pop(request_id, None)
         self._dropped.pop(request_id, None)
         self._victims.pop(request_id, None)
+        self._preempted.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1124,25 +1144,60 @@ class Worker:
         victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
         if victims is None:
             return False
-        self._victims.update(dict.fromkeys(victims, kv.key))
+        if not victims and kv.cache.waits(reason.request_id):
+            self._log_throttled(
+                self._hold_logged, (node_batch.node_name, node_batch.step_context.graph_walk),
+                "KV short on node=%s walk=%s: %s waits for room, since dropping what the pool can drop wouldn't "
+                "cover its shortage of %d pages (%d earlier waits not logged)",
+                node_batch.node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
+                reason.pages_short,
+            )
+        counts = self._preemptions[node_batch.node_name]
+        for rid in victims:
+            self._victims[rid] = Victim(kv.key, reason.pages_short)
+            record = self._preempted.setdefault(rid, Preempted())
+            record.times += 1
+            counts.victims += 1
+            counts.preempted_again += record.times == 2
+            sampled = next(len(self._kept_ids[node][rid].sampled) for node in nodes if rid in self._kept_ids[node])
+            counts.returns_preempted += record.returned_at == sampled
         self._drop_victims()
         return True
 
     def _drop_victims(self) -> None:
         """Drop each victim no step in flight holds. A backlogged row goes back to the runtime and a
         queued rebuild row leaves its queue first, so neither runs on pages the drop gave up."""
-        for rid, key in list(self._victims.items()):
+        for rid, victim in list(self._victims.items()):
             if rid in self._in_flight_rids:
                 continue
             del self._victims[rid]
-            kv = self._kv_caches[key]
+            kv = self._kv_caches[victim.key]
             if not kv.cache.is_victim(rid):
                 continue  # the request it was chosen for has left
+            arrival = kv.cache.arrival(rid)
             self.scheduler.return_backlogged(rid)
             self._rebuild_rows.pop(rid, None)
             for node_name in kv.nodes:
                 if rid in self._kept_ids.get(node_name, ()):
-                    self._drop(rid, node_name)
+                    freed = self._drop(rid, node_name)
+                    self._preemptions[node_name].drops += 1
+                    self._log_throttled(
+                        self._drop_logged, node_name,
+                        "KV short on node=%s: dropped %s (arrival %s), %d pages freed for a shortage of %d, "
+                        "preempted %d times (%d earlier drops not logged)",
+                        node_name, self._rid_str(rid), arrival, freed, victim.pages_short, self._preempted[rid].times,
+                    )
+
+    def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
+        """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since
+        as its last argument."""
+        now = _time.monotonic()
+        last, unlogged = logged.get(key, (None, 0))
+        if last is not None and now - last < _HOLD_LOG_INTERVAL:
+            logged[key] = (last, unlogged + 1)
+            return
+        logged[key] = (now, 0)
+        logger.warning(message, *args, unlogged)
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
         """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
@@ -1163,6 +1218,7 @@ class Worker:
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
         self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
         self._dropped.pop(request_id, None)
+        self._preemptions[node_name].rebuild_tokens += len(tokens)
 
     def _readmit_dropped(self) -> None:
         """Rebuild each dropped request that is first in its node's queue, once its kept history and
@@ -1174,6 +1230,8 @@ class Worker:
             history = len(kept.prompt) // 4 + len(kept.sampled)
             (key,) = self._kv_keys[node_name]
             if self._kv_caches[key].cache.readmit(rid, history):
+                if rid in self._preempted:
+                    self._preempted[rid].returned_at = len(kept.sampled)
                 self._rebuild(rid, node_name)
 
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
@@ -2546,19 +2604,13 @@ class Worker:
             blamed = getattr(node_batch.admit_error, "request_id", None)
             shed = [blamed] if blamed in batch_ids else list(batch_ids)
             self.scheduler.hold_requests(shed)
-            key = (batch.node_name, batch.graph_walk)
-            now = _time.monotonic()
-            last, unlogged = self._hold_logged.get(key, (None, 0))
-            if last is not None and now - last < _HOLD_LOG_INTERVAL:
-                self._hold_logged[key] = (last, unlogged + 1)
-                return
-            self._hold_logged[key] = (now, 0)
-            logger.warning(
+            self._log_throttled(
+                self._hold_logged, (batch.node_name, batch.graph_walk),
                 "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
                 "requests so the retry is smaller (%d earlier holds not logged)",
                 batch.node_name, batch.graph_walk,
                 blamed if len(shed) == 1 else f"all {len(shed)}",
-                len(batch_ids), unlogged,
+                len(batch_ids),
             )
 
     # ------------------------------------------------------------------
