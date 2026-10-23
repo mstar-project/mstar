@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -93,6 +94,12 @@ class CachedPrefix(NamedTuple):
     label: str
     tokens: int
     position: int
+
+
+class MoveKind(IntEnum):
+    """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
+    OFFLOAD = 0
+    RELOAD = 1
 
 
 class Resource(ABC):

@@ -1,8 +1,10 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
+from mstar.engine.resources.base import MoveKind
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
@@ -111,6 +113,11 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
+class Move(NamedTuple):
+    rid: str
+    kind: MoveKind
+
+
 @dataclass
 class OffloadDelta:
     """A rank's offloads and reloads, in the order it made them.
@@ -129,41 +136,37 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    # parallel lists: rids[i] was moved as kinds[i]
     rids: list[str] = field(default_factory=list)
-    is_offload: list[bool] = field(default_factory=list)
+    kinds: list[MoveKind] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
         return cls()
 
-    def add_offloaded(self, rid: str):
+    def add(self, kind: MoveKind, rid: str):
         self.rids.append(rid)
-        self.is_offload.append(True)
-
-    def add_reloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(False)
+        self.kinds.append(kind)
 
     def __len__(self):
         return len(self.rids)
 
-    def peek_left(self) -> tuple[str, bool] | None:
+    def peek_left(self) -> Move | None:
         if not len(self):
             return
-        return (self.rids[0], self.is_offload[0])
+        return Move(self.rids[0], self.kinds[0])
 
-    def pop_left(self) -> tuple[str, bool] | None:
+    def pop_left(self) -> Move | None:
         if not len(self):
             return None
-        return (self.rids.pop(0), self.is_offload.pop(0))
+        return Move(self.rids.pop(0), self.kinds.pop(0))
 
     def copy(self) -> "OffloadDelta":
         """An independent queue holding the same moves.
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.is_offload))
+        return OffloadDelta(list(self.rids), list(self.kinds))
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
@@ -173,12 +176,12 @@ class OffloadDelta:
         """
         taken = self.copy()
         self.rids.clear()
-        self.is_offload.clear()
+        self.kinds.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
-        self.is_offload.extend(other.is_offload)
+        self.kinds.extend(other.kinds)
 
 
 @dataclass

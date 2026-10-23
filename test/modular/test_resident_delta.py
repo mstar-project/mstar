@@ -29,6 +29,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.utils.ipc_format import (
+    MoveKind,
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
@@ -38,8 +39,8 @@ from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
 
-def _entries(delta: OffloadDelta) -> list[tuple[str, bool]]:
-    return list(zip(delta.rids, delta.is_offload, strict=True))
+def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:
+    return list(zip(delta.rids, delta.kinds, strict=True))
 
 
 # --- the queue itself -------------------------------------------------------
@@ -48,21 +49,21 @@ def _entries(delta: OffloadDelta) -> list[tuple[str, bool]]:
 def test_the_order_of_offloads_and_reloads_survives():
     """The reason this is a queue and not two sets."""
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("a")
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "a")
+    delta.add(MoveKind.OFFLOAD, "a")
 
-    assert _entries(delta) == [("a", True), ("a", False), ("a", True)]
+    assert _entries(delta) == [("a", MoveKind.OFFLOAD), ("a", MoveKind.RELOAD), ("a", MoveKind.OFFLOAD)]
 
 
 def test_pop_left_takes_the_oldest_entry():
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "b")
 
-    assert delta.pop_left() == ("a", True)
+    assert delta.pop_left() == ("a", MoveKind.OFFLOAD)
     assert len(delta) == 1, "pop_left returned an entry without removing it"
-    assert delta.pop_left() == ("b", False)
+    assert delta.pop_left() == ("b", MoveKind.RELOAD)
     assert len(delta) == 0
 
 
@@ -74,9 +75,9 @@ def test_pop_left_on_an_empty_queue_answers_none():
 
 def test_peek_left_does_not_consume():
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
 
-    assert delta.peek_left() == ("a", True)
+    assert delta.peek_left() == ("a", MoveKind.OFFLOAD)
     assert len(delta) == 1
     assert OffloadDelta.new().peek_left() is None
 
@@ -85,28 +86,28 @@ def test_take_hands_the_queue_over_and_leaves_it_empty():
     """What a leader does on every broadcast. The fields are a NamedTuple's, so
     this cannot work by reassigning them — only the deques can be mutated."""
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "b")
 
     taken = delta.take()
 
-    assert _entries(taken) == [("a", True), ("b", False)]
+    assert _entries(taken) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
     assert len(delta) == 0, "the source kept the entries it handed over"
 
-    delta.add_offloaded("c")
-    assert _entries(taken) == [("a", True), ("b", False)]
+    delta.add(MoveKind.OFFLOAD, "c")
+    assert _entries(taken) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
 
 
 def test_extend_appends_in_order():
     """A follower folds each message's delta onto whatever it still owes."""
     owed = OffloadDelta.new()
-    owed.add_offloaded("a")
+    owed.add(MoveKind.OFFLOAD, "a")
     arriving = OffloadDelta.new()
-    arriving.add_reloaded("b")
+    arriving.add(MoveKind.RELOAD, "b")
 
     owed.extend(arriving)
 
-    assert _entries(owed) == [("a", True), ("b", False)]
+    assert _entries(owed) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
 
 
 def test_an_empty_delta_is_falsy():
@@ -114,7 +115,7 @@ def test_an_empty_delta_is_falsy():
     callers branch on the delta directly."""
     assert not OffloadDelta.new()
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
     assert delta
 
 
@@ -251,13 +252,13 @@ def test_replay_is_exempt_from_both_guards():
     a follower must do, so it reaches the resources directly."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
     assert engine.is_offloaded("node", "a")
 
     back = OffloadDelta.new()
-    back.add_reloaded("wire-a")
+    back.add(MoveKind.RELOAD, "wire-a")
     assert engine.apply_resident_delta("node", back) is True
     assert not engine.is_offloaded("node", "a")
 
@@ -386,7 +387,7 @@ def test_both_directions_are_journalled_in_order():
     engine.offload_request("node", "b")
 
     assert _entries(engine.take_resident_delta("node")) == [
-        ("wire-a", True), ("wire-a", False), ("wire-b", True),
+        ("wire-a", MoveKind.OFFLOAD), ("wire-a", MoveKind.RELOAD), ("wire-b", MoveKind.OFFLOAD),
     ]
     assert len(engine.take_resident_delta("node")) == 0, "drained once only"
 
@@ -405,9 +406,9 @@ def test_a_rank_that_leads_nothing_journals_nothing():
 def test_replaying_a_delta_reproduces_the_leaders_state():
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_reloaded("wire-a")
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
     assert engine.is_offloaded("node", "a"), (
@@ -422,8 +423,8 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     engine = _Engine("follower")
     engine.resource.refuse_offload = True
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_offloaded("wire-b")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
 
     assert engine.apply_resident_delta("node", delta) is False
     assert len(delta) == 2, "a refused entry must stay queued"
@@ -443,8 +444,8 @@ def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
     None did -- ``offload(None)`` logged a move of "request None"."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-gone")     # _Rids answers None for unknown ids
-    delta.add_offloaded("wire-a")        # and the rest of the queue still lands
+    delta.add(MoveKind.OFFLOAD, "wire-gone")     # _Rids answers None for unknown ids
+    delta.add(MoveKind.OFFLOAD, "wire-a")        # and the rest of the queue still lands
 
     assert engine.apply_resident_delta("node", delta) is True
     assert len(delta) == 0, "the moot entry was left to be retried for ever"
@@ -459,7 +460,7 @@ def test_a_request_holding_nothing_is_not_a_refusal():
     engine = _Engine("follower")
     engine.resource.holds_nothing = {"a"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
     assert len(delta) == 0
@@ -470,7 +471,7 @@ def test_replaying_does_not_journal_it_onward():
     journalled, a rank that both leads and follows would echo."""
     engine = _Engine("leader")  # journalling is on
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
     engine.apply_resident_delta("node", delta)
 
@@ -488,8 +489,8 @@ def test_each_replayed_move_is_logged(caplog):
     two ranks' lines could not be matched up if they named handles."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_reloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
         assert engine.apply_resident_delta("node", delta) is True
@@ -505,7 +506,7 @@ def test_a_no_op_replay_is_not_logged_as_a_move(caplog):
     engine = _Engine("follower")
     engine.resource.offloaded = {"a"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")  # already off here
+    delta.add(MoveKind.OFFLOAD, "wire-a")  # already off here
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
         assert engine.apply_resident_delta("node", delta) is True
@@ -647,7 +648,7 @@ def test_the_broadcast_carries_the_leaders_moves():
     body = leader.sent[0][1].body
     # wire ids, not local handles: the follower mints its own, so a broadcast
     # naming rank 0's would replay against the wrong requests
-    assert _entries(body.resident_delta) == [("wire-victim", True)]
+    assert _entries(body.resident_delta) == [("wire-victim", MoveKind.OFFLOAD)]
     assert body.request_ids == ["wire-r0"]
 
 
@@ -661,7 +662,7 @@ def test_every_follower_gets_the_same_moves_in_its_own_queue():
 
     deltas = [msg.body.resident_delta for _, msg in leader.sent]
     assert len(deltas) == 2
-    assert all(_entries(d) == [("wire-victim", True)] for d in deltas), (
+    assert all(_entries(d) == [("wire-victim", MoveKind.OFFLOAD)] for d in deltas), (
         "a follower was sent an empty delta"
     )
     # and one replaying does not drain another's
@@ -795,7 +796,7 @@ def test_the_broadcast_ships_the_sequence_verbatim():
     engine.reload_request("node", "a")
 
     assert _entries(engine.take_resident_delta("node")) == [
-        ("wire-a", True), ("wire-a", False),
+        ("wire-a", MoveKind.OFFLOAD), ("wire-a", MoveKind.RELOAD),
     ]
 def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     """A follower that stops mid-delta and never finishes leaves rank 0 on a
@@ -804,7 +805,7 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     engine.resource.refuse_reload = True
     engine.resource.offloaded = {"a"}
     delta = OffloadDelta.new()
-    delta.add_reloaded("wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
         assert engine.apply_resident_delta("node", delta) is False
@@ -837,7 +838,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     message = ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=5,
     )
-    message.resident_delta.add_offloaded("wire-victim")
+    message.resident_delta.add(MoveKind.OFFLOAD, "wire-victim")
     sched.register_tp_follow(message)
 
     assert sched._try_schedule_tp_follow(
@@ -1082,7 +1083,7 @@ class _FollowSpec:
             node_name="node", graph_walk="walk", request_ids=["r0"],
             speculative=True, spec_seq=6, spec_from_seq=5,
         )
-        head.resident_delta.add_offloaded("victim")
+        head.resident_delta.add(MoveKind.OFFLOAD, "victim")
         self.scheduler.register_tp_follow(head)
 
 

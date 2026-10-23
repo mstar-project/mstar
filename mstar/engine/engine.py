@@ -60,7 +60,7 @@ from mstar.model.submodule_base import (
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils.device import DeviceCapability
-from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.utils.ipc_format import MoveKind, OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     mark,
@@ -2504,8 +2504,8 @@ class Engine:
             if resource.supports_eviction
         )
         if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
+            self._resident_delta[node_name].add(
+                MoveKind.OFFLOAD, self._graph_runtime.get_rid_string(request_id),
             )
         return freed
 
@@ -2546,8 +2546,8 @@ class Engine:
             self._graph_runtime.get_rid_string(request_id), node_name,
         )
         if node_name in self._resident_delta:
-            self._resident_delta[node_name].add_reloaded(
-                self._graph_runtime.get_rid_string(request_id)
+            self._resident_delta[node_name].add(
+                MoveKind.RELOAD, self._graph_runtime.get_rid_string(request_id),
             )
         return True
 
@@ -2597,7 +2597,7 @@ class Engine:
 
         resources = self._submodules[node_name].resources.values()
         for _ in range(len(delta)):
-            wire_rid, is_offload = delta.peek_left()
+            wire_rid, kind = delta.peek_left()
             # Wire strings, not handles: a handle is minted per worker, so rank
             # 0's is meaningless here. None means this rank has no live request
             # by that name -- it removed it already, on the other side of the
@@ -2613,7 +2613,7 @@ class Engine:
                 )
                 delta.pop_left()
                 continue
-            if is_offload:
+            if kind == MoveKind.OFFLOAD:
                 if self.is_offloaded(node_name, rid):
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
