@@ -1,4 +1,5 @@
-"""Whole-page copies between the device KV cache and the host page pool.
+"""Page copies between KV caches: the device cache and the host page pool, or
+two device caches (CUDA IPC KV transfer).
 
 Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous
 block per layer, a layer stride apart. ``copy_`` of that strided view between
@@ -43,6 +44,14 @@ class PageCopier:
     ) -> None:
         raise NotImplementedError
 
+    def copy_rows(
+        self, dst: torch.Tensor, src: torch.Tensor, stream: torch.cuda.Stream,
+    ) -> None:
+        """``dst.copy_(src)`` queued on ``stream``, for two views of the same
+        shape whose rows (``[i]``) are each contiguous: e.g. a page or a token
+        range of it, every layer."""
+        raise NotImplementedError
+
 
 class TorchCopier(PageCopier):
     """Per-page ``copy_``: works everywhere, but on CUDA blocks the host."""
@@ -53,6 +62,10 @@ class TorchCopier(PageCopier):
         with torch.cuda.stream(stream):
             for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
                 dst[:, dst_idx].copy_(src[:, src_idx], non_blocking=True)
+
+    def copy_rows(self, dst, src, stream):
+        with torch.cuda.stream(stream):
+            dst.copy_(src, non_blocking=True)
 
 
 class _Memcpy2DCopier(PageCopier):
@@ -79,6 +92,18 @@ class _Memcpy2DCopier(PageCopier):
             )
             if err != 0:
                 raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
+
+    def copy_rows(self, dst, src, stream):
+        assert dst.shape == src.shape and dst.dtype == src.dtype
+        assert dst[0].is_contiguous() and src[0].is_contiguous()
+        elt = dst.element_size()
+        err = self._memcpy_2d(
+            dst.data_ptr(), dst.stride(0) * elt,
+            src.data_ptr(), src.stride(0) * elt,
+            dst[0].numel() * elt, dst.shape[0], stream.cuda_stream,
+        )
+        if err != 0:
+            raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
 
 
 class CudaBindingsCopier(_Memcpy2DCopier):

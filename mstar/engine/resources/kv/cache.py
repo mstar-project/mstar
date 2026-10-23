@@ -277,6 +277,26 @@ class KVCache:
         if return_tensor:
             return self.read_tokens(layer_idx, page_idx, cache_idx)
 
+    def layer_rows(
+        self, layer_start: int, layer_end: int, page_idx: int,
+        token_start: int, token_end: int,
+        tensor: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Tokens [token_start, token_end) of one page over layers
+        [layer_start, layer_end), as views of shape ``[layers, ...]`` whose
+        rows are each contiguous: one view for a whole page, one each for K and
+        V otherwise. ``tensor`` is as for `chunk_view`."""
+        if self.layout != KVLayout.NHD:
+            raise NotImplementedError(
+                f"layer_rows is not implemented for layout {self.layout}."
+            )
+        if tensor is None:
+            tensor = self.tensor
+        page = tensor[layer_start:layer_end, page_idx]
+        if token_start == 0 and token_end == self.page_size:
+            return [page]
+        return [page[:, kv, token_start:token_end] for kv in range(2)]
+
     def copy_pages(self, src_pages: list[int], dst_pages: list[int]) -> None:
         """Copy whole pages (every layer, both K and V, all tokens) within
         this cache: ``src_pages[i]`` -> ``dst_pages[i]``."""
