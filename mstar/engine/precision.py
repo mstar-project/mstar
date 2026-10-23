@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from mstar.engine.quant.config import QuantConfig, parse_yaml_quant
 from mstar.engine.resources.spec import parse_yaml_dtype, require_unscaled_dtype
 
 
@@ -27,11 +28,18 @@ class NodePrecision:
     # wrap the forward in torch.amp.autocast(param_dtype); off, every op runs in
     # its inputs' dtypes and any fp32 the model needs is explicit
     autocast: bool = False
+    # model-declared globs on module names never quantized (heads, routers, gates)
+    quant_skip: tuple[str, ...] = ()
+    # linear quantization; usually set by the deployment
+    quant: QuantConfig | None = None
 
     def __post_init__(self):
-        if isinstance(self.fp32_modules, str):
-            raise TypeError(f"fp32_modules is a tuple of globs, not the string {self.fp32_modules!r}")
-        object.__setattr__(self, "fp32_modules", tuple(self.fp32_modules))
+        for name in ("fp32_modules", "quant_skip"):
+            if isinstance(getattr(self, name), str):
+                raise TypeError(f"{name} is a tuple of globs, not the string {getattr(self, name)!r}")
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if self.quant is not None and not isinstance(self.quant, QuantConfig):
+            raise TypeError(f"quant is a QuantConfig or None, not {self.quant!r}")
         if self.autocast and self.param_dtype is None:
             raise ValueError("autocast needs a param_dtype to autocast in")
         if self.param_dtype is not None:
@@ -68,16 +76,19 @@ def _target_dtypes(module: torch.nn.Module, precision: NodePrecision):
 
     A tensor already in a quantized dtype (fp8, fp4: below 16 bits) is left out:
     a quant pass or a pre-quantized checkpoint put it there with its scales, and
-    a cast would undo it."""
+    a cast would undo it. So are a quantized linear's scales; only its bias casts."""
     islands = fp32_names(module, precision.fp32_modules)
 
     def pinned(name: str) -> bool:
         return any(name == top or name.startswith(top + ".") for top in islands)
 
     for prefix, child in module.named_modules():
+        quantized = getattr(child, "linear_quant", None) is not None
         for kind in (child._parameters, child._buffers):
             for local, tensor in kind.items():
                 if tensor is None or not tensor.is_floating_point() or tensor.dtype.itemsize < 2:
+                    continue
+                if quantized and local != "bias":
                     continue
                 full = f"{prefix}.{local}" if prefix else local
                 yield child, kind, local, full, torch.float32 if pinned(full) else precision.param_dtype
@@ -123,7 +134,7 @@ def refuse_legacy_autocast_yaml(model_config: Mapping[str, Any]) -> None:
         )
 
 
-_YAML_KEYS = {"param_dtype", "fp32_modules", "autocast"}
+_YAML_KEYS = {"param_dtype", "fp32_modules", "autocast", "quant"}
 
 
 def apply_yaml_precision(
@@ -133,7 +144,8 @@ def apply_yaml_precision(
 
     YAML may tighten but not loosen: it may turn autocast off but never on, add
     fp32 modules but not drop the model's, and change the param dtype only of a
-    node that has one (None pins the dtype the node was built in).
+    node that has one (None pins the dtype the node was built in). ``quant`` is a
+    deployment choice, so YAML may set, change or (with null) remove it.
     """
     unknown = sorted(block.keys() - _YAML_KEYS)
     if unknown:
@@ -158,6 +170,8 @@ def apply_yaml_precision(
     if block.get("fp32_modules"):
         extra = tuple(g for g in block["fp32_modules"] if g not in precision.fp32_modules)
         updates["fp32_modules"] = precision.fp32_modules + extra
+    if "quant" in block:
+        updates["quant"] = parse_yaml_quant(node_name, block["quant"])
     return replace(precision, **updates)
 
 

@@ -15,8 +15,9 @@ projections but don't need TP.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from mstar.engine.quant import LinearQuant, run_linear
 
 
 class FusedColumnLinear(nn.Module):
@@ -36,6 +37,8 @@ class FusedColumnLinear(nn.Module):
     ``shard_sizes``). Wire the per-shard checkpoint keys to it with the
     loader's stacked-param rules.
     """
+    # set by the quant pass; the matmul then runs its kernel
+    linear_quant: LinearQuant | None = None
 
     def __init__(
         self,
@@ -98,4 +101,4 @@ class FusedColumnLinear(nn.Module):
         return self._shard_offsets[shard_id], self._shard_sizes[shard_id]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return run_linear(self, x, self.bias)

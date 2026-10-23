@@ -3,6 +3,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
+from mstar.engine.quant import LinearQuant, run_linear
 
 
 class ColumnParallelLinear(nn.Module):
@@ -11,6 +12,8 @@ class ColumnParallelLinear(nn.Module):
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
     """
+    # set by the quant pass; the matmul then runs its kernel
+    linear_quant: LinearQuant | None = None
 
     def __init__(
         self,
@@ -98,7 +101,7 @@ class ColumnParallelLinear(nn.Module):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = torch.nn.functional.linear(input_, self.weight, bias)
+        output_parallel = run_linear(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -303,6 +306,8 @@ class RowParallelLinear(nn.Module):
               | A_p |
                -   -
     """
+    # set by the quant pass; the matmul then runs its kernel
+    linear_quant: LinearQuant | None = None
 
     def __init__(
         self,
@@ -409,7 +414,7 @@ class RowParallelLinear(nn.Module):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = torch.nn.functional.linear(input_parallel, self.weight, bias_)
+        output_parallel = run_linear(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = self.comm_group.all_reduce(output_parallel)

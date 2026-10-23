@@ -10,10 +10,12 @@ from mstar.engine.precision import (
     NodePrecision,
     apply_precision,
     apply_yaml_precision,
+    fp32_names,
     precision_mismatches,
     refuse_legacy_autocast_yaml,
     yaml_precision_blocks,
 )
+from mstar.engine.quant import quant_mismatches, quantize_linears
 from mstar.engine.resources import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -130,14 +132,18 @@ def refuse_combined_walks_across_tp_groups(
 def _refuse_conflicting_shared_modules(
     submodules: dict[str, torch.nn.Module], precisions: dict[str, NodePrecision],
 ) -> None:
-    """Refuse two nodes that share a module but cast it differently: the one
-    loaded later would silently set the other's numerics."""
+    """Refuse two nodes that share a module but cast or quantize it differently:
+    the one loaded later would silently set the other's numerics."""
     for name, submodule in submodules.items():
-        bad = precision_mismatches(submodule, precisions[name])
+        precision = precisions[name]
+        bad = precision_mismatches(submodule, precision) + quant_mismatches(
+            submodule, precision.quant_skip, precision.quant,
+            fp32_names(submodule, precision.fp32_modules),
+        )
         if bad:
             raise ValueError(
                 f"node {name!r} does not hold the dtypes its precision policy gives it; "
-                f"a module it shares with another node was cast differently there: "
+                f"a module it shares with another node was cast or quantized differently there: "
                 f"{bad[:5]}{' ...' if len(bad) > 5 else ''}"
             )
 
@@ -282,6 +288,12 @@ class EngineManager:
             # the one policy the load cast and every forward and capture use
             precisions[name] = precision
             submodules[name] = apply_precision(submodule.to(device=device), precision)
+            if precision.quant is not None:
+                quantize_linears(
+                    submodules[name], name, precision.quant_skip, precision.quant,
+                    fp32_names(submodules[name], precision.fp32_modules),
+                    device_capability or DeviceCapability.of(device), precision.param_dtype,
+                )
         _refuse_split_combined_walks(submodules, model)
         _refuse_conflicting_shared_modules(submodules, precisions)
 

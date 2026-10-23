@@ -157,6 +157,8 @@ def normalize_lora_state_dict(
 
 def _merge_delta(param: nn.Parameter, delta: torch.Tensor, owner: nn.Module, shard_id) -> None:
     """``param[rows] += delta`` in fp32 with one final rounding to the parameter dtype."""
+    if getattr(owner, "linear_quant", None) is not None:
+        raise ValueError("cannot merge a LoRA into a quantized weight; merge before quantizing")
     if shard_id is None:
         target = param.data
     else:

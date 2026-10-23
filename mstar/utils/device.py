@@ -43,6 +43,13 @@ class DeviceCapability:
         return self.is_accelerator and bool(self._runtime.is_available())
 
     @property
+    def compute_capability(self) -> tuple[int, int] | None:
+        """CUDA (major, minor); None on any other device or without one."""
+        if self.device.type != "cuda" or not self.is_available:
+            return None
+        return torch.cuda.get_device_capability(self.device)
+
+    @property
     def pin_memory(self) -> bool:
         return self.is_available
 
