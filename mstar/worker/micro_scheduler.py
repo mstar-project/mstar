@@ -31,11 +31,6 @@ logger = logging.getLogger(__name__)
 REMOVED_RID = -1
 
 
-class TPDivergence(BaseException):
-    """Raised when a follower can't take rank 0's step. A BaseException, so no handler for
-    Exception catches it and the worker exits."""
-
-
 @dataclass
 class ReadyNodeEntry:
     """A ready node entry for a single request."""
@@ -427,7 +422,7 @@ class MicroScheduler:
         except Exception as exc:
             # The error would repeat on every pass over this head, and failing its requests would
             # leave the other ranks stuck in its collective.
-            raise TPDivergence(f"TP ranks diverged: {exc}") from exc
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
