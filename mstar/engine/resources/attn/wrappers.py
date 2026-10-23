@@ -151,6 +151,10 @@ class FlashInferPrefillWrapper:
         # page-locked staging for an inline plan's host arrays (`_stage_pinned`)
         self._pinned: dict[str, torch.Tensor] = {}
         self._pinned_done = None
+        # set by the first staged plan when ``_plan_direct`` may take the later
+        # ones, for the (dtype, causal) it was built for
+        self._planner_args: list | None = None
+        self._planner_key = None
 
     def _stage_pinned(self, qo_indptr, kv_indptr, last_page_len, kv_lens, indices):
         """Copy the plan's host arrays into this wrapper's page-locked buffers,
@@ -213,7 +217,6 @@ class FlashInferPrefillWrapper:
         consume them as CPU and async-H2D copy to the device for our own
         per-token bookkeeping below.
         """
-        self.dtype = dtype
         if self.accelerator_graph and paged_kv_indices.device.type != "cuda":
             # planned inline behind the step in flight, which a pageable copy
             # would wait for: stage page-locked, copy the indices in ourselves
@@ -223,10 +226,13 @@ class FlashInferPrefillWrapper:
                     kv_lens, paged_kv_indices,
                 )
             )
-            self._paged_kv_indices_buf[:n].copy_(
-                self._pinned["indices"][:n], non_blocking=True,
+            self.plan_staged(
+                qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
+                paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
             )
-            paged_kv_indices = self._paged_kv_indices_buf[:n]
+            self._pinned_done.record()
+            return
+        self.dtype = dtype
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -242,10 +248,6 @@ class FlashInferPrefillWrapper:
             seq_lens=kv_lens,
             window_left=window_left,
         )
-        if self._pinned_done is not None:
-            # every copy out of the staging buffers is issued: the next
-            # restage waits for them
-            self._pinned_done.record()
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
@@ -254,6 +256,98 @@ class FlashInferPrefillWrapper:
             if qo_indptr.device.type != "cuda":
                 qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
+
+    def plan_staged(
+        self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
+        kv_lens, causal: bool, dtype: torch.dtype, window_left: int = -1,
+    ) -> None:
+        """Plan a captured wrapper from page-locked int32 host arrays, which
+        the caller keeps unchanged until this plan's copies have landed."""
+        n = paged_kv_indices.shape[0]
+        self.dtype = dtype
+        key = (dtype, causal, window_left)
+        if self._planner_key == key and _EXP_SLIM_FI_PLAN:
+            self._plan_direct(
+                qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens,
+            )
+            return
+        self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
+        self.attn_wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=self._paged_kv_indices_buf[:n],
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=self.page_size,
+            causal=causal,
+            q_data_type=dtype,
+            seq_lens=kv_lens,
+            window_left=window_left,
+        )
+        self._planner_args = self._direct_planner_args(causal)
+        self._planner_key = None if self._planner_args is None else key
+
+    def _direct_planner_args(self, causal: bool) -> list | None:
+        """FlashInfer's planner arguments for this wrapper, fixed but for the
+        host indptrs and lengths, when its plan resolved to the one path
+        ``_plan_direct`` reproduces (fa2 or fa3 under a graph, no custom mask,
+        prefix items, window, soft cap or position encoding, a 16-bit KV); else
+        None.
+        As for decode, the rest of FlashInfer's ``plan`` gives the same answer
+        for every step of a captured bucket."""
+        w = self.attn_wrapper
+        if not (
+            w._backend in ("fa2", "fa3") and w.is_cuda_graph_enabled and w._jit_module is None
+            and w._cached_module is not None and w._custom_mask_buf is None
+            and w._prefix_len_ptr is None and w._window_left == -1
+            and w._logits_soft_cap == 0.0 and w._pos_encoding_mode == "NONE"
+            and w._cached_kv_data_type in (torch.bfloat16, torch.float16)
+            and w._max_total_num_rows is not None
+        ):
+            return None
+        args = [
+            w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+            None, None, None,
+            w._max_total_num_rows, w._fixed_batch_size,
+            self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+            self.head_dim, self.head_dim,
+            causal,
+            -1,  # window_left
+        ]
+        if w._backend == "fa2":
+            args += [
+                -1,  # fixed_split_size
+                False,  # disable_split_kv (FlashInfer sets it for an NVFP4 KV only)
+                0,  # num_colocated_ctas
+                0,  # uniform_q_len
+            ]
+        return args
+
+    def _plan_direct(self, qo_indptr, kv_indptr, indices, last_page_len, kv_lens) -> None:
+        """What FlashInfer's ``plan`` does per step on the path
+        ``_direct_planner_args`` checked: its checks, the four index copies
+        into the captured buffers, then its planner."""
+        w = self.attn_wrapper
+        n = indices.shape[0]
+        total = int(qo_indptr[-1])
+        if n > w._paged_kv_indices_buf.shape[0]:
+            raise ValueError("more page indices than the captured buffer holds")
+        if total > w._max_total_num_rows:
+            raise ValueError(
+                f"{total} query rows in a wrapper captured for {w._max_total_num_rows}"
+            )
+        w._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+        w._paged_kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
+        w._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
+        w._paged_kv_indices_buf[:n].copy_(indices, non_blocking=True)
+        w._qo_indptr_last = total
+        args = self._planner_args
+        args[3] = qo_indptr
+        args[4] = kv_indptr
+        args[5] = kv_lens
+        w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -385,7 +479,7 @@ class FlashInferDecodeWrapper:
 
         if (
             self._planner_args is not None and dtype is self.dtype and kv_lens is not None
-            and _EXP_SLIM_FI_PLAN
+            and window_left == -1 and _EXP_SLIM_FI_PLAN
         ):
             self._plan_direct(paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens)
             return
