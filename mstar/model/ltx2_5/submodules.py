@@ -63,7 +63,7 @@ VIDEO_SPAN, AUDIO_SPAN, TEXT_SPAN = "video", "audio", "text"
 
 @dataclass(frozen=True)
 class LTXShape:
-    """What a denoise step's shape is. Requests batch, and CUDA-graph buckets key, on it."""
+    """What a denoise step's shape is. Requests batch, and accelerator graph buckets key, on it."""
 
     frames: int        # latent frames
     height: int        # latent rows

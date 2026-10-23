@@ -48,7 +48,7 @@ class AcceleratorGraphConfig(ABC):
         # Additional information added to the capture bucket key (e.g., requires_cfg).
         # Must be hashable.
         additional_key_info: Any | None = None,
-        compile: bool = True, # whether to run torch.compile before cuda graph capture
+        compile: bool = True, # whether to run torch.compile before accelerator graph capture
         # torch.compile mode for the captured forward; None takes the runner's
         # default, max-autotune-no-cudagraphs
         compile_mode: str | None = None,
@@ -63,7 +63,7 @@ class AcceleratorGraphConfig(ABC):
         caps_eager_batch_size: bool = True,
         # Maps a static-input key, as returned by the submodule's
         # ``preprocess``, to the dim that varies with the bucket. Overrides
-        # the runner's size-matching guess (``CudaGraphRunner._seq_dim``),
+        # the runner's size-matching guess (``AcceleratorGraphRunner._seq_dim``),
         # which can pick the wrong dim when an unrelated axis happens to
         # match the bucket's token count.
         input_seq_dims: dict[str, int] | None = None,
@@ -270,7 +270,7 @@ class PiecewiseCallInputs:
 class PiecewiseAcceleratorGraphConfig(ABC):
     """One inner callable of a submodule's forward, captured on its own.
 
-    Unlike ``CudaGraphConfig``, which describes a whole ``forward_batched``
+    Unlike ``AcceleratorGraphConfig``, which describes a whole ``forward_batched``
     the engine drives, this describes a SUB-REGION the submodule invokes
     itself while the surrounding preamble stays eager.
 

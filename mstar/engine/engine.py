@@ -141,7 +141,7 @@ class SubmoduleManagement:
         init=False, default_factory=threading.Lock, repr=False
     )
 
-    # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
+    # label -> PiecewiseAcceleratorGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
@@ -155,7 +155,7 @@ class SubmoduleManagement:
         # specific — the main runner has it too (see `Resource`).
         # TODO: submodule-wide, so a capture touching neither kind still pays
         # double the buffers. Each runner could size its own count from the
-        # resources its captures touch, as PiecewiseCudaGraphRunner does.
+        # resources its captures touch, as PiecewiseAcceleratorGraphRunner does.
         preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
         self._forced_double_buffer = any(
             res.force_double_buffer for res in self.resources.values()
@@ -258,9 +258,9 @@ class ForwardPassInfoWrapper:
 class ExecutingBatch:
     node_name: str
 
-    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # Keyed by the worker's integer rid handle. Accelerator graph capture pads with
     # its own rows, which carry negative handles from the same space (see
-    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # accelerator_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
     # throughout.
     per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
@@ -720,8 +720,8 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
-        # torch.compile applied after CUDA graph capture because the cuda
-        # graph runner compiles internally
+        # torch.compile applied after capture because the accelerator graph
+        # runner compiles internally
         self._compile_submodules()
 
         for resource in self._resources.values():
@@ -824,7 +824,7 @@ class Engine:
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
-        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # ``PiecewiseAcceleratorGraphRunner``): its captured-memory footprint becomes
         # the largest region's rather than the sum over regions.
         memory_pool = None
         if configs and self.device_capability.graph_backend is not None:
@@ -2172,7 +2172,7 @@ class Engine:
 
         A batch that hasn't been through ``prepare_inputs`` has no token count
         yet, so only a batched capture can serve it — see
-        ``CudaGraphRunner.select_batched_bucket``.
+        ``AcceleratorGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
 

@@ -52,7 +52,7 @@ class NoiseStager:
         self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
-        # Without CUDA there is nothing to pin and nothing to overlap; the staging
+        # Without an accelerator there is nothing to pin or overlap; the staging
         # degrades to a plain copy so callers need no branch of their own.
         self._pinned = torch.accelerator.is_available()
         if numel:

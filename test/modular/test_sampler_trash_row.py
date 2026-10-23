@@ -2,7 +2,7 @@
 
 No request is ever given it, so its config stays ``SamplingConfig()``. Padding
 rows and unregistered rids read it, and every write on their behalf lands there.
-CUDA graph capture rows alias it rather than taking a slot each: they used to
+Accelerator graph capture rows alias it rather than taking a slot each: they used to
 hold ``cg_slots x max_bs`` master rows per runner for the process lifetime,
 doubling the masters, or using up the fixed in-graph capacity.
 

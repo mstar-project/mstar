@@ -217,6 +217,7 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     )
 
     def new_group(ranks, **kwargs):
+        # Every rank creates even the subgroups it does not belong to.
         calls.append((tuple(ranks), kwargs))
         key = (tuple(ranks), kwargs.get("backend"))
         handles[key] = object()

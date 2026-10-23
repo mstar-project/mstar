@@ -39,9 +39,9 @@ in ``test_pi05_reference_equivalence.py``
 (``test_flashinfer_paged_prefill_attention_matches_sdpa``), and the
 ``test_flashinfer_rope_matches_hf_gemma_formula`` test confirms that
 ``flashinfer.rope.apply_rope_pos_ids_inplace`` produces the same Q,K as
-HF Gemma's ``apply_rotary_pos_emb``. So if the action expert math is right
-on this test, plugging it into the FlashInfer cache_handle inside an
-``KVCacheEngine`` is mechanical.
+HF Gemma's ``apply_rotary_pos_emb``. These checks isolate the model math
+and attention kernels; this test does not exercise the engine's resource
+lifecycle.
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ def _hf_apply_rotary(q, k, position_ids, head_dim, theta=10000.0):
 
 
 class _MockCacheHandle:
-    """Vanilla-SDPA replacement for ``BatchedCacheManager``.
+    """Vanilla-SDPA test double for prefix KV attention.
 
     Stores per-layer prefix K/V (already RoPE'd by lerobot during prefill).
     Suffix Q/K get HF-style RoPE applied at ``suffix_positions`` before the
@@ -673,8 +673,8 @@ def test_pi05_model_loaded_via_remapper_matches_lerobot():
     standing up a full mstar worker process: it exercises
     :class:`Pi05Model`'s lazy submodule construction, the lerobot→mstar
     state-dict remap, and the actual ``Pi05ViTEncoderSubmodule`` and
-    ``Pi05LLMSubmodule`` forward methods. The only thing it bypasses is
-    the FlashInfer/KVCacheEngine paged KV cache (replaced with the same
+    ``Pi05LLMSubmodule`` forward methods. It bypasses the engine's paged
+    KV and FlashInfer attention resources (replaced with the same
     ``MockCacheHandle`` used by the other integration tests, which has
     been validated against the real FlashInfer wrapper separately).
     """

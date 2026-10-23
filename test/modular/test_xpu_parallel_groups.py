@@ -1,3 +1,4 @@
+"""Native mixed CPU/XPU parallel groups, including non-member workers."""
 
 import socket
 import sys
@@ -23,6 +24,8 @@ def _exercise_parallel_groups(rank, rendezvous):
     parallel.init_dist(init_method=rendezvous, device=torch.device("xpu", rank))
     try:
         if rank == 2:
+            # A worker with no local TP still joins subgroup creation, then
+            # waits while the two TP members exercise their mixed subgroup.
             dist.barrier()
             return
         assert group.device_group is group.cpu_group
@@ -33,6 +36,7 @@ def _exercise_parallel_groups(rank, rendezvous):
         dist.all_reduce(cpu_values, group=group.cpu_group)
         torch.testing.assert_close(cpu_values, torch.tensor([3.0]))
 
+        # Exercise eager device collectives on decode and packed-prefill sizes.
         for tokens in (4, 2048):
             inputs = torch.full(
                 (tokens, 3584), float(rank + 1), dtype=torch.bfloat16, device="xpu",

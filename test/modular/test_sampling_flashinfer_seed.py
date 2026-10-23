@@ -1,7 +1,7 @@
 """Pin the FlashInfer seed/offset contract the Talker's graph sampler relies on.
 
 The Talker samples stochastically (temperature ~0.9, top_k ~50) under CUDA-graph
-capture. ``CudaGraphableSampler.sample`` passes per-request philox
+capture. ``AcceleratorGraphableSampler.sample`` passes per-request philox
 ``seed``/``offset`` as captured int tensors and advances ``offset_buf += 1``
 in-graph so each replay steps the RNG (see the comments in
 ``mstar/engine/resources/sampler/utils.py`` about a frozen offset never reaching EOS).
@@ -50,7 +50,7 @@ def _stochastic_probs(batch: int, vocab: int, device: torch.device):
 def test_tensor_seed_offset_accepted_under_capture():
     """Pinned FlashInfer must accept captured tensor seed/offset and advancing
     offset_buf in-graph must step the RNG -- the exact pattern
-    CudaGraphableSampler.sample relies on.
+    AcceleratorGraphableSampler.sample relies on.
 
     Fails loudly (not skips) on a too-old build that rejects tensor seed, since
     that build silently breaks stochastic Talker sampling.
@@ -72,7 +72,7 @@ def test_tensor_seed_offset_accepted_under_capture():
     torch.cuda.synchronize()
 
     # Capture: sample, then advance the offset buffer in-graph (mirrors the
-    # mstar CudaGraphableSampler design). A private pool avoids cross-test
+    # mstar AcceleratorGraphableSampler design). A private pool avoids cross-test
     # graph-memory aliasing in the shared pytest process.
     pool = torch.cuda.graph_pool_handle()
     g = torch.cuda.CUDAGraph()

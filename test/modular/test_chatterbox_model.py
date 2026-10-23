@@ -1261,13 +1261,13 @@ def test_graph_warmup_covers_the_built_in_voice_chunk_shapes():
 
 
 # ---------------------------------------------------------------------------
-# SolveGraphs: shape keys, row padding, reuse and eviction (no CUDA: a stand-in
+# SolveGraphs: shape keys, row padding, reuse and eviction (a CPU stand-in
 # graph re-runs the solve on the static buffers when replayed)
 # ---------------------------------------------------------------------------
 
 
 class _FakeGraph:
-    """Stands in for a captured CUDA graph: a replay recomputes the function on
+    """Stands in for a captured accelerator graph: a replay recomputes the function on
     the static inputs into the static outputs (a tensor or a tuple of them)."""
 
     def __init__(self, run, output):

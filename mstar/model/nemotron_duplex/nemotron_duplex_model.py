@@ -32,7 +32,7 @@ The M* serving path is the walk graphs below: four async partitions
 decode loop consuming one encoder frame per step. ``get_node_resources`` declares
 the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
 slots), the Mamba-2 resource and the sampler, and the talker's paged KV cache,
-attention and positions. Both decode steps are CUDA graphs.
+attention and positions. Both decode steps are accelerator graphs.
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,

@@ -1,4 +1,4 @@
-"""Registration of captured CUDA graph buckets.
+"""Registration of captured accelerator graph buckets.
 
 A bucket's slots are double buffers of one shape: replay(N) runs on one while
 pre-plan(N+1) writes the other. So a bucket is only usable with all of its
@@ -101,7 +101,7 @@ class _FakeRunner:
     def _capture_one(self, spec, forwards):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
             raise RuntimeError("capture failed")
-        # stands in for the CudaGraphSlot; identity is what the test checks
+        # stands in for the AcceleratorGraphSlot; identity is what the test checks
         return f"{spec.bucket.graph_walk}:slot{spec.slot}"
 
     def _get_addtl_slot_specs(self, spec):
@@ -271,7 +271,7 @@ def test_seq_dim_picks_the_only_matching_dim_even_at_batch_size_one():
     ``batch_size`` here because `_seq_dim` no longer takes one — it just
     scans for ``seq_len``, so a coincidental dim-0 size never shadows the
     real seq dim. This is the case from the PR review comment on
-    cuda_graph_runner.py:621."""
+    accelerator_graph_runner.py:621."""
     value = torch.zeros(1, 512)
     assert AcceleratorGraphRunner._seq_dim(value, seq_len=512) == 1
 

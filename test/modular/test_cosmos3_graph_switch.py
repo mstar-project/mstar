@@ -1,3 +1,4 @@
+"""Cosmos3 graph switches cover denoise, prefill and reasoner decode."""
 
 from pathlib import Path
 from types import SimpleNamespace

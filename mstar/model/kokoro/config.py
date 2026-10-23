@@ -128,7 +128,7 @@ class KokoroModelConfig:
     # Upper bound on chunks per request (the loop's ``max_iters``).
     max_chunks: int = 512
 
-    # --- CUDA-graph buckets ------------------------------------------------
+    # --- accelerator graph buckets ------------------------------------------------
     # The text half is captured per padded phoneme count, the decoder half per
     # padded frame count (~1.33x spacing keeps padding under a third). A batch
     # is grouped by frame bucket so short and long sentences do not pad each
@@ -149,7 +149,7 @@ class KokoroModelConfig:
     decoder_dtype: str = "float32"
     # ``torch.compile`` the frame half (F0/energy heads + decoder) with dynamic
     # shapes on CUDA: inductor fuses its many elementwise ops (masks, AdaIN,
-    # Snake) and the fused kernels are what the CUDA graphs capture. One
+    # Snake) and the fused kernels are what the accelerator graphs capture. One
     # compile serves every bucket. Off on CPU.
     compile_decoder: bool = True
 

@@ -7,7 +7,7 @@ at different positions (padding the rest with random distractor rows), and check
 its sampled token never changes.
 
 Two paths are checked:
-  - ``sample_cuda_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
+  - ``sample_accelerator_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
   - raw ``flashinfer...top_k_top_p_sampling_from_probs`` on **fixed pre-computed
     probs**, skipping the fused kernel entirely.
 

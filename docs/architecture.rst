@@ -16,7 +16,7 @@ High-level components
   micro-scheduler (continuous batching), drives eviction and offload, and routes tensors
   directly to downstream workers.
 - **Engine** (``mstar/engine/engine.py``): the single execution backend that runs
-  submodules on the GPU. It compiles forwards, captures CUDA graphs, batches requests, and
+  submodules on the GPU. It compiles forwards, captures accelerator graphs, batches requests, and
   runs each step's resource lifecycle: admit, plan, forward, commit.
 - **Resources** (``mstar/engine/resources/``): the state that a node's compute uses. This
   includes paged KV caches, the attention planned over them (FlashInfer or dense),

@@ -181,7 +181,7 @@ class T3Submodule(ARNodeSubmodule):
     label-major into one plan (``CFG_LABEL``); the forward then sees ``2B``
     rows, combines the two logit halves with the per-request ``cfg_weight``
     and samples ``B`` tokens. Guidance on/off is the capture key, so a decode
-    batch of either kind replays its own CUDA graph.
+    batch of either kind replays its own accelerator graph.
     """
 
     # Sampling, guidance and the min-p mask are plain tensor ops but the

@@ -357,10 +357,10 @@ class Qwen3OmniCodePredictor(nn.Module):
 
     Two forward paths:
       * ``forward(embed, cache_manager)``  -- paged-FlashInfer eager path,
-        used as a fallback when CUDA graphs are disabled.
+        used as a fallback when accelerator graphs are disabled.
       * ``forward_depth_unrolled(...)``   -- SDPA + dense-KV path that runs
         every layer with per-token position IDs and a static KV cache tensor.
-        This is what the unrolled CUDA graph captures.
+        This is what the unrolled accelerator graph captures.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
@@ -442,7 +442,7 @@ class Qwen3OmniCodePredictor(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # SDPA + dense-KV depth forward (for unrolled CUDA-graph capture)
+    # Dense-KV depth forward (for unrolled accelerator graph capture)
     # ------------------------------------------------------------------
     def forward_depth_unrolled(
         self,
@@ -451,11 +451,9 @@ class Qwen3OmniCodePredictor(nn.Module):
         kv_cache: torch.Tensor,
         cache_pos: int,
     ) -> torch.Tensor:
-        """Run one "slice" of the code-predictor AR loop with SDPA + dense KV.
+        """Run one slice of the code-predictor AR loop with dense KV attention.
 
-        This is the CUDA-graph-compatible replacement for the paged-FlashInfer
-        attention path. It is safe to call repeatedly inside a single
-        ``torch.cuda.graph`` capture because:
+        The engine can capture repeated calls in an unrolled accelerator graph:
 
           * The KV cache is a preallocated dense tensor (no plan() call).
           * Position IDs come in directly (no PlanState bookkeeping).
@@ -463,14 +461,15 @@ class Qwen3OmniCodePredictor(nn.Module):
             the captured kernel sees identical shapes every replay.
 
         Args:
-            inputs_embeds: ``[bs, seq_len, hidden_size]``. ``seq_len`` is 2 for
-                the initial "prefill" call (``[last_hidden, c0_embed]``) and 1
-                for every subsequent decode iteration.
+            inputs_embeds: ``[bs, seq_len, hidden_size]``. The caller uses
+                ``seq_len=1`` for both the initial ``last_hidden`` context
+                and each subsequent codebook embedding.
             position_ids: ``[bs, seq_len]`` int tensor with the absolute
                 position of each input token within the depth sequence.
             kv_cache: ``[n_layers, bs, 2, max_seq_len, n_kv_heads, head_dim]``
-                dense tensor preallocated by the runner. The runner zeroes it
-                at the start of every graph replay so stale state cannot leak.
+                persistent dense tensor allocated once by the caller. Each
+                depth step overwrites its K/V slice before attention reads the
+                valid prefix; the unused tail does not need clearing.
             cache_pos: write offset into ``kv_cache``'s seq-len axis. The new
                 K/V tokens land at ``[cache_pos : cache_pos + seq_len]``.
 
@@ -487,9 +486,7 @@ class Qwen3OmniCodePredictor(nn.Module):
         n_q_heads = first_attn.num_heads
         head_dim = first_attn.head_dim
 
-        # FlashInfer's rope kernels require bf16; the rest of the code
-        # predictor runs at the weights' native dtype (fp32 for quality per
-        # the KVCacheEngine.has_autocast=False invariant).
+        # The fused Triton QK norm/RoPE kernel preserves the projection dtype.
         flat_pos = position_ids.reshape(-1)
 
         for layer_idx, layer in enumerate(self.model.layers):

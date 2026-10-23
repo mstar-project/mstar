@@ -401,7 +401,7 @@ class Benchmark:
 
         Sequential warmup on a concurrent measurement path leaves the first
         measured wave hitting cold concurrency code paths (KV-page allocation
-        for the bigger shape, scheduler queues, CUDA-graph misses). Warmup
+        for the bigger shape, scheduler queues, accelerator graph misses). Warmup
         cadence must match measurement cadence.
         """
         if self.config.num_warmup == 0 or not requests:
