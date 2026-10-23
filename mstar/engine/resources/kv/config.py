@@ -259,6 +259,8 @@ class KVReqConfig(ResourceReqConfig):
     prompt_ids: dict[str, bytes] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
+    # a guaranteed request reserves what it grows into on each worker and is never preempted
+    guaranteed: bool = False
 
     def apply_conductor_config(
         self,
@@ -412,6 +414,20 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
         if missing := sorted(configs[key].opened_labels() - laid_out):
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
+
+
+def mark_guaranteed(
+    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
+) -> None:
+    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
+    playback, or when any of them lays out KV that a rebuild from token ids can't recompute."""
+    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
+    guaranteed = (streaming and "audio" in output_modalities) or any(
+        span.kind != "ids"
+        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
+    )
+    for config in kv_configs:
+        config.guaranteed = guaranteed
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
