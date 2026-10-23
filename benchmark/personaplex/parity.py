@@ -31,7 +31,7 @@ p.add_argument("--reference-site", default="")
 p.add_argument("--backend", choices=["dense", "resources"], default="resources")
 p.add_argument("--skip-components", action="store_true")
 p.add_argument("--negative-control", action="store_true",
-               help="also run M* with RoPE one position ahead; the comparison must catch it")
+               help="also run M* with RoPE over split halves; the comparison must catch it")
 p.add_argument("--reference-control", action="store_true",
                help="also rerun NVIDIA under the math SDPA kernel: the reference's own kernel spread")
 a = p.parse_args()
@@ -47,7 +47,7 @@ from moshi.utils.compile import no_compile, no_cuda_graph
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from benchmark.personaplex.controls import ShiftedRope, candidates, first_reference_decision
+from benchmark.personaplex.controls import HalfSplitRope, candidates, first_reference_decision
 from benchmark.personaplex.resources import ResourceBackend
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.mimi import load_mimi_codec
@@ -261,8 +261,8 @@ def reference_control(ref, voice_path, persona, ref_user, user_frames, gen, ref_
 
 def negative_control(sub, native, meta, static, ref_agent, ref_text):
     """Run M* with a realistic bug through the same exact-token comparison; it must report a mismatch."""
-    stage("negative control: M* with RoPE one position ahead, compared the same way")
-    backend = ShiftedRope(native.config.num_layers, native.config.rope_theta)
+    stage("negative control: M* with RoPE over split halves, compared the same way")
+    backend = HalfSplitRope(native.config.num_layers, native.config.rope_theta)
     state, detected, frames = None, None, 0
     for index in range(meta["conditioning_frames"] + meta["num_user_frames"]):
         walk = cfg.CONDITIONING_WALK if index < meta["conditioning_frames"] else cfg.GENERATE_WALK
@@ -277,7 +277,7 @@ def negative_control(sub, native, meta, static, ref_agent, ref_text):
                 detected = j
                 break
     report["checks"]["negative_control"] = dict(
-        perturbation="RoPE positions one ahead (dense attention otherwise unchanged)",
+        perturbation="RoPE over split halves instead of adjacent pairs (dense attention otherwise unchanged)",
         detected=detected is not None,
         first_mismatch_generation_step=detected,
         frames_run=frames,

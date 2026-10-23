@@ -25,14 +25,19 @@ def first_reference_decision(records, other):
     return None
 
 
-class ShiftedRope(DenseTemporalCache):
-    """The negative control's deliberate bug: every RoPE position one ahead."""
+class HalfSplitRope(DenseTemporalCache):
+    """The negative control's deliberate bug: RoPE over split halves ``(i, i + D/2)``, not adjacent pairs.
+
+    This is the layout mix-up ``interleave=True`` guards against. (A uniform
+    position offset would not do: RoPE depends only on relative position, so it
+    leaves attention unchanged.)
+    """
 
     def rope(self, q, k):
         if q.dim() == 3:  # the base class re-enters rope with a time axis
             return super().rope(q, k)
-        self.offset += 1
-        try:
-            return super().rope(q, k)
-        finally:
-            self.offset -= 1
+        half = q.shape[-1] // 2
+        pairs = torch.stack((torch.arange(half), torch.arange(half) + half), dim=-1).flatten().to(q.device)
+        inverse = torch.argsort(pairs)
+        q, k = super().rope(q[..., pairs], k[..., pairs])
+        return q[..., inverse], k[..., inverse]

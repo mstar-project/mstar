@@ -142,22 +142,50 @@ def test_matching_comparison_fails_when_its_negative_control_was_not_caught(tmp_
         assert result["status"] == status and result["negative_control"] == {"detected": detected}
 
 
-def test_negative_control_rope_is_one_position_ahead_in_both_layouts():
+def test_negative_control_rope_rotates_split_halves_in_both_layouts():
+    import math
+
     import torch
 
-    from benchmark.personaplex.controls import ShiftedRope
-    from mstar.model.personaplex.components.temporal import apply_rope_adjacent
+    from benchmark.personaplex.controls import HalfSplitRope
 
     q, k = torch.randn(2, 1, 4, 8), torch.randn(2, 1, 4, 8)
-    shifted = ShiftedRope(num_layers=1, rope_theta=10000.0)
-    shifted.offset = 5
-    want = apply_rope_adjacent(q, k, torch.tensor([6]), 10000.0)
-    for got, expected in zip(shifted.rope(q, k), want, strict=True):
-        assert torch.equal(got, expected)
-    for got, expected in zip(shifted.rope(q[:, 0], k[:, 0]), want, strict=True):  # token-major
-        assert torch.equal(got, expected[:, 0])
-    shifted.advance()
-    assert shifted.offset == 6  # the cache itself still advances one position a forward
+    control = HalfSplitRope(num_layers=1, rope_theta=10000.0)
+    control.offset = 5
+    angles = 5 * torch.exp(torch.arange(4) * (-math.log(10000.0) * 2 / 8))
+    cos, sin = torch.cos(angles), torch.sin(angles)
+
+    def rotate_half(x):
+        x1, x2 = x[..., :4], x[..., 4:]
+        return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+
+    for got, x in zip(control.rope(q, k), (q, k), strict=True):
+        torch.testing.assert_close(got, rotate_half(x))
+    for got, x in zip(control.rope(q[:, 0], k[:, 0]), (q, k), strict=True):  # token-major
+        torch.testing.assert_close(got, rotate_half(x)[:, 0])
+
+
+def test_negative_control_changes_the_model_output():
+    """Unlike a uniform position offset, which RoPE's relative form leaves exactly invariant."""
+    import torch
+
+    from benchmark.personaplex.controls import HalfSplitRope
+    from mstar.model.personaplex import config as cfg
+    from mstar.model.personaplex.components.temporal import DenseTemporalCache
+    from mstar.model.personaplex.weights import PersonaPlexLM
+
+    torch.manual_seed(0)
+    tiny = cfg.LMArchConfig(dim=32, num_heads=2, num_layers=2, ffn_hidden=40, depformer_dim=16, depformer_heads=2,
+                            depformer_layers=2, depformer_ffn_hidden=24)
+    temporal = PersonaPlexLM(tiny).eval().temporal
+    x = torch.randn(4, 1, tiny.dim)
+    hidden = {}
+    with torch.no_grad():
+        for name, backend in (("served", DenseTemporalCache(2, 10000.0)), ("control", HalfSplitRope(2, 10000.0))):
+            for t in range(4):
+                hidden[name], _ = temporal.forward_embeddings(x[t], backend)
+                backend.advance()
+    assert (hidden["served"] - hidden["control"]).abs().max() > 1e-2
 
 
 def test_first_reference_decision_skips_forced_choices_and_reports_both_margins():
