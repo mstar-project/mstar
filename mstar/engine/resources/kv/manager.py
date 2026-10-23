@@ -2888,20 +2888,17 @@ class KVManager(AttentionResource):
         )
 
     def can_reload(self, rid: str) -> bool:
-        """Whether the free pages plus what the prefix index could evict cover
-        the pages ``rid``'s reload needs. An upper bound: ``reload`` can still refuse."""
+        """Whether `_room` covers the pages ``rid``'s reload takes."""
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            needed = evictable = 0
-            if self._index is not None:
-                evictable = self._index.num_sole_owned()
+            needed = 0
+            evictable = () if self._index is None else self._index.evictable()
             for state in self._cpu_pool.offloaded[rid].values():
                 run = self._index.pages_for(state.keys) if self._index is not None else []
-                needed += len(state.cpu_page_indices) - len(run)
-                # the reload retains these, so it can't also evict them
-                evictable -= sum(self._arena.num_owners[page] == 1 for page in run)
-            return needed <= self._arena.num_free + evictable
+                # the reload retains these, so an evictable one takes room as a copied page does
+                needed += len(state.cpu_page_indices) - len(run) + sum(page in evictable for page in run)
+            return needed <= self._room()
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
@@ -2923,21 +2920,24 @@ class KVManager(AttentionResource):
             for run in runs.values():
                 self._arena.retain(run)
             needed = sum(len(state.cpu_page_indices) - len(runs[label]) for label, state in states.items())
-            if needed > self._arena.num_free and self._index is not None:
-                # as `_alloc` does: once the pool is all cached pages, nothing
-                # else would ever free one for this request to come back to
-                self._evict(needed - self._arena.num_free)
-            pages = self._arena.acquire(needed)
+            # retaining the runs already took their evictable pages out of the room, so the check runs
+            # even when the index holds every page
+            fits = not self._decides or needed <= self._room()
+            pages = self._grant(rid, ", ".join(states), needed, 0) if fits else None
             if pages is None:
                 for run in runs.values():
                     self._arena.release(run)
                 return False
+            allotment = self._allotments.get(rid)
             copies = PageCopies(gpu=pages, cpu=[])
             for label, state in states.items():
                 run = runs[label]
                 stream = self._ensure_label(rid, label)
                 at = len(copies.cpu)
                 stream.page_indices = run + pages[at:at + len(state.cpu_page_indices) - len(run)]
+                if allotment is not None:
+                    # the offload took them off the allotment
+                    allotment.pages += len(stream.page_indices)
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
