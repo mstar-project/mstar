@@ -284,7 +284,7 @@ class PersonaPlexModel(Model):
             value = kwargs.get(name)
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"PersonaPlex {name} must be an integer >= 1, got {value!r}")
-        if "greedy" in kwargs and not isinstance(kwargs["greedy"], bool):
+        if kwargs.get("greedy") is not None and not isinstance(kwargs["greedy"], bool):
             raise ValueError(f"PersonaPlex greedy must be a boolean, got {kwargs['greedy']!r}")
 
     def process_prompt(
@@ -297,9 +297,9 @@ class PersonaPlexModel(Model):
     ) -> NameToTensorList:
         """Validate the request and build the conditioning tensors.
 
-        Request checks run on the data worker (here and in ``load_audio``),
-        where a ValueError becomes a 400; one raised at the conductor is
-        swallowed, so the conductor-side checks are only backstops.
+        Request checks run on the data worker (here and in ``load_audio``), where
+        a ValueError becomes a 400 before any GPU work; the conductor-side checks
+        in ``get_initial_forward_pass_args`` repeat the context budget as a backstop.
         """
         if "audio" not in output_modalities or not set(output_modalities) <= {"audio", "text"}:
             raise ValueError(f"PersonaPlex outputs audio (optionally with text); got {output_modalities}")
@@ -371,18 +371,26 @@ class PersonaPlexModel(Model):
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
-        """Reference defaults ([PP] offline.py:363-374); ``greedy`` maps to temperature 0."""
+        """Reference defaults ([PP] offline.py:363-374); ``greedy`` maps to temperature 0.
+
+        An option sent as ``null`` is unset, as for the shared sampling parameters.
+        """
         del partition_fwd_args
         kw = model_kwargs or {}
-        greedy = bool(kw.get("greedy", False))
+
+        def option(name, default):
+            value = kw.get(name)
+            return default if value is None else value
+
+        greedy = bool(option("greedy", False))
         return {
             cfg.TEXT_SAMPLER: SamplingReqConfig(
-                temperature=0.0 if greedy else float(kw.get("temp_text", cfg.TEXT_TEMPERATURE)),
-                top_k=int(kw.get("topk_text", cfg.TEXT_TOP_K)), top_p=1.0,
+                temperature=0.0 if greedy else float(option("temp_text", cfg.TEXT_TEMPERATURE)),
+                top_k=int(option("topk_text", cfg.TEXT_TOP_K)), top_p=1.0,
             ),
             cfg.DEPTH_SAMPLER: SamplingReqConfig(
-                temperature=0.0 if greedy else float(kw.get("temp_audio", cfg.AUDIO_TEMPERATURE)),
-                top_k=int(kw.get("topk_audio", cfg.AUDIO_TOP_K)), top_p=1.0,
+                temperature=0.0 if greedy else float(option("temp_audio", cfg.AUDIO_TEMPERATURE)),
+                top_k=int(option("topk_audio", cfg.AUDIO_TOP_K)), top_p=1.0,
             ),
         }
 

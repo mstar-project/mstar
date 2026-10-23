@@ -702,6 +702,15 @@ def test_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
     assert greedy[cfg.TEXT_SAMPLER].temperature == 0.0 and greedy[cfg.DEPTH_SAMPLER].temperature == 0.0
 
 
+@pytest.mark.parametrize("name", ["temp_text", "temp_audio", "topk_text", "topk_audio", "greedy"])
+def test_null_sampling_options_mean_unset(tmp_path, name):
+    model = _model(tmp_path)
+    _request(model, **{name: None})  # validation accepts null
+    configs = model.get_request_resource_configs({}, {name: None})
+    text, depth = configs[cfg.TEXT_SAMPLER], configs[cfg.DEPTH_SAMPLER]
+    assert (text.temperature, text.top_k, depth.temperature, depth.top_k) == (0.7, 25, 0.8, 250)
+
+
 def test_postprocess_text_pieces_and_pcm16():
     model = _model()
     assert model.postprocess(torch.tensor([42]), "text") == b" w42"
