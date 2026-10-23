@@ -844,3 +844,50 @@ def test_cli_and_benchmark_entries_are_registered():
     assert isinstance(benchmark_model, PersonaPlex) and benchmark_model.get_hf_url() == "nvidia/personaplex-7b-v1"
     assert benchmark_model.get_supported_modalities() == {RequestType.A2S}
     assert 'voice="NATF2"' in _next_steps("personaplex", "0.0.0.0", 8000)
+
+
+# --------------------------------------------------------------------------- KV pool sizing
+
+
+def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(caplog):
+    import yaml
+
+    with open(CONFIG_PATH) as f:
+        deployment = yaml.safe_load(f)
+    model = _model()
+    assert deployment["max_concurrent_requests"] == 5
+    assert deployment["resources"]["lm_kv"] == {"page_size": 128, "max_num_pages": 128}
+    model.validate_config_yaml(deployment, CONFIG_PATH)  # 1 sink + 5 x 24 = 121 <= 128
+    with pytest.raises(ValueError, match=r"6 concurrent requests .* need 145 pages of resources\.lm_kv, which has 128"):
+        model.validate_config_yaml({**deployment, "max_concurrent_requests": 6}, CONFIG_PATH)
+    model.validate_config_yaml({k: v for k, v in deployment.items() if k != "max_concurrent_requests"}, CONFIG_PATH)
+    assert "sets no max_concurrent_requests" in caplog.text
+
+
+def test_kv_fit_counts_full_length_requests_and_the_sink_page():
+    model = _model()
+    assert model._request_kv_pages(128) == 24 and model._request_kv_pages(64) == 47
+    assert model._request_kv_pages(2999) == 1 and model._request_kv_pages(1) == 2999
+    fits = {"max_concurrent_requests": 2, "resources": {"lm_kv": {"page_size": 64, "max_num_pages": 95}}}
+    model.validate_config_yaml(fits, "x.yaml")
+    fits["resources"]["lm_kv"]["max_num_pages"] = 94
+    with pytest.raises(ValueError, match="need 95 pages"):
+        model.validate_config_yaml(fits, "x.yaml")
+    # without a resources override the declared default pool is checked
+    model.validate_config_yaml({"max_concurrent_requests": 5}, "x.yaml")
+    with pytest.raises(ValueError, match="which has 128"):
+        model.validate_config_yaml({"max_concurrent_requests": 6}, "x.yaml")
+
+
+def test_yaml_kv_pool_reaches_the_resource_spec():
+    import yaml
+
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    with open(CONFIG_PATH) as f:
+        deployment = yaml.safe_load(f)
+    deployment["resources"]["lm_kv"]["max_num_pages"] = 64  # the YAML value, not the default, must land
+    specs = _model().get_node_resources()
+    apply_yaml_overrides(specs, deployment)
+    kv = next(s for s in specs if s.resource_key == cfg.LM_KV).config
+    assert (kv.page_size, kv.max_num_pages) == (128, 64)

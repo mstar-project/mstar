@@ -5,6 +5,18 @@ model: "personaplex"
 # attention for at most 2999 forwards, so requests beyond that are rejected.
 max_seq_len: 2999
 
+# A full-length request holds ceil(2999 / 128) = 24 KV pages, so 5 of them and
+# the pool's reserved sink page take 121 of the 128 pages below (checked at
+# startup). Requests over the cap wait in the conductor rather than failing.
+max_concurrent_requests: 5
+
+resources:
+  lm_kv:
+    # 32 layers x 32 heads x 128 dims x K+V x bf16 = 512 KiB per token, so
+    # 128 pages x 128 tokens = 8 GiB of KV next to the ~17 GB of weights.
+    page_size: 128
+    max_num_pages: 128
+
 model_kwargs:
   # Directory of extracted .pt voice presets. null fetches the gated repo's
   # voices.tgz into the Hugging Face cache and extracts it beside the archive,

@@ -56,6 +56,8 @@ LM_LOOP_BACKS = {
     cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_frame"),
 }
 SAMPLING_KWARGS = ("temp_text", "temp_audio", "topk_text", "topk_audio", "greedy")
+# 128 pages x 128 tokens x 512 KiB a token (32 layers x 32 heads x 128 dims, K+V, bf16) = 8 GiB
+DEFAULT_KV_PAGES = 128
 
 
 class PersonaPlexModel(Model):
@@ -87,15 +89,17 @@ class PersonaPlexModel(Model):
         """Paged temporal KV, RoPE and the two samplers, all on the LM node.
 
         The depformer's 16-step KV is frame-local scratch inside the LM
-        submodule, not a resource (worklog §4.4; Qwen3-TTS precedent).
+        submodule, not a resource: the reference rebuilds it every frame
+        ([PP] models/lm.py:1142), as Qwen3-TTS's code predictor does. Pool size
+        is a deployment choice (``resources.lm_kv`` in the YAML); the default
+        here only keeps a YAML without one off the generic 2048-page pool,
+        which at this KV geometry would not fit a 96 GB GPU.
         """
         c = self.lm_config
         kv = PagedKVConfig(
             num_layers=c.num_layers, num_kv_heads=c.num_heads, head_dim=c.head_dim,
             max_seq_len=cfg.MAX_TEMPORAL_FORWARDS, num_qo_heads=c.num_heads,
-            # 128 pages are 8 GiB at the checkpoint's bf16 KV geometry; the
-            # generic 2048-page default exceeds a GH200's usable VRAM.
-            max_num_pages=128,
+            max_num_pages=DEFAULT_KV_PAGES,
         )
         lm = {cfg.LM_NODE}
         return [
@@ -111,6 +115,37 @@ class PersonaPlexModel(Model):
                         enable_repetion_penalty=False),
             SamplerSpec(resource_key=cfg.DEPTH_SAMPLER, nodes=lm, vocab_size=c.card, enable_repetion_penalty=False),
         ]
+
+    def _request_kv_pages(self, page_size: int) -> int:
+        """Pages one request can hold: one KV entry per temporal forward, at most
+        ``MAX_TEMPORAL_FORWARDS`` (async scheduling is off, so no overshoot step)."""
+        return -(-cfg.MAX_TEMPORAL_FORWARDS // page_size)
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a request cap the temporal KV pool cannot hold.
+
+        Nothing preempts a request once the pool is full, so
+        ``max_concurrent_requests`` full-length requests must fit next to the
+        pool's reserved sink page; requests over the cap wait in the conductor.
+        """
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: long concurrent requests can fill "
+                "the PersonaPlex temporal KV pool and stall", config_path,
+            )
+            return
+        kv = next(s for s in self.get_node_resources() if s.resource_key == cfg.LM_KV).config
+        overrides = (config.get("resources") or {}).get(cfg.LM_KV) or {}
+        page_size = int(overrides.get("page_size", kv.page_size))
+        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
+        need = 1 + int(cap) * self._request_kv_pages(page_size)
+        if need > max_num_pages:
+            raise ValueError(
+                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) of up to "
+                f"{cfg.MAX_TEMPORAL_FORWARDS} forwards need {need} pages of resources.{cfg.LM_KV}, "
+                f"which has {max_num_pages}; raise max_num_pages or lower max_concurrent_requests"
+            )
 
     def _lm_node(self, walk: str) -> GraphNode:
         inputs = {
