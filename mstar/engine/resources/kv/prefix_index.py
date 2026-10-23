@@ -160,7 +160,7 @@ class PrefixIndex:
         for name in ("_by_key", "_key", "_parent", "_children", "_stamp", "_leaves", "_evictable"):
             setattr(index, name, copy.copy(getattr(self, name)))
         index._arena = _Owners(self._arena.num_owners)
-        freed = index.evict(len(self._evictable))
+        freed = len(index.evict(len(self._evictable)))
         assert freed == len(self._evictable), (
             f"eviction reaches {freed} of the {len(self._evictable)} pages the evictable set counts"
         )
