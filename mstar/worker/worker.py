@@ -900,6 +900,7 @@ class Worker:
             self._process_unprocessed(body.request_id)
             return
         self._keep_ids(request_id, body.request_info.resource_configs)
+        self._guarantee(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
@@ -1088,6 +1089,18 @@ class Worker:
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
             if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
                 kept[request_id] = KeptIds(ids, array("i"))
+
+    def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        """Where a node lays out KV for the request and keeps no ids to rebuild it, no drop can free the
+        request's pages, so the request is guaranteed in every paged KV cache of that node."""
+        for node_name, keys in self._kv_keys.items():
+            if request_id in self._kept_ids.get(node_name, ()):
+                continue
+            node_configs = [config for key in keys if isinstance(config := configs.get(key), KVReqConfig)]
+            layouts = [layout for config in node_configs for layout in (config.kv_layout or {}).values()]
+            if any(layout.spans or layout.growth for layout in layouts):
+                for config in node_configs:
+                    config.guaranteed = True
 
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
