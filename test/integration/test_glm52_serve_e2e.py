@@ -284,7 +284,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert cfg.quantization_config is not None
 
     prompt_tensors = model.process_prompt("hello glm", ["text"], ["text"])
-    prompt_ids = prompt_tensors["text_inputs"][0].to(DEVICE)
+    prompt_ids = prompt_tensors.new_input_tensors["text_inputs"][0].to(DEVICE)
     assert prompt_ids.tolist() == list("hello glm".encode("utf-8"))
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
@@ -326,7 +326,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     _write_checkpoint(tmp_path, seed=1)
     model = _load_model(tmp_path)
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
-    prompt_ids = model.process_prompt("serve", ["text"], ["text"])["text_inputs"][0].to(DEVICE)
+    prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
         _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)[0]

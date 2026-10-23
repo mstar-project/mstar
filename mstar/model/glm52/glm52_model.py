@@ -26,7 +26,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -215,6 +215,9 @@ class Glm52Model(Model):
             ))
         return specs
 
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_RESOURCE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
@@ -344,7 +347,7 @@ class Glm52Model(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
         if self._tokenizer_mode == "byte":
@@ -363,7 +366,11 @@ class Glm52Model(Model):
                 f"prompt is {input_ids.numel()} tokens; GLM-5.2 is served with "
                 f"at most {self.config.max_prompt_tokens}"
             )
-        return {"text_inputs": [input_ids.to(torch.long)]}
+        n = input_ids.numel()
+        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),))
+        return ProcessPromptOutput(
+            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
+        )
 
     def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
         """The chat's turns, each in its own role, through the checkpoint's template, which
@@ -417,15 +424,15 @@ class Glm52Model(Model):
         guard; every longer prompt stops sooner, via check_stop or the guard."""
         return self.context_limit() - 1
 
-    def get_max_output_tokens_limit(self) -> int:
-        """A one-token prompt emits at most ``context_limit`` tokens (the last is never
-        stored), so the conductor refuses a larger ``max_output_tokens`` with a 400."""
-        return self.context_limit()
-
     def get_max_output_tokens(self, **model_kwargs):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else budget
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer: the
+        # whole window is max_iters, and the conductor refuses a cap past it
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

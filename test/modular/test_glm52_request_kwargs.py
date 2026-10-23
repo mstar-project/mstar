@@ -18,11 +18,19 @@ def _intake(model: Glm52Model, kwargs: dict) -> int:
     """The conductor's checks of a new request's kwargs, before it is dispatched; there a
     ValueError is the client's 400 (``Conductor._admit_request``)."""
     conductor = Conductor.__new__(Conductor)
-    conductor.model = model
+    conductor.model, conductor.model_config = model, {}
+    conductor._kv_labels = {key: tuple(labels) for key, labels in model.kv_labels().items()}
+    conductor._loop_max_iters = {
+        name: loop.max_iters for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    # in the order _admit_request runs them
+    max_output_tokens = conductor._max_output_tokens(kwargs)
+    conductor._loop_caps(kwargs)
     specs = conductor._resource_specs()
     for key, cfg in conductor._get_resource_configs(kwargs, {}).items():
         cfg.validate(specs.get(key))
-    return conductor._max_output_tokens(kwargs)
+    return max_output_tokens
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -35,7 +43,8 @@ def test_a_null_kwarg_is_unset(kwargs):
     default = m.get_request_resource_configs({}, {})[SAMPLER_RESOURCE]
     assert sampling == default
     assert _intake(m, kwargs) == _intake(m, {}) == m.get_max_output_tokens()
-    assert m.process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].tolist() == [72, 105]
+    out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -74,7 +83,7 @@ def test_min_p_is_refused_at_intake():
 def test_max_tokens_past_the_window_is_refused_at_intake():
     m = _model()
     assert _intake(m, {"max_output_tokens": 2048}) == 2048
-    with pytest.raises(ValueError, match="at most 2048"):
+    with pytest.raises(ValueError, match="runs at most 2047"):
         _intake(m, {"max_output_tokens": 2049})
 
 

@@ -447,15 +447,15 @@ def test_glm52_process_prompt_byte_mode_never_touches_tokenizer():
     m.config = Glm52ModelConfig.reduced()  # vocab 256
     m._tokenizer_mode = "byte"
     m._tokenizer = None
-    out = m.process_prompt("Hi", ["text"], ["text"])
+    out = m.process_prompt("Hi", ["text"], ["text"]).new_input_tensors
     assert set(out) == {"text_inputs"}
     (ids,) = out["text_inputs"]
     assert ids.dtype == torch.long and ids.tolist() == [72, 105]
     # bytes past the vocabulary clip to the last id; an empty prompt is one
     # pad-ish token, not an empty prefill
     m.config.vocab_size = 100
-    assert m.process_prompt("z", ["text"], ["text"])["text_inputs"][0].tolist() == [99]
-    assert m.process_prompt("", ["text"], ["text"])["text_inputs"][0].tolist() == [0]
+    assert m.process_prompt("z", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [99]
+    assert m.process_prompt("", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [0]
     assert m.process_prompt(None, ["text"], ["text"]) == {}
     assert m._tokenizer is None  # no lazy HF download triggered
 
@@ -494,7 +494,7 @@ def test_glm52_process_prompt_renders_each_turn_in_its_role():
              PromptPart("text", "Blue.", role="assistant"), PromptPart("text", "Another.", role="user")]
     out = _chat_model(tok).process_prompt(
         "Be brief.\nA color?\nBlue.\nAnother.", ["text"] * 4, ["text"], prompt_parts=parts)
-    assert out["text_inputs"][0].tolist() == [1, 2, 3]
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [1, 2, 3]
     assert tok.messages == [
         {"role": "system", "content": "Be brief."}, {"role": "user", "content": "A color?"},
         {"role": "assistant", "content": "Blue."}, {"role": "user", "content": "Another."},

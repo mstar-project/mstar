@@ -254,8 +254,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
         """Cap the request's max_tokens at what fits before the context
         limit, so decode stops there (check_stop) instead of tripping
-        preprocess's guard mid-batch. ``room`` is the prompt-aware count,
-        known only once the prefill rows are declared."""
+        preprocess's guard mid-batch. The conductor holds prompt plus
+        max_tokens to the KV pool's ``max_seq_len`` from the request's
+        layout; this holds them to GLM-5.2's own limit, one row short for
+        the step that may be in flight when the stop lands."""
         info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
         asked = getattr(info, "max_tokens", None)
         if asked is None:
