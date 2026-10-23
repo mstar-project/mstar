@@ -300,3 +300,39 @@ def test_qwen3_5_state_dtype_follows_checkpoint(ckpt, k, v, want):
     model = SimpleNamespace(config=SimpleNamespace(
         mamba_ssm_dtype=ckpt, linear_key_head_dim=k, linear_value_head_dim=v))
     assert Qwen3_5DenseModel._gdn_state_dtype(model) is want
+
+
+def test_reused_addressing_matches_a_fresh_build():
+    """A step addressed like the last one reuses that addressing; every change
+    to a slot or its state in between must make it rebuild."""
+    pool = build_pool()
+
+    def check(rids, step=None):
+        step = step or decode_step(rids)
+        got = pool.plan(step, ctx(rids))["main"]
+        indices, has = list(got.host_slot_indices), list(got.host_has_state)
+        pool._addressing_memo.clear()
+        fresh = pool.plan(step, ctx(rids))["main"]
+        assert (indices, has) == (fresh.host_slot_indices, fresh.host_has_state)
+        return indices, has
+
+    for rid in "abc":
+        pool.ingest_request(rid)
+    rids = ["a", "b", "c"]
+    pool.admit(decode_step(rids), ctx(rids))
+    check(rids)
+    assert check(rids)[1] == [False, False, False]
+    pool.commit(decode_step(rids), ctx(rids))  # state now held
+    assert check(rids)[1] == [True, True, True]
+    pool.reset_request("b")  # keeps the slot, drops the state
+    assert check(rids)[1] == [True, False, True]
+    first = check(rids)[0]
+    pool.remove_request("a")  # slot freed
+    pool.ingest_request("d")
+    rids = ["d", "b", "c"]
+    pool.admit(decode_step(rids), ctx(rids))  # d takes a slot
+    indices, _ = check(rids)
+    assert indices[1:] == first[1:]
+    # a zero-span row addresses the sink
+    zero = RecurrentStep(segments=(Segment("d", "main", 0), Segment("b", "main", 1), Segment("c", "main", 1)))
+    assert check(rids, zero)[0][0] == pool.pad_index
