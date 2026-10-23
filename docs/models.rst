@@ -60,7 +60,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
-   * - ``personaplex`` *(Unvalidated)*
+   * - ``personaplex`` *(Beta)*
      - ``nvidia/personaplex-7b-v1`` (gated)
      - Full-duplex speech LM (Moshi architecture), served as an offline replay of a
        preloaded user WAV: temporal transformer + depformer + Mimi codec.
@@ -1173,8 +1173,8 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
 
 
-PersonaPlex (``personaplex``) *(Unvalidated)*
-----------------------------------------------
+PersonaPlex (``personaplex``) *(Beta)*
+---------------------------------------
 
 NVIDIA PersonaPlex-7B is a frame-synchronous, full-duplex speech model. M*
 serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
@@ -1213,42 +1213,33 @@ or after at most that much decoding, before the exact budget below is checked.
 Limits: voice embeddings + 12 silence frames + persona tokens + user frames must
 not exceed **2999** temporal forwards, so user audio is capped at
 (2999 − conditioning frames) × 80 ms, just under 4 minutes. NVIDIA's 3000-slot
-ring KV equals dense causal attention only up to that point. Output audio is trimmed to the input's sample count and lags it
-by one frame, as in NVIDIA's ``offline.py``. Text frames that are padding or
-special tokens produce empty chunks.
+ring KV equals dense causal attention only up to that point. Output audio is
+trimmed to the input's sample count and lags it by one frame, as in NVIDIA's
+``offline.py``. Text frames that are padding or special tokens produce empty
+chunks.
 
-Validation status:
+Status, checked with the released checkpoint against NVIDIA's reference
+implementation on GH200 and H100 GPUs:
 
-.. list-table::
-   :header-rows: 1
-
-   * - Check
-     - Status
-   * - Delayed token cache vs NVIDIA ``LMGen`` integer trace (CPU)
-     - Recorded passing with externally generated reference fixtures
-   * - Temporal transformer + depformer vs NVIDIA ``LMGen``, tiny random fp32 weights, greedy (CPU)
-     - Recorded passing with externally generated reference fixtures; not real-checkpoint parity
-   * - Mimi (HF submodules + ring-faithful mask) vs NVIDIA streaming Mimi, tiny random weights (CPU)
-     - Recorded passing with externally generated reference fixtures; not real-checkpoint parity
-   * - Graph walks, accumulated outputs and request validation (CPU, dummy mode)
-     - Ordering, persistence and final loop-output ownership pass targeted regressions;
-       bounded Python/Rust GPU worker cleanup checks also passed
-   * - Offline numerical component replay (CPU, tiny random weights)
-     - Recorded passing after substituting NVIDIA user codes at an encoder quantizer near-tie;
-       uninterrupted M* encoder-to-output parity is not established
-   * - Real checkpoint loading and eager single-GPU serving
-     - Exercised on GH200 with audio-only and audio-plus-text requests;
-       output format and duration checked
-   * - Real-checkpoint numerical comparisons and bounded request lifecycle checks
-     - Dense real-checkpoint control closely matches the reference; production paged
-       attention changes the greedy audio trajectory. Repeated, concurrent and
-       cancelled requests passed bounded checks. Sustained memory stability,
-       performance and audio quality remain unestablished
+- With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
+  audio to within 5e-7. The served path uses FlashInfer paged attention, whose
+  different rounding flips near-tied token choices (the first observed flip had
+  a logit margin of 0.0625, one bfloat16 step), so a long greedy trajectory
+  departs from NVIDIA's after some frames. Outputs are therefore not
+  bit-identical to the reference.
+- Cancellation, recovery and malformed inputs (rejected with 400) are checked
+  on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
+  GPU memory flat.
+- The model runs eagerly (no CUDA graphs) at batch size 1. On one H100 a single
+  request is processed slightly faster than real time; concurrent requests
+  queue rather than batch.
+- Audio quality has not been assessed (no listening or transcription-based
+  evaluation).
 
 Reference fixtures are generated outside Git by
 ``test/personaplex/reference_oracle.py`` (see
 ``test/modular/fixtures/personaplex/README.rst``). Their tests skip when fixtures
-are unavailable. The current path runs eagerly without CUDA graphs; an 80 ms
-audio frame is model timing, not an achieved processing-latency claim.
+are unavailable. The 80 ms frame is model timing, not an achieved
+processing latency.
 ``test/personaplex/`` has a launch script and a request client for trying a
 server by hand (``launch_server.sh``, ``request.py --audio user.wav``).
