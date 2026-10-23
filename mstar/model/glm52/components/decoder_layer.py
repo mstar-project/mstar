@@ -40,7 +40,6 @@ class Glm52DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         rows: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -50,12 +49,10 @@ class Glm52DecoderLayer(nn.Module):
         the previous layer's pair (``residual`` None: ``hidden_states`` is the embedding).
         """
         if self.fused_add_rmsnorm:
-            return self._forward_fused(
-                hidden_states, residual, position_ids, rope_cos_sin, rows)
+            return self._forward_fused(hidden_states, residual, position_ids, rows)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, position_ids, rope_cos_sin=rope_cos_sin)
+        hidden_states = self.self_attn(hidden_states, position_ids)
         hidden_states = residual + hidden_states
         if rows is not None:
             hidden_states = hidden_states.index_select(0, rows)
@@ -78,15 +75,14 @@ class Glm52DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
-    def _forward_fused(self, hidden_states, residual, position_ids, rope_cos_sin, rows):
+    def _forward_fused(self, hidden_states, residual, position_ids, rows):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm.forward_residual(
                 hidden_states, residual, self.comm_group)
-        hidden_states = self.self_attn(
-            hidden_states, position_ids, rope_cos_sin=rope_cos_sin)
+        hidden_states = self.self_attn(hidden_states, position_ids)
         if rows is None:
             hidden_states, residual = self.post_attention_layernorm.forward_residual(
                 hidden_states, residual, self.comm_group)
