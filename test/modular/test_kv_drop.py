@@ -103,10 +103,10 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host"])
+@pytest.mark.parametrize("refusal", ["step", "read", "ranks", "host"])
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
-    _prefill(kv, "r", PAGE_SIZE, kind=refusal if refusal in ("digest", "rows") else "ids")
+    _prefill(kv, "r", PAGE_SIZE)
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
     kv._world_size = 2 if refusal == "ranks" else kv._world_size
@@ -156,6 +156,7 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     rope.ingest_request("r")
     _prefill(kv, "r", PAGE_SIZE)
     _prefill(cross, "r", PAGE_SIZE, kind="rows")
+    cross._overrides["r"].guaranteed = True
     rope._counters["r"]["main"] = PAGE_SIZE
 
     with pytest.raises(RuntimeError):

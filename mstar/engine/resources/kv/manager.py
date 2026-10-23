@@ -2615,9 +2615,8 @@ class KVManager(AttentionResource):
         with self._lock:
             if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
                 return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
-            layouts = (self._overrides[rid].kv_layout or {}).values()
-            if any(span.kind != "ids" for layout in layouts for span in layout.spans):
-                return f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids"
+            if self._overrides[rid].guaranteed:
+                return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
         return None
 
     def drop(self, rid: str) -> int:
@@ -3265,6 +3264,8 @@ class KVManager(AttentionResource):
                         for page in (*stream.page_indices, *(stream.lease or ()))
                     ]
                     assert not held, f"{rid} was dropped and still holds pages {held}"
+            for rid in self._victims:
+                assert not self._overrides[rid].guaranteed, f"{rid} is guaranteed and was chosen as a victim"
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
