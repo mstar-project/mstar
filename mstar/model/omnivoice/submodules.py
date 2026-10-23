@@ -28,6 +28,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.omnivoice.components.backbone import (
     CanvasItem,
@@ -168,6 +169,9 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
     ]
 
+    # the codec's reference tokens extend the prompt's ids, so both are long
+    input_specs = {"prefix_ids": TensorSpec(torch.long), "ref_audio_tokens": TensorSpec(torch.long)}
+
     def __init__(self, backbone: OmniVoiceBackbone, config: OmniVoiceConfig):
         super().__init__()
         self.backbone = backbone
@@ -194,7 +198,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         # the prefix back and forth.
         ref_tokens = inputs.get("ref_audio_tokens")
         if ref_tokens:
-            ref = ref_tokens[0].to(device=device, dtype=prefix_ids.dtype)
+            ref = ref_tokens[0].to(device)
             prefix_ids = torch.cat([prefix_ids, ref], dim=-1)
             prefix_audio_mask = torch.cat(
                 [

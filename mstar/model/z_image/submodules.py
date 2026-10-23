@@ -24,6 +24,7 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
+from mstar.engine.input_spec import TensorSpec
 from mstar.model.components.diffusion.compile_utils import (
     compile_transformer_forward,
     step_schedule_recompile_limit,
@@ -238,6 +239,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
     """fp32 latent ``[16, H/8, W/8]`` -> ``z / scaling + shift`` in the VAE dtype -> decode -> uint8."""
 
     disable_torch_compile = True
+    input_specs = {LATENTS: TensorSpec("param")}
 
     def __init__(
         self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False,
@@ -268,7 +270,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
         return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs])}
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
-        latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
+        latents = latents.to(self.get_device())
         return pixels_to_uint8(self._vae_decode(self.vae.unscale_latents(latents)))
 
     def forward(self, graph_walk, engine_inputs, latents: torch.Tensor, **kwargs):

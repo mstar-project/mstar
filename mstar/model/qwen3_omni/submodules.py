@@ -30,6 +30,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -1237,6 +1238,10 @@ TTS_EOS_FED = "tts_eos_fed"
 
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
+    input_specs = {
+        "thinker_states": TensorSpec("param"),
+        "talker_input_embeds": TensorSpec("param"),
+    }
 
     def __init__(
         self,
@@ -1298,8 +1303,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     @property
     def _compute_dtype(self) -> torch.dtype:
         """The dtype the Talker runs in (the node's param dtype; an embedding
-        table's, which no quant pass touches). Without autocast its inputs are
-        put in it: the Thinker's states arrive in the Thinker node's dtype."""
+        table's, which no quant pass touches). Its routed inputs arrive in it,
+        per ``input_specs``."""
         return self.talker_code_emb.weight.dtype
 
     def _get_suppress_mask(self) -> torch.Tensor:
@@ -1397,7 +1402,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         if graph_walk == "talker_prefill":
             # The Thinker's walk, or one chunk of it when its prefill is chunked
-            selected_hidden = inputs["thinker_states"][0].to(device, self._compute_dtype)
+            selected_hidden = inputs["thinker_states"][0].to(device)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
                 selected_hidden=selected_hidden,
@@ -1409,7 +1414,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             rid = fwd_info.rid_handle
             # Last-prefill is the assistant's first token, which is
             # text-only — Thinker postprocess pre-selected layer-0 for it.
-            last_hidden = inputs["thinker_states"][0].to(device, self._compute_dtype)
+            last_hidden = inputs["thinker_states"][0].to(device)
 
             input_embeds = self._get_last_prefill_codec_hidden(
                 fwd_info.step_metadata.get("voice", "Ethan")
@@ -1493,11 +1498,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         extra_args = {}
         if graph_walk == "talker_decode":
-            dtype = self._compute_dtype
-            input_embeds = input_embeds.to(dtype)
             extra_args["text_raw"] = torch.cat(
                 [inp.tensor_inputs["text_raw"] for inp in inputs], dim=0,
-            ).to(dtype)
+            )
         if graph_walk == "talker_last_prefill":
             extra_args["last_token_indices"] = (
                 torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1

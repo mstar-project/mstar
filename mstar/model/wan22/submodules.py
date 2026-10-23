@@ -29,6 +29,7 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
+from mstar.engine.input_spec import TensorSpec
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
@@ -536,6 +537,7 @@ class Wan22VaeDecoderSubmodule(NodeSubmodule):
         # ``vae`` is never None here: dummy mode returns from
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
+        self.input_specs = {"latents": TensorSpec(self._decode_dtype())}
         self._fast = None
         self._fast_sizes = config.fast_decode_sizes()
         if config.vae_decode_fast:
@@ -630,7 +632,7 @@ class Wan22VaeDecoderSubmodule(NodeSubmodule):
             if next(vae.parameters()).dtype != vae_dtype:
                 vae = vae.to(vae_dtype)
             device = self.get_device()
-            latents = latents.to(device=device, dtype=vae_dtype)
+            latents = latents.to(device)
             mean, inv_std = latent_affine(vae, latents.dtype, latents.device)
             latents = latents / inv_std + mean
 
