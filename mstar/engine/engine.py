@@ -27,6 +27,7 @@ from mstar.engine.accelerator_graph_runner import (
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
+from mstar.engine.input_spec import ResolvedSpec, apply_input_specs, resolve_input_specs
 from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -143,6 +144,16 @@ def _outside_steps(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+def _row_inputs(
+    node_name: str, tensors: Mapping[int, NameToTensorList], rid: int,
+    specs: Mapping[str, ResolvedSpec],
+) -> NameToTensorList:
+    """A row's routed tensors as its node's ``input_specs`` take them; every
+    ``prepare_inputs`` call, whole or chunked, reads them through here."""
+    inputs = tensors.get(rid, {})
+    return apply_input_specs(node_name, inputs, specs) if specs else inputs
+
+
 def _common_dtype(dtypes: Iterable[torch.dtype | None]) -> torch.dtype | None:
     """The one param dtype a resource's nodes were cast to, or None if they differ or
     one keeps the dtype it was built in (``NodePrecision.param_dtype`` None)."""
@@ -193,6 +204,8 @@ class SubmoduleManagement:
     resources: dict[str, Resource]
     # param dtype, fp32 modules and autocast; resolved once at load
     precision: NodePrecision = field(default_factory=lambda: NodePrecision(None))
+    # the node's input_specs against its precision; applied per row before prepare_inputs
+    input_specs: Mapping[str, ResolvedSpec] = field(default_factory=dict)
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -719,6 +732,9 @@ class Engine:
                 resources=resources,
                 precision=precisions[node_name],
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                input_specs=resolve_input_specs(
+                    node_name, submodule.input_specs, precisions[node_name],
+                ),
             )
             submodule.bind_node_resources(resources)
             self._submodules[node_name].lora_pools = tuple(
@@ -1216,6 +1232,7 @@ class Engine:
         resources = mgmt.resources
         wrapped = batch.per_request_info_wrapped
         tensors = batch.per_request_input_tensors
+        specs = mgmt.input_specs
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
@@ -1262,7 +1279,7 @@ class Engine:
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
-                    inputs=tensors.get(rid, {}),
+                    inputs=_row_inputs(batch.node_name, tensors, rid, specs),
                     resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the
@@ -1356,7 +1373,10 @@ class Engine:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
                 fwd_info=batch.per_request_info_wrapped[rid],
-                inputs=batch.per_request_input_tensors.get(rid, {}),
+                inputs=_row_inputs(
+                    batch.node_name, batch.per_request_input_tensors, rid,
+                    self._submodules[batch.node_name].input_specs,
+                ),
                 resources=self._submodules[batch.node_name].resources,
                 is_final_stream_chunk=rid in batch.final_stream_rids,
                 input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
