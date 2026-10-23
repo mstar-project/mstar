@@ -127,7 +127,38 @@ def test_arena_lifecycle_cannot_pass_without_precleanup_decoder_observations():
     ]
     verify_ownership_observations(rows, completed=1)
     rows[0]["time"] = 12
-    with pytest.raises(AssertionError, match="followed hard cleanup"):
+    with pytest.raises(AssertionError, match="has no later hard cleanup"):
+        verify_ownership_observations(rows, completed=1)
+
+
+def _ownership(event, rid, time, dims=(), entity="worker_0", name=None):
+    return {"event": event, "rid": rid, "time": time, "entity": entity,
+            "tensors": [{"name": name, "dims": list(d)} for d in dims]}
+
+
+def test_ownership_gate_pairs_recycled_handles_with_their_own_cleanup():
+    # Handle 0 serves three requests in turn; the API process logs request UUIDs.
+    rows = [
+        _ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 16), (26,)]),
+        _ownership("before_hard_cleanup", 0, 11),
+        _ownership("before_hard_cleanup", "9f1c-uuid", 11.5, entity="api_server_preprocess_worker"),
+        _ownership("before_hard_cleanup", 0, 20),  # a cancelled request: no decoder observation
+        _ownership("after_decoder_inputs_consumed", 0, 30, [(1, 8, 16), (1,)]),
+        _ownership("before_hard_cleanup", 0, 31),
+    ]
+    verify_ownership_observations(rows, completed=2)
+    reused = rows[:1] + [_ownership("after_decoder_inputs_consumed", 0, 10.5)] + rows[1:2]
+    with pytest.raises(AssertionError, match="observed twice without a hard cleanup"):
+        verify_ownership_observations(reused, completed=2)
+
+
+def test_ownership_gate_recognises_unnamed_agent_frames_by_shape():
+    rows = [_ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 16), (1, 8, 1)]),
+            _ownership("before_hard_cleanup", 0, 11)]
+    with pytest.raises(AssertionError, match="still hold agent frames"):
+        verify_ownership_observations(rows, completed=1)
+    rows[0]["tensors"] = [{"name": "agent_frame", "dims": None}]
+    with pytest.raises(AssertionError, match="still hold agent frames"):
         verify_ownership_observations(rows, completed=1)
 
 
