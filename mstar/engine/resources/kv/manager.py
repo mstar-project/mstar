@@ -344,11 +344,12 @@ class HostCopy:
     the index under ``keys`` only once ``event`` completes. Until then the record
     holds a reference on ``pages`` and ``host_pages``.
     """
-    event: torch.cuda.Event
+    event: torch.cuda.Event | None
     pages: list[int]
     keys: list[bytes]
     parent: bytes | None
     host_pages: list[int]
+    rid: str
     stream: CacheStream
     landed: bool = False
 
@@ -531,8 +532,8 @@ class KVManager(AttentionResource):
             needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
-        # A copy is added only once its event is recorded, since an event that
-        # was never recorded reads as done.
+        # A copy is listed with `event` None until it is queued, since an event
+        # that was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
         self._arriving: dict[bytes, HostCopy] = {}
         if cfg.cpu_offload_pages > 0:
@@ -1381,10 +1382,10 @@ class KVManager(AttentionResource):
         if lease is not None:
             self._release(rid, stream, lease, refund)
 
-    def _release_hold(self, stream: CacheStream) -> None:
-        if stream.hold is not None:
-            self._arena.release(stream.hold)
-        stream.hold = None
+    def _release_hold(self, rid: str, stream: CacheStream) -> None:
+        hold, stream.hold = stream.hold, None
+        if hold is not None:
+            self._release(rid, stream, hold)
 
     def fingerprint(self) -> bytes:
         return fingerprint(
@@ -1564,9 +1565,9 @@ class KVManager(AttentionResource):
         copy those pages back so its probe finds them. Returns the label whose
         stream waits on the copy.
 
-        Pages come only from the free list, since ``rid`` isn't admitted yet and
-        evicting for it could drop pages a running request hits next. The walk
-        computes whatever isn't copied.
+        Pages come only from the free list, since evicting cached pages for a copy
+        could drop pages a running request hits next. The walk computes whatever
+        isn't copied.
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
@@ -1615,22 +1616,28 @@ class KVManager(AttentionResource):
                 stream.host_copy = self._arriving[rooted[at]]
                 stream.read_pending = True
                 return label
-            host = self._cpu_pool.retain_run(rooted[at:min(cap, at + self._arena.num_free)])
+            budget = self._arena.num_free
+            if self._decides:
+                # the copy and the run's evictable pages come out of the allowance
+                evictable = self._index.evictable()
+                budget = min(budget, self._allowance(rid) - sum(page in evictable for page in run))
+            host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
                 return None
             fresh = self._arena.acquire(len(host))
-            self._arena.retain(run)
-            stream.hold = run + fresh
+            stream.hold = self._retain_cached(rid, stream, run) + fresh
             stream.read_pending = True
-        self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
-        event = self._cpu_pool.record()
-        with self._lock:
+            # listed before the lock drops, so `assert_pages_conserved` on another thread finds a record
+            # for every page the copy holds
             copy = HostCopy(
-                event=event, pages=fresh, keys=rooted[at:at + len(fresh)],
-                parent=rooted[at - 1] if at else None, host_pages=host, stream=stream,
+                event=None, pages=fresh, keys=rooted[at:at + len(fresh)],
+                parent=rooted[at - 1] if at else None, host_pages=host, rid=rid, stream=stream,
             )
             self._add_host_copy(copy)
             stream.host_copy = copy
+            self._recount(rid)
+        self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
+        copy.event = self._cpu_pool.record()
         return label
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
@@ -2963,9 +2970,9 @@ class KVManager(AttentionResource):
     def _land_host_copies(self) -> None:
         """Under the lock: index the pages of each copy from the host that has landed,
         and drop that copy's references."""
-        pending = []
+        pending, landed = [], []
         for copy in self._host_copies:
-            if not copy.event.query():
+            if copy.event is None or not copy.event.query():
                 pending.append(copy)
                 continue
             # the parent may have left the index while the copy was in flight
@@ -2983,9 +2990,12 @@ class KVManager(AttentionResource):
                     copy.stream.chain.from_host += linked
                 copy.stream.host_copy = None
                 copy.stream.read_pending = copy.stream.read_future is not None
-                self._release_hold(copy.stream)
+                landed.append(copy)
             copy.landed = True
         self._host_copies = pending
+        for copy in landed:
+            self._release_hold(copy.rid, copy.stream)
+            self._recount(copy.rid)
 
     def reclaimable(self, rid: str) -> int:
         """The device pages ``rid`` holds, or 0 when offloading it would free none
@@ -3251,7 +3261,7 @@ class KVManager(AttentionResource):
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
-                    self._release_hold(stream)
+                    self._release_hold(rid, stream)
                     self._arena.release(stream.page_indices)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
@@ -3337,9 +3347,10 @@ class KVManager(AttentionResource):
             for rid, allotment in self._allotments.items():
                 held = 0
                 for label, stream in self._streams[rid].items():
-                    stale = stream.lent - set(stream.page_indices) - set(stream.lease or ())
+                    pages = [*stream.page_indices, *(stream.lease or ()), *(stream.hold or ())]
+                    stale = stream.lent - set(pages)
                     assert not stale, f"{rid}/{label} counts pages it no longer holds as lent: {sorted(stale)}"
-                    held += len(stream.page_indices) + len(stream.lease or ()) - len(stream.lent)
+                    held += len(pages) - len(stream.lent)
                 unused += max(0, allotment.pages - held)
             assert unused == self._unused, (
                 f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
@@ -3584,7 +3595,7 @@ class KVManager(AttentionResource):
         if allotment is None:
             return
         held = sum(
-            len(stream.page_indices) + len(stream.lease or ()) - len(stream.lent)
+            len(stream.page_indices) + len(stream.lease or ()) + len(stream.hold or ()) - len(stream.lent)
             for stream in self._streams.get(rid, {}).values()
         )
         remaining = max(0, allotment.pages - held)
