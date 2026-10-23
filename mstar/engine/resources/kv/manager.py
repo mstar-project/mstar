@@ -551,7 +551,7 @@ class KVManager(AttentionResource):
         # admit, so a grant could pass on one rank and fail on another.
         self._decides = self._world_size == 1 and leads
         # An allotment covers the labels `_nodes` open.
-        # `_waiting` is the queue in the order requests first asked, each with its prompt's pages.
+        # `_waiting` is the queue in arrival order, each request with its prompt's pages.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         self._nodes = nodes
         self._waiting: OrderedDict[str, int] = OrderedDict()
@@ -2592,13 +2592,15 @@ class KVManager(AttentionResource):
             self.check_drop(rid)
             # under the lock, so no other step allocates between the two counts
             free = self._arena.num_free
-            # Unlike an offload, the drop gives up the unused part too. A dropped request holds nothing
-            # until it is admitted again.
+            # Unlike an offload, a drop also gives up the unused part of the request's allotment. A dropped request
+            # holds nothing while it waits in the queue to be admitted again.
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
                 self._unused -= allotment.remaining
             self.reset_request(rid, free=True)
             self._dropped.add(rid)
+            if allotment is not None:
+                self._queue(rid, allotment.prompt)
             return self._arena.num_free - free
 
     def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
@@ -3291,8 +3293,22 @@ class KVManager(AttentionResource):
                 f"KV {self.name}: request {rid} needs {prompt} pages for its prompt, "
                 f"and the pool has {capacity} for requests"
             ))
-        self._waiting[rid] = prompt
+        self._queue(rid, prompt)
         return None
+
+    def _queue(self, rid: str, prompt: int) -> None:
+        """Keep `_waiting` in arrival order. A request without an arrival number goes behind every
+        numbered one."""
+        last = next(reversed(self._waiting), None)
+        self._waiting[rid] = prompt
+        place = self._place(rid)
+        if last is not None and self._place(last) > place:
+            for later in [other for other in self._waiting if self._place(other) > place]:
+                self._waiting.move_to_end(later)
+
+    def _place(self, rid: str) -> tuple[bool, int]:
+        arrival = self._overrides[rid].arrival
+        return arrival is None, arrival or 0
 
     def requeue(self, rid: str) -> None:
         with self._lock:
