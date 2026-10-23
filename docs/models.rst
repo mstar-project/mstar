@@ -358,9 +358,8 @@ tokens, and NCCL when that workspace can't be set up. On 4x GB200 at TP4 with
 
 Against the Hugging Face reference (``benchmark/command_a_plus/validate_checkpoint.py``,
 three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output
-matches on all three prompts. ``bench_http.py``, ``parity_http.py`` and
-``profile_decode.py`` in the same directory benchmark, diff greedy outputs and
-profile a running deployment. Not supported yet: image input, FP8 weights,
+matches on all three prompts. ``bench_http.py`` in the same directory benchmarks
+a running deployment. Not supported yet: image input, FP8 weights,
 prefill CUDA graphs, and reclaiming the KV pages that fall outside the sliding
 window.
 

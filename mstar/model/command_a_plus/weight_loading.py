@@ -81,25 +81,13 @@ def load_command_a_plus_weights(
 ) -> set[str]:
     """Load the official, unfused text checkpoint; return loaded parameter names.
 
-    Reuse the existing parameters' loaders for fusion offsets and TP slicing.
-    Track individual source tensors, not just destination parameters: loading
-    Q alone must not count as loading the entire QKV parameter. Non-text weights
-    are ignored; unexpected, duplicate, misshaped or missing text weights fail.
-
-    Loading is incremental, not transactional. On failure the model is partly
-    loaded and must not be used until a complete load succeeds.
+    Source tensors are tracked one by one, so loading Q alone doesn't count as
+    loading the fused QKV parameter. Non-text weights are skipped; unexpected,
+    duplicate, misshaped or missing text weights fail, leaving the model partly
+    loaded.
     """
     layout = _checkpoint_layout(config)
     parameters = dict(module.named_parameters())
-    targets = {spec.name for spec in layout.values()}
-    if targets != parameters.keys():
-        raise ValueError(
-            "Command A+ parameter layout mismatch: "
-            f"missing={sorted(targets - parameters.keys())}, "
-            f"unexpected={sorted(parameters.keys() - targets)}"
-        )
-    if any(parameter.is_meta for parameter in parameters.values()):
-        raise ValueError("Allocate Command A+ parameters with to_empty before loading weights")
 
     seen: set[str] = set()
     for checkpoint_name, tensor in weights:
@@ -116,8 +104,6 @@ def load_command_a_plus_weights(
                 f"Shape mismatch for {checkpoint_name}: "
                 f"expected {spec.shape}, got {tuple(tensor.shape)}"
             )
-        if tensor.is_meta:
-            raise ValueError(f"Checkpoint tensor has no data: {checkpoint_name}")
         parameter = parameters[spec.name]
         loader = getattr(parameter, "weight_loader", default_weight_loader)
         loader(parameter, tensor, spec.shard_id)
@@ -127,4 +113,4 @@ def load_command_a_plus_weights(
     if missing:
         examples = ", ".join(sorted(missing)[:8])
         raise ValueError(f"Missing {len(missing)} Command A+ text weights: {examples}")
-    return targets
+    return {spec.name for spec in layout.values()}

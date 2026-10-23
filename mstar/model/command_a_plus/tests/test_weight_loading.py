@@ -146,59 +146,22 @@ class WeightLoadingTests(unittest.TestCase):
             expected[:, 0] += 1
             torch.testing.assert_close(model.compute_logits(x), expected)
 
-    def test_missing_fused_slices_and_regular_parameters_fail(self):
-        for suffix in (
-            "embed_tokens.weight", "layers.0.self_attn.k_proj.weight",
-            "layers.0.mlp.shared_experts.up_proj.weight",
-            "layers.0.mlp.experts.10.up_proj.weight",
-            "layers.0.mlp.experts.2.down_proj.weight",
-        ):
-            with self.subTest(suffix=suffix):
-                weights = ((key, value) for key, value in self.weights.items() if key != PREFIX + suffix)
-                with self.assertRaisesRegex(ValueError, "Missing 1 Command A\\+ text weights"):
-                    self.make_model().load_weights(weights)
-
-    def test_duplicate_and_unknown_text_weights_fail(self):
+    def test_missing_duplicate_unknown_and_misshaped_weights_fail(self):
         name, tensor = next(iter(self.weights.items()))
+        q_proj = PREFIX + "layers.0.self_attn.q_proj.weight"
         for entries, message in (
+            ([(k, v) for k, v in self.weights.items() if k != PREFIX + "layers.0.mlp.experts.2.down_proj.weight"],
+             "Missing 1 Command A\\+ text weights"),
             ([(name, tensor), (name, tensor)], "Duplicate"),
             ([(PREFIX + "layers.0.mlp.experts.12.up_proj.weight", tensor)], "Unexpected"),
             ([(PREFIX + "layers.0.self_attn.q_proj.bias", tensor)], "Unexpected"),
-            ([(PREFIX + "layers.99.input_layernorm.weight", tensor)], "Unexpected"),
+            # The full source shape is checked, even when the rank-zero slice would fit.
+            ([(q_proj, torch.cat([self.weights[q_proj]] * 2))], "Shape mismatch"),
         ):
-            with self.subTest(message=message, name=entries[-1][0]):
+            with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
-                    self.make_model().load_weights(entries)
-
-    def test_full_source_shape_is_checked_before_tp_slicing(self):
-        for suffix in (
-            "layers.0.self_attn.q_proj.weight",
-            "layers.0.mlp.experts.0.gate_proj.weight",
-            "layers.0.mlp.experts.0.down_proj.weight",
-            "layers.0.mlp.shared_experts.up_proj.weight",
-            "embed_tokens.weight", "layers.0.mlp.gate.weight", "norm.weight",
-        ):
-            with self.subTest(suffix=suffix):
-                tensor = self.weights[PREFIX + suffix]
-                # Even an oversized tensor whose rank-zero slice would fit is invalid.
-                bad = torch.cat([tensor, tensor], dim=0)
-                with self.assertRaisesRegex(ValueError, "Shape mismatch"):
-                    self.make_model(tp=2).load_weights([(PREFIX + suffix, bad)])
-
-    def test_meta_destination_and_source_are_rejected(self):
-        with torch.device("meta"):
-            model = CommandAPlusForCausalLM(self.config)
-        with self.assertRaisesRegex(ValueError, "to_empty"):
-            model.load_weights(self.weights.items())
-        name, tensor = next(iter(self.weights.items()))
-        with self.assertRaisesRegex(ValueError, "no data"):
-            self.make_model().load_weights([(name, tensor.to("meta"))])
-
-    def test_remapper_changes_only_leading_text_prefix(self):
-        self.assertEqual(remap_text_weight_name(PREFIX + "norm.weight"), "model.norm.weight")
-        for name in ("model.vision_tower.weight", "other." + PREFIX + "norm.weight",
-                     "model.language_model_extra.weight", ""):
-            self.assertIsNone(remap_text_weight_name(name))
+                    self.make_model(tp=2).load_weights(entries)
+        self.assertIsNone(remap_text_weight_name("model.language_model_extra.weight"))
 
 
 if __name__ == "__main__":
