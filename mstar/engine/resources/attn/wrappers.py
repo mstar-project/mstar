@@ -15,7 +15,6 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 """
 
 import logging
-import os
 
 import numpy as np
 import torch
@@ -49,9 +48,6 @@ def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None)
         )
 
 
-# Experiment switch (remove before a PR): later decode plans of a captured
-# wrapper call FlashInfer's planner directly (``_plan_direct``).
-_EXP_SLIM_FI_PLAN = os.environ.get("MSTAR_EXP_SLIM_FI_PLAN", "1") == "1"
 
 
 class FlashInferPrefillWrapper:
@@ -266,7 +262,7 @@ class FlashInferPrefillWrapper:
         n = paged_kv_indices.shape[0]
         self.dtype = dtype
         key = (dtype, causal, window_left)
-        if self._planner_key == key and _EXP_SLIM_FI_PLAN:
+        if self._planner_key == key:
             self._plan_direct(
                 qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens,
             )
@@ -479,7 +475,7 @@ class FlashInferDecodeWrapper:
 
         if (
             self._planner_args is not None and dtype is self.dtype and kv_lens is not None
-            and window_left == -1 and _EXP_SLIM_FI_PLAN
+            and window_left == -1
         ):
             self._plan_direct(paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens)
             return
