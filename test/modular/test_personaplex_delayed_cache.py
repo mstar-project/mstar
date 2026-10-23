@@ -193,7 +193,8 @@ def reference_trace():
     path = Path(configured) if configured else Path(__file__).parent / "fixtures/personaplex/reference_trace.json"
     if not path.is_file() and not configured:
         pytest.skip(
-            "T3 needs NVIDIA LMGen trace; see fixtures/personaplex/README.rst or set PERSONAPLEX_REFERENCE_TRACE"
+            "the trace replay needs an NVIDIA LMGen trace; see fixtures/personaplex/README.rst "
+            "or set PERSONAPLEX_REFERENCE_TRACE"
         )
     data = json.loads(path.read_text())
     assert data["schema_version"] == 2
