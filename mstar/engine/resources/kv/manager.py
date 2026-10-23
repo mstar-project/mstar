@@ -1583,8 +1583,10 @@ class KVManager(AttentionResource):
                 or stream.offloaded or stream.read_pending
             ):
                 return None
-            keys, spans = list(chain.keys), chain.spans
-        rooted, ends = self._root(keys, spans)
+            keys, rooted = list(chain.keys), chain.rooted
+            spans, ends = chain.spans, chain.rooted_ends
+        if rooted is None:
+            rooted, ends = self._root(keys, spans)
         with self._lock:
             # a probe on the GPU thread may have looked the prompt up or taken a lease while the lock was dropped
             if (
