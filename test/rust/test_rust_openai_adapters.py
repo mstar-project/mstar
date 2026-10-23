@@ -56,6 +56,7 @@ NOT_PORTED = {
     ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),
+    ("TextChatAdapter", "chat"),
 }
 
 

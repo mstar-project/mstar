@@ -207,6 +207,12 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
+   * - ``MSTAR_GLM52_GRAPH_COMPILE``
+     - ``1``
+     - GLM-5.2: capture the ``torch.compile``'d forward into the CUDA graphs.
+       ``0`` captures the eager forward and runs the uncaptured steps
+       uncompiled, an escape hatch for an Inductor failure that would
+       otherwise fail every capture and serve eager.
 
 Serving (Python frontend)
 -------------------------
