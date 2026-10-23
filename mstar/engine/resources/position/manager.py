@@ -325,11 +325,14 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
-                counters = self._counters.setdefault(segment.request_id, {})
+                counters = all_counters.get(segment.request_id)
+                if counters is None:
+                    counters = all_counters[segment.request_id] = {}
                 counters[segment.label] = counters.get(segment.label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching

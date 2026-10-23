@@ -363,10 +363,12 @@ class RecurrentStatePool(Resource):
             # committed, so there is nothing left to unwind
             if self._admit_taken:
                 self._forget_taken(ctx.is_real_row)
+            slots, is_pad = self._slots, ctx.is_padding_row
             for segment in step.segments or ():
-                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+                if segment.span <= 0 or is_pad(segment.request_id):
                     continue
-                slot = self._slots.get(segment.request_id, {}).get(segment.label)
+                labels = slots.get(segment.request_id)
+                slot = labels.get(segment.label) if labels else None
                 if slot is not None and not slot.has_state:
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
