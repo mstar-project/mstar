@@ -827,7 +827,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         hidden, prenorm = self._hidden(ids, position_ids, dsa_ctx, with_prenorm=True)
         target = self.lm_head(hidden).argmax(-1).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
-        self._stage_verdict(engine_inputs, torch.cat([target, accepted[:, None]], 1), mtp_seq)
+        # every rank keeps rank 0's verdict: each trims its KV and seeds its next step by it, so
+        # an argmax near-tie read apart on two ranks would leave their streams apart
+        verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
+        target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
+        self._stage_verdict(engine_inputs, verdict, mtp_seq)
         with self._dsa_use(dsa_ctx):
             h_head, h_raw = lm.mtp(
                 embed(target.view(-1)), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
@@ -868,6 +872,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
         verdicts[: verdict.shape[0]].copy_(verdict, non_blocking=True)
         seq.copy_(mtp_seq, non_blocking=True)
+
+    # dynamo traces no in-place broadcast
+    @torch.compiler.disable
+    def _broadcast(self, t: torch.Tensor) -> torch.Tensor:
+        """Rank 0's copy: every rank must keep the same tail."""
+        return self.lm_head.comm_group.broadcast(t, src=0)
 
     # Keyed by request id, so outside dynamo (as _sample).
     @torch.compiler.disable
