@@ -2,9 +2,9 @@
 
 Checks M*'s PersonaPlex against NVIDIA's reference implementation and measures
 it as served. M* serves PersonaPlex as an offline replay: a prerecorded user
-clip in, an agent track of the same length out, one request per model step
-(batch size 1). Concurrency here means independent requests, not batching.
-Nothing in this directory exercises live duplex input or streamed audio.
+clip in, an agent track of the same length out. Concurrent requests share LM
+steps (`model_kwargs.max_batch_size`). Nothing in this directory exercises
+live duplex input or streamed audio.
 
 NVIDIA's numbers come from running its reference model code
 (`NVIDIA/personaplex` at `3428dfd95309a7f3c84fd93259ded0f810d1ff91`) in the
@@ -17,11 +17,13 @@ own subprocess with a timeout, and records every command, log and result:
 
 | Stage | What runs | Passes when |
 |---|---|---|
-| `parity-<clip>-dense` | M*'s LM with dense attention, step by step against NVIDIA's `LMGen`, greedy, from each side's own Mimi codes | Every text and audio token matches; float audio error is reported |
-| `parity-<clip>-resources` | The same, on the served path (paged KV + FlashInfer) | As above. Near-tied token choices can flip here, and the first divergence is recorded with its logit margin |
-| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime: each clip alone, then 1, 2 and 4 concurrent requests, cancellation mid-request, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent and post-cancellation outputs are byte-identical to the same request run alone, bad input gets a 4xx, and no agent frame is left in the worker's tensor store after the decoder runs |
-| `soak-rust` | 20 minutes of mixed short/long requests with periodic cancellations | Outputs stay correct, the request tensor store drains, and idle allocated GPU memory does not grow |
-| `warm-rust` | `benchmark.runner` per clip at concurrency 1, 2 and 4: 3 warm-up and 10 measured requests | Every measured request completes; a compile detected during measurement invalidates the cell, which is retried once |
+| `parity-<clip>-dense` | M*'s LM with dense attention, step by step against NVIDIA's `LMGen`, greedy, from each side's own Mimi codes; then a negative control, M* rotating RoPE over split halves instead of adjacent pairs | Every text and audio token matches, and the negative control is reported as a mismatch; float audio error is reported |
+| `parity-<clip>-resources` | The same, on the served path (paged KV + FlashInfer); then NVIDIA again under PyTorch's math SDPA kernel | As above, without the negative control. Near-tied token choices can flip here; the first divergence is recorded with its logit margin, next to how far NVIDIA moves against itself under the other kernel |
+| `batch-resources` | Each clip alone, then 2 and 4 requests batched with staggered starts and two voices, on the served path | Every emitted token matches the request run alone; otherwise the first differing choice is recorded with both runs' margins. LM step time per batch size is reported |
+| `judge` | Whisper transcripts of each served-path parity stage's input, NVIDIA and M* audio | Informational: the agents' word error rate, not a quality score |
+| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime, one request per LM step (`max_batch_size` 1): each clip alone, then 1, 2 and 4 concurrent requests, cancellation mid-request, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent and post-cancellation outputs are byte-identical to the same request run alone, bad input gets a 4xx, and no agent frame is left in the worker's tensor store after the decoder runs |
+| `soak-rust` | 20 minutes of mixed short/long requests with periodic cancellations, batched | Every response is well formed, the request tensor store drains, and idle allocated GPU memory does not grow; agreement with the isolated control is recorded |
+| `warm-rust` | `benchmark.runner` per clip at concurrency 1, 2 and 4, batched: 3 warm-up and 10 measured requests | Every measured request completes; a compile detected during measurement invalidates the cell, which is retried once |
 
 The soak and benchmark run only if `lifecycle-rust` passed. A failing parity
 stage does not stop the serving stages.
@@ -39,12 +41,13 @@ The suite reads a JSON settings file:
 | `expected_head` | The M* commit to test; the checkout must be at it with no tracked changes |
 | `source` | A clean checkout of `NVIDIA/personaplex` at the commit above |
 | `assets` | The checkpoint snapshot holding `model.safetensors`, the Mimi file and `tokenizer_spm_32k_3.model` |
-| `voices` | Extracted voice presets (from the repo's `voices.tgz`); `NATF2.pt` is used |
+| `voices` | Extracted voice presets (from the repo's `voices.tgz`); `NATF2.pt` and `NATM1.pt` are used |
 | `cache`, `server_config` | The Hugging Face cache and the server YAML the serving stages launch with |
 | `existing_clip` | A mono 24 kHz PCM16 clip of exactly 222 frames; `test/qwen3-omni/audio.wav` is one |
 | `english_clip` | Optional second clip; without it its two parity stages are reported BLOCKED |
 | `extension` | Optional directory holding a built `mstar_rust*.so`; otherwise the installed module is used |
 | `reference_site` | Optional directory with the extra packages NVIDIA's code imports (`sphn`, `tqdm`), added after M*'s own torch |
+| `asr_model` | Optional local Whisper checkpoint (e.g. `openai/whisper-large-v3-turbo`) for `judge`; without it `judge` is BLOCKED |
 | `port` | Server port, default 8000 |
 
 ## Reproduce
@@ -61,12 +64,13 @@ python -m benchmark.personaplex.suite report --output runs/personaplex
 ```
 
 `preflight` checks identities and input hashes without a GPU. `smoke` is a
-quick end-to-end check: served-path parity on a 16-frame clip, the Rust
-lifecycle on that clip and one benchmark request. `resume` continues a run in the same output
+quick end-to-end check on a 16-frame clip: served-path parity with both
+controls, a batch of 2, the judge, the Rust lifecycle and one benchmark
+request. `resume` continues a run in the same output
 directory, reusing finished stages if nothing it depends on has changed;
 `--retry-failed` reruns failed ones. `--deadline-seconds N` stops launching
 stages shortly before N seconds have passed, for runs inside a fixed job
-length. A full run took 53 minutes of stage time on one H100.
+length. A full run took 42 minutes of stage time on one H100.
 
 The benchmark cells can also be run by hand against a running server. The
 manifest lists clips as `[{"id": "clip", "path": "clip.wav", "sha256": "..."}]`:
@@ -95,7 +99,10 @@ differs.
 - Exact-token parity on the served path is not guaranteed: FlashInfer's
   rounding differs from PyTorch's SDPA, so near-tied choices can flip. The comparison
   measures this; it does not decide whether it is acceptable.
-- Audio quality is not scored; listen to `listen.html`.
+- Audio quality is not scored: `judge` compares what the two agents said, not
+  how they sound; listen to `listen.html`.
+- A batched step rounds differently from a request run alone, which is why
+  only the batch-size-1 lifecycle compares outputs byte for byte.
 - Ten requests per benchmark cell make the percentiles descriptive only.
 - The soak covers 20 minutes of one request mix; it is not proof against every
   leak.

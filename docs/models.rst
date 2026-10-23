@@ -1181,7 +1181,7 @@ serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
 with the request, the model advances once per 80 ms frame across all of it, and
 the response is an agent audio track time-aligned to the input (plus the
 agent's text stream). It is not turn-based: the agent may speak while the user
-speaks. Live ingress, barge-in, streamed output, batching above 1 and tensor
+speaks. Live ingress, barge-in, streamed output, CUDA graphs and tensor
 parallelism are out of scope.
 
 .. code-block:: bash
@@ -1192,6 +1192,11 @@ parallelism are out of scope.
    # Voice presets come from the repo's voices.tgz, fetched and extracted into
    # the Hugging Face cache on first use; set model_kwargs.voice_dir in a copy
    # of configs/personaplex.yaml to use a local directory instead.
+
+Concurrent requests share LM steps, up to ``model_kwargs.max_batch_size``
+(default 8) and the YAML's ``max_concurrent_requests``. A batched step rounds
+differently from a request run alone, so a greedy response can depend on what
+else is being served; ``max_batch_size: 1`` runs every request alone.
 
 Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
 used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
@@ -1215,26 +1220,32 @@ not exceed **2999** temporal forwards, so user audio is capped at
 (2999 − conditioning frames) × 80 ms, just under 4 minutes. NVIDIA's 3000-slot
 ring KV equals dense causal attention only up to that point. Output audio is
 trimmed to the input's sample count and lags it by one frame, as in NVIDIA's
-``offline.py``. Text frames that are padding or special tokens produce empty
-chunks.
+``offline.py``; the input fixes the output length, so ``max_output_tokens`` is
+ignored. Text frames that are padding or special tokens produce empty chunks.
 
 Status, checked with the released checkpoint against NVIDIA's reference
 implementation on GH200 and H100 GPUs:
 
 - With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
   audio to within 5e-7. The served path uses FlashInfer paged attention, whose
-  different rounding flips near-tied token choices (the first observed flip had
-  a logit margin of 0.0625, one bfloat16 step), so a long greedy trajectory
-  departs from NVIDIA's after some frames. Outputs are therefore not
-  bit-identical to the reference.
+  different rounding flips near-tied token choices (first flips at logit
+  margins of 0 to 0.0625, at most one bfloat16 step), so a long greedy
+  trajectory departs from NVIDIA's after some frames. NVIDIA's own code moves
+  as much when only PyTorch's attention kernel changes: on a 222-frame clip
+  762 agent codes differed between M* and NVIDIA, and 779 between NVIDIA's
+  default and math SDPA kernels, both first flipping at the same frame.
+  Batching changes rounding the same way.
 - Cancellation, recovery and malformed inputs (rejected with 400) are checked
   on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
   GPU memory flat.
-- The model runs eagerly (no CUDA graphs) at batch size 1. On one H100 a single
-  request is processed slightly faster than real time; concurrent requests
-  queue rather than batch.
-- Audio quality has not been assessed (no listening or transcription-based
-  evaluation).
+- The model runs eagerly (no CUDA graphs). On one H100 an LM step takes about
+  50 ms for one request and 54 ms for four batched, and over HTTP four
+  concurrent 17.7 s requests each finish in 0.82x real time (median), about
+  4.1 seconds of audio per second in total.
+- Audio quality has not been formally assessed. Whisper transcripts of M*'s
+  and NVIDIA's responses matched on an English clip (word error rate 0) and
+  differed on a second clip, after their tokens diverge; no listening study
+  has been done.
 
 Reference fixtures are generated outside Git by
 ``test/personaplex/reference_oracle.py`` (see
