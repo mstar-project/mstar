@@ -968,12 +968,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">lookup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Walk ``keys`` from the root and stop at the first one not indexed."""</span>
-        <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">:</span>
-            <span class="n">page</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">page</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">break</span>
-            <span class="n">pages</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages_for</span><span class="p">(</span><span class="n">keys</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">pages</span><span class="p">:</span>
             <span class="c1"># one stamp for the whole run, so recency stays monotone along it</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_clock</span> <span class="o">+=</span> <span class="mi">1</span>
@@ -1011,11 +1006,46 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">True</span></div>
 
 
+<div class="viewcode-block" id="PrefixIndex.insert_run">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert_run">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">insert_run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">],</span> <span class="n">pages</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">parent</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Name ``pages`` by ``keys``, each under the one before and the first</span>
+<span class="sd">        under ``parent``. A key already indexed keeps its page, and the next key</span>
+<span class="sd">        goes under that page. Returns how many pages were inserted."""</span>
+        <span class="n">inserted</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">page</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">keys</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">parent</span><span class="p">):</span>
+                <span class="n">inserted</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">page</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+            <span class="n">parent</span> <span class="o">=</span> <span class="n">page</span>
+        <span class="k">return</span> <span class="n">inserted</span></div>
+
+
 <div class="viewcode-block" id="PrefixIndex.page_for">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">page_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
         <span class="c1"># not `lookup`: this is not a hit, and must not re-stamp the page</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PrefixIndex.pages_for">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""`lookup` without the stamp, for a walk that is not a hit."""</span>
+        <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">:</span>
+            <span class="n">page</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">page</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="n">pages</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pages</span></div>
+
+
+<div class="viewcode-block" id="PrefixIndex.holds">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.holds">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">holds</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span></div>
 
 
 <div class="viewcode-block" id="PrefixIndex.pages">
@@ -1043,16 +1073,16 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="PrefixIndex.evict">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">evict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">evict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Drop the oldest leaves the index alone holds, until ``n`` are free.</span>
 
 <span class="sd">        A leaf a request or a lease also holds is passed over and put back:</span>
 <span class="sd">        dropping it would free nothing and lose an entry that is still good.</span>
-<span class="sd">        Returns how many pages reached the free list.</span>
+<span class="sd">        Returns the keys of the pages that reached the free list.</span>
 <span class="sd">        """</span>
-        <span class="n">freed</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">dropped</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">passed_over</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">while</span> <span class="n">freed</span> <span class="o">&lt;</span> <span class="n">n</span><span class="p">:</span>
+        <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">dropped</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">n</span><span class="p">:</span>
             <span class="n">entry</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pop_leaf</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">entry</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">break</span>
@@ -1060,11 +1090,11 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="n">passed_over</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span>
                 <span class="k">continue</span>
+            <span class="n">dropped</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">])</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_remove</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
-            <span class="n">freed</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="k">for</span> <span class="n">entry</span> <span class="ow">in</span> <span class="n">passed_over</span><span class="p">:</span>
             <span class="n">heapq</span><span class="o">.</span><span class="n">heappush</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_leaves</span><span class="p">,</span> <span class="n">entry</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">freed</span></div>
+        <span class="k">return</span> <span class="n">dropped</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_pop_leaf</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
