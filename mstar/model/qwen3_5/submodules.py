@@ -314,8 +314,11 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
-    # under the largest prefill capture (2048) with a mixed step's decode rows
-    MAX_BATCH_TOKENS = 1024
+    # a mixed step's prompt tokens and decode rows stay under the largest
+    # prefill capture (PREFILL_TOKEN_BUCKETS). 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
 
     def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
         if graph_walk == "prefill_text":
