@@ -429,7 +429,10 @@ Worker scheduling
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread.
+       thread. With ``MSTAR_TP_ASYNC_SCHED`` on, set it identically on every
+       rank of a lockstep instance: a follower builds a voided speculative step
+       as rank 0 pre-planned it, so the workers compare it at startup and
+       refuse to start on a mismatch.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads

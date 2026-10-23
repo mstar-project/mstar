@@ -323,7 +323,7 @@ ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise.
 
-On a single rank, a request waits at the head of its pool's queue until its reservation fits
+A request waits at the head of its pool's queue until its reservation fits
 beside the reservations already admitted, and no request behind it starts first. A cache hit on
 a page only the prefix index holds counts as a page the request takes. A request that
 can't fit in its pool at its full output length gets a 400 if it asked for that length,
@@ -337,15 +337,16 @@ reserves its whole footprint in every pool, with every cache hit counted, and is
 dropped. So does a request in the pools of a node that keeps no token ids to rebuild it.
 Voice requests then queue when the pool is short and are never preempted mid-stream.
 
-Above one rank, a decode step that finds no page holds its requests until they time out.
-At one rank, a request that runs short and can't be dropped waits for room when dropping
+Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before
+the step that follows, so every rank admits each step from the same reservations.
+A request that runs short and can't be dropped waits for room when dropping
 newer requests wouldn't cover its shortage. That is the case for every request under
 ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every drop. Several such
 requests can wait on each other.
-``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
+``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` moves a request to the host only in the cases above where
-requests are held. Where the worker drops requests, or a request waits for room, nothing is
+safe value. ``cpu_offload_pages`` moves a request to the host only where a full pool holds
+its requests. Where the worker drops requests, or a request waits for room, nothing is
 offloaded. An offload frees only the device pages no other running request reads, though, so
 a request that shares most of its prompt frees little.
 Offload helps a pool that runs short now and then. It doesn't replace the cap.
