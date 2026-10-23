@@ -2592,6 +2592,11 @@ class KVManager(AttentionResource):
             self.check_drop(rid)
             # under the lock, so no other step allocates between the two counts
             free = self._arena.num_free
+            # Unlike an offload, the drop gives up the unused part too. A dropped request holds nothing
+            # until it is admitted again.
+            allotment = self._allotments.pop(rid, None)
+            if allotment is not None:
+                self._unused -= allotment.remaining
             self.reset_request(rid, free=True)
             self._dropped.add(rid)
             return self._arena.num_free - free
