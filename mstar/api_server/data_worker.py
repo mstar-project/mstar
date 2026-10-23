@@ -124,6 +124,17 @@ class InlineToken:
 
 
 
+def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> dict:
+    """A text chunk's share of the API's usage: its token count, the prompt's,
+    and whether it ends on a stop token (the last chunk's says why the reply ended)."""
+    usage = {"tokens": tokens.numel()}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if stop_ids is not None and tokens.numel():
+        usage["stop_token"] = int(tokens.flatten()[-1]) in stop_ids
+    return usage
+
+
 def _preprocess_loop(**kwargs):
     worker = PreprocessWorkerThread(**kwargs)
     worker.run()
@@ -443,6 +454,8 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # the prompt's token count, for the API's usage
+    prompt_tokens: int | None = None
 
 
 class PreprocessWorkerThread:
@@ -669,7 +682,10 @@ class PreprocessWorkerThread:
             self.tensor_manager.set_persist(info.uuid, persist=True)
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        prompt_ids = tensors.get("text_inputs") if self.model is not None else None
+        self.request_output_state[input.request_id] = RequestOutputState(
+            prompt_tokens=sum(t.numel() for t in prompt_ids) if prompt_ids else None,
+        )
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1016,6 +1032,9 @@ class PreprocessWorkerThread:
                 tensor, item.modality,
                 request_kwargs=self.request_model_kwargs.get(request_id),
             )
+            metadata = _text_usage(
+                tensor, self.model.stop_token_ids(), state.prompt_tokens,
+            ) if item.modality == "text" else {}
             self._queue_completed_output(
                 request_id,
                 sequence,
@@ -1023,7 +1042,7 @@ class PreprocessWorkerThread:
                     request_id=request_id,
                     modality=item.modality,
                     data=postprocessed,
-                    metadata={},
+                    metadata=metadata,
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1106,6 +1125,12 @@ class PreprocessWorkerThread:
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
+                        if modality == "text" and self.model is not None:
+                            chunk_metadata = {
+                                **chunk_metadata,
+                                **_text_usage(tensor, self.model.stop_token_ids(),
+                                              self.request_output_state[request_id].prompt_tokens),
+                            }
                         # Audio is emitted as headerless 16-bit PCM; surface the
                         # model's output sample rate + channel count so clients can
                         # wrap it.

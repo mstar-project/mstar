@@ -326,3 +326,31 @@ def test_short_budgets_are_exact_and_name_no_missing_loop(max_tokens, caplog):
     stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", max_tokens, True))
     assert stream.numel() == max_tokens
     assert _errors(caplog) == []
+
+
+def test_a_prefill_stop_token_finishes_the_chat_reply():
+    """What the client gets: finish_reason stop on the one token, not a length cut."""
+    from mstar.api_server.data_worker import _text_usage
+    from mstar.api_server.openai.serving_chat import _build_response
+
+    cfg = _cfg(True)
+    eos = cfg.eos_token_ids[0]
+    driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
+    sampler = driver.resources[SAMPLER_RESOURCE]
+    greedy = sampler.sample
+
+    def eos_once(rids, logits, **kw):
+        sampler.sample = greedy
+        return torch.full((logits.shape[0],), eos)
+
+    sampler.sample = eos_once
+    stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 10, False))
+    model = Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+    chunks = [
+        SimpleNamespace(modality="text", data=model.postprocess(token[None], "text"),
+                        metadata=_text_usage(token[None], model.stop_token_ids(), 5))
+        for token in stream
+    ]
+    reply = _build_response("glm", "r0", chunks, 24000)
+    assert reply["choices"][0]["finish_reason"] == "stop"
+    assert reply["usage"]["completion_tokens"] == 1

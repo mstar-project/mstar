@@ -354,6 +354,9 @@ class _TextModel:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
+    def stop_token_ids(self):
+        return None
+
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):
     monkeypatch.setattr(data_worker_mod, "STATUS_INTERVAL_S", 0.01)

@@ -15,6 +15,9 @@ from mstar.graph.loop_indices import NestedLoopIndices
 
 
 class _Model:
+    def stop_token_ids(self):
+        return None
+
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 

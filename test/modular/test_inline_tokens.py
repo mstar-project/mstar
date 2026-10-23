@@ -46,6 +46,9 @@ def test_result_tokens_round_trips_through_the_codec():
 
 
 class _Model:
+    def stop_token_ids(self):
+        return None
+
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()

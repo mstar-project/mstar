@@ -868,6 +868,12 @@ class Model(ABC):
         """
         return None
 
+    def stop_token_ids(self) -> frozenset[int] | None:
+        """Token ids that end a text reply. A reply whose last token is not one
+        ran out of budget, which the API reports as ``finish_reason: "length"``;
+        None leaves every reply reported as stopped."""
+        return None
+
     def get_autocast_dtype(self):
         return torch.bfloat16
 
