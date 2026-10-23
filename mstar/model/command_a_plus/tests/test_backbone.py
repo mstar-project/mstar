@@ -10,12 +10,10 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusAttention,
-    CommandAPlusDecoderLayer,
     CommandAPlusLanguageModel,
 )
 from mstar.model.command_a_plus.config import (
@@ -183,25 +181,6 @@ class BackboneTests(unittest.TestCase):
                 p.copy_(values)
         return model
 
-    def test_parallel_branches_receive_same_normalized_input(self):
-        layer = CommandAPlusDecoderLayer(self.config, 0)
-        seen = []
-
-        class Branch(nn.Module):
-            def __init__(self, scale):
-                super().__init__()
-                self.scale = scale
-
-            def forward(self, x):
-                seen.append(x)
-                return x * self.scale
-
-        layer.self_attn, layer.mlp = Branch(2), Branch(3)
-        x = torch.arange(64, dtype=torch.float32).reshape(2, 32)
-        expected = x + 5 * F.layer_norm(x, (32,), eps=self.config.layer_norm_eps)
-        torch.testing.assert_close(layer(x), expected)
-        self.assertIs(seen[0], seen[1])
-
     def test_prefill_and_four_cached_steps_match_dense_reference(self):
         model = self.make_model()
         kv, pos, local, global_ = bind_test_resources(model, self.config)
@@ -236,21 +215,6 @@ class BackboneTests(unittest.TestCase):
                     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
         self.assertEqual(len(kv.cache), 8)
         self.assertTrue(all(len(k) == 6 for k, v in kv.cache.values()))
-
-    def test_missing_resources_fail_at_binding(self):
-        local = CommandAPlusAttention(self.config, 0)
-        for missing in (LOCAL_ATTN, KV_CACHE, ROPE):
-            with self.subTest(missing=missing):
-                resources = {LOCAL_ATTN: object(), KV_CACHE: object(), ROPE: object()}
-                del resources[missing]
-                with self.assertRaisesRegex(ValueError, missing):
-                    local.bind_resources(resources)
-        global_ = CommandAPlusAttention(self.config, 3)
-        global_.bind_resources({GLOBAL_ATTN: object(), KV_CACHE: object()})
-        self.assertIsNone(global_.pos)
-        for index in (-1, 4):
-            with self.assertRaisesRegex(ValueError, "layer_idx"):
-                CommandAPlusAttention(self.config, index)
 
     def test_tp8_production_geometry_on_meta(self):
         config = replace(

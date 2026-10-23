@@ -67,11 +67,6 @@ def reference(args):
     if any(loading.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"HF loading was not exact: {loading}")
     print(f"HF loaded in {load_seconds:.1f}s", flush=True)
-    trace = None
-    if args.trace:
-        from benchmark.command_a_plus.activation_trace import ActivationTrace
-
-        trace = ActivationTrace(model.model.language_model, reference=True)
     tensors, cases = {}, []
     for case_index, prompt in enumerate(PROMPTS):
         ids = adapter.process_prompt(prompt, ["text"], ["text"])["text_inputs"][0]
@@ -80,8 +75,6 @@ def reference(args):
         )
         inputs, cache, generated, logits_rows, timings = ids[None].cuda(0), None, [], [], []
         for _step in range(args.tokens):
-            if trace is not None:
-                trace.step = _step
             sync_all()
             start = time.perf_counter()
             output = model(input_ids=inputs, past_key_values=cache, use_cache=True, logits_to_keep=1)
@@ -104,12 +97,8 @@ def reference(args):
                     first_top_ids=top.indices.tolist(), first_top_logits=top.values.tolist(),
                     step_ms=timings)
         cases.append(case)
-        if trace is not None:
-            trace.save(args.output / f"hf_trace_{case_index}.safetensors")
         print("HF case", case_index, repr(case["text"]), flush=True)
         del output, cache
-    if trace is not None:
-        trace.close()
     save_file(tensors, args.output / "hf_logits.safetensors")
     write_json(args.output / "hf_reference.json", dict(
         checkpoint=str(args.checkpoint.resolve()), load_seconds=load_seconds, cases=cases,
@@ -212,11 +201,6 @@ def mstar(args):
     runtime = None
     try:
         runtime = Runtime(args, group)
-        trace = None
-        if args.trace and rank == 0:
-            from benchmark.command_a_plus.activation_trace import ActivationTrace
-
-            trace = ActivationTrace(runtime.node.language_model.model, reference=False)
         reference_info = json.loads((args.output / "hf_reference.json").read_text())
         expected = load_file(args.output / "hf_logits.safetensors")
         results, tensors = [], {}
@@ -228,8 +212,6 @@ def mstar(args):
             runtime.start(rid)
             rows, metrics, logits_rows = [ids.cuda()], [], []
             for step, reference_token in enumerate(case["generated_ids"]):
-                if trace is not None:
-                    trace.step = step
                 logits, tokens, timing = runtime.step([rid], rows, step)
                 ours = logits[0].float().cpu()
                 theirs = expected[f"case_{index}"][step]
@@ -252,18 +234,10 @@ def mstar(args):
             tensors[f"case_{index}"] = torch.stack(logits_rows)
             results.append(dict(prompt=case["prompt"], metrics=metrics))
             if rank == 0:
-                if trace is not None:
-                    trace.save(args.output / f"mstar_trace_{index}.safetensors")
                 print("M* parity", index, json.dumps(metrics), flush=True)
-        if trace is not None:
-            trace.close()
         if rank == 0:
             save_file(tensors, args.output / "mstar_logits.safetensors")
             write_json(args.output / "mstar_parity.json", results)
-        if args.trace:
-            from benchmark.command_a_plus.activation_trace import compare_reference_routing
-
-            compare_reference_routing(runtime, args, rank)
         # Stop before benchmarks if the same-prefix logits do not match. Keep
         # artifacts even on failure so discrepancies can be diagnosed.
         for result in results:
@@ -344,8 +318,6 @@ def main():
     parser.add_argument("--max-rmse", type=float, default=0.25)
     parser.add_argument("--max-abs", type=float, default=1.0)
     parser.add_argument("--min-cosine", type=float, default=0.995)
-    parser.add_argument("--trace", action="store_true",
-                        help="save activations and diagnose M* with saved HF routing choices and weights")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if not (args.checkpoint / "model.safetensors.index.json").is_file():

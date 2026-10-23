@@ -54,8 +54,8 @@ HF_MODELS: dict[str, dict] = {
     "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
     "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
     "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
-    # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "command_a_plus": {"model_path_hf": "CohereLabs/command-a-plus-05-2026-bf16"},
+    # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
     # DROID robot platform (domain droid_lerobot, 10-dim raw actions). Same
