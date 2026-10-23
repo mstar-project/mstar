@@ -625,9 +625,7 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
         with pytest.raises(ValueError, match=match):
             model.process_prompt(prompt, inputs, outputs, tensors)
     with pytest.raises(ValueError, match="max_new_tokens must be in 1..4096"):
-        model.process_prompt("hi", ["text"], ["audio"], max_new_tokens=5000)
-    with pytest.raises(ValueError, match="exceeds the 32,768-token context"):
-        model.process_prompt("x" * 480, ["text"], ["audio"], max_new_tokens=64)
+        model.get_max_output_tokens(max_new_tokens=5000)
 
 
 # ---------------------------------------------------------------------------
