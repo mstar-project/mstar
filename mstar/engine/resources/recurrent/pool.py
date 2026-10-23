@@ -620,10 +620,12 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.page_size if self._kv is not None else 0
+            slots, is_pad = self._slots, ctx.is_padding_row
             for segment in step.segments or ():
-                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+                if segment.span <= 0 or is_pad(segment.request_id):
                     continue
-                slot = self._slots.get(segment.request_id, {}).get(segment.label)
+                labels = slots.get(segment.request_id)
+                slot = labels.get(segment.label) if labels else None
                 if slot is not None:
                     if not slot.has_state:
                         # the backend already wrote the pool; a later step resumes
