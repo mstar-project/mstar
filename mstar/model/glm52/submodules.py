@@ -189,10 +189,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             logger.warning("%s: %d usable pages of %d hold less than max_seq_len=%d: a "
                            "request that long waits for pages until it times out", KV_RESOURCE,
                            kv.max_num_pages - 1, kv.page_size, cfg.max_seq_len)
-        # each rank attends the others' selected cache slots, so the ranks' page tables
-        # must agree, and an eviction frees pages in a different order on each rank
-        if cfg.dsa_shard_prefill and getattr(resources[KV_RESOURCE], "supports_eviction", False):
-            raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
         if kv.page_size & (kv.page_size - 1):
             # flashinfer's page-table transform takes power-of-two pages
             raise ValueError(f"{KV_RESOURCE} page_size={kv.page_size} must be a power of two")
