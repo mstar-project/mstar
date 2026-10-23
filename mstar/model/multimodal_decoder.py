@@ -92,6 +92,8 @@ class MediaIntake:
     metadata)`` gives its `PreparedMedia`, and each placeholder is expanded
     to its run's tokens, between ``sentinels`` when given. ``metadata`` is
     the attachment's loader metadata, ``{}`` when it came with none.
+    ``max_tokens`` caps the tokens one request's attachments of this
+    modality fill, all together; a request past it is refused (a 400).
     """
 
     modality: str
@@ -100,6 +102,7 @@ class MediaIntake:
     prepare: Callable[[torch.Tensor, dict], PreparedMedia]
     sentinels: tuple[int, int] | None = None
     runs: Callable[[dict], int] | None = None
+    max_tokens: int | None = None
 
 
 class MediaPrompt(NamedTuple):
@@ -307,6 +310,11 @@ class MultimodalDecoderModel(Model):
                 continue
             prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index))
             counts[intake.pad] += prepared.tokens
+            if intake.max_tokens is not None and sum(counts[intake.pad]) > intake.max_tokens:
+                raise ValueError(
+                    f"{self.NAME} takes at most {intake.max_tokens} {part.modality} tokens a "
+                    f"request; this request's {part.modality} fills more"
+                )
             if prepared.grids is not None:
                 grids.setdefault(intake.pad, []).extend(prepared.grids)
             for name, tensor in prepared.inputs.items():

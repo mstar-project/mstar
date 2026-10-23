@@ -2289,7 +2289,9 @@ resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``
 a template leaves to its processor, how many placeholders an attachment fills
 (``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
 ``prepare``, which turns an attachment into the encoder's input tensors and each
-placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and tokenizes the
+placeholder's tokens (a ``PreparedMedia``), and optionally ``max_tokens``, the most
+tokens one request's attachments of the modality may fill (Muse Spark caps its audio
+so). ``_prompt_ids`` renders and tokenizes the
 whole prompt once. ``intake`` then refuses a prompt whose placeholders don't match its
 attachments, prepares each attachment in prompt order, expands each placeholder to one
 pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'

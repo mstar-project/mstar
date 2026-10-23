@@ -6,6 +6,7 @@ Field names mirror HF's so ``from_hf`` can splat the checkpoint's own dicts.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, fields
 from functools import cached_property
 from pathlib import Path
@@ -30,6 +31,8 @@ VISION_ATTN = keys.VISION_ATTN
 # the tower's two ragged layouts: 32x32-patch windows, and whole frames
 VISION_WINDOW = "window"
 VISION_FULL = "full"
+# Muse Spark: the audio tower's convs' left context, carried between chunks
+AUDIO_CONV = "audio_conv"
 
 
 # a mixture-of-experts text config, which this dense port would load wrong
@@ -255,3 +258,71 @@ class MuseSparkConfig(MuseGlimmerConfig):
         if tc.get("output_multiplier") is None:
             raise ValueError("Muse Spark's text_config needs output_multiplier: it scales the router's logits")
 
+
+
+# audio_config keys that do not change the tower's computation
+_AUDIO_CONFIG_UNREAD = {"initializer_range", "model_type"}
+# What `_audio_intake` builds in: mono at 24 kHz, zero-padded on the right to
+# whole tokens, with no normalization. `samples_per_token` is the tower's.
+_FEATURE_EXTRACTOR = {
+    "feature_extractor_type": "MuseSparkFeatureExtractor", "feature_size": 1, "sampling_rate": 24_000,
+    "padding_side": "right", "padding_value": 0.0, "return_attention_mask": True,
+}
+
+
+@dataclass
+class MuseSparkAudioConfig:
+    """Muse Spark's waveform audio tower: a causal convolutional pyramid, one
+    token per ``prod(patch_sizes)`` samples."""
+
+    patch_sizes: list[int]
+    hidden_sizes: list[int]
+    depths: list[int]
+    out_hidden_size: int
+    conv_kernel_size: int = 7
+    mlp_ratio: float = 4.0
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "gelu"
+    # the text embedding's weightless norm, which the clips' tokens go through too
+    text_rms_norm_eps: float = 1e-5
+    sampling_rate: int = _FEATURE_EXTRACTOR["sampling_rate"]
+
+    @property
+    def samples_per_token(self) -> int:
+        return math.prod(self.patch_sizes)
+
+    @classmethod
+    def from_hf(cls, path: str | Path) -> MuseSparkAudioConfig:
+        """Refuses an ``audio_config`` key the tower does not build, and a
+        ``processor_config.json`` feature extractor intake would misread."""
+        raw = _read_config(path)
+        ac = raw.get("audio_config")
+        if ac is None:
+            raise ValueError(
+                "Muse Spark's config.json has no audio_config: this port builds the audio tower, so it needs one"
+            )
+        tower = {f.name for f in fields(cls)} - {"text_rms_norm_eps", "sampling_rate"}
+        unknown = sorted(ac.keys() - tower - _AUDIO_CONFIG_UNREAD - {"num_hidden_layers"})
+        if unknown:
+            raise ValueError(f"audio_config's {unknown} are not keys this port reads")
+        config = cls(
+            **{k: v for k, v in ac.items() if k in tower},
+            text_rms_norm_eps=raw["text_config"]["rms_norm_eps"],
+        )
+        if not len(config.patch_sizes) == len(config.hidden_sizes) == len(config.depths):
+            raise ValueError("audio_config: patch_sizes, hidden_sizes and depths need one entry per stage")
+        if ac.get("num_hidden_layers", len(config.depths)) != len(config.depths):
+            raise ValueError("audio_config's num_hidden_layers is its stages here, one per entry of depths")
+        processor = Path(path) / "processor_config.json" if Path(path).is_dir() else None
+        if processor is not None and processor.exists():
+            ours = {**_FEATURE_EXTRACTOR, "samples_per_token": config.samples_per_token}
+            for key, value in json.loads(processor.read_text()).get("feature_extractor", {}).items():
+                if key not in ours:
+                    raise ValueError(f"feature_extractor's {key} is not one this port reads")
+                if value != ours[key]:
+                    raise ValueError(f"feature_extractor's {key} is {value!r}, this port's {ours[key]!r}")
+        if config.hidden_act != "gelu":
+            raise ValueError(f"the audio tower's activation is gelu here, not {config.hidden_act}")
+        if config.out_hidden_size != raw["text_config"]["hidden_size"]:
+            raise ValueError("the audio tower's output feeds the text embeddings: out_hidden_size != hidden_size")
+        return config

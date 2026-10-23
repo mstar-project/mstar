@@ -358,9 +358,12 @@ class MuseGlimmer(Model):
 
 
 class MuseSpark(MuseGlimmer):
-    """Muse Spark Open 816B-A42B (text + image in, text out) benchmark metadata."""
+    """Muse Spark Open 816B-A42B (text + image + audio in, text out) benchmark metadata."""
 
     HF_URL = "meta-models/Muse-Spark-Open-816B-A42B"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T, RequestType.A2T}
 
 
 class Qwen3TTS1p7B(Qwen3TTS):

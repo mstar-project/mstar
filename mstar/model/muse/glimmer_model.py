@@ -195,7 +195,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
 
     def max_input_files(self) -> dict[str, int]:
         # refused before any file is decoded
-        return {"video": 0, "audio": 0}
+        return {m: 0 for m in ("video", "audio") if m not in {i.modality for i in self.media}}
 
     def _encode(self, text: str) -> torch.Tensor:
         """The rendered template opens with BOS; the tokenizer's own

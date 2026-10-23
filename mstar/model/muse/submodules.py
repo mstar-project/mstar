@@ -1,9 +1,10 @@
-"""Muse Glimmer's node submodules: the LLM (and Spark's, over its experts)
-and the vision encoder.
+"""The Muse node submodules: the LLM (and Spark's, over its experts) and the
+vision encoder; Spark's audio encoder is a `ChunkedCausalEncoder` as it is.
 
-Both build on the shared scaffolds (`SampledTokenDecoder`,
-`PackedBlockLoopEncoder`). Positions are plain 1D and advance one per token,
-images included, so the position resource's own counters place every step.
+They build on the shared scaffolds (`SampledTokenDecoder`,
+`PackedBlockLoopEncoder`). Positions are plain 1D and
+advance one per token, media included, so the position resource's own
+counters place every step.
 """
 
 from typing import Any
@@ -99,3 +100,4 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
             },
             resource_step_info={VISION_WINDOW: ti.window_lengths, VISION_FULL: ti.frame_lengths},
         )
+

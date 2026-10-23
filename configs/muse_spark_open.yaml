@@ -1,6 +1,11 @@
 model: "muse_spark"
 # The checkpoint allows 1M tokens; a request is capped at 128K here.
 max_seq_len: 131072
+model_kwargs:
+  # A request's audio, all its clips together, refused past this with a 400:
+  # rank 0 holds each clip's encoder output (205 KB a second) until the
+  # request's prefill, outside any pool (see kv_cache below).
+  max_audio_seconds: 1800
 
 resources:
   kv_cache:
@@ -8,16 +13,29 @@ resources:
     # token a rank, 4.06 MB a page of 128. ~52 GB of a B300 left after
     # weights, activations, graphs and MoE scratch (the experts take long
     # prompts in chunks of 8192 tokens, so ~3 GB at any length). Every rank
-    # takes this page count, and rank 0 also runs the media encoders (~4 GB of
-    # weights plus activations), so 6 GB stay free: 11000 pages, 1.4M tokens.
+    # takes this page count, and rank 0 also runs the media encoders: the
+    # vision tower (~4 GB of weights plus activations) and the audio tower
+    # (0.2 GB of weights, and the 1.2 GB its 1-8 row graphs at 250 tokens a
+    # row keep, measured on an H200), so ~4.5 GB stay free, less ~250 KB a
+    # second of audio for each clip in flight: the clip (48 KB/s) and its
+    # chunks' outputs, which the loop holds on rank 0 until its last chunk
+    # (8192 bf16 a 80 ms token, 205 KB/s): 11000 pages, 1.4M tokens.
     # To be measured on the box.
     max_num_pages: 11000
+  audio_conv:
+    # The audio tower's convs' left context between chunks, 92 KB a slot. A
+    # clip holds a slot from its first chunk to its last, so this bounds the
+    # clips being encoded at once, not the LLM's concurrency: 64 (one slot is
+    # the sink), 8 steps of 8-row chunks; past that, a new clip waits at the
+    # encoder's admission.
+    max_slots: 65
 
 node_groups:
   # BF16 on one 8x B300 (288 GB) node: ~213 GB of weights a rank, the 256
   # experts split 32 a rank. 8x B200 or H200 do not hold the BF16 weights.
-  # The encoders run once per request, colocated on rank 0.
-  - node_names: [vision_encoder]
+  # The encoders share rank 0 with the LLM: the vision tower runs once per
+  # image prompt, the audio tower one chunk of a clip a step.
+  - node_names: [vision_encoder, audio_encoder]
     ranks: [0]
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -43,3 +61,7 @@ warmup_requests:
   - text: "The quick brown fox jumps over the lazy dog. "
     repeat: 1000
     model_kwargs: {max_output_tokens: 1}
+  # the audio tower, and the LLM's media capture replayed for prefill_audio
+  - text: What is said in this clip?
+    files: [hf://hexgrad/Kokoro-82M/samples/af_heart_0.wav]
+    model_kwargs: {max_output_tokens: 4}

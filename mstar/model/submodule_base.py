@@ -910,7 +910,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``replay_graph_walks`` is always a superset of ``{capture_graph_walk}``
         (see ``CudaGraphConfig.__init__``), so this never narrows what the
         previous code accepted — only widens it for configs that explicitly
-        declared aliases.
+        declared aliases (a VLM's ``prefill_audio`` and ``prefill_vision_audio``
+        replay its one ``prefill_vision`` capture).
 
         Subclasses can override to reject on batch shape / metadata (e.g.
         codec submodules that need homogeneous frame counts).

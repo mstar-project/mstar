@@ -138,6 +138,11 @@ def vision_prompt():
             dict(type="image_url", image_url=dict(url=data_url(red_square_png())))]
 
 
+def audio_prompt():
+    return [dict(type="text", text="Transcribe this clip."),
+            dict(type="audio_url", audio_url=dict(url=data_url(speech_wav(), "audio/wav")))]
+
+
 def speech(**fields) -> Callable[[], dict]:
     def build():
         body = dict(input=SENTENCE, response_format="wav", seed=7, **fields)
@@ -251,8 +256,11 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ModelSpec("muse_glimmer", "configs/muse_glimmer.yaml", lm_cases(), "llm"),
     # ~213 GB of bf16 weights a rank over 8 GPUs (one 8x B300 node); peak VRAM
     # provisional, not yet measured
-    ModelSpec("muse_spark", "configs/muse_spark_open.yaml", lm_cases(), "llm",
-              gated=("meta-models/Muse-Spark-Open-816B-A42B",), peak_vram_gb=250),
+    ModelSpec("muse_spark", "configs/muse_spark_open.yaml", (
+        *lm_cases(),
+        Case("audio_to_text", "chat", chat(audio_prompt), Expect("text", contains_any=("quilter", "apostle")),
+             requires=SPEECH_FIXTURE),
+    ), "llm", gated=("meta-models/Muse-Spark-Open-816B-A42B",), peak_vram_gb=250),
     ModelSpec("bagel", "configs/bagel_single_gpu.yaml", (
         Case("text_to_text", "chat", chat(lambda: TWO_PLUS_TWO), ANSWER_4),
         Case("image_to_text", "chat", chat(vision_prompt), ANSWER_RED),

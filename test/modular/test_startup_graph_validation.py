@@ -855,14 +855,19 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _muse_spark(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal import MediaEncoder, vision_encoder
     from mstar.model.multimodal_decoder import MediaIntake
-    from mstar.model.muse.config import MuseSparkConfig
+    from mstar.model.muse.config import MuseSparkAudioConfig, MuseSparkConfig
     from mstar.model.muse.spark_model import MuseSparkModel
+    audio = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (1,), chunk_tokens=250)
     config, vision_config = _muse_configs(MuseSparkConfig, 1048576)
+    audio_config = MuseSparkAudioConfig(patch_sizes=[4, 2], hidden_sizes=[8, 16], depths=[1, 1], out_hidden_size=256)
     return _bare(
-        MuseSparkModel, config=config, vision_config=vision_config,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        MuseSparkModel, config=config, vision_config=vision_config, audio_config=audio_config,
+        media=(
+            MediaIntake("image", vision_encoder((0,)), 0, None),
+            MediaIntake("audio", audio, 1, None),
+        ),
     )
 
 

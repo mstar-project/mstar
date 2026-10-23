@@ -523,14 +523,18 @@ TEMPLATE = (
 
 @pytest.fixture
 def model_dir(ckpt_dir):
+    return _write_tokenizer(ckpt_dir, SPECIALS, TEMPLATE)
+
+
+def _write_tokenizer(ckpt_dir, specials, template):
     from tokenizers import Tokenizer, models, pre_tokenizers, processors
 
-    vocab = {t: i for i, t in enumerate(SPECIALS)}
+    vocab = {t: i for i, t in enumerate(specials)}
     for word in ("system", "user", "assistant", "sys", "high", "low", "Describe", "this", "and", "[UNK]"):
         vocab[word] = len(vocab)
     tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
     tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-    tok.add_special_tokens(SPECIALS)
+    tok.add_special_tokens(specials)
     # as the checkpoint's: the post-processor prepends BOS by itself
     tok.post_processor = processors.TemplateProcessing(
         single="<|begin_of_text|> $A", special_tokens=[("<|begin_of_text|>", 0)],
@@ -539,7 +543,7 @@ def model_dir(ckpt_dir):
     (ckpt_dir / "tokenizer_config.json").write_text(json.dumps({
         "bos_token": "<|begin_of_text|>", "eos_token": "<|end_of_text|>",
     }))
-    (ckpt_dir / "chat_template.jinja").write_text(TEMPLATE)
+    (ckpt_dir / "chat_template.jinja").write_text(template)
     return ckpt_dir
 
 
@@ -661,6 +665,11 @@ def _spark_raw(layers: int = 4) -> dict:
         "residual_gate_temperature": 0.3, "mlp_layer_types": ["sparse"] * layers,
         "num_shared_experts": 0,
     })
+    raw["audio_config"] = {
+        "patch_sizes": [4, 2], "hidden_sizes": [8, 16], "depths": [1, 1], "num_hidden_layers": 2,
+        "out_hidden_size": 64, "conv_kernel_size": 3, "mlp_ratio": 2.0, "rms_norm_eps": 1e-6,
+        "hidden_act": "gelu", "initializer_range": 0.02, "model_type": "muse_spark_audio",
+    }
     return raw
 
 
@@ -871,3 +880,347 @@ def test_spark_s_patch_embedding_matches_transformers_on_non_square_grids(tmp_pa
     with torch.no_grad():
         theirs = tower.ln_pre(ref(pixels, torch.tensor(grid)))[ti.window_index]
     torch.testing.assert_close(ours, theirs)
+
+
+# --- Muse Spark audio ----------------------------------------------------------------
+
+
+AUDIO_SPECIALS = ["<|audio|>", "<|soft_audio_start|>", "<|soft_audio_end|>"]
+SPARK_TEMPLATE = (
+    "{{- bos_token -}}<|start|>system<|message|>sys {{ reasoning_effort | default('high') }}<|eot|>"
+    "{%- for m in messages -%}<|start|>{{ m.role }}<|message|>"
+    "{%- for p in m.content -%}{%- if p.type == 'image' -%}<|patch|>"
+    "{%- elif p.type == 'audio' -%}<|audio|>"
+    "{%- else -%}{{ p.text }}{%- endif -%}{%- endfor -%}<|eot|>{%- endfor -%}"
+    "{%- if add_generation_prompt -%}<|start|>assistant{%- endif -%}"
+)
+
+
+@pytest.fixture
+def spark_dir(tmp_path):
+    specials = SPECIALS + AUDIO_SPECIALS
+    raw = _spark_raw()
+    raw["audio_token_id"] = specials.index("<|audio|>")
+    _write(tmp_path, raw)
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 4]}))
+    return _write_tokenizer(tmp_path, specials, SPARK_TEMPLATE)
+
+
+def test_each_audio_clip_expands_between_the_soft_audio_sentinels(spark_dir):
+    """A clip takes ``ceil(samples / samples_per_token)`` pads (8 samples a
+    token here), padded to whole tokens; the walk runs the encoders the
+    prompt needs."""
+    from mstar.model.multimodal import MEDIA_LAYOUT
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    model = MuseSparkModel(str(spark_dir))
+    audio_pad, start, end = (model.tokenizer.convert_tokens_to_ids(t) for t in AUDIO_SPECIALS)
+    out = model.process_prompt(
+        "Describe this", ["audio", "text"], ["text"],
+        tensors={"audio_inputs": [torch.randn(20)]}, reasoning_effort="low",
+    )
+    layout = out.metadata[MEDIA_LAYOUT]
+    tensors = out.new_input_tensors
+    (ids,) = tensors["text_inputs"]
+    (offset,), (n,) = layout["offset"], layout["tokens"]
+    assert n == 3 and layout["output"] == ["audio_embeds"]
+    assert ids.tolist()[offset - 1:offset + n + 1] == [start] + [audio_pad] * 3 + [end]
+    (clip,) = tensors["audio_values"]
+    # in the tower's dtype, which its first op casts the samples to anyway
+    assert clip.shape == (24,) and clip.dtype == torch.bfloat16 and not clip[20:].any()
+
+    signals = {k: list(v) for k, v in tensors.items()}
+    (step,) = model._prefill_schedule(["audio", "text"], signals, layout)
+    assert step.walk == "prefill_audio"
+    # the audio loop runs the clip's one chunk; a prompt with no audio has no such loop
+    assert model.get_loop_caps(**out.metadata)["audio_encoder_chunks"] == 1
+    assert "audio_encoder_chunks" not in model.get_loop_caps(
+        **model.process_prompt("Describe this", ["text"], ["text"]).metadata,
+    )
+    with_image = model.process_prompt(
+        "Describe this", ["image", "audio", "text"], ["text"],
+        tensors={"image_inputs": [torch.rand(3, 30, 50)], "audio_inputs": [torch.randn(8)]},
+    )
+    signals = {k: list(v) for k, v in with_image.new_input_tensors.items()}
+    (step,) = model._prefill_schedule(["image", "audio", "text"], signals, with_image.metadata[MEDIA_LAYOUT])
+    assert step.walk == "prefill_vision_audio"
+
+
+def test_a_request_s_audio_past_max_audio_seconds_is_refused(spark_dir):
+    """``max_audio_seconds`` caps a request's clips together, as a 400."""
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    probe = MuseSparkModel(str(spark_dir)).audio_config
+    # four tokens of 8 samples
+    model = MuseSparkModel(str(spark_dir), max_audio_seconds=4.5 * probe.samples_per_token / probe.sampling_rate)
+    clip = torch.randn(2 * probe.samples_per_token)
+    model.process_prompt("Hi", ["audio", "audio", "text"], ["text"], tensors={"audio_inputs": [clip, clip]})
+    with pytest.raises(ValueError, match="at most 4 audio tokens"):
+        model.process_prompt(
+            "Hi", ["audio", "audio", "audio", "text"], ["text"], tensors={"audio_inputs": [clip, clip, clip]},
+        )
+
+
+def test_spark_s_audio_node_refuses_a_dtype_its_clips_do_not_arrive_in(spark_dir):
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    with pytest.raises(ValueError, match="audio tower runs in"):
+        MuseSparkModel(str(spark_dir))._create_submodule("audio_encoder", "cpu", torch.float32, None)
+
+
+@pytest.mark.parametrize(("setting", "encoder_ranks", "refused"), [
+    (True, [0], True), (["LLM"], [0], True), (True, [2], False), (False, [0], False), (["vision_encoder"], [0], False),
+])
+def test_spark_refuses_tp_async_scheduling_beside_an_encoder(spark_dir, monkeypatch, setting, encoder_ranks, refused):
+    """TP async scheduling of the LLM is refused at startup while an encoder
+    shares one of its ranks."""
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
+    config = {
+        "tp_async_sched": setting,
+        "node_groups": [
+            {"node_names": ["vision_encoder", "audio_encoder"], "ranks": encoder_ranks},
+            {"node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2, "ep_config": {"parallel": "ep"}},
+        ],
+    }
+    model = MuseSparkModel(str(spark_dir))
+    if refused:
+        with pytest.raises(ValueError, match="TP async scheduling"):
+            model.validate_config_yaml(config, "config.yaml")
+    else:
+        model.validate_config_yaml(config, "config.yaml")
+
+
+# the checkpoint's processor_config.json, at the test tower's 8 samples a token
+FEATURE_EXTRACTOR = {
+    "feature_extractor_type": "MuseSparkFeatureExtractor", "feature_size": 1, "padding_side": "right",
+    "padding_value": 0.0, "return_attention_mask": True, "samples_per_token": 8, "sampling_rate": 24000,
+}
+
+
+def _audio_tower(tmp_path):
+    from mstar.model.muse.components.audio import MuseSparkAudioTower
+    from mstar.model.muse.config import MuseSparkAudioConfig
+
+    torch.manual_seed(0)
+    (tmp_path / "processor_config.json").write_text(json.dumps({"feature_extractor": FEATURE_EXTRACTOR}))
+    config = MuseSparkAudioConfig.from_hf(_write(tmp_path, _spark_raw()))
+    assert config.samples_per_token == 8 and config.sampling_rate == 24_000
+    tower = MuseSparkAudioTower(config)
+    for p in tower.parameters():
+        torch.nn.init.normal_(p, std=0.2)
+    return tower
+
+
+@pytest.mark.parametrize("change, match", [
+    (lambda raw, fe: raw.pop("audio_config"), "no audio_config"),
+    (lambda raw, fe: raw["audio_config"].update(causal=False), r"audio_config's \['causal'\]"),
+    (lambda raw, fe: fe.update(padding_side="left"), "feature_extractor's padding_side"),
+    (lambda raw, fe: fe.update(samples_per_token=1920), "feature_extractor's samples_per_token"),
+    (lambda raw, fe: fe.update(do_normalize=True), "feature_extractor's do_normalize"),
+], ids=["no_audio", "unknown_key", "left_padded", "token_width", "normalized"])
+def test_an_audio_config_intake_would_misread_is_refused(tmp_path, change, match):
+    from mstar.model.muse.config import MuseSparkAudioConfig
+
+    raw, fe = _spark_raw(), dict(FEATURE_EXTRACTOR)
+    change(raw, fe)
+    (tmp_path / "processor_config.json").write_text(json.dumps({"feature_extractor": fe}))
+    with pytest.raises(ValueError, match=match):
+        MuseSparkAudioConfig.from_hf(_write(tmp_path, raw))
+
+
+def _encode(tower, clips: dict[str, list[torch.Tensor]], chunk: int):
+    """Each request's rows from the audio node's Loop at ``chunk`` tokens,
+    driven as the runtime drives it: each request's chunk count from
+    ``get_loop_caps``, the iteration map, and steps that batch every request
+    still running (first, continuing and partial chunks) over the pool.
+    On CUDA, preprocess must not wait on the device."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.recurrent.config import RecurrentStateConfig, RecurrentStateSpec
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+    from mstar.engine.resources.step import StepContext
+    from mstar.model.components.chunked_causal_encoder import ChunkedCausalEncoder
+    from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.muse.components.audio import conv_state_blocks
+    from mstar.model.muse.config import AUDIO_CONV
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    device = next(tower.parameters()).device
+    encoder = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (7,), chunk_tokens=chunk)
+    node = ChunkedCausalEncoder(tower, tower.config.samples_per_token, encoder, (encoder,), AUDIO_CONV)
+    pool = RecurrentStatePool.build(
+        RecurrentStateSpec(AUDIO_CONV, {"audio_encoder"}, RecurrentStateConfig(
+            num_layers=1, blocks=conv_state_blocks(tower.config, torch.float32), max_slots=len(clips) + 1,
+        )),
+        EngineResourceInfo(device=device),
+    )
+    node.bind_node_resources({AUDIO_CONV: pool})
+    model = object.__new__(MuseSparkModel)
+    model.media = (MediaIntake("audio", encoder, 7, None),)
+
+    layouts = {
+        rid: {"tokens": [c.numel() // 8 for c in cs], "output": ["audio_embeds"] * len(cs)}
+        for rid, cs in clips.items()
+    }
+    caps = {rid: model.get_loop_caps(**{MEDIA_LAYOUT: layout})[encoder.loop] for rid, layout in layouts.items()}
+    out = {rid: [] for rid in clips}
+    for i in range(max(caps.values())):
+        rids = [rid for rid in clips if i < caps[rid]]
+        rows = [
+            node.prepare_inputs("prefill_audio", SimpleNamespace(
+                dynamic_loop_iter_counts={encoder.loop: i}, step_metadata={MEDIA_LAYOUT: layouts[rid]},
+            ), {"audio_values": clips[rid]})
+            for rid in rids
+        ]
+        step = node.declare_step("prefill_audio", rids, rows).get(AUDIO_CONV)
+        ctx = StepContext(request_ids=rids, graph_walk="prefill_audio", slot=0, capture=False)
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        if device.type == "cuda":
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            values = node.preprocess("prefill_audio", None, rows)
+        finally:
+            if device.type == "cuda":
+                torch.cuda.set_sync_debug_mode("default")
+        with torch.no_grad():
+            embeds = node.forward_batched("prefill_audio", None, **values).row_outputs["audio_embeds"]
+        pool.commit(step, ctx)
+        for j, (rid, row) in enumerate(zip(rids, rows, strict=True)):
+            outputs = {"audio_embeds": [embeds[j:j + 1]]}  # the engine's row view
+            node.postprocess(rid, None, outputs, inputs=row)
+            out[rid] += outputs["audio_embeds"]
+    # each clip's last chunk gave its slot back
+    assert pool.num_free_slots == pool.config.usable_slots
+    return {rid: torch.cat(chunks) for rid, chunks in out.items()}, caps
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    # the norms' CUDA kernel: a lone clip's conv output reached it with a row stride of 1
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")),
+])
+def test_the_audio_loop_s_chunks_are_each_clip_s_whole_tokens(tmp_path, device, fp32_matmul):
+    """Two requests' clips (2 + 5 tokens, and 3) in chunks of 2 tokens, on the
+    device a worker receives them on: each request's rows, in order, are its
+    clips' tokens each run as one chunk (within fp32 summation order)."""
+    import copy
+
+    # fp32_matmul: TF32 (the engine's setting) rounds the chunks' GEMMs and the whole clip's differently
+    tower = _audio_tower(tmp_path).to(device)
+    clips = {
+        rid: [torch.randn(n, device=device) for n in samples]
+        for rid, samples in {"a": (16, 40), "b": (24,)}.items()
+    }
+    chunked, caps = _encode(copy.deepcopy(tower), clips, chunk=2)
+    assert caps == {"a": 4, "b": 2}
+    whole, caps = _encode(tower, clips, chunk=5)
+    assert caps == {"a": 2, "b": 1}
+    for rid in clips:
+        torch.testing.assert_close(chunked[rid], whole[rid], rtol=1e-5, atol=1e-5)
+
+
+def test_host_chunks_cross_in_one_pinned_copy_beside_a_replay_s_padding_rows(tmp_path, monkeypatch):
+    """A replay's padding rows are already on the device; the step's host
+    chunks still cross in one pinned tensor, not a pageable copy a row.
+    ``meta`` stands in for the device, so this runs without CUDA."""
+    from mstar.model.components.chunked_causal_encoder import ChunkedCausalEncoder
+    from mstar.model.multimodal import MediaEncoder
+    from mstar.model.muse.config import AUDIO_CONV
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (7,), chunk_tokens=2)
+    node = ChunkedCausalEncoder(_audio_tower(tmp_path), 8, encoder, (encoder,), AUDIO_CONV)
+    host = [torch.randn(16), torch.randn(8)]  # a full chunk and a partial one
+    staged = torch.stack([host[0], F.pad(host[1], (0, 8)), torch.zeros(16)])
+    rows = [NodeInputs(tensor_inputs={"values": v}) for v in (*host, torch.zeros(16, device="meta"))]
+
+    pinned, host_copies = [], []
+    zeros, copy_ = torch.zeros, torch.Tensor.copy_
+
+    def zeros_recorded(*args, pin_memory=False, **kwargs):  # pinning needs a CUDA build
+        out = zeros(*args, **kwargs)
+        if pin_memory:
+            pinned.append(out)
+        return out
+
+    def copy_recorded(dst, src, *args, **kwargs):
+        if src.device.type == "cpu":
+            host_copies.append(dst.untyped_storage().data_ptr())
+        return copy_(dst, src, *args, **kwargs)
+
+    monkeypatch.setattr(node, "get_device", lambda: torch.device("meta"))
+    monkeypatch.setattr(torch, "zeros", zeros_recorded)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_recorded)
+    values = node.preprocess("prefill_audio", None, rows)["values"]
+    monkeypatch.undo()
+
+    assert values.device.type == "meta" and len(pinned) == 1
+    assert host_copies == [pinned[0].untyped_storage().data_ptr()] * len(host)
+    torch.testing.assert_close(pinned[0], staged)
+
+
+def test_the_audio_node_refuses_a_pool_without_its_sink(tmp_path):
+    """A replay's padding rows read and write the pool's sink slot; without
+    one they would index slot -1."""
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.recurrent.config import RecurrentStateConfig, RecurrentStateSpec
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+    from mstar.model.components.chunked_causal_encoder import ChunkedCausalEncoder
+    from mstar.model.multimodal import MediaEncoder
+    from mstar.model.muse.components.audio import conv_state_blocks
+    from mstar.model.muse.config import AUDIO_CONV
+
+    tower = _audio_tower(tmp_path)
+    encoder = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (7,), chunk_tokens=2)
+    node = ChunkedCausalEncoder(tower, 8, encoder, (encoder,), AUDIO_CONV)
+    pool = RecurrentStatePool.build(
+        RecurrentStateSpec(AUDIO_CONV, {"audio_encoder"}, RecurrentStateConfig(
+            num_layers=1, blocks=conv_state_blocks(tower.config, torch.float32), max_slots=2,
+            disable_sink_slot=True,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+    with pytest.raises(ValueError, match="needs its sink slot"):
+        node.bind_node_resources({AUDIO_CONV: pool})
+
+
+def test_the_audio_tower_matches_transformers(tmp_path):
+    """The tower on a whole clip as one chunk against transformers'
+    MuseSparkAudioModel on the same weights, then the text embedding's
+    weightless norm the reference applies to audio features."""
+    modeling = pytest.importorskip("transformers.models.muse_spark.modeling_muse_spark")
+    from transformers.models.muse_spark.configuration_muse_spark import MuseSparkAudioConfig
+
+    tower = _audio_tower(tmp_path)
+    ref = modeling.MuseSparkAudioModel(MuseSparkAudioConfig(**_spark_raw()["audio_config"])).eval()
+    ref.load_state_dict(tower.state_dict())
+    clip = torch.randn(1, 40)
+    with torch.no_grad():
+        theirs = unit_rms(ref(input_values=clip).last_hidden_state, tower.config.text_rms_norm_eps)
+    ours, _ = _encode(tower, {"r": [clip[0]]}, chunk=5)
+    torch.testing.assert_close(ours["r"], theirs[0], rtol=1e-5, atol=1e-5)
+
+
+def test_every_audio_parameter_has_a_checkpoint_tensor(tmp_path):
+    from mstar.model.muse.components.audio import MuseSparkAudioTower
+    from mstar.model.muse.config import MuseSparkAudioConfig
+    from mstar.model.muse.weight_loader import audio_name_remapper
+
+    with torch.device("meta"):
+        tower = MuseSparkAudioTower(MuseSparkAudioConfig.from_hf(_write(tmp_path, _spark_raw())))
+    names = ["norm.weight", "proj.weight", "proj.bias", "post_proj_norm.weight"]
+    for i in range(2):
+        names += [f"layers.{i}.patch_embedder.{s}" for s in ("proj.weight", "proj.bias", "norm.weight")]
+        names += [f"layers.{i}.conv_blocks.0.{s}" for s in (
+            "conv.weight", "conv.bias", "norm.weight", "mlp.fc1.weight", "mlp.fc1.bias",
+            "mlp.fc2.weight", "mlp.fc2.bias",
+        )]
+    # the released index's names, under model.audio_tower.
+    assert {n for n, _ in tower.named_parameters()} == {audio_name_remapper("model.audio_tower." + n) for n in names}
+    assert tower.layers[0].conv_blocks[0].conv.weight.shape == (8, 1, 3)
+

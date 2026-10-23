@@ -23,6 +23,10 @@ IMAGE_START = "<|image_start|>"
 IMAGE_END = "<|image_end|>"
 # the template writes one per image; the prompt expands it to the image's tokens
 IMAGE_PAD = "<|patch|>"
+# Muse Spark: one per audio clip, expanded likewise between the soft-audio sentinels
+AUDIO_START = "<|soft_audio_start|>"
+AUDIO_END = "<|soft_audio_end|>"
+AUDIO_PAD = "<|audio|>"
 
 
 def load_tokenizer(local_dir: str | Path):

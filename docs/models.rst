@@ -62,9 +62,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
    * - ``muse_spark`` *(Beta)*
      - ``meta-models/Muse-Spark-Open-816B-A42B``
-     - Meta's 816B (42B active) mixture-of-experts VLM: Glimmer's attention and
-       ViT, gated residuals and 256 experts (8 a token) in a 4096-wide latent.
-       BF16 on one 8x B300 node.
+     - Meta's 816B (42B active) mixture-of-experts model (text + image + audio in,
+       text out): Glimmer's attention and ViT, a waveform audio tower, gated
+       residuals and 256 experts (8 a token) in a 4096-wide latent. BF16 on one
+       8x B300 node.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -335,8 +336,9 @@ torchvision falls back to PIL's Lanczos with a warning, and its pixels differ sl
 Muse Spark Open (``muse_spark``)
 --------------------------------
 
-Meta's Muse Spark Open, 816B total and 42B active: text-and-image chat on
-``POST /generate`` and ``/v1/chat/completions``, with Muse Glimmer's prompt,
+Meta's Muse Spark Open, 816B total and 42B active: text, image and audio chat
+(``audio_url`` and ``input_audio`` parts) on ``POST /generate`` and
+``/v1/chat/completions``, with Muse Glimmer's prompt,
 reasoning strengths (default ``xhigh`` here) and channel stream (see above);
 sampling defaults to the checkpoint's (temperature 1, top_k 64). BF16
 needs one 8x B300 node (~213 GB of weights a rank); 8x B200 or H200 do not
@@ -349,7 +351,17 @@ The LLM runs TP8 with the 256 experts split whole across the ranks, 32 each
 each expert's output is RMS-normed before its routing weight, so a rank sums
 its own experts and one all-reduce over the 4096-wide latent combines them.
 The residual stream is kept in fp32 across layers, as SGLang and vLLM serve
-it (transformers rounds it to bf16 at every residual gate). Not yet supported:
+it (transformers rounds it to bf16 at every residual gate). Audio is resampled
+to 24 kHz mono and takes one token per 80 ms. The ``audio_encoder`` node runs
+the convolutional tower on one 20-second chunk of a clip a step, as a graph
+loop, so chunks of different requests batch into one captured shape; each
+conv's left context is carried between chunks in the ``audio_conv`` recurrent
+pool, which a clip holds while it is encoded (``max_slots`` in the YAML).
+A request's audio, all its clips together, is capped at the YAML's
+``model_kwargs: {max_audio_seconds: ...}`` (default 1800), as rank 0 holds the
+clips' encoder outputs until the request's prefill. TP async scheduling
+(``tp_async_sched``) is refused while an encoder shares the LLM's ranks.
+Not yet supported:
 NVFP4 experts (what the published 8x H200 setups serve), an FP8 KV cache,
 releasing the sliding layers' KV pages, video and the DFlash drafter.
 

@@ -54,6 +54,13 @@ def text_name_remapper(name: str) -> str | None:
     return "model." + name[len(_TEXT_PREFIX):]
 
 
+_AUDIO_PREFIX = "model.audio_tower."
+
+
+def audio_name_remapper(name: str) -> str | None:
+    return name[len(_AUDIO_PREFIX):] if name.startswith(_AUDIO_PREFIX) else None
+
+
 def vision_name_remapper(name: str) -> str | None:
     for prefix, ours in _VISION.items():
         if name.startswith(prefix):
@@ -92,3 +99,9 @@ def load_vision_weights(
         model, path, device, vision_name_remapper,
         [{"prefix": prefix} for prefix in _VISION],
     )
+
+
+def load_audio_weights(
+    model: nn.Module, path: str | Path, device: torch.device | str = "cpu",
+) -> set[str]:
+    return _load(model, path, device, audio_name_remapper, [{"prefix": _AUDIO_PREFIX}])

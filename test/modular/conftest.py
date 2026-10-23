@@ -11,7 +11,8 @@ Two stubs that exist purely so test imports survive on local macOS dev:
    minimal stub so the import succeeds; tests that exercise the kernels
    themselves still need a real GPU.
 
-And one autouse fixture that clears the cached platform around every test.
+An autouse fixture that clears the cached platform around every test, and
+``fp32_matmul`` for tests whose oracle needs true fp32 matmuls.
 """
 import sys
 import types
@@ -81,3 +82,14 @@ def _fresh_platform():
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()
+
+
+# --- matmul precision ---------------------------------------------------------
+
+@pytest.fixture
+def fp32_matmul():
+    """mstar.engine sets TF32 matmuls globally; the oracle needs true fp32."""
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    yield
+    torch.set_float32_matmul_precision(prev)
