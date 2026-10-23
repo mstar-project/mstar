@@ -122,6 +122,12 @@ class RopeManager(PositionManager):
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
                 raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            if device.type == "cuda" and rotary_dim % 16:
+                # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
+                # rotation reads past each head and returns garbage, without an error
+                raise ValueError(
+                    f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
+                    f"not {rotary_dim}")
             self._rope_table = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,

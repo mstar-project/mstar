@@ -2,6 +2,7 @@
 table built once from the config, so per-call RoPE arguments the table does
 not encode are refused instead of silently ignored."""
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -83,6 +84,16 @@ def test_llama31_scaling_is_refused_at_runtime_unless_it_is_a_no_op(kernel_calls
     with pytest.raises(NotImplementedError, match="Llama 3.1"):
         scaled.apply_qk(*qk(), "main", **ATTENTION_LLAMA31_DEFAULTS)
     assert len(kernel_calls) == 1
+
+
+def test_cuda_refuses_a_table_narrower_than_the_kernels_vector(monkeypatch):
+    """FlashInfer's cos/sin-cache kernel moves 16 elements a thread: at a width of 8 it rotated
+    garbage instead of failing."""
+    monkeypatch.setattr(RopeManager, "_build_rope_cache", lambda self, *args: torch.zeros(1))
+    config = PositionConfig(kv_cache="kv", interleave=True, rotary_dim=8, rope_table_dtype=torch.float32)
+    with pytest.raises(ValueError, match="multiple of 16"):
+        RopeManager(config, torch.device("cuda"), max_seq_len=64, head_dim=8)
+    RopeManager(dataclasses.replace(config, rotary_dim=16), torch.device("cuda"), max_seq_len=64)
 
 
 def test_llama31_config_is_refused_at_build():
