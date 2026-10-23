@@ -29,7 +29,7 @@ class _RecordingSubmodule(NodeSubmodule):
 
 def _engine_with(submodule) -> Engine:
     engine = object.__new__(Engine)
-    engine._submodules = {"vocoder": SimpleNamespace(submodule=submodule, resources={})}
+    engine._submodules = {"vocoder": SimpleNamespace(submodule=submodule, resources={}, input_specs={})}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
     return engine

@@ -61,7 +61,7 @@ class _Sub:
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
+    eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={}, input_specs={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     return eng

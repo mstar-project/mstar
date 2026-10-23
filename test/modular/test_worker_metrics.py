@@ -95,7 +95,7 @@ def _engine(resources=(), sub=None, keyed=False) -> Engine:
     eng = Engine.__new__(Engine)
     eng._resources = {r.name: r for r in resources}
     eng._resource_nodes = {r.name: frozenset({NODE}) for r in resources}
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})}
+    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={}, input_specs={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})

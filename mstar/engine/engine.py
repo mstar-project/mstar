@@ -24,6 +24,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
+from mstar.engine.input_spec import ResolvedSpec, apply_input_specs, resolve_input_specs
 from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -129,6 +130,8 @@ class SubmoduleManagement:
     resources: dict[str, Resource]
     # param dtype, fp32 modules and autocast; resolved once at load
     precision: NodePrecision = field(default_factory=lambda: NodePrecision(None))
+    # the node's input_specs against its precision; applied per row before prepare_inputs
+    input_specs: Mapping[str, ResolvedSpec] = field(default_factory=dict)
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -605,6 +608,9 @@ class Engine:
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
                 precision=precisions[node_name],
+                input_specs=resolve_input_specs(
+                    node_name, submodule.input_specs, precisions[node_name],
+                ),
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -977,6 +983,7 @@ class Engine:
         tensors = batch.per_request_input_tensors
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
+        specs = mgmt.input_specs
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
         # read leniently, as the probe itself was only reached per prepared row.
         # Under a combined walk each row has its own walk, so a mixed step
@@ -1008,10 +1015,13 @@ class Engine:
             row_walk = walk_of(rid) if mixed else walk
             probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             try:
+                row_inputs = tensors.get(rid, {})
+                if specs:
+                    row_inputs = apply_input_specs(batch.node_name, row_inputs, specs)
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
-                    inputs=tensors.get(rid, {}),
+                    inputs=row_inputs,
                     resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the

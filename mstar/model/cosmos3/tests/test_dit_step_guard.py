@@ -141,7 +141,7 @@ def test_finished_request_re_queued_fails_alone_instead_of_asserting():
         batch, "request_ids", [r for r in batch.request_ids if r not in rids])
     batch.register_failure = lambda rid, err: batch.failed_requests.__setitem__(rid, str(err))
     eng = Engine.__new__(Engine)
-    eng._submodules = {"dit": SimpleNamespace(submodule=dit, resources={})}
+    eng._submodules = {"dit": SimpleNamespace(submodule=dit, resources={}, input_specs={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
 

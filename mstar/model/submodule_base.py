@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.input_spec import TensorSpec
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -502,6 +503,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # step, which a node that reads its tokens on the host (Whisper's decoder)
     # would pay for nothing.
     reads_device_loopback: bool = False
+
+    # The dtype each input signal is taken in (``mstar.engine.input_spec``). The
+    # engine resolves these at load and applies them to every request's routed
+    # tensors before ``prepare_inputs``, so the node casts none by hand. Read
+    # once, after the node is built: an instance may set it from its own state.
+    input_specs: Mapping[str, TensorSpec] = MappingProxyType({})
 
     def __init__(self):
         super().__init__()
