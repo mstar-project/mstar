@@ -2266,6 +2266,9 @@ class KVManager(AttentionResource):
                 if rows.built is not None and not rows.built[0]:
                     row_pages = list(row_pages)
                 streams, last_page = rows.streams, rows.last_page
+                # a row that crossed by one page kept the pages it had: its new
+                # page goes in after them, and the rest of the array stands
+                appended = True
                 for i in crossed.tolist():
                     want = int(npages[i])
                     stream = streams[i]
@@ -2274,13 +2277,19 @@ class KVManager(AttentionResource):
                         stats["miss"] += 1
                         return None
                     pages = held[:want]
+                    appended = appended and pages[:-1] == row_pages[i]
                     row_pages[i] = pages
                     last_page[i] = pages[-1]
                     gens[i] = stream.generation
                 rows.row_pages = row_pages
-                rows.indices = np.fromiter(
-                    itertools.chain.from_iterable(row_pages), np.int32, int(npages.sum()),
-                )
+                if appended and (npages[crossed] - rows.npages[crossed] == 1).all():
+                    rows.indices = np.insert(
+                        rows.indices, np.cumsum(rows.npages)[crossed], last_page[crossed],
+                    )
+                else:
+                    rows.indices = np.fromiter(
+                        itertools.chain.from_iterable(row_pages), np.int32, int(npages.sum()),
+                    )
             rows.lens = lens
             rows.npages = npages
             rows.gens = gens
