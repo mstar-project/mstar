@@ -50,7 +50,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
-       LM, text in / text out, fp8 checkpoint, TP8.
+       LM, text in / text out, fp8 checkpoint, TP8. Under MTP it serves without the
+       prefix cache: with both on, a 482k-token multikey case was answered wrong.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet

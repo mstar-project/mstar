@@ -195,8 +195,12 @@ class Glm5NextModel(Model):
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Under dsa_long_context the prompt's ids key the MLA cache and the KDA state's
-        snapshots beside it: a hit needs both. Replies are not keyed, as GLM-5.2's."""
-        if not self.config.dsa_long_context:
+        snapshots beside it: a hit needs both. Replies are not keyed, as GLM-5.2's.
+
+        Not under MTP: with a hit and MTP both on, one multikey case at 482k tokens is answered
+        wrong, the same way every run, and greedy MTP must never change the trunk's output, so
+        some state after a hit is wrong. Off until that is found."""
+        if not self.config.dsa_long_context or self.config.mtp_num_draft_tokens > 0:
             return {}
         stream = PrefixStream("text_inputs", "ids", "prefill")
         return {KV_CACHE: {"main": stream}, KDA_STATE: {"main": stream}}
@@ -265,7 +269,7 @@ class Glm5NextModel(Model):
                     blocks=kda_blocks,
                     max_slots=self.kda_max_requests + 1,  # + the sink
                     # prefix reuse past a long prompt: its KDA state at page boundaries
-                    prefix_slots=16 if self.config.dsa_long_context else 0,
+                    prefix_slots=16 if self.prefix_key_streams() else 0,
                     prefix_page_size=128,
                 ),
             ),

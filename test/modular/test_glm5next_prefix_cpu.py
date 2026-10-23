@@ -202,7 +202,8 @@ def _prompt(n: int, seed: int) -> list[int]:
     return torch.randint(2, 240, (n,), generator=g).tolist()
 
 
-@pytest.mark.parametrize("k", [0, 3])
+# k > 0 too once MTP serves prefix hits again (Glm5NextModel.prefix_key_streams)
+@pytest.mark.parametrize("k", [0])
 def test_a_prompt_past_a_cached_prefix_generates_what_a_fresh_prefill_does(k, tmp_path):
     a = _prompt(150, seed=1)
     cases = {
@@ -226,7 +227,7 @@ def test_a_prompt_past_a_cached_prefix_generates_what_a_fresh_prefill_does(k, tm
             assert torch.equal(have, ref), rid
 
 
-@pytest.mark.parametrize("k", [0, 3])
+@pytest.mark.parametrize("k", [0])
 def test_prompts_prefilled_in_one_step_each_save_their_state(k, tmp_path):
     """a and o share a prefill step; each saves its state where its own pages end, so a next
     turn of either skips its first 144 tokens and lands where a fresh prefill does."""

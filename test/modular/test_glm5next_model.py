@@ -557,10 +557,7 @@ def test_serve_yaml_caps_prefill_steps(name):
     assert serve["model_kwargs"]["prefill_max_step_tokens"] == "auto"
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8_longctx.yaml", "glm5_next_tp8_longctx_mtp.yaml"])
-def test_longctx_yaml_keeps_two_snapshots_for_each_of_8_sessions(name):
-    """The yaml's prefix_slots reaches the KDA pool: a multi-turn session holds the snapshot its
-    turn restored and the one it saved."""
+def _longctx_specs(name: str, mtp: int = 0):
     import yaml
 
     from mstar.engine.resources.spec import apply_yaml_overrides
@@ -569,12 +566,30 @@ def test_longctx_yaml_keeps_two_snapshots_for_each_of_8_sessions(name):
     model = object.__new__(Glm5NextModel)
     model.config = Glm5NextModelConfig()
     model.config.dsa_long_context = True
+    model.config.mtp_num_draft_tokens = mtp
     model.kda_max_requests = 64
     model.kda_conv_dtype = torch.bfloat16
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, serve)
+    return model, specs, serve
+
+
+def test_longctx_yaml_keeps_two_snapshots_for_each_of_8_sessions():
+    """The yaml's prefix_slots reaches the KDA pool: a multi-turn session holds the snapshot its
+    turn restored and the one it saved."""
+    _, specs, serve = _longctx_specs("glm5_next_tp8_longctx.yaml")
     pool = next(s.config for s in specs if s.resource_key == KDA_STATE)
     assert pool.prefix_slots == serve["resources"]["kda_state"]["prefix_slots"] >= 2 * 8
+
+
+def test_mtp_serves_without_the_prefix_cache():
+    """With a hit and MTP both on, a 482k-token multikey case was answered wrong every run: no
+    prefix keys under MTP, so no hit, and no snapshot slots held for one."""
+    model, specs, serve = _longctx_specs("glm5_next_tp8_longctx_mtp.yaml", mtp=3)
+    assert serve["model_kwargs"]["mtp_num_draft_tokens"] == 3
+    assert model.prefix_key_streams() == {}
+    assert next(s.config for s in specs if s.resource_key == KDA_STATE).prefix_slots == 0
+    assert not serve["resources"]["kv_cache"].get("prefix_cache_tp")
 
 
 def test_glm5next_model_constructs_from_config():

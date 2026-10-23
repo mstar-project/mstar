@@ -34,13 +34,10 @@ resources:
     # ~32 GB/rank next to ~38 GB of weights.
     max_num_pages: 8960
     page_size: 128
-    # the prefix cache at TP > 1: rank 0 decides each hit and the other ranks adopt it
-    prefix_cache_tp: true
+    # No prefix cache under MTP: with both on, a 482k-token multikey case is answered wrong
+    # (Glm5NextModel.prefix_key_streams declares no keys under MTP).
   kda_state:
     max_slots: 65
-    # KDA states kept for prefix reuse, 20.9 MiB a slot per rank: a session's next turn
-    # restores its last turn's, and each session holds about two (restored, then saved)
-    prefix_slots: 32
 # glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill (with its MTP pass) compiles before
 # the server binds, not on the first long request.
 # Each text is its own, so no warmup hits another's cached prefix and each compiles the long
