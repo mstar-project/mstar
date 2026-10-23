@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 23, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -652,6 +652,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-within-spans">Block-causal attention within spans</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#bounded-sink-window-caches">Bounded (sink + window) caches</a></li>
 </ul>
 </li>
 </ul>
@@ -1070,7 +1071,18 @@ Multi-head Latent Attention latent per token in place of K and V. It needs
 <code class="docutils literal notranslate"><span class="pre">RingKVLayerConfig</span></code> per layer, and the deployment-tunable <code class="docutils literal notranslate"><span class="pre">num_sessions</span></code>.
 Ring storage is currently paired with FlexAttention.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec(config=BoundedKVConfig(...))</span></code></p></td>
+<td><p>Fixed-size per-request KV with sink + window retention, and its attention. A
+request’s stream is an optional read-only source (e.g. a voice prompt’s keys,
+shared by the requests that use it) followed by what it writes; <code class="docutils literal notranslate"><span class="pre">retention</span></code> maps
+the source length to the <code class="docutils literal notranslate"><span class="pre">SinkWindow</span></code> kept (the first <code class="docutils literal notranslate"><span class="pre">sink</span></code> entries and the
+last <code class="docutils literal notranslate"><span class="pre">window</span></code>). Each step declares its rows’ <code class="docutils literal notranslate"><span class="pre">StreamPosition</span></code> and writes
+(<code class="docutils literal notranslate"><span class="pre">BoundedKVStep</span></code>), so rows at different positions batch, and nothing is
+reserved or released per step. <code class="docutils literal notranslate"><span class="pre">attend</span></code> takes an optional per-distance score
+term (<code class="docutils literal notranslate"><span class="pre">rel_bias</span></code>) for relative-position attention. Float32 by default (Triton
+kernels). See <a class="reference internal" href="#bounded-sink-window-caches">Bounded (sink + window) caches</a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Self-attention planned over the named cache. <code class="docutils literal notranslate"><span class="pre">backend</span></code> selects
 <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code> (the default, which lets the engine pick the platform’s
 paged backend, FlashInfer for now), <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code>,
@@ -1088,12 +1100,12 @@ the layer applies <code class="docutils literal notranslate"><span class="pre">W
 64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
 fallback, which cannot be captured in a CUDA graph.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
 <td><p>Attention over a paged context that is written once and never extended.
 <code class="docutils literal notranslate"><span class="pre">backend</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code>. Only FlashInfer is implemented.
 See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>Cacheless (ragged) varlen self-attention over the segments packed into one
 forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
@@ -1103,17 +1115,17 @@ default, or <code class="docutils literal notranslate"><span class="pre">RaggedA
 two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>The cross-attention counterpart: one span of each request attends another
 (<code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep(pairs=...)</span></code>). Same config. See <a class="reference internal" href="#cross-attention-between-spans">Cross-attention
 between spans</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...),</span> <span class="pre">block_size=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...),</span> <span class="pre">block_size=...)</span></code></p></td>
 <td><p>Block-causal self-attention within each span (<code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=False)</span></code>): causal
 between <code class="docutils literal notranslate"><span class="pre">block_size</span></code>-token blocks, bidirectional within one. Same config. See
 <a class="reference internal" href="#block-causal-attention-within-spans">Block-causal attention within spans</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
@@ -1121,7 +1133,7 @@ between <code class="docutils literal notranslate"><span class="pre">block_size<
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -1355,6 +1367,40 @@ for the worst layout the bucket’s token count allows.</p>
 us to zero-pad to 128. So that tower attends through the resource only when it is
 replaying a captured graph, and runs flash-attn varlen otherwise.</p>
 </div>
+</section>
+<section id="bounded-sink-window-caches">
+<h4>Bounded (sink + window) caches<a class="headerlink" href="#bounded-sink-window-caches" title="Link to this heading">#</a></h4>
+<p>A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
+prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder’s chunk
+caches do) declares a <code class="docutils literal notranslate"><span class="pre">BoundedKVSpec</span></code>. A request takes a slot when it first runs and
+keeps it; the window is a ring overwritten in place, so a step reserves and releases
+nothing. A step’s layout is at most five key ranges and three write ranges per row,
+computed on the host from the position the step declares, which is also what lets rows at
+different positions share a batch and a captured graph.</p>
+<p>The model calls <code class="docutils literal notranslate"><span class="pre">attend(layer_idx,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">v,</span> <span class="pre">source,</span> <span class="pre">plan)</span></code>: each row attends its
+retained keys in stream order and the step’s keys it writes (all of them for a row that
+writes none), unmasked, and its writes land after. Pass
+<code class="docutils literal notranslate"><span class="pre">source</span></code> (<code class="docutils literal notranslate"><span class="pre">[sources,</span> <span class="pre">rows,</span> <span class="pre">H,</span> <span class="pre">L,</span> <span class="pre">2</span> <span class="pre">*</span> <span class="pre">head_dim]</span></code>, keys then values) when requests start
+from shared prefixes that the slots should not copy; each row reads the one its
+<code class="docutils literal notranslate"><span class="pre">StreamPosition.source</span></code> names, so rows of different prefixes share a batch and a graph. <code class="docutils literal notranslate"><span class="pre">rel_bias</span></code> adds a term that depends only on
+the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
+like MiniCPM-o’s token2wav fits three of them: its two conformer caches and its DiT’s.</p>
+<p>Two flags cover retention rules that are not quite a token FIFO.
+<code class="docutils literal notranslate"><span class="pre">SinkWindow(window_includes_step=True)</span></code> counts the step’s own tokens toward the window.
+<code class="docutils literal notranslate"><span class="pre">BoundedKVConfig(reverse_step_order=True)</span></code> appends each step’s tokens last-first, which
+only makes sense for attention that ignores key order; it decides which of the oldest
+step’s tokens leave first.</p>
+<p>By default the window is per step: every query of a step sees the same keys, the retained
+ones and the step’s own. A streaming encoder whose frames each see a fixed left
+context (a conformer’s <code class="docutils literal notranslate"><span class="pre">att_context_size=[left,</span> <span class="pre">0]</span></code>) sets
+<code class="docutils literal notranslate"><span class="pre">BoundedKVConfig(retention=SinkWindow(0,</span> <span class="pre">left),</span> <span class="pre">query_window=left)</span></code> instead: each query
+attends the keys at distances <code class="docutils literal notranslate"><span class="pre">0..left</span></code> from it, so a step of several frames is causal
+within itself and matches the offline mask. <code class="docutils literal notranslate"><span class="pre">rel_bias</span></code> is then indexed by that distance,
+<code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">H,</span> <span class="pre">T,</span> <span class="pre">left</span> <span class="pre">+</span> <span class="pre">1]</span></code>, and passed unscaled (the kernel scales the sum by
+<code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>). A per-query window takes no sink, and its right context is 0.
+<code class="docutils literal notranslate"><span class="pre">retention</span></code> may be a single <code class="docutils literal notranslate"><span class="pre">SinkWindow</span></code> when it does not depend on the source length.
+<code class="docutils literal notranslate"><span class="pre">BoundedKVConfig(dtype=None)</span></code> stores the cache in the engine’s KV dtype, for layers that
+compute in it.</p>
 </section>
 </section>
 </section>
@@ -2060,15 +2106,18 @@ that a misspelled setting is never silently ignored:</p>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> with <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">num_sessions</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code> / <code class="docutils literal notranslate"><span class="pre">xpu_paged</span></code>),
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size CUDA-graph buckets, which is a
@@ -2624,6 +2673,7 @@ for a full omni-modal model.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-within-spans">Block-causal attention within spans</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#bounded-sink-window-caches">Bounded (sink + window) caches</a></li>
 </ul>
 </li>
 </ul>
@@ -2685,7 +2735,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 22, 2026.
+  Last updated on Oct 23, 2026.
   <br/>
 </p>
   </div>

@@ -27,6 +27,7 @@ mstar.engine.resources.kv
    :toctree:
    :recursive:
 
+   bounded
    cache
    config
    cpu_page_pool

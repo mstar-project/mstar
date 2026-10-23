@@ -50,12 +50,12 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.engine.resources.kv.config" href="mstar.engine.resources.kv.config.html" />
+    <link rel="next" title="mstar.engine.resources.kv.bounded" href="mstar.engine.resources.kv.bounded.html" />
     <link rel="prev" title="mstar.engine.resources.base" href="mstar.engine.resources.base.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 23, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -642,22 +642,25 @@
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.config.html#module-mstar.engine.resources.kv.config" title="mstar.engine.resources.kv.config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">config</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.bounded.html#module-mstar.engine.resources.kv.bounded" title="mstar.engine.resources.kv.bounded"><code class="xref py py-obj docutils literal notranslate"><span class="pre">bounded</span></code></a></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.config.html#module-mstar.engine.resources.kv.config" title="mstar.engine.resources.kv.config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">config</span></code></a></p></td>
 <td><p>What a model declares about a KV cache: its shape, its spec, its step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.keys.html#module-mstar.engine.resources.kv.keys" title="mstar.engine.resources.kv.keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">keys</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.keys.html#module-mstar.engine.resources.kv.keys" title="mstar.engine.resources.kv.keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">keys</span></code></a></p></td>
 <td><p>Page keys for cross-request prefix reuse.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.page_copier.html#module-mstar.engine.resources.kv.page_copier" title="mstar.engine.resources.kv.page_copier"><code class="xref py py-obj docutils literal notranslate"><span class="pre">page_copier</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.page_copier.html#module-mstar.engine.resources.kv.page_copier" title="mstar.engine.resources.kv.page_copier"><code class="xref py py-obj docutils literal notranslate"><span class="pre">page_copier</span></code></a></p></td>
 <td><p>Whole-page copies between the device KV cache and the host page pool.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.plan.html#module-mstar.engine.resources.kv.plan" title="mstar.engine.resources.kv.plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.plan.html#module-mstar.engine.resources.kv.plan" title="mstar.engine.resources.kv.plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan</span></code></a></p></td>
 <td><p>The KV plan: what <cite>KVManager.plan</cite> hands its dependents.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.prefix_index.html#module-mstar.engine.resources.kv.prefix_index" title="mstar.engine.resources.kv.prefix_index"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefix_index</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.prefix_index.html#module-mstar.engine.resources.kv.prefix_index" title="mstar.engine.resources.kv.prefix_index"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefix_index</span></code></a></p></td>
 <td><p>The prefix index: which cached page holds which key, and which to drop first.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.ring.html#module-mstar.engine.resources.kv.ring" title="mstar.engine.resources.kv.ring"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ring</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.ring.html#module-mstar.engine.resources.kv.ring" title="mstar.engine.resources.kv.ring"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ring</span></code></a></p></td>
 <td><p>Ring KV storage: a fixed horizon of frame slots, overwritten in place.</p></td>
 </tr>
 </tbody>
@@ -686,11 +689,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="mstar.engine.resources.kv.config.html"
+       href="mstar.engine.resources.kv.bounded.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.engine.resources.kv.config</p>
+        <p class="prev-next-title">mstar.engine.resources.kv.bounded</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -729,7 +732,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 22, 2026.
+  Last updated on Oct 23, 2026.
   <br/>
 </p>
   </div>
