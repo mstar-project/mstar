@@ -257,6 +257,8 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # label -> the prompt as int32 bytes, when it is the only label with spans and all of them are ids
     prompt_ids: dict[str, bytes] | None = None
+    # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
+    arrival: int | None = None
 
     def apply_conductor_config(
         self,
@@ -267,6 +269,7 @@ class KVReqConfig(ResourceReqConfig):
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
         prompt_ids: dict[str, bytes] | None=None,
+        arrival: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -298,6 +301,8 @@ class KVReqConfig(ResourceReqConfig):
             }
         if prompt_ids is not None:
             self.prompt_ids = prompt_ids
+        if arrival is not None:
+            self.arrival = arrival
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
