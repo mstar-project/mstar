@@ -66,9 +66,9 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
 command_a_plus = [
-    "flashinfer-python>=0.6.18,<0.7",
+    "flashinfer-python>=0.6.18",
     "huggingface-hub>=1.5",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",
     "safetensors",
     "transformers>=5.17",
