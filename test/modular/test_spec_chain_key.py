@@ -28,6 +28,7 @@ def _worker(target):
         enable_nvtx=False,
         _phase_period=0,
         request_state=None,
+        _rebuild_rows={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or True,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
@@ -39,7 +40,7 @@ def _worker(target):
 
 def _pending():
     return SimpleNamespace(
-        batch=object(), node_name="LLM", graph_walk="mixed",
+        batch=SimpleNamespace(request_to_worker_graph={0: 0}), node_name="LLM", graph_walk="mixed",
         node_batch=SimpleNamespace(admit_error=None),
     )
 

@@ -3,9 +3,9 @@ import logging
 import os
 import threading
 from collections import Counter, OrderedDict
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Future, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 import numpy as np
@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
+from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -512,6 +512,7 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        self._dropped: set[str] = set()
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -2562,6 +2563,85 @@ class KVManager(AttentionResource):
                 stream.offloaded for stream in self._streams.get(rid, {}).values()
             )
 
+    def is_resident(self, rid: str) -> bool:
+        """False once ``rid``'s offload is claimed or its drop is applied."""
+        if rid in self._dropped:
+            return False
+        return self._cpu_pool is None or not self.is_offloaded(rid)
+
+    def check_drop(self, rid: str) -> None:
+        if self._world_size > 1:
+            raise RuntimeError(
+                f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
+                "would leave them holding different pages"
+            )
+        if self.is_offloaded(rid):
+            raise RuntimeError(f"KV {self.name}: {rid} has a host copy, which a drop would leave behind")
+        with self._lock:
+            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
+                raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
+            layouts = (self._overrides[rid].kv_layout or {}).values()
+            if any(span.kind != "ids" for layout in layouts for span in layout.spans):
+                raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
+
+    def drop(self, rid: str) -> int:
+        """Take ``rid``'s KV off the device without a host copy, and return the
+        number of pages freed. Pages the index also holds stay cached, where they
+        can be evicted, and the rest go back to the free list."""
+        with self._lock:
+            self.check_drop(rid)
+            # under the lock, so no other step allocates between the two counts
+            free = self._arena.num_free
+            self.reset_request(rid, free=True)
+            self._dropped.add(rid)
+            return self._arena.num_free - free
+
+    def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
+        """Lay ``rid``'s label out again as one ids span over ``ids`` without the last id, keyed as a
+        prompt of those ids would be, and return the walk that writes the span.
+
+        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
+        the one at intake. The decode step that samples an id keys it, so a label that keys
+        generation also extends its chain by the last id.
+        """
+        with self._lock:
+            overrides = self._overrides[rid]
+            (label,) = overrides.prompt_ids
+            layout = overrides.kv_layout[label]
+            (walk,) = {span.walk for span in layout.spans}
+            ((loop, slots),) = layout.growth
+            prompt = ids[:-1]
+            length = len(prompt)
+            grown = length - sum(span.length for span in layout.spans)
+            keyed = bool((overrides.prefix_keys or {}).get(label))
+            changes = {}
+            if keyed:
+                page_size = self.config.page_size
+                pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+                changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
+                changes["prefix_tail"] = {
+                    **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
+                }
+            self._overrides[rid] = replace(
+                overrides,
+                kv_layout={
+                    **overrides.kv_layout,
+                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
+                },
+                loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
+                **changes,
+            )
+            stream = self._streams[rid][label]
+            stream.forget_chain()
+            self._lay_out(rid, label, stream)
+            self._seed_keys(rid, label, stream)
+            if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
+                stream.chain.extend([ids[-1]], self.config.page_size)
+            return walk
+
+    def land_rebuild(self, rid: str) -> None:
+        self._dropped.discard(rid)
+
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
 
@@ -3022,6 +3102,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._dropped.discard(rid)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:

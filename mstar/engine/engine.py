@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -255,6 +255,13 @@ class ForwardPassInfoWrapper:
         return getattr(self.info, name)
 
 
+def _runtime_rids(batch: "ExecutingBatch") -> Sequence[int]:
+    """``batch.request_ids`` without the rebuild rows."""
+    if not batch.rebuild_rids:
+        return batch.request_ids
+    return [rid for rid in batch.request_ids if rid not in batch.rebuild_rids]
+
+
 @dataclass
 class ExecutingBatch:
     node_name: str
@@ -325,6 +332,10 @@ class ExecutingBatch:
     # device: such a row loops back as it would in a step of its walk alone,
     # while the step's other rows route tensors.
     loopback_rids: frozenset = frozenset()
+
+    # Rows that recompute a dropped request's KV from its token ids (`Worker._rebuild`). The graph
+    # runtime never sees them, and their samples are discarded.
+    rebuild_rids: frozenset = frozenset()
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -1033,9 +1044,10 @@ class Engine:
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
         steps = self._loopback_steps
+        rids = _runtime_rids(batch)
         if batch.rows_only:
             steps.update(dict.fromkeys(
-                batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
+                rids, (batch.node_name, batch.step_context.graph_walk),
             ))
         elif batch.loopback_rids:
             # a mixed step: a row looped back under its own walk, so the next
@@ -1043,13 +1055,13 @@ class Engine:
             keep, node, walk_of = (
                 batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
             )
-            for rid in batch.request_ids:
+            for rid in rids:
                 if rid in keep:
                     steps[rid] = (node, walk_of(rid))
                 else:
                     steps.pop(rid, None)
         elif steps:
-            for rid in batch.request_ids:
+            for rid in rids:
                 steps.pop(rid, None)
 
     def inline_client_signals(
@@ -1079,18 +1091,19 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
+        rids = _runtime_rids(batch)
         # The batch call keys each row under its own walk, so a combined-walk
         # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
             ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name,
+                rids, batch.node_name,
                 # a step of one walk passes the walk: no call per row
                 ctx.walk_of if ctx.request_walks else ctx.graph_walk,
                 host_rows, outputs, keys=keys,
             )
             return
-        for rid in batch.request_ids:
+        for rid in rids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
@@ -1754,11 +1767,12 @@ class Engine:
         request.
         """
         submodule = self._submodules[batch.node_name].submodule
+        rids = _runtime_rids(batch)
         if host_rows is not None:
             try:
                 ctx = batch.step_context
                 batched = submodule.check_stop_batched(
-                    batch.request_ids, batch.per_request_info_wrapped, host_rows,
+                    rids, batch.per_request_info_wrapped, host_rows,
                     step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
@@ -1770,7 +1784,7 @@ class Engine:
             if batched is not None:
                 return batched
         stops: dict[str, set[str]] = {}
-        for rid in batch.request_ids:
+        for rid in rids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
                 continue
@@ -2144,7 +2158,8 @@ class Engine:
 
         An offloaded request is brought back first; it stays not-ready until
         that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). Then each resource takes in whatever the request
+        on OOM, to evict). A dropped request stays not-ready until its
+        rebuild lands. Then each resource takes in whatever the request
         published elsewhere — a KV transfer from a prefill worker, say — and
         reports whether that has landed.
 
@@ -2152,7 +2167,7 @@ class Engine:
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id):
+        if not self.is_resident(node_name, request_id):
             if not allow_reload:
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
@@ -2367,6 +2382,36 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
+    def is_resident(self, node_name: str, request_id: str) -> bool:
+        return all(
+            resource.is_resident(request_id)
+            for resource in self._submodules[node_name].resources.values()
+        )
+
+    def drop_request(self, node_name: str, request_id: int) -> int:
+        """Discard the request's state on this node that can be recomputed from
+        its token ids, and return the pages freed."""
+        resources = self._submodules[node_name].resources.values()
+        # check every resource before dropping any, so a refusal changes nothing,
+        # as `reload_request` checks `can_reload`
+        for resource in resources:
+            resource.check_drop(request_id)
+        return sum(resource.drop(request_id) for resource in resources)
+
+    def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> str:
+        """Lay the dropped request's KV out over all of ``ids`` but the last, and return the walk
+        whose row writes it."""
+        (walk,) = {
+            kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
+        }
+        return walk
+
+    def land_rebuild(self, node_name: str, request_id: int) -> None:
+        """Make the dropped request resident again, once its rebuild step has run."""
+        for kv in self.paged_kv_caches():
+            if node_name in kv.nodes:
+                kv.cache.land_rebuild(request_id)
+
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
 
@@ -2403,6 +2448,10 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction and resource.is_offloaded(request_id)
         ]
+        if not offloaded:
+            # A dropped request, which `check_ready` sends here, has nothing offloaded, and `all()` over
+            # nothing would report it reloaded.
+            return False
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
             return False

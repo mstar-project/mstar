@@ -292,6 +292,13 @@ class SamplerResource(Resource):
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
+    def check_drop(self, rid: str) -> None:
+        if self._cg_buffers is not None and self._cg_buffers.ingraph_scatter:
+            raise RuntimeError(
+                f"Sampler: dropping {rid} under MSTAR_SAMPLER_INGRAPH_SCATTER=1, whose captured sample "
+                "writes a rebuild row's discarded token and RNG offset"
+            )
+
     def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
         """Settle this step's two penalty flags (and whether it filters).
         """
@@ -512,7 +519,7 @@ class SamplerResource(Resource):
             self._keep_last_token and bufs is not None
             and all(bufs.has_slot(rid) for rid in request_ids)
         ):
-            bufs.write_last_tokens(request_ids, tokens)
+            bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
         return tokens
 
     def enable_device_loopback_reader(self) -> None:

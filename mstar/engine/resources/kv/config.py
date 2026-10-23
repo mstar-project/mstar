@@ -216,14 +216,15 @@ class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
 
     ``length`` is how many slots the write fills and ``advance`` is how far it
-    moves the position counter. ``digest`` is an item's digest, and None for
-    ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end.
+    moves the position counter. ``kind`` is the span's `Span.kind`. ``digest`` is
+    an item's digest, and None for ids. ``end_key`` is set for an item that ends
+    inside a page, and keys that page up to the item's end.
     """
     length: int
     advance: int
     walk: str
     scratch: int = 0
+    kind: str = "ids"
     digest: bytes | None = None
     end_key: bytes | None = None
 
@@ -254,6 +255,8 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
+    # label -> the prompt as int32 bytes, when it is the only label with spans and all of them are ids
+    prompt_ids: dict[str, bytes] | None = None
 
     def apply_conductor_config(
         self,
@@ -263,6 +266,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
+        prompt_ids: dict[str, bytes] | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -292,6 +296,8 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
+        if prompt_ids is not None:
+            self.prompt_ids = prompt_ids
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
@@ -404,10 +410,11 @@ def refuse_undeclared_labels(
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """Only the KV manager's ingest reads the layouts and caps, so they are dropped
+    """Only the ingest reads the layouts, caps and prompt ids, so they are dropped
     before the configs go out with every frame between workers."""
     return {
-        key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
+        key: replace(config, kv_layout=None, loop_caps=None, prompt_ids=None) if isinstance(config, KVReqConfig)
+        else config
         for key, config in configs.items()
     }
 

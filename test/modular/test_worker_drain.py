@@ -59,6 +59,7 @@ def _worker(
         ),
     )
     w._last_active = {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows = {}, {}, {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
@@ -234,7 +235,7 @@ def test_draining_and_pending_removal_rids_are_not_published():
     w._pending_removes["pending"] = None
     w.scheduler.failed_rids.add("failed")
     batch = SimpleNamespace(
-        request_ids=["healthy", "draining", "pending", "failed"],
+        request_ids=["healthy", "draining", "pending", "failed"], rebuild_rids=frozenset(),
         per_request_info={
             rid: SimpleNamespace(request_id=rid)
             for rid in ("healthy", "draining", "pending", "failed")
@@ -396,6 +397,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
     w._last_active = {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows = {}, {}, {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(

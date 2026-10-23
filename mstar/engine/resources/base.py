@@ -354,6 +354,19 @@ class Resource(ABC):
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
 
+    def check_drop(self, rid: str) -> None:
+        """Raise if ``drop`` would refuse ``rid``. Changes nothing."""
+        return
+
+    def drop(self, rid: str) -> int:
+        """Discard the request's state that can be recomputed from its token
+        ids, and keep the rest. Returns what was reclaimed."""
+        return 0
+
+    def is_resident(self, rid: str) -> bool:
+        """False while the request's state is off the device, offloaded or dropped."""
+        return True
+
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
         return True

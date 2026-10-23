@@ -55,7 +55,7 @@ def _batch(seq: int, rids: list[int]):
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None,
+        launch_started_event=None, rebuild_rids=frozenset(),
     )
     return scheduled, executing
 
@@ -122,6 +122,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows = {}, {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -194,7 +195,7 @@ def _rank(
             w._remove_request(body)
 
     w._process_messages = _process_messages
-    w._build_executing_batch = lambda batch: _batch(
+    w._build_executing_batch = lambda batch, rebuild=None: _batch(
         batch.tp_seq, list(batch.request_to_worker_graph))[1]
     w.maybe_send_zmq_to_tp_followers = _broadcast
     w._build_speculation = _build_speculation
@@ -321,7 +322,7 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 
-    def _executing(batch):
+    def _executing(batch, rebuild=None):
         node_batch = build_executing(batch)
         if batch.tp_seq == 0:
             node_batch.failed_requests = {HANDLES["also"]: "failed"}

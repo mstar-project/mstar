@@ -132,6 +132,9 @@ class _Resource:
     def is_offloaded(self, rid):
         return rid in self.offloaded
 
+    def is_resident(self, rid):
+        return rid not in self.offloaded
+
     def reclaimable(self, rid):
         return 0 if rid in self.holds_nothing else 1
 
@@ -187,6 +190,7 @@ class _Engine:
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
+    is_resident = Engine.is_resident
     offload_request = Engine.offload_request
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
@@ -919,6 +923,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
+        self._kv_keys, self._kept_ids, self._rebuild_rows = {}, {}, {}
         self.streaming_buffers: dict = {}
         self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because

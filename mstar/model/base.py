@@ -95,8 +95,8 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
+        ``[length, advance, walk, scratch, kind]``: plain values, which keep a request's kwargs on
+        the wire's msgpack path."""
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
@@ -107,7 +107,7 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch, span.kind] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
