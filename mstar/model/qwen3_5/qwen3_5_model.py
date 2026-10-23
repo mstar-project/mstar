@@ -678,11 +678,13 @@ class Qwen3_5DenseModel(Model):
     def get_node_precision(self, node_name: str) -> NodePrecision:
         """bf16 params, no autocast: the norms compute in fp32 themselves and
         every kernel takes its dtype explicitly. FlashInfer's GDN kernels assert
-        on the three gated-delta-net params, so they stay fp32."""
+        on the three gated-delta-net params, so they stay fp32. The LM head is
+        never quantized."""
         fp32 = ()
         if node_name == "LLM" and LINEAR_ATTENTION in self.config.layer_types:
             fp32 = ("*.self_attn.A_log", "*.self_attn.dt_bias", "*.self_attn.norm.weight")
-        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=False)
+        skip = ("*.lm_head",) if node_name == "LLM" else ()
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=False, quant_skip=skip)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
