@@ -594,7 +594,44 @@ def test_same_node_speculation_with_a_held_external_input_agrees():
     prep = lock._both("prep_spec_rids(ar_decode)",
                       lambda rt, b, s: _prep_same_node(rt, "ar_decode", rid))
     assert prep == ([rid], [("ctx", [301])])
+    rows = lock._both("prep_spec_rows(ar_decode)",
+                      lambda rt, b, s: _prep_rows_same_node(rt, "ar_decode", rid))
+    assert rows == ([rid], WG_ID, 0, [("ctx", [301])])
     lock.refcounts([101, 201, 301])
+
+
+def _prep_rows_same_node(rt, node, rid, room=None):
+    out = rt.prep_spec_rows(node, node, WALK, [rid], room)
+    return (
+        list(out.ready_rids), out.wg_id, out.spec_id,
+        None if out.input_edges is None else sorted(
+            (sig, list(uuids)) for _r, sig, uuids, _f in out.input_edges.edge_tuples()
+        ),
+    )
+
+
+def test_prep_spec_rows_agrees_across_a_loop(lock):
+    """The columnar prep (Rust's own, the contract default on Python) offers the
+    same rows at every iteration, down to the last, where none is left."""
+    rid = lock.admit()
+    lock.put(101)
+    lock.ingest(rid, "prompt", "prefill", [101])
+    lock.pop("prefill", rid)
+    lock.put(201)
+    lock.route("prefill", rid, ["token"], [201])
+    offered = []
+    for uuid in (202, 203, 204):
+        lock.pop("ar_decode", rid)
+        for room in (None, 0):
+            offered.append(lock._both(
+                f"prep_spec_rows(ar_decode, room={room}) before {uuid}",
+                lambda rt, b, s, room=room: _prep_rows_same_node(rt, "ar_decode", rid, room),
+            )[0])
+        lock.put(uuid)
+        lock.route("ar_decode", rid, ["token"], [uuid])
+    # the next iteration (all of max_iters=4 remain), never past the room
+    assert offered == [[rid], [], [rid], [], [rid], []]
+    lock.refcounts([101, 201, 202, 203, 204])
 
 
 def test_speculative_flag_survives_completion(lock):
