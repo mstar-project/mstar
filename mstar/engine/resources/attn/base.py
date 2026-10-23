@@ -1,8 +1,8 @@
 """The attention resource's shared machinery: the spec-time factory, the
 custom op every backend attends through, and the workspace pool.
 
-The backends themselves live beside this — `flashinfer`, `cross`, `dense`,
-`flex` — and `AttentionManager.build` reaches them by deferred import, so
+The backends are sibling modules (`flashinfer`, `aiter`, `cross`, `dense`,
+`flex`), and `AttentionManager.build` reaches them by deferred import, so
 naming a backend in a spec does not load the others.
 """
 
@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -28,18 +29,70 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.FLASHINFER_MLA: PagedKVConfig,
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
+    AttnBackend.AITER: PagedKVConfig,
 }
 
 
-def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
+def resolve_attn_backend(
+    backend: AttnBackend, device: torch.device, page_size: int | None = None,
+) -> AttnBackend:
     """The concrete backend for ``backend`` on ``device``.
 
-    ``AUTO`` becomes the platform's default, FlashInfer on every platform for
-    now. A backend named in the spec or YAML is returned as is.
+    ``AUTO`` becomes the platform's default. A backend named in the spec or
+    YAML is returned as is. ``page_size``, the paged cache's if there is one,
+    decides between AITER and FlashInfer on ROCm (see ``_rocm_paged_backend``).
     """
-    if backend is AttnBackend.AUTO:
+    if backend is not AttnBackend.AUTO:
+        return backend
+    if current_platform.is_rocm():
+        return _rocm_paged_backend(page_size)
+    return AttnBackend.FLASHINFER
+
+
+def _rocm_paged_backend(page_size: int | None) -> AttnBackend:
+    """AITER's unified attention, unless AITER reads page tails unmasked at this
+    page size and AMD's FlashInfer build (which masks them) is installed."""
+    from mstar.engine.resources.attn import aiter as rocm
+
+    aiter_reason = rocm.aiter_paged_unavailable_reason()
+    flashinfer_reason = rocm.flashinfer_rocm_unavailable_reason()
+    tails_safe = page_size is None or rocm.nan_safe_page_size(page_size)
+    if aiter_reason is None and (tails_safe or flashinfer_reason is not None):
+        return AttnBackend.AITER
+    if flashinfer_reason is None:
         return AttnBackend.FLASHINFER
-    return backend
+    raise RuntimeError(
+        "No paged attention backend on this ROCm install: AITER's unified "
+        f"attention is not importable ({aiter_reason}), nor is AMD's FlashInfer "
+        f"build ({flashinfer_reason}). Install amd-aiter (AITER) or amd-flashinfer."
+    )
+
+
+def flashinfer_kwargs(kv_config: KVConfig, backend: str) -> dict:
+    """``FlashInferManager``'s platform arguments for a spec naming ``backend``.
+
+    On ROCm only AMD's FlashInfer build runs. Its ``auto`` can't use an AITER
+    kernel at page 128 (it falls back to fa2 after a failed attempt, or gathers
+    per token for prefill), so ``auto`` is pinned to fa2 there. Decode skips
+    tensor cores, the faster path on ROCm, for the GQA groups that kernel
+    dispatches.
+    """
+    if not current_platform.is_rocm():
+        return {"backend": backend}
+    from mstar.engine.resources.attn import aiter as rocm
+
+    reason = rocm.flashinfer_rocm_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(
+            "attention backend 'flashinfer' on ROCm needs AMD's FlashInfer build "
+            f"(amd-flashinfer), which is not importable ({reason}); name backend "
+            "'aiter' or 'auto' instead"
+        )
+    group = kv_config.num_qo_heads // kv_config.num_kv_heads
+    return {
+        "backend": "fa2" if backend == "auto" else backend,
+        "decode_tensor_cores": group not in rocm.FLASHINFER_ROCM_DECODE_GROUPS,
+    }
 
 
 class AttentionManager(AttentionResource):
@@ -60,7 +113,9 @@ class AttentionManager(AttentionResource):
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
+        backend = resolve_attn_backend(
+            spec.config.backend, info.device, getattr(kv_config, "page_size", None),
+        )
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -101,7 +156,9 @@ class AttentionManager(AttentionResource):
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
                 )
-            backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
+            backend = resolve_attn_backend(
+                AttnBackend.AUTO, info.device, kv_config.page_size,
+            )
             _warn_dense_fallback(reason, backend)
 
         if backend == AttnBackend.FLASHINFER_MLA:
@@ -123,9 +180,24 @@ class AttentionManager(AttentionResource):
                 device=info.device,
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                **flashinfer_kwargs(kv_config, spec.config.flashinfer_backend),
+            )
+
+        if backend == AttnBackend.AITER:
+            if not current_platform.is_rocm():
+                raise RuntimeError(
+                    "attention backend 'aiter' runs on AMD GPUs (ROCm); this "
+                    f"process runs on {current_platform.name}"
+                )
+            from mstar.engine.resources.attn.aiter import AiterPagedAttentionManager
+
+            return AiterPagedAttentionManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
             )
 
         if backend == AttnBackend.FLEX:
