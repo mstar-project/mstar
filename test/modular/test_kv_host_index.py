@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections import OrderedDict
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -46,6 +47,7 @@ class _HostPool(CPUPagePool):
         self._dropped_logged_at = None
         self.copied_out: list[int] = []
         self.copied_in: list[int] = []
+        self.written_out: list[int] = []
         self.events: list[_Event] = []
 
     def copy_out(self, gpu_kv_cache, copies):
@@ -54,9 +56,18 @@ class _HostPool(CPUPagePool):
     def copy_in(self, gpu_kv_cache, copies):
         self.copied_in.extend(copies.gpu)
 
+    def write(self, gpu_kv_cache, copies, written):
+        self.written_out.extend(copies.gpu)
+
+    def record_compute(self):
+        # the steps run as soon as they are queued
+        return SimpleNamespace(query=lambda: True)
+
     def record(self):
         self.events.append(_Event())
         return self.events[-1]
+
+    record_write = record
 
     def land(self):
         for event in self.events:
@@ -85,6 +96,8 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
+    # `enable_prefix_cache` opens `pending` only when the host pool exists, and the stub comes after it
+    kv._arena.pending = OrderedDict()
     return kv
 
 
@@ -308,4 +321,96 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
     kv.assert_pages_conserved()
 
 
+def test_the_heads_prefix_on_the_host_comes_back_into_its_allotment_evicting_cache():
+    kv = _manager(max_num_pages=16)
+    _on_the_host_only(kv)
+    _serve(kv, "c", list(range(600, 600 + 12 * PAGE_SIZE)) + [1, 2])
+    kv.remove_request("c")
+    assert kv._arena.num_free < 6
+    _ingest(kv, "b", A_PROMPT + [7, 8])
 
+    assert not _ready(kv, "b")
+    kv._cpu_pool.land()
+    assert _ready(kv, "b") and _probe(kv, "b", A_PROMPT + [7, 8]) == 6 * PAGE_SIZE, (
+        "the head recomputed a prefix the host holds because the free pages were short"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_a_request_behind_the_head_copies_nothing_from_the_host():
+    kv = _manager(max_num_pages=16)
+    _on_the_host_only(kv)
+    kv.ingest_request("hog", KVReqConfig())
+    _run(kv, "hog", 10 * PAGE_SIZE)
+    _ingest(kv, "head", list(range(600, 600 + 8 * PAGE_SIZE)))
+    assert not _ready(kv, "head")
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+
+    assert not _ready(kv, "b")
+    assert kv._cpu_pool.copied_in == [] and kv._streams["b"]["main"].hold is None, (
+        "a request behind the head took pages for a copy from the host"
+    )
+
+
+def test_a_request_waiting_on_another_requests_copy_from_the_host_hits_its_pages():
+    kv = _manager()
+    _on_the_host_only(kv)
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+    assert not _ready(kv, "b")
+    _ingest(kv, "c", A_PROMPT + [9, 10])
+    assert not _ready(kv, "c"), "c ran before the copy b started for its prefix landed"
+    kv._cpu_pool.land()
+
+    assert _ready(kv, "c")
+    prefix = kv.resolve_cached_prefix("c", NODE, WALK, ARNodeInputs(input_seq_len=len(A_PROMPT) + 2))
+    assert prefix is not None and prefix.tokens == 6 * PAGE_SIZE, "c recomputed the prefix b's copy brought back"
+
+
+def test_a_copier_that_raises_in_a_readiness_copy_files_nothing_and_frees_its_pages():
+    kv = _manager()
+    _on_the_host_only(kv)
+
+    def fails(gpu_kv_cache, copies):
+        raise RuntimeError("copy failed")
+
+    kv._cpu_pool.copy_in = fails
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+    with pytest.raises(RuntimeError, match="copy failed"):
+        _ready(kv, "b")
+    _land(kv)
+
+    assert _ready(kv, "b"), "b waits on a copy from the host that raised"
+    assert kv._index.num_pages() == 0, "a copy from the host that raised filed its pages"
+    kv.assert_pages_conserved()
+
+
+def test_a_walk_the_engine_doesnt_probe_copies_nothing_from_the_host():
+    kv = _manager()
+    _on_the_host_only(kv)
+    tokens = A_PROMPT + [7, 8]
+    whole = len(tokens) // PAGE_SIZE
+    # a walk that writes a second label from the same input, as a guided Bagel request's does
+    kv.ingest_request("b", KVReqConfig(
+        prefix_keys={"main": chain([tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)])},
+        prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
+        needed_labels=["main", "cfg"],
+    ))
+
+    assert _ready(kv, "b"), "b waits on a copy from the host its walk never reads"
+    assert kv._cpu_pool.copied_in == [], "b took pages for a copy from the host its walk never reads"
+
+
+def test_a_pool_that_keeps_no_allotments_copies_from_the_host_into_free_pages_only():
+    kv = _manager(max_num_pages=16)
+    kv._decides = False
+    _on_the_host_only(kv)
+    _serve(kv, "c", list(range(600, 600 + 12 * PAGE_SIZE)) + [1, 2])
+    kv.remove_request("c")
+    free = kv._arena.num_free
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+
+    _ready(kv, "b")
+
+    assert len(kv._cpu_pool.copied_in) == free, "the copy from the host didn't take the free pages, and only those"
+    assert kv._index.num_pages() == 12, "a pool that keeps no allotments evicted cached pages for a copy from the host"

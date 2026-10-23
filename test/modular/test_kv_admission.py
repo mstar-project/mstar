@@ -399,6 +399,7 @@ def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None
         return "rolled back"
     kv.plan(step, ctx)
     kv.commit(step, ctx)
+    kv.after_output_copy()
     return "committed"
 
 
@@ -474,13 +475,14 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _manager(max_num_pages=20)
     kv._cpu_pool = _StubHostPool()
-    # the stub comes after `enable_prefix_cache`, so open the set of pages to copy to the host here
+    # the stub comes after `enable_prefix_cache`, so open `pending` here
     kv._arena.pending = OrderedDict()
 
     log = _drive(kv, random.Random(SEED), ops=10_000)
 
     for op in ("committed", "rolled back", "dropped", "refused", "reset", "offload", "reload", "remove"):
         assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
+    assert kv._cpu_pool.written >= 10, f"seed {SEED}: too few pages written ahead of eviction to say anything"
     for rid in list(kv._streams):
         kv.remove_request(rid)
     assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
