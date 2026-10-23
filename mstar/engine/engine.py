@@ -1118,6 +1118,9 @@ class Engine:
                 hits[self._graph_runtime.get_rid_string(rid)] = leases
         return hits
 
+    def prefix_cache_open(self, node_name: str) -> bool:
+        return bool(self._runner.prefix_chain_keys(node_name))
+
     def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
         """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
         ready = True

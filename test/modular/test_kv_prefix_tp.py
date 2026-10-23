@@ -347,12 +347,13 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
         worker._try_follow_speculation(step_n)
 
 
-def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do():
-    leader = SimpleNamespace(parallel_nodes={NODE})
+@pytest.mark.parametrize("cache_open", [True, False])
+def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cache_open):
+    leader = SimpleNamespace(parallel_nodes={NODE}, _prefix_cache_open=lambda node: cache_open)
 
     def spec(node, yield_away):
         return SimpleNamespace(is_yield_away=yield_away, node_batch=SimpleNamespace(node_name=node))
 
-    assert not Worker._plans_ahead(leader, spec(NODE, True))
+    assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
     assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
     assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
