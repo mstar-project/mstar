@@ -6,9 +6,10 @@ model: "personaplex"
 max_seq_len: 2999
 
 model_kwargs:
-  # Directory of extracted .pt voice presets (NVIDIA's gated voices.tgz).
-  # Requests name a preset with model_kwargs["voice"]; without a directory
-  # every request is rejected with a clear error.
+  # Directory of extracted .pt voice presets. null fetches the gated repo's
+  # voices.tgz into the Hugging Face cache and extracts it beside the archive,
+  # as NVIDIA's offline.py does. Requests name a preset with
+  # model_kwargs["voice"] (for example "NATF2").
   voice_dir: null
 
 # Single GPU: every node on rank 0.

@@ -728,3 +728,119 @@ def test_registry_hf_entry_and_yaml_agree():
     assert deployment["model"] == "personaplex" and deployment["max_seq_len"] == cfg.MAX_TEMPORAL_FORWARDS
     assert set(deployment["model_kwargs"]) == {"voice_dir"}
     assert {n for g in deployment["node_groups"] for n in g["node_names"]} == set(_model().nodes)
+
+
+# --------------------------------------------------------------------------- voice presets from the repo
+
+
+def _voices_archive(tmp_path: Path, members: dict[str, bytes]) -> Path:
+    import io
+    import tarfile
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir(exist_ok=True)
+    archive = snapshot / "voices.tgz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return archive
+
+
+def test_voice_archive_extracts_once_beside_itself(tmp_path):
+    from mstar.model.personaplex.voice import extract_voice_presets
+
+    archive = _voices_archive(tmp_path, {"voices/NATF2.pt": b"a", "voices/NATM1.pt": b"b"})
+    target = extract_voice_presets(archive)
+    assert target == archive.parent / "voices" and sorted(p.name for p in target.iterdir()) == ["NATF2.pt", "NATM1.pt"]
+    (target / "NATF2.pt").write_bytes(b"kept")  # a second call must not re-extract over it
+    assert extract_voice_presets(archive) == target and (target / "NATF2.pt").read_bytes() == b"kept"
+    assert [p.name for p in archive.parent.iterdir() if p.name.startswith(".voices-")] == []
+
+
+def test_voice_archive_without_voices_dir_fails_and_leaves_nothing(tmp_path):
+    from mstar.model.personaplex.voice import extract_voice_presets
+
+    archive = _voices_archive(tmp_path, {"other/NATF2.pt": b"a"})
+    with pytest.raises(RuntimeError, match="no voices/ directory"):
+        extract_voice_presets(archive)
+    assert sorted(p.name for p in archive.parent.iterdir()) == ["voices.tgz"]
+
+
+def test_voice_archive_refuses_members_outside_the_tree(tmp_path):
+    import tarfile
+
+    from mstar.model.personaplex.voice import extract_voice_presets
+
+    archive = _voices_archive(tmp_path, {"voices/NATF2.pt": b"a", "../escaped.pt": b"x"})
+    with pytest.raises(tarfile.FilterError):
+        extract_voice_presets(archive)
+    assert not (tmp_path / "escaped.pt").exists() and not (archive.parent / "voices").exists()
+
+
+def _served_model(monkeypatch, tmp_path, **kwargs):
+    archive = _voices_archive(tmp_path, {"voices/NATF2.pt": b"a", "voices/NATM1.pt": b"b"})
+    downloads = []
+
+    def download(self, filename):
+        downloads.append(filename)
+        return str(archive)
+
+    monkeypatch.setattr(PersonaPlexModel, "_download", download)
+    return PersonaPlexModel(**kwargs), downloads, archive
+
+
+def test_unset_voice_dir_fetches_the_repo_archive_once(monkeypatch, tmp_path):
+    model, downloads, archive = _served_model(monkeypatch, tmp_path)
+    assert model._voice_dir() == str(archive.parent / "voices")
+    assert model._voice_dir() == str(archive.parent / "voices") and downloads == ["voices.tgz"]
+
+
+def test_configured_or_dummy_voice_dirs_never_download(monkeypatch, tmp_path):
+    model, downloads, _ = _served_model(monkeypatch, tmp_path, voice_dir="/srv/voices")
+    assert model._voice_dir() == "/srv/voices"
+    dummy, dummy_downloads, _ = _served_model(monkeypatch, tmp_path, skip_weight_loading=True)
+    assert dummy._voice_dir() is None and dummy.get_voices() is None
+    assert downloads == [] and dummy_downloads == []
+    with pytest.raises(ValueError, match="no voice_dir"):
+        _request(dummy)
+
+
+def test_warmup_fetches_tokenizer_and_voices_except_in_dummy_mode(monkeypatch, tmp_path):
+    model, downloads, _ = _served_model(monkeypatch, tmp_path)
+    tokenizers = []
+    monkeypatch.setattr(PersonaPlexModel, "_ensure_tokenizer", lambda self: tokenizers.append(1))
+    model.warmup_preprocess()
+    assert tokenizers == [1] and downloads == ["voices.tgz"]
+    PersonaPlexModel(skip_weight_loading=True).warmup_preprocess()
+    assert tokenizers == [1] and downloads == ["voices.tgz"]
+
+
+def test_get_voices_lists_presets_without_downloading(monkeypatch, tmp_path):
+    model, downloads, archive = _served_model(monkeypatch, tmp_path)
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: None)
+    assert model.get_voices() is None  # not cached yet: no fixed list, and no download
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: str(archive))
+    model._voice_dir()
+    assert model.get_voices() == ["NATF2", "NATM1"] and downloads == ["voices.tgz"]
+    assert _model(tmp_path).get_voices() == ["NATF2"]
+
+
+def test_cli_and_benchmark_entries_are_registered():
+    repo_root = str(Path(__file__).resolve().parents[2])
+    sys.path.insert(0, repo_root)
+    try:
+        from benchmark.base import ModelType, PersonaPlex, RequestType
+        from mstar.cli.main import DEFAULT_CONFIGS, _next_steps
+    finally:
+        sys.path.remove(repo_root)
+
+    assert DEFAULT_CONFIGS["personaplex"] == "personaplex.yaml"
+    assert (Path(repo_root) / "configs" / DEFAULT_CONFIGS["personaplex"]).is_file()
+    benchmark_model = ModelType.PERSONAPLEX.inst()
+    assert isinstance(benchmark_model, PersonaPlex) and benchmark_model.get_hf_url() == "nvidia/personaplex-7b-v1"
+    assert benchmark_model.get_supported_modalities() == {RequestType.A2S}
+    assert 'voice="NATF2"' in _next_steps("personaplex", "0.0.0.0", 8000)

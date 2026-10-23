@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
 
 import torch
 
@@ -41,7 +42,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 
 from . import config as cfg
-from .voice import load_voice_preset, resolve_voice_path
+from .voice import VOICES_ARCHIVE, extract_voice_presets, load_voice_preset, resolve_voice_path
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,31 @@ class PersonaPlexModel(Model):
             self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=path)
         return self.tokenizer
 
+    def _voice_dir(self) -> str | None:
+        """``voice_dir``, or the repo's extracted ``voices.tgz`` when unset (not in dummy mode)."""
+        if self.voice_dir is None and not self.skip_weight_loading:
+            self.voice_dir = str(extract_voice_presets(self._download(VOICES_ARCHIVE)))
+        return self.voice_dir
+
+    def warmup_preprocess(self) -> None:
+        """Fetch the tokenizer and voice presets before the first request."""
+        if self.skip_weight_loading:
+            return
+        self._ensure_tokenizer()
+        self._voice_dir()
+
+    def get_voices(self) -> list[str] | None:
+        """Preset names for ``GET /v1/audio/voices``; never downloads (runs in the API process)."""
+        voice_dir = self.voice_dir
+        if voice_dir is None and not self.skip_weight_loading:
+            from huggingface_hub import try_to_load_from_cache
+
+            archive = try_to_load_from_cache(self.model_path_hf, VOICES_ARCHIVE, cache_dir=self.cache_dir)
+            voice_dir = Path(archive).parent / "voices" if isinstance(archive, str) else None
+        if voice_dir is None or not Path(voice_dir).is_dir():
+            return None
+        return sorted(path.stem for path in Path(voice_dir).glob("*.pt")) or None
+
     @staticmethod
     def wrap_with_system_tags(text: str) -> str:
         """[PP] offline.py:83-90."""
@@ -252,7 +278,7 @@ class PersonaPlexModel(Model):
         if not isinstance(persona, str) or not persona.strip():
             # The reference would iterate None for an empty prompt and fail ([PP] offline.py:241-243).
             raise ValueError("PersonaPlex persona text prompt must be non-empty")
-        preset = load_voice_preset(resolve_voice_path(self.voice_dir, kwargs.get("voice")),
+        preset = load_voice_preset(resolve_voice_path(self._voice_dir(), kwargs.get("voice")),
                                    dim=self.lm_config.dim)
         tokens = list(self._ensure_tokenizer().encode(self.wrap_with_system_tags(persona)))
         if not tokens:

@@ -1187,22 +1187,28 @@ parallelism are out of scope.
 .. code-block:: bash
 
    pip install -e ".[personaplex]"
-   # Accept NVIDIA's license on Hugging Face, extract voices.tgz from the repo,
-   # set model_kwargs.voice_dir in a copy of configs/personaplex.yaml, then:
-   mstar-serve --config my_personaplex.yaml --port 8000
+   # Accept NVIDIA's license on Hugging Face and use a token with access, then:
+   mstar serve personaplex
+   # Voice presets come from the repo's voices.tgz, fetched and extracted into
+   # the Hugging Face cache on first use; set model_kwargs.voice_dir in a copy
+   # of configs/personaplex.yaml to use a local directory instead.
 
 Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
 used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
 ``model_kwargs``:
 
-- ``voice`` (required): a preset name in ``voice_dir`` (``NATF2`` or
-  ``NATF2.pt``). Presets are loaded with ``torch.load(weights_only=True)`` and
-  validated; raw-WAV voice prompts are not supported yet.
+- ``voice`` (required, as in NVIDIA's ``offline.py``): a preset name such as
+  ``NATF2`` or ``NATF2.pt``; ``GET /v1/audio/voices`` lists them once fetched.
+  Presets are loaded with ``torch.load(weights_only=True)`` and validated;
+  raw-WAV voice prompts are not supported yet.
 - ``text_prompt``: the persona, wrapped in ``<system>`` tags as NVIDIA does;
   defaults to NVIDIA's offline default. The request prompt may carry it instead.
 - ``temp_text`` / ``topk_text`` (0.7 / 25), ``temp_audio`` / ``topk_audio``
   (0.8 / 250), ``greedy``. Seeded sampled output does not reproduce NVIDIA's,
   whose RNG stream differs; parity is defined on greedy and forced paths.
+
+Uploads longer than 2999 × 80 ms (239.9 s) are rejected from the file header,
+or after at most that much decoding, before the exact budget below is checked.
 
 Limits: voice embeddings + 12 silence frames + persona tokens + user frames must
 not exceed **2999** temporal forwards, so user audio is capped at

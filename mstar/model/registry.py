@@ -114,8 +114,8 @@ HF_MODELS: dict[str, dict] = {
     "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Gated: accept NVIDIA's license on the model page and use a token with
-    # access. Voice presets come from the same repo's voices.tgz and are
-    # passed to the model as model_kwargs.voice_dir (configs/personaplex.yaml).
+    # access. Voice presets come from the same repo's voices.tgz, fetched and
+    # extracted on first use unless model_kwargs.voice_dir points elsewhere.
     "personaplex": {"model_path_hf": "nvidia/personaplex-7b-v1"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar

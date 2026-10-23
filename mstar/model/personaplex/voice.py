@@ -4,12 +4,16 @@ A preset holds ``embeddings``, the stacked ``embed_codes`` outputs of every
 voice frame after the first (``[N, 1, 1, 4096]``), and ``cache``, the token
 cache saved after the raw-voice pass (``[1, 17, 4]``). It holds no KV:
 replaying it re-runs the temporal transformer on each embedding, then restores
-the cache. Presets ship in the gated ``voices.tgz``; operators point
-``voice_dir`` at the extracted files.
+the cache. Presets ship in the gated repo's ``voices.tgz``: operators either
+point ``voice_dir`` at extracted files or leave it unset, in which case the
+archive is fetched and extracted like NVIDIA's ``offline.py`` does.
 """
 
 from __future__ import annotations
 
+import shutil
+import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +30,38 @@ class VoicePreset:
     @property
     def num_embeddings(self) -> int:
         return self.embeddings.shape[0]
+
+
+VOICES_ARCHIVE = "voices.tgz"  # [PP] offline.py:125-150 (_get_voice_prompt_dir)
+
+
+def extract_voice_presets(archive: str | Path) -> Path:
+    """Extract ``voices.tgz`` once into ``voices/`` beside it, as [PP] offline.py:125-150 does.
+
+    Unlike the reference, extraction uses tarfile's ``data`` filter (no absolute
+    or parent paths, no links out of the tree, no devices) and goes into a
+    temporary sibling that is renamed into place, so concurrent workers never
+    read a partly extracted directory.
+    """
+    archive = Path(archive)
+    target = archive.parent / "voices"
+    if target.is_dir():
+        return target
+    staging = Path(tempfile.mkdtemp(prefix=".voices-", dir=archive.parent))
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(staging, filter="data")
+        extracted = staging / "voices"
+        if not extracted.is_dir():
+            raise RuntimeError(f"{archive.name} has no voices/ directory")
+        try:
+            extracted.rename(target)
+        except OSError:
+            if not target.is_dir():  # not merely another worker finishing first
+                raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
 
 
 def resolve_voice_path(voice_dir: str | Path | None, voice: object) -> Path:
