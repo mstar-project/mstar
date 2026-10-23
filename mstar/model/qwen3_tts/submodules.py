@@ -55,6 +55,7 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -136,6 +137,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     16 codec embeddings becomes the recurrent input for the next Talker step;
     the complete code vector is streamed independently to ``CodecSubmodule``.
     """
+
+    input_specs = {"talker_input_embeds": TensorSpec("param")}
 
     # Compiling the entire engine-facing forward traces request sampling,
     # residual-code control flow, and recurrent routing in addition to the
@@ -494,10 +497,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             # the previous frame, not a token ID that needs another lookup.
             # The text condition is added for the whole batch in
             # ``preprocess`` (one kernel instead of one per row).
-            input_embeds = inputs["talker_input_embeds"][0].to(
-                device=text_condition.device,
-                dtype=text_condition.dtype,
-            ).reshape(1, -1)
+            input_embeds = inputs["talker_input_embeds"][0].to(text_condition.device).reshape(1, -1)
         else:
             raise ValueError(f"Unknown Qwen3-TTS Talker walk: {graph_walk!r}")
 
@@ -1353,6 +1353,8 @@ class RefEncoderSubmodule(NodeSubmodule):
 
     disable_torch_compile = True
     CONDITIONING_CACHE_SIZE = 64
+    # the mel front end is fp32, whatever the speaker encoder runs in
+    input_specs = {"audio_inputs": TensorSpec(torch.float32)}
 
     def __init__(
         self,
@@ -1377,7 +1379,7 @@ class RefEncoderSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> NodeInputs:
         del graph_walk, kwargs
-        waveform = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32)
+        waveform = inputs["audio_inputs"][0].to(self.get_device())
         if waveform.ndim > 1:
             waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
         # ``process_prompt`` settled the layout and hashed the clip on the host.
