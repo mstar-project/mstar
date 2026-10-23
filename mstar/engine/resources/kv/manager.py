@@ -3254,6 +3254,13 @@ class KVManager(AttentionResource):
             )
             if self._index is not None:
                 self._index.assert_evictable()
+            for rid in self._dropped:
+                if rid in self._waiting:
+                    held = [
+                        page for stream in self._streams[rid].values()
+                        for page in (*stream.page_indices, *(stream.lease or ()))
+                    ]
+                    assert not held, f"{rid} was dropped and still holds pages {held}"
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
