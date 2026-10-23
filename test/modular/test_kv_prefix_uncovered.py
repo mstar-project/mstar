@@ -302,7 +302,7 @@ def test_a_stream_with_no_window_indexes_every_page_it_fills():
 
 # ── a walk the keys never described ─────────────────────────────────────
 
-WALKS = {"main": ("prefill_text", "decode")}
+WALKS = {"main": (("prefill_text",), ("decode",))}
 
 
 def _first_write(walk: str) -> KVManager:

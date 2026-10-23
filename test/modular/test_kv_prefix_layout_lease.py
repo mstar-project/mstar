@@ -91,7 +91,7 @@ class _Node(_TextNode):
 
     def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
         super().__init__()
-        self.kv.enable_prefix_cache(ROOT, {"main": (TEXT_WALK, "decode", IMAGE_WALK)})
+        self.kv.enable_prefix_cache(ROOT, {"main": ((TEXT_WALK, IMAGE_WALK), ("decode",))})
         self.runner.ingest_request("seed", {"kv": _config(seeded, decode=decode)})
         for walk, length in _walks(seeded):
             self.step("seed", length, walk)

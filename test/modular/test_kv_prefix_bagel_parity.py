@@ -311,7 +311,7 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 @requires_cuda
 def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance():
     device = torch.device("cuda:0")
-    walks = {"main": (WALK, "decode", IMAGE_WALK)}
+    walks = {"main": ((WALK, IMAGE_WALK), ("decode",))}
     generator = torch.Generator().manual_seed(20260930)
     # at the scale `_initialise` gives the token embeddings
     image = (torch.randn(50, _small_config().hidden_size, generator=generator) * 0.02).to(

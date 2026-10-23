@@ -28,7 +28,7 @@ from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
-WALKS = {"main": (WALK, "decode", IMAGE_WALK)}
+WALKS = {"main": ((WALK, IMAGE_WALK), ("decode",))}
 
 
 @pytest.fixture(autouse=True)
@@ -256,7 +256,8 @@ def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
 
 
 def test_under_tp_a_stream_keys_its_prompt_only():
-    assert _manager(1)._keyed_walks["main"] == _manager(0, world_size=1)._keyed_walks["main"] - {"decode"}
+    assert _manager(0, world_size=1)._keyed_walks["main"] == {WALK, IMAGE_WALK, "decode"}
+    assert _manager(1)._keyed_walks["main"] == {WALK, IMAGE_WALK}, "every keyed walk stays keyed above one rank"
 
 
 def test_above_one_rank_a_commit_caches_no_image_end():

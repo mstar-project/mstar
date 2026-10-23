@@ -655,17 +655,14 @@ class KVManager(AttentionResource):
         return state
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
-        # Above one rank the decode walk, `named[1]`, isn't keyed, since each rank reads its sampled ids
-        # at a different step.
+        # Above one rank a growth walk isn't keyed, since each rank reads its sampled ids at a
+        # different step.
         self._keyed_walks = {
-            label: frozenset(
-                walk for walk in (named[:1] + named[2:] if self._world_size > 1 else named)
-                if walk is not None
-            )
-            for label, named in (walks or {}).items()
+            label: frozenset((*keyed, *(growth if self._world_size == 1 else ())))
+            for label, (keyed, growth) in (walks or {}).items()
         }
         if not self.config.prefix_cache:
             return False

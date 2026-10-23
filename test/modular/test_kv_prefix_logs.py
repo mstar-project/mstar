@@ -224,7 +224,7 @@ def test_a_request_admitted_twice_is_still_one_line(caplog):
 
 # ── a declared node that its keys never reach ───────────────────────────
 
-DECLARED = {"main": (WALK, "decode")}
+DECLARED = {"main": ((WALK,), ("decode",))}
 
 
 def _serve(kv: KVManager, count: int, keyed: bool) -> None:

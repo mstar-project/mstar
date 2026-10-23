@@ -892,7 +892,7 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (*kv_label.keys.walks, *(walk for walk, _ in kv_label.growth if kv_label.keys.growth))
+                label: (kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth))
                 for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):

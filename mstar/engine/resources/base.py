@@ -111,12 +111,13 @@ class Resource(ABC):
     prefix_skip_safe: bool = False
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
     ) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
         True if anything opened.
 
-        ``walks`` names, per label, the walks that write the keyed stream.
+        ``walks`` names, per label, the walks that write the keyed stream, then
+        the growth walks whose sampled ids extend its keys.
         """
         return False
 
