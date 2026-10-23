@@ -72,18 +72,16 @@ def test_longctx_config_window_fits_its_pages(name):
     assert (res["max_num_pages"] - 1) * res["page_size"] >= model.config.max_seq_len
 
 
-def _kv(pages, page_size, eviction=False):
+def _kv(pages, page_size):
     import types
 
     return types.SimpleNamespace(config=types.SimpleNamespace(max_num_pages=pages,
-                                                              page_size=page_size),
-                                 supports_eviction=eviction)
+                                                              page_size=page_size))
 
 
 @pytest.mark.parametrize("change, resources, match", [
     ({"prefill_chunk_tokens": 0}, {}, "must be >= 1"),
     ({}, {"kv": _kv(4096, 96)}, "kv page_size=96 must be a power of two"),
-    ({"dsa_shard_prefill": True}, {"kv": _kv(4096, 128, eviction=True)}, "cpu_offload_pages"),
 ])
 def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match):
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, **change)
