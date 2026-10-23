@@ -444,16 +444,21 @@ class _DecodePlanCache:
     """The last leased decode plan, as `_fast_decode_plan` continues it."""
 
     __slots__ = (
-        "step_segments", "real_segments", "n_real", "pad_layout", "combined_labels", "views", "epoch", "pending",
-        "derived", "_rows",
+        "step_segments", "real_segments", "real_keys", "n_real", "pad_layout", "combined_labels", "views", "epoch",
+        "pending", "derived", "_rows",
     )
 
-    def __init__(self, step_segments, real_segments, n_real, pad_layout, combined_labels, views, epoch):
+    def __init__(
+        self, step_segments, real_segments, n_real, pad_layout, combined_labels, views, epoch, real_keys=None,
+    ):
         # the planned step's own segments tuple: a commit of that object is the
         # one commit the next plan may assume
         self.step_segments = step_segments
         # the real rows' segments, the key the next step must match
         self.real_segments = real_segments
+        # a packed step's real (request, label) pairs instead: the decode step
+        # after it has the same rows at span 1 (None for a decode step)
+        self.real_keys = real_keys
         self.n_real = n_real
         # (count, span) of the padding rows, which change dummy ids per slot
         self.pad_layout = pad_layout
@@ -2139,11 +2144,13 @@ class KVManager(AttentionResource):
     def _remember_decode_plan(
         self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
     ) -> None:
-        """Keep a leased decode step's plan so the next step of the same rows
-        can be planned off it (`_fast_decode_plan`). O(1): the full plan's
-        views are kept as they are and the per-row arrays are derived at the
-        first hit. Any other plan leaves the cache alone; the epoch and the
-        commit bookkeeping say whether it still describes the streams."""
+        """Keep a leased step's plan so the next decode step of the same rows
+        can be planned off it (`_fast_decode_plan`): a decode step's, or a
+        packed one's (prompt rows among the decode rows) under one plan label,
+        whose next step decodes every row. O(1): the full plan's views are
+        kept as they are and the per-row arrays are derived at the first hit.
+        Any other plan leaves the cache alone; the epoch and the commit
+        bookkeeping say whether it still describes the streams."""
         lease = ctx.slot_lease
         if lease is None or ctx.capture or step.pre_forks or step.post_forks or step.sink:
             return
@@ -2151,14 +2158,17 @@ class KVManager(AttentionResource):
         if split is None:
             return
         n_real, pad_layout = split
-        for seg in step.segments:
-            if seg.span != 1:
+        real_keys = None
+        if not all(seg.span == 1 for seg in step.segments):
+            real = step.segments[:n_real]
+            if step.combined_labels or len(res) != 1 or not all(seg.span >= 1 for seg in real):
                 return
+            real_keys = tuple((seg.request_id, seg.label) for seg in real)
         self._decode_plan_cache = _DecodePlanCache(
             step_segments=step.segments, real_segments=step.segments[:n_real],
             n_real=n_real, pad_layout=pad_layout, combined_labels=dict(step.combined_labels),
             views={label: out.views for label, out in res.items()},
-            epoch=self._plan_epoch,
+            epoch=self._plan_epoch, real_keys=real_keys,
         )
 
     def _derive_rows(self, cache: _DecodePlanCache, ctx: StepContext) -> dict | None:
@@ -2166,12 +2176,13 @@ class KVManager(AttentionResource):
         at the first hit)."""
         page_size = self.kv_cache.page_size
         derived: dict[str, _LabelRows] = {}
+        real_rows = cache.rows
         for label, views in cache.views.items():
             n_real = 0
             for v in views:
                 if not ctx.is_real_row(v.request_id) and v.request_id not in self._streams:
                     break
-                if not any(v.request_id == seg[0] and v.label == seg[1] for seg in cache.real_segments):
+                if (v.request_id, v.label) not in real_rows:
                     break
                 n_real += 1
             real, pad = views[:n_real], views[n_real:]
@@ -2230,19 +2241,37 @@ class KVManager(AttentionResource):
             return None
         n_real = cache.n_real
         segs = step.segments
-        if (
-            len(segs) != n_real + cache.pad_layout[0]
-            or segs[:n_real] != cache.real_segments
-            or step.combined_labels != cache.combined_labels
-            or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in segs[n_real:])
-            # padding keeps its labels: their order places the real rows in a combined label
-            or any(
-                seg.label != prev.label
-                for seg, prev in zip(segs[n_real:], cache.step_segments[n_real:], strict=True)
-            )
-        ):
-            stats["miss"] += 1
-            return None
+        pad_segs = segs[n_real:]
+        if cache.real_keys is None:
+            if (
+                len(segs) != n_real + cache.pad_layout[0]
+                or segs[:n_real] != cache.real_segments
+                or step.combined_labels != cache.combined_labels
+                or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in pad_segs)
+                # padding keeps its labels: their order places the real rows in a combined label
+                or any(
+                    seg.label != prev.label
+                    for seg, prev in zip(pad_segs, cache.step_segments[n_real:], strict=True)
+                )
+            ):
+                stats["miss"] += 1
+                return None
+        else:
+            # after a packed step: the same rows, every one decoding, under
+            # this step's own padding (one label, so its order places nothing)
+            (label,) = cache.views
+            if (
+                len(segs) < n_real
+                or step.combined_labels
+                or any(seg.span != 1 for seg in segs[:n_real])
+                or tuple((seg.request_id, seg.label) for seg in segs[:n_real]) != cache.real_keys
+                or any(
+                    seg.span != pad_segs[0].span or seg.label != label or ctx.is_real_row(seg.request_id)
+                    for seg in pad_segs
+                )
+            ):
+                stats["miss"] += 1
+                return None
         if cache.derived is None:
             cache.derived = self._derive_rows(cache, ctx)
             if cache.derived is None:
@@ -2250,10 +2279,14 @@ class KVManager(AttentionResource):
                 stats["miss"] += 1
                 return None
         page_size = self.kv_cache.page_size
-        pad_segs = segs[n_real:]
         make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
         out: dict[str, KVPlanOutput] = {}
         for label, rows in cache.derived.items():
+            if cache.real_keys is not None:
+                # the packed step's padding is not this step's
+                rows.n_pad = len(pad_segs)
+                rows.pad_span = pad_segs[0].span if pad_segs else 0
+                rows.pad_pages = -(-rows.pad_span // page_size)
             lens = rows.lens + 1
             last = (lens - 1) % page_size + 1
             npages = (lens + page_size - 1) // page_size
@@ -2342,6 +2375,11 @@ class KVManager(AttentionResource):
                 view_builder=build_views,
             )
         cache.step_segments = step.segments
+        if cache.real_keys is not None:
+            # a decode step from here on: the next is matched as one
+            cache.real_segments = segs[:n_real]
+            cache.real_keys = None
+            cache.pad_layout = (len(pad_segs), pad_segs[0].span if pad_segs else 0)
         cache.pending = 0
         stats["hit"] += 1
         return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
