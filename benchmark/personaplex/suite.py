@@ -29,6 +29,8 @@ STOP_RESERVE_S = {"smoke": 120, "full": 900}
 # ones (the 16 GB checkpoint) are identified by size and modification time.
 HASH_LIMIT_BYTES = 256 << 20
 ASSET_FILES = ("model.safetensors", "tokenizer-e351c8d8-checkpoint125.safetensors", "tokenizer_spm_32k_3.model")
+# The batching check alternates these presets, so a batch mixes voice lengths.
+VOICES = ("NATF2", "NATM1")
 INTERRUPTED = False
 
 
@@ -63,8 +65,9 @@ def preflight(settings, root):
     for name in ASSET_FILES:
         if not (Path(settings["assets"]) / name).is_file():
             raise FileNotFoundError(name)
-    if not (Path(settings["voices"]) / "NATF2.pt").is_file():
-        raise FileNotFoundError("NATF2.pt")
+    for voice in VOICES:
+        if not (Path(settings["voices"]) / f"{voice}.pt").is_file():
+            raise FileNotFoundError(f"{voice}.pt")
     extension = rust_extension_files(settings)
     entries = [entry(settings["existing_clip"], "existing-222")]
     if settings.get("english_clip") and Path(settings["english_clip"]).is_file():
@@ -98,7 +101,7 @@ def preflight(settings, root):
         "model_files": {
             str(path): file_identity(path)
             for path in [*(Path(settings["assets"]) / name for name in ASSET_FILES),
-                         Path(settings["voices"]) / "NATF2.pt"]
+                         *(Path(settings["voices"]) / f"{voice}.pt" for voice in VOICES)]
         },
         "reference_runtime_scope": "Same-runtime reference; supported NVIDIA runtime deferred",
     }
@@ -181,6 +184,13 @@ def missing_clip_results(entries, smoke):
     return {f"parity-english-{backend}": {"status": "BLOCKED", "reason": reason} for backend in ("dense", "resources")}
 
 
+def judge_blocked(settings):
+    """The judge stage's BLOCKED row when the settings name no ASR model."""
+    if settings.get("asr_model"):
+        return {}
+    return {"judge": {"status": "BLOCKED", "reason": "No asr_model in the settings; listen to listen.html instead"}}
+
+
 def subprocess_case(command, output, logpath, deadline, timeout, env):
     remaining = min(timeout, deadline - time.time())
     if remaining <= 0:
@@ -256,6 +266,15 @@ def report(root):
             lines.append(f"  Numerical metrics: {json.dumps(numeric_rows[-1], sort_keys=True)}")
             if values.get("first_decision"):
                 lines.append(f"  First decision: {json.dumps(values['first_decision'], sort_keys=True)}")
+        summary = root / name / "summary.json"
+        if name.startswith("batch-") and summary.exists():
+            values = json.loads(summary.read_text())
+            for size, cases in values.get("batched", {}).items():
+                lines.append(f"  Batch of {size} vs alone: {json.dumps(cases, sort_keys=True)}")
+            lines.append(f"  LM step timing: {json.dumps(values.get('timing'), sort_keys=True)}")
+        if name == "judge" and summary.exists():
+            for stage, values in json.loads(summary.read_text()).get("stages", {}).items():
+                lines.append(f"  {stage}: {json.dumps(values, sort_keys=True)}")
         cells = root / name / "cells.json"
         if cells.exists():
             for cell in json.loads(cells.read_text()):
@@ -285,8 +304,8 @@ def report(root):
                 )
     lines += [
         "",
-        "Deferred: second voice, injected worker errors, supported NVIDIA runtime, accepted",
-        "near-limit requests, broad quality claims, batching, live ingress and streamed audio.",
+        "Deferred: injected worker errors, supported NVIDIA runtime, accepted near-limit",
+        "requests, broad quality claims, CUDA graphs, live ingress and streamed audio.",
         "A completed comparison does not approve numerical divergence or establish quality.",
     ]
     (root / "REPORT.rst").write_text("\n".join(lines) + "\n")
@@ -374,7 +393,58 @@ def main():
                 "--output",
                 str(root / name),
             ]
-            scenarios.append((name, command, 1200, 120 if smoke else 180))
+            # The dense stage is the exact baseline the negative control is checked against; the
+            # served-path stage is the one whose near-tie flips need the reference's own spread.
+            if backend == "dense" or smoke:
+                command.append("--negative-control")
+            if backend == "resources":
+                command.append("--reference-control")
+            scenarios.append((name, command, 1200 if smoke else 1800, 120 if smoke else 240))
+    name = "batch-resources"
+    scenarios.append(
+        (
+            name,
+            [
+                sys.executable,
+                "-m",
+                "benchmark.personaplex.batch",
+                "--inputs",
+                *[item["path"] for item in parity_entries],
+                "--assets",
+                settings["assets"],
+                "--voices",
+                settings["voices"],
+                "--voice-names",
+                *VOICES,
+                "--frames",
+                "16" if smoke else "2999",
+                "--batch-sizes",
+                *(["2"] if smoke else ["2", "4"]),
+                "--output",
+                str(root / name),
+            ],
+            900 if smoke else 1800,
+            120 if smoke else 240,
+        )
+    )
+    if settings.get("asr_model"):
+        scenarios.append(
+            (
+                "judge",
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmark.personaplex.judge",
+                    "--asr-model",
+                    settings["asr_model"],
+                    "--output",
+                    str(root / "judge"),
+                    *[str(root / f"parity-{item['id']}-resources") for item in parity_entries],
+                ],
+                900,
+                120,
+            )
+        )
     for backend in ["rust"] if smoke else ["python", "rust"]:
         name = "lifecycle-" + backend
         scenarios.append(
@@ -394,6 +464,9 @@ def main():
                     backend,
                     "--mode",
                     "smoke" if smoke else "lifecycle",
+                    # One request a step, so concurrent outputs must equal isolated ones exactly.
+                    "--max-batch-size",
+                    "1",
                 ],
                 1800,
                 180 if smoke else 360,
@@ -448,6 +521,7 @@ def main():
     for name, *_ in scenarios:
         results.setdefault(name, {"status": "NOT RUN"})
     results.update(missing_clip_results(entries, smoke))
+    results.update(judge_blocked(settings))
     write_json(result_path, results)
     for name, command, timeout, minimum in scenarios:
         if reusable(results[name], command, args.retry_failed):

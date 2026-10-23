@@ -1,4 +1,10 @@
-"""Bounded actual-worker lifecycle/soak checks, deliberately not benchmark timings."""
+"""Bounded actual-worker lifecycle/soak checks, deliberately not benchmark timings.
+
+Outputs are compared byte for byte with each input's first (isolated) response
+only when the server runs every LM step alone (``--max-batch-size 1``): a
+batched step changes floating-point rounding, so there agreement is recorded,
+not asserted. Batched correctness is checked offline by ``batch.py``.
+"""
 
 import argparse
 import base64
@@ -69,9 +75,23 @@ def verify_ownership_observations(rows, completed):
         assert not pending, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
 
 
+def server_config(settings, root, max_batch_size):
+    """The settings' server YAML, or a copy of it in ``root`` with ``model_kwargs.max_batch_size`` replaced."""
+    if max_batch_size is None:
+        return settings["server_config"]
+    import yaml
+
+    config = yaml.safe_load(Path(settings["server_config"]).read_text())
+    config.setdefault("model_kwargs", {})["max_batch_size"] = max_batch_size
+    path = root / "server-config.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+    return str(path)
+
+
 class Server:
-    def __init__(self, settings, root, backend, observe):
+    def __init__(self, settings, root, backend, observe, max_batch_size=None):
         self.settings, self.root, self.backend, self.observe = settings, root, backend, observe
+        self.max_batch_size = max_batch_size
         self.port = settings.get("port", 8000)
         self.process = None
 
@@ -103,7 +123,7 @@ class Server:
         command = [
             str(Path(sys.executable).with_name("mstar-serve")),
             "--config",
-            self.settings["server_config"],
+            server_config(self.settings, self.root, self.max_batch_size),
             "--cache-dir",
             self.settings["cache"],
             "--tensor-comm-protocol",
@@ -118,6 +138,7 @@ class Server:
             {
                 "command": command,
                 "backend": self.backend,
+                "max_batch_size": self.max_batch_size,
                 "instrumented": self.observe,
                 "MSTAR_SHM_ARENA": "1",
                 "started": time.time(),
@@ -196,8 +217,8 @@ class Server:
 
 
 class Lifecycle:
-    def __init__(self, server, entries):
-        self.server, self.entries = server, entries
+    def __init__(self, server, entries, exact):
+        self.server, self.entries, self.exact = server, entries, exact
         self.rows, self.controls = [], {}
         self.index = 0
 
@@ -285,9 +306,8 @@ class Lifecycle:
             row.update(audio_sha256=hashlib.sha256(pcm).hexdigest(), text=text.decode("utf-8"), samples=len(pcm) // 2)
             key = (entry["id"], with_text)
             control = self.controls.setdefault(key, (row["audio_sha256"], row["text"]))
-            assert control == (row["audio_sha256"], row["text"]), (
-                "Concurrent/recovery output differs from isolated control"
-            )
+            row["matches_control"] = control == (row["audio_sha256"], row["text"])
+            assert row["matches_control"] or not self.exact, "Concurrent/recovery output differs from isolated control"
         write_json(self.server.root / f"request-{index}.json", row)
         return row
 
@@ -361,18 +381,23 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--backend", choices=["python", "rust"], default="rust")
     parser.add_argument("--mode", choices=["smoke", "lifecycle", "soak"], default="lifecycle")
+    parser.add_argument("--max-batch-size", type=int, help="override the YAML's model_kwargs.max_batch_size")
     args = parser.parse_args()
     settings = json.loads(args.settings.read_text())
     args.output.mkdir(parents=True, exist_ok=False)
-    outcome = {"status": "FAIL", "mode": args.mode, "backend": args.backend}
+    exact = args.max_batch_size == 1
+    outcome = {"status": "FAIL", "mode": args.mode, "backend": args.backend, "max_batch_size": args.max_batch_size,
+               "outputs_compared_exactly": exact}
     try:
-        with Server(settings, args.output, args.backend, True) as server:
-            run = Lifecycle(server, read_manifest(args.manifest))
+        with Server(settings, args.output, args.backend, True, args.max_batch_size) as server:
+            run = Lifecycle(server, read_manifest(args.manifest), exact)
             run.run(smoke=args.mode != "lifecycle")
             if args.mode == "soak":
                 run.soak(1200)
             verify_ownership_observations(run.events(), sum("samples" in row for row in run.rows))
-            outcome.update(status="PASS", requests=run.rows)
+            compared = [row for row in run.rows if "matches_control" in row]
+            outcome.update(status="PASS", requests=run.rows,
+                           matching_control=sum(row["matches_control"] for row in compared), compared=len(compared))
     except Exception as exc:
         outcome["error"] = repr(exc)
         raise

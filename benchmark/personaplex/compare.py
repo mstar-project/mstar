@@ -18,10 +18,12 @@ def audit(directory):
         counter_matches = emitted == summary["checks"]["output_frame_mismatches"]
         difference = arrays["mstar_pcm"].astype(np.float64) - arrays["nvidia_pcm"].astype(np.float64)
         finite = bool(np.isfinite(arrays["mstar_pcm"]).all() and np.isfinite(arrays["nvidia_pcm"]).all())
+        # A negative control that ran must have been caught by the same comparison.
+        negative = summary["checks"].get("negative_control")
+        caught = negative is None or negative["detected"]
+        exact = counter_matches and not emitted and summary["checks"]["user_codes"]["different"] == 0
         return {
-            "status": "PASS"
-            if counter_matches and not emitted and finite and summary["checks"]["user_codes"]["different"] == 0
-            else "FAIL",
+            "status": "PASS" if exact and finite and caught else "FAIL",
             "agent_code_differences": int(np.count_nonzero(ours != reference)),
             "agent_frames": frames,
             "agent_frame_count": len(frames),
@@ -35,6 +37,8 @@ def audit(directory):
                 "rmse": float(np.sqrt(np.mean(difference**2))),
             },
             "first_decision": summary["checks"].get("first_decision"),
+            "negative_control": negative,
+            "reference_control": summary["checks"].get("reference_control"),
             "scope": "Exact token trajectory check; float audio metrics are descriptive, not quality acceptance.",
         }
 

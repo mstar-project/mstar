@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -116,6 +117,72 @@ def test_failing_saved_comparison_reports_fail_and_nonzero(tmp_path):
     )
     assert result.returncode == 1
     assert json.loads(result.stdout)["status"] == "FAIL"
+
+
+def test_matching_comparison_fails_when_its_negative_control_was_not_caught(tmp_path):
+    from benchmark.personaplex.compare import audit
+
+    agent = np.zeros((1, 8, 2), dtype=np.int64)
+    np.savez(
+        tmp_path / "pipeline.npz",
+        mstar_agent=agent,
+        nvidia_agent=agent,
+        mstar_text=np.zeros((2, 1)),
+        nvidia_text=np.zeros((2, 1)),
+        mstar_pcm=np.zeros(20),
+        nvidia_pcm=np.zeros(20),
+    )
+    checks = {"output_frame_mismatches": [], "user_codes": {"different": 0}}
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"checks": checks}))
+    assert audit(tmp_path)["status"] == "PASS"
+    for detected, status in ((True, "PASS"), (False, "FAIL")):
+        summary.write_text(json.dumps({"checks": {**checks, "negative_control": {"detected": detected}}}))
+        result = audit(tmp_path)
+        assert result["status"] == status and result["negative_control"] == {"detected": detected}
+
+
+def test_negative_control_rope_is_one_position_ahead_in_both_layouts():
+    import torch
+
+    from benchmark.personaplex.controls import ShiftedRope
+    from mstar.model.personaplex.components.temporal import apply_rope_adjacent
+
+    q, k = torch.randn(2, 1, 4, 8), torch.randn(2, 1, 4, 8)
+    shifted = ShiftedRope(num_layers=1, rope_theta=10000.0)
+    shifted.offset = 5
+    want = apply_rope_adjacent(q, k, torch.tensor([6]), 10000.0)
+    for got, expected in zip(shifted.rope(q, k), want, strict=True):
+        assert torch.equal(got, expected)
+    for got, expected in zip(shifted.rope(q[:, 0], k[:, 0]), want, strict=True):  # token-major
+        assert torch.equal(got, expected[:, 0])
+    shifted.advance()
+    assert shifted.offset == 6  # the cache itself still advances one position a forward
+
+
+def test_first_reference_decision_skips_forced_choices_and_reports_both_margins():
+    import torch
+
+    from benchmark.personaplex.controls import first_reference_decision
+
+    def record(phase, text, depth, text_forced=False):
+        depth_logits = torch.zeros(1, 16, 4)
+        for d, token in depth.items():
+            depth_logits[0, d, token] = 2.0
+        return {"phase": phase, "text_logits": torch.tensor([[[[0.0, 3.0, 1.0, 0.0]]]]) if text == 1
+                else torch.tensor([[[[0.0, 1.0, 3.0, 0.0]]]]),
+                "provided": torch.tensor([[[text_forced]]]), "depth_logits": depth_logits,
+                "depth_provided": torch.zeros(1, 16, dtype=torch.bool)}
+
+    default = [record("conditioning", 1, {}), record("generation", 1, {}, text_forced=True),
+               record("generation", 1, {3: 1})]
+    math = [record("conditioning", 2, {}), record("generation", 2, {}, text_forced=True),
+            record("generation", 1, {3: 2})]
+    found = first_reference_decision(default, math)
+    assert (found["record"], found["kind"], found["depth_step"]) == (2, "depth", 3)
+    assert found["default"]["tokens"][0] == 1 and found["math"]["tokens"][0] == 2
+    assert found["default"]["margin"] == found["math"]["margin"] == 2.0
+    assert first_reference_decision(default, default) is None
 
 
 def test_arena_lifecycle_cannot_pass_without_precleanup_decoder_observations():
@@ -299,3 +366,34 @@ def test_model_file_identity_hashes_small_files_and_stats_large_ones(tmp_path):
     assert "sha256" in first and file_identity(voice) != first
     large = file_identity(voice, hash_limit=1)
     assert set(large) == {"bytes", "mtime_ns"} and large["bytes"] == 7
+
+
+def test_word_error_rate_ignores_case_and_punctuation():
+    from benchmark.personaplex.judge import word_error_rate
+
+    assert word_error_rate("Hello, there!", "hello there") == 0
+    assert word_error_rate("pack light for japan", "pack lights for japan") == 0.25
+    assert word_error_rate("one two three", "one three") == pytest.approx(1 / 3)
+    assert word_error_rate("one", "one two three") == 2
+    assert word_error_rate("", "anything") is None
+
+
+def test_serving_config_override_copies_the_yaml_with_one_batch_size(tmp_path):
+    import yaml
+
+    from benchmark.personaplex.serving import server_config
+
+    source = tmp_path / "personaplex.yaml"
+    source.write_text("model: personaplex\nmodel_kwargs:\n  voice_dir: /voices\n  max_batch_size: 8\n")
+    settings = {"server_config": str(source)}
+    assert server_config(settings, tmp_path, None) == str(source)
+    derived = yaml.safe_load(Path(server_config(settings, tmp_path, 1)).read_text())
+    assert derived["model_kwargs"] == {"voice_dir": "/voices", "max_batch_size": 1}
+    assert yaml.safe_load(source.read_text())["model_kwargs"]["max_batch_size"] == 8
+
+
+def test_judge_is_blocked_without_an_asr_model():
+    from benchmark.personaplex.suite import judge_blocked
+
+    assert judge_blocked({"asr_model": "/models/whisper"}) == {}
+    assert judge_blocked({})["judge"]["status"] == "BLOCKED"

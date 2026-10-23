@@ -9,7 +9,6 @@ No production code or reference math is patched. Observer overrides only record.
 import argparse
 import hashlib
 import json
-import socket
 import subprocess
 import sys
 import time
@@ -31,6 +30,10 @@ p.add_argument("--voices", type=Path, required=True)
 p.add_argument("--reference-site", default="")
 p.add_argument("--backend", choices=["dense", "resources"], default="resources")
 p.add_argument("--skip-components", action="store_true")
+p.add_argument("--negative-control", action="store_true",
+               help="also run M* with RoPE one position ahead; the comparison must catch it")
+p.add_argument("--reference-control", action="store_true",
+               help="also rerun NVIDIA under the math SDPA kernel: the reference's own kernel spread")
 a = p.parse_args()
 PIN = "3428dfd95309a7f3c84fd93259ded0f810d1ff91"
 REPO = Path(__file__).resolve().parents[2]
@@ -44,6 +47,8 @@ from moshi.utils.compile import no_compile, no_cuda_graph
 from safetensors import safe_open
 from safetensors.torch import load_file
 
+from benchmark.personaplex.controls import ShiftedRope, candidates, first_reference_decision
+from benchmark.personaplex.resources import ResourceBackend
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.mimi import load_mimi_codec
 from mstar.model.personaplex.components.temporal import DenseTemporalCache
@@ -106,62 +111,6 @@ def metrics(got, expected):
         top = y.topk(2, dim=-1).values
         result["reference_min_top2_margin"] = float((top[..., 0] - top[..., 1]).min())
     return result
-
-
-class ResourceBackend:
-    def __init__(self, model, sub, rid):
-        from mstar.communication.tensors import LocalTransferEngine
-        from mstar.engine.resources.base import EngineResourceInfo, build_resource
-        from mstar.engine.resources.kv.config import KVReqConfig
-        from mstar.engine.resources.kv.transfer import TransferEngineInfo
-        from mstar.engine.resources.runner import StepRunner
-
-        specs = model.get_node_resources()
-        by_key = {s.resource_key: s for s in specs}
-        transfer = TransferEngineInfo(
-            "numerical-oracle", socket.gethostname(), LocalTransferEngine(socket.gethostname())
-        )
-        self.resources = {
-            s.resource_key: build_resource(
-                s,
-                EngineResourceInfo(
-                    device=torch.device("cuda:0"),
-                    kv_dtype=torch.bfloat16,
-                    transfer_engine_info=transfer,
-                    dependencies={k: by_key[k] for k in s.depends_on()},
-                ),
-            )
-            for s in specs
-        }
-        self.runner = StepRunner(self.resources)
-        self.rid, self.sub = rid, sub
-        overrides = model.get_request_resource_configs({}, {"greedy": True})
-        overrides[cfg.LM_KV] = KVReqConfig(needed_labels=["main"], prefix_cache=False)
-        self.runner.ingest_request(rid, overrides)
-        sub.bind_node_resources(self.resources)
-        self.backend = sub._backend
-
-    def begin(self, walk):
-        from mstar.engine.resources.step import StepContext
-
-        self.step = self.sub.declare_step(walk, [self.rid], [SimpleNamespace(input_seq_len=1)])
-        self.step.set_ctx(StepContext([self.rid], walk, slot=0, capture=False))
-        outcome = self.runner.admit(self.step)
-        assert outcome.ok and outcome.ready, outcome
-        self.runner.plan(self.step)
-        self.backend.begin()
-
-    def finish(self):
-        self.runner.commit(self.step)
-
-    def close(self):
-        self.runner.remove_request(self.rid)
-
-    def sample_text(self, logits):
-        return self.resources[cfg.TEXT_SAMPLER].sample([self.rid], logits.float())
-
-    def sample_depth(self, logits, index):
-        return self.resources[cfg.DEPTH_SAMPLER].sample([self.rid], logits.float())
 
 
 class Observer(LMGen):
@@ -269,6 +218,73 @@ def components(ref, native, input_codes):
     save()
 
 
+def reference_generation(ref, voice_path, persona, ref_user, user_frames):
+    """NVIDIA's own conditioning and greedy generation, observed; returns the observer and its tokens."""
+    gen = Observer(ref)
+    gen.load_voice_prompt_embeddings(str(voice_path))
+    gen.text_prompt_tokens = persona.tolist()
+    agent, text = [], []
+    with gen.streaming(1):
+        gen.step_system_prompts(None)
+        gen.phase = "generation"
+        for i in range(user_frames):
+            tokens, _ = gen.step(ref_user[..., i : i + 1])
+            assert tokens is not None
+            agent.append(tokens[:, 1:9].clone())
+            text.append(tokens[:, 0, 0].clone())
+        state = gen._streaming_state
+        final = (state.cache.cpu().clone(), state.provided.cpu().clone(), state.offset)
+    return gen, agent, text, final
+
+
+def reference_control(ref, voice_path, persona, ref_user, user_frames, gen, ref_agent, ref_text):
+    """How far NVIDIA's own output moves under another valid attention kernel.
+
+    The suite's served-path comparison can flip near-tied tokens; this measures
+    the reference against itself, so those flips have a yardstick.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    stage("reference kernel control: NVIDIA again under the math SDPA kernel")
+    with sdpa_kernel(SDPBackend.MATH):
+        control, agent, text, _ = reference_generation(ref, voice_path, persona, ref_user, user_frames)
+    agent_diff = int((torch.cat(agent, -1) != torch.cat(ref_agent, -1)).sum())
+    text_frames = int((torch.stack(text) != torch.stack(ref_text)).sum())
+    report["checks"]["reference_control"] = dict(
+        kernels="default SDPA selection vs SDPBackend.MATH, both NVIDIA's own code",
+        agent_codes_different=agent_diff,
+        text_tokens_different=text_frames,
+        first_decision=first_reference_decision(gen.records, control.records),
+    )
+    save()
+
+
+def negative_control(sub, native, meta, static, ref_agent, ref_text):
+    """Run M* with a realistic bug through the same exact-token comparison; it must report a mismatch."""
+    stage("negative control: M* with RoPE one position ahead, compared the same way")
+    backend = ShiftedRope(native.config.num_layers, native.config.rope_theta)
+    state, detected, frames = None, None, 0
+    for index in range(meta["conditioning_frames"] + meta["num_user_frames"]):
+        walk = cfg.CONDITIONING_WALK if index < meta["conditioning_frames"] else cfg.GENERATE_WALK
+        frame = sub.prepare_frame(walk, meta, {**static, "lm_state": [] if state is None else [state]})
+        result = sub.run_frame(frame, backend, lambda x: x.argmax(-1), lambda x, i: x.argmax(-1))
+        backend.advance()
+        state, frames = result["lm_state"][0], index + 1
+        if walk == cfg.GENERATE_WALK:
+            j = index - meta["conditioning_frames"]
+            if not (torch.equal(result["agent_frame"][0], ref_agent[j])
+                    and torch.equal(result["text_frame"][0], ref_text[j])):
+                detected = j
+                break
+    report["checks"]["negative_control"] = dict(
+        perturbation="RoPE positions one ahead (dense attention otherwise unchanged)",
+        detected=detected is not None,
+        first_mismatch_generation_step=detected,
+        frames_run=frames,
+    )
+    save()
+
+
 @torch.inference_mode()
 def pipeline(ref, native):
     stage("production preprocessing and independent Mimi encoders")
@@ -319,29 +335,18 @@ def pipeline(ref, native):
     if not a.skip_components:
         components(ref, native, ref_user)
     stage("independent NVIDIA conditioning and greedy generation")
-    gen = Observer(ref)
-    gen.load_voice_prompt_embeddings(str(voice_path))
-    gen.text_prompt_tokens = persona.tolist()
-    ref_agent, ref_text = [], []
-    with gen.streaming(1):
-        gen.step_system_prompts(None)
-        report["checks"]["nvidia_conditioning_steps"] = len(gen.records)
-        gen.phase = "generation"
-        for i in range(user_frames):
-            tokens, _ = gen.step(ref_user[..., i : i + 1])
-            assert tokens is not None
-            ref_agent.append(tokens[:, 1:9].clone())
-            ref_text.append(tokens[:, 0, 0].clone())
-        final_ref_cache = gen._streaming_state.cache.cpu().clone()
-        final_ref_provided = gen._streaming_state.provided.cpu().clone()
-        final_ref_offset = gen._streaming_state.offset
+    gen, ref_agent, ref_text, final_ref = reference_generation(ref, voice_path, persona, ref_user, user_frames)
+    final_ref_cache, final_ref_provided, final_ref_offset = final_ref
+    report["checks"]["nvidia_conditioning_steps"] = len(gen.records) - user_frames
     torch.save(gen.records, out / "nvidia-events.pt")
+    if a.reference_control:
+        reference_control(ref, voice_path, persona, ref_user, user_frames, gen, ref_agent, ref_text)
     stage("production conditioning and generation, own user codes, no substitution")
     sub = LMSubmodule(native)
     static["user_audio_codes"] = [ours_user]
     state = None
     backend = DenseTemporalCache(native.config.num_layers, native.config.rope_theta)
-    resource = ResourceBackend(model, sub, "real-checkpoint") if a.backend == "resources" else None
+    resource = ResourceBackend(model, sub, ["real-checkpoint"]) if a.backend == "resources" else None
     records, agent, text = [], [], []
     total = meta["conditioning_frames"] + user_frames
     latest = {}
@@ -424,15 +429,6 @@ def pipeline(ref, native):
                     if forced or torch.equal(got_logits.argmax(-1), ref_logits.argmax(-1)):
                         continue
                     if "first_decision" not in report["checks"]:
-
-                        def candidates(logits):
-                            values, ids = logits.float().topk(2, dim=-1)
-                            return dict(
-                                tokens=ids[0].tolist(),
-                                logits=values[0].tolist(),
-                                margin=float(values[0, 0] - values[0, 1]),
-                            )
-
                         # topk's order at a tie need not match argmax, so record each side's actual
                         # choice and both sides' logits for both choices (batch size 1).
                         picks = {"reference": int(ref_logits.argmax(-1).reshape(-1)[0]),
@@ -494,6 +490,8 @@ def pipeline(ref, native):
         native.depth.step = depth_original
         if resource:
             resource.close()
+    if a.negative_control:
+        negative_control(sub, native, meta, static, ref_agent, ref_text)
     (out / "pipeline-events.json").write_text(json.dumps(records, indent=2))
     torch.save(actual_events, out / "mstar-events.pt")
     from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
@@ -580,4 +578,8 @@ except Exception as exc:
     save()
     raise
 
-raise SystemExit(0 if report.get("exact_trajectory_match") and report["checks"]["user_codes"]["different"] == 0 else 1)
+control = report["checks"].get("negative_control")
+caught = control is None or control["detected"]
+raise SystemExit(
+    0 if report.get("exact_trajectory_match") and report["checks"]["user_codes"]["different"] == 0 and caught else 1
+)
