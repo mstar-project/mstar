@@ -19,3 +19,25 @@ node_groups:
   # `action_gen`: the four-step denoise loop
   - node_names: [denoise_step]
     ranks: [0]
+
+model_kwargs:
+  # CUDA graphs for the denoise step, the node that runs four times per request.
+  # One graph per [text_rows, image_rows] bucket per batch size; a shape with no
+  # graph runs eager, and a batch of 3, 5, 6 or 7 replays the next captured size.
+  # The rows are what the request's prompt and frames become: two cameras at two
+  # timesteps are 448 image rows; DROID's demo instructions give 13 text rows (no
+  # instruction), 21 and 25. A deployment captures its own prompts' lengths.
+  # Graph mode holds one FlashInfer workspace per attention label per slot (the
+  # denoise step alone: 3 labels x 2 slots), at MSTAR_WORKSPACE_BUFFER_MB each,
+  # 512 by default. On a 12-16 GB card set it to 128, or the card fills before
+  # the first request (an RTX 5070 Ti with 512: 1.6 s a request; with 128: 0.12 s).
+  accelerator_graph: true
+  capture_shapes: [[13, 448], [21, 448], [25, 448]]
+  capture_batch_sizes: [1, 2, 4, 8]
+
+resources:
+  # A captured DT step's cross-attention wrapper is sized per request: by default
+  # the bucket's own 41 query tokens, but its keys are a request's text or image
+  # rows. 448 covers the widest span of the capture_shapes above.
+  dt_xattn:
+    max_tokens_per_request: 448

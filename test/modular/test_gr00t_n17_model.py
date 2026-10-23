@@ -88,6 +88,7 @@ import msgpack
 import numpy as np
 import pytest
 import torch
+import yaml
 from safetensors.torch import save_file
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
@@ -97,6 +98,7 @@ from mstar.engine.resources import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
+    apply_yaml_overrides,
 )
 from mstar.graph.base import (
     GraphEdge,
@@ -131,6 +133,7 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 from mstar.model.gr00t_n17.submodules import (
     Gr00tN17DenoiseStepSubmodule,
     Gr00tN17LLMSubmodule,
+    Gr00tN17Shape,
     Gr00tN17StateEncoderSubmodule,
     Gr00tN17VisionEncoderSubmodule,
     Gr00tN17VLBridgeSubmodule,
@@ -301,6 +304,8 @@ def _model(config: Gr00tN17Config | None = None, video_keys=None) -> Gr00tN17Mod
     model.config = config if config is not None else _config()
     model.processor = _Processor(_VIDEO_KEYS if video_keys is None else video_keys)
     model._submodules = {}
+    # `__init__`'s capture defaults: no graphs
+    model.accelerator_graph, model.capture_shapes, model.capture_batch_sizes = False, [], [1, 2, 4, 8]
     return model
 
 
@@ -1596,6 +1601,96 @@ def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(torch.nn.functional, "layer_norm", fp32_layer_norm)
         assert {t.dtype for t in spans(torch.bfloat16)} == {torch.float32}
+
+
+# ----------------------------------------------------------------------------
+# accelerator graphs
+# ----------------------------------------------------------------------------
+
+_SERVING = Path(__file__).resolve().parents[2] / "configs" / "gr00t_n17.yaml"
+
+
+def _constructed(path: Path, **model_kwargs) -> Gr00tN17Model:
+    """The real ``__init__`` over ``path``, with the two checkpoint reads stood in by
+    the tiny config and ``_Processor``: the capture settings are parsed there and
+    nowhere else, and neither read is a property of them."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Gr00tN17Config, "from_hf", lambda *args: _config())
+        patch.setattr(Gr00tN17Preprocessor, "from_pretrained", lambda *args, **kwargs: _Processor(_VIDEO_KEYS))
+        return Gr00tN17Model(model_path_hf=str(path), backbone_path_hf=str(path), **model_kwargs)
+
+
+def test_each_capture_shape_is_one_dt_graph_config_with_its_rows_and_batch_sizes(tmp_path):
+    """Capture on: the DT declares one graph per ``[text_rows, image_rows]``, keyed by
+    that shape, at the configured batch sizes, and its dummy request has those rows.
+    The spans are inputs the DT attends over, so a wrong row count captures a graph
+    no request replays."""
+    _served(tmp_path)
+    model = _constructed(tmp_path, accelerator_graph=True, capture_shapes=[[3, 8], [5, 8]], capture_batch_sizes=[1, 2])
+
+    configs = model.get_submodule(DENOISE_STEP).get_accelerator_graph_configs(torch.device("cpu"))
+
+    assert [c.additional_key_info for c in configs] == [Gr00tN17Shape(3, 8), Gr00tN17Shape(5, 8)]
+    for config, (text, image) in zip(configs, [(3, 8), (5, 8)], strict=True):
+        assert config.capture_graph_walk == _ACTION_GEN
+        assert config.capture_batch_sizes == [1, 2]
+        tensors = config.single_request_inputs.tensor_inputs
+        assert tensors["vl_text"].shape[0] == text
+        assert tensors["vl_image"].shape[0] == image
+
+
+@pytest.mark.parametrize("model_kwargs", [{}, {"capture_shapes": [[3, 8]]}], ids=["default", "shapes_but_off"])
+def test_with_capture_off_the_dt_declares_no_graphs(tmp_path, model_kwargs):
+    """Off by default, and the flag alone turns it on: shapes left in a config with
+    ``accelerator_graph`` off capture nothing, so every step runs eager."""
+    _served(tmp_path)
+    model = _constructed(tmp_path, **model_kwargs)
+
+    assert model.capture_buckets() == []
+    assert model.get_submodule(DENOISE_STEP).get_accelerator_graph_configs(torch.device("cpu")) == []
+
+
+def test_capture_without_shapes_is_refused(tmp_path):
+    """No shapes would be no graphs, silently: a request's spans are inputs, so there
+    is no default bucket to capture."""
+    with pytest.raises(ValueError, match="capture_shapes"):
+        _constructed(tmp_path, accelerator_graph=True)
+
+
+def _xattn_ceiling_and_widest_span(serving: dict, path: Path) -> tuple[int, int]:
+    """The DT cross-attention's per-request token ceiling once ``serving``'s
+    ``resources:`` apply, and the widest text or image span its capture shapes give."""
+    model = _constructed(path, **serving["model_kwargs"])
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, serving)
+    ceiling = next(spec for spec in specs if spec.resource_key == DT_XATTN).config.max_tokens_per_request
+    return ceiling, max(max(shape) for shape in model.capture_shapes)
+
+
+def test_the_shipped_yaml_sizes_the_dt_cross_attention_for_its_widest_capture_span(tmp_path):
+    """A captured cross-attention wrapper is sized by ``max_tokens_per_request``, but
+    its keys are a request's text or image rows. Below the widest span, capture fails
+    ("3584 key tokens exceeds the 328"). The shapes also have to parse into buckets."""
+    serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
+    kwargs = serving["model_kwargs"]
+    assert kwargs["accelerator_graph"] is True
+
+    ceiling, widest = _xattn_ceiling_and_widest_span(serving, tmp_path)
+    assert ceiling is not None and ceiling >= widest
+
+    model = _constructed(tmp_path, **kwargs)
+    assert model.capture_buckets() == [(_ACTION_GEN, Gr00tN17Shape(*shape)) for shape in kwargs["capture_shapes"]]
+    assert model.capture_batch_sizes == kwargs["capture_batch_sizes"]
+
+
+def test_a_capture_span_wider_than_the_cross_attention_ceiling_is_caught(tmp_path):
+    """The negative control for the test above: one image row past the override."""
+    serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
+    override = serving["resources"][DT_XATTN]["max_tokens_per_request"]
+    serving["model_kwargs"] = {**serving["model_kwargs"], "capture_shapes": [[13, override + 1]]}
+
+    ceiling, widest = _xattn_ceiling_and_widest_span(serving, tmp_path)
+    assert ceiling < widest
 
 
 # ----------------------------------------------------------------------------
