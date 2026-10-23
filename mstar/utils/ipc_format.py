@@ -50,6 +50,7 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
+    loop_caps: dict[str, int]
 
 
 class MessageSource(IntEnum):

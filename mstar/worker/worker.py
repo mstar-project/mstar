@@ -33,6 +33,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -795,6 +796,7 @@ class Worker:
             graph_walk=body.request_info.graph_walk,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+            loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
 
@@ -816,6 +818,7 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
             self._process_unprocessed(body.request_id)
             return
+        body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
         # with several partitions here arrives once per partition: keep the
@@ -1425,7 +1428,7 @@ class Worker:
         if not engine.evictable(node_name):
             return None
 
-        candidates = [
+        active = [
             rid for (rid, node) in self._last_active
             if node == node_name and not engine.is_offloaded(node_name, rid)
         ]
@@ -1433,20 +1436,16 @@ class Worker:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in candidates if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
         ]
 
         if not candidates:
-            # Nothing holds pages of the resource that ran out. Eviction is the
-            # wrong tool here — the working set does not fit — and saying so
-            # separates it from the host pool being full, which looks identical
-            # from the caller and wants the opposite response.
             logger.warning(
-                "No eviction candidate on %s for %s: nothing holds reclaimable "
-                "pages of it. The working set does not fit; eviction cannot "
-                "help.", node_name,
+                "No eviction candidate on %s for %s: %d active requests, none "
+                "with pages of it to reclaim now.", node_name,
                 "any resource" if affected_resources is None
                 else ", ".join(sorted(affected_resources)),
+                len(active),
             )
             return None
 
@@ -1456,7 +1455,7 @@ class Worker:
         freed = engine.offload_request(node_name, victim_id)
         if freed <= 0:
             # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.offload_stream``) — different
+            # pool being full (see ``CPUPagePool.place``) - different
             # from having no candidate, and fixed by a larger
             # ``cpu_offload_pages`` rather than by scheduling less.
             logger.warning(

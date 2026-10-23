@@ -55,7 +55,16 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import (
+    MAX_OUTPUT_TOKENS,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+)
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -68,6 +77,7 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
+from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
@@ -116,6 +126,8 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 
 class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
+
+    LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
 
     def __init__(
         self,
@@ -438,7 +450,7 @@ class Qwen3OmniModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
@@ -495,7 +507,7 @@ class Qwen3OmniModel(Model):
                     )
                 ]
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
@@ -1078,7 +1090,7 @@ class Qwen3OmniModel(Model):
         input_metadata: dict[str, dict] = {},
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Build the full ChatML prompt + derived multimodal tensors.
 
         Uses HF's full ``AutoProcessor`` (combines tokenizer + image_processor
@@ -1180,7 +1192,8 @@ class Qwen3OmniModel(Model):
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
-        check_plan(prefill_plan(parts), spans, len(segments))
+        plan = prefill_plan(parts)
+        check_plan(plan, spans, len(segments))
         result["text_inputs"] = segments
 
         result["pixel_values"] = []
@@ -1240,7 +1253,72 @@ class Qwen3OmniModel(Model):
             result["video_grid_thw"] += vid_out["video_grid_thw"]
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
-        return result
+        if not attached:
+            return ProcessPromptOutput(result, {})
+        return ProcessPromptOutput(result, {"kv_layout": self._kv_layout(plan, result, "audio" in output_modalities)})
+
+    def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
+        """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
+
+        The Talker prefills every step's rows except those of a system or earlier
+        assistant turn. It then prefills its assistant prefix, and writes a row per decode step.
+        """
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
+
+        merge = self.config.vision.spatial_merge_size
+        grids = {"image": tensors["image_grid_thw"], "video": tensors["video_grid_thw"]}
+        thinker, talker, position = [], [], 0
+        for step in plan:
+            if step.modality == TEXT:
+                ids = tensors["text_inputs"][step.index]
+                span = Span("ids", "prefill_text", len(ids), len(ids), "text_inputs")
+                kept = int(talker_text_mask(ids, self.config).sum())
+            elif step.modality == "audio":
+                # the encoder's rows between two sentinels
+                rows = int(_get_feat_extract_output_lengths(tensors["audio_seqlens"][step.index])) + 2
+                span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
+                kept = rows
+            else:
+                grid = grids[step.modality][step.index]
+                per_grid = tensors["video_second_per_grid"][step.index].item() if step.modality == "video" else None
+                rows = int(grid.prod()) // merge ** 2 + 2
+                # the walk moves the counter one past its end sentinel, which follows the grid's largest position
+                positions = get_rope_index_vision(
+                    grid, position + 1, self.config.thinker.position_id_per_seconds,
+                    spatial_merge_size=merge, seconds_per_grid=per_grid,
+                )
+                advance = int(positions.max()) + 2 - position
+                span = Span("digest", "prefill_vision", rows, advance, (step.modality, step.index))
+                kept = rows
+            thinker.append(span)
+            talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
+            position += span.advance
+        prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
+        return {
+            THINKER_KV: {"main": LabelLayout(spans=tuple(thinker), growth=(("thinker_decode_loop", 1),))},
+            TALKER_KV: {"main": LabelLayout(
+                spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
+                growth=(("talker_decode_loop", 1),),
+            ) if audio_output else LabelLayout()},
+        }
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {
+            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+        }
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {
+            THINKER_KV: {"main": KVLabel(
+                growth=(("thinker_decode", "thinker_decode_loop"),),
+            )},
+            TALKER_KV: {"main": KVLabel(
+                growth=(("talker_decode", "talker_decode_loop"),),
+            )},
+        }
 
     # -----------------------------------------------------------------------
     # Model ABC: postprocess

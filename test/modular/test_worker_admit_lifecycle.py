@@ -113,6 +113,7 @@ def _new_request(request_id="r1"):
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers={WG_ID: [WORKER]},
         initial_inputs=[],
+        loop_caps={},
     )
 
 
