@@ -213,6 +213,11 @@ model, so they are named for it.
        ``0`` captures the eager forward and runs the uncaptured steps
        uncompiled, an escape hatch for an Inductor failure that would
        otherwise fail every capture and serve eager.
+   * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
+     - ``1``
+     - GLM-5.2 MTP: pair drafts against the trunk's post-norm hidden state,
+       the reference convention. ``0`` pairs the pre-norm state. Changes which
+       tokens are drafted, never which are emitted.
 
 Serving (Python frontend)
 -------------------------

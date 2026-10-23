@@ -114,6 +114,9 @@ class Glm52MLAAttention(MLAAttention):
         mask = dsa_selection_to_mask(dsa_selection, q.shape[0], dtype=q.dtype, device=q.device)
         return masked_reference_attention(q, k, v, mask)
 
+    def _selects(self, dsa_selection=None) -> bool:
+        return self._dsa is not None
+
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
         # None-guarded here (not just inside _dsa_select) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo

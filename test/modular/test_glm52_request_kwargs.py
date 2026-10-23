@@ -66,3 +66,18 @@ def test_a_request_without_max_tokens_runs_to_the_window():
     m = _model(dsa_long_context=True, max_seq_len=8192)
     assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == 8192
     assert m.get_max_output_tokens(max_output_tokens=100) == 100
+
+
+@pytest.mark.parametrize("kwargs", [{"temperature": 0.7}, {"repetition_penalty": 1.1}])
+def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
+    with pytest.raises(ValueError, match="greedy only"):
+        _model(mtp_num_draft_tokens=2).process_prompt("Hi", ["text"], ["text"], **kwargs)
+    # without MTP it samples
+    assert _model().process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].numel() == 2
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}])
+def test_mtp_serves_greedy(kwargs):
+    m = _model(mtp_num_draft_tokens=2)
+    assert m.process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].numel() == 2
+    assert m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE].temperature == 0
