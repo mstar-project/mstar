@@ -219,15 +219,20 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
-        if self._admit_taken:
-            with self._lock:
+        slots = self._slots
+        # one critical section for the batch, not one per row
+        with self._lock:
+            if self._admit_taken:
                 self._forget_taken(ctx.is_real_row)
-        for segment in step.segments or ():
-            if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
-                # reads its state without extending it, or a padding row
-                continue
-            if self._alloc(segment.request_id, segment.label) is None:
-                return self._out_of_slots(segment.request_id, segment.label)
+            for segment in step.segments or ():
+                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+                    # reads its state without extending it, or a padding row
+                    continue
+                labels = slots.get(segment.request_id)
+                if labels is not None and segment.label in labels:
+                    continue  # a resident row: its slot is already held
+                if self._alloc(segment.request_id, segment.label) is None:
+                    return self._out_of_slots(segment.request_id, segment.label)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
