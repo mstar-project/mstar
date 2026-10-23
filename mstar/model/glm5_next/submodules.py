@@ -131,11 +131,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
-            # each rank attends the others' selected cache slots, so the ranks' page tables
-            # must agree, and an eviction frees pages in a different order on each rank
-            if self.config.dsa_shard_prefill and getattr(resources[KV_CACHE],
-                                                         "supports_eviction", False):
-                raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
         buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
         if self.config.dsa_long_context and self.config.prefill_graphs and (
                 max(buckets) > sparse_mla.MAX_ROWS):
