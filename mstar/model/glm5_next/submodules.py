@@ -27,6 +27,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda import SpecBlocks
@@ -34,6 +35,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import (
     ATTN,
+    DSA,
     KDA,
     KDA_STATE,
     KV_CACHE,
@@ -118,10 +120,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
+    def _dsa(self):
+        """The DSA resource (dsa_long_context), whose ``ctx`` the MLA layers read."""
+        return self.node_resources.get(DSA) if self.config.dsa_long_context else None
+
+    @property
     def mtp_block(self) -> int:
         return self.mtp_k + 1
 
     def bind_node_resources(self, resources: dict) -> None:
+        if KV_CACHE in resources:
+            self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
+            # each rank attends the others' selected cache slots, so the ranks' page tables
+            # must agree, and an eviction frees pages in a different order on each rank
+            if self.config.dsa_shard_prefill and getattr(resources[KV_CACHE],
+                                                         "supports_eviction", False):
+                raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
+        buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
+        if self.config.dsa_long_context and self.config.prefill_graphs and (
+                max(buckets) > sparse_mla.MAX_ROWS):
+            # a captured prefill plans its whole bucket at once; the eager plan takes chunks
+            raise ValueError(f"dsa_long_context captures prefill buckets up to "
+                             f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
@@ -214,6 +234,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             )
             self._prefill_captured = False
             return []
+        kv = self.node_resources.get(KV_CACHE)
+        if (self.config.dsa_long_context and device.type == "cuda" and kv is not None
+                and kv.layer_view().dtype != torch.bfloat16):
+            # the DSA kernels take a bf16 cache; the torch paths sync with the host
+            logger.warning("glm5_next: dsa_long_context on a %s cache cannot be captured; "
+                           "decode runs eager", kv.layer_view().dtype)
+            self._prefill_captured = False
+            return []
         max_slots = self._kda_max_slots()
         batch_sizes = [
             b for b in DEFAULT_CAPTURE_BATCH_SIZES
@@ -289,12 +317,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
                 seq_len = self.mtp_block
-        # dsa_long_context is refused at model __init__, so the serving
-        # regime is ALWAYS ctx <= index_topk, where dense MLA computes
-        # exactly what GLM-5.3-Flash's DSA would — refuse beyond it rather
-        # than serve off-spec logits. Raising here fails only this request
-        # (the engine registers the failure and drops the rid from the batch).
-        limit = self.config.index_topk
+        # Without dsa_long_context the serving regime is ctx <= index_topk,
+        # where dense MLA computes exactly what GLM-5.3-Flash's DSA would —
+        # refuse beyond it rather than serve off-spec logits. Raising here
+        # fails only this request (the engine registers the failure and
+        # drops the rid from the batch).
+        limit = self.config.context_limit
         # the handle, which the batch, check_stop and cleanup_request key by
         state = self.request_state(fwd_info.rid_handle)
         committed = state.get("context", 0)
@@ -306,11 +334,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if real + seq_len > limit or committed + seq_len > self.config.kv_rows:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: context {real + seq_len} "
-                f"({committed + seq_len} cache rows) exceeds index_topk={limit} "
-                f"or {self.config.kv_rows} rows; index_topk is the regime where "
-                "dense MLA is exactly GLM-5.3-Flash's DSA computation. Long "
-                "context needs the k-pool indexer engine path (dsa_long_context), "
-                "a post-M1 follow-up refused at model __init__."
+                f"({committed + seq_len} cache rows) exceeds "
+                f"{'max_seq_len' if self.config.dsa_long_context else 'index_topk'}={limit} "
+                f"or {self.config.kv_rows} rows; without dsa_long_context the limit is "
+                "index_topk, where dense MLA is exactly GLM-5.3-Flash's DSA."
             )
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)
@@ -362,6 +389,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # replay what the last step accepted
             del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
+        if self.config.dsa_long_context:
+            # every MLA layer attends sparse (the DSA resource): no dense plan over the whole context
+            del steps[ATTN]
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -385,6 +415,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             out["mtp_keep"] = self._mtp_keep(engine_inputs, inputs, out["input_ids"].shape[0])
         if self.mtp_k > 0 and graph_walk == "decode":
             out["mtp_seq"] = self._mtp_stage_seq(engine_inputs)
+        if self.config.dsa_long_context:
+            # the DSA resource stages its rows off the KV plan; the forward opens them
+            out.update(self._dsa.step_inputs(
+                engine_inputs.step.ctx, engine_inputs.captured, LABEL))
         return out
 
     def _mtp_keep(
@@ -447,9 +481,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
+        dsa_inputs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        if self._dsa is not None:
+            self._dsa.ctx = self._dsa.context(dsa_inputs or {})
+        try:
+            return self._forward_inner(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
+        finally:
+            if self._dsa is not None:
+                self._dsa.ctx = None
+
+    def _forward_inner(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        last_rows: torch.Tensor | None,
+        mtp_keep: torch.Tensor | None,
     ) -> torch.Tensor:
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
+        if self.config.dsa_long_context and graph_walk == "prefill" and not engine_inputs.captured:
+            return self._prefill_windows(engine_inputs, input_ids, sampler)
         last = None  # prefill samples each row's last token: the model computes only those
         if last_rows is not None:
             last = last_rows
@@ -469,6 +522,40 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         hidden = self.language_model.model(input_ids, rows=last)
         logits = self.lm_head(hidden)  # (rows, vocab)
         return sampler.sample(engine_inputs.request_ids, logits=logits)
+
+    def _prefill_windows(
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, sampler,
+    ) -> torch.Tensor:
+        """dsa_long_context's prefill: the step's tokens in windows of prefill_window_tokens,
+        each through every layer before the next (its KV rows and KDA state land first), so
+        activations stay bounded however long the prompt. Samples each request's last row."""
+        ctx = self._dsa.ctx
+        kv, kda = engine_inputs.resources[KV_CACHE], engine_inputs.resources[KDA]
+        size = self.config.prefill_window_tokens
+        total = input_ids.shape[0]
+        last = [r0 + n - 1 for r0, n, _ in ctx.spans]
+        # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
+        if total <= size or len(ctx.spans) == total:
+            rows = self._long_stager.to_device(last, input_ids.device)
+            hidden = self.language_model.model(input_ids, rows=rows)
+            return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
+        hidden: list[torch.Tensor | None] = [None] * len(last)
+        try:
+            for start in range(0, total, size):
+                end = min(start + size, total)
+                pieces = [(max(r0, start), min(r0 + n, end), req)
+                          for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+                ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
+                rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
+                self._dsa.ctx = ctx.window(start, end, pieces)
+                with kv.token_window(start, end, LABEL), kda.token_window(
+                        [(req, b - a) for a, b, req in pieces], LABEL):
+                    out = self.language_model.model(input_ids[start:end], rows=rows)
+                for k, (i, _) in enumerate(ends):
+                    hidden[i] = out[k]
+        finally:
+            self._dsa.ctx = ctx
+        return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(torch.stack(hidden)))
 
     # -- MTP device side ---------------------------------------------------
 
@@ -594,7 +681,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return self.forward_batched(graph_walk, engine_inputs, input_ids,
                                         mtp_seq=mtp_seq)[engine_inputs.request_ids[0]]
         return {"new_token": self._forward(
-            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)}
+            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -617,7 +704,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 rid: {"text_inputs": [next_input[i : i + 1]]}
                 for i, rid in enumerate(engine_inputs.request_ids)
             }
-        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
+        new_tokens = self._forward(
+            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)
         # row i is request i: one clone out of the graph and one host copy a step
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
@@ -757,9 +845,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         # The next step takes the context to prompt + generated, and it may
         # already be scheduled when this stop lands, so stop while it still
-        # fits: past index_topk prepare_inputs refuses it.
+        # fits: past the context limit prepare_inputs refuses it.
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
-        full = prompt_len + generated >= self.config.index_topk
+        full = prompt_len + generated >= self.config.context_limit
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()

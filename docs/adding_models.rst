@@ -400,6 +400,11 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       ``aux_planes`` names per-token state of its own width on the same pages
+       (``AuxPlanes(num_layers, width)``, DSA's index keys for one): it shares the page
+       table, is copied and freed with the pages, and is read and written through
+       ``KVManager.aux_view`` and ``write_aux``. CPU offload and a cross-instance KV
+       retrieve refuse a cache with aux planes for now.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -441,6 +446,11 @@ The spec types are:
        outside the paged pool and the selection runs per request on the host, so the
        resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
        decodes one row per step. GLM-5.2 declares it under ``dsa_long_context``.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3). That
+       resource is the paged one: its index rows sit on the aux planes ``INDEX_PLANES``
+       the model declares on the cache, and it scores, picks and attends
+       on device, under CUDA graphs. ``sm_scale`` is the absorbed MLA's softmax scale for
+       its sparse-attention plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -539,7 +549,7 @@ appears in no spec, so it receives no resources:
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
-   * - An LLM with DeepSeek sparse attention (GLM-5.2)
+   * - An LLM with DeepSeek sparse attention (GLM-5.2, GLM-5.3)
      - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
        plus a ``DSASpec`` over the same cache.
    * - A node that samples with two different sets of parameters

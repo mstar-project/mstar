@@ -21,6 +21,7 @@ from mstar.engine.resources import (  # noqa: E402
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
 from mstar.engine.resources.kv import manager as kv_mod  # noqa: E402
 from mstar.engine.resources.linear_attn.config import (  # noqa: E402
     LinearAttnBackend,
@@ -641,8 +642,19 @@ def test_glm5next_model_constructs_from_config():
     assert req.temperature == 0.0 and req.top_k == 3
     assert req.top_p == constructed.config.top_p
 
-    with pytest.raises(NotImplementedError, match="dsa_long_context"):
-        Glm5NextModel("x", config_variant="reduced", dsa_long_context=True)
+    # long context needs no MTP holes
+    with pytest.raises(ValueError, match="MTP"):
+        Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
+                      mtp_num_draft_tokens=1)
+    long = Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
+                         max_seq_len=4096)
+    assert long.config.context_limit == 4096
+    (kv_spec,) = [s for s in long.get_node_resources() if s.resource_key == "kv_cache"]
+    planes = len(long.config.full_attn_layer_indices)
+    # an index plane beside each latent plane, on its pages: [k | gate | pool key] per token
+    assert kv_spec.config.num_layers == planes
+    index = kv_spec.config.aux_planes[INDEX_PLANES]
+    assert (index.num_layers, index.width) == (planes, 3 * long.config.index_head_dim)
 
 
 def test_glm5next_registered():
