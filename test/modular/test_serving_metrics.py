@@ -562,6 +562,32 @@ def test_each_way_a_request_ends_counts_once_under_its_outcome(served, end, outc
     assert samples[("mstar_requests_in_flight", _labels())] == 0
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_reply_its_handler_ends_whole_counts_as_a_success(served, stream):
+    """A stop string ends a chat reply in the API server, which stops its
+    request in the engine: the client got a whole reply, so it is a success,
+    timed like one, and not an abort."""
+    from mstar.api_server.openai import reply
+
+    async def run():
+        served.server.submit_request(text="x", request_id="r", streaming=stream, **TEXT)
+        events = reply.reply_events(served.server, "r", stops=["STOP"])
+        served.data_worker.chunks.put(ResultChunk(request_id=served.key(), modality="text", data=b"done STOP and on"))
+        if stream:
+            return [e async for batch in events for e in batch]
+        return await reply.collect(events)
+
+    events = asyncio.run(run())
+
+    assert events[-1].stop_string == "STOP"
+    samples = served.scrape()
+    counted = {o: _count(samples, o) for o in metrics_module.OUTCOMES if _count(samples, o)}
+    assert counted == {"success": 1}
+    assert samples[("mstar_e2e_request_latency_seconds_count", _labels(output_modalities="text"))] == 1
+    assert samples[("mstar_requests_in_flight", _labels())] == 0
+    assert served.data_worker.aborted == [served.key()], "the request still stops in the engine"
+
+
 def test_every_outcome_is_exported_at_zero_once_its_modalities_are_seen(served):
     """A series that first appears at 1 loses that increment to rate() and
     increase(), so the first error must find its series already at 0."""

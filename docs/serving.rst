@@ -37,8 +37,9 @@ mstar serve
      - HTTP port.
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
-     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       and ``/metrics`` (see :ref:`api-key`).
+     - Require ``Authorization: Bearer <key>`` (or ``x-api-key: <key>`` on the
+       Anthropic routes) on every route except ``/health`` and ``/metrics`` (see
+       :ref:`api-key`).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
@@ -127,8 +128,9 @@ mstar-serve
      - Bind address / HTTP port.
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
-     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       and ``/metrics`` (see :ref:`api-key`).
+     - Require ``Authorization: Bearer <key>`` (or ``x-api-key: <key>`` on the
+       Anthropic routes) on every route except ``/health`` and ``/metrics`` (see
+       :ref:`api-key`).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -195,7 +197,11 @@ set.
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 :ref:`serving-metrics`) answers ``401`` unless the request carries
 ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
-``/generate/ws``) refuse the handshake without it. The check is one middleware over the
+``/generate/ws``) refuse the handshake without it. Anthropic's routes (``/v1/messages``,
+``/v1/messages/count_tokens``) also take the key as ``x-api-key: <key>``, which the
+Anthropic SDKs and Claude Code send for an API key (``ANTHROPIC_API_KEY``; an auth token,
+``ANTHROPIC_AUTH_TOKEN``, goes as the bearer), and refuse in Anthropic's error shape
+(``authentication_error``). The check is one middleware over the
 whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. ``--api-key`` overrides the environment variable, but

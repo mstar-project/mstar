@@ -1234,7 +1234,9 @@ class APIServer:
     def abort_submission(self, key: str | None, outcome: str = "abort") -> None:
         """:meth:`abort_request` for one submission, by its key
         (:meth:`submission_key`); a newer submission under the id is untouched.
-        ``outcome`` is what the metrics count it as (``abort`` or ``timeout``)."""
+        ``outcome`` is what the metrics count it as: ``abort``, ``timeout``, or
+        ``success`` for a reply its handler ended once it was whole (a chat
+        reply at a stop string)."""
         if key is None:
             return
         with self.request_lock:

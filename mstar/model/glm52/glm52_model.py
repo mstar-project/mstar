@@ -55,7 +55,7 @@ class Glm52Model(Model):
     prebuild_fused_moe = True
     # read only by process_prompt's template, and kept off the conductor's wire,
     # which cannot carry every number a tool schema may hold (2**64)
-    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
 
     def __init__(
         self,
@@ -450,6 +450,13 @@ class Glm52Model(Model):
             )[0]
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+        if prefix := kwargs.get("reply_prefix"):
+            # what the reply opens with, after the generation prompt (a forced tool call)
+            if self._tokenizer_mode == "byte":
+                prefix_ids = [min(b, self.config.vocab_size - 1) for b in prefix.encode("utf-8")]
+            else:
+                prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
+            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:

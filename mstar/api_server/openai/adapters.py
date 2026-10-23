@@ -241,6 +241,10 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
     supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
+    # POST /v1/messages (Anthropic) and /v1/responses, translated onto chat: a
+    # text-only chat that serves roles and tools
+    supports_messages: bool = False
+    supports_responses: bool = False
     # Longest clip the model transcribes in one request. Longer uploads are cut
     # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None
@@ -297,6 +301,11 @@ class OpenAIAdapter:
         """A parser for a chat reply with structure inside its text (reasoning,
         tool calls), or None to return the text as ``content``."""
         return None
+
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:  # noqa: ARG002
+        """The strings the chat handler ends the reply at (``stop``). An adapter
+        that does not serve them returns none."""
+        return []
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/speech is not supported by this model")
@@ -1152,8 +1161,7 @@ class TextChatAdapter(OpenAIAdapter):
         # what the model cannot serve is refused, not dropped: off, a field passes
         if req.n not in (None, 1):
             raise ValueError(f"n={req.n}: this model returns one choice")
-        if req.stop:
-            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
+        self.stop_strings(req)
         mk = _passthrough(req)
         for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
                      "stop_token_ids"):
@@ -1178,23 +1186,49 @@ class TextChatAdapter(OpenAIAdapter):
             prompt_parts=parts,
         )
 
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:
+        """``stop``, as OpenAI takes it: a string or up to 4. The serving layer
+        matches them on the decoded answer and ends the request at the first."""
+        stops = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
+        if len(stops) > 4:
+            raise ValueError(f"stop takes at most 4 strings, got {len(stops)}")
+        if "" in stops:
+            raise ValueError("a stop string cannot be empty")
+        return stops
+
 
 class GlmChatAdapter(TextChatAdapter):
     """GLM-5.2 / GLM-5.3: the messages with their roles, and ``tools``, go to
     the checkpoint's chat template; the reply comes back with
     ``reasoning_content`` and ``tool_calls`` split out (see ``glm_chat``).
+    Anthropic's ``/v1/messages`` and OpenAI's ``/v1/responses`` are translated
+    onto this chat.
 
-    ``tool_choice`` is ``"auto"`` (default) or ``"none"``, which leaves the tools
-    out of the prompt; ``"required"`` and a named function need constrained
-    decoding and are refused. ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always
-    reasons, and turning it off is a 400), ``reasoning_effort`` and
-    ``clear_thinking`` reach the template, flat in ``extra_body`` or under
-    ``chat_template_kwargs``; other template keys are dropped, as vLLM drops the
-    ones a template does not read.
+    ``tool_choice`` is ``"auto"`` (default), ``"none"``, which leaves the tools
+    out of the prompt, ``"required"`` or a named function. With no grammar, a
+    forced call is the prompt's: it ends in ``<tool_call>`` (and the name), so
+    the reply opens inside the call. ``"required"`` over one tool names it;
+    over several the model picks, and a name it makes up stays text. The call
+    opens the reply, so a forced call has no reasoning: GLM-5.2's prompt ends
+    as with thinking off, GLM-5.3's closes the empty ``<think>``, and an
+    explicit ``enable_thinking`` with it is a 400.
+
+    ``parallel_tool_calls: false`` ends the reply, and the request, when its
+    first call ends.
+
+    ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always reasons, and turning it
+    off is a 400), ``reasoning_effort`` and ``clear_thinking`` reach the
+    template, flat in ``extra_body`` or under ``chat_template_kwargs``; other
+    template keys are dropped, as vLLM drops the ones a template does not read.
     """
 
-    def __init__(self, *, always_thinks: bool):
+    supports_messages = True
+    supports_responses = True
+
+    def __init__(self, *, always_thinks: bool, reasoning_efforts: tuple[str, ...]):
         self.always_thinks = always_thinks
+        # the template's reasoning_effort levels, least first; it reads any other as the last
+        self.reasoning_efforts = reasoning_efforts
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         # flatten_messages refuses a tool turn; the template takes each turn's role
@@ -1204,7 +1238,7 @@ class GlmChatAdapter(TextChatAdapter):
         ]})
         args = super().chat_to_request(checked, upload_dir)
         mk = args.model_kwargs
-        tools, template_kwargs = self._options(mk)
+        tools, template_kwargs, forced = self._options(mk)
         thinking = template_kwargs.get("enable_thinking")
         if self.always_thinks and thinking is not None and not thinking:
             # the template has no switch, so off would still reason
@@ -1212,28 +1246,41 @@ class GlmChatAdapter(TextChatAdapter):
         mk["messages"] = glm_chat.template_messages(req.messages)
         if tools:
             mk["tools"] = tools
+        if forced is not None:
+            # GLM-5.3's prompt ends inside <think>: an empty reasoning, as the template
+            # renders a turn without one
+            mk["reply_prefix"] = (glm_chat.THINK_END if self.always_thinks else "") + glm_chat.CALL_START + forced
         mk["chat_template_kwargs"] = template_kwargs
         return args
 
     def make_output_parser(self, req: ChatCompletionRequest):
-        tools, template_kwargs = self._options(_passthrough(req))
+        mk = _passthrough(req)
+        single_call = mk.get("parallel_tool_calls") is False
+        tools, template_kwargs, forced = self._options(mk)
         # truthiness, as the GLM-5.2 template reads it
         thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
+        params = glm_chat.tool_parameters(tools) if tools else None
+        if forced:
+            # the prompt opened a call to this function: a name the model goes on to write
+            # (get_weather -> get_weather_hourly) is not another tool's call
+            params = {forced: params[forced]}
         return glm_chat.GlmReplyParser(
-            thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None,
+            thinking=thinking, tools=params, forced_call=forced, single_call=single_call,
         )
 
-    @staticmethod
-    def _options(mk: dict) -> tuple[list | None, dict]:
-        """Takes ``tools``, ``tool_choice`` and the template's keys out of ``mk``."""
+    def _options(self, mk: dict) -> tuple[list | None, dict, str | None]:
+        """Takes ``tools``, ``tool_choice`` and the template's keys out of ``mk``.
+        The third is the call a forced ``tool_choice`` opens the reply with:
+        the function's name, or ``""`` for the model to name one."""
+        if "reply_prefix" in mk:
+            raise ValueError("reply_prefix is not a request field; tool_choice sets it")
+        # false ends the reply at its first call (the parser's single_call); read, not sent on
+        parallel = mk.pop("parallel_tool_calls", None)
+        if parallel is not None and not isinstance(parallel, bool):
+            raise ValueError(f"parallel_tool_calls must be a boolean, got {parallel!r}")
         tools = mk.pop("tools", None) or None
         choice = mk.pop("tool_choice", None)
-        if choice not in (None, "auto", "none"):
-            raise ValueError(f"tool_choice {choice!r} needs constrained decoding; use 'auto' or 'none'")
-        if tools is not None:
-            glm_chat.tool_parameters(tools)
-            if choice == "none":
-                tools = None
+        names = list(glm_chat.tool_parameters(tools)) if tools is not None else []
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if not isinstance(template_kwargs, dict):
             raise ValueError("chat_template_kwargs must be an object")
@@ -1241,7 +1288,29 @@ class GlmChatAdapter(TextChatAdapter):
         for key in glm_chat.TEMPLATE_KWARGS:
             if key in mk:
                 template_kwargs.setdefault(key, mk.pop(key))
-        return tools, template_kwargs
+        forced = None
+        if choice == "none":
+            tools = None
+        elif choice == "required" or isinstance(choice, dict):
+            if not names:
+                raise ValueError(f"tool_choice {choice!r} needs tools")
+            if choice == "required":
+                forced = names[0] if len(names) == 1 else ""
+            else:
+                fn = choice.get("function")
+                forced = fn.get("name") if choice.get("type") == "function" and isinstance(fn, dict) else None
+                if forced not in names:
+                    raise ValueError(f"tool_choice {choice!r} names no function in tools {names}")
+            if template_kwargs.get("enable_thinking"):
+                raise ValueError("a forced tool call opens the reply, which leaves no room to reason; "
+                                 "leave enable_thinking unset, or use tool_choice 'auto'")
+            if not self.always_thinks:
+                # the prompt ends in <think></think>, as a turn that does not reason
+                template_kwargs["enable_thinking"] = False
+        elif choice not in (None, "auto"):
+            raise ValueError(f"tool_choice takes 'auto', 'none', 'required' or "
+                             f"{{'type': 'function', 'function': {{'name': ...}}}}; got {choice!r}")
+        return tools, template_kwargs, forced
 
 
 class OmnilingualASRAdapter(OpenAIAdapter):
@@ -1318,8 +1387,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
-    "glm52": GlmChatAdapter(always_thinks=False),
-    "glm5_next": GlmChatAdapter(always_thinks=True),
+    "glm52": GlmChatAdapter(always_thinks=False, reasoning_efforts=("high", "max")),
+    "glm5_next": GlmChatAdapter(always_thinks=True, reasoning_efforts=("low", "high", "max")),
 }
 
 # One key per size; every size takes the same adapter.

@@ -51,11 +51,22 @@ class _StubAPI:
         # raised out of the stream after its chunks, like the delivery timeout
         self.raise_after: Exception | None = None
         self.aborted: list = []
+        self.ended: dict = {}  # how each submission stopped early ended
 
     def submit_request(self, **kw):
         self.last_submit = kw
         self._chunks[kw["request_id"]] = list(self.next_chunks)
         return kw["request_id"]
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        # once per submission, as the real one: after a handler ends a whole
+        # reply (a success), the stream's close aborts nothing more
+        if key not in self.ended:
+            self.ended[key] = outcome
+            self.aborted.append(key)
 
     async def collect_results(self, request_id, raw_request=None):
         self.last_raw_request = raw_request
@@ -76,7 +87,7 @@ class _StubAPI:
             finished = True
         finally:
             if not finished:
-                self.aborted.append(request_id)
+                self.abort_submission(request_id)
 
     async def iter_result_chunks(self, request_id):
         batches = self.iter_result_chunk_batches(request_id)
@@ -454,6 +465,9 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     from mstar.api_server.openai.serving_chat import _stream
 
     class _Batches:
+        def submission_key(self, request_id):
+            return request_id
+
         async def iter_result_chunk_batches(self, request_id):
             yield [_Chunk("text", b"a"), _Chunk("text", b"b"), _Chunk("text", b"c")]
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
@@ -800,19 +814,26 @@ def test_glm_chat_streams_reasoning_then_the_call(client_and_stub):
     assert deltas[0] == {"role": "assistant", "reasoning_content": "Need the "}
     assert "".join(d.get("reasoning_content", "") for d in deltas) == "Need the weather."
     assert not any(d.get("content") for d in deltas)
-    (call,) = [c for d in deltas for c in d.get("tool_calls", [])]
-    assert call["index"] == 0 and call["function"]["arguments"] == '{"city": "Paris"}'
+    first, *rest = [c for d in deltas for c in d.get("tool_calls", [])]
+    assert first["index"] == 0 and first["function"]["name"] == "get_weather" and first["id"].startswith("call_")
+    # the arguments stream after the name
+    assert first["function"]["arguments"] + "".join(c["function"]["arguments"] for c in rest) == '{"city": "Paris"}'
+    assert all(c["index"] == 0 and "id" not in c for c in rest)
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
-def test_glm_chat_refuses_a_required_tool_choice(client_and_stub):
+def test_glm_chat_forces_a_required_tool_call(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "glm52"
-    r = client.post("/v1/chat/completions", json={
+    # the prompt ended in <tool_call>get_weather: the reply starts at the arguments
+    stub.next_chunks = [_Chunk("text", b"<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>")]
+    choice = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}],
         "tools": _GLM_TOOLS, "tool_choice": "required",
-    })
-    assert r.status_code == 400 and "constrained decoding" in r.json()["error"]["message"]
+    }).json()["choices"][0]
+    assert stub.last_submit["model_kwargs"]["reply_prefix"] == "<tool_call>get_weather"
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
 
 
 def _usage_chunks(*parts, stop=True):
@@ -852,6 +873,134 @@ def test_chat_refuses_bad_stream_options_before_running(client_and_stub):
     r = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": True})
     assert r.status_code == 400 and stub.last_submit is None
+
+
+def test_a_parsed_reply_stops_when_its_client_disconnects():
+    """Non-streaming, a reply is read chunk by chunk; a client that goes away
+    unwinds the chunk iterator, which aborts the request."""
+    from fastapi import HTTPException
+
+    from mstar.api_server.openai import reply
+
+    aborted = []
+
+    class _Endless:
+        def submission_key(self, request_id):
+            return request_id
+
+        async def iter_result_chunk_batches(self, request_id):
+            try:
+                while True:
+                    yield [_Chunk("text", b"x", {"tokens": 1})]
+                    await asyncio.sleep(0.01)
+            finally:
+                aborted.append(request_id)
+
+    class _Gone:
+        calls = 0
+
+        async def is_disconnected(self):
+            self.calls += 1
+            return self.calls > 2
+
+    async def _collect():
+        return await reply.collect(reply.reply_events(_Endless(), "r1"), _Gone())
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_collect())
+    assert exc.value.status_code == 499 and aborted == ["r1"]
+
+
+def _glm_events(text):
+    return [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_glm_chat_ends_at_a_stop_string_and_stops_the_request(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    # the stop spans two tokens; what follows it is never read
+    stub.next_chunks = _usage_chunks((b"Plan. STOP</think>", 3), (b"Done: 4", 2), (b"2. ST", 2), (b"OP more", 2),
+                                     (b" text", 1), stop=False)
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": ["STOP"], "stream": stream,
+        "stream_options": {"include_usage": True} if stream else None,
+    })
+    if stream:
+        events = _glm_events(r.text)
+        deltas = [e["choices"][0]["delta"] for e in events if e["choices"]]
+        content = "".join(d.get("content", "") for d in deltas)
+        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+        finish = events[-2]["choices"][0]["finish_reason"]
+        usage = events[-1]["usage"]
+    else:
+        choice = r.json()["choices"][0]
+        content, reasoning = choice["message"]["content"], choice["message"]["reasoning_content"]
+        finish, usage = choice["finish_reason"], r.json()["usage"]
+    # stops match the answer only: the reasoning's STOP went out
+    assert reasoning == "Plan. STOP" and content == "Done: 42. " and finish == "stop"
+    # the tokens read through the one that completed the stop
+    assert usage["completion_tokens"] == 9
+    assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
+
+
+def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = [_Chunk("text", b) for b in _GLM_REPLY]
+    body = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+        "stop": ["Paris", "weather"],
+    }).json()
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls" and choice["message"]["reasoning_content"] == "Need the weather."
+    assert choice["message"]["tool_calls"][0]["function"]["arguments"] == '{"city": "Paris"}'
+    assert stub.aborted == []
+
+
+def test_glm_chat_refuses_a_fifth_stop_string_before_running(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": list("abcde")})
+    assert r.status_code == 400 and "at most 4" in r.json()["error"]["message"] and stub.last_submit is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    call = b"<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+    stub.next_chunks = _usage_chunks((b"Two.</think>", 3), (call, 9), (b"\n" + call, 9), stop=False)
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+        "parallel_tool_calls": False, "stream": stream,
+    })
+    if stream:
+        events = _glm_events(r.text)
+        calls = [c for e in events for c in e["choices"][0]["delta"].get("tool_calls", [])]
+        finish = events[-1]["choices"][0]["finish_reason"]
+    else:
+        calls, finish = r.json()["choices"][0]["message"]["tool_calls"], r.json()["choices"][0]["finish_reason"]
+    assert [c["function"]["arguments"] for c in calls] == ['{"city": "Paris"}'] and finish == "tool_calls"
+    assert "parallel_tool_calls" not in stub.last_submit["model_kwargs"]
+    assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
+
+
+def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
+    """The answer's trailing whitespace is held until text follows it, so a
+    stop that ends in whitespace ends the reply one chunk later, and that
+    chunk's tokens count."""
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Line one.", 3), (b"\n\n", 1), (b"Line", 1),
+                                     (b" two", 1), stop=False)
+    body = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": "\n\n"}).json()
+    assert body["choices"][0]["message"]["content"] == "Line one."
+    assert body["choices"][0]["finish_reason"] == "stop" and body["usage"]["completion_tokens"] == 7
 
 
 _PNG_URL = "data:image/png;base64," + base64.b64encode(

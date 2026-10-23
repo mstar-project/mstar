@@ -24,6 +24,18 @@ def _parser(thinking=True, tools=TOOLS):
     return glm_chat.GlmReplyParser(thinking=thinking, tools=tools)
 
 
+def _calls(deltas):
+    """The calls the deltas stream, put together: index, id, name and arguments."""
+    calls = {}
+    for d in deltas:
+        for c in d.get("tool_calls", []):
+            if "id" in c:
+                calls[c["index"]] = {"index": c["index"], "id": c["id"], "function": dict(c["function"])}
+            else:
+                calls[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
+    return list(calls.values())
+
+
 def _streamed(text, pieces, **kw):
     """The deltas of ``text`` fed in ``pieces``-character chunks, merged back."""
     p = _parser(**kw)
@@ -33,8 +45,7 @@ def _streamed(text, pieces, **kw):
     deltas += p.finish()
     reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
     content = "".join(d.get("content", "") for d in deltas)
-    calls = [c for d in deltas for c in d.get("tool_calls", [])]
-    return reasoning, content, calls, p.finish_reason
+    return reasoning, content, _calls(deltas), p.finish_reason
 
 
 def test_reasoning_then_answer():
@@ -69,6 +80,68 @@ def test_streaming_in_any_chunks_matches_the_whole_reply(text):
         assert [c["function"] for c in got[2]] == [c["function"] for c in whole[2]]
 
 
+def _whole_call_arguments(body, tools):
+    """A call's arguments as the parser read them whole, before they streamed."""
+    import re
+
+    props = tools[body.partition("<arg_key>")[0].strip()]
+    pairs = re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", body, re.DOTALL)
+    return json.dumps({k.strip(): glm_chat._arg_value(v, props.get(k.strip())) for k, v in pairs}, ensure_ascii=False)
+
+
+EDIT = glm_chat.tool_parameters([{"type": "function", "function": {"name": "edit", "parameters": {
+    "type": "object", "properties": {
+        "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": ["string", "null"]},
+        "line": {"type": "integer"}, "opts": {"type": "object"}, "tags": {"type": "array"}, "any": {}}}}}])
+
+
+@pytest.mark.parametrize("body", [
+    "edit<arg_key>path</arg_key><arg_value>src/a.py</arg_value>",
+    'edit<arg_key>old</arg_key><arg_value>if a < b and "q" in s:\n\treturn \\x</arg_value>'
+    "<arg_key>new</arg_key><arg_value>é√ 😀 </arg_valu </arg_value>",
+    'edit<arg_key>line</arg_key><arg_value>3.0</arg_value><arg_key>opts</arg_key><arg_value>{"a": [1, "<"]}'
+    '</arg_value><arg_key>tags</arg_key><arg_value>["x"]</arg_value><arg_key>any</arg_key><arg_value>nope'
+    "</arg_value>",
+    "edit\n<arg_key> path </arg_key>\n<arg_value>a</arg_value>\n<arg_key>line</arg_key> <arg_value>7</arg_value>\n",
+    "edit",
+    "edit<arg_key>unknown</arg_key><arg_value>NaN</arg_value><arg_key>old</arg_key><arg_value></arg_value>",
+])
+def test_streamed_arguments_add_up_to_the_whole_calls_json_in_any_chunking(body):
+    text = "plan</think>Sure. <tool_call>" + body + "</tool_call>"
+    want = _whole_call_arguments(body, EDIT)
+    for pieces in (1, 2, 3, 5, 7, 11, len(text)):
+        p, deltas = _parser(tools=EDIT), []
+        for i in range(0, len(text), pieces):
+            deltas += p.feed(text[i:i + pieces])
+        deltas += p.finish()
+        (call,) = _calls(deltas)
+        assert call["function"] == {"name": "edit", "arguments": want}
+        assert "".join(d.get("content", "") for d in deltas) == "Sure."
+    # the id and name go out before the arguments are read
+    p = _parser(tools=EDIT)
+    first = p.feed("x</think><tool_call>edit<arg_key>pa")
+    assert first[-1]["tool_calls"][0]["function"] == {"name": "edit", "arguments": ""}
+    assert p.feed("th</arg_key><arg_value>src/") == [{"tool_calls": [{"index": 0, "function": {
+        "arguments": '{"path": "src/'}}]}]
+
+
+def test_a_string_value_streams_with_a_partial_tag_held():
+    p = _parser(tools=EDIT)
+    p.feed("x</think><tool_call>edit<arg_key>old</arg_key><arg_value>a <")
+    assert p.feed("b> </arg_v") == [{"tool_calls": [{"index": 0, "function": {"arguments": "<b> "}}]}]
+    assert p.feed("alue></tool_call>") == [{"tool_calls": [{"index": 0, "function": {"arguments": '"}'}}]}]
+
+
+def test_a_single_call_parser_is_done_at_the_end_of_its_call():
+    p = glm_chat.GlmReplyParser(thinking=True, tools=TOOLS, single_call=True)
+    deltas = p.feed("Plan</think>" + CALL[:-3])
+    assert not p.done
+    deltas += p.feed(CALL[-3:] + "\nMore text" + CALL)
+    assert p.done and p.feed("x") == [] and p.finish() == []
+    assert [c["function"]["name"] for c in _calls(deltas)] == ["get_weather"] and p.finish_reason == "tool_calls"
+    assert not any("content" in d for d in deltas)
+
+
 def test_two_calls_take_indices_and_drop_the_space_between():
     reasoning, content, calls, finish = _streamed("Plan</think>\n" + CALL + "\n" + CALL + "\n", 5)
     assert [c["index"] for c in calls] == [0, 1] and content == "" and finish == "tool_calls"
@@ -90,9 +163,23 @@ def test_without_tools_a_call_tag_is_text():
     assert calls == [] and content == CALL
 
 
-def test_a_cut_off_call_is_returned_as_text():
-    _, content, calls, finish = _streamed("ok</think>" + CALL[:50], 6)
-    assert calls == [] and content == CALL[:50] and finish == "stop"
+def test_a_call_cut_off_before_its_name_ends_is_text():
+    _, content, calls, finish = _streamed("ok</think>" + CALL[:20], 6)
+    assert calls == [] and content == CALL[:20] and finish == "stop"
+
+
+@pytest.mark.parametrize("cut, arguments", [
+    (len("<tool_call>get_weather<arg_key>"), ""),
+    (len("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par"), '{"city": "Par'),
+    (len("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key>"
+         "<arg_value>3"), '{"city": "Paris", "days": '),
+])
+def test_a_call_cut_off_after_its_name_stays_a_call_as_far_as_it_got(cut, arguments):
+    for pieces in (1, 4, cut):
+        _, content, calls, finish = _streamed("ok</think>" + CALL[:cut], pieces)
+        assert content == "" and [c["function"] for c in calls] == [{"name": "get_weather", "arguments": arguments}]
+        # not tool_calls: the arguments are not whole
+        assert finish == "stop"
 
 
 def test_thinking_off_reads_the_reply_as_the_answer():
@@ -240,8 +327,14 @@ def test_tool_choice_none_leaves_the_tools_out(tmp_path):
 
 
 @pytest.mark.parametrize("body", [
-    {"tools": [WEATHER], "tool_choice": "required"},
-    {"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+    {"tool_choice": "required"},
+    {"tools": [WEATHER], "tool_choice": "any"},
+    {"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "get_time"}}},
+    {"tools": [WEATHER], "tool_choice": {"type": "function", "name": "get_weather"}},
+    {"tools": [WEATHER], "tool_choice": "required", "enable_thinking": True},
+    {"reply_prefix": "<tool_call>get_weather"},
+    {"tools": [WEATHER], "parallel_tool_calls": "no"},
+    {"tools": [WEATHER], "parallel_tool_calls": 0},
     {"tools": [{"type": "function"}]},
     {"tools": "get_weather"},
     {"tools": [{"type": "function", "function": {"name": "f", "parameters": "{}"}}]},
@@ -251,6 +344,62 @@ def test_tool_choice_none_leaves_the_tools_out(tmp_path):
 def test_adapter_refuses_what_it_cannot_honour(body, tmp_path):
     with pytest.raises(ValueError):
         adapters.get_adapter("glm52").chat_to_request(_chat(**body), tmp_path)
+
+
+TIME = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+
+
+ARGS = "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+
+
+@pytest.mark.parametrize("model, choice, tools, prefix, thinking, reply", [
+    # one tool: it is named, and the reply starts at the arguments
+    ("glm52", "required", [WEATHER], "<tool_call>get_weather", False, ARGS),
+    ("glm52", "required", [WEATHER, TIME], "<tool_call>", False, "get_weather" + ARGS),
+    ("glm52", {"type": "function", "function": {"name": "get_weather"}}, [WEATHER, TIME],
+     "<tool_call>get_weather", False, ARGS),
+    ("glm5_next", "required", [WEATHER, TIME], "</think><tool_call>", None, "get_weather" + ARGS),
+    ("glm5_next", {"type": "function", "function": {"name": "get_weather"}}, [WEATHER, TIME],
+     "</think><tool_call>get_weather", None, ARGS),
+])
+def test_a_forced_tool_choice_opens_the_call_in_the_prompt(model, choice, tools, prefix, thinking, reply, tmp_path):
+    adapter = adapters.get_adapter(model)
+    req = _chat(tools=tools, tool_choice=choice)
+    mk = adapter.chat_to_request(req, tmp_path).model_kwargs
+    assert mk["reply_prefix"] == prefix and mk["tools"] == tools
+    # GLM-5.2's prompt ends <think></think>, as a turn that does not reason
+    assert mk["chat_template_kwargs"].get("enable_thinking") is thinking
+    p = adapter.make_output_parser(req)
+    msg = p.message(reply)
+    (call,) = msg["tool_calls"]
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
+    assert msg["content"] is None and "reasoning_content" not in msg and p.finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize("model", ["glm52", "glm5_next"])
+def test_a_forced_function_is_the_only_one_its_call_can_name(model):
+    """Forced get_weather beside get_weather_hourly: the model writing on past the prompt's
+    name parsed as a call to the other tool."""
+    hourly = {"type": "function", "function": {
+        "name": "get_weather_hourly", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+    req = _chat(tools=[WEATHER, hourly], tool_choice={"type": "function", "function": {"name": "get_weather"}})
+    p = adapters.get_adapter(model).make_output_parser(req)
+    msg = p.message("_hourly" + ARGS)
+    assert not msg.get("tool_calls") and p.finish_reason == "stop"
+    assert msg["content"].startswith("<tool_call>get_weather_hourly")
+
+
+def test_a_forced_call_to_a_made_up_function_stays_text():
+    p = glm_chat.GlmReplyParser(thinking=False, tools=TOOLS, forced_call="")
+    msg = p.message("rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>")
+    assert msg["content"].startswith("<tool_call>rm_rf<arg_key>") and p.finish_reason == "stop"
+
+
+def test_auto_and_none_leave_the_prompt_alone(tmp_path):
+    for choice in ("auto", "none", None):
+        req = _chat(tools=[WEATHER], tool_choice=choice)
+        mk = adapters.get_adapter("glm52").chat_to_request(req, tmp_path).model_kwargs
+        assert "reply_prefix" not in mk and "enable_thinking" not in mk["chat_template_kwargs"]
 
 
 class _RecordingTokenizer:
@@ -264,6 +413,10 @@ class _RecordingTokenizer:
 
         self.calls.append((messages, kw))
         return torch.tensor([[1, 2, 3]])
+
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens  # no [gMASK]<sop> mid prompt
+        return [100 + len(text)]
 
 
 def _glm52():
@@ -304,6 +457,19 @@ def test_process_prompt_renders_the_chat(make, tmp_path):
     assert "tokenize" not in kw and kw["enable_thinking"] is False
     with pytest.raises(ValueError, match="messages"):
         m.process_prompt("hello", ["text"], ["text"], messages="hi")
+
+
+@pytest.mark.parametrize("make", [_glm52, _glm53])
+def test_process_prompt_ends_with_the_reply_prefix(make, tmp_path):
+    pytest.importorskip("torch")
+    m = make()
+    mk = adapters.get_adapter("glm52").chat_to_request(
+        _chat(tools=[WEATHER], tool_choice="required"), tmp_path).model_kwargs
+    out = m.process_prompt("ignored", ["text"], ["text"], **mk)
+    assert out["text_inputs"][0].tolist() == [1, 2, 3, 100 + len("<tool_call>get_weather")]
+    m._tokenizer_mode = "byte"
+    out = m.process_prompt("hi", ["text"], ["text"], reply_prefix="<t")
+    assert out["text_inputs"][0].tolist() == list(b"hi<t")
 
 
 @pytest.mark.parametrize("raw", ["1e400", "[1e309]", "-1e999", '{"x": 1e400}'])
@@ -374,7 +540,7 @@ def test_a_long_call_is_read_once_and_parses_as_whole():
     deltas += p.finish()
     # what is still searched for the end tag stays a feed long, whatever the call's length
     assert longest < len(glm_chat.CALL_END) + 4
-    [call] = [c for d in deltas for c in d.get("tool_calls", [])]
+    [call] = _calls(deltas)
     assert json.loads(call["function"]["arguments"]) == {"path": "a.py", "content": body}
     assert _parser(tools=write).message(text)["tool_calls"][0]["function"] == call["function"]
 
@@ -389,6 +555,76 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     mk = adapters.get_adapter("glm52").chat_to_request(_chat(tools=[tool]), tmp_path).model_kwargs
     # what the data worker sends the conductor: the wire carries no int past 64 bits
     sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
-    assert {"messages", "tools", "chat_template_kwargs"} <= set(mk) and not {"messages", "tools"} & set(sent)
+    mk["reply_prefix"] = "<tool_call>f"
+    sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
+    assert {"messages", "tools", "chat_template_kwargs"} <= set(mk)
+    assert not {"messages", "tools", "reply_prefix"} & set(sent)
     body = NewRequestConductor("r", {}, ["text"], ["text"], {}, sent)
     wire.encode(ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST, body=body))
+
+
+@pytest.mark.parametrize("stops, text, want, stop", [
+    (["END"], "abcENDdef", "abc", "END"),
+    (["END"], "abcENdef", "abcENdef", None),
+    (["xyz", "y"], "axyz", "ax", "y"),  # the stop that completes first wins
+    (["bc", "abc"], "zabcd", "z", "abc"),  # of two ending together, the longer
+    (["\n\n"], "a\nb\n\nc", "a\nb", "\n\n"),
+    (["ab", "b"], "aab", "a", "ab"),
+])
+def test_a_stop_string_ends_the_text_in_any_chunking(stops, text, want, stop):
+    from mstar.api_server.openai.reply import StopMatcher
+
+    for pieces in (1, 2, 3, len(text)):
+        m, out, got = StopMatcher(stops), "", None
+        for i in range(0, len(text), pieces):
+            emitted, got = m.feed(text[i:i + pieces])
+            out += emitted
+            if got is not None:
+                break
+        if got is None:
+            out += m.flush()
+        assert (out, got) == (want, stop)
+
+
+def test_a_stop_string_holds_back_only_what_may_start_it():
+    from mstar.api_server.openai.reply import StopMatcher
+
+    m = StopMatcher(["</answer>"])
+    assert m.feed("plain text") == ("plain text", None)
+    assert m.feed(" and </ans") == (" and ", None)
+    assert m.feed("wer") == ("", None) and m.feed(">!") == ("", "</answer>")
+
+
+def test_any_reply_parses_alike_in_any_chunking_and_whole_calls_are_json():
+    """Seeded fuzz over tags, partial tags and text: chunking never changes the
+    reply, and a reply whose calls all closed has JSON arguments."""
+    import random
+
+    tools = glm_chat.tool_parameters([
+        {"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {
+            "s": {"type": "string"}, "n": {"type": "integer"}, "o": {}}}}},
+        {"type": "function", "function": {"name": "g", "parameters": {}}}])
+    frags = ["<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
+             "</arg_value>", "f", "g", "h", "s", "n", "o", " ", "\n", "<", "</", "x", "1", '"q"', "é", "[1]",
+             "</arg_v", "<tool"]
+
+    def run(text, size, **kw):
+        p, deltas = glm_chat.GlmReplyParser(tools=tools, **kw), []
+        for i in range(0, len(text), size):
+            deltas += p.feed(text[i:i + size])
+        deltas += p.finish()
+        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+        content = "".join(d.get("content", "") for d in deltas)
+        return reasoning, content, [c["function"] for c in _calls(deltas)], p.finish_reason, p.done
+
+    rng = random.Random(0)
+    for _ in range(1500):
+        text = "".join(rng.choice(frags) for _ in range(rng.randint(0, 40)))
+        kw = {"thinking": rng.random() < 0.5, "single_call": rng.random() < 0.3,
+              "forced_call": rng.choice([None, None, "", "f", "h"])}
+        whole = run(text, max(1, len(text)), **kw)
+        for size in (1, 2, 3, 7):
+            assert run(text, size, **kw) == whole, (text, size, kw)
+        if whole[3] == "tool_calls":
+            for fn in whole[2]:
+                json.loads(fn["arguments"])

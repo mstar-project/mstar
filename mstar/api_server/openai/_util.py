@@ -34,8 +34,11 @@ def release_unread(api, request_ids: list[str], read: int) -> None:
             logger.warning("Failed to release request %s: %r", request_id, exc)
 
 
-def sse(obj: dict) -> str:
-    return f"data: {_dumps(obj)}\n\n"
+def sse(obj: dict, event: str | None = None) -> str:
+    """One server-sent event; ``event`` names its type, as the Anthropic and
+    Responses streams name each of theirs."""
+    data = f"data: {_dumps(obj)}\n\n"
+    return data if event is None else f"event: {event}\n{data}"
 
 
 try:
