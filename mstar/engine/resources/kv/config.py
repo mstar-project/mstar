@@ -287,6 +287,20 @@ class KVReqConfig(ResourceReqConfig):
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
 
+    def validate(self, spec: "KVSpec | None" = None) -> None:
+        """``ValueError`` (a 400) when a label would hold more positions at the request's caps
+        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
+        the one model that declares one, computes its positions in each forward."""
+        if spec is None or not isinstance(spec.config, PagedKVConfig):
+            return
+        for label, layout in (self.kv_layout or {}).items():
+            positions = layout.positions(self.loop_caps or {})
+            if layout.retention is None and positions > spec.config.max_seq_len:
+                raise ValueError(
+                    f"this request needs {positions} positions of {label!r}, "
+                    f"past the model's context of {spec.config.max_seq_len}"
+                )
+
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
             return self.needed_labels_per_node_walk[(node, walk)]
@@ -337,20 +351,6 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
         if missing := sorted(configs[key].opened_labels() - laid_out):
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
-
-
-def refuse_past_context(context: Mapping[str, int], configs: Mapping[str, ResourceReqConfig]) -> None:
-    """``ValueError`` (a 400) when a label would hold more positions at the request's caps
-    than its pool's ``max_seq_len``. A label under retention releases old positions as it goes, so it is left out."""
-    for key, config in configs.items():
-        if key not in context or not isinstance(config, KVReqConfig):
-            continue
-        for label, layout in (config.kv_layout or {}).items():
-            positions = layout.slots(config.loop_caps or {})
-            if layout.retention is None and positions > context[key]:
-                raise ValueError(
-                    f"this request needs {positions} positions of {label!r}, past the model's context of {context[key]}"
-                )
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
@@ -419,6 +419,11 @@ class StreamLayout:
 
     def slots(self, caps: Mapping[str, int]) -> int:
         return sum(span.length for span in self.spans) + sum(
+            slots * caps[loop] for loop, slots in self.growth
+        )
+
+    def positions(self, caps: Mapping[str, int]) -> int:
+        return sum(span.advance for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
         )
 

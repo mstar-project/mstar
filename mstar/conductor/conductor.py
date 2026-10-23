@@ -32,13 +32,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import (
-    KVSpec,
-    PagedKVConfig,
-    refuse_past_context,
-    refuse_undeclared_labels,
-    without_layouts,
-)
+from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -593,24 +587,14 @@ class Conductor:
         return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
 
     def _resource_specs(self) -> dict:
-        """The model's resource specs by key, for admission-time capability checks."""
+        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
+            built = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+            specs = {s.resource_key: s for s in built}
             self._resource_specs_cache = specs
         return specs
-
-    def _context(self) -> dict[str, int]:
-        """Each paged pool's ``max_seq_len`` after this deployment's YAML."""
-        context = getattr(self, "_context_cache", None)
-        if context is None:
-            specs = self.model.get_node_resources() or []
-            apply_yaml_overrides(specs, self.model_config)
-            context = self._context_cache = {
-                spec.resource_key: spec.config.max_seq_len
-                for spec in specs if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
-            }
-        return context
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -1225,9 +1209,6 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}
         prefix_keys = kwargs.get("prefix_keys") or {}
@@ -1247,7 +1228,9 @@ class Conductor:
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
             )
-        refuse_past_context(self._context(), request_data.resource_configs)
+        specs = self._resource_specs()
+        for key, cfg in request_data.resource_configs.items():
+            cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
