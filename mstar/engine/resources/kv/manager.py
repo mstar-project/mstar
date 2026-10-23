@@ -2004,6 +2004,28 @@ class KVManager(AttentionResource):
         offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
         return pages, offsets
 
+    def _stage_packed_plan_state(
+        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int,
+    ) -> KVPlanState:
+        """``_compute_plan_state`` + ``KVPlanState.copy_``, computed on the host
+        from the indptrs the plan built there, in one H2D per buffer."""
+        page_size = self.kv_cache.page_size
+        qo = indptrs.qo_indptr.numpy()
+        kvp = indptrs.paged_kv_indptr.numpy()
+        spans = np.diff(qo)
+        total = int(qo[-1])
+        seg = np.repeat(np.arange(len(spans)), spans)
+        # each token's position in its stream, after the append
+        kv_after = (np.diff(kvp) - 1) * page_size + indptrs.paged_kv_last_page_len.numpy()
+        pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
+        page, offset = np.divmod(pos, page_size)
+        pages = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
+        n = max(capture_len, total)
+        self._plan_stager.copy_(static_state.token_to_page[:n], pages, pad_value=SINK_PAGE)
+        self._plan_stager.copy_(static_state.token_to_cache[:n], offset, pad_value=0)
+        static_state.total_tokens = total
+        return static_state
+
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
         capture_len: int, pages=None, offsets=None,
@@ -2038,6 +2060,18 @@ class KVManager(AttentionResource):
                     self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens,
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
+                )
+                if ctx.is_preplan:
+                    self._preplan_states[label] = plan_state
+                else:
+                    self._current_plan_states[label] = plan_state
+                continue
+            if lease is not None:
+                # a captured packed step (prefill, mixed): addressing off the
+                # host indptrs, staged as for decode, not unpacked on device
+                plan_state = self._stage_packed_plan_state(
+                    indptrs.cpu_indptrs, self._static_plan_state(lease.slot, label),
+                    lease.bucket.num_tokens,
                 )
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
