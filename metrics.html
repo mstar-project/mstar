@@ -913,7 +913,7 @@ time the worker had a step running. Buckets: <a class="reference internal" href=
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_query_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
 keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
-Orpheus); the cache is off under tensor parallelism.</p>
+Orpheus). Under tensor parallelism only rank 0 counts a lookup.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Tokens the prefix cache already held at that lookup. The hit rate is
 <code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_hit_tokens_total[5m])</span></code> divided by

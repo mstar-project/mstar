@@ -28,6 +28,7 @@ mstar.engine.resources.base
       CGSlotSpec
       CachedPrefix
       EngineResourceInfo
+      KeyedWalks
       PublishedInfo
       Resource
    

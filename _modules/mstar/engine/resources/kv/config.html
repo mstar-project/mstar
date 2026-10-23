@@ -1035,6 +1035,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># folded into the root, not checked at match time</span>
     <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">prefix_cache_tp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``</span>
     <span class="n">kv_lora_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">qk_rope_head_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1069,6 +1070,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache_tp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""How much cache this deployment gets, and how it is cut up."""</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
@@ -1078,6 +1080,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="s2">"cpu_offload_pages"</span><span class="p">,</span> <span class="n">cpu_offload_pages</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"prefix_cache_salt"</span><span class="p">,</span> <span class="n">prefix_cache_salt</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"prefix_cache"</span><span class="p">,</span> <span class="n">prefix_cache</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"prefix_cache_tp"</span><span class="p">,</span> <span class="n">prefix_cache_tp</span><span class="p">),</span>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>

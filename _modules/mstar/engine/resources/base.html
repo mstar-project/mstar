@@ -1040,6 +1040,16 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="KeyedWalks">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.KeyedWalks">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">KeyedWalks</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A keyed label's walks, as a resource's prefix cache takes them: the walks whose</span>
+<span class="sd">    writes are keyed, and the growth walks whose sampled ids extend the keys."""</span>
+    <span class="n">writes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">growth</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span></div>
+
+
+
 <div class="viewcode-block" id="Resource">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Resource</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
@@ -1070,14 +1080,9 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Resource.enable_prefix_cache">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.enable_prefix_cache">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">enable_prefix_cache</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KeyedWalks</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Open whatever this resource keeps across requests, under ``root``;</span>
-<span class="sd">        True if anything opened.</span>
-
-<span class="sd">        ``walks`` names, per label, the walks that write the keyed stream.</span>
-<span class="sd">        """</span>
+<span class="sd">        True if anything opened."""</span>
         <span class="k">return</span> <span class="kc">False</span></div>
 
 
@@ -1129,6 +1134,39 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">complete_cached_walk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Called for a walk the cache served whole, since that walk never admits or commits."""</span>
         <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="Resource.lease_cached_prefix">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.lease_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">lease_cached_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""On rank 0 of a TP node, lease the request's cached prefix as its step is sent and</span>
+<span class="sd">        return the pages, or None."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="Resource.adopt_cached_prefix">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.adopt_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">adopt_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">caught_up</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and</span>
+<span class="sd">        raises if it still lacks them once ``caught_up``."""</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+
+
+<div class="viewcode-block" id="Resource.release_cached_prefix">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.release_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">release_cached_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="Resource.page_trail">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.page_trail">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">page_trail</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How many page allocations this resource has made and a hash of their pages in</span>
+<span class="sd">        order, for a TP follower to check against rank 0's. None where it keeps no trail."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
 
 
 <div class="viewcode-block" id="Resource.fingerprint">

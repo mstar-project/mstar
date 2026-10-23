@@ -1022,7 +1022,7 @@ them by that name:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">resources</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">kv_cache</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages,</span>
-<span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt</span>
+<span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt, prefix_cache_tp</span>
 <span class="w">  </span><span class="nt">talker_attn</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense)</span>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
@@ -1037,7 +1037,11 @@ no longer read. It raises an error with a message describing the migration.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">false</span></code> turns cross-request prefix reuse off for that cache, and
 <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code> keeps two otherwise identical deployments off each other’s
 cached pages. A single request opts out by sending <code class="docutils literal notranslate"><span class="pre">prefix_cache=False</span></code>, which
-travels with its other <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>.</p>
+travels with its other <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>. Above one rank the cache stays off unless
+<code class="docutils literal notranslate"><span class="pre">prefix_cache_tp:</span> <span class="pre">true</span></code> is set as well: rank 0 then decides each hit and the other
+ranks adopt it. <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> can’t be combined with <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>, and the
+cache’s nodes must run on one TP group, with no replicas and no walks placed on other
+ranks. Loading fails otherwise.</p>
 <p>A cached prompt no longer reserves its pages, so the pool no longer limits how many
 requests are admitted. It has to hold the decode of every request allowed to run at once,
 and a decode step that finds no free page holds its requests until they time out.
@@ -1312,7 +1316,7 @@ forward ran.</p></li>
 <code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code>: counters, prompt
 tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
 tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
-Orpheus) count; the cache is off under tensor parallelism.</p></li>
+Orpheus) count, and above one rank only with <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> set.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code>: gauge, requests whose next
 step on the node is ready (its inputs arrived) and not running: waiting for room in a
 step or for the worker to pick the node.</p></li>
