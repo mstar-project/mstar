@@ -797,6 +797,7 @@ class Qwen3TTSModel(Model):
     INTERNAL_KWARGS = (
         PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
     )
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
         self,

@@ -596,6 +596,30 @@ class Conductor:
             self._resource_specs_cache = specs
         return specs
 
+    def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
+        """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
+        within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
+        left as it is, and ``validate`` then refuses the request if it doesn't fit."""
+        specs = self._resource_specs()
+        room: dict[str, int] = {}
+        for key, cfg in configs.items():
+            for name, n in cfg.loop_room(specs.get(key)).items():
+                room[name] = min(n, room.get(name, n))
+
+        def overrun(caps: dict[str, int]) -> int:
+            return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
+
+        caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+        over = overrun(caps)
+        while over > 0 and cap > 1:
+            cap = max(1, cap - over)
+            caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+            over, last = overrun(caps), over
+            if over >= last:
+                # the loop that overruns is one max_output_tokens doesn't drive
+                break
+        return cap, caps
+
     def _get_resource_configs(
         self, model_kwargs: dict,
         partition_fwd_args: dict[str, ForwardPassArgs]
@@ -1228,6 +1252,12 @@ class Conductor:
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
             )
+        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
+            request_data.max_output_tokens, loop_caps = self._fit_loop_caps(
+                model_kwargs, request_data.resource_configs, max_output_tokens,
+            )
+            for key, cfg in request_data.resource_configs.items():
+                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
         specs = self._resource_specs()
         for key, cfg in request_data.resource_configs.items():
             cfg.validate(specs.get(key))

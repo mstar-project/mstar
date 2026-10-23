@@ -116,6 +116,7 @@ class FishS2ProModel(Model):
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         self.model_path_hf = model_path_hf

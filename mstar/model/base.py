@@ -423,6 +423,10 @@ class Model(ABC):
     # worker drops a client's values for them before process_prompt.
     INTERNAL_KWARGS: tuple[str, ...] = ()
 
+    # Request keys that set an output length. A request that sets one is refused when it
+    # doesn't fit the context, instead of having its length cut to fit.
+    LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's

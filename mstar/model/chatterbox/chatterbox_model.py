@@ -130,6 +130,8 @@ class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
     per-partition state machine. No GPU compute lives here."""
 
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
+
     def __init__(
         self,
         model_path_hf: str,

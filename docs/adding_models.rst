@@ -346,7 +346,9 @@ text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label w
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
    The iterations each named loop may run for this request. The conductor refuses a request
    whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
-   positions than its pool's ``max_seq_len``, with a 400. Speculation never runs past a
+   positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
+   the default ``max_output_tokens`` cut to the context its prompt leaves. A model that reads
+   a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
    cap. A model whose stop
    check ends a loop at a count returns that count, so the cap and the stop check end the
    loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for

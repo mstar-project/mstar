@@ -282,10 +282,23 @@ class KVReqConfig(ResourceReqConfig):
                 for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
                 if label in opened
             }
+        if loop_caps is not None and self.kv_layout is not None:
             self.loop_caps = {
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
+
+    def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
+        if spec is None or not isinstance(spec.config, PagedKVConfig):
+            return {}
+        caps, room = self.loop_caps or {}, {}
+        for layout in (self.kv_layout or {}).values():
+            if layout.retention is not None:
+                continue
+            for loop, slots in layout.growth:
+                n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
+                room[loop] = min(n, room.get(loop, n))
+        return room
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
