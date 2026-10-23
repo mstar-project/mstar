@@ -497,6 +497,7 @@ class FlashInferMixedWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs,
     ):
         from mstar.engine.resources.kv.plan import HostLens
@@ -588,7 +589,7 @@ class FlashInferMixedWrapper:
             paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
             paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
             kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-            dtype=dtype,
+            dtype=dtype, window_left=window_left,
         )
         self._prefill.plan(
             qo_indptr=torch.from_numpy(p_qo),
@@ -596,7 +597,7 @@ class FlashInferMixedWrapper:
             paged_kv_indices=torch.from_numpy(p_idx),
             paged_kv_last_page_len=torch.from_numpy(p_last),
             kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
-            causal=causal, dtype=dtype,
+            causal=causal, dtype=dtype, window_left=window_left,
         )
         self._done.record()
 
