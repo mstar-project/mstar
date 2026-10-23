@@ -589,7 +589,6 @@ def test_initial_args_builtin_voice():
     assert [e.name for e in t3.inputs] == [TEXT_INPUTS]
     assert t3.unpersist_tensors == signals[TEXT_INPUTS]
     assert t3.step_metadata["cfg_weight"] == 0.4 and t3.step_metadata["is_prefill"] is True
-    assert t3.full_metadata.kwargs["max_new_tokens"] == 1000
 
     s3 = model.get_initial_forward_pass_args("S3Gen", ["text"], ["audio"], signals, {})
     assert s3.full_metadata.graph_walk == "s3gen_chunk" and s3.inputs == []
@@ -619,7 +618,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     metadata = CurrentForwardConductorMetadata(
         input_modalities=["text"], output_modalities=["audio"],
         graph_walk="prefill_voice", is_prefill=True,
-        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "max_new_tokens": 10},
+        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05},
     )
     persist = {SPEECH_TOKENS: [SimpleNamespace(name=SPEECH_TOKENS)]}
     result = model.get_partition_forward_pass_args("T3", metadata, persist)
@@ -627,7 +626,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     assert result.inputs[0].name == PREV_TOKEN and result.inputs[0].next_node == "T3"
     assert result.inputs[0].tensor_info == persist[SPEECH_TOKENS]
     assert result.unpersist_tensors == persist[SPEECH_TOKENS]
-    assert result.step_metadata["is_prefill"] is False and result.step_metadata["max_new_tokens"] == 10
+    assert result.step_metadata == {"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": False}
     assert result.request_done is False
 
     result = model.get_partition_forward_pass_args("T3", metadata, {})
@@ -727,10 +726,9 @@ def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
     # the wire id differs from the handle, so state keyed by the wrong one shows
     return SimpleNamespace(
         request_id=f"wire-{rid}", rid_handle=rid,
-        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05,
-                       "max_new_tokens": max_new, "is_prefill": True},
+        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": True},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=temperature, ignore_eos=False)},
-        max_tokens=4096, random_seed=0,
+        max_tokens=max_new, random_seed=0,
     )
 
 

@@ -116,6 +116,7 @@ class FishS2ProModel(Model):
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         self.model_path_hf = model_path_hf
@@ -377,8 +378,6 @@ class FishS2ProModel(Model):
             ref_frames = self.config.codec.frames_for_samples(num_samples)
         ref_text = str(kwargs.get("ref_text") or "").strip() if clips else None
         ids, prefix_len = self.build_prompt(prompt.strip(), ref_text, ref_frames)
-        if len(ids) + ref_frames + self.get_max_output_tokens(**kwargs) > self.config.slow_ar.max_seq_len:
-            raise ValueError("Fish S2-Pro prompt plus max_new_tokens exceeds the 32,768-token context")
         metadata: dict[str, Any] = {PROMPT_LAYOUT_KEY: [prefix_len, ref_frames]}
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
@@ -486,7 +485,7 @@ class FishS2ProModel(Model):
 
     @staticmethod
     def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill, "ar_max_tokens": metadata.kwargs["ar_max_tokens"]}
+        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding

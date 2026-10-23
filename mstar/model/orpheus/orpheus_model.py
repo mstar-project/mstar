@@ -145,7 +145,7 @@ class OrpheusModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -315,17 +315,6 @@ class OrpheusModel(Model):
         start_token = torch.tensor([self.config.start_token_id], dtype=torch.long)
         end_tokens = torch.tensor(self.config.end_token_ids, dtype=torch.long)
         all_input_ids = torch.cat([start_token, prompt_tokens.input_ids[0], end_tokens])
-
-        # The decode loop writes up to get_max_output_tokens() more positions
-        # after the prompt, and all of them must fit the context.
-        context = self.config.max_position_embeddings
-        limit = context - self.get_max_output_tokens()
-        if all_input_ids.numel() > limit:
-            raise ValueError(
-                f"The prompt is {all_input_ids.numel()} tokens; Orpheus takes at most "
-                f"{limit} (its {context}-token context less the "
-                f"{self.get_max_output_tokens()} audio tokens it can generate)"
-            )
 
         length = all_input_ids.numel()
         layout = LabelLayout(

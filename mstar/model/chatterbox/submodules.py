@@ -447,7 +447,7 @@ class T3Submodule(ARNodeSubmodule):
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
         generated = int(self.request_state(request_id).get("generated", 0))
-        max_new = int(request_info.step_metadata.get("max_new_tokens", request_info.max_tokens))
+        max_new = request_info.max_tokens
         sampling = request_info.resource_configs.get(T3_SAMPLER)
         ignore_eos = bool(getattr(sampling, "ignore_eos", False))
         if (not ignore_eos and token == self.t3.stop_speech_token) or generated >= max_new:

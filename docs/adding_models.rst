@@ -344,8 +344,13 @@ text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label w
    return ProcessPromptOutput(result, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
-   The iterations each named loop may run for this request. A loop runs the smaller of its
-   graph ``max_iters`` and its cap, and speculation never runs past it. A model whose stop
+   The iterations each named loop may run for this request. The conductor refuses a request
+   whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
+   positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
+   the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
+   reads that length from ``request_info.max_tokens``, which carries the cut. A model that
+   reads a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
+   cap. A model whose stop
    check ends a loop at a count returns that count, so the cap and the stop check end the
    loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
    every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
@@ -855,7 +860,8 @@ Step 3 — Declare the computation graph
   concurrently.
 - ``Loop(name, section, max_iters, outputs)`` is a subgraph that iterates. Its body feeds
   its own outputs back as the inputs of the next iteration. It runs at most ``max_iters``
-  times, and can stop earlier. Give the loop a ``name`` so that a submodule's
+  times, and can stop earlier. A decode loop's ``max_iters`` is the model's context length,
+  and each request's own length is its cap from ``get_loop_caps``. Give the loop a ``name`` so that a submodule's
   ``check_stop`` can register a stop signal against it. This is the usual ``decode`` loop.
 
 A minimal text generator has two walks: a ``prefill`` node that runs once, and a
@@ -878,7 +884,7 @@ A minimal text generator has two walks: a ``prefill`` node that runs once, and a
                input_names=["text_inputs"],
                outputs=[GraphEdge(next_node="LLM", name="text_inputs")],  # loop-back
            ),
-           max_iters=self.get_max_output_tokens(),
+           max_iters=self.config.max_position_embeddings,
            outputs=[],
        )
        return dict(prefill=prefill, decode=decode)

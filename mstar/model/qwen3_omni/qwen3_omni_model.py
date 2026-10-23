@@ -127,6 +127,8 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
+    LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
+
     def __init__(
         self,
         model_path_hf: str,
@@ -448,7 +450,7 @@ class Qwen3OmniModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
@@ -505,7 +507,7 @@ class Qwen3OmniModel(Model):
                     )
                 ]
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 

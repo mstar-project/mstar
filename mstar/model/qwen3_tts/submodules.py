@@ -800,9 +800,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         generated = int(
             self.request_state(request_id).get("generated_frames", 0)
         )
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
+        max_tokens = request_info.max_tokens
         sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
         reached_eos = (

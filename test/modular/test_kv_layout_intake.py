@@ -22,7 +22,7 @@ from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
@@ -61,12 +61,12 @@ class _ScriptDoneError(Exception):
 
 class _Model(Model):
 
-    def __init__(self, layout=LAYOUT):
-        self._layout = layout
+    def __init__(self, layout=LAYOUT, max_seq_len=4096):
+        self._layout, self._max_seq_len = layout, max_seq_len
 
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=PS,
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,
         ))]
 
     def kv_labels(self):
@@ -88,8 +88,11 @@ class _Model(Model):
             )),
         ])}
 
+    def get_max_output_tokens(self, **model_kwargs):
+        return model_kwargs.get("max_output_tokens", 40)
+
     def get_loop_caps(self, **model_kwargs):
-        return {"decode_loop": model_kwargs["max_output_tokens"]}
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
     def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
         return {"kv": KVReqConfig(needed_labels=["main", "uncond"])}
@@ -188,12 +191,44 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
     assert kv._ensure_label("r", "uncond").footprint == -(-(10 + 2 * 40 + 7) // PS)
 
 
-def test_a_cap_past_its_loop_reaches_the_workers_as_its_max_iters(tmp_path, monkeypatch):
+def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
     model = _Model()
 
-    new_request = _ingest(model, _preprocess(model, {"max_output_tokens": 2**40}), tmp_path, monkeypatch)
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 51}), tmp_path, monkeypatch).sent
 
-    assert new_request.loop_caps == {"decode_loop": 50, "talk_loop": 40}, "a cap went out past its loop's max_iters"
+    failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [body.status for body in failed] == [400], "a request the loop would end short was served"
+    assert not any(getattr(msg.message_type, "name", "") == "NEW_REQUEST" for msg in sent)
+
+
+@pytest.mark.parametrize("context, model_kwargs", [(PROMPT + 29, {"max_output_tokens": 30}), (PROMPT - 1, {})])
+def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch, context, model_kwargs):
+    model = _Model(max_seq_len=context)
+
+    sent = _conduct(model, _preprocess(model, model_kwargs), tmp_path, monkeypatch).sent
+
+    failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [body.status for body in failed] == [400], "a request past the model's context was served"
+
+
+def test_a_span_counts_its_advance_not_its_slots_against_the_context():
+    cfg = KVReqConfig(
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(100, 40, "prefill"),), growth=(("decode_loop", 1),))},
+        loop_caps={"decode_loop": 50},
+    )
+
+    cfg.validate(_Model(max_seq_len=90).get_node_resources()[0])
+    with pytest.raises(ValueError, match="past the model's context"):
+        cfg.validate(_Model(max_seq_len=89).get_node_resources()[0])
+
+
+def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypatch):
+    model = _Model(max_seq_len=PROMPT + 29)
+
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch)
+
+    assert new_request.loop_caps["decode_loop"] == 29, "the default cap ran past the context"
+    assert new_request.request_info.max_tokens == 29
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):

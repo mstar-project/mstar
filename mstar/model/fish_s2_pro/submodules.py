@@ -332,7 +332,7 @@ class ARSubmodule(ARNodeSubmodule):
         state = self.request_state(request_id)
         generated = int(state.get("generated_frames", 0)) + 1
         state.add("generated_frames", generated)
-        max_tokens = request_info.step_metadata.get("ar_max_tokens", request_info.max_tokens)
+        max_tokens = request_info.max_tokens
         sampling = request_info.resource_configs.get(AR_SAMPLER)
         reached_eos = head_index == self.eos_code and not bool(getattr(sampling, "ignore_eos", False))
         if reached_eos or generated >= max_tokens:

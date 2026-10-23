@@ -33,6 +33,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -560,32 +561,64 @@ class Conductor:
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
-        """The request's output cap: an int >= 1 within the model's published
-        limit, else ``ValueError`` (a 400). Checked here because the cap is
-        compared inside the run loop, where a non-int would raise and the
-        request would hang."""
+        """The request's output cap: an int >= 1, else ``ValueError`` (a 400).
+        Checked here because the cap is compared inside the run loop, where a
+        non-int would raise and the request would hang."""
         requested = model_kwargs.get("max_output_tokens")
         if requested is not None and (
             isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
         ):
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {requested!r}")
-        limit = self.model.get_max_output_tokens_limit()
-        if requested is not None and limit is not None and requested > limit:
-            raise ValueError(
-                f"max_output_tokens is {requested}; this model produces at most {limit}"
-            )
         cap = self.model.get_max_output_tokens(**model_kwargs)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
         return cap
 
+    def _loop_caps(self, model_kwargs: dict) -> dict[str, int]:
+        """Each named loop's cap for the request. A cap past its loop's ``max_iters``
+        would end the request short of what it asked for, so it is a ``ValueError`` (a 400)."""
+        caps = self.model.get_loop_caps(**model_kwargs)
+        for name, cap in caps.items():
+            max_iters = self._loop_max_iters.get(name)
+            if max_iters is not None and cap > max_iters:
+                raise ValueError(
+                    f"this request needs {cap} iterations of {name!r}, and this model runs at most {max_iters}"
+                )
+        return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
+
     def _resource_specs(self) -> dict:
-        """The model's resource specs by key, for admission-time capability checks."""
+        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
+            built = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+            specs = {s.resource_key: s for s in built}
             self._resource_specs_cache = specs
         return specs
+
+    def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
+        """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
+        within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
+        left as it is, and ``validate`` then refuses the request if it doesn't fit."""
+        specs = self._resource_specs()
+        room: dict[str, int] = {}
+        for key, cfg in configs.items():
+            for name, n in cfg.loop_room(specs.get(key)).items():
+                room[name] = min(n, room.get(name, n))
+
+        def overrun(caps: dict[str, int]) -> int:
+            return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
+
+        caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+        over = overrun(caps)
+        while over > 0 and cap > 1:
+            cap = max(1, cap - over)
+            caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+            over, last = overrun(caps), over
+            if over >= last:
+                # the loop that overruns is one max_output_tokens doesn't drive
+                break
+        return cap, caps
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -1115,10 +1148,7 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
-        caps = self.model.get_loop_caps(**model_kwargs)
-        # Rust's graph runtime holds a cap as a u32, so an unclamped cap from a large
-        # max_output_tokens would fail the request there but not in Python.
-        loop_caps = {name: min(n, caps.get(name, n)) for name, n in self._loop_max_iters.items()}
+        loop_caps = self._loop_caps(model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
@@ -1203,9 +1233,6 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}
         prefix_keys = kwargs.get("prefix_keys") or {}
@@ -1227,6 +1254,15 @@ class Conductor:
                 loop_caps=loop_caps,
                 prompt_ids=prompt_ids.get(key),
             )
+        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
+            request_data.max_output_tokens, loop_caps = self._fit_loop_caps(
+                model_kwargs, request_data.resource_configs, max_output_tokens,
+            )
+            for key, cfg in request_data.resource_configs.items():
+                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        specs = self._resource_specs()
+        for key, cfg in request_data.resource_configs.items():
+            cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True

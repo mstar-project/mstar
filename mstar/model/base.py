@@ -423,6 +423,10 @@ class Model(ABC):
     # worker drops a client's values for them before process_prompt.
     INTERNAL_KWARGS: tuple[str, ...] = ()
 
+    # Request keys that set an output length. A request that sets one is refused when it
+    # doesn't fit the context, instead of having its length cut to fit.
+    LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's
@@ -938,17 +942,6 @@ class Model(ABC):
         loop ends on the same iteration and never speculates past it.
         """
         return {}
-
-    def get_max_output_tokens_limit(self) -> int | None:
-        """The largest ``max_output_tokens`` a request may ask for; above it the
-        conductor refuses the request (a 400) rather than stopping short. None
-        is no published limit.
-
-        A model whose decode Loop is built with ``max_iters`` from the
-        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
-        ends there whatever the request asked.
-        """
-        return None
 
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an

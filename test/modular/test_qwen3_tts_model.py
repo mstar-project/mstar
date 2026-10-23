@@ -665,12 +665,11 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
         input_modalities=["text"],
         output_modalities=["audio"],
         input_signals=pointers,
-        model_kwargs={"max_new_tokens": 12, "subtalker_top_k": 7, **prompt},
+        model_kwargs={"subtalker_top_k": 7, **prompt},
     )
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
-    assert talker.full_metadata.kwargs["talker_max_tokens"] == 12
-    assert talker.step_metadata == {"is_prefill": True, "talker_max_tokens": 12, **prompt}
+    assert talker.step_metadata == {"is_prefill": True, **prompt}
     # Residual-group sampling rides the code predictor's own per-request
     # sampler config, not step metadata.
     assert "subtalker_sampling" not in talker.step_metadata
@@ -695,9 +694,6 @@ def test_qwen3_tts_talker_prefill_transitions_to_decode():
         output_modalities=["audio"],
         graph_walk="talker_prefill",
         is_prefill=True,
-        kwargs={
-            "talker_max_tokens": 100,
-        },
     )
 
     result = model.get_partition_forward_pass_args(
@@ -966,9 +962,9 @@ def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
     submodule.request_state("request").add("generated_frames", 0)
     outputs = {"new_token": [torch.tensor(1)]}
     request_info = SimpleNamespace(
-        step_metadata={"talker_max_tokens": 1},
+        step_metadata={},
         resource_configs={},
-        max_tokens=8192,
+        max_tokens=1,
     )
 
     submodule.postprocess("request", request_info, outputs)
@@ -990,7 +986,7 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
         config.talker.codec_eos_token_id, 1, 2, 3
     ])]}
     request_info = SimpleNamespace(
-        step_metadata={"talker_max_tokens": 100},
+        step_metadata={},
         resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=False)},
         max_tokens=8192,
     )
@@ -1015,7 +1011,7 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
         config.talker.codec_eos_token_id
     )]}
     request_info = SimpleNamespace(
-        step_metadata={"talker_max_tokens": 100},
+        step_metadata={},
         resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=True)},
         max_tokens=8192,
     )

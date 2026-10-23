@@ -549,7 +549,7 @@ class Qwen3TTSModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.talker.max_position_embeddings,
             outputs=[],
         )
         walks = {
@@ -797,6 +797,7 @@ class Qwen3TTSModel(Model):
     INTERNAL_KWARGS = (
         PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
     )
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
         self,
@@ -930,9 +931,6 @@ class Qwen3TTSModel(Model):
                 output_modalities=output_modalities,
                 graph_walk=walk,
                 is_prefill=True,
-                kwargs={
-                    "talker_max_tokens": self.get_max_output_tokens(**model_kwargs),
-                },
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
             step_metadata = self._talker_step_metadata(metadata)
@@ -1329,8 +1327,4 @@ class Qwen3TTSModel(Model):
     def _talker_step_metadata(
         metadata: CurrentForwardConductorMetadata,
     ) -> dict[str, Any]:
-        """Copy conductor-owned generation controls into worker step metadata."""
-        return {
-            "is_prefill": metadata.is_prefill,
-            "talker_max_tokens": metadata.kwargs["talker_max_tokens"],
-        }
+        return {"is_prefill": metadata.is_prefill}

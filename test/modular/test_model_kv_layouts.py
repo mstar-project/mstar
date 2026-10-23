@@ -259,7 +259,7 @@ def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     assert cap == _stops_after(
         check_stop, "decode_loop", "decode", model.config.t3.max_speech_tokens, outputs,
-        max_tokens=max_tokens, step_metadata={"max_new_tokens": max_tokens},
+        max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 
 
@@ -377,14 +377,14 @@ def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
     outputs = {"new_token": [torch.tensor([4])]}
     ar.request_state("r").add("generated_frames", 0)
     ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={"ar_max_tokens": max_tokens}, max_tokens=max_tokens, resource_configs={})
+    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
     ar.check_stop("r", prefill, outputs)
 
     cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
 
     assert cap == _stops_after(
         ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens, step_metadata={"ar_max_tokens": max_tokens},
+        max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 
 
@@ -519,7 +519,7 @@ def test_qwen3_tts_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     assert cap == _stops_after(
         check_stop, "talker_decode_loop", "talker_decode", 2048, outputs,
-        max_tokens=max_tokens, step_metadata={"talker_max_tokens": max_tokens},
+        max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 
 
