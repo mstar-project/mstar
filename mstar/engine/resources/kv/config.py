@@ -433,7 +433,7 @@ class StreamLayout:
         step, end = self.scratch, 0
         for span in self.spans:
             end += span.length
-            if end > prefix:
+            if max(end, end - span.length + span.scratch) > prefix:
                 step = max(step, span.length, span.scratch)
         step = max([step, *(slots for _, slots in self.growth)])
         window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
