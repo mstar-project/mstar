@@ -444,26 +444,32 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
-        if self._admit_taken or self._admit_restores or self._admit_snaps:
-            with self._lock:
-                self._forget_taken(ctx.is_real_row)
-                self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
+        slots = self._slots
         page = self._kv.config.page_size if self._kv is not None else 0
         every: dict[str, int] = {}
-        for segment in step.segments or ():
-            if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
-                # a zero-span row is addressed at the sink, like a padding row:
-                # it neither reads nor writes its own slot
-                continue
-            if self._alloc(segment.request_id, segment.label) is None:
-                return self._refused(segment.request_id, segment.label)
-            if page and (segment.request_id in self._leases or segment.span >= page):
-                label = segment.label
-                if label not in every:
-                    every[label] = self._checkpoint_every(
-                        [seg for seg in step.segments if seg.label == label], ctx,
-                    )
-                self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
+        # one critical section for the batch, not one per row
+        with self._lock:
+            if self._admit_taken or self._admit_restores or self._admit_snaps:
+                self._forget_taken(ctx.is_real_row)
+                self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
+            for segment in step.segments or ():
+                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+                    # a zero-span row is addressed at the sink, like a padding row:
+                    # it neither reads nor writes its own slot
+                    continue
+                labels = slots.get(segment.request_id)
+                # a resident row's slot is already held
+                if (labels is None or segment.label not in labels) and self._alloc(
+                    segment.request_id, segment.label,
+                ) is None:
+                    return self._refused(segment.request_id, segment.label)
+                if page and (segment.request_id in self._leases or segment.span >= page):
+                    label = segment.label
+                    if label not in every:
+                        every[label] = self._checkpoint_every(
+                            [seg for seg in step.segments if seg.label == label], ctx,
+                        )
+                    self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
