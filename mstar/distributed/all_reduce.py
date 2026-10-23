@@ -103,8 +103,9 @@ class SymmMemAllReduce(AllReduce, ABC):
     """One persistent symmetric-memory buffer per group; small messages are
     reduced through it (copy in, the subclass's kernel sums it across the group,
     result back in the input — in-place semantics, except for an input that is
-    the buffer itself). The kernels' reduction order differs from NCCL's, so
-    bf16 results can differ at the last bit."""
+    the buffer itself). bf16 results may differ from NCCL's in the last bit
+    (a hypothesis, not measured: multimem adds in the NVSwitch, whose rounding
+    may not match NCCL's, and above two ranks the order of the sum can differ)."""
 
     def __init__(self, device_group, device: torch.device, max_bytes: int):
         import torch.distributed._symmetric_memory as symm
@@ -144,6 +145,8 @@ class SymmMemAllReduce(AllReduce, ABC):
             and input_.is_cuda
             and input_.is_contiguous()
         ):
+            if torch.compiler.is_compiling():
+                return _reduce_outside_compile(self, input_)
             return self._reduce(input_)
         return super().all_reduce(input_)
 
@@ -151,23 +154,28 @@ class SymmMemAllReduce(AllReduce, ABC):
         n = input_.numel()
         flat = input_.view(-1)
         view = self._buf[: n * input_.element_size()].view(input_.dtype)
-        # data_ptr() breaks a torch.compile graph at every call, so only eager code
-        # checks pointers: a compiled forward never gets the buffer (``buffer``),
-        # and multimem takes its split kernel there.
-        eager = not torch.compiler.is_compiling()
-        if eager and flat.data_ptr() == view.data_ptr():
+        if flat.data_ptr() == view.data_ptr():
             # The producer wrote into the buffer, and the next call reuses it,
             # so the sum goes to a new tensor.
             input_ = torch.empty_like(input_)
             flat = input_.view(-1)
         else:
             view.copy_(flat)
-        self._sum_into(view, flat, eager)
+        self._sum_into(view, flat)
         return input_
 
     @abstractmethod
-    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor) -> None:
         """Write the sum of every rank's ``buf`` (a view of the symm buffer) to ``out``."""
+
+
+@torch.compiler.disable
+def _reduce_outside_compile(backend: SymmMemAllReduce, input_: torch.Tensor) -> torch.Tensor:
+    """The whole reduce (copy in, kernel, copy out) as eager code behind one
+    graph break. Traced, the symmetric buffer's views and kernels went wrong
+    at the second dynamic size: multimem's copy out failed to trace, and
+    Inductor sized one-shot's input buffer by the first call."""
+    return backend._reduce(input_)
 
 
 class OneShotAllReduce(SymmMemAllReduce):
@@ -175,15 +183,7 @@ class OneShotAllReduce(SymmMemAllReduce):
 
     mode = "symm_oneshot"
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # Inductor gives one_shot_all_reduce's input a persistent symmetric buffer
-        # of its own, sized by the first call, so a forward compiled for dynamic
-        # batch sizes fails at the next size; compiled code stays on NCCL.
-        if torch.compiler.is_compiling():
-            return AllReduce.all_reduce(self, input_)
-        return super().all_reduce(input_)
-
-    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor) -> None:
         out.copy_(torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.group_name))
 
 
@@ -199,8 +199,8 @@ class MultimemAllReduce(SymmMemAllReduce):
         if not self._handle.multicast_ptr:
             raise RuntimeError("no NVLink multicast for this group")
 
-    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
-        if eager and buf.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES:
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor) -> None:
+        if buf.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES:
             # Every rank must run the same kernel, so the choice can't follow this
             # rank's alignment: an ``out`` the kernel's 16-byte stores can't take
             # gets the sum in an aligned tensor, then a copy.

@@ -369,30 +369,6 @@ def test_reducing_the_buffer_returns_the_sum_in_a_new_tensor(
         assert bool((y == 3).all())
 
 
-def test_a_compiled_forward_traces_the_symm_path_in_one_graph(monkeypatch, fake_symm_mem):
-    """GLM-5.2 captures a torch.compile'd forward: data_ptr() would break its
-    graph at every all-reduce, so compiled code gets no buffer handout and
-    takes the split kernel (fullgraph=True raises on any break)."""
-    calls: list = []
-    g = _multimem_group(monkeypatch, fake_symm_mem, calls)
-
-    def forward(x):
-        buf = g.all_reduce_buffer(x.shape, x.dtype, x.device)
-        torch.add(x, 1, out=buf)
-        return g._all_reduce._reduce(buf) * 2
-
-    # dynamo imports inductor, which the conftest's triton stub breaks; a real
-    # triton stays, since dropping it but not its submodules breaks its re-import
-    for name in ("triton", "triton.language"):
-        if name in sys.modules and not hasattr(sys.modules[name], "__file__"):
-            monkeypatch.delitem(sys.modules, name)
-    torch._dynamo.reset()
-    x = torch.ones(2, 4096, dtype=torch.bfloat16)
-    out = torch.compile(forward, backend="eager", fullgraph=True)(x)
-    assert [name for name, _ in calls] == ["split"]
-    assert bool((out == 4).all())
-
-
 # --- routing: which tensors take the symm path ------------------------------
 
 
@@ -491,15 +467,16 @@ def test_size_not_in_4_byte_units_goes_nccl(nccl_calls, symm_group):
     assert nccl_calls == [(t, g.device_group)]
 
 
-def test_compiled_one_shot_goes_nccl(monkeypatch, nccl_calls, symm_group):
-    """Inductor plans one_shot_all_reduce's input as a symmetric buffer of its own,
-    sized by the first call: BAGEL at TP2 failed capture at its second decode size."""
+def test_compiled_one_shot_reduces_outside_the_graph(monkeypatch, nccl_calls, symm_group):
+    """A compiled caller takes the symmetric path as eager code, as multimem's
+    does, so Inductor never sizes one_shot_all_reduce's input by a first call
+    (BAGEL at TP2 failed capture at its second decode size)."""
     g, routed = symm_group()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     t = _CudaTensor(nbytes=16)
     g.all_reduce(t)
-    assert routed == []
-    assert nccl_calls == [(t, g.device_group)]
+    assert routed == [t]
+    assert nccl_calls == []
 
 
 def test_cpu_tensor_goes_nccl(nccl_calls, symm_group):
@@ -615,3 +592,40 @@ def test_compiled_flashinfer_goes_nccl(monkeypatch, nccl_calls, flashinfer):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     g.all_reduce(_Matrix((8, 4096)))
     assert routed == []
+# --- on two GPUs ---------------------------------------------------------------------
+
+
+def _compiled_multimem_worker(rank: int, store_path: str, out_dir: str) -> None:
+    import os
+
+    dist.init_process_group("nccl", init_method=f"file://{store_path}", rank=rank, world_size=2)
+    torch.cuda.set_device(rank)
+    result = "skip"
+    try:
+        backend = MultimemAllReduce(dist.group.WORLD, torch.device("cuda", rank), 4 << 20)
+    except RuntimeError:  # no NVLS on this box
+        backend = None
+    if backend is not None:
+        compiled = torch.compile(lambda x: backend.all_reduce(x * 2) + 1)
+        sums = []
+        for rows in (64, 96, 160):  # the second size recompiles for dynamic sizes
+            x = torch.full((rows, 16), float(rank + 1), device="cuda", dtype=torch.bfloat16)
+            sums.append(str(bool((compiled(x) == 7).all())))
+        result = ",".join(sums)
+    with open(os.path.join(out_dir, str(rank)), "w") as f:
+        f.write(result)
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def test_a_compiled_multimem_all_reduce_sums_at_every_size(tmp_path):
+    """Traced into the compiled forward, the reduce failed at the second
+    (dynamic) size: copying the sum out of the buffer's view did not trace
+    (Muse Spark at TP4, a prefill past the captured buckets)."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_compiled_multimem_worker, args=(str(tmp_path / "store"), str(tmp_path)), nprocs=2, join=True)
+    results = [(tmp_path / str(rank)).read_text() for rank in range(2)]
+    if results[0] == "skip":
+        pytest.skip("no NVLink multicast")
+    assert results == ["True,True,True"] * 2
