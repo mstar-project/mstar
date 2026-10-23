@@ -42,7 +42,7 @@ def _worker(fresh: ScheduledBatch | None = None):
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
     w._in_flight_rids, w._last_active, w._stream_buffer_rids = set(), {}, set()
-    w._kv_keys, w._kept_ids, w._rebuild_rows = {NODE: ["kv"]}, {NODE: {}}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped = {NODE: ["kv"]}, {NODE: {}}, {}, {}
     w._walk_inputs = {(PREFILL, NODE): {"text_inputs"}, (DECODE, NODE): {"text_inputs"}, ("embeds", NODE): {"embeds"},
                       ("pair", NODE): {"a", "b"}, ("pair_decode", NODE): {"a", "b"}}
     w._growth_loops = {(DECODE, NODE): "loop", ("embeds", NODE): "embeds_loop", ("pair_decode", NODE): "pair_loop"}
