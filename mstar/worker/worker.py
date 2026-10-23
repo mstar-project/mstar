@@ -2315,6 +2315,12 @@ class Worker:
             )
         return True
 
+    def _plans_ahead(self, spec: Speculation) -> bool:
+        """A TP leader admits a yield-away step at exec, as its followers do. A pre-plan refused
+        on rank 0 alone puts its pages back at the end of rank 0's free list, and the ranks then
+        hand out different page ids."""
+        return not (spec.is_yield_away and spec.node_batch.node_name in self.parallel_nodes)
+
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -4281,7 +4287,7 @@ class Worker:
             # commit event, then reserves a slot and pre-plans —
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
-            if plan_executor is not None:
+            if plan_executor is not None and self._plans_ahead(spec):
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )
