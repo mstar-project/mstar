@@ -19,15 +19,24 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, ".")
 
+from test_kv_preemption import _step
+from test_kv_prefix_lease import NODE, PAGE_SIZE, _StubTransfer
+
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.manager import Allotment, KVManager
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext
 from mstar.utils.ipc_format import (
     Move,
     MoveKind,
@@ -456,6 +465,18 @@ def test_a_move_for_a_request_this_rank_has_not_taken_in_waits_for_it():
     assert engine.is_offloaded("node", "a"), "the move was lost while it waited"
 
 
+@pytest.mark.parametrize("kind", [kind for kind in MoveKind if kind is not MoveKind.OFFLOAD])
+def test_a_move_of_any_kind_waits_for_a_request_this_rank_has_not_taken_in(kind):
+    engine = _Engine("follower")
+    engine._graph_runtime._live.discard("a")
+    delta = OffloadDelta.new()
+    delta.add(kind, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
+
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is False
+    assert len(delta) == 2 and not engine.is_offloaded("node", "b"), "a move ran ahead of one still owed"
+
+
 def test_a_request_holding_nothing_is_not_a_refusal():
     """``offload`` answers 0 both for "a step still holds these pages, retry" and
     for "there is nothing here to free". Only the first is retryable; treating
@@ -672,6 +693,27 @@ def test_every_follower_gets_the_same_moves_in_its_own_queue():
     # and one replaying does not drain another's
     deltas[0].pop_left()
     assert len(deltas[1]) == 1
+
+
+def test_the_broadcast_sends_the_rebuild_rows_apart_from_the_rows_the_follower_pops():
+    leader, node_batch = _Leader(), _node_batch()
+    node_batch.request_ids, node_batch.rebuild_rids = ("rb", "r0"), frozenset({"rb"})
+
+    leader.maybe_send_zmq_to_tp_followers(node_batch)
+
+    body = leader.sent[0][1].body
+    assert (body.request_ids, body.rebuild_ids) == (["wire-r0"], ["wire-rb"]), "the follower can't pop a rebuild row"
+
+
+def test_rank_0_drops_its_victim_before_it_drains_the_journal_for_the_step():
+    """A follower drops the victim before it builds the step, so rank 0's drop has to travel with that step."""
+    leader = _Leader()
+    leader._victims = {"v": None}
+    leader._drop_victims = lambda node: leader.engine._resident_delta[node].add(MoveKind.DROP, "wire-v", count=8)
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert leader.sent[0][1].body.resident_delta.kinds == [MoveKind.DROP], "rank 0 admits a step its followers don't"
 
 
 def test_the_journal_is_drained_by_the_broadcast():
@@ -1142,3 +1184,202 @@ def test_the_async_follow_path_proceeds_once_the_replay_lands():
 
     assert worker._try_follow_speculation(parent) is None
     assert parent.reads == 1, "the gate blocked a build it should have allowed"
+
+
+# --- rank 0's pool moves ------------------------------------------------------
+#
+# Rank 0 allots, earmarks, drops and rebuilds, and records each move in its journal.
+# A follower makes the same moves from the delta, so both ranks admit every step from
+# the same counts and free pages in the same order. If a grant past the room passes on
+# one rank and fails on the other, only the rank where it passed enters the next collective.
+
+
+def _pool_rank(monkeypatch, rank: int) -> tuple[KVManager, Engine]:
+    """Rank ``rank`` of two: a pool of 10 pages for requests, under the `Engine` methods that journal
+    (rank 0) and replay (rank 1) its moves."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=11,
+                          page_size=PAGE_SIZE),
+        name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=2), transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.local_loops = {"decode"}
+    engine = Engine.__new__(Engine)
+    engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
+    engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, submodule=SimpleNamespace(
+        cleanup_request=lambda rid: None))}
+    engine._runner, engine._loopback_steps = StepRunner({"kv": kv}), {}
+    engine._graph_runtime = SimpleNamespace(
+        get_rid_string=str, get_rid_handle=lambda rid: rid if rid in kv._streams else None,
+    )
+    engine._tp_follower_nodes = {NODE} if rank else set()
+    engine._resident_delta = {} if rank else {NODE: OffloadDelta.new()}
+    if not rank:
+        kv.journal = partial(engine._journal, NODE, "kv")
+    return kv, engine
+
+
+def _ingest(kvs, rid: str, pages: int, arrival: int) -> None:
+    """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
+    tokens = pages * PAGE_SIZE
+    layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
+    for kv in kvs:
+        kv.ingest_request(rid, KVReqConfig(
+            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
+            prompt_ids={"main": bytes(4 * tokens)},
+        ))
+
+
+def _counts(kv) -> tuple:
+    """What the next admit reads, and the order the next grant takes free pages in."""
+    return (
+        kv._unused, {rid: (a.pages, a.remaining, a.prompt) for rid, a in kv._allotments.items()},
+        {rid: (e.pages, sorted(e.victims), e.freed) for rid, e in kv._earmarks.items()},
+        sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
+        list(kv._arena.allocator.free_pages.queue),
+    )
+
+
+def _kept(rid):
+    return [0] * 8
+
+
+def _both_short_then_drop(monkeypatch):
+    """r (arrival 1) grows past its allotment until its next token finds no room, on both ranks.
+    Rank 0 then chooses v (arrival 2) and drops it."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert leader.admit_retrieve("r", NODE, "prefill", None).ready
+    assert leader.admit_retrieve("v", NODE, "prefill", None).ready
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
+        assert _counts(leader) == _counts(follower)
+    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+    lead.drop_request(NODE, "v", len(_kept("v")))
+    return (leader, lead), (follower, follow)
+
+
+def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+
+    delta = lead.take_resident_delta(NODE)
+    assert delta.kinds == [MoveKind.EARMARK, MoveKind.DROP]
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+
+    assert _counts(leader) == _counts(follower), "the follower's earmark or drop left other counts"
+    assert _step(leader, "r", 1).ok and _step(follower, "r", 1).ok, "the page v's drop freed went elsewhere on one rank"
+    assert _counts(leader) == _counts(follower)
+
+
+def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for kv, engine in ((leader, lead), (follower, follow)):
+        assert _step(kv, "r", 1).ok
+        engine.remove_request("r")
+
+    assert leader.readmit("v", len(_kept("v")))
+    lead.lay_out_rebuild(NODE, "v", _kept("v"))
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+
+    assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
+    assert follower._overrides["v"].kv_layout == leader._overrides["v"].kv_layout, "the rebuild writes another span"
+
+
+def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatch):
+    """A dropped request reserved again for its return holds pages a grant can take, so rank 0 may choose it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    assert leader.readmit("v", len(_kept("v")))
+    lead.lay_out_rebuild(NODE, "v", _kept("v"))
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    _ingest((leader, follower), "x", 1, arrival=0)
+    leader._allotments["x"] = follower._allotments["x"] = Allotment(pages=1)
+
+    assert leader.preempt("x", 1, droppable=lambda rid: True) == ["v"]
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    assert _counts(leader) == _counts(follower)
+
+
+def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps_ahead(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    assert leader.readmit("v", len(_kept("v")))
+    delta = lead.take_resident_delta(NODE)
+    step, ctx = KVStep(segments=(Segment("v", "main", 0),)), StepContext(("v",), "prefill", 0, False)
+    assert follower.admit(step, ctx).ok
+
+    assert not follow.apply_resident_delta(NODE, delta, _kept)
+    assert delta.kinds == [MoveKind.DROP, MoveKind.RESERVE], "the drop or the return behind it moved early"
+    assert "v" not in follower._dropped and "v" in follower._allotments
+
+    follower.rollback_admit(step, ctx)
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+    assert _counts(leader) == _counts(follower)
+
+
+def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
+    """A node's second pool can hold a request back on every readiness check, undoing the first pool's allotment."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    _ingest((leader,), "x", 1, arrival=1)
+    assert leader.admit_retrieve("x", NODE, "prefill", None).ready
+    leader.requeue("x")
+
+    assert not lead.take_resident_delta(NODE), "two moves per pass would pile up for each follower to replay"
+
+
+def test_rank_0_strips_a_removed_requests_moves_from_its_journal(monkeypatch):
+    leader, lead = _pool_rank(monkeypatch, 0)
+    _ingest((leader,), "x", 1, arrival=1)
+    _ingest((leader,), "y", 1, arrival=2)
+    assert leader.admit_retrieve("x", NODE, "prefill", None).ready
+    assert leader.admit_retrieve("y", NODE, "prefill", None).ready
+
+    lead.remove_request("x")
+
+    assert lead.take_resident_delta(NODE).rids == ["y"], "a follower would wait for a request it has torn down"
+
+
+def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
+    follower, follow = _pool_rank(monkeypatch, 1)
+    _ingest((follower,), "x", 1, arrival=1)
+    head = ScheduleTPNode(NODE, "prefill", ["x"], spec_seq=0)
+    for kind in (MoveKind.RESERVE, MoveKind.UNRESERVE, MoveKind.UNRESERVE):
+        head.resident_delta.add(kind, "x", "kv", 1)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.register_tp_follow(head)
+
+    with pytest.raises(SystemExit, match="TP ranks diverged"):
+        scheduler.settle_tp_follow_delta(caught_up=True)
+
+
+def test_a_follower_builds_rank_0s_rebuild_rows_and_runs_nothing_for_moves_alone():
+    engine = SimpleNamespace(apply_resident_delta=lambda node, delta, kept_ids: True)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
+    scheduler.rid_of = {"r0": 7}.get
+    moves = ScheduleTPNode(NODE, "prefill", [], spec_seq=3)
+    moves.resident_delta.add(MoveKind.DROP, "r0", count=8)
+    rebuild = ScheduleTPNode(NODE, "prefill", [], spec_seq=4, rebuild_ids=["r0"])
+    for message in (moves, rebuild):
+        scheduler.register_tp_follow(message)
+
+    assert scheduler._try_schedule_tp_follow(None) is None and scheduler.peek_tp_follow() is rebuild
+    batch = scheduler._try_schedule_tp_follow(None)
+    assert batch.rebuild_rids == (7,) and not batch.request_to_worker_graph, "the follower's step isn't rank 0's"
+
+
+def test_rank_0_holds_a_victim_and_the_request_it_was_chosen_for_until_the_drop(monkeypatch):
+    (leader, lead), (follower, _) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert leader.admit_retrieve("r", NODE, "prefill", None).ready
+    assert leader.admit_retrieve("v", NODE, "prefill", None).ready
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        _step(leader, rid, tokens)
+    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+
+    for rid in ("r", "v"):
+        assert not leader.admit_retrieve(rid, NODE, "decode", None).ready, f"a step before the drop could take {rid}"
+    lead.drop_request(NODE, "v", len(_kept("v")))
+    assert leader.admit_retrieve("r", NODE, "decode", None).ready, "r still waits after the drop went out"

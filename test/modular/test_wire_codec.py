@@ -28,7 +28,9 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     FailRequests,
     InputSignals,
+    MoveKind,
     NewRequest,
+    OffloadDelta,
     ScheduleTPNode,
     StopLoops,
     WorkerGraphsDone,
@@ -164,6 +166,18 @@ def test_polymorphic_body_dispatch():
         got = roundtrip(WorkerMessage(message_type=mtype, body=body))
         assert type(got.body) is type(body)
         assert got.message_type is mtype
+
+
+def test_rank_0s_moves_and_rebuild_rows_round_trip_typed():
+    delta = OffloadDelta.new()
+    delta.add(MoveKind.EARMARK, "r", "kv", 1, ["v"])
+    delta.add(MoveKind.DROP, "v", count=8)
+    body = ScheduleTPNode("llm", "decode", ["r"], spec_seq=3, resident_delta=delta, rebuild_ids=["w"])
+
+    got = roundtrip(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=body)).body
+
+    assert got.resident_delta == delta and got.rebuild_ids == ["w"], "a follower would replay other moves"
+    assert type(got.resident_delta.kinds[0]) is MoveKind, "the kinds came back untyped"
 
 
 def test_unregistered_payloads_still_round_trip():

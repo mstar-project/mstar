@@ -190,3 +190,30 @@ def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
     Worker._handle_allocation_failure(w, batch, node_batch)
 
     assert w._dropped == {"r": NODE} and kv.is_resident("v"), "a guaranteed request was dropped for an older page"
+
+
+def test_a_tp_nodes_victim_waits_for_the_nodes_next_broadcast_which_a_pass_without_a_step_still_sends():
+    """Rank 0 drops a TP node's victim when it sends the node's next step. The followers drop it at the
+    same point, after every removal stamped with the step before. A pass that builds no step for the node
+    still sends one with no rows, since the request the victim was chosen for waits for the drop."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+    Worker._handle_allocation_failure(w, batch, node_batch)
+    assert "v" in w._victims and kv.is_resident("v"), "rank 0 dropped ahead of the broadcast its followers drop at"
+
+    sent = []
+    w.maybe_send_zmq_to_tp_followers, w._make_executing_batch = sent.append, SimpleNamespace
+    Worker._flush_tp_moves(w)
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, [])], (
+        "the drop waits for a step that never comes"
+    )
+
+    Worker._drop_victims(w, NODE)
+    assert w._dropped == {"v": NODE} and not w._victims, "the broadcast didn't drop the victim it carries"

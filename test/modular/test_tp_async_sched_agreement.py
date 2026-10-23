@@ -61,6 +61,28 @@ def test_tp_mismatch_is_refused():
         _check(_worker("thinker", async_on=True, tp_group=_Group([0, 1], [1, 0])))
 
 
+class _Gathers(_Group):
+    """A group whose all_gathers return the preset values in order."""
+
+    def __init__(self, members, *gathered):
+        super().__init__(members, None)
+        self._calls = list(gathered)
+
+    def all_gather(self, input_, dim=0):
+        return torch.tensor(self._calls.pop(0), dtype=input_.dtype)
+
+
+def test_a_pre_plan_mismatch_is_refused():
+    """A follower builds a head that N voids, matching the leader's pre-plan, so the ranks have to pre-plan alike."""
+    with pytest.raises(RuntimeError, match="MSTAR_PRE_PLAN_SPEC disagrees"):
+        _check(_worker("thinker", async_on=True, tp_group=_Gathers([0, 1], [1, 1], [1, 0])))
+
+
+def test_a_pre_plan_mismatch_is_allowed_with_async_scheduling_off():
+    """The serial protocol pre-plans no TP step, so ranks that set MSTAR_PRE_PLAN_SPEC differently still start."""
+    _check(_worker("thinker", async_on=False, tp_group=_Gathers([0, 1], [0, 0], [1, 0])))
+
+
 def test_sp_mismatch_is_refused():
     with pytest.raises(RuntimeError, match="disagrees"):
         _check(_worker(

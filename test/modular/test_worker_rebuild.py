@@ -10,6 +10,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -325,3 +326,51 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
 
+
+def test_a_follower_leaves_a_refused_rebuild_row_to_rank_0s_next_step():
+    """Rank 0 puts the row back and sends it again in a later step, and the follower builds the row from that step."""
+    w, _, batch, node_batch = _rebuilding(fresh=ScheduledBatch(NODE, PREFILL, {A: 0}))
+    del w._rebuild_rows[R]
+    w.parallel_nodes = {NODE}
+    node_batch.admit_error = AllocationFailed("short", 1, "main", R)
+    w._handle_allocation_failure = lambda *a: w.held.append("base")
+
+    w._handle_admit_failure(batch, node_batch)
+
+    assert not w._rebuild_rows and w.held == ["base"], "the follower would schedule the rebuild row itself"
+
+
+def test_a_victims_queued_rebuild_row_stays_out_of_the_next_step():
+    """A rebuild row the victim has queued must not ride in the step whose broadcast drops the request."""
+    w = Worker.__new__(Worker)
+    w.scheduler = SimpleNamespace(held_until={}, failed_rids=set())
+    w._pending_removes = {}
+    w._rebuild_rows = {1: "row 1", 2: "row 2"}
+    w._victims = {2: SimpleNamespace(key="kv")}
+    assert Worker._runnable_rebuilds(w) == {1: "row 1"}, "the broadcast would drop a request riding in its own step"
+
+
+def test_a_followers_yield_away_onto_rank_0s_rebuild_step_builds_its_rebuild_rows():
+    """A follower that also runs a node of its own can yield away onto rank 0's next step. That step's rebuild rows
+    aren't taken from a ready queue, so the follower builds them from its own kept ids, as the serial path does, or
+    the follower runs fewer rows than rank 0."""
+    rank_0s = ScheduledBatch(node_name=NODE, graph_walk=PREFILL, request_to_worker_graph={}, rebuild_rids=(7,))
+    built = []
+    w = SimpleNamespace(
+        _rebuild_rows={}, _can_speculate=lambda batch: True, _choose_spec_target=lambda batch: None,
+        scheduler=SimpleNamespace(get_next_batch=lambda request_state, exclude_target=None: rank_0s),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        _tp_lead_needs_marker=lambda pending, spec: False, _span=lambda name: nullcontext(),
+        _build_executing_batch=lambda batch, rebuild=None: built.append(rebuild) or SimpleNamespace(request_ids=[]),
+        maybe_send_zmq_to_tp_followers=lambda node_batch: -1, enable_nvtx=False, _phase_period=0,
+        _kept_ids_of=lambda node, rid: [1, 2, 3], _rebuild_row=lambda node, walk, ids: (node, walk, tuple(ids)),
+    )
+    w._follower_rebuild = lambda batch: Worker._follower_rebuild(w, batch)
+    own = SimpleNamespace(
+        node_name="own", graph_walk=DECODE, tp_seq=-1, node_batch=SimpleNamespace(admit_error=None),
+        batch=SimpleNamespace(request_to_worker_graph={1: 0}),
+    )
+
+    speculation, _ = Worker._build_speculation(w, own, 5, SimpleNamespace(peek=False, max_consecutive=1))
+
+    assert speculation.is_yield_away and built == [{7: (NODE, PREFILL, (1, 2, 3))}], "rank 0's rebuild row was left out"
