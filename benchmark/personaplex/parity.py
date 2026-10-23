@@ -433,6 +433,17 @@ def pipeline(ref, native):
                                 margin=float(values[0, 0] - values[0, 1]),
                             )
 
+                        # topk's order at a tie need not match argmax, so record each side's actual
+                        # choice and both sides' logits for both choices (batch size 1).
+                        picks = {"reference": int(ref_logits.argmax(-1).reshape(-1)[0]),
+                                 "mstar": int(got_logits.argmax(-1).reshape(-1)[0])}
+                        selected = dict(
+                            tokens=picks,
+                            **{f"{side}_logits": {name: float(logits.float().reshape(-1)[token])
+                                                  for name, token in picks.items()}
+                               for side, logits in (("reference", ref_logits), ("mstar", got_logits))},
+                        )
+
                         report["checks"]["first_decision"] = dict(
                             model_step=index,
                             generation_step=index - meta["conditioning_frames"],
@@ -458,6 +469,7 @@ def pipeline(ref, native):
                                 if kind == "depth"
                                 else None
                             ),
+                            selected=selected,
                             reference=candidates(ref_logits),
                             mstar=candidates(got_logits),
                             note=(
