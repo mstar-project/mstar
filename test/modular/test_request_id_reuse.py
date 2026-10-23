@@ -747,6 +747,13 @@ def _bridge(s):
     return bridge, sent
 
 
+@pytest.mark.parametrize("streaming", [True, False])
+def test_the_conductor_learns_whether_the_client_streams(rig, streaming):
+    rig.server.submit_request(text="a", request_id="X", streaming=streaming, **TEXT)
+    rig.settle()
+    assert rig.socket.sent_of(ConductorMessageType.NEW_REQUEST)[-1].streaming is streaming, "the flag was lost"
+
+
 def test_rust_bridge_relays_a_refused_submit_under_its_own_sub():
     """Two submits under X in one receive batch while the first runs: the
     second is refused and its 409 goes back in-band under its own sub (the

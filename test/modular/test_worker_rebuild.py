@@ -15,10 +15,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_kv_preemption import _pool
+from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import AllocationFailed, SamplerStep, StepContext
+from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
@@ -77,7 +80,10 @@ def _rebuilding(fresh: ScheduledBatch | None = None):
 def _config(growth=(("loop", 1),), labels=("main",), walk=PREFILL) -> dict[str, KVReqConfig]:
     layout = StreamLayout(spans=(PrefixSpan(2, 2, walk),), growth=growth)
     ids = array("i", [1, 2]).tobytes()
-    return {"kv": KVReqConfig(prompt_ids=dict.fromkeys(labels[:1], ids), kv_layout=dict.fromkeys(labels, layout))}
+    return {"kv": KVReqConfig(
+        prompt_ids=dict.fromkeys(labels[:1], ids), kv_layout=dict.fromkeys(labels, layout),
+        loop_caps={loop: 1 for loop, _ in growth},
+    )}
 
 
 @pytest.mark.parametrize("sampled", [[4, 5, 7], [[4], [5], [7]]])  # the sampler's [B] output, and a [B, 1] one
@@ -105,6 +111,30 @@ def test_a_request_keeps_its_ids_once_and_only_its_kept_samples(sampled):
     assert list(w._kept_ids[NODE][R].sampled) == [3, 4, 6], "a rebuild would prefill other ids than the request's"
     assert not (w._kept_ids[NODE][A].sampled or w._kept_ids[NODE][11].sampled), "it kept a discarded sample"
     assert w._kept_ids[NODE].keys() == {R, A, 11}, "one row can't rebuild two labels, or KV not grown from ids"
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["own pool", "pool shared with a node that keeps no ids"])
+def test_a_request_its_kept_ids_cant_rebuild_is_guaranteed_in_its_pools(monkeypatch, shared):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    w, _ = _worker()
+    if shared:
+        w._kv_keys["talker"] = ["kv"]
+    kv, w._my_consumer_connections, w._unprocessed_messages = _pool(), [], {}
+    w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
+    w.engine_manager.evictable_nodes = list
+    w.engine_manager.add_request = lambda rid, configs: kv.ingest_request(rid, configs["kv"])
+    w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
+    w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    # 12's decode reads embeddings, as Fish S2 Pro's does, so it keeps no ids.
+    # 10 lays out nothing, so it isn't guaranteed.
+    configs = {R: _config(), 12: _config(growth=(("embeds_loop", 1),)), 10: {"kv": KVReqConfig(kv_layout={})}}
+    for rid, config in configs.items():
+        info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=config, stream_lead_items={})
+        w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
+                                           worker_graph_to_workers={}, initial_inputs=[], request_info=info))
+    guaranteed = {rid for rid in configs if kv._overrides[rid].guaranteed}
+    assert guaranteed == ({R, 12} if shared else {12}), "a request nothing can drop would reserve only its prompt"
 
 
 def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
