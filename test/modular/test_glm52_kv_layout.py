@@ -13,6 +13,7 @@ from test_kv_layout_intake import _Comm, _preprocess, _ScriptDoneError
 
 import mstar.conductor.conductor as conductor_mod
 from mstar.conductor.conductor import Conductor
+from mstar.model.glm52.config import KV_RESOURCE
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks
@@ -75,8 +76,24 @@ def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 30
 
 
-def test_a_request_that_asks_no_length_runs_to_the_window(tmp_path, monkeypatch):
-    model = _model()
+# the reduced variant's window (index_topk 64) is smaller than its max_seq_len (512)
+_WINDOWS = pytest.mark.parametrize("kwargs", [{}, {"config_variant": "reduced"}], ids=["full", "reduced"])
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"dsa_long_context": True}, {"config_variant": "reduced"}], ids=["dense", "dsa", "reduced"],
+)
+def test_the_kv_pool_holds_exactly_the_window(kwargs):
+    # the conductor sizes requests by the pool's max_seq_len, so it must be the window the
+    # submodule's preprocess guard holds contexts to
+    model = _model(**kwargs)
+    [kv] = [spec for spec in model.get_node_resources() if spec.resource_key == KV_RESOURCE]
+    assert kv.config.max_seq_len == model.context_limit()
+
+
+@_WINDOWS
+def test_a_request_that_asks_no_length_runs_to_the_window(tmp_path, monkeypatch, kwargs):
+    model = _model(**kwargs)
     window = model.context_limit()
 
     new_request = _dispatched(_conduct(model, _preprocess(model, {}), tmp_path, monkeypatch))
@@ -85,9 +102,10 @@ def test_a_request_that_asks_no_length_runs_to_the_window(tmp_path, monkeypatch)
     assert new_request.request_info.max_tokens == window - PROMPT + 1
 
 
+@_WINDOWS
 @pytest.mark.parametrize("past", [0, 1])
-def test_max_tokens_past_the_window_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past):
-    model = _model()
+def test_max_tokens_past_the_window_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past, kwargs):
+    model = _model(**kwargs)
     # the prompt's rows and one per decode step fill the window; the last token is never stored
     fits = model.context_limit() - PROMPT + 1
 

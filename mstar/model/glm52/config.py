@@ -102,13 +102,12 @@ class Glm52ModelConfig:
     rope_theta: float = 8_000_000.0
     rope_interleave: bool = True
     max_position_embeddings: int = 1_048_576
-    # Serving cap, consumed by get_kv_cache_config (the top-level YAML
-    # max_seq_len key is only presence-checked by the conductor — it does
-    # not override this). Held to index_topk while dsa_long_context is off:
-    # dense MLA is exactly GLM-5.2's DSA computation only within the
-    # top-2048 window, and the submodule's preprocess guard enforces the
-    # same bound. With dsa_long_context on, Glm52Model raises this from the
-    # ``max_seq_len`` model kwarg and the guard checks against it instead.
+    # The serving window with dsa_long_context on, raised by the
+    # ``max_seq_len`` model kwarg (the top-level YAML max_seq_len key is
+    # only presence-checked by the conductor). With it off the window is
+    # index_topk: dense MLA is exactly GLM-5.2's DSA computation only within
+    # the top-2048 window. The KV pool is sized to the window
+    # (``Glm52Model.context_limit``), which the conductor holds requests to.
     max_seq_len: int = 2048
 
     # --- MTP layer (in the checkpoint; not built or loaded) ---

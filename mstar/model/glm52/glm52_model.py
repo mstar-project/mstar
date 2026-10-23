@@ -166,7 +166,7 @@ class Glm52Model(Model):
                 num_layers=num_kv_layers,
                 num_kv_heads=1,
                 head_dim=self.config.cache_latent_dim,
-                max_seq_len=self.config.max_seq_len,
+                max_seq_len=self.context_limit(),
                 num_qo_heads=self.config.num_attention_heads,
                 layout=KVLayout.MLA,
                 kv_lora_rank=self.config.kv_lora_rank,
@@ -187,7 +187,7 @@ class Glm52Model(Model):
                 num_layers=num_kv_layers,
                 num_kv_heads=self.config.num_attention_heads,
                 head_dim=self.config.padded_head_dim,
-                max_seq_len=self.config.max_seq_len,
+                max_seq_len=self.context_limit(),
                 num_qo_heads=self.config.num_attention_heads,
             )
             attn = AttentionSpec(
@@ -420,8 +420,8 @@ class Glm52Model(Model):
         return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
 
     def max_decode_steps(self) -> int:
-        """Decode iterations a one-token prompt can run before the context
-        guard; every longer prompt stops sooner, via check_stop or the guard."""
+        """Decode iterations a one-token prompt can run within the window; the
+        conductor caps a longer prompt's loop at the room it leaves."""
         return self.context_limit() - 1
 
     def get_max_output_tokens(self, **model_kwargs):

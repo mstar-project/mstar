@@ -54,13 +54,13 @@ from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 def test_cleanup_request_drops_the_request_state():
     """Retirement leaves NO per-request growth: the engine's request removal calls
-    cleanup_request on every managed submodule, which drops the token budget and the prefill's
-    stop (the index keys are the DSA resource's, which remove_request drops)."""
+    cleanup_request on every managed submodule, which drops the prefill's stop (the index
+    keys are the DSA resource's, which remove_request drops)."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
 
-    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
+    sub.request_state("r0").add("ended_at_prefill", True)
     sub.cleanup_request("r0")
     assert sub.request_states == {}
     sub.cleanup_request("r0")  # idempotent, like the base hook

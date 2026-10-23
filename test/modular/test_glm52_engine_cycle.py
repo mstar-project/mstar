@@ -239,39 +239,21 @@ def _window_cfg(limit: int) -> Glm52ModelConfig:
     return cfg
 
 
-def test_stream_stops_cleanly_at_the_context_limit():
-    """A request whose max_tokens outruns the context limit stops one row short
-    of it: the prefill's preprocess caps its budget at limit - prompt, so the
-    guard never fires inside the batch and no third KV page is taken."""
+def test_a_request_sized_to_the_window_gets_every_token():
+    """The conductor sizes a request to the room its prompt leaves (limit - prompt + 1
+    tokens: the last is never stored), and decode fills the window exactly, with no
+    third KV page. The loop cap ends decode there, so nothing runs past it."""
     limit, prompt_len = 16, 5
     cfg = _window_cfg(limit)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     driver = _Driver(sub, cfg, ["r0"])
     prompt = torch.arange(prompt_len, dtype=torch.long) + 3
-    stream = _drive(driver, prompt, _fwd_info("r0", 40, True))
+    fits = limit - prompt_len + 1
+    stream = _drive(driver, prompt, _fwd_info("r0", fits, True))
     kv = driver.resources[KV_RESOURCE]
-    expect_tokens = limit - prompt_len
-    assert sub.request_state("r0")["token_budget"] == expect_tokens
-    assert stream.numel() == expect_tokens
-    assert kv._streams["r0"]["main"].stored_len == limit - 1
+    assert stream.numel() == fits
+    assert kv._streams["r0"]["main"].stored_len == limit
     assert len(kv._streams["r0"]["main"].page_indices) == limit // 8
-
-
-def test_the_step_after_the_context_stop_still_fits():
-    # the worker may launch step N+1 before check_stop(N) lands; its row must fit
-    limit, prompt_len = 16, 5
-    cfg = _window_cfg(limit)
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    driver = _Driver(sub, cfg, ["r0"])
-    info = _fwd_info("r0", 40, True)
-    out = driver.step("prefill", {"r0": (info, torch.arange(prompt_len) + 3)})["r0"]
-    step = 0
-    while not sub.check_stop("r0", info, out):
-        out = driver.step("decode", {"r0": (info, out["text_inputs"][0])})["r0"]
-        info.dynamic_loop_iter_counts["decode_loop"] = step
-        step += 1
-    driver.step("decode", {"r0": (info, out["text_inputs"][0])})
-    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == limit
 
 
 def test_a_prompt_without_room_fails_alone():
@@ -285,14 +267,13 @@ def test_a_prompt_without_room_fails_alone():
         sub.prepare_inputs("prefill", _fwd_info("b", 8, True), {"text_inputs": [full]})
 
 
-def test_budget_within_the_window_is_untouched():
+def test_max_tokens_within_the_window_is_honored():
     cfg = _window_cfg(64)
     model = _model(cfg)
     sub = Glm52LLMSubmodule(model, cfg)
     driver = _Driver(sub, cfg, ["r0"])
     prompt = torch.arange(5, dtype=torch.long) + 3
     stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
-    assert sub.request_state("r0")["token_budget"] == 9
     assert stream.numel() == 9
 
 

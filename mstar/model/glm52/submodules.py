@@ -73,10 +73,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._capture_block_warned = False
         # the step's row ends, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
-        # Per request, in its request_state: "token_budget", max_tokens capped at the
-        # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop);
-        # "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no loop
-        # to stop, so the first decode step stops decode_loop and emits nothing.
+        # Per request, in its request_state: "ended_at_prefill", the prefill sampled a stop
+        # token: the prefill walk has no loop to stop, so the first decode step stops
+        # decode_loop and emits nothing.
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -251,26 +250,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         path, else index_topk, where dense MLA is exactly GLM-5.2's DSA."""
         return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
 
-    def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
-        """Cap the request's max_tokens at what fits before the context
-        limit, so decode stops there (check_stop) instead of tripping
-        preprocess's guard mid-batch. The conductor holds prompt plus
-        max_tokens to the KV pool's ``max_seq_len`` from the request's
-        layout; this holds them to GLM-5.2's own limit, one row short for
-        the step that may be in flight when the stop lands."""
-        info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
-        asked = getattr(info, "max_tokens", None)
-        if asked is None:
-            return
-        budget = min(int(asked), room)
-        if budget < asked:
-            # debug: a request that names no max_tokens is capped every time
-            logger.debug(
-                "request %s: max_tokens %d capped to %d by the context limit %d",
-                rid, asked, budget, self._context_limit(),
-            )
-        self.request_state(rid).add("token_budget", budget)
-
     def preprocess(
         self,
         graph_walk: str,
@@ -283,8 +262,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
-        # engine path is on, where the cap is the serving window. The
-        # positions themselves are the position resource's (``_positions``).
+        # engine path is on, where the cap is the serving window. The KV pool
+        # is sized to this limit, so the conductor holds every request inside
+        # it and this only fires on a bug. The positions themselves are the
+        # position resource's (``_positions``).
         long_context = self.config.dsa_long_context
         limit = self._context_limit()
         topk = self.config.index_topk
@@ -300,10 +281,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                         "DSA computation. Long context needs dsa_long_context=True."
                     )
                 )
-            if graph_walk == "prefill":
-                # a prompt of P rows emits at most limit - P tokens, one row short of
-                # the limit: the next step may already be running when the stop lands
-                self._clamp_token_budget(engine_inputs, rid, limit - (start + sl))
             if long_context and start + sl > topk and sl > 1:
                 raise RuntimeError(
                     f"request {rid}: prefill context {start + sl} exceeds "
@@ -443,8 +420,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if token is None:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
-        # the prompt-aware cap from the prefill's preprocess, else the request's own
-        budget = state.get("token_budget", request_info.max_tokens)
         is_eos = token in self.config.eos_token_ids
         if request_info.graph_walk == "prefill":
             # no decode_loop on this walk to stop: a stop token ends the reply at the first
@@ -455,6 +430,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # max_tokens counts the token the prefill emits, so the total is
         # 1 + (iters + 1) decode tokens
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if (not ignore_eos and is_eos) or generated >= budget:
+        if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
