@@ -446,8 +446,8 @@ def test_check_stop_on_im_end_on_the_frame_limit_and_not_with_ignore_eos():
 
     def info(ignore_eos=False):
         return SimpleNamespace(
-            step_metadata={"ar_max_tokens": 3},
-            max_tokens=99,
+            step_metadata={},
+            max_tokens=3,
             resource_configs={AR_SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         )
 
@@ -663,7 +663,6 @@ def test_partition_state_machine_routes_clones_through_the_ref_encoder():
     }
     assert clone.step_metadata == {
         "is_prefill": True,
-        "ar_max_tokens": 7,
         "prompt_layout": [5, 21],
         "ref_clip_key": "k",
     }

@@ -485,7 +485,7 @@ class FishS2ProModel(Model):
 
     @staticmethod
     def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill, "ar_max_tokens": metadata.kwargs["ar_max_tokens"]}
+        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding

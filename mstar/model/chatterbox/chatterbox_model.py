@@ -100,7 +100,7 @@ BUILTIN_VOICE = "default"
 _BUILTIN_VOICE_ALIASES = {None, "", BUILTIN_VOICE, "builtin", "built-in"}
 
 # Per-request generation knobs that ride on the conductor metadata
-_T3_KNOBS = ("cfg_weight", "exaggeration", "min_p", "max_new_tokens")
+_T3_KNOBS = ("cfg_weight", "exaggeration", "min_p")
 _S3GEN_KNOBS = ("n_cfm_timesteps", "watermark")
 
 MAX_REFERENCE_SECONDS = 30.0
