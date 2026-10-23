@@ -941,10 +941,9 @@ class LLMSubmodule(ARNodeSubmodule):
         """This batch's step: which cache streams it touches, by how much,
         what backs them, and what commits.
 
-        The three CFG branches are three labels on the same cache. Which of
-        them are live is a per-request property, so it rides in on
-        ``NodeInputs.resource_step_info`` from ``prepare_inputs`` rather than
-        being read off the batch here.
+        The three CFG branches are three labels on the same cache. Whether
+        the batch runs them rides in on ``NodeInputs.resource_step_info`` from
+        ``prepare_inputs``.
         """
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
@@ -991,6 +990,18 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             })
 
+        info = per_request_info or {}
+        guided = sink = frozenset()
+        if requires_cfg:
+            # A pre-plan declares over the bucket's template rows, which are all
+            # guided, so whether a row is guided comes from its request.
+            guided = frozenset(
+                rid for rid, inp in zip(request_ids, inputs, strict=True)
+                if (info[rid].step_metadata.get("requires_cfg", False) if rid in info else inp.resource_step_info)
+            )
+            sink = frozenset(
+                (rid, label) for label in labels if label != "main" for rid in request_ids if rid not in guided
+            )
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
         if graph_walk in ("prefill_vit", "prefill_vae"):
             pos_advance = (IMAGE_ADVANCE,) * len(segments)
@@ -1016,19 +1027,19 @@ class LLMSubmodule(ARNodeSubmodule):
                 # decode row sharing the step
                 fork_rids = frozenset(
                     rid for rid, walk in zip(request_ids, row_walks, strict=True)
-                    if walk == "prefill_text"
+                    if walk == "prefill_text" and rid in guided
                 )
                 pre_forks = (("main", "cfg_text"),)
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
+                fork_rids = guided
                 post_forks = (("main", "cfg_text"),)
 
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
         steps: dict = {}
         # the rows whose token `postprocess` keeps
-        info = per_request_info or {}
         kept_rids = frozenset(
             rid for rid, walk in zip(request_ids, row_walks, strict=True)
             if walk == "decode" or (
@@ -1062,6 +1073,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 pre_forks=pre_forks,
                 post_forks=post_forks,
                 fork_rids=fork_rids,
+                sink=sink,
             ),
             "attn": AttentionStep(
                 segments=segments,
