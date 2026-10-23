@@ -105,6 +105,12 @@ class RecurrentStatePool(Resource):
         # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
         # same way, so a released request's entries are purged with it.
         self._admit_taken: dict[tuple[str, str], int] = {}
+        # Bumped by every change to which slot a (rid, label) holds or to its
+        # `has_state`: a step's addressing depends on nothing else, so the
+        # last one built is reused while this and the step's rows are unchanged
+        # (a steady decode batch). See `_build_addressing`.
+        self._version = 0
+        self._addressing_memo: dict[str, tuple] = {}
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -155,11 +161,13 @@ class RecurrentStatePool(Resource):
             # Idempotent: the conductor sends one NewRequest per partition, so
             # a worker serving two ingests twice.
             self._slots.setdefault(rid, {})
+            self._version += 1
 
     def remove_request(self, rid: str):
         self.reset_request(rid, free=True)
         with self._lock:
             self._slots.pop(rid, None)
+            self._version += 1
 
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
@@ -172,6 +180,7 @@ class RecurrentStatePool(Resource):
             labels = self._slots.get(rid)
             if not labels:
                 return
+            self._version += 1
             for slot in labels.values():
                 self._zero_slot(slot.index)
                 if free:
@@ -199,6 +208,7 @@ class RecurrentStatePool(Resource):
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
             self._admit_taken[(rid, label)] = slot.index
+            self._version += 1
             return slot
 
     def _forget_taken(self, is_mine) -> None:
@@ -261,6 +271,7 @@ class RecurrentStatePool(Resource):
                 del labels[label]
                 self._zero_slot(index)
                 self._free.append(index)
+                self._version += 1
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
@@ -356,9 +367,10 @@ class RecurrentStatePool(Resource):
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 slot = self._slots.get(segment.request_id, {}).get(segment.label)
-                if slot is not None:
+                if slot is not None and not slot.has_state:
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
+                    self._version += 1
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -388,6 +400,7 @@ class RecurrentStatePool(Resource):
                 tensor[:, dst.index].copy_(tensor[:, src.index])
             dst.has_state = src.has_state
             dst.generation += 1
+            self._version += 1
 
     # Addressing
 
@@ -403,6 +416,15 @@ class RecurrentStatePool(Resource):
         pending_forks: dict[tuple[str, str], bool] | None = None,
     ) -> RecurrentAddressing:
         pad = self.pad_index
+        memo_key = None
+        if not pending_forks:
+            memo_key = (
+                self._version, ctx.capture, tuple(ctx.request_ids),
+                tuple([seg.request_id for seg in segments]), tuple([seg.span > 0 for seg in segments]),
+            )
+            memo = self._addressing_memo.get(label)
+            if memo is not None and memo[0] == memo_key:
+                return self._stage_addressing(label, ctx, memo[1], memo[2])
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
@@ -421,7 +443,14 @@ class RecurrentStatePool(Resource):
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
+        if memo_key is not None:
+            self._addressing_memo[label] = (memo_key, indices, has_state)
+        return self._stage_addressing(label, ctx, indices, has_state)
 
+    def _stage_addressing(
+        self, label: str, ctx: StepContext, indices: list[int], has_state: list[bool],
+    ) -> RecurrentAddressing:
+        pad = self.pad_index
         num_rows = len(indices)
         target, mirrors = self._addressing_buffers(label, ctx, num_rows)
         # Built on the host and copied in. The tail is cleared too: a recurrent
@@ -438,8 +467,8 @@ class RecurrentStatePool(Resource):
             slot_indices=target.slot_indices,
             has_state=target.has_state,
             num_rows=num_rows,
-            # the lists as built, not copies: this call made them and nothing
-            # changes them after
+            # the lists as built, not copies: nothing changes them after, and
+            # a later step with the same addressing hands out the same ones
             host_slot_indices=indices,
             host_has_state=has_state,
         )
