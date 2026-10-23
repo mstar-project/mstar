@@ -440,7 +440,10 @@ The spec types are:
        absorbed MLA over just the picked latents. The keys sit in per-request buffers
        outside the paged pool and the selection runs per request on the host, so the
        resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. GLM-5.2 declares it under ``dsa_long_context``.
+       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
+       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
+       move onto the MLA cache's pages under its page table, so the allocator, eviction and
+       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
