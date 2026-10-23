@@ -62,6 +62,9 @@ CONTEXT_FRAMES = 3000  # [PP] models/loaders.py:104
 # capacity as position end_offset, which masks it ([PP] modules/transformer.py:
 # 263-299). Dense causal attention therefore matches only up to C - 1 forwards.
 MAX_TEMPORAL_FORWARDS = CONTEXT_FRAMES - 1
+# Upper bound on decoded user audio: every forward a user frame, no conditioning.
+# The exact per-request limit (after conditioning) is validate_context_budget's.
+MAX_USER_AUDIO_SAMPLES = MAX_TEMPORAL_FORWARDS * FRAME_SIZE
 
 TEMPORAL_DIM = 4096  # [PP] models/loaders.py:93
 TEMPORAL_LAYERS = 32  # [PP] models/loaders.py:100

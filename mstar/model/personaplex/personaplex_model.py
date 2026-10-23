@@ -166,14 +166,26 @@ class PersonaPlexModel(Model):
         # Outside the try: a missing FFmpeg runtime fails here and is a server fault (500).
         from torchcodec.decoders import AudioDecoder
 
+        limit_seconds = cfg.MAX_USER_AUDIO_SAMPLES / cfg.SAMPLE_RATE
+        too_long = (f"PersonaPlex user audio is longer than {limit_seconds:.1f} s, the most "
+                    f"{cfg.MAX_TEMPORAL_FORWARDS} temporal forwards can hold")
         try:
-            samples = AudioDecoder(filepath, sample_rate=cfg.SAMPLE_RATE).get_all_samples().data
+            decoder = AudioDecoder(filepath, sample_rate=cfg.SAMPLE_RATE)
+            # Bound the upload before decoding it: a small compressed file can hold hours.
+            header = decoder.metadata.duration_seconds_from_header
+            if header is not None and header > limit_seconds:
+                raise ValueError(f"{too_long} ({header:.1f} s)")
+            # Headers can be absent or wrong, so decode at most one frame past the limit.
+            stop = (cfg.MAX_USER_AUDIO_SAMPLES + cfg.FRAME_SIZE) / cfg.SAMPLE_RATE
+            samples = decoder.get_samples_played_in_range(0.0, stop).data
         except RuntimeError as exc:
             # torchcodec reports undecodable bytes as RuntimeError; the data worker maps
             # ValueError to a 400. The message omits the server-side upload path.
             raise ValueError("PersonaPlex cannot decode the uploaded audio") from exc
         if samples.dim() != 2 or samples.shape[0] < 1:
-            raise ValueError(f"cannot decode audio from {filepath!r}")
+            raise ValueError("PersonaPlex cannot decode the uploaded audio")
+        if samples.shape[-1] > cfg.MAX_USER_AUDIO_SAMPLES:
+            raise ValueError(too_long)
         audio = samples[0].to(torch.float32)
         return TensorAndMetadata(
             data=audio,

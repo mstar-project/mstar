@@ -511,15 +511,25 @@ def test_t8_conditioning_persists_only_the_final_lm_state():
 # --------------------------------------------------------------------------- T10 request validation
 
 
-def _fake_torchcodec(monkeypatch, samples: torch.Tensor):
+_UNSET = object()
+
+
+def _fake_torchcodec(monkeypatch, samples: torch.Tensor, *, header_seconds=_UNSET, open_error=None):
+    """torchcodec stand-in; ``seen["decoded_until"]`` records how far it was asked to decode."""
     seen = {}
 
     class AudioDecoder:
         def __init__(self, path, **kwargs):
+            if open_error is not None:
+                raise open_error
             seen.update(path=path, **kwargs)
+            header = samples.shape[-1] / 24000 if header_seconds is _UNSET else header_seconds
+            self.metadata = types.SimpleNamespace(duration_seconds_from_header=header)
 
-        def get_all_samples(self):
-            return types.SimpleNamespace(data=samples)
+        def get_samples_played_in_range(self, start_seconds=0.0, stop_seconds=None):
+            seen["decoded_until"] = stop_seconds
+            stop = samples.shape[-1] if stop_seconds is None else round(stop_seconds * 24000)
+            return types.SimpleNamespace(data=samples[..., round(start_seconds * 24000):stop])
 
     decoders = types.ModuleType("torchcodec.decoders")
     decoders.AudioDecoder = AudioDecoder
@@ -532,21 +542,39 @@ def test_t10_load_audio_keeps_channel_zero_at_24khz(monkeypatch):
     stereo = torch.stack((torch.full((5000,), 0.25), torch.full((5000,), -0.75)))
     seen = _fake_torchcodec(monkeypatch, stereo)
     loaded = _model().load_audio("in.wav", "cpu")
-    assert seen == {"path": "in.wav", "sample_rate": 24000}  # native channels requested
+    assert {k: seen[k] for k in ("path", "sample_rate")} == {"path": "in.wav", "sample_rate": 24000}
+    assert "num_channels" not in seen  # native channels requested, not a downmix
     assert torch.equal(loaded.data, stereo[0]) and loaded.data.dtype == torch.float32
     assert loaded.metadata == {"sample_rate": 24000, "num_channels": 1, "source_channels": 2, "num_samples": 5000}
 
 
 def test_load_audio_reports_undecodable_upload_as_client_error(monkeypatch):
-    _fake_torchcodec(monkeypatch, torch.zeros(1, 10))
-
-    def undecodable(self):
-        raise RuntimeError("Could not open input file: /tmp/mstar_uploads/x.wav Invalid data found")
-
-    monkeypatch.setattr(sys.modules["torchcodec.decoders"].AudioDecoder, "get_all_samples", undecodable)
+    error = RuntimeError("Could not open input file: /tmp/mstar_uploads/x.wav Invalid data found")
+    _fake_torchcodec(monkeypatch, torch.zeros(1, 10), open_error=error)
     with pytest.raises(ValueError, match="cannot decode the uploaded audio") as info:
         _model().load_audio("/tmp/mstar_uploads/x.wav", "cpu")
     assert "/tmp/mstar_uploads" not in str(info.value)
+
+
+def test_load_audio_rejects_a_long_header_before_decoding(monkeypatch):
+    seen = _fake_torchcodec(monkeypatch, torch.zeros(1, 10), header_seconds=2 * 3600.0)
+    with pytest.raises(ValueError, match=r"longer than 239\.9 s.*\(7200\.0 s\)"):
+        _model().load_audio("long.mp3", "cpu")
+    assert "decoded_until" not in seen
+
+
+def test_load_audio_bounds_decoding_when_the_header_understates_length(monkeypatch):
+    limit = cfg.MAX_TEMPORAL_FORWARDS * cfg.FRAME_SIZE
+    seen = _fake_torchcodec(monkeypatch, torch.zeros(1, limit + 5 * cfg.FRAME_SIZE), header_seconds=None)
+    with pytest.raises(ValueError, match="longer than 239.9 s"):
+        _model().load_audio("lying-header.mp3", "cpu")
+    assert seen["decoded_until"] == pytest.approx((limit + cfg.FRAME_SIZE) / 24000)
+
+
+def test_load_audio_accepts_exactly_the_sample_limit(monkeypatch):
+    limit = cfg.MAX_TEMPORAL_FORWARDS * cfg.FRAME_SIZE
+    _fake_torchcodec(monkeypatch, torch.zeros(1, limit))
+    assert _model().load_audio("max.wav", "cpu").data.numel() == limit
 
 
 def test_load_audio_missing_decoder_runtime_stays_a_server_error(monkeypatch):
