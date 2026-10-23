@@ -1719,10 +1719,11 @@ class KVManager(AttentionResource):
         with self._lock:
             # before the fork loop and the segment loop, both of which size
             # off `stored_len`: a pre-fork target has to cover the whole prefix
+            streams = self._streams
+            report = self._index is not None
             for segment in step.segments:
-                stream = self._streams.get(
-                    segment.request_id, {},
-                ).get(segment.label)
+                labels = streams.get(segment.request_id)
+                stream = labels.get(segment.label) if labels else None
                 if stream is None:
                     continue
                 if (
@@ -1746,7 +1747,8 @@ class KVManager(AttentionResource):
                     if stream.lease is not None:
                         self._image_ends.append(stream)
                     stream.converted = True
-                self._report_admission(segment, stream)
+                if report:
+                    self._report_admission(segment, stream)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
                 # these; reset anyway so a refused admit can't leave stale
@@ -1772,16 +1774,28 @@ class KVManager(AttentionResource):
                             (rid, to_label), []).extend(alloc_res.new_pages)
 
             page_size = self.config.page_size
+            # A capture's rows and a replay's padding rows reserve nothing:
+            # they run against SINK_PAGE (see `_sequence_views`). Pages for
+            # them would fail to allocate on a near-full arena and hold the batch.
+            # So do the step's `sink` rows (`KVStep.sink`).
+            is_pad = ctx.is_padding_row
             sink = step.sink
-            for segment in step.segments:
-                # A replay's padding rows reserve nothing: they run against
-                # SINK_PAGE (see `_sequence_views`). Pages for them would fail
-                # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or self._on_sink(ctx, segment.request_id) or (
-                    sink and (segment.request_id, segment.label) in sink
-                ):
+            marked: list[tuple[Segment, CacheStream]] = []
+            for segment in () if ctx.capture else step.segments:
+                rid = segment.request_id
+                if is_pad(rid) or (sink and (rid, segment.label) in sink):
                     continue
-                stream = self._ensure_label(segment.request_id, segment.label)
+                if segment.span == 0:
+                    # reserves nothing, and creates no stream for a label nothing created
+                    stream = streams.get(rid, {}).get(segment.label)
+                    if stream is not None:
+                        marked.append((segment, stream))
+                    continue
+                labels = streams.get(rid)
+                stream = labels.get(segment.label) if labels else None
+                if stream is None:
+                    stream = self._ensure_label(rid, segment.label)
+                marked.append((segment, stream))
                 seq_len = segment.span + stream.stored_len
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
@@ -1790,35 +1804,26 @@ class KVManager(AttentionResource):
                     and len(stream.page_indices) * page_size >= seq_len
                 ):
                     continue
-                alloc_res = self._alloc(
-                    segment.request_id, segment.label, seq_len,
-                )
+                alloc_res = self._alloc(rid, segment.label, seq_len)
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
                 if alloc_res.new_pages:
                     self._admit_reserved_pages.setdefault(
-                        (segment.request_id, segment.label), []
+                        (rid, segment.label), []
                     ).extend(alloc_res.new_pages)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
             # this step has already been given. last, and only once every
             # reservation above succeeded, so a refusal here sets none.
-            # `.get` because a zero-span segment on a label nothing created
-            # reserves no stream (see the loop above)
-            for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
-                    continue
-                stream = self._streams.get(
-                    segment.request_id, {}
-                ).get(segment.label)
-                if stream is None:
-                    continue
+            # (`_alloc` adds pages to a stream, never replaces it, and the
+            # lock is held throughout, so the streams found above are current)
+            for _, stream in marked:
                 stream.step_in_flight = True
-                if ctx.is_preplan:
-                    self._preplan_marked.append(
-                        (segment.request_id, segment.label)
-                    )
+            if ctx.is_preplan:
+                self._preplan_marked.extend(
+                    (segment.request_id, segment.label) for segment, _ in marked
+                )
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
         # retention is applied at commit (see `_apply_retention`)
