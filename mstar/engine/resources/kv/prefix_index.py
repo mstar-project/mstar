@@ -67,6 +67,10 @@ class PrefixIndex:
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
+        if self._arena.num_owners[page] > 2:
+            # `PageArena.retain` calls `set_shared` only when a page goes from one owner to two, so a page
+            # that was already shared before the index named it is marked here
+            self.set_shared(page, True)
         if parent is not None:
             self._children[parent] += 1
         heapq.heappush(self._leaves, (self._clock, page))
