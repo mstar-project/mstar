@@ -24,6 +24,7 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _grow, _keys, _lay
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
@@ -33,7 +34,8 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
     StreamLayout,
 )
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -400,7 +402,9 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
     live: dict[str, list] = {}  # rid -> [state, prompt length, policy, decoded]
     log: list[str] = []
     for i in range(ops):
-        kv._cpu_pool.land()  # a copy from the host lands by the next call
+        if i % 100 == 0:
+            # copies from the host land in batches, so two can land in one call
+            kv._cpu_pool.land()
         op = rng.choices(list(_CALLS), weights=[w for _, w in _CALLS.values()])[0]
         rids = [rid for rid, entry in live.items() if entry[0] in _CALLS[op][0]]
         rid = rng.choice(rids) if rids else f"r{i}"
@@ -438,8 +442,9 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
         elif op == "offload" and kv.offload(rid):
             live[rid][0] = "offloaded"
         elif op == "reload":
-            left = kv._allotments[rid].remaining
-            if not kv.reload(rid):
+            left, fits = kv._allotments[rid].remaining, kv.can_reload(rid)
+            assert kv.reload(rid) == fits, f"can_reload {rid} answered {fits}, and reload the opposite"
+            if not fits:
                 continue
             assert kv._allotments[rid].remaining == left, f"reload {rid} changed the unused part of its allotment"
             live[rid][0] = "running"
@@ -465,6 +470,7 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
         assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
     for rid in list(kv._streams):
         kv.remove_request(rid)
+    host._land(kv)
     assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
         f"seed {SEED}: pages or allotments outlived every request that held them"
     )
@@ -483,16 +489,71 @@ def test_every_page_an_offload_frees_is_room():
     assert kv._room() == room + 2, "the offload gave back its victim's unused allotment, or kept the used part"
 
 
-def test_a_reload_past_the_room_is_refused_and_leaves_the_request_offloaded():
-    kv = _manager(max_num_pages=9)
-    kv._cpu_pool = host._HostPool(64)
-    _laid_out(kv, "r0", list(range(4 * PAGE_SIZE)))
-    assert _ready(kv, "r0")
-    _grow(kv, "r0", 4 * PAGE_SIZE)
-    assert kv.offload("r0") == 4
-    _laid_out(kv, "r1", list(range(500, 500 + 5 * PAGE_SIZE)))
-    assert _ready(kv, "r1")
+def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment():
+    kv = host._manager(max_num_pages=20)
+    host._on_the_host_only(kv)
+    # "c" holds the first four pages of the prompt "b" finds on the host
+    host._serve(kv, "c", host.SHARED + list(range(900, 900 + 4 * host.PAGE_SIZE)))
+    room = kv._room()
+    for rid, prompt in (("big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE))), ("b", host.A_PROMPT + [7, 8])):
+        host._ingest(kv, rid, prompt)
+        assert not _ready(kv, rid)
+    assert kv._host_copies == [], "a request still in the queue started a copy from the host"
 
-    assert not kv.can_reload("r0"), "can_reload counted room an admitted prompt counts on"
-    assert kv.reload("r0") is False, "a returning request took pages an admitted prompt counts on"
-    assert kv.is_offloaded("r0")
+    kv.remove_request("big")
+    assert not _ready(kv, "b") and kv._host_copies, "\"b\" didn't start its copy once admitted"
+    pages = kv._allotments["b"].pages
+    assert kv._room() == room - pages, "the copy took room past \"b\"'s allotment"
+    host._land(kv)
+    assert kv._allotments["b"].pages == pages and kv._room() == room - pages, "the landed copy moved \"b\"'s room"
+
+
+def test_a_reload_counts_the_evictable_index_pages_it_keeps_as_room():
+    kv = host._manager(max_num_pages=16)
+    host._serve(kv, "a", host.A_PROMPT)
+    assert kv.offload("a") > 0
+    host._ingest(kv, "r1", list(range(500, 500 + 10 * host.PAGE_SIZE)))
+    # the index still holds all six of "a"'s pages, so the reload copies none, and the room is five
+    assert _ready(kv, "r1") and kv._room() == 5
+
+    assert not (kv.can_reload("a") or kv.reload("a")) and kv.is_offloaded("a"), "a reload went past the room"
+
+
+def test_a_grant_that_evicts_counts_the_pages_the_host_has_no_copy_of():
+    kv = host._manager(max_num_pages=8)
+    host._serve(kv, "a", host.A_PROMPT + [1])
+    kv.remove_request("a")
+
+    host._serve(kv, "b", list(range(500, 500 + 3 * host.PAGE_SIZE)))
+
+    assert kv._cpu_pool.dropped == 2, "the grant's eviction went uncounted"
+
+
+def test_a_run_filed_after_a_page_only_the_index_holds_leaves_that_page_evictable():
+    arena = PageArena(kv_cache=None, allocator=PageAllocator(8))
+    arena.index = index = PrefixIndex(arena)
+    cached, *run = arena.acquire(3)
+    index.insert(b"cached", cached)
+    arena.release([cached])
+
+    index.insert_run([b"cached", b"next"], run, None)
+
+    assert cached in index.evictable(), "the run's next page, held by its stream, pinned a page the pool counts as room"
+
+
+def test_two_copies_under_one_parent_page_release_it_once_each_and_leave_it_cached():
+    kv = host._manager(max_num_pages=32)
+    other = host.SHARED + list(range(300, 300 + 2 * host.PAGE_SIZE))
+    for rid, prompt in (("a", host.A_PROMPT), ("x", other)):
+        host._serve(kv, rid, prompt + [1, 2])
+        assert kv.offload(rid) > 0
+    kv._index.evict(4)
+    shared = kv._index.pages_for(kv._streams["a"]["main"].chain.rooted[:4])
+    assert len(shared) == 4 and kv._index.num_pages() == 4
+    for rid, prompt in (("b", host.A_PROMPT), ("c", other)):
+        host._ingest(kv, rid, prompt + [7, 8])
+        assert not _ready(kv, rid) and set(shared) <= set(kv._streams[rid]["main"].hold)
+
+    host._land(kv)
+
+    assert all(kv._arena.num_owners[page] == 1 for page in shared), "a landing left the shared parent pages held"
