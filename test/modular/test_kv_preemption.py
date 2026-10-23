@@ -1,0 +1,185 @@
+"""A request whose grant runs short drops newer requests and takes the pages they free.
+
+A new prompt waits in the queue for room, since a pool admits only its oldest waiting request.
+A request that grows past what it was allotted can't wait that way: every request beside it
+may be growing too, and nothing would ever finish. The newest requests the pool can rebuild are dropped,
+and they wait in the queue at their arrival position until their whole history and one more page fit.
+So the oldest request always gets its page and finishes.
+"""
+
+from __future__ import annotations
+
+import sys
+
+sys.path.insert(0, ".")
+
+import pytest
+from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
+
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
+from mstar.engine.resources.step import AdmitOutcome, Segment
+from mstar.model.submodule_base import ARNodeInputs
+
+
+@pytest.fixture(autouse=True)
+def _stub_transfer(monkeypatch):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+
+
+def _pool():
+    """A pool where requests can hold 10 pages, past the sink page."""
+    return _manager(max_num_pages=11)
+
+
+def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None) -> None:
+    """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
+    tokens = pages * PAGE_SIZE
+    layout = StreamLayout(
+        spans=(PrefixSpan(tokens, tokens, WALK),), growth=(("decode", 1),), keyed_spans=int(bool(keyed)),
+    )
+    kv.ingest_request(rid, KVReqConfig(
+        prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
+        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
+    ))
+
+
+def _ready(kv, rid: str) -> bool:
+    return kv.admit_retrieve(rid, NODE, WALK, None).ready
+
+
+def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
+    """One step of ``tokens`` for ``rid``, committed when it is admitted."""
+    step = KVStep(segments=(Segment(rid, "main", tokens),))
+    outcome = kv.admit(step, _ctx(rid))
+    if outcome.ok:
+        kv.plan(step, _ctx(rid))
+        kv.commit(step, _ctx(rid))
+    else:
+        kv.rollback_admit(step, _ctx(rid))
+    return outcome
+
+
+def _running(kv, rid: str, pages: int, arrival: int) -> None:
+    """Admit ``rid`` and prefill its prompt of ``pages`` pages, ending on a full page."""
+    _request(kv, rid, pages, arrival)
+    assert _ready(kv, rid)
+    assert _step(kv, rid, pages * PAGE_SIZE).ok
+
+
+def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
+    kv = _pool()
+    _running(kv, "x", 8, arrival=0)
+    for rid, pages, arrival in (("c", 5, 3), ("a", 3, 1), ("b", 3, 2)):
+        _request(kv, rid, pages, arrival)
+        assert not _ready(kv, rid)
+    assert list(kv._waiting) == ["a", "b", "c"], "the queue kept the order of the readiness checks"
+
+    kv.remove_request("x")
+    assert _ready(kv, "a") and _ready(kv, "b") and not _ready(kv, "c")
+    assert _step(kv, "a", 3 * PAGE_SIZE).ok and _step(kv, "b", 2 * PAGE_SIZE).ok
+    kv.drop("b")
+
+    assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
+    assert list(kv._waiting) == ["b", "c"] and not _ready(kv, "c"), "c passed the request dropped ahead of it"
+
+
+def _short(kv, rid: str) -> int:
+    """Step ``rid``'s next token, which needs a page past its allotment, and return how many pages ``rid`` is short."""
+    outcome = _step(kv, rid, 1)
+    assert not outcome.ok
+    return outcome.reason.pages_short
+
+
+def test_a_newer_victim_waits_until_the_older_request_has_its_page():
+    kv = _pool()
+    _running(kv, "r", 3, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows past its allotment into the room"
+
+    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
+    kv.drop("v")
+
+    assert kv._allotments["r"].remaining == 1, "the page v freed isn't reserved for r"
+    assert _step(kv, "r", 1).ok, "the older request didn't get the page its victim freed"
+    assert not kv.readmit("v", 5 * PAGE_SIZE), "v came back into the room r needs to grow"
+    kv.remove_request("r")
+    assert kv.readmit("v", 5 * PAGE_SIZE) and kv._allotments["v"].pages == 6, "v didn't reserve its history and a page"
+
+
+@pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
+def test_the_oldest_request_drops_itself_or_waits_for_room(then):
+    kv = _pool()
+    _running(kv, "older", 5, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+
+    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
+
+    assert victims == (["r"] if then == "drops itself" else []) and not kv._earmarks, "nothing newer frees a page"
+    assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
+    if then == "waits, then is dropped":
+        kv.drop("r")
+        # readmitting r takes the rest of the room, so only the drop can end r's wait
+        assert kv.readmit("r", 4 * PAGE_SIZE) and not kv.waits("r"), "r's wait for room outlived its drop"
+    elif then == "waits":
+        kv.remove_request("older")
+        assert not kv.waits("r"), "r kept waiting after the room grew"
+
+
+@pytest.mark.parametrize("state", ["pending victim", "dropped", "rebuilding", "earmark's request"])
+def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    _running(kv, "r", 3, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
+    if state in ("dropped", "rebuilding"):
+        kv.drop("v")
+    if state == "rebuilding":
+        kv.remove_request("r")
+        assert kv.readmit("v", 5 * PAGE_SIZE)
+    gone = "r" if state == "earmark's request" else "v"
+
+    kv.remove_request(gone)
+
+    left = [state for state in (kv._earmarks, kv._victims, kv._short, kv._ran_short, kv._waiting, kv._allotments)
+            if gone in state]
+    assert not left and not kv._earmarks and not kv._victims, f"{gone} left preemption state behind"
+    assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
+
+
+def test_victims_that_share_pages_are_preempted_together():
+    kv = _pool()
+    shared, tokens = list(range(3 * PAGE_SIZE)), {"a": range(100, 116), "b": range(200, 216)}
+    _running(kv, "r", 5, arrival=1)
+    _request(kv, "a", 4, arrival=2, keyed=shared + list(tokens["a"]))
+    assert _ready(kv, "a") and _step(kv, "a", 4 * PAGE_SIZE).ok
+    _request(kv, "b", 4, arrival=3, keyed=shared + list(tokens["b"]))
+    assert _ready(kv, "b")
+    inputs = ARNodeInputs(input_seq_len=4 * PAGE_SIZE)
+    kv.apply_cached_prefix("b", NODE, WALK, inputs, kv.resolve_cached_prefix("b", NODE, WALK, inputs))
+    assert _step(kv, "b", PAGE_SIZE).ok and kv._arena.num_free == 0, "b writes only its page past the shared three"
+    short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
+
+    assert kv.preempt("r", short, droppable=lambda rid: True) == ["b", "a"], "a victim alone frees one page"
+    alone, both = kv._frees(["a"]), kv._frees(["b", "a"])
+    before = kv._arena.num_free + len(kv._index.evictable())
+    kv.drop("b")
+    kv.drop("a")
+
+    assert alone == 1, "the shared pages counted as freed while b still holds them"
+    assert kv._arena.num_free + len(kv._index.evictable()) - before == both == 5, "the drops freed other than counted"
+
+
+def test_a_page_the_failing_step_gives_back_is_no_release():
+    kv = _pool()
+    for rid, arrival in (("a", 0), ("r", 1), ("v", 2)):
+        _running(kv, rid, 3, arrival)
+    step, ctx = KVStep(segments=(Segment("a", "main", 1), Segment("r", "main", 1))), _ctx("a", "r")
+    outcome = kv.admit(step, ctx)
+    kv.rollback_admit(step, ctx)
+
+    assert kv.preempt("r", outcome.reason.pages_short, droppable=lambda rid: True) == ["v"], (
+        "the page a's row gave back counted as room, so r waits on the step that will fail again"
+    )
