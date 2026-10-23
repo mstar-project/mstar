@@ -9,17 +9,23 @@ success.
 """
 
 import asyncio
+import gc
 import queue
 import threading
 import time
+import weakref
+from types import SimpleNamespace
 
+import pytest
 from api_server_helpers import make_test_api_server
 
+from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.profile.format import OutputInfo, RequestProfile
 
 
 class _RecordingTensorManager:
@@ -349,3 +355,156 @@ def test_error_tail_is_its_own_last_batch():
         return [[c.modality for c in b] async for b in server.iter_result_chunk_batches("r6")]
 
     assert asyncio.run(_collect()) == [["text"], ["error"]]
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("batched", [True, False])
+def test_consumed_chunks_are_released_before_stream_completion(streaming, batched):
+    """Even the Rust relay's non-streaming submissions drain through the iterator."""
+    server = make_test_api_server(preprocess_worker=SimpleNamespace(abort_request=lambda rid: None))
+    req = _pending_request()
+    req.streaming = streaming
+    _register(server, "retention", req)
+
+    async def consume():
+        stream = (
+            server.iter_result_chunk_batches("retention") if batched
+            else server.iter_result_chunks("retention")
+        )
+        refs = []
+        try:
+            for i in range(128):
+                with server.request_lock:
+                    req.chunks.append(ResultChunk(
+                        request_id="retention", modality="video_frame", data=bytes([i]) * (64 * 1024),
+                    ))
+                    refs.append(weakref.ref(req.chunks[-1]))
+                    req.notify()
+                result = await anext(stream)
+                if batched:
+                    assert len(result) == 1
+                    assert result[0].data == bytes([i]) * (64 * 1024)
+                else:
+                    assert result.data == bytes([i]) * (64 * 1024)
+                del result
+
+            assert "retention" in server.pending_requests
+            assert not req.event.is_set()
+            assert len(req.chunks) == 0
+            gc.collect()
+            # The suspended sender may still own its current chunk, but no history.
+            assert all(ref() is None for ref in refs[:-1])
+            with server.request_lock:
+                req.event.set()
+                req.notify()
+            assert [result async for result in stream] == []
+        finally:
+            await stream.aclose()
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+
+    asyncio.run(consume())
+    assert "retention" not in server.pending_requests
+
+
+def test_final_flush_drains_chunks_appended_while_yielding_a_completed_batch():
+    server = make_test_api_server(preprocess_worker=SimpleNamespace(abort_request=lambda rid: None))
+    req = _pending_request()
+    req.chunks.append(ResultChunk(request_id="tail", modality="text", data=b"first"))
+    req.event.set()
+    _register(server, "tail", req)
+
+    async def consume():
+        stream = server.iter_result_chunk_batches("tail")
+        try:
+            assert [c.data for c in await anext(stream)] == [b"first"]
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id="tail", modality="text", data=b"last"))
+            assert [[c.data for c in batch] async for batch in stream] == [[b"last"]]
+        finally:
+            await stream.aclose()
+
+    asyncio.run(consume())
+    assert req.chunks == []
+    assert "tail" not in server.pending_requests
+
+
+def _deliver_result_chunks(server, *chunks):
+    """Drive one real message-loop pass with outputs from a fake data worker."""
+    def stop_after_this_pass():
+        server.running = False
+        return []
+
+    server.communicator = SimpleNamespace(get_all_new_messages=stop_after_this_pass)
+    server.preprocess_worker = SimpleNamespace(
+        get_profile_updates=lambda: [], get_result_chunks=lambda: chunks,
+        abort_request=lambda rid: None,
+    )
+    server.running = True
+    server._process_messages()
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("log_stats", [True, False])
+def test_output_totals_survive_draining_and_native_collection(monkeypatch, streaming, log_stats):
+    monkeypatch.setattr(entrypoint, "pretty_print_profile", lambda *args: None)
+    server = make_test_api_server(log_stats=log_stats)
+    req = PendingRequest(
+        streaming=streaming, input_modalities=["text"], output_modalities=["text", "audio"],
+        profile=RequestProfile(rid="profile"),
+    )
+    _register(server, "profile", req)
+
+    async def consume():
+        stream = server.iter_result_chunk_batches("profile") if streaming else None
+        delivered = []
+        for batch in (
+            [("text", b"a"), ("audio", b"1234")],
+            [("text", b"bc")],
+        ):
+            _deliver_result_chunks(server, *[
+                ResultChunk(request_id="profile", modality=modality, data=data) for modality, data in batch
+            ])
+            if stream is not None:
+                delivered.extend(c.data for c in await anext(stream))
+                assert len(req.chunks) == 0
+        req.event.set()
+        if stream is not None:
+            assert [batch async for batch in stream] == []
+        else:
+            delivered = [c.data for c in await server.collect_results("profile")]
+        return delivered
+
+    assert asyncio.run(consume()) == [b"a", b"1234", b"bc"]
+    assert "profile" not in server.pending_requests
+    assert req.profile.outputs == (
+        [OutputInfo(modality="text", count=2, total_bytes=3), OutputInfo(modality="audio", count=1, total_bytes=4)]
+        if log_stats else []
+    )
+
+
+def test_profile_counts_accepted_errors_and_outputs_after_the_error(monkeypatch):
+    """Profiling counts accepted chunks, even when terminal filtering hides a tail."""
+    monkeypatch.setattr(entrypoint, "pretty_print_profile", lambda *args: None)
+    server = make_test_api_server(log_stats=True)
+    req = PendingRequest(
+        streaming=True, input_modalities=["text"], output_modalities=["text"],
+        profile=RequestProfile(rid="error"), request_id="public",
+    )
+    _register(server, "error", req)
+    _deliver_result_chunks(
+        server,
+        ResultChunk(request_id="error", modality="text", data=b"ok"),
+        ResultChunk(request_id="error", modality="error", data=b"error failed"),
+        ResultChunk(request_id="error", modality="text", data=b"late"),
+    )
+
+    async def consume():
+        return [(c.modality, c.data) async for c in server.iter_result_chunks("error")]
+
+    assert asyncio.run(consume()) == [("text", b"ok"), ("error", b"public failed")]
+    assert req.chunks == []
+    assert req.profile.outputs == [
+        OutputInfo(modality="text", count=2, total_bytes=6),
+        OutputInfo(modality="error", count=1, total_bytes=len(b"public failed")),
+    ]
