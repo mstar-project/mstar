@@ -1,6 +1,6 @@
 """T7 conversion/mask checks (fixture-free) and T13-Mimi against NVIDIA's streaming Mimi.
 
-T13-Mimi replays ``reference_mimi.pt`` from ``test/scratch/personaplex_reference_oracle.py --mode mimi``:
+T13-Mimi replays ``reference_mimi.pt`` from ``test/personaplex/reference_oracle.py --mode mimi``:
 a shrunken random Mimi run one 1920-sample frame at a time by NVIDIA's code. Synthetic
 weights only; the real ``tokenizer-e351c8d8-checkpoint125.safetensors`` is gated (T15).
 """

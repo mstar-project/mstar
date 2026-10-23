@@ -1246,7 +1246,9 @@ Validation status:
        performance and audio quality remain unestablished
 
 Reference fixtures are generated outside Git by
-``test/scratch/personaplex_reference_oracle.py`` (see
+``test/personaplex/reference_oracle.py`` (see
 ``test/modular/fixtures/personaplex/README.rst``). Their tests skip when fixtures
 are unavailable. The current path runs eagerly without CUDA graphs; an 80 ms
 audio frame is model timing, not an achieved processing-latency claim.
+``test/personaplex/`` has a launch script and a request client for trying a
+server by hand (``launch_server.sh``, ``request.py --audio user.wav``).

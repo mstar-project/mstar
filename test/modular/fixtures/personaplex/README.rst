@@ -26,7 +26,7 @@ with Python 3.12 available:
    git -C /tmp/personaplex-3428dfd9 checkout 3428dfd95309a7f3c84fd93259ded0f810d1ff91
    python3.12 -m venv /tmp/personaplex-oracle
    /tmp/personaplex-oracle/bin/python -m pip install /tmp/personaplex-3428dfd9/moshi tqdm
-   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+   /tmp/personaplex-oracle/bin/python test/personaplex/reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode trace --out /tmp/personaplex-trace
    PERSONAPLEX_REFERENCE_TRACE=/tmp/personaplex-trace/reference_trace.json \
      python -m pytest test/modular/test_personaplex_delayed_cache.py -v
@@ -62,9 +62,9 @@ The same recorder has two more modes, run with the same reference venv:
 
 .. code-block:: bash
 
-   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+   /tmp/personaplex-oracle/bin/python test/personaplex/reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode manifest --out /tmp/personaplex-fixtures
-   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+   /tmp/personaplex-oracle/bin/python test/personaplex/reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode lm --out /tmp/personaplex-fixtures
    PERSONAPLEX_REFERENCE_MANIFEST=/tmp/personaplex-fixtures/reference_lm_manifest.json \
    PERSONAPLEX_REFERENCE_LM=/tmp/personaplex-fixtures/reference_lm.pt \
@@ -92,7 +92,7 @@ Commit 3: Mimi streaming reference (T7, T13-Mimi)
 
 .. code-block:: bash
 
-   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+   /tmp/personaplex-oracle/bin/python test/personaplex/reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode mimi --out /tmp/personaplex-fixtures
    PERSONAPLEX_REFERENCE_MIMI=/tmp/personaplex-fixtures/reference_mimi.pt \
      python -m pytest test/modular/test_personaplex_mimi.py -v   # needs transformers
@@ -118,7 +118,7 @@ Offline component replay with reference user codes (tiny random weights)
 
 .. code-block:: bash
 
-   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+   /tmp/personaplex-oracle/bin/python test/personaplex/reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode offline --out /tmp/personaplex-fixtures
    PERSONAPLEX_REFERENCE_OFFLINE=/tmp/personaplex-fixtures/reference_offline.pt \
      python -m pytest test/modular/test_personaplex_submodules.py -v -k offline_components

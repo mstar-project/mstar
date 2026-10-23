@@ -1,6 +1,6 @@
 """T5/T6 fixture-free structure checks; T5/T13-LM compare against NVIDIA fixtures.
 
-R-tier tests replay fixtures recorded by ``test/scratch/personaplex_reference_oracle.py``
+R-tier tests replay fixtures recorded by ``test/personaplex/reference_oracle.py``
 from NVIDIA's own ``LMModel``/``LMGen`` with random weights (fixtures/personaplex/README.rst).
 They establish algorithmic equivalence on synthetic weights, not checkpoint or GPU parity.
 """
