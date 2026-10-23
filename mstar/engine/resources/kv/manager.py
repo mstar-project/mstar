@@ -2,7 +2,7 @@ import itertools
 import logging
 import os
 import threading
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -64,6 +64,16 @@ logger = logging.getLogger(__name__)
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
+# What a step may queue for the host. The device has one device-to-host copy engine, which runs copies
+# in the order they were queued whatever their stream or priority, and `after_output_copy` queues its
+# writes behind the step's own output copy.
+# `_WRITE_BYTES_PER_STEP` bounds how long the writes hold the copy engine before the next step's output
+# copy can run (about 1 ms on an H100).
+# `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page (about 0.1 ms of host
+# time at 16).
+_WRITE_BYTES_PER_STEP = 32 << 20
+_WRITE_PAGES_PER_STEP = 16
+
 _WAIT = AdmitOutcome(ok=True, ready=False, held_back=True)
 _ADMITTED = AdmitOutcome(ok=True, admitted=True)
 
@@ -82,6 +92,14 @@ class PageArena:
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
     index: PrefixIndex | None = field(default=None, init=False, repr=False)
+    # `pending` holds the keys `after_output_copy` copies to the host, in release order. A key enters once a
+    # release leaves its page to the index alone, with the commit count at that moment. A key released
+    # again while queued keeps its place and its commit count, since its page is sealed and never written again.
+    # `image_ends` holds the keys of cached image ends, which no lookup on the host reads, so they never
+    # enter `pending`.
+    pending: OrderedDict[bytes, int] | None = field(default=None, init=False, repr=False)
+    commits: int = field(default=0, init=False, repr=False)
+    image_ends: set[bytes] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -117,6 +135,9 @@ class PageArena:
                 freed.append(page)
             elif self.num_owners[page] == 1 and self.index is not None:
                 self.index.set_shared(page, False)
+                key = self.index.key_of(page) if self.pending is not None else None
+                if key is not None and key not in self.image_ends:
+                    self.pending.setdefault(key, self.commits)
         self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
@@ -337,23 +358,33 @@ class ClaimedStream:
 
 @dataclass
 class HostCopy:
-    """A copy from the host for a readiness check, not yet seen to land.
+    """A copy between the device and the host, not yet seen to land.
 
-    No `sync()` follows this copy, as one follows a reload's, so ``pages`` enter
-    the index under ``keys`` only once ``event`` completes. Until then the record
-    holds a reference on ``pages`` and ``host_pages``. A copy whose copier raised
-    lands with ``failed`` set, and files nothing.
+    A copy from the host serves a readiness check. No `sync()` follows it, as one
+    follows a reload's, so ``pages`` enter the index under ``keys`` only once
+    ``event`` completes. Until then the record holds a reference on ``pages`` and
+    ``host_pages``.
 
-    ``joined`` holds the streams of other requests whose prompt continues in the
-    copy, which wait on it too.
+    A write copies cached pages to the host before they are evicted, and holds no
+    device page. Once ``event`` completes, ``host_pages[i]`` is filed on the host
+    under ``keys[i]``, below the host page of ``parents[i]``. A key in ``cancelled``
+    is not filed, since eviction reused its device page during the copy, or
+    `CPUPagePool.write` raised.
+
+    A copy from the host whose copier raised lands with ``failed`` set, and files nothing.
+
+    ``joined`` holds the streams of other requests whose prompt continues in a copy from the host, which wait on it
+    too.
     """
-    pages: list[int]
     keys: list[bytes]
-    parent: bytes | None
     host_pages: list[int]
-    rid: str
-    stream: CacheStream
     event: torch.cuda.Event | None = None
+    pages: list[int] = field(default_factory=list)
+    parent: bytes | None = None
+    rid: str | None = None
+    stream: CacheStream | None = None
+    parents: list[bytes | None] | None = None
+    cancelled: set[bytes] = field(default_factory=set)
     failed: bool = False
     joined: list[CacheStream] = field(default_factory=list)
 
@@ -540,6 +571,15 @@ class KVManager(AttentionResource):
         # event is recorded, since an event that was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
         self._arriving: dict[bytes, HostCopy] = {}
+        self._writing: dict[bytes, HostCopy] = {}
+        # `_commit_events` holds, oldest first, the commit count and an event recorded at the end of each
+        # commit while keys are pending.
+        # `_commit_done` is the newest of them that `after_output_copy` has seen complete.
+        self._commit_events: deque[tuple[int, torch.cuda.Event]] = deque()
+        self._commit_done: tuple[int, torch.cuda.Event] | None = None
+        self._writes_per_step = min(
+            _WRITE_PAGES_PER_STEP, max(1, _WRITE_BYTES_PER_STEP // self.kv_cache.tensor[:, 0].nbytes),
+        )
         if cfg.cpu_offload_pages > 0:
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
@@ -695,6 +735,8 @@ class KVManager(AttentionResource):
             return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
+        if self._cpu_pool is not None:
+            self._arena.pending = OrderedDict()
         return True
 
     def page_counts(self) -> KVPageCounts:
@@ -975,11 +1017,71 @@ class KVManager(AttentionResource):
             self._cache_image_end(stream, chain, *ended)
 
     def _evict(self, n: int) -> int:
-        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host."""
+        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. A dropped
+        page leaves `pending`, and a write still copying it is cancelled."""
         dropped = self._index.evict(n)
         if self._cpu_pool is not None:
+            for key in dropped:
+                self._arena.pending.pop(key, None)
+                self._arena.image_ends.discard(key)
+                write = self._writing.get(key)
+                if write is not None and (write.event is None or not write.event.query()):
+                    write.cancelled.add(key)
             self._cpu_pool.count_dropped(dropped)
         return len(dropped)
+
+    def after_output_copy(self) -> None:
+        """Copy to the host up to `_writes_per_step` of the cached pages that only the index holds, each
+        once the commit that indexed it has run on the device. Nothing waits on the copy."""
+        pending = self._arena.pending
+        if not pending:
+            return
+        events = self._commit_events
+        while events and events[0][1].query():
+            self._commit_done = events.popleft()
+        if self._commit_done is None:
+            return
+        # Waiting on a commit that has run, and not on the step's stream as it is now, keeps the writes
+        # from queueing behind the next step's kernels and so from holding up the next step's output copy.
+        done, event = self._commit_done
+        with self._lock:
+            keys, pages = [], []
+            while pending and len(keys) < self._writes_per_step:
+                key, commits = next(iter(pending.items()))
+                # wait until the commit counted when the key entered `pending` has run, since every kernel that
+                # writes its page is queued before that commit ends
+                if commits > done:
+                    break
+                del pending[key]
+                writing = self._writing.get(key)
+                # a cancelled write files nothing, so the page now under the key needs a write of its own
+                if writing is not None and key not in writing.cancelled:
+                    continue
+                if self._cpu_pool.index.page_for(key) is None:
+                    keys.append(key)
+                    pages.append(self._index.page_for(key))
+            host = self._cpu_pool.take(len(keys))
+            if not host:
+                return
+            del keys[len(host):], pages[len(host):]
+            write = HostCopy(
+                keys=keys, host_pages=host, parents=[self._index.parent_key(page) for page in pages],
+            )
+            # Listed in `_writing` before the copies launch, so `_evict` cancels the write of a page another
+            # thread evicts and reuses during the copy.
+            for key in keys:
+                self._writing[key] = write
+            self._host_copies.append(write)
+        queued = False
+        try:
+            self._cpu_pool.write(self.kv_cache.tensor, PageCopies(gpu=pages, cpu=host), event)
+            queued = True
+        finally:
+            event = self._cpu_pool.record_write()
+            with self._lock:
+                write.event = event
+                if not queued:
+                    write.cancelled.update(write.keys)
 
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
@@ -996,6 +1098,8 @@ class KVManager(AttentionResource):
             return
         self.kv_cache.copy_slots(stream.page_indices[page], copy[0], end % self.config.page_size)
         self._index.insert(rooted, copy[0], parent)
+        if self._arena.pending is not None:
+            self._arena.image_ends.add(rooted)
         # drop our reference, so the index is the page's one owner and can evict it
         self._arena.release(copy)
 
@@ -1429,7 +1533,8 @@ class KVManager(AttentionResource):
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
         self._touch_plan_cache(rid)
-        if self._host_copies:
+        # Writes land in `admit`, once a step, so check here only while a copy from the host is in flight.
+        if self._arriving:
             with self._lock:
                 self._land_host_copies()
         admitted = False
@@ -2488,6 +2593,7 @@ class KVManager(AttentionResource):
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            self._arena.commits += 1
             # committed, so there is nothing left to unwind
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
@@ -2550,6 +2656,8 @@ class KVManager(AttentionResource):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+        if self._arena.pending:
+            self._commit_events.append((self._arena.commits, self._cpu_pool.record_compute()))
 
     def _assert_layout(
         self, segment: Segment, stream: CacheStream, touched: list[tuple[int, int]],
@@ -2991,11 +3099,19 @@ class KVManager(AttentionResource):
 
     def _land_host_copies(self) -> None:
         """Under the lock: index the pages of each copy from the host that has landed,
-        and drop that copy's references."""
+        and drop that copy's references. File each landed write on the host."""
         pending, landed = [], []
         for copy in self._host_copies:
             if copy.event is None or not copy.event.query():
                 pending.append(copy)
+                continue
+            if copy.parents is not None:
+                for key in copy.keys:
+                    if self._writing.get(key) is copy:
+                        del self._writing[key]
+                self._cpu_pool.file_writes(
+                    copy.keys, copy.host_pages, copy.parents, copy.cancelled,
+                )
                 continue
             landed.append(copy.rid)
             # the parent may have left the index while the copy was in flight

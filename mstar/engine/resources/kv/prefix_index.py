@@ -108,6 +108,13 @@ class PrefixIndex:
     def holds(self, page: int) -> bool:
         return self._key[page] is not None
 
+    def key_of(self, page: int) -> bytes | None:
+        return self._key[page]
+
+    def parent_key(self, page: int) -> bytes | None:
+        parent = self._parent[page]
+        return None if parent is None else self._key[parent]
+
     def evictable(self) -> set[int]:
         """Return the live set of pages `evict` could free, cascading from the leaves.
         Callers read it and don't keep it.

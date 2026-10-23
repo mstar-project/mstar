@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import sys
+from collections import OrderedDict
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -369,8 +370,13 @@ class _StubHostPool(_HostPoolStub):
     def copy_in(self, gpu_kv_cache, copies):
         pass
 
+    def write(self, gpu_kv_cache, copies, written):
+        pass
+
     def record(self):
         return SimpleNamespace(query=lambda: True)
+
+    record_write = record_compute = record
 
 
 def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None, preplan: bool = False) -> str:
@@ -468,6 +474,8 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _manager(max_num_pages=20)
     kv._cpu_pool = _StubHostPool()
+    # the stub comes after `enable_prefix_cache`, so open the set of pages to copy to the host here
+    kv._arena.pending = OrderedDict()
 
     log = _drive(kv, random.Random(SEED), ops=10_000)
 
