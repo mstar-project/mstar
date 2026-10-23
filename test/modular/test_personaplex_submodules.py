@@ -170,6 +170,137 @@ def test_shared_lm_interleaved_request_state_matches_isolated_runs():
                     assert torch.equal(value, reference), (request, step, name)
 
 
+class _RowBackends:
+    """A batched temporal forward over per-request dense KV: row ``i`` uses ``backends[i]``."""
+
+    def __init__(self, backends):
+        self.backends = backends
+
+    def begin(self):
+        pass
+
+    def rope(self, q, k):
+        pairs = [b.rope(q[i : i + 1], k[i : i + 1]) for i, b in enumerate(self.backends)]
+        return torch.cat([q for q, _ in pairs]), torch.cat([k for _, k in pairs])
+
+    def attend(self, layer_idx, q, k, v):
+        return torch.cat([b.attend(layer_idx, q[i : i + 1], k[i : i + 1], v[i : i + 1])
+                          for i, b in enumerate(self.backends)])
+
+
+def _assert_same_outputs(got, want, what):
+    assert got.keys() == want.keys(), what
+    for name in want:
+        for value, reference in zip(got[name], want[name], strict=True):
+            assert torch.equal(value, reference), (what, name)
+
+
+@torch.no_grad()
+def test_batched_frames_match_isolated_runs():
+    """Rows at different frame offsets share a step and still match each request run alone.
+
+    The second request starts two frames late, so the batches hold caches at
+    different offsets, and for some steps the requests are in different walks
+    and run separately. Three requests cover voice, persona and user lengths
+    that differ.
+    """
+    sub = _tiny_submodule(seed=41)
+    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=42),
+             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=43),
+             _random_inputs(n_emb=1, n_text=3, n_user=2, seed=44)]
+    expected = []
+    for voice, persona, codes, meta in cases:
+        isolated = _Run(sub, meta, voice, persona, codes)
+        conditioning, state = isolated.walk(cfg.CONDITIONING_WALK, None)
+        generated, _ = isolated.walk(cfg.GENERATE_WALK, state)
+        expected.append(conditioning + generated)
+
+    runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
+    starts = [0, 2, 2]
+    states, actual = [None] * len(runs), [[] for _ in runs]
+    batch_sizes = []
+    for tick in range(max(start + len(want) for start, want in zip(starts, expected, strict=True))):
+        by_walk = {}
+        for request, run in enumerate(runs):
+            index = tick - starts[request]
+            if not 0 <= index < len(expected[request]):
+                continue
+            walk = cfg.CONDITIONING_WALK if index < run.meta["conditioning_frames"] else cfg.GENERATE_WALK
+            by_walk.setdefault(walk, []).append(request)
+        for walk, requests in by_walk.items():
+            frames = [sub.prepare_frame(walk, runs[r].meta, {
+                **runs[r].static, "lm_state": [] if states[r] is None else [states[r]],
+            }) for r in requests]
+            backend = _RowBackends([runs[r].backend for r in requests])
+            outputs = sub.run_frames(frames, backend, _greedy_text, _greedy_depth)
+            batch_sizes.append(len(requests))
+            for r, output in zip(requests, outputs, strict=True):
+                runs[r].backend.advance()
+                states[r] = output["lm_state"][0]
+                actual[r].append(output)
+
+    assert max(batch_sizes) == 3 and 1 in batch_sizes
+    for request in range(len(runs)):
+        assert len(actual[request]) == len(expected[request])
+        for step, (got, want) in enumerate(zip(actual[request], expected[request], strict=True)):
+            _assert_same_outputs(got, want, (request, step))
+
+
+@torch.no_grad()
+def test_forward_batched_returns_each_request_its_own_rows():
+    class Sampler:
+        def __init__(self):
+            self.shapes, self.tokens = [], []
+
+        def sample(self, request_ids, logits):
+            assert request_ids == ["a", "b"]
+            self.shapes.append(tuple(logits.shape))
+            self.tokens.append(logits.argmax(-1))
+            return self.tokens[-1]
+
+    sub = _tiny_submodule(seed=31)
+    cases = [_random_inputs(n_emb=1, n_text=1, n_user=2, seed=52), _random_inputs(n_emb=2, n_text=3, n_user=2, seed=53)]
+    runs, states, want = [], [], []
+    for voice, persona, codes, meta in cases:
+        run = _Run(sub, meta, voice, persona, codes)
+        _, state = run.walk(cfg.CONDITIONING_WALK, None)
+        reference = _Run(sub, meta, voice, persona, codes)
+        _, reference_state = reference.walk(cfg.CONDITIONING_WALK, None)
+        frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**reference.static, "lm_state": [reference_state]})
+        want.append(sub.run_frame(frame, reference.backend, _greedy_text, _greedy_depth))
+        runs.append(run)
+        states.append(state)
+    frames = [sub.prepare_frame(cfg.GENERATE_WALK, run.meta, {**run.static, "lm_state": [state]})
+              for run, state in zip(runs, states, strict=True)]
+    sub._backend = _RowBackends([run.backend for run in runs])
+    text_sampler, depth_sampler = Sampler(), Sampler()
+    engine_inputs = SimpleNamespace(request_ids=["a", "b"], resources={
+        cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
+    })
+    got = sub.forward_batched(cfg.GENERATE_WALK, engine_inputs, frames)
+    assert set(got) == {"a", "b"}
+    # The rows sample different text, so handing one row the other's tokens would show.
+    assert text_sampler.tokens[0][0] != text_sampler.tokens[0][1]
+    assert text_sampler.shapes == [(2, TINY.text_card)] and depth_sampler.shapes == [(2, TINY.card)] * 16
+    _assert_same_outputs(got["a"], want[0], "a")
+    _assert_same_outputs(got["b"], want[1], "b")
+    for output in got.values():
+        assert output["agent_frame"][0].shape == (1, 8, 1) and output["text_frame"][0].shape == (1,)
+
+
+@torch.no_grad()
+def test_a_batch_must_hold_one_walk():
+    sub = _tiny_submodule()
+    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=1)
+    run = _Run(sub, meta, voice, persona, codes)
+    conditioning = sub.prepare_frame(cfg.CONDITIONING_WALK, meta, {**run.static, "lm_state": []})
+    _, state = _Run(sub, meta, voice, persona, codes).walk(cfg.CONDITIONING_WALK, None)
+    generate = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+    with pytest.raises(ValueError, match="one walk"):
+        sub.run_frames([conditioning, generate], _RowBackends([run.backend, run.backend]),
+                       _greedy_text, _greedy_depth)
+
+
 @torch.no_grad()
 def test_generated_text_frame_serializes_for_worker_transfer():
     """A B=1 text column must have byte-viewable strides for worker transfer."""
@@ -241,7 +372,7 @@ def test_forward_accepts_eager_int32_sampler_tokens():
     engine_inputs = SimpleNamespace(request_ids=["request"], resources={
         cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
     })
-    got = sub.forward(cfg.GENERATE_WALK, engine_inputs, frame)
+    got = sub.forward(cfg.GENERATE_WALK, engine_inputs, [frame])
     assert (text_sampler.calls, depth_sampler.calls) == (1, 16)
 
     reference = _Run(sub, meta, voice, persona, codes)
@@ -318,12 +449,16 @@ def test_lm_frame_validation_and_engine_hooks():
               "persona_tokens": [persona], "lm_state": []}
     node_inputs = sub.prepare_inputs(cfg.CONDITIONING_WALK, fwd_info, inputs)
     assert node_inputs.input_seq_len == 1 and node_inputs.input_embeds.shape == (1, TINY.dim)
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs]) == {"frame": node_inputs.kwargs["frame"]}
-    with pytest.raises(NotImplementedError, match="batch size 1"):
-        sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs])
+    frame = node_inputs.kwargs["frame"]
+    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs]) == {"frames": [frame]}
+    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs]) == {"frames": [frame, frame]}
     with pytest.raises(RuntimeError, match="not bound"):
-        sub.forward(cfg.CONDITIONING_WALK, None, node_inputs.kwargs["frame"])
+        sub.forward(cfg.CONDITIONING_WALK, None, [frame])
+    # One row takes the unbatched forward; the cap is the model kwarg.
     assert sub.can_batch(None, [node_inputs]) is False
+    assert sub.can_batch(None, [node_inputs, node_inputs]) is True
+    assert sub.max_batch_size(cfg.GENERATE_WALK) == cfg.DEFAULT_MAX_BATCH_SIZE
+    assert LMSubmodule(sub.lm, max_batch_size=1).max_batch_size(cfg.CONDITIONING_WALK) == 1
 
 
 class _FakeKV:

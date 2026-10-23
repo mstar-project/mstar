@@ -693,6 +693,29 @@ def test_dummy_mode_builds_without_submodules_or_network():
     assert model.get_max_output_tokens() == 2999 and model.get_autocast_dtype() is torch.bfloat16
 
 
+def test_client_output_cap_is_ignored_because_the_input_fixes_the_length():
+    model = PersonaPlexModel(skip_weight_loading=True)
+    assert model.get_max_output_tokens(max_output_tokens=1) == cfg.MAX_TEMPORAL_FORWARDS
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.0, True, "4"])
+def test_max_batch_size_must_be_a_positive_integer(value):
+    with pytest.raises(ValueError, match="max_batch_size"):
+        PersonaPlexModel(skip_weight_loading=True, max_batch_size=value)
+
+
+def test_max_batch_size_reaches_the_lm_submodule(monkeypatch):
+    from mstar.model.personaplex import weights
+
+    model = PersonaPlexModel(max_batch_size=3)
+    monkeypatch.setattr(model, "_download", lambda name: name)
+    monkeypatch.setattr(weights, "iter_lm_checkpoint", lambda path, device: iter(()))
+    monkeypatch.setattr(weights, "build_lm", lambda config, tensors, device: torch.nn.Linear(1, 1))
+    lm = model.get_submodule(cfg.LM_NODE)
+    assert lm.max_batch_size(cfg.GENERATE_WALK) == 3
+    assert PersonaPlexModel().max_batch_size == cfg.DEFAULT_MAX_BATCH_SIZE
+
+
 def test_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
     model = _model()
     configs = model.get_request_resource_configs({}, {})
@@ -735,7 +758,9 @@ def test_registry_hf_entry_and_yaml_agree():
     with open(CONFIG_PATH) as f:
         deployment = yaml.safe_load(f)
     assert deployment["model"] == "personaplex" and deployment["max_seq_len"] == cfg.MAX_TEMPORAL_FORWARDS
-    assert set(deployment["model_kwargs"]) == {"voice_dir"}
+    assert set(deployment["model_kwargs"]) == {"voice_dir", "max_batch_size"}
+    model = PersonaPlexModel(**deployment["model_kwargs"], skip_weight_loading=True)
+    assert model.max_batch_size == deployment["model_kwargs"]["max_batch_size"] == cfg.DEFAULT_MAX_BATCH_SIZE
     assert {n for g in deployment["node_groups"] for n in g["node_names"]} == set(_model().nodes)
 
 

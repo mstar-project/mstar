@@ -15,6 +15,10 @@ frames skip the text head, depformer and samplers: NVIDIA runs them, but only
 to consume RNG, and the cache keeps the forced values either way. Whether a
 generate channel is forced is read from the cache every frame (the first one
 forces the agent acoustic codebooks).
+
+Requests in the same walk batch: the temporal transformer, text head, samplers
+and depformer run once over every row, while each row keeps its own cache
+(offsets differ between requests) and commits it separately.
 """
 
 from __future__ import annotations
@@ -96,14 +100,15 @@ def _planned_frames(walk: str, meta: dict) -> tuple[int, int]:
 
 
 class LMSubmodule(ARNodeSubmodule):
-    """Temporal transformer + depformer + delayed token cache, batch size 1."""
+    """Temporal transformer + depformer + delayed token cache, up to ``max_batch_size`` requests a step."""
 
     disable_autocast = True
     disable_torch_compile = True
 
-    def __init__(self, lm: PersonaPlexLM):
+    def __init__(self, lm: PersonaPlexLM, max_batch_size: int = cfg.DEFAULT_MAX_BATCH_SIZE):
         super().__init__()
         self.lm = lm
+        self._max_batch_size = max_batch_size
         self._backend: ResourceTemporalBackend | None = None
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
@@ -177,16 +182,35 @@ class LMSubmodule(ARNodeSubmodule):
         sample_text: Callable[[torch.Tensor], torch.Tensor],
         sample_depth: Callable[[torch.Tensor, int], torch.Tensor],
     ) -> NameToTensorList:
-        """Temporal forward, sampling, depformer and cache commit for one frame."""
-        conditioning = frame.walk == cfg.CONDITIONING_WALK
-        hidden, text_logits = self.lm.temporal.forward_embeddings(frame.embeds, backend, text_logits=not conditioning)
-        cache = frame.cache
-        target = cache.target[:, :, 0].clone()
-        provided = cache.target_provided[:, :, 0].clone()
+        """``run_frames`` for one request."""
+        return self.run_frames([frame], backend, sample_text, sample_depth)[0]
+
+    def run_frames(
+        self,
+        frames: list[LMFrame],
+        backend,
+        sample_text: Callable[[torch.Tensor], torch.Tensor],
+        sample_depth: Callable[[torch.Tensor, int], torch.Tensor],
+    ) -> list[NameToTensorList]:
+        """Temporal forward, sampling, depformer and cache commits for one frame of each request.
+
+        Row ``i`` of the batch is ``frames[i]``; the samplers map ``[B, vocab]``
+        logits to ``[B]`` tokens. Returns each request's outputs in order.
+        """
+        walk = frames[0].walk
+        if any(frame.walk != walk for frame in frames):
+            raise ValueError("a PersonaPlex LM batch must hold one walk")
+        conditioning = walk == cfg.CONDITIONING_WALK
+        embeds = torch.cat([frame.embeds for frame in frames])
+        hidden, text_logits = self.lm.temporal.forward_embeddings(embeds, backend, text_logits=not conditioning)
+        # Snapshots: commit rewrites the target column these are read from.
+        target = torch.cat([frame.cache.target[:, :, 0] for frame in frames])
+        provided = torch.cat([frame.cache.target_provided[:, :, 0] for frame in frames])
         if conditioning:
-            if not cache.target_all_provided():
-                raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target")
-            output = cache.commit(target[:, 0], target[:, 1:])
+            for frame in frames:
+                if not frame.cache.target_all_provided():
+                    raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target")
+            sampled_text, audio = target[:, 0], target[:, 1:]
         else:
             sampled_text = _sampled_token_ids(sample_text(text_logits.float()), target[:, 0], "text sampler")
             next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
@@ -194,19 +218,23 @@ class LMSubmodule(ARNodeSubmodule):
                 return _sampled_token_ids(sample_depth(logits, step), target[:, 0], f"depth sampler step {step}")
 
             audio = self.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio)
-            output = cache.commit(sampled_text, audio)
-            if output is None:
-                raise RuntimeError("generate frames always gather an output")
-        if frame.restore_cache is not None:
-            cache.load(frame.restore_cache)
-        outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
-        if not conditioning:
-            # Delay-0 channels from the previous step, delay-1 from this one ([PP] models/lm.py:899-952).
-            outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
-            # B=1 column views can report contiguous while retaining stride 17;
-            # worker byte serialization requires a physical stride of one.
-            outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
-        return outputs
+        results = []
+        for row, frame in enumerate(frames):
+            cache = frame.cache
+            output = cache.commit(sampled_text[row : row + 1], audio[row : row + 1])
+            if frame.restore_cache is not None:
+                cache.load(frame.restore_cache)
+            outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
+            if not conditioning:
+                if output is None:
+                    raise RuntimeError("generate frames always gather an output")
+                # Delay-0 channels from the previous step, delay-1 from this one ([PP] models/lm.py:899-952).
+                outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
+                # B=1 column views can report contiguous while retaining stride 17;
+                # worker byte serialization requires a physical stride of one.
+                outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
+            results.append(outputs)
+        return results
 
     # ------------------------------------------------------------------ engine contract
 
@@ -224,9 +252,7 @@ class LMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
     ) -> dict[str, Any]:
         del graph_walk, engine_inputs
-        if len(inputs) != 1:
-            raise NotImplementedError("PersonaPlex serves batch size 1")
-        return {"frame": inputs[0].kwargs["frame"]}
+        return {"frames": [inp.kwargs["frame"] for inp in inputs]}
 
     def declare_step(
         self,
@@ -249,20 +275,31 @@ class LMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    @torch.no_grad()
-    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frame: LMFrame, **kwargs):
-        del graph_walk, kwargs
+    def _run_engine_frames(self, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame]) -> list[NameToTensorList]:
         if self._backend is None:
             raise RuntimeError("LM resources are not bound")
         self._backend.begin()
         rids = engine_inputs.request_ids
         resources = engine_inputs.resources
         text_sampler, depth_sampler = resources.get(cfg.TEXT_SAMPLER), resources.get(cfg.DEPTH_SAMPLER)
-        return self.run_frame(
-            frame, self._backend,
+        return self.run_frames(
+            frames, self._backend,
             lambda logits: text_sampler.sample(rids, logits),
             lambda logits, _step: depth_sampler.sample(rids, logits.float()),
         )
+
+    @torch.no_grad()
+    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], **kwargs):
+        del graph_walk, kwargs
+        return self._run_engine_frames(engine_inputs, frames)[0]
+
+    @torch.no_grad()
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], **kwargs
+    ) -> dict[str, NameToTensorList]:
+        del graph_walk, kwargs
+        outputs = self._run_engine_frames(engine_inputs, frames)
+        return dict(zip(engine_inputs.request_ids, outputs, strict=True))
 
     def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
         """Finish the walk's loop after its last planned frame (read off ``lm_state``)."""
@@ -277,12 +314,21 @@ class LMSubmodule(ARNodeSubmodule):
         return set()
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
-        del batch, model_inputs
-        return False
+        # A batch holds one walk, so its rows agree on which heads run; one row takes ``forward``.
+        del batch
+        return len(model_inputs) > 1
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        del graph_walk
+        return self._max_batch_size
 
 
 class _MimiSubmodule(NodeSubmodule):
-    """Mimi runs in fp32 like the reference ([PP] models/loaders.py:129-163)."""
+    """Mimi runs in fp32 like the reference ([PP] models/loaders.py:129-163).
+
+    The codec nodes do not batch: each runs once per request, over clips of
+    different lengths, and is not on the per-frame path the LM batches.
+    """
 
     disable_autocast = True
     disable_torch_compile = True

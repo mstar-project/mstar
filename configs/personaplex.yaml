@@ -23,6 +23,9 @@ model_kwargs:
   # as NVIDIA's offline.py does. Requests name a preset with
   # model_kwargs["voice"] (for example "NATF2").
   voice_dir: null
+  # Requests the LM runs together in one step (bounded above by
+  # max_concurrent_requests). 1 runs each request alone.
+  max_batch_size: 8
 
 # Single GPU: every node on rank 0.
 node_groups:

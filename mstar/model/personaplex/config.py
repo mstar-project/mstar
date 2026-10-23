@@ -66,6 +66,10 @@ MAX_TEMPORAL_FORWARDS = CONTEXT_FRAMES - 1
 # Upper bound on decoded user audio: every forward a user frame, no conditioning.
 # The exact per-request limit (after conditioning) is validate_context_budget's.
 MAX_USER_AUDIO_SAMPLES = MAX_TEMPORAL_FORWARDS * FRAME_SIZE
+# Requests the LM runs in one step (the max_batch_size model kwarg). The served
+# YAML's max_concurrent_requests is the tighter bound in practice; 1 runs every
+# request alone, which makes outputs independent of what else is being served.
+DEFAULT_MAX_BATCH_SIZE = 8
 
 TEMPORAL_DIM = 4096  # [PP] models/loaders.py:93
 TEMPORAL_LAYERS = 32  # [PP] models/loaders.py:100

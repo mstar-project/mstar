@@ -61,19 +61,23 @@ DEFAULT_KV_PAGES = 128
 
 
 class PersonaPlexModel(Model):
-    """NVIDIA PersonaPlex-7B (``nvidia/personaplex-7b-v1``), single GPU, batch 1."""
+    """NVIDIA PersonaPlex-7B (``nvidia/personaplex-7b-v1``), single GPU."""
 
     def __init__(
         self,
         model_path_hf: str = DEFAULT_REPO,
         cache_dir: str | None = None,
         voice_dir: str | None = None,
+        max_batch_size: int = cfg.DEFAULT_MAX_BATCH_SIZE,
         skip_weight_loading: bool = False,
         **kwargs,
     ):
+        if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int) or max_batch_size < 1:
+            raise ValueError(f"max_batch_size must be an integer >= 1, got {max_batch_size!r}")
         self.model_path_hf = model_path_hf or DEFAULT_REPO
         self.cache_dir = cache_dir
         self.voice_dir = voice_dir
+        self.max_batch_size = max_batch_size
         # Dummy mode: get_submodule returns None, so the graph runs without weights.
         self.skip_weight_loading = skip_weight_loading
         self.lm_config = cfg.LMArchConfig()
@@ -360,7 +364,11 @@ class PersonaPlexModel(Model):
     # ------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # Text frames carry no conductor_new_token, so the 2048-token default cap never counts them.
+        # The input audio fixes the output length (one agent frame per user
+        # frame), and process_prompt has already bounded it, so a client
+        # max_output_tokens is ignored, as in Nemotron Duplex. Text frames carry
+        # no conductor_new_token, so the conductor's cap never counts them.
+        del model_kwargs
         return cfg.MAX_TEMPORAL_FORWARDS
 
     def get_autocast_dtype(self):
@@ -510,7 +518,7 @@ class PersonaPlexModel(Model):
             path = self._download(LM_CHECKPOINT_NAME)
             lm = build_lm(self.lm_config, iter_lm_checkpoint(path, device=device), device=device)
             logger.info("Loaded PersonaPlex LM from %s", path)
-            return LMSubmodule(lm)
+            return LMSubmodule(lm, max_batch_size=self.max_batch_size)
         if node_name in (cfg.MIMI_ENCODER_NODE, cfg.MIMI_DECODER_NODE):
             from safetensors.torch import load_file
 
