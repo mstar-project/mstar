@@ -695,8 +695,10 @@ class _Rank:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _is_tp_follower_node = Worker._is_tp_follower_node
     _push_back_batch = Worker._push_back_batch
+    _preempt = Worker._preempt
 
     def __init__(self, *, leader: bool):
+        self._kv_caches = {}
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
@@ -729,7 +731,7 @@ def _oom(rank, referenced_rids=frozenset()):
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
@@ -923,7 +925,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
-        self._kv_keys, self._kept_ids, self._rebuild_rows, self._dropped = {}, {}, {}, {}
+        self._kv_keys, self._kept_ids, self._rebuild_rows, self._dropped, self._victims = {}, {}, {}, {}, {}
         self.streaming_buffers: dict = {}
         self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because

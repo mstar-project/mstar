@@ -119,7 +119,7 @@ def _worker(eng, runtime):
     w.enable_prof = False
     w.device = torch.device("cpu")
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped = {}, {}, {}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims = {}, {}, {}, {}, {}
     w._graph_runtime = runtime
     w.tensor_manager = SimpleNamespace(
         cleanup_collectable=lambda *a: None,

@@ -2391,12 +2391,20 @@ class Engine:
     def drop_request(self, node_name: str, request_id: int) -> int:
         """Discard the request's state on this node that can be recomputed from
         its token ids, and return the pages freed."""
-        resources = self._submodules[node_name].resources.values()
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
-        for resource in resources:
-            resource.check_drop(request_id)
-        return sum(resource.drop(request_id) for resource in resources)
+        refusal = self.drop_refusal(node_name, request_id)
+        if refusal is not None:
+            raise RuntimeError(refusal)
+        return sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+
+    def drop_refusal(self, node_name: str, request_id: int) -> str | None:
+        """Why `drop_request` would refuse the request on this node, or None."""
+        for resource in self._submodules[node_name].resources.values():
+            refusal = resource.check_drop(request_id)
+            if refusal is not None:
+                return refusal
+        return None
 
     def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> str:
         """Lay the dropped request's KV out over all of ``ids`` but the last, and return the walk
