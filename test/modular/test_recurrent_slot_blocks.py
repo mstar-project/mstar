@@ -80,6 +80,29 @@ def test_released_slots_are_zeroed_and_forks_copy():
     assert pool.block("state", 2).abs().sum() == 0
 
 
+def test_gather_and_scatter_address_the_steps_rows():
+    """A forward reads and writes its rows' slots through the step's addressing, per slot or
+    per layer, and a padding row reaches only the sink."""
+    pool = build_pool()
+    step = RecurrentStep(segments=[Segment("a", "main", 2), Segment("b", "main", 1)])
+    for rid in ("a", "b"):
+        pool.ingest_request(rid)
+    ctx = StepContext(request_ids=("a", "b"), graph_walk="prefill", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    rows = pool.addressing()
+    pool.scatter_("count", rows, torch.tensor([[3], [5]]))
+    assert int(pool.block("count")[slot_of(pool, "a")]) == 3
+    assert int(pool.block("count")[slot_of(pool, "b")]) == 5
+    assert pool.gather("count", rows).tolist() == [[3], [5]]
+    pool.scatter_("state", rows, torch.ones(2, 2, 4), layer_idx=1)
+    assert pool.gather("state", rows, layer_idx=1).sum() == 16
+    assert pool.block("state", 0).abs().sum() == 0
+    with pytest.raises(ValueError, match="per layer"):
+        pool.gather("state", rows)
+    pool.commit(step, ctx)
+
+
 def test_speculative_delta_net_blocks_shard_with_the_heads():
     geometry = DeltaNetGeometry(
         num_k_heads=4, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4,

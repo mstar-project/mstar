@@ -589,10 +589,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
         the token after ``prev`` (the step's next input)."""
         pool = engine_inputs.resources[KDA_STATE]
-        slots = engine_inputs.resources[KDA].current_plan().slot_ids.long()
-        seed = pool.block(MTP_HIDDEN)
-        seed.index_copy_(0, slots, hidden.to(seed.dtype))
-        pool.block(MTP_DRAFT).index_copy_(0, slots, self._draft_tokens(hidden, prev)[:, None])
+        rows = pool.addressing()
+        pool.scatter_(MTP_HIDDEN, rows, hidden)
+        pool.scatter_(MTP_DRAFT, rows, self._draft_tokens(hidden, prev)[:, None])
 
     def _mtp_prefill(self, engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep) -> None:
         """The MTP pass over the prompt: row i pairs the trunk's state at token i with the
@@ -615,13 +614,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input token per row."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
         pool, kda = engine_inputs.resources[KDA_STATE], engine_inputs.resources[KDA]
-        slots = kda.current_plan().slot_ids.long()
-        n = slots.shape[0]
+        rows = pool.addressing()
+        n = rows.num_rows
 
         # Drafts: d1 was seeded by the last step; each further one is an MTP pass whose
         # query sits at its row of this step's block.
-        h = pool.block(MTP_HIDDEN).index_select(0, slots)
-        drafts = [pool.block(MTP_DRAFT).index_select(0, slots)[:, 0]]
+        h = pool.gather(MTP_HIDDEN, rows)
+        drafts = [pool.gather(MTP_DRAFT, rows)[:, 0]]
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank + attn.mla_cache_kpe)
         for row in range(k - 1):
@@ -646,12 +645,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # Seed the next step: the MTP pass over the block, with the target's argmax as each
         # row's next token (up to the accepted row it equals the drafts), read at the last
         # accepted row.
-        rows = torch.arange(n, device=slots.device)
-        next_input = target[rows, accepted]
+        each = torch.arange(n, device=accepted.device)
+        next_input = target[each, accepted]
         h_block = lm.mtp(lm.model.embed_tokens(target.reshape(-1)), hidden)
-        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[rows, accepted], next_input)
+        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[each, accepted], next_input)
 
-        keep = torch.arange(block, device=slots.device)[None, :] <= accepted[:, None]
+        keep = torch.arange(block, device=accepted.device)[None, :] <= accepted[:, None]
         self._mask_holes(engine_inputs, keep)
         return next_input
 
