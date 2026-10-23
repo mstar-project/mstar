@@ -2489,6 +2489,8 @@ class Engine:
         (walk,) = {
             kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
         }
+        if node_name in self._resident_delta:
+            self._journal(node_name, "", MoveKind.REBUILD, request_id, 0)
         return walk
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
@@ -2653,6 +2655,8 @@ class Engine:
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.info("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
+            elif kind == MoveKind.REBUILD:
+                self.lay_out_rebuild(node_name, rid, kept_ids(rid))
             elif kind == MoveKind.OFFLOAD:
                 if self.is_offloaded(node_name, rid):
                     logger.debug(

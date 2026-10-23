@@ -634,7 +634,7 @@ class _Leader:
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), rebuild_rids=frozenset(),
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),

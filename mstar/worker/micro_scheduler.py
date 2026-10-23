@@ -71,6 +71,8 @@ class ScheduledBatch:
     tp_seq: int = -1
     # rid -> real walk, set iff ``graph_walk`` is a combined walk
     request_walks: dict[int, str] = field(default_factory=dict)
+    # on a TP follower, the rows of rank 0's step that rebuild a dropped request
+    rebuild_rids: tuple[int, ...] = ()
     # real walk -> its output edge names, under a combined walk
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
@@ -544,7 +546,7 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
-        if not first_tp_node.request_ids:
+        if not first_tp_node.request_ids and not first_tp_node.rebuild_ids:
             # a step with no rows, so pop it rather than build an empty batch
             self.pop_tp_follow_head()
             return
@@ -568,6 +570,7 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            rebuild_rids=tuple(map(self.rid_of, first_tp_node.rebuild_ids)) if first_tp_node.rebuild_ids else (),
         )
 
 

@@ -232,6 +232,8 @@ class ScheduleTPNode(MessageBody):
     # rank 0's prefix-cache leases, by wire request id and then resource
     prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # the step's rebuild rows, which run ahead of ``request_ids`` and aren't taken from a ready queue
+    rebuild_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

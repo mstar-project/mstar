@@ -1256,11 +1256,23 @@ class Worker:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
         ids = self._kept_ids_of(node_name, request_id)
         walk = engine.lay_out_rebuild(node_name, request_id, ids)
+        self._rebuild_rows[request_id] = self._rebuild_row(node_name, walk, ids)
+        self._dropped.pop(request_id, None)
+        self._preemptions[node_name].rebuild_tokens += len(ids) - 1
+
+    def _follower_rebuild(self, batch: ScheduledBatch) -> dict[int, RebuildRow] | None:
+        """The rebuild rows of a step rank 0 sent this follower, built from this rank's own kept ids."""
+        if not batch.rebuild_rids:
+            return None
+        node_name, walk = batch.node_name, batch.graph_walk
+        return {
+            rid: self._rebuild_row(node_name, walk, self._kept_ids_of(node_name, rid)) for rid in batch.rebuild_rids
+        }
+
+    def _rebuild_row(self, node_name: str, walk: str, ids: array) -> RebuildRow:
         (name,) = self._walk_inputs[(walk, node_name)]
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
-        self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
-        self._dropped.pop(request_id, None)
-        self._preemptions[node_name].rebuild_tokens += len(tokens)
+        return RebuildRow(node_name, walk, {name: [tokens]})
 
     def _readmit_dropped(self) -> None:
         """Rebuild each dropped request that is first in its node's queue, once its kept history and
@@ -2039,11 +2051,13 @@ class Worker:
                 node_batch.node_name, ctx.walk_of(sample_rid)
             )._workers[1:]
         workers = self._tp_followers
+        rebuild, request_ids, rebuild_ids = node_batch.rebuild_rids, node_batch.request_ids, []
+        if rebuild:
+            request_ids = [rid for rid in request_ids if rid not in rebuild]
+            rebuild_ids = [self._rid_str(rid) for rid in node_batch.request_ids if rid in rebuild]
         walks, walk_idx = [], []
         if ctx.request_walks:
-            rows = RequestWalks.from_walks(
-                node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
-            )
+            rows = RequestWalks.from_walks(request_ids, [ctx.walk_of(r) for r in request_ids])
             walks, walk_idx = rows.walks, rows.walk_idx
         for worker in workers:
             self.communicator.send(
@@ -2052,7 +2066,7 @@ class Worker:
                     body=ScheduleTPNode(
                         node_name=node_batch.node_name,
                         graph_walk=node_batch.graph_walk,
-                        request_ids=[self._rid_str(r) for r in node_batch.request_ids],
+                        request_ids=[self._rid_str(r) for r in request_ids],
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
@@ -2061,6 +2075,7 @@ class Worker:
                         walk_idx=walk_idx,
                         prefix_hits=prefix_hits,
                         page_trails=page_trails,
+                        rebuild_ids=rebuild_ids,
                     )
                 )
             )
@@ -2535,7 +2550,11 @@ class Worker:
                 batch.discard_rid(rid)
 
         reason = node_batch.admit_error
-        if node_batch.rebuild_rids and self._requeue_rebuilds(batch, node_batch, reason):
+        if (
+            node_batch.rebuild_rids and not self._is_tp_follower_node(batch.node_name)
+            and self._requeue_rebuilds(batch, node_batch, reason)
+        ):
+            # a follower runs the rows again when rank 0's next step names them
             return
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
@@ -4650,7 +4669,8 @@ class Worker:
                         exclude_target=yield_away_from_target,
                     )
                 if batch is not None:
-                    node_batch = self._build_executing_batch(batch)
+                    # a follower's yield-away can take rank 0's next step, rebuild rows and all
+                    node_batch = self._build_executing_batch(batch, self._follower_rebuild(batch))
                     batch_partition = self.request_state.get_partition_for_node(batch.node_name)
                     logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
                     speculation = Speculation(
@@ -5170,6 +5190,8 @@ class Worker:
 
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
+                if batch.rebuild_rids:
+                    rebuild = self._follower_rebuild(batch)
                 node_batch = self._build_executing_batch(batch, rebuild)
                 batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
@@ -5206,8 +5228,9 @@ class Worker:
                     submitted_at=submitted_at,
                 ))
                 # only now, so a raise before the step is pending leaves them queued
-                for rid in node_batch.rebuild_rids:
-                    del self._rebuild_rows[rid]
+                if scheduled is not None:
+                    for rid in node_batch.rebuild_rids:
+                        del self._rebuild_rows[rid]
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)

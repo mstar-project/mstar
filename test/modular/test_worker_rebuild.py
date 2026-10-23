@@ -54,6 +54,7 @@ def _worker(fresh: ScheduledBatch | None = None):
                       ("pair", NODE): {"a", "b"}, ("pair_decode", NODE): {"a", "b"}}
     w._growth_loops = {(DECODE, NODE): "loop", ("embeds", NODE): "embeds_loop", ("pair_decode", NODE): "pair_loop"}
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
+    w.parallel_nodes = w.parallel_leader_nodes = set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,
                                        get_rid_string=str, push_back_node=lambda node, rids, wgs: w.pushed.extend(rids))
