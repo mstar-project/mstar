@@ -1,5 +1,6 @@
 """sparse_mla on CPU: the torch reference against a masked dense softmax, and a sharded row
 selection against the unsharded one."""
+import pytest
 import torch
 
 from mstar.engine.resources.dsa import sparse_mla
@@ -49,6 +50,7 @@ class _FakeGroup:
 
 def test_select_rows_shards_into_the_unsharded_selection():
     rows = torch.arange(1000, dtype=torch.int32)[:, None].expand(-1, 5).contiguous()
+    request = sparse_mla.RequestPages(torch.arange(250, dtype=torch.int32), 4)  # slot = position
 
     def select(a, b):
         return rows[a:b]
@@ -57,8 +59,39 @@ def test_select_rows_shards_into_the_unsharded_selection():
         group = _FakeGroup(world)
         for rank in range(world):  # the last rank's call sees every block
             group.rank = rank
-            got = sparse_mla.select_rows(select, r0, r1, 5, torch.device("cpu"), group)
+            got = sparse_mla.select_rows(select, r0, r1, 5, torch.device("cpu"), group, request)
         assert torch.equal(got, rows[r0:r1]), (world, r0, r1)
+
+
+def test_a_sharded_selection_comes_back_as_each_ranks_own_slots():
+    """The ranks hold the request in different pages: each selects its block in its own slots,
+    the blocks cross as positions, and every rank gets the whole selection in its own slots.
+    Gathering slots instead gave a rank another rank's pages, other tokens or other requests'."""
+    page, n_pages, world = 4, 80, 4
+    pages = [torch.randperm(200, generator=torch.Generator().manual_seed(r))[:n_pages].int()
+             for r in range(world)]
+    # row r picks positions r, r - 7, r // 2, then nothing
+    rows = torch.arange(n_pages * page)[:, None]
+    picks = torch.cat([rows, rows - 7, rows // 2, torch.full_like(rows, -1)], 1).clamp_min(-1)
+    picks = picks.to(torch.int32)
+
+    def slots_on(rank, positions):
+        return sparse_mla.RequestPages(pages[rank], page).to_slots(positions)
+
+    group = _FakeGroup(world)
+    for rank in range(world):
+        group.rank = rank
+        got = sparse_mla.select_rows(
+            lambda a, b: slots_on(group.rank, picks[a:b]), 0, picks.shape[0], 4,
+            torch.device("cpu"), group, sparse_mla.RequestPages(pages[rank], page))
+    assert torch.equal(got, slots_on(world - 1, picks))
+    assert torch.equal(sparse_mla.RequestPages(pages[1], page).to_positions(slots_on(1, picks)), picks)
+
+
+def test_a_sharded_selection_needs_the_request_pages():
+    with pytest.raises(ValueError, match="request's pages"):
+        sparse_mla.select_rows(lambda a, b: torch.zeros(b - a, 2, dtype=torch.int32), 0, 1000, 2,
+                               torch.device("cpu"), _FakeGroup(4))
 
 
 def test_select_rows_keeps_short_spans_on_every_rank():
