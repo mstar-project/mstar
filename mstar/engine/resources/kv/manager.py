@@ -2682,6 +2682,11 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
+    def stored_len(self, rid: str, label: str = "main") -> int:
+        """Tokens the stream holds (GLM-5.2's DSA checks its index store against its latents)."""
+        with self._lock:
+            return self._streams[rid][label].stored_len
+
     def _own_transfer_info(
         self,
         request_id: str,
@@ -3263,6 +3268,23 @@ class KVManager(AttentionResource):
             token_to_page=full.token_to_page[start:end],
             token_to_cache=full.token_to_cache[start:end],
             total_tokens=end - start,
+        )
+        try:
+            yield
+        finally:
+            self._current_plan_states[label] = full
+
+    @contextmanager
+    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
+        order), for a pass over some of a step's rows: each writes at its own slot."""
+        if label is None:
+            label = self._default_label
+        full = self._current_plan_states[label]
+        self._current_plan_states[label] = KVPlanState(
+            token_to_page=full.token_to_page[rows],
+            token_to_cache=full.token_to_cache[rows],
+            total_tokens=rows.numel(),
         )
         try:
             yield

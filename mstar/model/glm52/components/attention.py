@@ -5,8 +5,14 @@ from __future__ import annotations
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.dsa import paged
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.model.components.mla import MLAAttention
-from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
+from mstar.model.glm52.components.indexer import (
+    Glm52Indexer,
+    index_store_layer,
+    is_full_indexer_layer,
+)
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -41,10 +47,10 @@ def masked_reference_attention(
 
 class Glm52MLAAttention(MLAAttention):
     """The shared MLA with GLM-5.2's DSA: on FULL layers an indexer projects each token's index
-    key and each query's heads, and the DSA resource picks each query's top ``index_topk`` keys;
-    SHARED layers reuse the last FULL layer's pick, and the absorbed path attends just those
-    latents. ``dsa_selection`` is the naive path's reference hook: given rows, the mask over
-    the current batch."""
+    key and each query's heads, and the DSA resource's context (``paged``) picks each query's top
+    ``index_topk`` keys; SHARED layers reuse the last FULL layer's pick, and the absorbed path
+    attends just those latents. ``dsa_selection`` is the naive path's reference hook: given
+    rows, the mask over the current batch."""
 
     def __init__(
         self,
@@ -60,7 +66,7 @@ class Glm52MLAAttention(MLAAttention):
         # And only under dsa_long_context, the one mode that declares the DSA
         # resource: off it, a FULL layer's indexer (replicated, not TP-sharded)
         # would be read and held for nothing; the loader skips its keys to match
-        # (Glm52ForCausalLM.load_weights).
+        # (Glm52ForCausalLM.load_weights). layer_idx is the selection's provenance.
         self.dsa_long_context = config.dsa_long_context
         self.indexer = (
             Glm52Indexer(config)
@@ -69,6 +75,11 @@ class Glm52MLAAttention(MLAAttention):
             and is_full_indexer_layer(config, layer_idx)
             else None
         )
+        # this FULL layer's index plane on the MLA cache's pages
+        self.index_layer_idx = (
+            index_store_layer(config, layer_idx) if self.indexer is not None else None)
+        # dsa_shard_prefill: TP ranks split a long prefill's selection (paged.select)
+        self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
         self._dsa = None
 
     def bind_resources(self, resources: dict) -> None:
@@ -82,7 +93,7 @@ class Glm52MLAAttention(MLAAttention):
                 "dsa_long_context off: its indexer does not exist"
             )
         if self._dsa is not None and not self.mla_absorb:
-            # The sparse path reads the paged 576-dim latent cache; the naive
+            # Sparse attention reads the paged 576-dim latent cache; the naive
             # backend stores padded per-head K/V instead. The naive path stays
             # what it is: the reduced-test parity fallback.
             raise RuntimeError(
@@ -114,45 +125,70 @@ class Glm52MLAAttention(MLAAttention):
         mask = dsa_selection_to_mask(dsa_selection, q.shape[0], dtype=q.dtype, device=q.device)
         return masked_reference_attention(q, k, v, mask)
 
+    def _dsa_ctx(self) -> paged.DSAContext | None:
+        """The forward's DSA context, which the submodule opened on the resource."""
+        return self._dsa.ctx if self._dsa is not None else None
+
     def _selects(self, dsa_selection=None) -> bool:
-        return self._dsa is not None
+        return self._dsa_ctx() is not None
 
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
-        # None-guarded here (not just inside _dsa_select) so the default
+        # None-guarded here (not just inside _dsa_update) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo
         # specializes on the unbound resource and folds the branch away.
         if self._dsa is None:
             return None
-        return self._dsa_select(hidden_states, q_c, position_ids)
+        return self._dsa_update(hidden_states, q_c, position_ids)
 
-    # The layer index and the resource's host state are read only here, outside dynamo.
+    # Host-side per-step work (python lists, launches sized on the host): keep dynamo out of
+    # it, same as the cache-manager plan/run methods.
     @torch.compiler.disable
-    def _dsa_select(
-        self, hidden_states: torch.Tensor, q_c: torch.Tensor, position_ids: torch.Tensor,
+    def _dsa_update(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Hand the DSA resource this FULL layer's keys and return the pick to attend, or None
-        while every row sees at most ``index_topk`` keys; a SHARED layer reuses the last pick."""
-        dsa = self._dsa
-        if self.indexer is None:
-            return dsa.shared_selection(self.layer_idx) if dsa.needs_selection() else None
-        dsa.store_keys(self.layer_idx, self.indexer.compute_k(hidden_states, position_ids))
-        if not dsa.needs_selection():
+        """A FULL layer writes its index keys to its index plane and, when a row needs it,
+        returns each row's selected latent-cache slots; a SHARED layer reuses the last FULL
+        one's."""
+        dsa_ctx = self._dsa_ctx()
+        if dsa_ctx is None:
             return None
-        q, weights = self.indexer.compute_query(q_c, hidden_states, position_ids)
-        return dsa.select(self.layer_idx, q, weights)
+        if self.indexer is None:
+            if not dsa_ctx.needs_selection:
+                return None
+            if dsa_ctx.last_selection is None:
+                raise RuntimeError(
+                    f"SHARED layer {self.layer_idx} needs a DSA selection but no "
+                    "FULL layer ran before it")
+            return dsa_ctx.last_selection
+        keys = self.indexer.compute_k(hidden_states, position_ids)
+        paged.write_index(self._kv, self.index_layer_idx, None, keys, dsa_ctx)
+        if not dsa_ctx.needs_selection:
+            return None
+        q, w = self.indexer.compute_query(q_c, hidden_states, position_ids)
+        selection = paged.select(
+            q, w, self._kv.aux_view(INDEX_PLANES, self.index_layer_idx), dsa_ctx,
+            self.dsa_group)
+        dsa_ctx.last_selection = selection
+        dsa_ctx.last_selection_layer = self.layer_idx
+        return selection
 
     @torch.compiler.disable
     def _attend_selected(
         self,
-        selection: torch.Tensor,
+        slots: torch.Tensor,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
         kv_c: torch.Tensor,
         k_pe: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Write this step's latents, then sparse absorbed MLA over the picked ones."""
+        """Write the step's latents at the plan's slots, then attend each row over its own
+        selected slots (prefill rows too: each sees its causal top-k)."""
+        dsa_ctx = self._dsa_ctx()
         layer_idx = self.cache_layer_idx
         self._kv.write_kv(torch.cat([kv_c, k_pe], dim=-1).squeeze(1), None, layer_idx=layer_idx)
-        return self._dsa.attend(
-            selection, q_nope, q_pe, self._kv.layer_view(layer_idx), self.softmax_scale)
+        return paged.sparse_attend(
+            q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)

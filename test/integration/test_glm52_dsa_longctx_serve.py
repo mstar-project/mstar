@@ -17,10 +17,16 @@ from mstar.engine.resources import (
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import (
+    ATTN_RESOURCE,
+    DSA_RESOURCE,
+    KV_RESOURCE,
+    Glm52ModelConfig,
+)
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -36,7 +42,8 @@ TOPK = 8
 PROMPT_LEN = 6
 MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 # 8-token pages, 16 of them (one is the sink page): 120 cached tokens for a
-# 20-token context, and the torch fallback's page table spans every page.
+# 20-token context, and the torch fallback's page table spans every page. The
+# index keys sit on the same pages.
 KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 16, "page_size": 8}}}
 
 
@@ -179,8 +186,8 @@ class _Serve:
     def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor,
              batched: bool = True) -> dict:
         """declare -> admit -> plan -> preprocess -> forward -> commit. The
-        plan runs BEFORE preprocess, as in the engine: the DSA resource plans
-        this step's rows off the KV plan."""
+        plan runs BEFORE preprocess, as in the engine: the DSA resource stages
+        this step's rows from the KV plan."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
         step = self.submodule.declare_step(walk, [rid], inputs)
@@ -214,9 +221,8 @@ class _Serve:
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
     """The real serve loop (prefill -> decode -> check_stop) on the sparse
-    path; returns (generated tokens, stopped-via-check_stop, the DSA resource's
-    stored key counts of layers 0 and 1 before retirement, the requests it
-    still tracks after)."""
+    path; returns (generated tokens, stopped-via-check_stop, the tokens the
+    latent cache and the index-key store hold before retirement)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
@@ -244,10 +250,21 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
             if stop:
                 stopped = True
                 break
-        stored = (dsa.keys.tokens(serve.rid, 0), dsa.keys.tokens(serve.rid, 1))
+        stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
+        assert dsa.ctx is None  # each forward closed the context it opened on the resource
     finally:
-        serve.close(cleanup_request=False)
-    return generated, stopped, stored, dsa.keys.tracked_requests()
+        serve.close()
+    return generated, stopped, stored
+
+
+def _stored_rows(kv, rid):
+    """The request's stored latent rows, and how many of them have their index keys (the first
+    index plane's rows at the same slots)."""
+    n = kv.stored_len(rid)
+    pos = torch.arange(n)
+    pages = torch.tensor(kv._streams[rid]["main"].page_indices)[pos // kv.config.page_size]
+    keys = kv.aux_view(INDEX_PLANES, 0)[pages.to(DEVICE), (pos % kv.config.page_size).to(DEVICE)]
+    return n, int((keys != 0).any(-1).sum())
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
@@ -284,11 +301,6 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
-    # Long-context serving is eager-only (the DSA resource selects per request
-    # on the host, which a captured graph would not replay): neither
-    # whole-forward nor piecewise.
-    assert submodule.get_accelerator_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_accelerator_graph_configs(DEVICE, DTYPE) == {}
     # The absorbed declaration: one latent row per token, the MLA resource
     # planned over it (its torch fallback at reduced dims).
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
@@ -296,21 +308,20 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert specs[KV_RESOURCE].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
     assert specs[KV_RESOURCE].config.kv_lora_rank == cfg.kv_lora_rank
     assert specs[ATTN_RESOURCE].config.backend is AttnBackend.FLASHINFER_MLA
+    # the index keys on the latents' pages: one index_head_dim row per token per FULL layer
+    assert specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES].width == cfg.index_head_dim
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves and stops cleanly ------------------
-    generated, stopped, stored, tracked = _generate_greedy(
-        model, submodule, prompt_ids, MAX_TOKENS)
+    generated, stopped, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
     assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    # key store lifecycle on the real path: one row per token per FULL layer
-    # (prefill 6 + one per decode forward), gone after retirement.
-    assert stored[0] == PROMPT_LEN + MAX_TOKENS - 1  # 6 prompt rows + 13 decode forwards
-    assert stored[1] == 0  # SHARED layer: none
-    assert tracked == set()
+    # every stored token has its index keys, at its latent's slot
+    # (prefill 6 + one per decode forward)
+    assert stored == (PROMPT_LEN + MAX_TOKENS - 1,) * 2  # 6 prompt rows + 13 decode forwards
 
     # ---- teacher-forced replays of the generated sequence --------------
     forced = generated[:-1]  # the last token is never fed back

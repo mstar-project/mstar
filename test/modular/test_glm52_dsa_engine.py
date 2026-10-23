@@ -1,7 +1,9 @@
-"""GLM-5.2 on the DSA resource: guard states, the declared step, IndexShare threading and
-decode across ``index_topk`` — over the real ``KVManager`` (MLA latent layout), MLA attention
-resource and DSA resource on CPU. The resource's own math is test_dsa_resource.py's.
+"""DSA engine half: per-request state, guard states, IndexShare threading and
+the prefix property across index_topk — over the real ``KVManager`` (MLA
+latent layout, the index keys on its pages), the DSA resource and the MLA
+attention resource on CPU.
 """
+import itertools
 import sys
 import types
 from pathlib import Path
@@ -33,10 +35,16 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
+from mstar.engine.resources.dsa import paged  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig  # noqa: E402
 from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
+from mstar.model.glm52._testing import (  # noqa: E402
+    build_cpu_resources,
+    build_random_model,
+    install_cpu_rope,
+)
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
-from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -48,17 +56,26 @@ from mstar.model.glm52.config import (  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
-from mstar.model.utils import process_weights_after_loading  # noqa: E402
 from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
-def test_cleanup_request_drops_the_request_state():
-    """Retirement leaves NO per-request growth: the engine's request removal calls
-    cleanup_request on every managed submodule, which drops the MTP counters, the token budget
-    and the prefill's stop (the index keys are the DSA resource's, which remove_request drops)."""
+def _ctx(needs_selection: bool) -> DSAContext:
+    """One decode row at position 6 of a single-page request."""
+    one = torch.ones(1, dtype=torch.int32)
+    return DSAContext(
+        pos=one * 6, row_req=one - 1, pages=one, page_start=one - 1, host_pos=[6],
+        spans=[(0, 1, 0)], host_page_start=[0], max_pools=7, page_size=8, topk=4, kpool=1,
+        needs_selection=needs_selection)
+
+
+def test_cleanup_request_drops_per_request_state():
+    """Retirement leaves NO per-request growth: the engine's request removal
+    calls cleanup_request on every managed submodule, which must drop the
+    prefix-hit mark, the MTP counters, the token budget and the prefill's stop."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
+    sub._prefix_hits = {"r0"}
     sub._mtp_emitted = {"r0": 7}
     sub._mtp_checked = {"r0": 7}
     sub._mtp_max_tokens = {"r0": 32}
@@ -68,6 +85,7 @@ def test_cleanup_request_drops_the_request_state():
 
     sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
     sub.cleanup_request("r0")
+    assert sub._prefix_hits == set()
     assert sub.request_states == {}
     assert sub._mtp_emitted == {}
     assert sub._mtp_max_tokens == {}
@@ -89,14 +107,42 @@ class _FakePositions:
         return self._starts[rid]
 
 
+class _FakeKV:
+    def __init__(self, config, page_size=8):
+        # what the DSA resource reads off its cache's config
+        self.config = SimpleNamespace(
+            page_size=page_size, max_seq_len=config.max_seq_len,
+            num_qo_heads=config.num_attention_heads, kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim)
+
+
+def _fake_step(starts, seq_len, tables):
+    """This step's plan of the latent cache, as the DSA resource reads it: one view per
+    request, positionally, and the step's pages flat; an eager prefill."""
+    views = [SimpleNamespace(length=start + seq_len, to_compute=seq_len)
+             for start in starts.values()]
+    indptrs = SimpleNamespace(
+        paged_kv_indptr=torch.tensor([0, *itertools.accumulate(len(t) for t in tables)]),
+        paged_kv_indices=torch.tensor([p for t in tables for p in t], dtype=torch.int32))
+    plan = {KV_RESOURCE: {"main": SimpleNamespace(views=views, cpu_indptrs=indptrs)}}
+    return SimpleNamespace(ctx=StepContext(
+        request_ids=tuple(starts), graph_walk="prefill", slot=0, capture=False,
+        plan_results=plan))
+
+
 def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
+    sub._prefix_hits = set()
     sub._index_stager = PinnedStager(torch.long)
+    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 
-def _preprocess(sub, starts, seq_len):
+def _preprocess(sub, starts, seq_len, tables=None, steps=None):
+    """``sub.preprocess`` of an eager prefill over fake resources; ``steps`` collects the
+    step whose plan it read."""
+    cfg = sub.config
     sub.get_device = lambda: torch.device("cpu")
     inputs = [
         ARNodeInputs(
@@ -105,10 +151,18 @@ def _preprocess(sub, starts, seq_len):
         )
         for _ in starts
     ]
+    resources = {KV_RESOURCE: _FakeKV(cfg), POS_RESOURCE: _FakePositions(starts)}
+    if cfg.dsa_long_context:  # the one mode that declares the DSA resource
+        resources[DSA_RESOURCE] = DSAManager(
+            DSAConfig(kv_cache=KV_RESOURCE, topk=cfg.index_topk, dense_below_topk=True),
+            resources[KV_RESOURCE].config, torch.device("cpu"))
+    sub.node_resources = resources
     engine_inputs = SimpleNamespace(
-        request_ids=list(starts),
-        resources={POS_RESOURCE: _FakePositions(starts)},
+        request_ids=list(starts), resources=resources, captured=False,
+        step=_fake_step(starts, seq_len, tables or [[0, 1, 2] for _ in starts]),
     )
+    if steps is not None:
+        steps.append(engine_inputs.step)
     return sub.preprocess("prefill", engine_inputs, inputs)
 
 
@@ -116,7 +170,8 @@ def test_guard_flag_off_holds_context_to_topk():
     cfg = Glm52ModelConfig()
     assert cfg.dsa_long_context is False
     sub = _make_submodule(cfg)
-    _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
+    out = _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
+    assert sub._dsa_ctx(out) is None
     with pytest.raises(RuntimeError, match="dsa_long_context"):
         _preprocess(sub, {"r0": 2040}, seq_len=16)
 
@@ -126,22 +181,41 @@ def test_guard_flag_on_lifts_cap_to_max_seq_len():
     cfg.dsa_long_context = True
     cfg.max_seq_len = 4096
     sub = _make_submodule(cfg)
+    topk = cfg.index_topk
 
-    # Decode one past topk: allowed (the DSA resource selects for it).
-    _preprocess(sub, {"r0": cfg.index_topk}, seq_len=1)
+    # Decode one past topk: allowed, and the batch is marked for selection.
+    ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=1))
+    assert isinstance(ctx, DSAContext)
+    assert ctx.needs_selection is True
+    assert ctx.host_pos == [topk]  # it sees topk + 1 keys
+    assert ctx.last_selection is None  # transient starts clean every forward
+
+    # Prefill rows past topk select too: each over its own causal prefix.
+    ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=16))
+    assert ctx.needs_selection is True
+    assert ctx.host_pos == list(range(topk, topk + 16))
 
     # The new cap is max_seq_len, not topk.
     with pytest.raises(RuntimeError, match="max_seq_len"):
         _preprocess(sub, {"r0": 4096}, seq_len=1)
 
 
-def test_guard_flag_on_prefill_beyond_topk_is_refused_decode_first():
+def test_flag_on_identity_batch_builds_spans_without_selection():
     cfg = Glm52ModelConfig()
     cfg.dsa_long_context = True
-    cfg.max_seq_len = 4096  # inside the lifted cap: the topk rule must fire
     sub = _make_submodule(cfg)
-    with pytest.raises(RuntimeError, match="decode-only"):
-        _preprocess(sub, {"r0": cfg.index_topk}, seq_len=16)
+    steps = []
+    ctx = sub._dsa_ctx(
+        _preprocess(sub, {"r0": 0, "r1": 5}, seq_len=4, tables=[[0, 1, 2], [5]], steps=steps))
+
+    assert ctx.needs_selection is False  # everything fits topk: identity
+    assert ctx.spans == [(0, 4, 0), (4, 4, 1)]
+    assert ctx.host_pos == [0, 1, 2, 3, 5, 6, 7, 8]
+    assert ctx.row_req.tolist() == [0] * 4 + [1] * 4
+    assert ctx.pages.tolist() == [0, 1, 2, 5] and ctx.page_start.tolist() == [0, 3]
+    # The pages are a snapshot: a later change to the plan's must not alias.
+    steps[0].ctx.plan_results[KV_RESOURCE]["main"].cpu_indptrs.paged_kv_indices[0] = 99
+    assert ctx.pages.tolist() == [0, 1, 2, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +236,14 @@ def test_model_kwarg_dsa_long_context():
 
     with pytest.raises(ValueError, match="mla_absorb"):
         Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
+    mtp = Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
+    assert mtp.config.dsa_long_context and mtp.config.mtp_num_draft_tokens == 2
+
+
+def test_model_kwarg_dsa_long_context_refuses_old_flashinfer(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace(__version__="0.6.17"))
+    with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+        Glm52Model(model_path_hf="", dsa_long_context=True)
 
 
 def test_reduced_variant_grows_trunk_for_mtp():
@@ -184,63 +264,14 @@ def test_reduced_variant_grows_trunk_for_mtp():
         Glm52MTPModule(m.config)  # the SHARED-slot guard no longer fires
 
 
-def test_no_cuda_graphs_when_long_context():
-    cfg = Glm52ModelConfig.reduced()  # would otherwise register 2 configs
-    cfg.dsa_long_context = True
-    sub = _make_submodule(cfg)
-    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
-    assert sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
-
-
 # ---------------------------------------------------------------------------
 # The real resources: reduced absorbed model driven a step at a time
 # ---------------------------------------------------------------------------
 
-def _build_absorbed_model(cfg, seed):
-    """Randomize EVERY parameter (MoE expert containers are raw
-    ``torch.empty`` at construction — garbage in them NaNs the logits)."""
-    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-
-    torch.manual_seed(seed)
-    model = Glm52ForCausalLM(cfg)
-    model.model.embed_tokens.weight.data.normal_(0, 0.05)
-    model.model.norm.weight.data.normal_(1.0, 0.02)
-    model.lm_head.weight.data.normal_(0, 0.02)
-    for layer in model.model.layers:
-        a = layer.self_attn
-        for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa,
-                    a.kv_b_proj, a.o_proj):
-            lin.weight.data.normal_(0, 0.03)
-        for norm in (a.q_a_layernorm, a.kv_a_layernorm):
-            norm.weight.data.normal_(1.0, 0.02)
-        if a.indexer is not None:
-            a.indexer.wq_b.weight.data.normal_(0, 0.05)
-            a.indexer.wk.weight.data.normal_(0, 0.05)
-            a.indexer.weights_proj.weight.data.normal_(0, 0.05)
-            a.indexer.k_norm.weight.data.normal_(1.0, 0.02)
-            a.indexer.k_norm.bias.data.normal_(0, 0.02)
-        layer.input_layernorm.weight.data.normal_(1.0, 0.02)
-        layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
-        mlp = layer.mlp
-        if isinstance(mlp, Glm52SparseMoeBlock):
-            mlp.gate.weight.data.normal_(0, 1)
-            mlp.gate.e_score_correction_bias.data = torch.randn(
-                cfg.n_routed_experts, dtype=torch.float32)
-            mlp.experts.gate_up_proj.data.normal_(0, 0.05)
-            mlp.experts.down_proj.data.normal_(0, 0.05)
-            mlp.shared_expert.gate_up_proj.weight.data.normal_(0, 0.05)
-            mlp.shared_expert.down_proj.weight.data.normal_(0, 0.05)
-        else:
-            mlp.gate_up_proj.weight.data.normal_(0, 0.05)
-            mlp.down_proj.weight.data.normal_(0, 0.05)
-    process_weights_after_loading(model, torch.device("cpu"))
-    return model.eval()
-
-
 class _Driver:
     """The engine's per-step cycle for one request over the real resources:
-    declare -> admit -> plan (the DSA resource plans its rows off the live KV
-    plan, as serving would) -> preprocess -> forward -> commit."""
+    declare -> admit -> plan -> preprocess (builds the DSA inputs exactly as
+    serving would, page tables from the live plans) -> forward -> commit."""
 
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rid="r0", page_size=8):
         self.sub, self.rid = sub, rid
@@ -270,6 +301,11 @@ def _serve_steps(driver: _Driver, prompt, decode_tokens):
     return logits_per_step
 
 
+def _keys_written(kv, plane: int) -> int:
+    """Rows of index plane ``plane`` a layer has written: the rest of the pool is zeros."""
+    return int((kv.aux_view(INDEX_PLANES, plane) != 0).any(-1).sum())
+
+
 def _longctx_reduced_cfg(topk):
     cfg = Glm52ModelConfig.reduced()
     cfg.mla_absorb = True
@@ -278,11 +314,12 @@ def _longctx_reduced_cfg(topk):
     return cfg
 
 
-def test_declared_step_under_dsa_adds_the_dsa_step():
+def test_declared_step_under_dsa_adds_the_dsa_resource():
     cfg = _longctx_reduced_cfg(topk=4)
-    sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
+    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
     step = sub.declare_step("prefill", ["r0"], [ar])
+    # the index keys live on the latent cache's pages: no KV resource of their own
     assert set(step.keys()) == {
         KV_RESOURCE, ATTN_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE, DSA_RESOURCE}
     assert step.segments[0].span == 3
@@ -292,36 +329,28 @@ def test_full_to_shared_threading_order(monkeypatch):
     """Layer 1 (SHARED, no indexer weights) must consume the selection layer
     0 (FULL) published THIS forward — the IndexShare reuse window."""
     cfg = _longctx_reduced_cfg(topk=4)
-    model = _build_absorbed_model(cfg, seed=0)
+    model = build_random_model(cfg, seed=0)
     sub = Glm52LLMSubmodule(language_model=model, config=cfg)
     driver = _Driver(sub, cfg)
     dsa = driver.resources[DSA_RESOURCE]
 
     trace = []
-    layer = {}
 
-    def spy(self, selection, q_nope, q_pe, latent_layer, sm_scale, label="main"):
-        trace.append((layer["idx"], selection))
+    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
+        trace.append((self.layer_idx, selection))
         return torch.zeros_like(q_nope)
 
-    monkeypatch.setattr(DSAManager, "attend", spy)
-    attend_selected = Glm52MLAAttention._attend_selected
+    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", spy)
 
-    def tagged(self, *args, **kwargs):
-        layer["idx"] = self.layer_idx
-        return attend_selected(self, *args, **kwargs)
+    select_calls = []
+    original = paged.select
 
-    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", tagged)
-
-    picks = []
-    select = DSAManager.select
-
-    def counting(self, *args, **kwargs):
-        result = select(self, *args, **kwargs)
-        picks.append(result)
+    def counting(*args, **kwargs):
+        result = original(*args, **kwargs)
+        select_calls.append(result)
         return result
 
-    monkeypatch.setattr(DSAManager, "select", counting)
+    monkeypatch.setattr(paged, "select", counting)
 
     prompt = torch.randint(0, cfg.vocab_size, (4,))  # ctx 4 == topk: identity
     decode = [torch.tensor(5)]  # ctx 5 > topk: selection engages
@@ -329,28 +358,41 @@ def test_full_to_shared_threading_order(monkeypatch):
 
     # One FULL computation, consumed IN ORDER by layer 0 then layer 1, and
     # both consumed the very tensor the FULL layer produced.
-    assert len(picks) == 1
-    assert [idx for idx, _ in trace] == [0, 1]
-    assert trace[0][1] is picks[0]
-    assert trace[1][1] is picks[0]
+    assert len(select_calls) == 1
+    assert [layer for layer, _ in trace] == [0, 1]
+    assert trace[0][1] is select_calls[0]
+    assert trace[1][1] is select_calls[0]
+    assert dsa.ctx is None  # the forward's context closed with it
 
-    # FULL layer stored prompt + decode token; SHARED layer stored nothing.
-    assert dsa.keys.tokens("r0", 0) == 5
-    assert dsa.keys.tokens("r0", 1) == 0
-    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 5
-
-    driver.runner.remove_request("r0")
-    assert dsa.keys.tracked_requests() == set()
+    # The FULL layer stored prompt + decode keys; there is no index plane for a SHARED one.
+    kv = driver.resources[KV_RESOURCE]
+    assert kv.config.aux_planes[INDEX_PLANES].num_layers == 1
+    assert kv.stored_len("r0") == 5
+    assert _keys_written(kv, 0) == 5
 
 
-def test_a_layer_built_flag_off_refuses_the_dsa_resource():
-    """Flag-off, no indexer was built or loaded: a FULL layer would pass for SHARED."""
+def test_shared_layer_without_full_selection_raises():
+    """A SHARED layer reached in selection mode with no published rows is a
+    threading bug and must fail loudly, not attend densely off-spec."""
+    cfg = _longctx_reduced_cfg(topk=4)
+    model = build_random_model(cfg, seed=1)
+    resources, _ = build_cpu_resources(cfg)
+    attn1 = model.model.layers[1].self_attn  # SHARED
+    attn1.bind_resources(resources)
+    with resources[DSA_RESOURCE].use(_ctx(True)), pytest.raises(RuntimeError, match="no FULL layer ran"):
+        attn1(torch.randn(1, cfg.hidden_size) * 0.1, torch.tensor([6]))
+
+
+def test_a_model_built_flag_off_refuses_the_dsa_resource():
+    """Flag-off, no indexer was built or loaded: bound to a node that declares the DSA
+    resource, a FULL layer would pass for SHARED, so binding fails."""
     cfg = _longctx_reduced_cfg(topk=4)
     resources, _ = build_cpu_resources(cfg)
     cfg.dsa_long_context = False
-    attn = Glm52MLAAttention(cfg, layer_idx=0)
+    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=1), config=cfg)
+    assert sub.language_model.model.layers[0].self_attn.indexer is None  # FULL slot
     with pytest.raises(RuntimeError, match="dsa_long_context off"):
-        attn.bind_resources(resources)
+        sub.bind_node_resources(resources)
 
 
 def test_the_naive_path_refuses_the_dsa_resource():
@@ -372,7 +414,7 @@ def test_decode_across_topk_prefix_property_and_divergence():
     """
     topk = 6
     cfg = _longctx_reduced_cfg(topk)
-    model = _build_absorbed_model(cfg, seed=3)
+    model = build_random_model(cfg, seed=3)
     sub = Glm52LLMSubmodule(language_model=model, config=cfg)
 
     torch.manual_seed(7)
@@ -384,11 +426,9 @@ def test_decode_across_topk_prefix_property_and_divergence():
     driver = _Driver(sub, cfg, page_size=4)  # the sparse steps span 3 pages
     assert not flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     sparse_logits = _serve_steps(driver, prompt, decode)
-    dsa = driver.resources[DSA_RESOURCE]
-    assert dsa.keys.tokens("r0", 0) == 3 + len(decode)
-    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 3 + len(decode)
-    driver.runner.remove_request("r0")
-    assert dsa.keys.tracked_requests() == set()
+    assert driver.resources[KV_RESOURCE].stored_len("r0") == 3 + len(decode)
+    assert _keys_written(driver.resources[KV_RESOURCE], 0) == 3 + len(decode)
+    sub.cleanup_request("r0")
 
     cfg.index_topk = 512  # dense comparator: identity regime end to end
     driver2 = _Driver(sub, cfg, page_size=4)  # fresh cache, same weights

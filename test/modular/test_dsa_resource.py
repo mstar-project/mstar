@@ -1,227 +1,194 @@
-"""The DSA resource on CPU: its key store, the rows it plans from the KV plan, IndexShare's
-shared pick, and sparse attention against an independent masked reference."""
-import sys
-from pathlib import Path
+"""The DSA resource on CPU: its spec and build over the MLA cache whose pages hold the index keys,
+the step's rows and pages it stages from the KV plan (``step_inputs``), the forward's context it
+builds from them (``context``), the rows of it a pass takes (``rows`` / ``pick``) and the one it
+holds open for the layers (``use``)."""
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
+from mstar.engine.resources.dsa.manager import DSAManager
+from mstar.engine.resources.dsa.paged import DSAContext
+from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
+from mstar.engine.resources.step import StepContext
 
-from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep  # noqa: E402
-from mstar.engine.resources.dsa.manager import (  # noqa: E402
-    DSAManager,
-    DSAPlan,
-    DSASpan,
-    IndexKeyStore,
-    index_topk,
-)
-from mstar.engine.resources.kv.plan import SequenceView  # noqa: E402
+KV = "kv"
+PAGE, TOPK, HEADS, MAX_SEQ_LEN = 4, 4, 16, 64
+
+
+def _spec(topk=TOPK, **config) -> DSASpec:
+    return DSASpec(resource_key="dsa", nodes={"LLM"},
+                   config=DSAConfig(kv_cache=KV, topk=topk, **config))
+
+
+def _kv_spec(index_planes: bool = True) -> KVSpec:
+    return KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=MAX_SEQ_LEN,
+        max_num_pages=32, page_size=PAGE, num_qo_heads=HEADS, layout=KVLayout.MLA,
+        kv_lora_rank=32, qk_rope_head_dim=16,
+        aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=16)} if index_planes else {}))
+
+
+def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK) -> DSAManager:
+    """The resource as the engine builds it, from its spec and its cache's spec."""
+    info = EngineResourceInfo(
+        device=torch.device("cpu"), joint_comm_group=SimpleNamespace(world_size=world_size),
+        dependencies={KV: _kv_spec()})
+    return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1), info)
+
+
+def _stage(dsa: DSAManager, walk: str, pages, lengths, to_compute) -> dict:
+    """``step_inputs`` of an eager step whose KV plan holds one view per request: request i
+    has ``lengths[i]`` tokens after the step, its last ``to_compute[i]`` new."""
+    views = [SequenceView(f"r{i}", "main", p, length=n, to_compute=c)
+             for i, (p, n, c) in enumerate(zip(pages, lengths, to_compute, strict=True))]
+    indptr = torch.tensor([0, *torch.tensor([len(p) for p in pages]).cumsum(0).tolist()])
+    flat = torch.tensor([page for p in pages for page in p], dtype=torch.int32)
+    plan = SimpleNamespace(views=views, cpu_indptrs=PagedIndptrs(
+        qo_indptr=None, paged_kv_indptr=indptr, paged_kv_indices=flat,
+        paged_kv_last_page_len=None))
+    step_ctx = StepContext(
+        request_ids=tuple(f"r{i}" for i in range(len(lengths))), graph_walk=walk, slot=0,
+        capture=False, plan_results={KV: {"main": plan}})
+    return dsa.step_inputs(step_ctx, captured=False)
+
+
+def _prefill(dsa: DSAManager, pages=([0], [5, 6, 7])) -> dict:
+    """A fresh 3-token prompt and a 4-token one past 5 cached tokens: 9 keys, past topk."""
+    return _stage(dsa, "prefill", pages, lengths=[3, 9], to_compute=[3, 4])
+
 
 # ---------------------------------------------------------------------------
-# IndexKeyStore
+# spec and build
 # ---------------------------------------------------------------------------
 
 
-def test_key_store_append_history_grow_and_evict():
-    store = IndexKeyStore()
-    d = 16
-    first = torch.randn(3, d)
-    second = torch.randn(70, d)  # crosses the initial 64-row capacity
-
-    store.append("r0", 0, first, start_pos=0)
-    store.append("r0", 0, second, start_pos=3)
-    assert store.tokens("r0", 0) == 73
-    hist = store.history("r0", 0, 73)
-    torch.testing.assert_close(hist, torch.cat([first, second]), rtol=0, atol=0)
-    # Windowed view (what a mid-sequence selection scores against).
-    torch.testing.assert_close(store.history("r0", 0, 2), first[:2], rtol=0, atol=0)
-
-    # Growth doubled capacity but content survived the buffer swap above;
-    # a request/layer never touched reports 0, not KeyError.
-    assert store.tokens("r0", 1) == 0
-    assert store.tokens("nope", 0) == 0
-
-    store.evict("r0")
-    assert store.tracked_requests() == set()
-    assert store.tokens("r0", 0) == 0
-    store.evict("r0")  # idempotent
+def test_the_spec_builds_one_resource_over_the_mla_cache():
+    for kpool in (1, 4):  # a key per token, or GLM-5.3's pooled keys: the same resource
+        spec = _spec(kpool=kpool)
+        assert spec.depends_on() == {KV}
+        assert spec.resource_class is DSAManager
 
 
-def test_key_store_desync_and_overrun_raise():
-    store = IndexKeyStore()
-    store.append("r0", 0, torch.randn(4, 8), start_pos=0)
-    with pytest.raises(RuntimeError, match="desync"):
-        store.append("r0", 0, torch.randn(1, 8), start_pos=3)  # overlap
-    with pytest.raises(RuntimeError, match="desync"):
-        store.append("r0", 0, torch.randn(1, 8), start_pos=5)  # gap
-    with pytest.raises(RuntimeError, match="holds 4"):
-        store.history("r0", 0, 5)  # window beyond stored history
+def test_the_resource_reads_its_geometry_off_the_cache():
+    dsa = _manager(world_size=2)
+    assert dsa.depends_on() == {KV}
+    assert (dsa.page_size, dsa.kv_rows, dsa.kv_lora_rank, dsa.kpe) == (PAGE, MAX_SEQ_LEN, 32, 16)
+    assert dsa.num_heads == HEADS // 2  # this rank's query heads
+    assert dsa.ctx is None  # no forward is running
 
 
-def test_removing_a_request_drops_its_keys():
+def test_a_cache_without_index_planes_is_refused():
+    info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=None,
+                              dependencies={KV: _kv_spec(index_planes=False)})
+    with pytest.raises(ValueError, match=INDEX_PLANES):
+        build_resource(_spec(), info)
+
+
+# ---------------------------------------------------------------------------
+# step_inputs: the step's rows, from the KV plan
+# ---------------------------------------------------------------------------
+
+
+def test_an_eager_prefill_stages_its_rows_and_pages():
     dsa = _manager()
-    dsa.keys.append("r0", 0, torch.randn(5, 16), start_pos=0)
-    dsa.remove_request("r0")
-    assert dsa.keys.tracked_requests() == set()
-    dsa.remove_request("r0")  # idempotent, like the base hook
+    out = _prefill(dsa)
+    assert out["dsa_row_req"].tolist() == [0, 0, 0, 1, 1, 1, 1]
+    assert out["dsa_pos"].tolist() == [0, 1, 2, 5, 6, 7, 8]
+    # the step's requests' pages, flat, and where each request's begin
+    assert out["dsa_pages"].dtype == torch.int32
+    assert out["dsa_pages"].tolist() == [0, 5, 6, 7]
+    assert out["dsa_page_start"].tolist() == [0, 1]
+    meta = out["dsa_meta"]
+    assert meta["host_pos"] == [0, 1, 2, 5, 6, 7, 8]
+    assert meta["spans"] == [(0, 3, 0), (3, 4, 1)]  # (first row, rows, request)
+    assert meta["host_page_start"] == [0, 1]
+    assert meta["max_pools"] == 9  # the step's longest context
+    assert meta["needs_selection"] is True  # a row sees 9 keys, past topk
+    assert meta["decode_rows"] is False  # prefill rows score in chunks of one request
+    assert meta["sparse_plan"] is None  # eager: the first layer to attend plans it
+
+
+def test_an_eager_decode_scores_every_row_on_its_own():
+    dsa = _manager()
+    # r0 at position 6 (past topk), r1 at position 2
+    out = _stage(dsa, "decode", pages=[[1, 2], [4]], lengths=[7, 3], to_compute=[1, 1])
+    assert out["dsa_row_req"].tolist() == [0, 1]
+    assert out["dsa_pos"].tolist() == [6, 2]
+    assert out["dsa_pages"].tolist() == [1, 2, 4]
+    meta = out["dsa_meta"]
+    assert meta["spans"] == [(0, 1, 0), (1, 1, 1)]
+    assert meta["max_pools"] == 7
+    assert meta["needs_selection"] is True
+    assert meta["decode_rows"] is True
+    # below topk every row attends all it sees: dense MLA is the same computation
+    short = _stage(dsa, "decode", pages=[[1], [4]], lengths=[4, 3], to_compute=[1, 1])
+    assert short["dsa_meta"]["needs_selection"] is False
+
+
+def test_pooled_keys_score_in_pools():
+    out = _prefill(_manager(kpool=2, topk=4))
+    assert out["dsa_meta"]["max_pools"] == 4  # 9 keys: 4 complete pools of 2
 
 
 # ---------------------------------------------------------------------------
-# plan: the rows of a step, from the KV plan
+# context / rows / pick / use: the forward's context, open while its layers run
 # ---------------------------------------------------------------------------
 
 
-def _manager(topk=4, page_size=4) -> DSAManager:
-    return DSAManager(DSAConfig(kv_cache="kv", topk=topk), page_size=page_size,
-                      device=torch.device("cpu"))
+def test_the_context_is_the_staged_step():
+    dsa = _manager()
+    out = _prefill(dsa)
+    ctx = dsa.context(out)
+    assert isinstance(ctx, DSAContext)
+    assert ctx.pos is out["dsa_pos"] and ctx.row_req is out["dsa_row_req"]
+    assert ctx.pages is out["dsa_pages"] and ctx.page_start is out["dsa_page_start"]
+    assert ctx.host_pos == [0, 1, 2, 5, 6, 7, 8]
+    assert ctx.spans == [(0, 3, 0), (3, 4, 1)]
+    assert (ctx.max_pools, ctx.page_size, ctx.topk, ctx.kpool) == (9, PAGE, TOPK, 1)
+    assert ctx.needs_selection and not ctx.decode_rows and ctx.sparse_plan is None
+    assert ctx.width == TOPK
+    assert ctx.attn_lens() == [1, 2, 3, 4, 4, 4, 4]  # a row past topk attends its top topk
+    assert ctx.last_selection is None  # a fresh step
+    # without the resource's inputs (a flag-off step) there is no context
+    assert dsa.context({}) is None
+    assert dsa.context({k: v for k, v in out.items() if k != "dsa_meta"}) is None
 
 
-def _plan(dsa: DSAManager, views: list[SequenceView]) -> dict[str, DSAPlan]:
-    ctx = SimpleNamespace(plan_results={"kv": {"main": SimpleNamespace(views=views)}})
-    return dsa.plan(DSAStep(), ctx)
+def test_rows_and_pick_are_passes_over_part_of_the_step():
+    ctx = _manager().context(_prefill(_manager()))
+    ctx.last_selection = torch.zeros(7, TOPK, dtype=torch.int32)
+    tail = ctx.rows(2, 6)  # r0's last row and r1's first three
+    assert tail.pos.tolist() == [2, 5, 6, 7] and tail.row_req.tolist() == [0, 1, 1, 1]
+    assert tail.host_pos == [2, 5, 6, 7]
+    assert tail.spans == [(0, 1, 0), (1, 3, 1)]
+    assert tail.max_pools == 8
+    # its own selection, its own eager plan: dense attention would plan the whole step
+    assert tail.needs_selection and tail.last_selection is None and tail.sparse_plan is None
+    assert tail.pages is ctx.pages and tail.page_start is ctx.page_start
+    last = ctx.pick([2, 6])  # each request's last row
+    assert last.pos.tolist() == [2, 8] and last.row_req.tolist() == [0, 1]
+    assert last.spans == [(0, 1, 0), (1, 1, 1)]
 
 
-def test_the_spec_builds_over_its_kv_cache():
-    spec = DSASpec(resource_key="dsa", nodes={"LLM"}, config=DSAConfig(kv_cache="kv", topk=8))
-    assert spec.depends_on() == {"kv"}
-    assert spec.resource_class is DSAManager
-
-
-def test_plan_reads_each_requests_rows_off_the_kv_plan():
-    dsa = _manager(topk=16)
-    tables = [[0, 1, 2], [5, 6, 7]]
-    plans = _plan(dsa, [
-        SequenceView("r0", "main", tables[0], length=4, to_compute=4),  # a 4-token prompt
-        SequenceView("r1", "main", tables[1], length=9, to_compute=4),  # 5 cached, 4 new
-    ])
-    plan = plans["main"]
-    assert plan.needs_selection is False  # every row sees at most topk keys: dense
-    (s0, s1) = plan.spans
-    assert (s0.request_id, s0.q_start, s0.q_len, s0.ctx_start) == ("r0", 0, 4, 0)
-    assert (s1.request_id, s1.q_start, s1.q_len, s1.ctx_start) == ("r1", 4, 4, 5)
-    assert s1.pages == [5, 6, 7]
-    # Page tables are snapshots: later plan growth must not alias.
-    tables[0].append(99)
-    assert s0.pages == [0, 1, 2]
-
-
-def test_plan_selects_once_a_row_sees_more_than_topk_keys():
-    dsa = _manager(topk=4)
-    _plan(dsa, [SequenceView("r0", "main", [0], length=4, to_compute=1)])
-    assert dsa.needs_selection() is False
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=5, to_compute=1)])
-    assert dsa.needs_selection() is True
-    assert dsa._plans["main"].last_selection is None  # a fresh pick every forward
-
-
-# ---------------------------------------------------------------------------
-# select / shared_selection
-# ---------------------------------------------------------------------------
-
-
-def test_select_scores_each_request_over_its_own_keys():
-    """Two decode rows of different requests each pick from their own keys, and SHARED layers
-    get that very pick."""
-    torch.manual_seed(0)
-    topk, heads, d = 4, 2, 8
-    dsa = _manager(topk=topk)
-    keys = {"r0": torch.randn(6, d), "r1": torch.randn(9, d)}
-    for rid, k in keys.items():
-        dsa.keys.append(rid, 0, k[:-1], start_pos=0)
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=6, to_compute=1),
-                SequenceView("r1", "main", [2, 3, 4], length=9, to_compute=1)])
-    dsa.store_keys(0, torch.stack([keys["r0"][-1], keys["r1"][-1]]))
-    q, w = torch.randn(2, heads, d), torch.rand(2, heads)
-
-    picked = dsa.select(0, q, w)
-    for row, k in enumerate(keys.values()):
-        n = k.shape[0]
-        want = index_topk(q[row:row + 1], w[row:row + 1], k, torch.tensor([n - 1]), topk)
-        assert torch.equal(picked[row], want[0])
-    assert dsa.shared_selection(1) is picked
-
-
-def test_shared_layer_without_a_full_pick_raises():
-    """A SHARED layer reached in selection mode with no published rows is a threading bug and
-    must fail loudly, not attend densely off-spec."""
-    dsa = _manager(topk=4)
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=7, to_compute=1)])
-    with pytest.raises(RuntimeError, match="no FULL layer ran"):
-        dsa.shared_selection(1)
-
-
-@pytest.mark.parametrize("autocast", [False, True])
-def test_scores_stay_fp32_under_bf16_autocast(autocast):
-    torch.manual_seed(3)
-    q, w, keys = torch.randn(3, 2, 8), torch.rand(3, 2), torch.randn(40, 8)
-    positions = torch.tensor([20, 30, 39])
-    ref = index_topk(q, w, keys, positions, 8)
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        assert torch.equal(index_topk(q, w, keys, positions, 8), ref)
-
-
-# ---------------------------------------------------------------------------
-# attend vs an independent mask-based reference
-# ---------------------------------------------------------------------------
-
-
-def _independent_masked_reference(latent_cache, pages, page_size, positions,
-                                  selection_row, q_all, scale, latent_dim):
-    """Dense MQA over ALL cached positions with an additive mask keeping only the selected
-    ones — written from scratch, sharing no code with ``DSAManager.attend``."""
-    pos = torch.arange(positions)
-    flat = latent_cache[pages[pos // page_size], pos % page_size].float()
-    scores = q_all.float() @ flat.T * scale  # (H, positions)
-    mask = torch.full((positions,), float("-inf"))
-    mask[selection_row[selection_row >= 0].long()] = 0.0
-    weights = (scores + mask).softmax(-1)
-    return weights @ flat[:, :latent_dim]
-
-
-@pytest.mark.parametrize("autocast", [False, True])
-@pytest.mark.parametrize("selection_row", [
-    [9, 2, 7, 0],      # full topk row, unsorted, includes self (position 9)
-    [5, 9, -1, -1],    # padded row: -1 entries must be excluded, not scored
-])
-def test_attend_matches_masked_reference(selection_row, autocast):
-    """The engine runs the forward under bf16 autocast, which must not reach this fp32 math."""
-    torch.manual_seed(2)
-    page_size, heads, rank, rope = 4, 4, 32, 16
-    dsa = _manager(topk=4, page_size=page_size)
-    cache = torch.zeros(8, page_size, rank + rope)  # (pages, page_size, latent), the MLA layer
-    pages = torch.tensor([3, 1, 6], dtype=torch.long)  # non-monotonic on purpose
-
-    current = 9  # decode position; its own latent already written, as the layer does first
-    for pos in range(current + 1):
-        cache[pages[pos // page_size], pos % page_size] = torch.randn(rank + rope)
-    _plan(dsa, [SequenceView("r0", "main", pages.tolist(), length=current + 1, to_compute=1)])
-
-    q_nope = torch.randn(1, heads, rank)
-    q_pe = torch.randn(1, heads, rope)
-    selection = torch.tensor([selection_row], dtype=torch.int32)
-    scale = (rank + rope) ** -0.5
-
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        out = dsa.attend(selection, q_nope, q_pe, cache, scale)
-
-    q_all = torch.cat([q_nope, q_pe], dim=-1)[0]
-    ref = _independent_masked_reference(
-        cache, pages, page_size, current + 1, selection[0], q_all, scale, rank)
-    torch.testing.assert_close(out[0], ref, rtol=1e-6, atol=1e-6)
-
-    # Discrimination control: attending the WHOLE prefix must not match — otherwise this
-    # test could not catch a sparse path that ignores the selection.
-    dense_row = torch.arange(current + 1, dtype=torch.int32)
-    dense_ref = _independent_masked_reference(
-        cache, pages, page_size, current + 1, dense_row, q_all, scale, rank)
-    assert not torch.allclose(out[0], dense_ref, rtol=1e-3, atol=1e-3)
-
-
-def test_attend_refuses_a_prefill_past_topk():
-    dsa = _manager(topk=4)
-    dsa._plans = {"main": DSAPlan(spans=[DSASpan("r0", 0, 2, 5, [1, 2])], needs_selection=True)}
-    with pytest.raises(RuntimeError, match="decode-only"):
-        dsa.attend(torch.zeros(2, 4, dtype=torch.int32), torch.randn(2, 4, 32),
-                   torch.randn(2, 4, 16), torch.zeros(4, 4, 48), 1.0)
+def test_use_opens_a_context_for_the_block_and_restores_the_one_before():
+    dsa = _manager()
+    step = dsa.context(_prefill(dsa))
+    tail = step.rows(3, 7)  # r1's rows, a pass of their own over the step's plan
+    assert dsa.ctx is None
+    with dsa.use(step):
+        assert dsa.ctx is step
+        with dsa.use(tail):
+            assert dsa.ctx is tail
+        assert dsa.ctx is step
+        with dsa.use(None):  # a dense block inside the forward
+            assert dsa.ctx is None
+        assert dsa.ctx is step
+    assert dsa.ctx is None
+    # a forward that fails still closes its context
+    with pytest.raises(RuntimeError, match="boom"), dsa.use(step):
+        raise RuntimeError("boom")
+    assert dsa.ctx is None

@@ -1,4 +1,4 @@
-"""glm5_next DSA past index_topk (dsa/kpool.py) on CPU: the k-pool selection and pool keys against the
+"""glm5_next DSA past index_topk (dsa/paged.py, kpool > 1) on CPU: the k-pool selection and pool keys against the
 reference indexer (transformers' Glm5NextTextIndexer, ported below), and the long-context engine
 path against itself (one-shot prefill vs stepwise decode vs windowed prefill) and against dense
 MLA where they must agree.
@@ -20,7 +20,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import paged as dsa
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -88,7 +88,7 @@ class _Planes:
 def _ctx(page_table, positions, page_size, topk, kpool, spans=None):
     """A one-request context over ``page_table`` for rows at ``positions``."""
     n = len(positions)
-    return dsa.KPoolContext(
+    return dsa.DSAContext(
         pos=torch.tensor(positions, dtype=torch.int32),
         row_req=torch.zeros(n, dtype=torch.int32),
         pages=torch.tensor(page_table, dtype=torch.int32),
@@ -122,7 +122,7 @@ def test_selection_matches_reference(seq, chunks):
         planes.slots = (torch.tensor([pages[p // page] for p in positions]),
                         torch.tensor([p % page for p in positions]))
         ctx = _ctx(pages, positions, page, topk, kpool)
-        dsa.write_index(planes, 0, "main", k[start:start + c], gate[start:start + c], ape, ctx)
+        dsa.write_index(planes, 0, "main", k[start:start + c], ctx, gate=gate[start:start + c], ape=ape)
         slots = dsa.select(q[start:start + c], w[start:start + c], planes.layer_view(0), ctx)
         for r, p in enumerate(positions):
             n = dsa.attn_lens([p], topk, kpool)[0]
@@ -159,7 +159,7 @@ def test_sharded_prefill_selection_equals_unsharded():
     planes.slots = (torch.tensor([p // page for p in range(seq)]),
                     torch.tensor([p % page for p in range(seq)]))
     ctx = _ctx(pages, list(range(seq)), page, topk, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
+    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
     want = dsa.select(q, w, planes.layer_view(0), ctx)
     group = _FakeGroup(4)
     group.call = 0
@@ -182,7 +182,7 @@ def test_pool_keys_match_reference_bf16():
     planes.slots = (torch.tensor([pages[p // page] for p in positions]),
                     torch.tensor([p % page for p in positions]))
     ctx = _ctx(pages, positions, page, 64, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
+    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
     ref, members = _ref_pools(k, gate, ape, kpool)
     flat = planes.cache[0].view(-1, 3 * d)
     for j, last in enumerate(members[:, -1].tolist()):
@@ -202,10 +202,10 @@ def test_decode_rows_select_like_prefill_rows():
     planes.slots = (torch.tensor([p // page for p in range(seq)]),
                     torch.tensor([p % page for p in range(seq)]))
     ctx = _ctx(pages, list(range(seq)), page, topk, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
+    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
     prefill = dsa.select(q, w, planes.layer_view(0), ctx)
     rows = [7, 64, 119, 33]
-    dec = dsa.KPoolContext(
+    dec = dsa.DSAContext(
         pos=torch.tensor(rows, dtype=torch.int32), row_req=torch.zeros(4, dtype=torch.int32),
         pages=torch.tensor(pages, dtype=torch.int32), page_start=torch.zeros(1, dtype=torch.int32),
         host_pos=rows, spans=[(i, 1, 0) for i in range(4)], host_page_start=[0],

@@ -35,6 +35,53 @@ def fake_quantize_fp8_block(
     return w_fp8, scale_inv, dequant
 
 
+# -- DSA's selection in torch: the references the paged path and its kernels are held to ------
+
+def select_topk_causal(
+    scores: torch.Tensor, positions: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Per-row top-``topk`` key positions of causally masked ``scores``.
+
+    ``scores`` is ``(T, num_keys)`` with every key past a row's position
+    already ``-inf``; the result is ``(T, topk)`` int32, -1 padded where a
+    row sees fewer than ``topk`` keys. One stable sort for the whole batch:
+    no per-token topk launch, no host sync. Ties break toward the earlier
+    key position, so a row's selection does not depend on how the batch
+    is packed or on which device ran it (torch.topk's tie order is neither).
+    """
+    num_tokens, num_keys = scores.shape
+    k_eff = min(topk, num_keys)
+    order = scores.sort(dim=1, descending=True, stable=True).indices[:, :k_eff]
+    # the -inf tail sorts last (stable: by ascending index), so rank >= p_t+1
+    # is exactly the invisible remainder
+    rank = torch.arange(k_eff, device=scores.device)
+    invisible = rank.unsqueeze(0) >= positions.unsqueeze(1) + 1
+    selection = torch.full(
+        (num_tokens, topk), -1, dtype=torch.int32, device=scores.device)
+    selection[:, :k_eff] = order.to(torch.int32).masked_fill(invisible, -1)
+    return selection
+
+
+def index_topk(
+    q: torch.Tensor, weights: torch.Tensor, keys: torch.Tensor,
+    positions: torch.Tensor, topk: int,
+) -> torch.Tensor:
+    """Top-``topk`` key positions per query row, ``(T, topk)`` int32, -1 padded.
+
+    ``q`` ``(T, H, D)`` and ``weights`` ``(T, H)`` are the indexer's queries and head weights
+    (any scales folded in), ``keys`` ``(S, D)`` a request's keys by position and ``positions``
+    ``(T,)`` the rows' own: a row sees keys ``0 .. position``, itself included."""
+    # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]), in fp32: per-head ReLU BEFORE the
+    # weighted sum; the raw weights get no softmax/sigmoid. The engine's bf16 autocast would run
+    # both einsums in bf16.
+    with torch.autocast(q.device.type, enabled=False):
+        dots = torch.einsum("thd,sd->ths", q.float(), keys.float()).relu()
+        scores = torch.einsum("th,ths->ts", weights.float(), dots)
+    key_pos = torch.arange(keys.shape[0], device=scores.device)
+    scores = scores.masked_fill(key_pos.unsqueeze(0) > positions.unsqueeze(1), float("-inf"))
+    return select_topk_causal(scores, positions, topk)
+
+
 def cpu_rope_apply_qk_inplace(
     q, k, pos_ids, cos_sin_cache, rotary_dim, interleave, rope_scale, rope_theta, **llama31,
 ) -> None:
@@ -168,10 +215,10 @@ def build_cpu_resources(
     them. Requests in ``request_ids`` are ingested.
     """
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
-    from mstar.engine.resources.dsa.config import DSAConfig
+    from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig
     from mstar.engine.resources.dsa.manager import DSAManager
     from mstar.engine.resources.kv import manager as manager_mod
-    from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+    from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.glm52.config import (
         ATTN_RESOURCE,
@@ -187,12 +234,21 @@ def build_cpu_resources(
     manager_mod.KVTransferManager = _StubTransferManager
     try:
         if config.mla_absorb:
+            aux = {}
+            if config.dsa_long_context:
+                from mstar.model.glm52.components.indexer import full_indexer_layers
+
+                # an index plane per FULL layer, and the MTP layer's
+                aux[INDEX_PLANES] = AuxPlanes(
+                    num_layers=len(full_indexer_layers(config)) + num_layers
+                    - config.num_hidden_layers,
+                    width=config.index_head_dim)
             kv_cfg = PagedKVConfig(
                 num_layers=num_layers, num_kv_heads=1, head_dim=config.cache_latent_dim,
                 max_seq_len=config.max_seq_len, max_num_pages=max_num_pages,
                 page_size=page_size, num_qo_heads=config.num_attention_heads,
                 layout=KVLayout.MLA, kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim, aux_planes=aux,
             )
             kv = KVManager(
                 cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
@@ -229,10 +285,54 @@ def build_cpu_resources(
     }
     if config.dsa_long_context:
         resources[DSA_RESOURCE] = DSAManager(
-            DSAConfig(kv_cache=KV_RESOURCE, topk=config.index_topk),
-            page_size=page_size, device=device,
+            DSAConfig(kv_cache=KV_RESOURCE, topk=config.index_topk,
+                      sm_scale=config.qk_head_dim ** -0.5, dense_below_topk=True),
+            kv_cfg, device,
         )
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:
         runner.ingest_request(rid)
     return resources, runner
+
+
+def build_random_model(cfg, seed: int):
+    """A reduced absorbed model with EVERY parameter randomized (MoE expert containers are raw
+    ``torch.empty`` at construction — garbage in them NaNs the logits)."""
+    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+    from mstar.model.utils import process_weights_after_loading
+
+    torch.manual_seed(seed)
+    model = Glm52ForCausalLM(cfg)
+    model.model.embed_tokens.weight.data.normal_(0, 0.05)
+    model.model.norm.weight.data.normal_(1.0, 0.02)
+    model.lm_head.weight.data.normal_(0, 0.02)
+    for layer in model.model.layers:
+        a = layer.self_attn
+        for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa,
+                    a.kv_b_proj, a.o_proj):
+            lin.weight.data.normal_(0, 0.03)
+        for norm in (a.q_a_layernorm, a.kv_a_layernorm):
+            norm.weight.data.normal_(1.0, 0.02)
+        if a.indexer is not None:
+            a.indexer.wq_b.weight.data.normal_(0, 0.05)
+            a.indexer.wk.weight.data.normal_(0, 0.05)
+            a.indexer.weights_proj.weight.data.normal_(0, 0.05)
+            a.indexer.k_norm.weight.data.normal_(1.0, 0.02)
+            a.indexer.k_norm.bias.data.normal_(0, 0.02)
+        layer.input_layernorm.weight.data.normal_(1.0, 0.02)
+        layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
+        mlp = layer.mlp
+        if isinstance(mlp, Glm52SparseMoeBlock):
+            mlp.gate.weight.data.normal_(0, 1)
+            mlp.gate.e_score_correction_bias.data = torch.randn(
+                cfg.n_routed_experts, dtype=torch.float32)
+            mlp.experts.gate_up_proj.data.normal_(0, 0.05)
+            mlp.experts.down_proj.data.normal_(0, 0.05)
+            mlp.shared_expert.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.shared_expert.down_proj.weight.data.normal_(0, 0.05)
+        else:
+            mlp.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.down_proj.weight.data.normal_(0, 0.05)
+    process_weights_after_loading(model, torch.device("cpu"))
+    return model.eval()

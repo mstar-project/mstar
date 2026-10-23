@@ -1,6 +1,7 @@
 """AR submodule for the GLM-5.2 text backbone."""
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import os
@@ -30,6 +31,8 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.dsa.manager import DSAManager
+from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -78,6 +81,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step drafts k tokens, verifies them with the last emitted token and
         # seeds the next step, all in one captured graph; the eager fallback stays uncompiled
         self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
+        # dsa_long_context: requests whose prefill starts past a cached prefix, which no
+        # prefill bucket's capture can hold (cg_key_info runs their step eager)
+        self._prefix_hits: set[int] = set()
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -90,6 +96,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_ignore_eos: dict[str, bool] = {}
         # the step's per-step indices, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
+        # paged DSA: rows' requests and lengths, page tables
+        self._int_stager = PinnedStager(torch.int32)
         # Per request, in its request_state: "token_budget", max_tokens capped at the
         # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop for
         # every k); "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no
@@ -119,6 +127,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
 
     def cleanup_request(self, request_id: str):
+        self._prefix_hits.discard(request_id)
         self._mtp_emitted.pop(request_id, None)
         self._mtp_checked.pop(request_id, None)
         self._mtp_max_tokens.pop(request_id, None)
@@ -158,6 +167,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return res[ATTN_RESOURCE]
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        if self.config.dsa_long_context:
+            self._check_long_context(resources)
         super().bind_node_resources(resources)
         if self.mtp_k > 0:
             # a request holds at least one page, so the pool bounds the requests in flight
@@ -167,6 +178,24 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 slots, self.config.hidden_size, dtype=weight.dtype, device=weight.device)
             self._mtp_seed_draft = torch.zeros(slots, dtype=torch.long, device=weight.device)
             self._mtp_free_slots = list(range(slots - 1, 0, -1))
+
+    def _check_long_context(self, resources: dict[str, Any]) -> None:
+        cfg = self.config
+        if cfg.prefill_chunk_tokens < 1:
+            raise ValueError(f"prefill_chunk_tokens={cfg.prefill_chunk_tokens} must be >= 1")
+        kv = resources[KV_RESOURCE].config
+        # the manager holds one page back as its sink
+        if (kv.max_num_pages - 1) * kv.page_size < cfg.max_seq_len:
+            logger.warning("%s: %d usable pages of %d hold less than max_seq_len=%d: a "
+                           "request that long waits for pages until it times out", KV_RESOURCE,
+                           kv.max_num_pages - 1, kv.page_size, cfg.max_seq_len)
+        # each rank attends the others' selected cache slots, so the ranks' page tables
+        # must agree, and an eviction frees pages in a different order on each rank
+        if cfg.dsa_shard_prefill and getattr(resources[KV_RESOURCE], "supports_eviction", False):
+            raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
+        if kv.page_size & (kv.page_size - 1):
+            # flashinfer's page-table transform takes power-of-two pages
+            raise ValueError(f"{KV_RESOURCE} page_size={kv.page_size} must be a power of two")
 
     def declare_step(
         self,
@@ -182,8 +211,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             prefill_tokens = {
                 rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
             }
-        steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True),
-                 POS_RESOURCE: PositionStep()}
+        steps = {KV_RESOURCE: KVStep(), POS_RESOURCE: PositionStep()}
+        long_context = self.config.dsa_long_context
+        if not (long_context and graph_walk == "prefill"
+                and sum(inp.input_seq_len for inp in inputs) > self.config.prefill_chunk_tokens):
+            # a prefill in row chunks attends sparse on every row, so it plans no dense
+            # attention (FlashInfer's MLA planner corrupts the heap near a million rows)
+            steps[ATTN_RESOURCE] = AttentionStep(causal=True)
         if self.mtp_k > 0 and graph_walk == "decode":
             # Under TP async the plan thread declares, admits and plans this step before
             # prepare_inputs runs, so the last verdict's trim lands here. The verify and the
@@ -201,7 +235,25 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
+            cg_key_info=self._cg_key(graph_walk, request_ids),
         )
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict,
+                    per_request_input_metadata=None, **kwargs) -> str | None:
+        return self._cg_key(graph_walk, per_request_info)
+
+    def _cg_key(self, graph_walk: str, rids) -> str | None:
+        """Every capture's key (None), or for a prefill with a request past a cached prefix
+        one no capture has: its rows see more keys than its bucket's capture scores."""
+        if (self.config.dsa_long_context and graph_walk == "prefill"
+                and not self._prefix_hits.isdisjoint(rids)):
+            return "eager"
+        return None
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        if self.config.dsa_long_context and graph_walk == "prefill" and start > 0:
+            self._prefix_hits.add(fwd_info.rid_handle)
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
 
     def max_step_tokens(self, graph_walk: str) -> int | None:
         cap = self.config.prefill_max_step_tokens
@@ -262,8 +314,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     @property
     def disable_torch_compile(self) -> bool:
-        # the escape hatch covers the uncaptured steps too, which the engine compiles
-        return (getattr(self, "_mtp_uncompiled", False)
+        # the escape hatch covers the uncaptured steps too, which the engine compiles; under
+        # dsa_long_context those run eager, and the frame would key on each prompt's length
+        return (getattr(self, "_mtp_uncompiled", False) or self.config.dsa_long_context
                 or os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1")
 
     def to(self, *args, **kwargs):
@@ -290,10 +343,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        if self.config.dsa_long_context:
-            # the DSA resource selects per request on the host; a captured
-            # decode would skip index upkeep. Eager-only.
-            return []
         if self._moe_capture_blocked(tp_world_size):
             return []
         prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
@@ -301,8 +350,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        groups = [(prefill_buckets, prefill_batch_sizes)]
         batched = self.config.prefill_batched_token_buckets
+        if self.config.dsa_long_context:
+            # a captured prefill plans dense attention, which a step past
+            # prefill_chunk_tokens leaves unplanned (declare_step)
+            chunk = self.config.prefill_chunk_tokens
+            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > chunk})
+            if past:
+                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass prefill_chunk_tokens="
+                               "%d and run eager, in row chunks", past, chunk)
+                prefill_buckets = [n for n in prefill_buckets if n <= chunk]
+                batched = [n for n in batched or () if n <= chunk]
+        groups = [(prefill_buckets, prefill_batch_sizes)]
         if batched:
             # one request's buckets and a batch's apart, so each can be fine or coarse
             groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
@@ -330,9 +389,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     capture_batch_sizes=list(sizes),
                     **flags,
                 )
-                for buckets, sizes in groups if sizes
+                for buckets, sizes in groups if buckets and sizes
             ),
         ]
+        if self.config.dsa_long_context and self.mtp_k:
+            # MTP's prefill over DSA stays eager
+            configs = [c for c in configs if c.capture_graph_walk == "decode"]
         self._fit_recompile_limit(configs)
         return configs
 
@@ -440,13 +502,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]
         device = self.get_device()
+        long_context = self.config.dsa_long_context
+        if long_context and graph_walk == "prefill":
+            self._prefix_hits.difference_update(request_ids)  # its step has been leased
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
         # engine path is on, where the cap is the serving window. The
         # positions themselves are the position resource's (``_positions``).
-        long_context = self.config.dsa_long_context
         limit = self._context_limit()
-        topk = self.config.index_topk
         for rid, sl in zip(request_ids, seq_lens, strict=True):
             start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
@@ -465,12 +528,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 # Under MTP every step writes a whole block, that one included.
                 room = limit - (start + sl) - (2 * self.mtp_block if self.mtp_k else 0)
                 self._clamp_token_budget(engine_inputs, rid, room)
-            if long_context and start + sl > topk and sl > 1:
-                raise RuntimeError(
-                    f"request {rid}: prefill context {start + sl} exceeds "
-                    f"index_topk={topk}; sparse attention beyond topk is "
-                    "decode-only."
-                )
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
         # drains the stream before the step even starts): on prefill each request's last row
         # (for an eager prefill, when no plan buffer carries qo_indptr); under MTP the seed
@@ -490,6 +547,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
+        if long_context:
+            # the DSA resource stages the step's rows off the KV plan; the forward opens them
+            # (_dsa_use)
+            out.update(engine_inputs.resources[DSA_RESOURCE].step_inputs(
+                engine_inputs.step.ctx, engine_inputs.captured))
         return out
 
     def _mtp_pair_rows(self, normed: torch.Tensor, prenorm: torch.Tensor) -> torch.Tensor:
@@ -498,6 +560,19 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         which accepts markedly better, unless
         MSTAR_GLM52_MTP_PAIR_POSTNORM=0."""
         return normed if self._mtp_pair_postnorm else prenorm
+
+    def _dsa(self) -> DSAManager | None:
+        return self.node_resources.get(DSA_RESOURCE) if self.config.dsa_long_context else None
+
+    def _dsa_ctx(self, kwargs: dict) -> DSAContext | None:
+        """The forward's DSA context, from its preprocess inputs."""
+        dsa = self._dsa()
+        return dsa.context(kwargs) if dsa is not None else None
+
+    def _dsa_use(self, dsa_ctx: DSAContext | None):
+        """Open ``dsa_ctx`` on the DSA resource for the layers a block runs (None: dense)."""
+        dsa = self._dsa()
+        return dsa.use(dsa_ctx) if dsa is not None else contextlib.nullcontext()
 
     def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
         """The step's positions as the position resource planned them, in the KV plan's
@@ -508,11 +583,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        dsa_ctx: DSAContext | None = None,
         rows: torch.Tensor | None = None,
         with_prenorm: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.language_model.model(
-            input_ids, position_ids, rows=rows, return_prenorm=with_prenorm)
+        with self._dsa_use(dsa_ctx):
+            return self.language_model.model(
+                input_ids, position_ids, rows=rows, return_prenorm=with_prenorm)
 
     @torch.compiler.disable
     def _last_row_index(
@@ -548,8 +625,40 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        hidden = self._hidden(input_ids, self._positions(engine_inputs, input_ids.shape[0]))
+        dsa_ctx = self._dsa_ctx(kwargs)
+        position_ids = self._positions(engine_inputs, input_ids.shape[0])
+        if self._long_prefill(graph_walk, input_ids, dsa_ctx):
+            last = [input_ids.shape[0] - 1]
+            return {"logits": [self.lm_head(
+                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last))]}
+        hidden = self._hidden(input_ids, position_ids, dsa_ctx)
         return {"logits": [self.lm_head(hidden[-1:])]}
+
+    def _long_prefill(self, graph_walk: str, input_ids: torch.Tensor, dsa_ctx) -> bool:
+        """An eager prefill past prefill_chunk_tokens; a captured one (its rows score on their
+        own, ``decode_rows``) never runs in chunks, whatever the bucket's size."""
+        return (graph_walk == "prefill" and dsa_ctx is not None and not dsa_ctx.decode_rows
+                and input_ids.shape[0] > self.config.prefill_chunk_tokens)
+
+    def _prefill_rows_chunked(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor,
+        dsa_ctx: DSAContext, rows: list[int],
+    ) -> torch.Tensor:
+        """The trunk's final hidden state at ``rows`` (ascending) of a paged-DSA prefill longer
+        than ``prefill_chunk_tokens``: the trunk runs over row chunks in turn, each writing its
+        keys and latents (at its own slots: ``token_window``) before the next one selects over
+        them, so only a chunk's activations are ever live."""
+        chunk, kv = self.config.prefill_chunk_tokens, self._kv()
+        picked = []
+        for c0 in range(0, input_ids.shape[0], chunk):
+            c1 = min(c0 + chunk, input_ids.shape[0])
+            with kv.token_window(c0, c1):
+                hidden = self._hidden(
+                    input_ids[c0:c1], position_ids[c0:c1], dsa_ctx.rows(c0, c1))
+            want = [r - c0 for r in rows if c0 <= r < c1]
+            if want:
+                picked.append(hidden[want])
+        return torch.cat(picked)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -565,16 +674,41 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # a verify step plans a block of rows per request around its one input token
             position_ids = self._positions(engine_inputs, input_ids.shape[0] * self.mtp_block)
             return self._mtp_decode(
-                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"])
+                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"],
+                self._dsa_ctx(kwargs))
         position_ids = self._positions(engine_inputs, input_ids.shape[0])
         if self.mtp_k > 0 and graph_walk == "prefill":
             return self._mtp_prefill(engine_inputs, input_ids, position_ids, kwargs)
         if graph_walk not in ("prefill", "decode"):
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+        if self.config.dsa_long_context and not engine_inputs.captured:
+            # DSA outside a graph (prefill, oversized decode) is host-driven per step:
+            # traced, its metadata would key the compiled frame and recompile it every step
+            return self._forward_batched_eager(
+                graph_walk, engine_inputs, input_ids, position_ids, **kwargs)
+        return self._forward_batched(graph_walk, engine_inputs, input_ids, position_ids, **kwargs)
+
+    @torch.compiler.disable
+    def _forward_batched_eager(self, *args, **kwargs) -> dict[str, NameToTensorList]:
+        return self._forward_batched(*args, **kwargs)
+
+    def _forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        dsa_ctx = self._dsa_ctx(kwargs)
+        if self._long_prefill(graph_walk, input_ids, dsa_ctx):
+            last = [r0 + n - 1 for r0, n, _ in dsa_ctx.spans]
+            return self._sample(engine_inputs, self.lm_head(
+                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last)))
         rows = None
         if graph_walk == "prefill" and self.config.prefill_last_layer_rows:
             rows = self._last_row_index(engine_inputs, kwargs)
-        hidden = self._hidden(input_ids, position_ids, rows=rows)
+        hidden = self._hidden(input_ids, position_ids, dsa_ctx, rows=rows)
         if graph_walk == "prefill" and rows is None:
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
         logits = self.lm_head(hidden)  # (bs, vocab)
@@ -609,17 +743,58 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         row (each request's last row pairs with its sampled token): it fills the MTP plane and
         seeds the first decode step."""
         lm = self.language_model
-        hidden, prenorm = self._hidden(input_ids, position_ids, with_prenorm=True)
+        dsa_ctx = self._dsa_ctx(kwargs)
+        if self._long_prefill("prefill", input_ids, dsa_ctx):
+            return self._mtp_prefill_chunked(engine_inputs, input_ids, position_ids, kwargs,
+                                             dsa_ctx)
+        hidden, prenorm = self._hidden(input_ids, position_ids, dsa_ctx, with_prenorm=True)
         last = self._last_row_index(engine_inputs, kwargs)
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(hidden.index_select(0, last)))
         # roll, not a shifted copy into empty memory: a captured bucket's tail is padding,
         # and every row must hold a valid id for the embedding
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, new_tokens.to(nxt.dtype))
-        h_head, h_raw = lm.mtp(
-            lm.model.embed_tokens(nxt), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
+        with self._dsa_use(dsa_ctx):
+            h_head, h_raw = lm.mtp(
+                lm.model.embed_tokens(nxt), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
         self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last),
                        h_raw.index_select(0, last), new_tokens)
+        return {
+            rid: {"new_token": [new_tokens[i : i + 1]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
+
+    def _mtp_prefill_chunked(
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
+        position_ids: torch.Tensor, kwargs: dict, dsa_ctx: DSAContext,
+    ) -> dict[str, NameToTensorList]:
+        """``_mtp_prefill`` past ``prefill_chunk_tokens``: the trunk and then the MTP pass over
+        each row chunk in turn. A request's last row pairs with its sampled token, unknown
+        until every chunk has run, so its MTP row is written again once that token is in."""
+        lm, chunk, kv = self.language_model, self.config.prefill_chunk_tokens, self._kv()
+        last = [r0 + n - 1 for r0, n, _ in dsa_ctx.spans]
+        nxt = torch.roll(input_ids, -1)
+        normed, paired = [], []
+        for c0 in range(0, input_ids.shape[0], chunk):
+            c1 = min(c0 + chunk, input_ids.shape[0])
+            sub = dsa_ctx.rows(c0, c1)
+            with kv.token_window(c0, c1):
+                hidden, prenorm = self._hidden(
+                    input_ids[c0:c1], position_ids[c0:c1], sub, with_prenorm=True)
+                pair = self._mtp_pair_rows(hidden, prenorm)
+                with self._dsa_use(sub):
+                    lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), pair, position_ids[c0:c1] + 1)
+            want = [r - c0 for r in last if c0 <= r < c1]
+            if want:
+                normed.append(hidden[want])
+                paired.append(pair[want])
+        new_tokens = self._sample_tokens(engine_inputs, self.lm_head(torch.cat(normed)))
+        rows = torch.tensor(last, device=input_ids.device)
+        with kv.token_rows(rows), self._dsa_use(dsa_ctx.pick(last)):
+            h_head, h_raw = lm.mtp(
+                lm.model.embed_tokens(new_tokens), torch.cat(paired),
+                position_ids.index_select(0, rows) + 1)
+        self._mtp_seed(kwargs["mtp_slots"], h_head, h_raw, new_tokens)
         return {
             rid: {"new_token": [new_tokens[i : i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -628,12 +803,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _mtp_decode(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         position_ids: torch.Tensor, mtp_slots: torch.Tensor, mtp_seq: torch.Tensor,
+        dsa_ctx: DSAContext | None = None,
     ) -> dict[str, NameToTensorList]:
         """One verify step. Drafts: d1 from the seed, each later one an MTP pass whose query
         sits at its row of this step's block. Verify: the trunk over [last | drafts], the
         verdict (the target's argmax per row, then the accepted count) to the host's mailbox.
         Seed: the MTP pass over the block with the target's argmax as each row's next token (up
-        to the accepted row it equals the drafts), read at the last accepted row."""
+        to the accepted row it equals the drafts), read at the last accepted row. With paged
+        DSA the verify and the seed pass select per row; the draft passes attend densely, which
+        moves only the acceptance."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
         embed, n = lm.model.embed_tokens, input_ids.shape[0]
         positions = position_ids.view(n, block)
@@ -646,12 +824,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             drafts.append(self._draft_tokens(h_head, drafts[-1]))
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
-        hidden, prenorm = self._hidden(ids, position_ids, with_prenorm=True)
+        hidden, prenorm = self._hidden(ids, position_ids, dsa_ctx, with_prenorm=True)
         target = self.lm_head(hidden).argmax(-1).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         self._stage_verdict(engine_inputs, torch.cat([target, accepted[:, None]], 1), mtp_seq)
-        h_head, h_raw = lm.mtp(
-            embed(target.view(-1)), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
+        with self._dsa_use(dsa_ctx):
+            h_head, h_raw = lm.mtp(
+                embed(target.view(-1)), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
         at = torch.arange(n, device=accepted.device) * block + accepted
         next_input = target.view(-1).index_select(0, at)
         self._mtp_seed(mtp_slots, h_head.index_select(0, at), h_raw.index_select(0, at), next_input)
@@ -768,6 +947,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return
         _, accepted = self._read_verdicts([rid])[0]
         if accepted < self.mtp_k:
+            # the rejected rows' latents, and their index keys on the same pages
             self._kv().correct_len(rid, _MAIN, accepted - self.mtp_k)
             self._pos().correct_len(rid, _MAIN, accepted - self.mtp_k)
         self._mtp_trimmed[rid] = pending[0]

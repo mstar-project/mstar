@@ -8,8 +8,9 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
-from mstar.engine.resources.dsa import kpool
+from mstar.engine.resources.dsa import paged
 from mstar.engine.resources.dsa.config import INDEX_PLANES
+from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -135,7 +136,7 @@ class Glm5NextMLAAttention(nn.Module):
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
         # and the DSA resource whose context the submodule opens per forward
         self.index_plane = kv_plane if config.dsa_long_context else None
-        self.dsa: kpool.KPoolDSA | None = None
+        self.dsa: DSAManager | None = None
         self.dsa_group = comm_group if config.dsa_shard_prefill else None
 
         # The engine's MLA backend applies this scale (AttentionConfig
@@ -202,18 +203,18 @@ class Glm5NextMLAAttention(nn.Module):
 
     def _attend_sparse(
         self, hidden_states: torch.Tensor, q_c: torch.Tensor, q_nope: torch.Tensor,
-        q_pe: torch.Tensor, ctx: kpool.KPoolContext,
+        q_pe: torch.Tensor, ctx: paged.DSAContext,
     ) -> torch.Tensor:
         """DSA past index_topk: write the step's index keys, select each row's slots, attend
         over just those (prefill rows too: each selects over its own causal prefix)."""
         k, gate = self.indexer.keys_and_gate(hidden_states)
-        kpool.write_index(self.kv, self.index_plane, LABEL, k, gate,
-                        self.indexer.index_kpool_compress_ape, ctx)
+        paged.write_index(self.kv, self.index_plane, LABEL, k, ctx, gate=gate,
+                          ape=self.indexer.index_kpool_compress_ape)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
-        slots = kpool.select(q, w, self.kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
+        slots = paged.select(q, w, self.kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
                              self.dsa_group)
-        return kpool.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
-                                 self.softmax_scale)
+        return paged.sparse_attend(q_nope, q_pe, self.kv.layer_view(self.kv_plane), slots, ctx,
+                                   self.softmax_scale)
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         num_tokens, h = attn_latent.shape[:2]
