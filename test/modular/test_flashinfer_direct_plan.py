@@ -36,15 +36,14 @@ def _batch(rng):
                 paged_kv_last_page_len=t(last), kv_lens=t(lens.astype(np.int32)))
 
 
-def test_direct_plan_matches_flashinfer_plan(monkeypatch):
+def test_direct_plan_matches_flashinfer_plan():
     rng = np.random.default_rng(0)
     full, direct = _wrapper(), _wrapper()
     cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _batch(rng)
-        monkeypatch.setattr(wrappers, "_EXP_SLIM_FI_PLAN", False)
+        full._planner_args = None  # forget the direct planner: a full FlashInfer plan
         full.plan(dtype=torch.bfloat16, **batch)
-        monkeypatch.setattr(wrappers, "_EXP_SLIM_FI_PLAN", True)
         direct.plan(dtype=torch.bfloat16, **batch)
         if step == 0:
             assert direct._planner_args is not None, "this configuration should take the direct path"
@@ -83,15 +82,14 @@ def _prefill_batch(rng):
     )
 
 
-def test_prefill_direct_plan_matches_flashinfer_plan(monkeypatch):
+def test_prefill_direct_plan_matches_flashinfer_plan():
     rng = np.random.default_rng(1)
     full, direct = _prefill_wrapper(), _prefill_wrapper()
     cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _prefill_batch(rng)
-        monkeypatch.setattr(wrappers, "_EXP_SLIM_FI_PLAN", False)
+        full._planner_key = None  # forget the direct planner: a full FlashInfer plan
         full.plan(causal=True, dtype=torch.bfloat16, **batch)
-        monkeypatch.setattr(wrappers, "_EXP_SLIM_FI_PLAN", True)
         direct.plan(causal=True, dtype=torch.bfloat16, **batch)
         if step == 0:
             assert direct._planner_args is not None, "this configuration should take the direct path"
