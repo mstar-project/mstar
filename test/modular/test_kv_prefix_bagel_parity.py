@@ -38,7 +38,7 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
@@ -311,7 +311,7 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 @requires_cuda
 def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance():
     device = torch.device("cuda:0")
-    walks = {"main": ((WALK, IMAGE_WALK), ("decode",))}
+    walks = {"main": KeyedWalks((WALK, IMAGE_WALK), ("decode",))}
     generator = torch.Generator().manual_seed(20260930)
     # at the scale `_initialise` gives the token embeddings
     image = (torch.randn(50, _small_config().hidden_size, generator=generator) * 0.02).to(

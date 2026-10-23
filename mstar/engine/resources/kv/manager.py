@@ -17,6 +17,7 @@ from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotSpec,
     EngineResourceInfo,
+    KeyedWalks,
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
@@ -654,16 +655,16 @@ class KVManager(AttentionResource):
             )
         return state
 
-    def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
-    ) -> bool:
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
-        # Above one rank a growth walk isn't keyed, since each rank reads its sampled ids at a
-        # different step.
-        self._keyed_walks = {
-            label: frozenset((*keyed, *(growth if self._world_size == 1 else ())))
-            for label, (keyed, growth) in (walks or {}).items()
-        }
+        self._keyed_walks = {}
+        for label, named in (walks or {}).items():
+            keyed = set(named.writes)
+            # Above one rank a growth walk isn't keyed, since each rank reads its sampled ids at a
+            # different step.
+            if self._world_size == 1:
+                keyed.update(named.growth)
+            self._keyed_walks[label] = frozenset(keyed)
         if not self.config.prefix_cache:
             return False
         if self._world_size > 1 and not self.config.prefix_cache_tp:

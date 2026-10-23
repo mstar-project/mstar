@@ -35,7 +35,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -892,7 +892,9 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth))
+                label: KeyedWalks(
+                    kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
+                )
                 for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):

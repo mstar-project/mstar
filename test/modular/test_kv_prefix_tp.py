@@ -19,6 +19,7 @@ from test_tp_async_teardown_order import _rank, _Stop
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.engine.engine import Engine
 from mstar.engine.resources import StepRunner, apply_yaml_overrides
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -28,7 +29,7 @@ from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
-WALKS = {"main": ((WALK, IMAGE_WALK), ("decode",))}
+WALKS = {"main": KeyedWalks((WALK, IMAGE_WALK), ("decode",))}
 
 
 @pytest.fixture(autouse=True)

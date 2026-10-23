@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
@@ -224,7 +225,7 @@ def test_a_request_admitted_twice_is_still_one_line(caplog):
 
 # ── a declared node that its keys never reach ───────────────────────────
 
-DECLARED = {"main": ((WALK,), ("decode",))}
+DECLARED = {"main": KeyedWalks((WALK,), ("decode",))}
 
 
 def _serve(kv: KVManager, count: int, keyed: bool) -> None:
