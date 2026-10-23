@@ -353,6 +353,31 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
         total += accepted + 1
 
 
+def test_every_rank_keeps_rank_0s_verdict(monkeypatch):
+    """The verdict is broadcast from rank 0 before anything reads it: here rank 0 accepted no
+    draft where this rank's oracle drafts were all right, and the step still trims, emits
+    and seeds by rank 0's, so the stream stays the plain one, a token a step."""
+    k = 2
+    (base, _), _ = _run_pair(k=k, max_tokens=12, ignore_eos=True, mla_absorb=True)
+    calls = []
+
+    def rank0(self, verdict):
+        calls.append(verdict.shape)
+        verdict = verdict.clone()
+        verdict[:, k + 1] = 0
+        return verdict
+
+    monkeypatch.setattr(Glm52LLMSubmodule, "_broadcast", rank0)
+    cfg = _cfg(k, True)
+    sub = Glm52LLMSubmodule(_model(cfg), cfg)
+    _oracle(sub, {"r0": base.tolist()}, 0)
+    spec = _drive(_Driver(sub, cfg, ["r0"]), torch.arange(5, dtype=torch.long) + 3,
+                  _fwd_info("r0", 12, True))
+    assert torch.equal(spec, base)
+    # one token from the prefill, then one per verify step
+    assert calls == [(1, k + 2)] * (base.numel() - 1)
+
+
 def test_batch_of_two_matches_single_streams():
     """Two requests in one batch (different prompts, different accepted
     counts per step) emit what each emits alone."""

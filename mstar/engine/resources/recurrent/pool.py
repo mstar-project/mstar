@@ -204,6 +204,26 @@ class RecurrentStatePool(Resource):
         tensor = self._blocks[name]
         return tensor[layer_idx] if per_layer else tensor
 
+    def gather(
+        self, name: str, rows: RecurrentAddressing, layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
+
+        ``rows`` is the step's addressing (``addressing``), so a captured and an
+        eager forward address their slots the same way; padding rows read the
+        sink."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        return self.block(name, layer_idx).index_select(0, index)
+
+    def scatter_(
+        self, name: str, rows: RecurrentAddressing, value: torch.Tensor,
+        layer_idx: int | None = None,
+    ) -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of these rows' slots."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        block = self.block(name, layer_idx)
+        block.index_copy_(0, index, value.to(block.dtype))
+
     def _slot_views(self, index: int):
         """Every block's rows of slot ``index``, all layers."""
         for name, tensor in self._blocks.items():

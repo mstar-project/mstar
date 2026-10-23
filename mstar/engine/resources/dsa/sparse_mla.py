@@ -8,6 +8,7 @@ under a CUDA graph a ``SparseGraphPlan`` re-planned outside the graph every step
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 
@@ -215,19 +216,48 @@ def reference(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,
     return out
 
 
+class RequestPages(NamedTuple):
+    """One request's cache pages, in position order, on this rank. A selection is this rank's
+    cache slots and the ranks' page tables need not agree, so it crosses ranks as the
+    request's token positions."""
+
+    pages: torch.Tensor
+    page_size: int
+
+    def to_positions(self, slots: torch.Tensor) -> torch.Tensor:
+        """The token positions of ``slots`` (-1: none), all in this request's pages."""
+        sorted_pages, order = self.pages.sort()
+        slot = slots.clamp_min(0).long()
+        page = (slot // self.page_size).to(sorted_pages.dtype)
+        at = torch.searchsorted(sorted_pages, page).clamp_max(order.numel() - 1)
+        pos = order[at] * self.page_size + slot % self.page_size
+        return torch.where(slots >= 0, pos.to(slots.dtype), -1)
+
+    def to_slots(self, positions: torch.Tensor) -> torch.Tensor:
+        """This rank's cache slots of ``positions`` (-1: none)."""
+        pos = positions.clamp_min(0).long()
+        index = (pos // self.page_size).clamp_max(self.pages.numel() - 1)
+        slot = self.pages[index].long() * self.page_size + pos % self.page_size
+        return torch.where(positions >= 0, slot.to(positions.dtype), -1)
+
+
 def select_rows(select: Callable[[int, int], torch.Tensor], r0: int, r1: int, width: int,
-                device: torch.device, group=None) -> torch.Tensor:
-    """``select(a, b)`` (``[b - a, width]`` int32) over rows ``[r0, r1)`` of one request's
-    prefill. With a TP ``group`` each rank selects a contiguous block and the blocks are
-    all-gathered: every rank would compute the same selection."""
+                device: torch.device, group=None,
+                request: RequestPages | None = None) -> torch.Tensor:
+    """``select(a, b)`` (``[b - a, width]`` int32 cache slots) over rows ``[r0, r1)`` of one
+    request's prefill. With a TP ``group`` each rank selects a contiguous block and the blocks
+    are all-gathered: every rank would compute the same selection. A block crosses ranks as
+    ``request``'s token positions and comes back as this rank's slots."""
     n = r1 - r0
     world = group.world_size if group is not None else 1
     if world == 1 or n < world * SHARD_MIN_ROWS:
         return select(r0, r1)
+    if request is None:
+        raise ValueError("a selection sharded across ranks needs the request's pages")
     per = -(-n // world)
     a = min(r0 + group.rank * per, r1)
     b = min(a + per, r1)
     block = torch.full((per, width), -1, dtype=torch.int32, device=device)
     if b > a:
-        block[:b - a] = select(a, b)
-    return group.all_gather(block, dim=0)[:n]
+        block[:b - a] = request.to_positions(select(a, b))
+    return request.to_slots(group.all_gather(block, dim=0)[:n])

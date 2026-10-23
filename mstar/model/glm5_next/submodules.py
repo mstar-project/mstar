@@ -152,11 +152,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
-            # each rank attends the others' selected cache slots, so the ranks' page tables
-            # must agree, and an eviction frees pages in a different order on each rank
-            if self.config.dsa_shard_prefill and getattr(resources[KV_CACHE],
-                                                         "supports_eviction", False):
-                raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
         buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
         if self.config.dsa_long_context and self.config.prefill_graphs and (
                 max(buckets) > sparse_mla.MAX_ROWS):
@@ -782,12 +777,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         the token after ``prev`` (the step's next input). A prefill's ``ends`` (device: each
         request's tokens in cache) start ``_mtp_len`` under mtp_trims."""
         pool = engine_inputs.resources[KDA_STATE]
-        slots = engine_inputs.resources[KDA].current_plan().slot_ids.long()
-        seed = pool.block(MTP_HIDDEN)
-        seed.index_copy_(0, slots, hidden.to(seed.dtype))
-        pool.block(MTP_DRAFT).index_copy_(0, slots, self._draft_tokens(hidden, prev)[:, None])
+        rows = pool.addressing()
+        pool.scatter_(MTP_HIDDEN, rows, hidden)
+        pool.scatter_(MTP_DRAFT, rows, self._draft_tokens(hidden, prev)[:, None])
         if ends is not None and self._mtp_len is not None:
-            self._mtp_len.index_copy_(0, slots, ends.long())
+            self._mtp_len.index_copy_(0, rows.slot_indices[: rows.num_rows].long(), ends.long())
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """mtp_trims: move this verify step's block to each request's true rows. The host
@@ -843,13 +837,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input token per row."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
         pool, kda = engine_inputs.resources[KDA_STATE], engine_inputs.resources[KDA]
-        slots = kda.current_plan().slot_ids.long()
-        n = slots.shape[0]
+        rows = pool.addressing()
+        n = rows.num_rows
 
         # Drafts: d1 was seeded by the last step; each further one is an MTP pass whose
         # query sits at its row of this step's block.
-        h = pool.block(MTP_HIDDEN).index_select(0, slots)
-        drafts = [pool.block(MTP_DRAFT).index_select(0, slots)[:, 0]]
+        h = pool.gather(MTP_HIDDEN, rows)
+        drafts = [pool.gather(MTP_DRAFT, rows)[:, 0]]
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank + attn.mla_cache_kpe)
         index_rows = None
@@ -877,7 +871,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         target, accepted = verdict[:, :block], verdict[:, block]
         kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
         if base is not None:  # mtp_trims: the next block starts after the accepted rows
-            self._mtp_len.index_copy_(0, slots, base + accepted + 1)
+            self._mtp_len.index_copy_(0, rows.slot_indices[: rows.num_rows].long(), base + accepted + 1)
 
         # The host's copy: the verdict first, then its step number.
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
@@ -887,13 +881,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # Seed the next step: the MTP pass over the block, with the target's argmax as each
         # row's next token (up to the accepted row it equals the drafts), read at the last
         # accepted row.
-        rows = torch.arange(n, device=slots.device)
-        next_input = target[rows, accepted]
+        each = torch.arange(n, device=accepted.device)
+        next_input = target[each, accepted]
         h_block = lm.mtp(lm.model.embed_tokens(target.reshape(-1)), hidden)
-        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[rows, accepted], next_input)
+        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[each, accepted], next_input)
 
         if not self.config.mtp_trims:
-            keep = torch.arange(block, device=slots.device)[None, :] <= accepted[:, None]
+            keep = torch.arange(block, device=accepted.device)[None, :] <= accepted[:, None]
             self._mask_holes(engine_inputs, keep)
         return next_input
 
