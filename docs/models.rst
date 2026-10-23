@@ -60,6 +60,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``meta-models/Muse-Glimmer-30B``
      - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
        NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
+   * - ``muse_spark`` *(Beta)*
+     - ``meta-models/Muse-Spark-Open-816B-A42B``
+     - Meta's 816B (42B active) mixture-of-experts VLM: Glimmer's attention and
+       ViT, gated residuals and 256 experts (8 a token) in a 4096-wide latent.
+       BF16 on one 8x B300 node.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -326,6 +331,27 @@ is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
 torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.
+
+Muse Spark Open (``muse_spark``)
+--------------------------------
+
+Meta's Muse Spark Open, 816B total and 42B active: text-and-image chat on
+``POST /generate`` and ``/v1/chat/completions``, with Muse Glimmer's prompt,
+reasoning strengths (default ``xhigh`` here) and channel stream (see above);
+sampling defaults to the checkpoint's (temperature 1, top_k 64). BF16
+needs one 8x B300 node (~213 GB of weights a rank); 8x B200 or H200 do not
+hold it::
+
+    mstar serve muse_spark --gpus 0,1,2,3,4,5,6,7
+
+The LLM runs TP8 with the 256 experts split whole across the ranks, 32 each
+(the config's ``ep_config: {parallel: ep}``; TP of the experts is refused):
+each expert's output is RMS-normed before its routing weight, so a rank sums
+its own experts and one all-reduce over the 4096-wide latent combines them.
+The residual stream is kept in fp32 across layers, as SGLang and vLLM serve
+it (transformers rounds it to bf16 at every residual gate). Not yet supported:
+NVFP4 experts (what the published 8x H200 setups serve), an FP8 KV cache,
+releasing the sliding layers' KV pages, video and the DFlash drafter.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

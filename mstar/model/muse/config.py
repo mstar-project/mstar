@@ -1,4 +1,5 @@
-"""Muse Glimmer's text and vision configs, read off the HF ``config.json``.
+"""The Muse family's text and vision configs, read off the HF ``config.json``:
+Muse Glimmer's (dense) and Muse Spark Open's (mixture of experts).
 
 Field names mirror HF's so ``from_hf`` can splat the checkpoint's own dicts.
 """
@@ -8,6 +9,7 @@ import json
 from dataclasses import dataclass, fields
 from functools import cached_property
 from pathlib import Path
+from typing import ClassVar
 
 from mstar.model import keys
 
@@ -41,17 +43,17 @@ def _read_config(path: str | Path) -> dict:
     return json.loads(path.read_text())
 
 
-def _plain_rope(section: dict, where: str) -> dict:
+def _plain_rope(section: dict, where: str, rope_types: tuple[str, ...] = ("default",)) -> dict:
     """``section``'s ``rope_parameters``, refusing a rope type or scaling this
     port does not build (it reads only ``rope_theta``)."""
     rope = section.get("rope_parameters") or {}
     if (
         section.get("rope_scaling")
-        or rope.get("rope_type", "default") != "default"
+        or rope.get("rope_type", "default") not in rope_types
         or set(rope) - {"rope_type", "rope_theta"}
     ):
         raise ValueError(
-            f"the {where} rope is a default one here, without scaling; "
+            f"the {where} rope is a {' or '.join(rope_types)} one here, without scaling; "
             f"the config's is {section.get('rope_scaling') or rope}"
         )
     return rope
@@ -77,6 +79,10 @@ class MuseGlimmerVisionConfig:
     layer_norm_eps: float = 1e-5
     hidden_act: str = "gelu"
     rope_theta: float = 10_000.0
+    # Muse Spark's tower reads its position table through a (t, w, h) grid,
+    # the reference's `meshgrid(..., indexing="xy")`; Glimmer's through (t, h, w).
+    # They differ on non-square grids only.
+    pos_table_xy: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -96,11 +102,13 @@ class MuseGlimmerVisionConfig:
         raw = _read_config(path)
         vc = raw["vision_config"]
         merged = {
-            **vc, **_plain_rope(vc, "vision tower's"),
+            # the tower's 2D rope, which Muse Spark's config calls axial
+            **vc, **_plain_rope(vc, "vision tower's", ("default", "axial")),
             "out_hidden_size": raw["out_hidden_size"],
             "projector_hidden_size": raw["projector_hidden_size"],
             "projector_hidden_act": raw.get("projector_hidden_act", "gelu"),
             "text_hidden_size": raw["text_config"]["hidden_size"],
+            "pos_table_xy": vc.get("model_type") == "muse_spark_vision",
         }
         known = {f.name for f in fields(cls)}
         config = cls(**{k: v for k, v in merged.items() if k in known})
@@ -146,6 +154,14 @@ class MuseGlimmerConfig:
     eos_token_id: int | list[int] | None = None
     # generation_config.json's eos list; see `from_hf`
     generation_eos_token_ids: tuple[int, ...] = ()
+    # the fields read from config.json's root rather than its text_config; required
+    ROOT_FIELDS: ClassVar[tuple[str, ...]] = ("image_token_id",)
+
+    @classmethod
+    def _check_text_config(cls, raw: dict) -> None:
+        moe = sorted(k for k in _MOE_KEYS if raw["text_config"].get(k))
+        if moe:
+            raise ValueError(f"this port is the dense Muse Glimmer; the config has MoE keys {moe}")
 
     @classmethod
     def from_hf(cls, path: str | Path) -> MuseGlimmerConfig:
@@ -153,11 +169,9 @@ class MuseGlimmerConfig:
         tc = raw["text_config"]
         merged = {
             **tc, **_plain_rope(tc, "text stack's"),
-            "image_token_id": raw["image_token_id"],
+            **{k: raw[k] for k in cls.ROOT_FIELDS},
         }
-        moe = sorted(k for k in _MOE_KEYS if tc.get(k))
-        if moe:
-            raise ValueError(f"this port is the dense Muse Glimmer; the config has MoE keys {moe}")
+        cls._check_text_config(raw)
         # the 30B's config names it hidden_activation
         act = tc.get("hidden_activation", tc.get("hidden_act", "silu"))
         if act != "silu":
@@ -211,3 +225,33 @@ class MuseGlimmerConfig:
     def attn_scale(self) -> float:
         """The query multiplier after QK-norm, folded into the softmax scale."""
         return (self.qk_scale_factor or 1.0) / self.head_dim ** 0.5
+
+
+@dataclass
+class MuseSparkConfig(MuseGlimmerConfig):
+    """Muse Spark Open's text stack: Glimmer's attention (with an output
+    norm), residual gates, and a mixture of experts in a narrower latent."""
+
+    num_local_experts: int = 256
+    num_experts_per_tok: int = 8
+    # the latent the experts run in, between `pre_expert_proj` and `post_expert_proj`
+    moe_hidden_size: int = 4096
+    moe_intermediate_size: int = 4096
+    routed_scaling_factor: float = 1.0
+    residual_gate_temperature: float = 0.3
+    audio_token_id: int | None = None
+    ROOT_FIELDS: ClassVar[tuple[str, ...]] = ("image_token_id", "audio_token_id")
+
+    @classmethod
+    def _check_text_config(cls, raw: dict) -> None:
+        tc = raw["text_config"]
+        if raw.get("model_type") != "muse_spark":
+            raise ValueError(f"not a Muse Spark config: model_type {raw.get('model_type')!r}")
+        dense = [i for i, t in enumerate(tc.get("mlp_layer_types") or []) if t != "sparse"]
+        if dense:
+            raise ValueError(f"this port runs every layer as experts; layers {dense} are dense")
+        if tc.get("num_shared_experts") or tc.get("n_group", 1) != 1 or tc.get("topk_group", 1) != 1:
+            raise ValueError("this port's router has no shared experts and no expert groups")
+        if tc.get("output_multiplier") is None:
+            raise ValueError("Muse Spark's text_config needs output_multiplier: it scales the router's logits")
+

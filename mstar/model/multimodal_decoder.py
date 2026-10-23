@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -56,6 +56,9 @@ from mstar.model.multimodal import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 # the sampling knobs a request may set
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos")
@@ -379,26 +382,32 @@ class MultimodalDecoderModel(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name not in self._submodule_cache:
             self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, autocast_dtype, tp_group,
+                node_name, device, autocast_dtype, tp_group, moe_parallel,
             )
         return self._submodule_cache[node_name]
 
     def _create_submodule(
         self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         """The node's submodule with its weights loaded, or None for a node
-        this model does not run."""
+        this model does not run. ``moe_parallel`` is the node group's
+        ``ep_config``, set only for a node in ``ep_enabled_nodes``."""
         raise NotImplementedError
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under `dtype` so no fp32 copy of the weights is
-        allocated. fp32-only parameters restore themselves in `_apply`."""
+        """Construct on ``device`` under ``dtype``, so no host or fp32 copy of
+        the weights is allocated. The ``.to`` copies nothing; it runs each
+        module's ``_apply``, where fp32-only parameters restore themselves
+        before the weights load."""
         torch.set_default_dtype(dtype)
         try:
-            return make().to(device)
+            with torch.device(device):
+                return make().to(device)
         finally:
             torch.set_default_dtype(torch.float32)

@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components import MoeParallelConfig
 from mstar.model.loader.base import _apply_stacked
 from mstar.model.muse.components.text import (
     GatedQKVParallelLinear,
@@ -643,3 +644,230 @@ def test_smart_resize_matches_the_reference_example():
     # the cap holds for any aspect ratio, a 1 x 89M-pixel image's too
     for size in ((4000, 3000), (1, 89_000_000), (89_000_000, 1)):
         assert math.prod(smart_resize(*size, 28, 4096)) // 28 ** 2 <= 4096
+
+
+# --- Muse Spark Open ---------------------------------------------------------------
+
+
+def _spark_raw(layers: int = 4) -> dict:
+    raw = _raw_config(layers)
+    raw["model_type"] = "muse_spark"
+    raw["audio_token_id"] = 7
+    raw["vision_config"]["model_type"] = "muse_spark_vision"
+    raw["vision_config"]["rope_parameters"] = {"rope_theta": 10000.0, "rope_type": "axial"}
+    raw["text_config"].update({
+        "num_local_experts": 8, "num_experts_per_tok": 2, "moe_hidden_size": 32,
+        "moe_intermediate_size": 48, "routed_scaling_factor": 1.0,
+        "residual_gate_temperature": 0.3, "mlp_layer_types": ["sparse"] * layers,
+        "num_shared_experts": 0,
+    })
+    return raw
+
+
+def test_the_spark_config_reads_the_checkpoint(tmp_path):
+    from mstar.model.muse.config import MuseSparkConfig
+
+    config = MuseSparkConfig.from_hf(_write(tmp_path, _spark_raw()))
+    assert config.audio_token_id == 7
+    assert (config.num_local_experts, config.num_experts_per_tok, config.moe_hidden_size) == (8, 2, 32)
+    assert MuseGlimmerVisionConfig.from_hf(tmp_path).pos_table_xy
+    # the dense Glimmer entry refuses it rather than dropping the experts
+    with pytest.raises(ValueError, match="dense Muse Glimmer"):
+        MuseGlimmerConfig.from_hf(tmp_path)
+
+
+@pytest.mark.parametrize(("change", "match"), [
+    ({"mlp_layer_types": ["dense", "sparse", "sparse", "sparse"]}, "dense"),
+    ({"num_shared_experts": 1}, "shared experts"),
+    ({"n_group": 4}, "expert groups"),
+    # the fused experts run SiLU whatever the config says
+    ({"hidden_act": "gelu"}, "silu"),
+    ({"output_multiplier": None}, "output_multiplier"),
+])
+def test_a_spark_config_this_port_would_run_wrong_is_refused(tmp_path, change, match):
+    from mstar.model.muse.config import MuseSparkConfig
+
+    raw = _spark_raw()
+    raw["text_config"].update(change)
+    with pytest.raises(ValueError, match=match):
+        MuseSparkConfig.from_hf(_write(tmp_path, raw))
+
+
+def _checkpoint_spark_text_names(layers: int):
+    """The released index's text keys (model.safetensors.index.json)."""
+    names = ["lm_head.weight", "model.language_model.embed_tokens.weight", "model.language_model.norm.weight"]
+    for i in range(layers):
+        p = f"model.language_model.layers.{i}."
+        names += [p + s for s in (
+            "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+            "self_attn.gate_proj.weight", "self_attn.o_proj.weight",
+            "input_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+            "post_attention_residual_gate.gate", "post_feedforward_residual_gate.gate",
+            "mlp.gate.weight", "mlp.gate.e_score_correction_bias",
+            "mlp.pre_expert_proj.weight", "mlp.pre_expert_norm.weight", "mlp.post_expert_proj.weight",
+            "mlp.experts.gate_up_proj", "mlp.experts.down_proj", "mlp.experts.post_expert_norm.weight",
+        )]
+    return names
+
+
+EP = MoeParallelConfig(parallel="ep")
+
+
+def test_every_spark_text_parameter_has_a_checkpoint_tensor(tmp_path):
+    from mstar.model.muse.components.spark import MuseSparkForCausalLM
+    from mstar.model.muse.config import MuseSparkConfig
+
+    with torch.device("meta"):
+        model = MuseSparkForCausalLM(MuseSparkConfig.from_hf(_write(tmp_path, _spark_raw())), moe_parallel=EP)
+    targets = {}
+    for name in _checkpoint_spark_text_names(4):
+        target, shard = _apply_stacked(text_name_remapper(name), _STACKED_PARAMS)
+        targets.setdefault(target, set()).add(shard)
+    assert {n for n, _ in model.named_parameters()} == set(targets)
+    assert targets["model.layers.0.self_attn.qkvg_proj.weight"] == {"q", "gate", "k", "v"}
+    # the router's fp32 weight is held as bf16 parts, and its bias stays fp32 through a cast
+    gate = model.model.layers[0].mlp.gate
+    model.to(torch.bfloat16)
+    assert gate.weight.shape == (3, 8, 64) and gate.e_score_correction_bias.dtype == torch.float32
+
+
+def test_each_tp_rank_holds_its_share_of_whole_experts(tmp_path):
+    from types import SimpleNamespace
+
+    from mstar.model.muse.components.spark import spark_moe
+    from mstar.model.muse.config import MuseSparkConfig
+
+    config = MuseSparkConfig.from_hf(_write(tmp_path, _spark_raw()))
+    with torch.device("meta"):
+        moe = spark_moe(config, SimpleNamespace(rank=1, world_size=2), EP)
+    assert (moe.expert_start, moe.num_local_experts) == (4, 4)
+    # whole experts: the intermediate dim is not split
+    assert moe.experts.gate_up_proj.shape == (4, 2 * 48, 32)
+    assert moe.experts.down_proj.shape == (4, 32, 48)
+
+
+@pytest.mark.parametrize("ep_config", [None, {"parallel": "tp"}], ids=["default", "tp"])
+def test_spark_refuses_a_tp_split_of_its_experts_at_startup(ep_config):
+    """The per-expert norm needs each expert's whole output row, which a TP
+    split of the intermediate dim leaves partial on every rank; the conductor
+    refuses such a config before any worker loads the weights."""
+    from mstar.model.muse.spark_model import MuseSparkModel
+
+    group = {"node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2}
+    model = object.__new__(MuseSparkModel)
+    model.validate_config_yaml({"node_groups": [{**group, "ep_config": {"parallel": "ep"}}]}, "config.yaml")
+    if ep_config is not None:
+        group["ep_config"] = ep_config
+    with pytest.raises(ValueError, match="parallel: ep"):
+        model.validate_config_yaml({"node_groups": [group]}, "config.yaml")
+
+
+def _spark_moe(tmp_path):
+    from mstar.model.muse.components.spark import spark_moe
+    from mstar.model.muse.config import MuseSparkConfig
+
+    torch.manual_seed(0)
+    moe = spark_moe(MuseSparkConfig.from_hf(_write(tmp_path, _spark_raw())), CommGroup.trivial(), EP)
+    for p in moe.parameters():
+        torch.nn.init.normal_(p, std=0.2)
+    return moe.double()
+
+
+def test_a_replay_s_padding_rows_skip_spark_s_experts(tmp_path):
+    """Under ``mask_padding`` the shared block routes rows past the real
+    tokens to no expert: the real rows are as without padding, and the
+    padding's are the latent projection of nothing."""
+    moe = _spark_moe(tmp_path)
+    h = torch.randn(7, 64, dtype=torch.float64)
+    valid = torch.arange(7) < 5
+    out = moe(h, token_valid=valid)
+    torch.testing.assert_close(out[:5], moe(h[:5]))
+    assert not out[5:].any()
+
+
+def _hf_spark_text_model(model):
+    """transformers' own MuseSparkTextModel, its eager attention and experts,
+    carrying ``model``'s weights."""
+    modeling = pytest.importorskip("transformers.models.muse_spark.modeling_muse_spark")
+    from transformers.models.muse_spark.configuration_muse_spark import MuseSparkTextConfig
+
+    config = MuseSparkTextConfig(
+        **_spark_raw()["text_config"], attn_implementation="eager", experts_implementation="eager",
+    )
+    ref = modeling.MuseSparkTextModel(config).double().eval()
+    cfg = model.config
+    q, kv = cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim
+    state = {}
+    latent = {"pre_experts.proj.": "pre_expert_proj.", "pre_experts.norm.": "pre_expert_norm.",
+              "post_experts.": "post_expert_proj.", "mlp.expert_norm.": "mlp.experts.post_expert_norm."}
+    for name, p in model.model.named_parameters():
+        for ours, theirs in latent.items():
+            name = name.replace(ours, theirs)
+        if name.endswith("qkvg_proj.weight"):
+            prefix = name[:-len("qkvg_proj.weight")]
+            for part, w in zip(("q", "gate", "k", "v"), p.split([q, q, kv, kv]), strict=True):
+                state[f"{prefix}{part}_proj.weight"] = w
+        elif name.endswith("mlp.gate.weight"):
+            # the router weight its bf16 parts hold
+            state[name] = p.double().sum(0)
+        else:
+            state[name] = p
+    ref.load_state_dict(state)
+    return ref
+
+
+def test_the_spark_text_stack_matches_transformers(tmp_path):
+    """The whole text stack against transformers' MuseSparkTextModel on the
+    same weights: attention with its output norm, the gated residuals, the
+    router, the experts' latent and the per-expert norm."""
+    from mstar.model.muse.components.spark import MuseSparkForCausalLM
+    from mstar.model.muse.config import MuseSparkConfig
+
+    torch.manual_seed(0)
+    cfg = MuseSparkConfig.from_hf(_write(tmp_path, _spark_raw()))
+    model = MuseSparkForCausalLM(cfg, moe_parallel=EP).double()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.2)
+    ref = _hf_spark_text_model(model)
+    resources = {
+        KV_CACHE: _KV(),
+        ATTN_SLIDING: _Attn(cfg.attn_scale, cfg.sliding_window - 1),
+        ATTN_FULL: _Attn(cfg.attn_scale, -1),
+        ROPE: _Pos(cfg.rope_theta),
+    }
+    for module in model.modules():
+        bind = getattr(module, "bind_resources", None)
+        if callable(bind):
+            bind(resources)
+    # long enough that the 5-token window cuts the sliding layers off
+    ids = torch.randint(0, cfg.vocab_size, (13,))
+    ours = model.model(model.model.embed(ids), label="main")
+    with torch.no_grad():
+        theirs = ref(input_ids=ids[None], use_cache=False).last_hidden_state[0]
+    # the router's logits and the norms are fp32 on both sides, the rest fp64
+    assert torch.allclose(ours.double(), theirs, atol=1e-4, rtol=1e-4), (ours.double() - theirs).abs().max()
+
+
+def test_spark_s_patch_embedding_matches_transformers_on_non_square_grids(tmp_path):
+    """Spark reads its position table through a (t, w, h) grid, as transformers'
+    MuseSparkVisionPatchEmbedder does; on a non-square grid that differs from
+    Glimmer's (t, h, w)."""
+    modeling = pytest.importorskip("transformers.models.muse_spark.modeling_muse_spark")
+    from transformers.models.muse_spark.configuration_muse_spark import MuseSparkVisionConfig
+
+    from mstar.model.muse.components.vision import MuseGlimmerVisionModel
+
+    raw = _spark_raw()["vision_config"]
+    config = MuseGlimmerVisionConfig.from_hf(_write(tmp_path, _spark_raw()))
+    torch.manual_seed(0)
+    tower = MuseGlimmerVisionModel(config).double()
+    hf_config = MuseSparkVisionConfig(**{k: v for k, v in raw.items() if k != "model_type"})
+    ref = modeling.MuseSparkVisionPatchEmbedder(hf_config).double()
+    ref.load_state_dict(tower.patch_embedder.state_dict())
+    grid = [(1, 6, 10), (2, 8, 2)]
+    pixels = torch.randn(sum(math.prod(g) for g in grid), config.patch_dim, dtype=torch.float64)
+    ti = tower_inputs(grid, config)
+    ours, _, _ = tower.embed(pixels, ti.interp_indices, ti.interp_weights, ti.window_index, ti.rope_positions)
+    with torch.no_grad():
+        theirs = tower.ln_pre(ref(pixels, torch.tensor(grid)))[ti.window_index]
+    torch.testing.assert_close(ours, theirs)

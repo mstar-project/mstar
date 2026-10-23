@@ -73,6 +73,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "ltx2_5": "ltx2_5.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
     "muse_glimmer": "muse_glimmer.yaml",
+    # bf16 on one 8x B300 node, TP8 with the experts split 32 a rank
+    "muse_spark": "muse_spark_open.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
@@ -146,7 +148,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer", "muse_spark"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -207,11 +209,12 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "muse_glimmer"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "muse_glimmer",
+                 "muse_spark"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni", "muse_glimmer"):
+        if model in ("bagel", "qwen3_omni", "muse_glimmer", "muse_spark"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):

@@ -117,8 +117,11 @@ class MuseGlimmerAttention(nn.Module):
         if self.pos is not None:
             # plain NEOX rope; no llama-3.1 scaling arguments
             q, k = self.pos.apply_qk(q, k, label=self.attend.label)
-        out = self.attend(q, k, v).reshape(n, q_dim)
-        return self.o_proj(out * torch.sigmoid(gate))
+        return self.o_proj(self._attend_heads(q, k, v).reshape(n, q_dim) * torch.sigmoid(gate))
+
+    def _attend_heads(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Each query head's attention output, before the output gate."""
+        return self.attend(q, k, v)
 
 
 class MuseGlimmerDecoderLayer(nn.Module):
@@ -139,7 +142,10 @@ class MuseGlimmerDecoderLayer(nn.Module):
 
 
 class MuseGlimmerTextModel(nn.Module):
-    def __init__(self, config: MuseGlimmerConfig, comm_group: CommGroup | None = None):
+    LAYER: type[nn.Module] = MuseGlimmerDecoderLayer
+
+    def __init__(self, config: MuseGlimmerConfig, comm_group: CommGroup | None = None, **layer_kwargs):
+        """``layer_kwargs``: a subclass's layer options (Spark's ``moe_parallel``)."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -150,7 +156,7 @@ class MuseGlimmerTextModel(nn.Module):
             config.vocab_size, config.hidden_size, comm_group=comm_group,
         )
         self.layers = nn.ModuleList(
-            MuseGlimmerDecoderLayer(config, s, comm_group) for s in sliding
+            self.LAYER(config, s, comm_group, **layer_kwargs) for s in sliding
         )
         # plain `w`, unlike the layers' norms
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -180,10 +186,12 @@ class MuseGlimmerTextModel(nn.Module):
 
 
 class MuseGlimmerForCausalLM(nn.Module):
-    def __init__(self, config: MuseGlimmerConfig, comm_group: CommGroup | None = None):
+    TEXT_MODEL: type[MuseGlimmerTextModel] = MuseGlimmerTextModel
+
+    def __init__(self, config: MuseGlimmerConfig, comm_group: CommGroup | None = None, **layer_kwargs):
         super().__init__()
         self.config = config
-        self.model = MuseGlimmerTextModel(config, comm_group)
+        self.model = self.TEXT_MODEL(config, comm_group, **layer_kwargs)
         # untied; gathers the vocab so the sampler is TP-oblivious
         self.lm_head = ColumnParallelLinear(
             comm_group=self.model.comm_group,
@@ -204,9 +212,9 @@ class MuseGlimmerForCausalLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, label: str, **decoder_kwargs) -> torch.Tensor:
         """``(tokens, hidden)`` in, the stack's normed output out."""
-        return self.model(input_embeds, label=label)
+        return self.model(input_embeds, label=label, **decoder_kwargs)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """``cap * tanh(lm_head(x) * output_multiplier / cap)``, in fp32."""

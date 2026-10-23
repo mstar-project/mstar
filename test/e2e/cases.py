@@ -249,6 +249,10 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ModelSpec("qwen3_5_9b", "configs/qwen3_5_9b.yaml", lm_cases(), "llm", peak_vram_gb=39.6),
     # ~60 GB of bf16 weights: one 141 GB GPU; peak VRAM not yet measured on an H200
     ModelSpec("muse_glimmer", "configs/muse_glimmer.yaml", lm_cases(), "llm"),
+    # ~213 GB of bf16 weights a rank over 8 GPUs (one 8x B300 node); peak VRAM
+    # provisional, not yet measured
+    ModelSpec("muse_spark", "configs/muse_spark_open.yaml", lm_cases(), "llm",
+              gated=("meta-models/Muse-Spark-Open-816B-A42B",), peak_vram_gb=250),
     ModelSpec("bagel", "configs/bagel_single_gpu.yaml", (
         Case("text_to_text", "chat", chat(lambda: TWO_PLUS_TWO), ANSWER_4),
         Case("image_to_text", "chat", chat(vision_prompt), ANSWER_RED),

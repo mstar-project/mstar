@@ -357,6 +357,12 @@ class MuseGlimmer(Model):
         return self._tokenizer
 
 
+class MuseSpark(MuseGlimmer):
+    """Muse Spark Open 816B-A42B (text + image in, text out) benchmark metadata."""
+
+    HF_URL = "meta-models/Muse-Spark-Open-816B-A42B"
+
+
 class Qwen3TTS1p7B(Qwen3TTS):
     HF_URL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
@@ -525,6 +531,7 @@ class ModelType(Enum):
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
     MUSE_GLIMMER = "muse_glimmer"
+    MUSE_SPARK = "muse_spark"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -571,4 +578,6 @@ class ModelType(Enum):
             return Qwen3_8_Dense(**kwargs)
         if self == ModelType.MUSE_GLIMMER:
             return MuseGlimmer(**kwargs)
+        if self == ModelType.MUSE_SPARK:
+            return MuseSpark(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

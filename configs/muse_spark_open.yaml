@@ -1,0 +1,45 @@
+model: "muse_spark"
+# The checkpoint allows 1M tokens; a request is capped at 128K here.
+max_seq_len: 131072
+
+resources:
+  kv_cache:
+    # 62 layers x 2 KV heads a rank x 64 dims x 2 (k, v) x bf16 = 31.7 KB a
+    # token a rank, 4.06 MB a page of 128. ~52 GB of a B300 left after
+    # weights, activations, graphs and MoE scratch (the experts take long
+    # prompts in chunks of 8192 tokens, so ~3 GB at any length). Every rank
+    # takes this page count, and rank 0 also runs the media encoders (~4 GB of
+    # weights plus activations), so 6 GB stay free: 11000 pages, 1.4M tokens.
+    # To be measured on the box.
+    max_num_pages: 11000
+
+node_groups:
+  # BF16 on one 8x B300 (288 GB) node: ~213 GB of weights a rank, the 256
+  # experts split 32 a rank. 8x B200 or H200 do not hold the BF16 weights.
+  # The encoders run once per request, colocated on rank 0.
+  - node_names: [vision_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    # Attention is TP; the experts are whole on each rank, which Spark needs:
+    # each expert's output is normed over its full width before weighting.
+    ep_config:
+      parallel: ep
+      log_expert_load_every: 0    # N > 0 logs per-rank slot counts every N steps
+      mask_padding: false         # skip CUDA-graph padding rows in the experts
+
+# All-reduces on the compute stream through NVLS multicast (see
+# muse_glimmer_tp2.yaml); falls back to NCCL with a warning.
+tp_allreduce: symm_multimem
+
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  # ~10K tokens, past the top prefill bucket (8192): the uncaptured long-prompt
+  # path, its experts in chunks, runs here first rather than on a client's
+  # first long prompt.
+  - text: "The quick brown fox jumps over the lazy dog. "
+    repeat: 1000
+    model_kwargs: {max_output_tokens: 1}

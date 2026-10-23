@@ -396,6 +396,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         self, node_name: str, device: str,
         autocast_dtype: torch.dtype | None = None,
         tp_group=None,
+        moe_parallel=None,
     ) -> NodeSubmodule | None:
         from mstar.model.qwen3_5.submodules import (
             LLMSubmodule,

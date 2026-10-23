@@ -70,9 +70,14 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
     )
 
+    # the chat template's name for the reasoning strength
+    REASONING_KWARG = "reasoning_strength"
+    # what a larger Muse (`MuseSparkModel`) swaps in, with `NAME`
+    TEXT_CONFIG: type[MuseGlimmerConfig] = MuseGlimmerConfig
+
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
         super().__init__(model_path_hf, cache_dir)
-        self.config = MuseGlimmerConfig.from_hf(self.local_dir)
+        self.config = self.TEXT_CONFIG.from_hf(self.local_dir)
         self.vision_config = MuseGlimmerVisionConfig.from_hf(self.local_dir)
         self.tokenizer = load_tokenizer(self.local_dir)
         ids = {t: self.tokenizer.convert_tokens_to_ids(t) for t in (IMAGE_PAD, IMAGE_START, IMAGE_END)}
@@ -212,7 +217,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                     f"{self.NAME}'s reasoning strength is one of {_REASONING_STRENGTHS}, "
                     f"got {strength!r}"
                 )
-            template_kwargs["reasoning_strength"] = strength
+            template_kwargs[self.REASONING_KWARG] = strength
         if kwargs.get("current_date") is not None:
             template_kwargs["current_date"] = kwargs["current_date"]
         try:
@@ -223,7 +228,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 **template_kwargs,
             )
         except TemplateError as exc:
-            raise ValueError(f"Muse Glimmer's chat template refused the chat: {exc}") from exc
+            raise ValueError(f"{self.NAME}'s chat template refused the chat: {exc}") from exc
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
@@ -246,6 +251,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
 
     def _create_submodule(
         self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        moe_parallel=None,
     ) -> NodeSubmodule | None:
         from mstar.model.muse import weight_loader
         from mstar.model.muse.submodules import (
@@ -263,7 +269,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             tower = self._build(lambda: MuseGlimmerVisionModel(self.vision_config), dtype, device)
             weight_loader.load_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
-            logger.info("Loaded Muse Glimmer vision encoder onto %s", device)
+            logger.info("Loaded %s vision encoder onto %s", self.NAME, device)
             return VisionEncoderSubmodule(
                 tower, self.vision_config, self.encoder(node_name),
             )
@@ -273,5 +279,5 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         model = self._build(lambda: MuseGlimmerForCausalLM(self.config, tp_group), dtype, device)
         weight_loader.load_text_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
-        logger.info("Loaded Muse Glimmer LLM onto %s", device)
+        logger.info("Loaded %s LLM onto %s", self.NAME, device)
         return LLMSubmodule(model, self.config, self.encoders)

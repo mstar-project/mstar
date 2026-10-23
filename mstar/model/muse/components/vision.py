@@ -104,7 +104,9 @@ def _merge_order(grid, merge: int):
 def tower_inputs(grid: list[tuple[int, int, int]], config: MuseGlimmerVisionConfig) -> TowerInputs:
     """The tower's index tensors for ``grid``, built once per request, on
     the CPU: the node's `preprocess` moves them."""
-    indices, weights = _interpolation(grid, config.pos_emb_height)
+    # Spark samples the table through a (t, w, h) grid (`pos_table_xy`)
+    table_grid = [(t, w, h) for t, h, w in grid] if config.pos_table_xy else grid
+    indices, weights = _interpolation(table_grid, config.pos_emb_height)
     window_index, window_lengths = _windows(grid, config.window_patches)
     raster_pos = torch.cat([
         torch.stack([

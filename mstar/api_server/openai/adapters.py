@@ -1472,6 +1472,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "glm52": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
+    "muse_spark": Qwen3_5Adapter(),
 }
 
 # One key per size; every size takes the same adapter.

@@ -31,6 +31,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "muse_glimmer": ("mstar.model.muse.glimmer_model", "MuseGlimmerModel"),
+    "muse_spark": ("mstar.model.muse.spark_model", "MuseSparkModel"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -103,6 +104,9 @@ HF_MODELS: dict[str, dict] = {
     "ltx2_5": {"model_path_hf": "Lightricks/LTX-2.5-Diffusers"},
     # Meta's 30B dense agentic VLM (text + image in). Apache-2.0.
     "muse_glimmer": {"model_path_hf": "meta-models/Muse-Glimmer-30B"},
+    # Meta's 816B (42B active) mixture-of-experts VLM. Gated; the Muse model
+    # license allows the ungated copies.
+    "muse_spark": {"model_path_hf": "meta-models/Muse-Spark-Open-816B-A42B"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over
     # 10 codebooks) with a 44.1 kHz causal DAC codec and reference-audio voice

@@ -817,6 +817,18 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
     )
 
 
+def _muse_spark(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.muse.config import MuseSparkConfig
+    from mstar.model.muse.spark_model import MuseSparkModel
+    config, vision_config = _muse_configs(MuseSparkConfig, 1048576)
+    return _bare(
+        MuseSparkModel, config=config, vision_config=vision_config,
+        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+    )
+
+
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
     # The talker imports flashinfer at module level; none of it runs here.
     if importlib.util.find_spec("flashinfer") is None:
@@ -899,6 +911,7 @@ _FACTORIES = {
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
     "MuseGlimmerModel": _muse_glimmer,
+    "MuseSparkModel": _muse_spark,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,

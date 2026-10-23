@@ -1,4 +1,5 @@
-"""Muse Glimmer's node submodules: the LLM and the vision encoder.
+"""Muse Glimmer's node submodules: the LLM (and Spark's, over its experts)
+and the vision encoder.
 
 Both build on the shared scaffolds (`SampledTokenDecoder`,
 `PackedBlockLoopEncoder`). Positions are plain 1D and advance one per token,
@@ -24,7 +25,7 @@ from mstar.model.muse.config import (
     VISION_FULL,
     VISION_WINDOW,
 )
-from mstar.model.submodule_base import NodeInputs
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
 
 
 class LLMSubmodule(SampledTokenDecoder):
@@ -40,6 +41,26 @@ class LLMSubmodule(SampledTokenDecoder):
             ATTN_SLIDING: AttentionStep(causal=True),
             ATTN_FULL: AttentionStep(causal=True),
         }
+
+
+class SparkLLMSubmodule(LLMSubmodule):
+    """The LLM node over Spark's experts: their expert-load log, and a
+    replay's padding rows kept out of them, as the node group's ``ep_config``
+    asks (``log_expert_load_every``, ``mask_padding``)."""
+
+    def preprocess(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        out = super().preprocess(graph_walk, engine_inputs, inputs)
+        ids = out["input_ids"]
+        out.update(self.model.model.moe_step_inputs(engine_inputs, ids.shape[0], ids.device))
+        return out
+
+    def decoder_kwargs(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
+        num_tokens: int, **tensors: torch.Tensor,
+    ) -> dict[str, Any]:
+        return {"num_valid_tokens": tensors["num_valid_tokens"]} if "num_valid_tokens" in tensors else {}
 
 
 class VisionEncoderSubmodule(PackedBlockLoopEncoder):

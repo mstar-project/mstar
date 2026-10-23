@@ -1,9 +1,11 @@
-"""Loading a Muse Glimmer checkpoint into this stack.
+"""Loading a Muse Glimmer or Muse Spark checkpoint into this stack.
 
 The text stack sits under ``model.language_model``; the attention's output
 gate (``self_attn.gate_proj``) and the MLP's (``mlp.gate_proj``) share a
 suffix, so the stacked rules name their module. The vision tower, adapter and
-projection load into one module, as one node.
+projection load into one module, as one node. Spark's experts are one tensor
+per layer, which the EP block's loaders take; a rank reads only its own
+experts' rows (`ep_expert_slice_spec`).
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import torch
 from torch import nn
 
 from mstar.model.loader.base import StackedParamRule, load_weights_into
-from mstar.model.loader.iterators import iter_safetensors_shards
+from mstar.model.loader.iterators import SliceSpec, iter_safetensors_shards
 
 _STACKED_PARAMS: list[StackedParamRule] = [
     StackedParamRule(".self_attn.qkvg_proj", ".self_attn.q_proj", "q"),
@@ -27,6 +29,13 @@ _STACKED_PARAMS: list[StackedParamRule] = [
 
 _TEXT_PREFIX = "model.language_model."
 _LM_HEAD = "lm_head.weight"
+# Spark's latent projections and per-expert norm, held as the MoE block's options
+_MOE_OPTIONS = (
+    (".mlp.pre_expert_proj.", ".mlp.pre_experts.proj."),
+    (".mlp.pre_expert_norm.", ".mlp.pre_experts.norm."),
+    (".mlp.post_expert_proj.", ".mlp.post_experts."),
+    (".mlp.experts.post_expert_norm.", ".mlp.expert_norm."),
+)
 _VISION = {
     "model.vision_tower.": "",
     "model.vision_adapter.fc1.": "adapter_fc1.",
@@ -40,6 +49,8 @@ def text_name_remapper(name: str) -> str | None:
         return name
     if not name.startswith(_TEXT_PREFIX):
         return None
+    for theirs, ours in _MOE_OPTIONS:
+        name = name.replace(theirs, ours)
     return "model." + name[len(_TEXT_PREFIX):]
 
 
@@ -50,12 +61,13 @@ def vision_name_remapper(name: str) -> str | None:
     return None
 
 
-def _load(model, path, device, remapper, selectors, stacked=None) -> set[str]:
+def _load(model, path, device, remapper, selectors, stacked=None, slice_spec=None) -> set[str]:
     """Fill every parameter of ``model`` from tensors that all have one, or
     raise: a half-loaded tower, or a checkpoint tensor this port has no
     parameter for (a weighted norm, a bias), produces plausible garbage."""
     weights = itertools.chain.from_iterable(
-        iter_safetensors_shards(Path(path), device=device, **selector) for selector in selectors
+        iter_safetensors_shards(Path(path), device=device, slice_spec=slice_spec, **selector)
+        for selector in selectors
     )
     return load_weights_into(
         model, weights, stacked_params=stacked, name_remapper=remapper, strict=True,
@@ -64,11 +76,12 @@ def _load(model, path, device, remapper, selectors, stacked=None) -> set[str]:
 
 def load_text_weights(
     model: nn.Module, path: str | Path, device: torch.device | str = "cpu",
+    slice_spec: SliceSpec | None = None,
 ) -> set[str]:
     return _load(
         model, path, device, text_name_remapper,
         [{"prefix": _TEXT_PREFIX}, {"keys": {_LM_HEAD}}],
-        stacked=_STACKED_PARAMS,
+        stacked=_STACKED_PARAMS, slice_spec=slice_spec,
     )
 
 
