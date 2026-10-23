@@ -33,7 +33,6 @@ class PrefixIndex:
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
         self._evictable: set[int] = set()
-        arena.index = self
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""

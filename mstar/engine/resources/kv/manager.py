@@ -691,6 +691,7 @@ class KVManager(AttentionResource):
             return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
+        self._arena.index = self._index
         return True
 
     def page_counts(self) -> KVPageCounts:
