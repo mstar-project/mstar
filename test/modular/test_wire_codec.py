@@ -17,7 +17,12 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultTensors
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    GenerationControlResult,
+    RequestComplete,
+    ResultTensors,
+)
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
@@ -26,11 +31,17 @@ from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
+    ContinueGeneration,
     FailRequests,
+    GetGenerationState,
     InputSignals,
     NewRequest,
+    PauseGeneration,
     ScheduleTPNode,
     StopLoops,
+    UpdateWeightsFromDisk,
+    WeightControl,
+    WeightControlAck,
     WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
@@ -245,6 +256,27 @@ def test_api_server_result_tensors():
     assert body.modality == "audio"
     assert body.graph_edge.name == "chunk"
     assert body.metadata == {"sr": 24000}
+
+
+def test_pause_and_weight_reload_messages():
+    for body in (
+        PauseGeneration(op_id="p", mode="wait"),
+        ContinueGeneration(op_id="c"),
+        UpdateWeightsFromDisk(op_id="u", model_path="/ckpt", weight_version="v1"),
+        GetGenerationState(op_id="s"),
+        WeightControlAck(epoch=3, worker_id="worker_1", op="apply", error="OSError: x", dirty=True),
+    ):
+        msg = ConductorMessage(message_type=ConductorMessageType.PAUSE_GENERATION, body=body)
+        assert roundtrip(msg).body == body
+    step = WeightControl(op="apply", epoch=3, model_path="/ckpt", weight_version=None)
+    assert roundtrip(WorkerMessage(message_type=WorkerMessageType.WEIGHT_CONTROL, body=step)).body == step
+    result = GenerationControlResult(
+        op_id="u", status=500, state="paused", paused=True, weight_version=None,
+        error_message="failed", ranks={"worker_0": "ok", "worker_1": "OSError: x"},
+        rank_versions={"worker_0": "v1", "worker_1": None},
+    )
+    out = roundtrip(APIServerMessage(message_type="generation_control_result", body=result)).body
+    assert out == result
 
 
 def test_fail_requests_and_empty_collections():
