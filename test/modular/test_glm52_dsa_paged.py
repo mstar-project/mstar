@@ -32,6 +32,7 @@ from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
     build_random_model,
     index_topk,
+    install_cpu_rope,
 )
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.indexer import full_indexer_layers  # noqa: E402
@@ -49,6 +50,7 @@ from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # no
 def _force_cpu_flashinfer(monkeypatch):
     """CPU tensors throughout: the stub, whatever flashinfer is installed."""
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 def _cfg(topk):

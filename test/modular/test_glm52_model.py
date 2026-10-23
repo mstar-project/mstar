@@ -323,7 +323,7 @@ def test_glm52_config_sanity():
 
     reduced = Glm52ModelConfig.reduced()
     assert not is_moe_layer(reduced, 0) and is_moe_layer(reduced, 1)
-    assert reduced.qk_head_dim == 24 and reduced.padded_head_dim == 64
+    assert reduced.qk_head_dim == 32 and reduced.padded_head_dim == 64
 
 
 # ── submodule: check_stop ──
@@ -446,10 +446,15 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     assert sub._dsa_ctx(out) is None
 
 
-def test_glm52_preprocess_positions_continue_from_the_stream_position():
+def test_glm52_positions_are_the_position_resources_plan():
+    """The forward takes the ids ``PositionManager.plan`` built (from the stream counters, in
+    KV plan order); preprocess builds none of its own."""
     sub = _make_submodule(Glm52ModelConfig())
-    out = _preprocess(sub, {"r0": 5, "r1": 0}, seq_len=3)
-    assert out["position_ids"].tolist() == [5, 6, 7, 0, 1, 2]
+    assert "position_ids" not in _preprocess(sub, {"r0": 5, "r1": 0}, seq_len=3)
+    planned = torch.tensor([5, 6, 7, 0, 1, 2, 2, 2])  # a captured bucket's buffer, padded
+    pos = SimpleNamespace(pos_ids=lambda label: planned if label == "main" else None)
+    engine_inputs = SimpleNamespace(resources={POS_RESOURCE: pos})
+    assert sub._positions(engine_inputs, 6).tolist() == [5, 6, 7, 0, 1, 2]
 
 
 def test_glm52_preprocess_refuses_context_beyond_dsa_window():

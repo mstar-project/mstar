@@ -2,15 +2,16 @@
 
 ``config`` carries the MLA dims: ``hidden_size``, ``num_attention_heads``, ``q_lora_rank``,
 ``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``qk_head_dim``, ``v_head_dim``,
-``padded_head_dim``, ``rms_norm_eps``, ``rope_theta``, ``mla_absorb`` (the backend), and optionally
-``mla_fused_prep`` and the fp8 block-scale fields ``dense_fp8_block`` reads:
+``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale``, ``mla_absorb`` (the backend), and
+optionally ``mla_fused_prep`` and the fp8 block-scale fields ``dense_fp8_block`` reads:
 
 * absorbed: once the weights load, ``kv_b_proj`` folds into the query (``w_kc``) and the output
   (``w_vc``), and the two down projections into one GEMM. Attention runs over the cache's compressed
   rows (the ``kv_lora_rank`` latent and the decoupled RoPE key) through the MLA attention resource.
 * naive: per-head K/V padded to the attention backend's head size, the reduced-dims parity path.
 
-The decoupled RoPE is interleaved, in fp32 (``InterleavedRotaryEmbedding``). A model's sparse
+The decoupled RoPE is the position resource's (``pos_key``; the model's ``PositionConfig`` sets
+its layout and table), at the positions the caller passes. A model's sparse
 attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
 (naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
 """
@@ -26,7 +27,6 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, dense_fp8_block, fp8_block_linear
 from mstar.model.components.norm import RMSNorm
-from mstar.model.components.rope import InterleavedRotaryEmbedding
 from mstar.utils import mla_prep
 
 
@@ -39,6 +39,7 @@ class MLAAttention(nn.Module):
         *,
         kv_key: str,
         attn_key: str,
+        pos_key: str,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -90,14 +91,11 @@ class MLAAttention(nn.Module):
             else Fp8Linear(h * config.v_head_dim, config.hidden_size, fp8, comm_group,
                            shard=ROW, reduce_results=True))
 
-        self.rotary = InterleavedRotaryEmbedding(
-            rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
-
         self.layer_idx = layer_idx
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
-        # qk_head_dim**-0.5 into q on the padded path. No Yarn -> no mscale.
-        self.softmax_scale_boost = math.sqrt(self.padded_head_dim / self.qk_head_dim)
-        self.softmax_scale = self.qk_head_dim ** -0.5
+        # softmax_scale into q on the padded path.
+        self.softmax_scale = config.softmax_scale
+        self.softmax_scale_boost = math.sqrt(self.padded_head_dim) * self.softmax_scale
 
         self.mla_absorb = config.mla_absorb
         self.mla_fused_prep = (
@@ -109,13 +107,29 @@ class MLAAttention(nn.Module):
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
             self.register_buffer("fused_qkv_a_proj_scale_inv", None, persistent=False)  # dense_fp8
         # engine-built, bound once at load (bind_resources)
-        self._kv_key, self._attn_key = kv_key, attn_key
+        self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv = None
         self._attn = None
+        self._pos = None
 
     def bind_resources(self, resources: dict) -> None:
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
+        self._pos = resources[self._pos_key]
+        if self.mla_fused_prep and self._pos.cos_sin_table is None:
+            raise RuntimeError(
+                "mla_fused_prep rotates from the position resource's cos/sin table: set "
+                "rope_table_dtype in the model's PositionConfig")
+
+    def _rope(
+        self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate ``q_pe`` / ``k_pe`` at ``position_ids`` through the position resource. Its
+        kernel rotates whole rows in place, so the slices split off q and the latent are
+        copied out first."""
+        return self._pos.apply_qk(
+            q_pe.clone(memory_format=torch.contiguous_format),
+            k_pe.clone(memory_format=torch.contiguous_format), pos_ids=position_ids)
 
     @property
     def cache_layer_idx(self) -> int:
@@ -138,13 +152,11 @@ class MLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         **sparse,
     ) -> torch.Tensor:
-        """``rope_cos_sin``: the forward's shared ``InterleavedRotaryEmbedding.cos_sin``, else
-        computed here. ``sparse``: the subclass's selection inputs, passed to its hooks."""
+        """``sparse``: the subclass's selection inputs, passed to its hooks."""
         if self.mla_absorb:
-            return self._forward_absorbed(hidden_states, position_ids, rope_cos_sin, **sparse)
+            return self._forward_absorbed(hidden_states, position_ids, **sparse)
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
@@ -159,7 +171,7 @@ class MLAAttention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # shared MQA rope key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe)
 
         q = torch.cat([q_nope, q_pe], dim=-1)  # (T, H, Dqk)
         k_pe = k_pe.expand(num_tokens, h, self.qk_rope_head_dim)
@@ -184,7 +196,6 @@ class MLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         **sparse,
     ) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
@@ -208,10 +219,9 @@ class MLAAttention(nn.Module):
                                      self.fused_qkv_a_proj_scale_inv, self.fp8_block)
         if (self.mla_fused_prep and not self._selects(**sparse) and fused.is_cuda
                 and fused.dtype == torch.bfloat16):
-            attn_latent = self._fused_prep_and_attend(fused, position_ids, rope_cos_sin)
+            attn_latent = self._fused_prep_and_attend(fused, position_ids)
         else:
-            attn_latent = self._prep_and_attend(
-                fused, hidden_states, position_ids, rope_cos_sin, **sparse)
+            attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
 
         out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)
         return self.o_proj(out.reshape(num_tokens, h * self.v_head_dim))
@@ -238,7 +248,7 @@ class MLAAttention(nn.Module):
         q = self.q_b_proj(self.q_a_layernorm(q_c.contiguous())).view(n, h, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_c = self.kv_a_layernorm(kv_a.clone(memory_format=torch.contiguous_format))
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe.reshape(n, 1, self.qk_rope_head_dim))
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe.reshape(n, 1, self.qk_rope_head_dim))
         latents = rows.setdefault("latent", kv_c.new_zeros(n, block, kv_c.shape[-1] + k_pe.shape[-1]))
         latents[:, row] = torch.cat([kv_c, k_pe.squeeze(1)], dim=-1)
         q_nope_all = q.new_zeros(n, block, h, self.kv_lora_rank)
@@ -260,7 +270,7 @@ class MLAAttention(nn.Module):
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv = self.kv_b_proj(self.kv_a_layernorm(kv_a)).view(n, h, -1)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe.reshape(n, 1, self.qk_rope_head_dim))
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe.reshape(n, 1, self.qk_rope_head_dim))
         pad = self.padded_head_dim
         q = F.pad(torch.cat([q_nope, q_pe], dim=-1), [0, pad - self.qk_head_dim])
         k = F.pad(torch.cat([k_nope, k_pe.expand(n, h, -1)], dim=-1), [0, pad - self.qk_head_dim])
@@ -280,7 +290,6 @@ class MLAAttention(nn.Module):
         fused: torch.Tensor,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
         **sparse,
     ) -> torch.Tensor:
         """Norms, RoPE, cache write and attention over the latent, op by op."""
@@ -303,7 +312,7 @@ class MLAAttention(nn.Module):
         kv_c = self.kv_a_layernorm(kv_a).view(num_tokens, 1, self.kv_lora_rank)  # (T,1,L)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # (T,1,Drope) shared MQA key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
+        q_pe, k_pe = self._rope(position_ids, q_pe, k_pe)
 
         selection = self._select(hidden_states, q_c, position_ids, **sparse)
 
@@ -315,29 +324,24 @@ class MLAAttention(nn.Module):
             return self._write_and_attend(q_nope, latent, None, q_pe=q_pe)
         return self._attend_selected(selection, q_nope, q_pe, kv_c, k_pe, **sparse)
 
-    def _fused_prep_and_attend(
-        self,
-        fused: torch.Tensor,
-        position_ids: torch.Tensor,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
-    ) -> torch.Tensor:
+    def _fused_prep_and_attend(self, fused: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """``_prep_and_attend`` in two kernels: q_a's norm before q_b, then kv_a's norm, both
-        RoPEs and the latent's cache write inside the attention call."""
-        cos, sin = self.rotary.cos_sin(position_ids) if rope_cos_sin is None else rope_cos_sin
+        RoPEs (from the position resource's cos/sin table) and the latent's cache write inside
+        the attention call."""
         q_c = mla_prep.q_norm(
             fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
         q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
         q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
-        return self._write_fused_and_attend(q_nope, q, fused, cos, sin)
+        return self._write_fused_and_attend(q_nope, q, fused, position_ids)
 
     # outside dynamo for the layer index, as _write_and_attend
     @torch.compiler.disable
-    def _write_fused_and_attend(self, q_nope, q, fused, cos, sin):
+    def _write_fused_and_attend(self, q_nope, q, fused, position_ids):
         layer = self._kv.layer_view(self.cache_layer_idx)
         pages, offsets = self._kv.write_slots()
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
-            cos, sin, q, layer, pages, offsets)
+            self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
         return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
 
     def _selects(self, **sparse) -> bool:
