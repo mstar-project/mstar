@@ -277,6 +277,20 @@ def test_a_prefix_on_the_host_is_copied_back_before_the_request_runs():
 
 
 
+def test_a_prompt_rooted_before_its_readiness_check_still_copies_its_prefix_back():
+    kv = _manager()
+    _on_the_host_only(kv)
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+    chain = kv._streams["b"]["main"].chain
+    chain.rooted, chain.rooted_ends = kv._root(list(chain.keys), chain.spans)
+
+    assert not _ready(kv, "b"), "a prompt rooted before its readiness check skipped its copy from the host"
+    kv._cpu_pool.land()
+    assert _ready(kv, "b"), "b stayed not ready after its copy landed"
+    assert _probe(kv, "b", A_PROMPT + [7, 8]) == 6 * PAGE_SIZE, "b's probe missed the pages copied back"
+    kv.assert_pages_conserved()
+
+
 def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
     kv = _manager()
     _on_the_host_only(kv)

@@ -144,6 +144,8 @@ class PrefixChain:
     # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
     rooted: list[bytes] | None = None
     rooted_ends: list[tuple[int, bytes]] | None = None
+    # set once the copy from the host or the probe has looked the prompt up, so the copy is tried once
+    looked_up: bool = False
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # set once this stream has been reported, so a request that is admitted
@@ -678,6 +680,7 @@ class KVManager(AttentionResource):
                 return None
             chain.rooted = rooted
             chain.rooted_ends = ends
+            chain.looked_up = True
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
                 # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
@@ -1454,7 +1457,7 @@ class KVManager(AttentionResource):
         read_in = published.get(self._rank) if published is not None else {}
         if not any(
             label not in read_in
-            and ((stream.chain is not None and stream.chain.rooted is None) or stream.host_copy is not None)
+            and ((stream.chain is not None and not stream.chain.looked_up) or stream.host_copy is not None)
             for label, stream in list(streams.items())
         ):
             return None
@@ -1467,7 +1470,7 @@ class KVManager(AttentionResource):
                 return label
             chain = stream.chain
             if (
-                chain is None or chain.rooted is not None or chain.done
+                chain is None or chain.looked_up or chain.done
                 or chain.spans[0].walk != graph_walk
                 or stream.stored_len or stream.lease is not None or stream.converted
                 or stream.offloaded or stream.read_pending
@@ -1476,14 +1479,15 @@ class KVManager(AttentionResource):
             keys, spans = list(chain.keys), chain.spans
         rooted, ends = self._root(keys, spans)
         with self._lock:
-            # a probe on the GPU thread may have rooted the chain or taken a lease while the lock was dropped
+            # a probe on the GPU thread may have looked the prompt up or taken a lease while the lock was dropped
             if (
                 self._streams.get(rid, {}).get(label) is not stream
-                or chain.rooted is not None or stream.lease is not None
+                or chain.looked_up or stream.lease is not None
             ):
                 return None
             chain.rooted = rooted
             chain.rooted_ends = ends
+            chain.looked_up = True
             # one page short of the whole prompt, as the probe matches
             cap = len(rooted) - 1
             run = self._index.pages_for(rooted[:cap])
