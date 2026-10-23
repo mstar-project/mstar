@@ -33,7 +33,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch, PagedKVCache
 from mstar.engine.resources import (
     AdmitFailedReason,
     AllocationFailed,
@@ -624,19 +624,23 @@ class Worker:
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
         # Kept so a dropped request can be rebuilt from its token ids.
-        # `_kv_keys`: node -> the keys of its paged KV caches.
+        # `_kv_keys`: node -> the keys of its paged KV caches, and `_kv_caches`: key -> its cache.
         # `_kept_ids`: node -> handle -> the request's ids on that node. Per node, since a colocated node
         #   of another partition samples tokens of its own.
         # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
+        # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
         # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
         #   prefill walk's single input, such as `text_inputs`.
         # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
         self._kv_keys: dict[str, list[str]] = defaultdict(list)
+        self._kv_caches: dict[str, PagedKVCache] = {}
         for kv in self.engine_manager.engine.paged_kv_caches():
+            self._kv_caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
         self._kept_ids: dict[str, dict[int, KeptIds]] = {node_name: {} for node_name in self._kv_keys}
         self._rebuild_rows: dict[int, RebuildRow] = {}
+        self._dropped: dict[int, str] = {}
         self._walk_inputs: dict[tuple[str, str], set[str]] = {}
         self._growth_loops: dict[tuple[str, str], str] = {}
         if model is not None:
@@ -1016,6 +1020,7 @@ class Worker:
         for kept in self._kept_ids.values():
             kept.pop(request_id, None)
         self._rebuild_rows.pop(request_id, None)
+        self._dropped.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1075,7 +1080,9 @@ class Worker:
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} on {node_name} is in walk "
                 f"{info.graph_walk!r}, which grows no KV, or its {len(kept.sampled)} kept samples don't cover its KV"
             )
-        return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        self._dropped[request_id] = node_name
+        return freed
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
         """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
@@ -1095,6 +1102,19 @@ class Worker:
         (name,) = self._walk_inputs[(walk, node_name)]
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
         self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
+        self._dropped.pop(request_id, None)
+
+    def _readmit_dropped(self) -> None:
+        """Rebuild each dropped request that is first in its node's queue, once its kept history and
+        one more page fit there. A node drops requests only when it has one paged KV cache."""
+        for rid, node_name in list(self._dropped.items()):
+            if self._is_tearing_down(rid):
+                continue
+            kept = self._kept_ids[node_name][rid]
+            history = len(kept.prompt) // 4 + len(kept.sampled)
+            (key,) = self._kv_keys[node_name]
+            if self._kv_caches[key].cache.readmit(rid, history):
+                self._rebuild(rid, node_name)
 
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
         """The queued rebuild rows the scheduler would run now: not held, failed or removed."""
@@ -4672,6 +4692,9 @@ class Worker:
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
                     metrics.maybe_report()
+
+                if self._dropped:
+                    self._readmit_dropped()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
